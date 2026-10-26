@@ -10,9 +10,40 @@ import (
 type Role string
 
 const (
-	RoleUser  Role = "user"
-	RoleAdmin Role = "admin"
+	RoleUser       Role = "user"
+	RoleAdmin      Role = "admin"
+	RoleSuperAdmin Role = "super_admin"
 )
+
+func (role Role) IsAdmin() bool {
+	return role == RoleAdmin || role == RoleSuperAdmin
+}
+
+type AccountStatus string
+
+const (
+	StatusPending  AccountStatus = "pending"
+	StatusRejected AccountStatus = "rejected"
+	StatusApproved AccountStatus = "approved"
+	StatusDisabled AccountStatus = "disabled"
+)
+
+func (status AccountStatus) Valid() bool {
+	return status == StatusPending || status == StatusRejected || status == StatusApproved || status == StatusDisabled
+}
+
+func (status AccountStatus) CanTransitionTo(next AccountStatus) bool {
+	switch status {
+	case StatusPending:
+		return next == StatusApproved || next == StatusRejected
+	case StatusRejected, StatusDisabled:
+		return next == StatusApproved
+	case StatusApproved:
+		return next == StatusDisabled
+	default:
+		return false
+	}
+}
 
 type Kind string
 
@@ -140,6 +171,7 @@ func (p Principal) CanAccessHost(hostID string, scope Scope) bool {
 type Principal struct {
 	UserID               string
 	Role                 Role
+	MustChangePassword   bool
 	Kind                 Kind
 	TokenID              string
 	ClientInstallationID string
@@ -155,16 +187,17 @@ type Principal struct {
 var ErrInvalidCredential = errors.New("invalid credential")
 
 type User struct {
-	ID            string
-	Name          string
-	PasswordHash  string
-	Role          Role
-	QuotaHosts    int
-	QuotaCPUMilli int
-	QuotaMemMiB   int
-	Disabled      bool
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                 string
+	Name               string
+	PasswordHash       string
+	Role               Role
+	Status             AccountStatus
+	MustChangePassword bool
+	QuotaHosts         int
+	QuotaCPUMilli      int
+	QuotaMemMiB        int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type Token struct {

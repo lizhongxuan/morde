@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
@@ -205,7 +206,7 @@ func TestCoverageTicketAndLogoutFailurePaths(t *testing.T) {
 }
 
 func TestCoverageUserUsageOwnerIsolationAndUpdates(t *testing.T) {
-	credentials, users, hosts, workspaces, _, auditor := newCredentialFixture(t)
+	credentials, users, hosts, workspaces, _, _ := newCredentialFixture(t)
 	attached := workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady}
 	workspaces.values[attached.ID] = attached
 	workspaces.values["w1234571"] = workspace.Workspace{ID: "w1234571", OwnerID: "u1234567", State: workspace.StateReady}
@@ -220,12 +221,12 @@ func TestCoverageUserUsageOwnerIsolationAndUpdates(t *testing.T) {
 		{ID: "h1234573", OwnerID: "u1234567", State: host.StateFailed, CPUMilli: 700, MemMiB: 800},
 		{ID: "h1234574", OwnerID: "u1234567", State: host.StateDeleted, CPUMilli: 800, MemMiB: 900},
 	}
-	userService, err := NewUserService(users, hosts, auditor)
+	userService, err := NewUserService(users, hosts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	admin := identity.Principal{Role: identity.RoleAdmin, Kind: identity.KindSystem}
-	items, err := userService.List(context.Background(), admin)
+	items, err := userService.List(context.Background(), admin, nil)
 	want := ResourceUsage{Hosts: 5, CPUMilli: 1500, MemMiB: 2000}
 	if err != nil || len(items) != 1 || items[0].Usage != want {
 		t.Fatalf("UserService.List() = %#v, %v", items, err)
@@ -237,45 +238,36 @@ func TestCoverageUserUsageOwnerIsolationAndUpdates(t *testing.T) {
 	}
 	role := identity.RoleAdmin
 	quota := ResourceUsage{Hosts: 7, CPUMilli: 9000, MemMiB: 12000}
-	password := "updated password"
-	disabled := false
 	updated, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{
-		Role: &role, Quota: &quota, Password: &password, Disabled: &disabled,
+		ExpectedStatus: identity.StatusApproved, Role: &role, Quota: &quota,
 	})
 	if err != nil || updated.Role != role || updated.Quota != quota || updated.Usage != want {
 		t.Fatalf("UserService.Update() = %#v, %v", updated, err)
 	}
-	if err := bcryptCompare(users.values[member.UserID].PasswordHash, password); err != nil {
-		t.Fatalf("updated password hash: %v", err)
-	}
 	badRole := identity.Role("owner")
-	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{Role: &badRole}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{ExpectedStatus: identity.StatusApproved, Role: &badRole}); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("Update() with invalid role = %v", err)
 	}
 	badQuota := ResourceUsage{Hosts: -1}
-	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{Quota: &badQuota}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{ExpectedStatus: identity.StatusApproved, Quota: &badQuota}); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("Update() with negative quota = %v", err)
 	}
 	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{}); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("Update() with no fields = %v", err)
 	}
-	if _, err := userService.Update(context.Background(), admin, "bad-id", UpdateUserCommand{Role: &role}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := userService.Update(context.Background(), admin, "bad-id", UpdateUserCommand{ExpectedStatus: identity.StatusApproved, Role: &role}); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("Update() with bad user id = %v", err)
 	}
 	if _, err := credentials.CurrentUser(context.Background(), identity.Principal{UserID: member.UserID, Kind: identity.KindSession}); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("CurrentUser() without token id = %v", err)
 	}
-	disabled = true
-	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{Disabled: &disabled}); err != nil {
+	disabled := identity.StatusDisabled
+	if _, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{ExpectedStatus: identity.StatusApproved, Status: &disabled}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := credentials.CurrentUser(context.Background(), member); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("CurrentUser() for disabled account = %v", err)
 	}
-}
-
-func bcryptCompare(hash, password string) error {
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 }
 
 func TestCoverageCapacityCountsAllocationsAndStates(t *testing.T) {
@@ -529,7 +521,7 @@ func TestCoverageConstructorsRejectInvalidDependencies(t *testing.T) {
 	if _, err := NewCredentialService(users, hosts, tokens, auditor, CredentialOptions{}); err == nil {
 		t.Fatal("NewCredentialService() accepted invalid limits")
 	}
-	if _, err := NewUserService(nil, hosts, auditor); err == nil {
+	if _, err := NewUserService(nil, hosts); err == nil {
 		t.Fatal("NewUserService() accepted a missing user store")
 	}
 	if _, err := NewWorkspaceService(workspaces, nil, &workspaceCapacityStub{}, auditor, 1); err == nil {
@@ -639,44 +631,23 @@ func TestCoverageHostPrincipalValidation(t *testing.T) {
 }
 
 func TestCoverageUserCreateValidationAndAuditOutcome(t *testing.T) {
-	_, users, hosts, _, _, auditor := newCredentialFixture(t)
-	service, err := NewUserService(users, hosts, auditor)
+	_, users, hosts, _, _, _ := newCredentialFixture(t)
+	service, err := NewUserService(users, hosts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	admin := identity.Principal{Role: identity.RoleAdmin, Kind: identity.KindSystem}
 	member := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
-	if _, err := service.List(context.Background(), member); domain.CodeOf(err) != domain.CodeForbidden {
+	if _, err := service.List(context.Background(), member, nil); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("List(non-admin) = %v", err)
 	}
-	if _, err := service.Create(context.Background(), admin, CreateUserCommand{Name: "  ", Password: "password", Role: identity.RoleUser}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("Create(blank name) = %v", err)
+	if _, err := service.Register(context.Background(), "  ", "password123", "192.0.2.1"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Register(blank name) = %v", err)
 	}
-	if _, err := service.Create(context.Background(), admin, CreateUserCommand{Name: "bob", Password: "password", Role: identity.Role("owner")}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("Create(invalid role) = %v", err)
+	if _, err := service.Register(context.Background(), "bob", "short", "192.0.2.1"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Register(short password) = %v", err)
 	}
-	if _, err := service.Create(context.Background(), admin, CreateUserCommand{Name: "bob", Password: "", Role: identity.RoleUser}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("Create(empty password) = %v", err)
-	}
-	negative := ResourceUsage{CPUMilli: -1}
-	if _, err := service.Create(context.Background(), admin, CreateUserCommand{Name: "bob", Password: "password", Role: identity.RoleUser, Quota: &negative}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("Create(negative quota) = %v", err)
-	}
-	auditor.err = errors.New("audit unavailable")
-	if _, err := service.Create(context.Background(), admin, CreateUserCommand{Name: "bob", Password: "password", Role: identity.RoleUser}); err == nil {
-		t.Fatal("Create() ignored audit failure")
-	}
-	if _, ok := users.values["bob"]; ok {
-		t.Fatal("test user was incorrectly indexed by name")
-	}
-	created := false
-	for _, user := range users.values {
-		if user.Name == "bob" {
-			created = true
-		}
-	}
-	if !created {
-		t.Fatal("user was not persisted before the audit failure")
+	if _, err := service.Register(context.Background(), "admin", "password123", "192.0.2.1"); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("Register(reserved admin) = %v", err)
 	}
 }
 
@@ -786,13 +757,15 @@ func hostServiceTestTestHostForCoverage(state host.State, id string) host.Host {
 
 func TestCoverageCreateProbeFailureCleansSandboxAndDetachesWorkspace(t *testing.T) {
 	service, deps := newHostServiceTest(t)
+	core, logs := observer.New(zap.WarnLevel)
+	service.logger = zap.New(core)
 	value := hostServiceTestHost(host.StateCreating)
 	sealHostServiceTestKey(t, deps.sealer, &value)
 	deps.hosts.addHost(value)
 	deps.workspaces.add(workspace.Workspace{
 		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, State: workspace.StateReady,
 	})
-	deps.probe.err = errors.New("AIO not ready")
+	deps.probe.err = errors.New("private AIO error detail")
 	if err := service.AdvanceCreate(context.Background(), value.ID); err != nil {
 		t.Fatalf("AdvanceCreate() after probe timeout = %v", err)
 	}
@@ -809,5 +782,12 @@ func TestCoverageCreateProbeFailureCleansSandboxAndDetachesWorkspace(t *testing.
 	}
 	if deps.sandbox.values["sandbox-1"].State != SandboxTerminated {
 		t.Fatalf("sandbox after readiness failure = %#v", deps.sandbox.values["sandbox-1"])
+	}
+	if logs.FilterMessage("host readiness timed out").Len() != 1 ||
+		logs.FilterField(zap.String("stage", "aio_health")).Len() != 1 {
+		t.Fatalf("readiness diagnostics = %#v, want one safe AIO health stage", logs.All())
+	}
+	if _, leaked := logs.All()[0].ContextMap()["error"]; leaked {
+		t.Fatalf("readiness log exposed probe error: %#v", logs.All()[0].ContextMap())
 	}
 }

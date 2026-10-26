@@ -94,7 +94,7 @@ func newSharingService(t *testing.T, memberPermissions []host.Permission) (HostS
 	auditor := &sharingAudit{}
 	service, err := NewHostSharingService(
 		sharingHostStore{value: host.Host{ID: sharingHostID, OwnerID: sharingOwnerID, Name: "demo", State: host.StateRunning}},
-		sharingUserStore{user: identity.User{ID: sharingMemberID}}, store, tokens, auditor,
+		sharingUserStore{user: identity.User{ID: sharingMemberID, Status: identity.StatusApproved}}, store, tokens, auditor,
 		"https", "hosts.example.test", time.Minute, zap.NewNop(), func() {},
 	)
 	if err != nil {

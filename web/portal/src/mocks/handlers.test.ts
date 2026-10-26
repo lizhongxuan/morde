@@ -35,6 +35,90 @@ afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); });
 afterAll(() => server.close());
 
 describe("portal mock cookie sessions", () => {
+  it("registers a pending user without logging in and only reveals the review state after a correct password", async () => {
+    const account = createApiClient();
+    const created = await account("/api/auth/register", json("POST", { name: "fresh-user", password: "secret-pass" }));
+    expect(created.status).toBe(201);
+    expect(created.headers.get("set-cookie")).toBeNull();
+    expect(await created.json()).toMatchObject({ user: { name: "fresh-user", role: "user", status: "pending", must_change_password: false } });
+    expect((await account("/api/me")).status).toBe(401);
+    expect((await account("/api/auth/register", json("POST", { name: "fresh-user", password: "secret-pass" }))).status).toBe(409);
+    expect((await account("/api/auth/register", json("POST", { name: "admin", password: "secret-pass" }))).status).toBe(409);
+    expect((await account("/api/auth/register", json("POST", { name: "AdMiN", password: "secret-pass" }))).status).toBe(409);
+    const wrongPassword = await account("/api/auth/login", json("POST", { name: "fresh-user", password: "wrong-pass" }));
+    expect(wrongPassword.status).toBe(401);
+    expect((await wrongPassword.json()).error.code).toBe("unauthenticated");
+    const pendingLogin = await account("/api/auth/login", json("POST", { name: "fresh-user", password: "secret-pass" }));
+    expect(pendingLogin.status).toBe(403);
+    expect((await pendingLogin.json()).error.code).toBe("account_pending");
+    expect((await account("/api/admin/users")).status).toBe(401);
+  });
+
+  it("lets admins approve, promote and disable accounts using expected status", async () => {
+    const admin = createApiClient();
+    const account = createApiClient();
+    await account("/api/auth/register", json("POST", { name: "review-me", password: "secret-pass" }));
+    await admin("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+
+    const pending = await admin("/api/admin/users?status=pending");
+    const pendingList = await pending.json() as { items: Array<{ id: string; name: string; role: string; status: string }> };
+    expect(pendingList.items).toEqual(expect.arrayContaining([expect.objectContaining({ name: "review-me", status: "pending", role: "user" })]));
+    const user = pendingList.items.find((item) => item.name === "review-me")!;
+    const stale = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "approved", status: "disabled" }));
+    expect(stale.status).toBe(409);
+    expect((await stale.json()).error.code).toBe("conflict");
+
+    const approved = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "pending", status: "approved" }));
+    expect(approved.status).toBe(200);
+    const promoted = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "approved", role: "admin" }));
+    expect(await promoted.json()).toMatchObject({ role: "admin", status: "approved" });
+    await account("/api/auth/login", json("POST", { name: "review-me", password: "secret-pass" }));
+    expect((await account("/api/admin/users")).status).toBe(200);
+
+    const disabled = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "approved", status: "disabled" }));
+    expect(await disabled.json()).toMatchObject({ status: "disabled", role: "admin" });
+    expect((await account("/api/me")).status).toBe(401);
+    expect((await account("/api/auth/login", json("POST", { name: "review-me", password: "wrong-pass" }))).status).toBe(401);
+    const disabledLogin = await account("/api/auth/login", json("POST", { name: "review-me", password: "secret-pass" }));
+    expect(disabledLogin.status).toBe(403);
+    expect((await disabledLogin.json()).error.code).toBe("account_disabled");
+
+    const rejectedRegistration = await account("/api/auth/register", json("POST", { name: "rejected-me", password: "secret-pass" }));
+    const rejectedUser = (await rejectedRegistration.json() as { user: { id: string } }).user;
+    expect((await admin(`/api/admin/users/${rejectedUser.id}`, json("PATCH", { expected_status: "pending", status: "rejected" }))).status).toBe(200);
+    expect((await account("/api/auth/login", json("POST", { name: "rejected-me", password: "wrong-pass" }))).status).toBe(401);
+    const rejectedLogin = await account("/api/auth/login", json("POST", { name: "rejected-me", password: "secret-pass" }));
+    expect(rejectedLogin.status).toBe(403);
+    expect((await rejectedLogin.json()).error.code).toBe("account_rejected");
+  });
+
+  it("protects the super administrator and restricts its initial default-password session", async () => {
+    const admin = createApiClient();
+    const initialLogin = await admin("/api/auth/login", json("POST", { name: "admin", password: "admin" }));
+    expect(await initialLogin.json()).toMatchObject({ user: { name: "admin", role: "super_admin", must_change_password: true } });
+    expect(await (await admin("/api/me")).json()).toMatchObject({ role: "super_admin", must_change_password: true });
+    expect((await admin("/api/admin/users")).status).toBe(403);
+    expect((await admin("/api/me/preferences")).status).toBe(403);
+
+    const changed = await admin("/api/me/password", json("POST", { current_password: "admin", new_password: "admin-new-pass" }));
+    expect(changed.status).toBe(204);
+    expect(changed.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect((await admin("/api/me")).status).toBe(401);
+    expect((await admin("/api/auth/login", json("POST", { name: "admin", password: "admin" }))).status).toBe(401);
+    const nextLogin = await admin("/api/auth/login", json("POST", { name: "admin", password: "admin-new-pass" }));
+    expect(await nextLogin.json()).toMatchObject({ user: { role: "super_admin", must_change_password: false } });
+    expect((await admin("/api/admin/users")).status).toBe(200);
+  });
+
+  it("does not allow an admin to change their own role or operate on admin", async () => {
+    const admin = createApiClient();
+    await admin("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const self = await admin("/api/admin/users/u1a2b3c4", json("PATCH", { expected_status: "approved", role: "user" }));
+    expect(self.status).toBe(403);
+    const protectedAdmin = await admin("/api/admin/users/uadmin01", json("PATCH", { expected_status: "approved", status: "disabled" }));
+    expect(protectedAdmin.status).toBe(403);
+  });
+
   it("approves and revokes only the current user's client without exposing the code in audit", async () => {
     const owner = createApiClient();
     const other = createApiClient();
@@ -96,7 +180,7 @@ describe("portal mock cookie sessions", () => {
     expect(adminCookie).toMatch(/^ch_mock_session=.+; Path=\/; SameSite=Lax$/);
     expect(memberCookie).not.toBe(adminCookie);
 
-    expect(await (await admin("/api/me")).json()).toMatchObject({ name: "admin", role: "admin" });
+    expect(await (await admin("/api/me")).json()).toMatchObject({ name: "admin", role: "super_admin", must_change_password: true });
     expect(await (await member("/api/me")).json()).toMatchObject({ name: "member", role: "user" });
     expect((await member("/api/admin/users")).status).toBe(403);
 
@@ -410,7 +494,7 @@ describe("portal mock quota and capacity", () => {
     const initialCapacity = await (await api("/api/admin/capacity")).json();
     expect(initialCapacity.allocated).toEqual({ cpu_milli: 0, mem_mib: 0 });
 
-    await api("/api/admin/users/u1a2b3c4", json("PATCH", { quota: { hosts: 1, cpu_milli: 500, mem_mib: 1536 } }));
+    await api("/api/admin/users/u1a2b3c4", json("PATCH", { expected_status: "approved", quota: { hosts: 1, cpu_milli: 500, mem_mib: 1536 } }));
     const created = await createHostRequest({ name: "quota test", template_id: "std-2c4g", workspace_ids: [] });
     expect(created.status).toBe(201);
     const me = await (await api("/api/me")).json();
@@ -423,7 +507,7 @@ describe("portal mock quota and capacity", () => {
     expect(quotaRejected.status).toBe(409);
     expect((await quotaRejected.json()).error).toMatchObject({ code: "quota_exceeded", details: { dimension: "hosts", limit: 1 } });
 
-    await api("/api/admin/users/u1a2b3c4", json("PATCH", { quota: { hosts: 100, cpu_milli: 50000, mem_mib: 200000 } }));
+    await api("/api/admin/users/u1a2b3c4", json("PATCH", { expected_status: "approved", quota: { hosts: 100, cpu_milli: 50000, mem_mib: 200000 } }));
     for (let index = 1; index < 64; index += 1) {
       const response = await createHostRequest({ name: `capacity test ${index}`, template_id: "std-2c4g", workspace_ids: [] });
       expect(response.status).toBe(201);
@@ -433,24 +517,8 @@ describe("portal mock quota and capacity", () => {
     expect((await capacityRejected.json()).error).toMatchObject({ code: "capacity_exceeded", details: { dimension: "mem_mib", limit: 98304 } });
   });
 
-  it("stores admin-created user credentials and blocks disabled accounts", async () => {
-    await api("/api/auth/login", json("POST", { name: "admin", password: "admin" }));
-    const created = await api("/api/admin/users", json("POST", { name: "local-new-user", password: "local-password", role: "user" }));
-    expect(created.status).toBe(201);
-    const user = await created.json();
-    expect(user).toMatchObject({ name: "local-new-user", role: "user", disabled: false });
-    expect(user).not.toHaveProperty("password");
-
-    await api("/api/auth/logout", { method: "POST" });
-    expect((await api("/api/auth/login", json("POST", { name: "local-new-user", password: "local-password" }))).status).toBe(200);
-    await api("/api/auth/login", json("POST", { name: "admin", password: "admin" }));
-    expect((await api(`/api/admin/users/${user.id}`, json("PATCH", { disabled: true }))).status).toBe(200);
-    await api("/api/auth/logout", { method: "POST" });
-    expect((await api("/api/auth/login", json("POST", { name: "local-new-user", password: "local-password" }))).status).toBe(401);
-  });
-
   it("filters synthetic audit records and applies the requested result limit", async () => {
-    await api("/api/auth/login", json("POST", { name: "admin", password: "admin" }));
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const since = encodeURIComponent(new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString());
     const filtered = await api(`/api/admin/audit?actor=u1a2b3c4&action=host.create&target=h-audit-demo&since=${since}&limit=1`);
     expect(filtered.status).toBe(200);

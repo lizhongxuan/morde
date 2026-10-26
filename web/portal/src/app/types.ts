@@ -1,26 +1,13 @@
 import type { components } from '../api/schema';
 
-export interface PortalUser {
-  id: string;
-  name: string;
-  role: string;
-  disabled?: boolean;
-  quota?: { hosts: number; cpu_milli: number; mem_mib: number };
-  usage?: { hosts: number; cpu_milli: number; mem_mib: number };
-  created_at?: string;
-}
+export type PortalUser = components['schemas']['Me'];
 
 export type Host = components['schemas']['Host'];
 export type Workspace = components['schemas']['Workspace'];
 export type WorkspaceBinding = components['schemas']['WorkspaceBinding'];
 export type Template = components['schemas']['Template'];
 
-export interface AdminUser extends PortalUser {
-  disabled: boolean;
-  quota: NonNullable<PortalUser['quota']>;
-  usage: NonNullable<PortalUser['usage']>;
-  created_at: string;
-}
+export type AdminUser = components['schemas']['AdminUser'];
 
 export interface AuditLog {
   id: number;

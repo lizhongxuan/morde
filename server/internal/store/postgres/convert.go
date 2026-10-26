@@ -116,9 +116,10 @@ func workspaceBindingDomainFromWorkspaceIDs(row sqlcgen.ListWorkspaceBindingsByW
 func userDomain(row sqlcgen.User) identity.User {
 	return identity.User{
 		ID: row.ID, Name: row.Name, PasswordHash: row.PasswordHash, Role: identity.Role(row.Role),
+		Status: identity.AccountStatus(row.Status), MustChangePassword: row.MustChangePassword,
 		QuotaHosts: int(row.QuotaHosts), QuotaCPUMilli: int(row.QuotaCpuMilli),
-		QuotaMemMiB: int(row.QuotaMemMib), Disabled: row.Disabled,
-		CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
+		QuotaMemMiB: int(row.QuotaMemMib),
+		CreatedAt:   row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
 }
 

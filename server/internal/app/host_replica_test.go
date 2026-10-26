@@ -27,7 +27,7 @@ func TestHostReplicaAppliesAndActivatesOnlyCurrentBindingRevision(t *testing.T) 
 		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
 		bindings: map[string]workspace.Binding{hostValue.ID + "/" + workspaceValue.ID: binding},
 	}
-	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser}}}
+	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
 	service, err := NewHostReplicaService(hosts, workspaces, users, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestHostReplicaReportsWorkspaceSyncConflictAndRecovery(t *testing.T) {
 		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
 		bindings: map[string]workspace.Binding{hostValue.ID + "/" + workspaceValue.ID: binding},
 	}
-	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser}}}
+	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
 	service, err := NewHostReplicaService(&hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}, workspaces, users, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +158,7 @@ func TestHostReplicaCannotRunWhenOwnerIsDisabled(t *testing.T) {
 	hostValue := hostServiceTestHost(host.StateRunning)
 	sealHostServiceTestKey(t, sealer, &hostValue)
 	hosts := &hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}
-	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Disabled: true}}}
+	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Status: identity.StatusDisabled}}}
 	service, err := NewHostReplicaService(hosts, &hostServiceTestWorkspaceStore{}, users, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestHostReplicaDetachesOnlyAfterCurrentCheckpoint(t *testing.T) {
 		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
 		bindings: map[string]workspace.Binding{hostValue.ID + "/" + workspaceValue.ID: binding},
 	}
-	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser}}}
+	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
 	service, err := NewHostReplicaService(
 		&hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}, workspaces, users, sealer,
 	)

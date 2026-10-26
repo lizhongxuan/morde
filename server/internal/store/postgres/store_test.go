@@ -159,7 +159,10 @@ func TestStoreQueriesAndConversions(t *testing.T) {
 	if got, err := s.ListUsers(ctx); err != nil || got == nil {
 		t.Fatalf("empty user list = %#v, %v", got, err)
 	}
-	user := identity.User{ID: "u1234567", Role: identity.RoleUser}
+	user := identity.User{
+		ID: "u1234567", Name: "new-user", PasswordHash: "hash", Role: identity.RoleUser,
+		Status: identity.StatusPending,
+	}
 	if _, err := s.CreateUser(ctx, user); err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,7 @@ const workspace: components['schemas']['AdminWorkspace'] = {
   bindings: [{ host_id: 'h1234567', host_name: '开发电脑', state: 'active', sync_state: 'healthy', desired_revision: 3, applied_revision: 3 }],
 };
 const user: components['schemas']['AdminUser'] = {
-  id: 'u1234567', name: 'alice', role: 'user', disabled: false,
+  id: 'u1234567', name: 'alice', role: 'user', status: 'approved',
   quota: { hosts: 2, cpu_milli: 4000, mem_mib: 8192 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 },
   created_at: '2026-10-22T00:00:00Z',
 };

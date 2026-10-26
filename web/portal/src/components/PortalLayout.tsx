@@ -47,7 +47,7 @@ export function PortalLayout() {
         {settingLinks.map(({ to, label, icon }) => <NavLink className="morde-nav-link" to={to} key={to}><span className="morde-nav-icon" aria-hidden="true">{icon}</span><span>{label}</span></NavLink>)}
       </nav>
       <div className="morde-sidebar-bottom">
-        {user?.role === 'admin' && <a className="morde-nav-link" href="/admin/"><span className="morde-nav-icon" aria-hidden="true">⚙</span><span>管理后台</span></a>}
+        {(user?.role === 'admin' || user?.role === 'super_admin') && <a className="morde-nav-link" href="/admin/"><span className="morde-nav-icon" aria-hidden="true">⚙</span><span>管理后台</span></a>}
         <div className="morde-profile"><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span><strong>{user?.name}</strong><small>PC 用户端</small></span><button className="button button-quiet button-small" type="button" onClick={() => void logout()}>退出</button></div>
       </div>
     </aside>

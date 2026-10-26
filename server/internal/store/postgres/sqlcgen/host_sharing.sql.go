@@ -10,7 +10,7 @@ import (
 )
 
 const getHostActorAccess = `-- name: GetHostActorAccess :one
-SELECT h.owner_id, u.disabled, COALESCE(m.permissions, '{}'::text[]) AS permissions
+SELECT h.owner_id, u.status <> 'approved' AS disabled, COALESCE(m.permissions, '{}'::text[]) AS permissions
 FROM hosts h JOIN users u ON u.id = $2
 LEFT JOIN host_members m ON m.host_id = h.id AND m.user_id = u.id AND m.revoked_at IS NULL
 WHERE h.id = $1 AND h.deleted_at IS NULL AND h.state <> 'deleted'

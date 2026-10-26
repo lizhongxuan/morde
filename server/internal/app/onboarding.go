@@ -385,7 +385,7 @@ func (s *OnboardingService) ownedHosts(ctx context.Context, principal identity.P
 
 func validateOnboardingPrincipal(principal identity.Principal) error {
 	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) ||
-		(principal.Role != identity.RoleUser && principal.Role != identity.RoleAdmin) || principal.HostScope != "" ||
+		(principal.Role != identity.RoleUser && !principal.Role.IsAdmin()) || principal.HostScope != "" ||
 		len(principal.HostIDs) != 0 || len(principal.Scopes) != 0 {
 		return domain.NewError(domain.CodeForbidden, "portal session required")
 	}

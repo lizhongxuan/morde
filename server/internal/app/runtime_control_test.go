@@ -189,7 +189,7 @@ func TestHostReadinessRequiresAIOThenRuntimeHandshake(t *testing.T) {
 	value := hostServiceTestHost(host.StateCreating)
 	value.ControlState = host.ControlAI
 	sealHostServiceTestKey(t, deps.sealer, &value)
-	if err := service.probeReady(context.Background(), deps.sandbox, value); err != nil {
+	if stage, err := service.probeReady(context.Background(), deps.sandbox, value); err != nil || stage != "" {
 		t.Fatalf("probeReady() error = %v", err)
 	}
 	if len(deps.runtime.hosts) != 1 || deps.runtime.hosts[0] != value.ID {
@@ -198,8 +198,8 @@ func TestHostReadinessRequiresAIOThenRuntimeHandshake(t *testing.T) {
 
 	deps.runtime.hosts = nil
 	deps.runtime.err = errors.New("runtime unavailable")
-	if err := service.probeReady(context.Background(), deps.sandbox, value); err == nil {
-		t.Fatal("probeReady() succeeded without runtime handshake")
+	if stage, err := service.probeReady(context.Background(), deps.sandbox, value); err == nil || stage != "runtime_handshake" {
+		t.Fatalf("probeReady() stage/error = %q / %v, want runtime handshake failure", stage, err)
 	}
 	if len(deps.runtime.hosts) != 1 {
 		t.Fatalf("runtime handshake calls = %d, want 1", len(deps.runtime.hosts))
@@ -208,8 +208,8 @@ func TestHostReadinessRequiresAIOThenRuntimeHandshake(t *testing.T) {
 	deps.runtime.err = nil
 	deps.probe.err = errors.New("AIO unavailable")
 	deps.runtime.hosts = nil
-	if err := service.probeReady(context.Background(), deps.sandbox, value); err == nil {
-		t.Fatal("probeReady() succeeded without AIO health")
+	if stage, err := service.probeReady(context.Background(), deps.sandbox, value); err == nil || stage != "aio_health" {
+		t.Fatalf("probeReady() stage/error = %q / %v, want AIO health failure", stage, err)
 	}
 	if len(deps.runtime.hosts) != 0 {
 		t.Fatalf("runtime handshake ran after failed AIO probe: %v", deps.runtime.hosts)
@@ -267,7 +267,7 @@ func TestHostReadinessUsesRealRuntimeHandshakeWhileCreating(t *testing.T) {
 		t.Fatal(err)
 	}
 	hostsService.runtime = runtime
-	if err := hostsService.probeReady(context.Background(), deps.sandbox, value); err != nil {
+	if _, err := hostsService.probeReady(context.Background(), deps.sandbox, value); err != nil {
 		t.Fatalf("probeReady() with real runtime handshake error = %v", err)
 	}
 	stored, err := deps.hosts.GetHost(context.Background(), value.ID)

@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../api/client';
 import { gatewayApi, type GatewayControl, type GatewayHost } from '../api/gateway';
 import Workbench from './Workbench';
 
@@ -50,6 +51,30 @@ describe('Workbench MVP navigation', () => {
     expect(screen.queryByText(/Codex|微信|QQ|飞书/)).not.toBeInTheDocument();
     await waitFor(() => expect(gatewayApi.host).toHaveBeenCalledOnce());
     appApi.forEach((call) => expect(call).not.toHaveBeenCalled());
+  });
+});
+
+describe('Workbench control conflicts', () => {
+  beforeEach(mockWorkbenchApi);
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('drops a stale takeover request after a 409 and retries with the refreshed version', async () => {
+    const refreshed = { ...control, control_version: 1 };
+    vi.spyOn(gatewayApi, 'control').mockResolvedValueOnce(control).mockResolvedValueOnce(refreshed).mockResolvedValue(refreshed);
+    const action = vi.spyOn(gatewayApi, 'controlAction')
+      .mockRejectedValueOnce(new ApiError({ message: '控制状态已变化，请刷新后重试', code: 'conflict', status: 409 }))
+      .mockResolvedValue({ ...refreshed, control_state: 'taking_over', control_version: 2 });
+    render(<Workbench />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '接管电脑' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '接管电脑' })).toBeVisible());
+    fireEvent.click(screen.getByRole('button', { name: '接管电脑' }));
+    await waitFor(() => expect(action).toHaveBeenCalledTimes(2));
+    expect(action.mock.calls.map(([request]) => request.expected_control_version)).toEqual([0, 1]);
   });
 });
 

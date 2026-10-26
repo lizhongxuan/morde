@@ -28,7 +28,7 @@ func (s *hostService) List(ctx context.Context, principal identity.Principal) ([
 	}
 	var values []host.Host
 	var err error
-	if principal.Role == identity.RoleAdmin {
+	if principal.Role.IsAdmin() {
 		values, err = s.hosts.ListHosts(ctx)
 	} else {
 		values, err = s.hosts.ListHostsByOwner(ctx, principal.UserID)
@@ -595,7 +595,7 @@ func (s *hostService) getAuthorizedHost(ctx context.Context, principal identity.
 		return host.Host{}, err
 	}
 	if value.State == host.StateDeleted || value.DeletedAt != nil ||
-		(principal.Role != identity.RoleAdmin && value.OwnerID != principal.UserID) ||
+		(!principal.Role.IsAdmin() && value.OwnerID != principal.UserID) ||
 		(principal.HostScope != "" && principal.HostScope != value.ID) ||
 		(principal.Kind == identity.KindAPIKey && !principal.AllowsHost(value.ID)) {
 		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")

@@ -51,7 +51,7 @@
 ```text
 server/
 ├── cmd/
-│   └── portal/            # 配置加载、依赖装配、启动、健康检查、优雅关闭；子命令 serve / migrate / user add
+│   └── portal/            # 配置加载、依赖装配、启动、健康检查、优雅关闭；子命令 serve / migrate
 ├── internal/
 │   ├── domain/            # 纯内核：ErrorCode、ID 生成与校验（根包）及各实体子包，只依赖标准库
 │   │   ├── template/      # 模板值对象、校验、单位换算

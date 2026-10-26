@@ -17,28 +17,6 @@ import (
 	"morde/server/internal/config"
 )
 
-func TestReadPassword(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		want    string
-		wantErr bool
-	}{
-		{name: "newline", input: "  secret  \r\n", want: "  secret  "},
-		{name: "no newline", input: "secret", want: "secret"},
-		{name: "empty", input: "\n", wantErr: true},
-		{name: "too long", input: strings.Repeat("x", 73), wantErr: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := readPassword(strings.NewReader(test.input))
-			if (err != nil) != test.wantErr || got != test.want {
-				t.Fatalf("readPassword() = (%q, %v), want (%q, error=%v)", got, err, test.want, test.wantErr)
-			}
-		})
-	}
-}
-
 func TestRequireLoopbackMetrics(t *testing.T) {
 	if err := requireLoopbackMetrics("127.0.0.1:7082"); err != nil {
 		t.Fatalf("loopback metrics address rejected: %v", err)
@@ -99,6 +77,13 @@ func TestWorkspaceVerifyRejectsUnexpectedArguments(t *testing.T) {
 	}
 }
 
+func TestUserAddCommandIsRemoved(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"user", "add"}, strings.NewReader(""), &stdout, &stderr); err == nil {
+		t.Fatal("removed user add command was accepted")
+	}
+}
+
 func TestParseWorkspaceImportFlags(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -126,14 +111,3 @@ func TestParseWorkspaceImportFlags(t *testing.T) {
 		})
 	}
 }
-
-func TestReadPasswordPropagatesReadErrors(t *testing.T) {
-	_, err := readPassword(errorReader{})
-	if err == nil || !strings.Contains(err.Error(), "read password") {
-		t.Fatalf("readPassword() error = %v", err)
-	}
-}
-
-type errorReader struct{}
-
-func (errorReader) Read([]byte) (int, error) { return 0, errors.New("stdin failed") }

@@ -119,12 +119,13 @@ func (s *hostServiceStub) IssuePreviewTicket(_ context.Context, principal identi
 }
 
 type verifierStub struct {
-	err  error
-	role identity.Role
+	err        error
+	role       identity.Role
+	mustChange bool
 }
 
 func (s verifierStub) VerifySession(context.Context, string) (identity.Principal, error) {
-	return identity.Principal{UserID: testUserID, Role: s.roleOrUser(), Kind: identity.KindSession, TokenID: testTokenID}, s.err
+	return identity.Principal{UserID: testUserID, Role: s.roleOrUser(), MustChangePassword: s.mustChange, Kind: identity.KindSession, TokenID: testTokenID}, s.err
 }
 func (s verifierStub) VerifyAPIKey(context.Context, string) (identity.Principal, error) {
 	return identity.Principal{UserID: testUserID, Role: s.roleOrUser(), Kind: identity.KindAPIKey, TokenID: testTokenID}, s.err
@@ -151,15 +152,30 @@ func (s verifierStub) roleOrUser() identity.Role {
 }
 
 type authServiceStub struct {
-	loginResult LoginResult
-	loginErr    error
-	logoutErr   error
-	current     UserView
-	currentErr  error
-	logoutCalls int
-	loginName   string
-	loginPass   string
-	loginIP     string
+	registerUser UserView
+	registerErr  error
+	registerName string
+	registerPass string
+	registerIP   string
+	loginResult  LoginResult
+	loginErr     error
+	logoutErr    error
+	changeErr    error
+	changeCalls  int
+	changeOld    string
+	changeNew    string
+	changeP      identity.Principal
+	current      UserView
+	currentErr   error
+	logoutCalls  int
+	loginName    string
+	loginPass    string
+	loginIP      string
+}
+
+func (s *authServiceStub) Register(_ context.Context, name, password, ip string) (UserView, error) {
+	s.registerName, s.registerPass, s.registerIP = name, password, ip
+	return s.registerUser, s.registerErr
 }
 
 func (s *authServiceStub) Login(_ context.Context, name, password, ip string) (LoginResult, error) {
@@ -169,6 +185,11 @@ func (s *authServiceStub) Login(_ context.Context, name, password, ip string) (L
 func (s *authServiceStub) Logout(context.Context, identity.Principal) error {
 	s.logoutCalls++
 	return s.logoutErr
+}
+func (s *authServiceStub) ChangePassword(_ context.Context, principal identity.Principal, current, next string) error {
+	s.changeCalls++
+	s.changeP, s.changeOld, s.changeNew = principal, current, next
+	return s.changeErr
 }
 func (s *authServiceStub) CurrentUser(context.Context, identity.Principal) (UserView, error) {
 	return s.current, s.currentErr
@@ -263,7 +284,7 @@ type adminServiceStub struct {
 	audits    []AuditRecord
 	err       error
 	principal identity.Principal
-	created   CreateAdminUserCommand
+	status    *identity.AccountStatus
 	updatedID string
 	updated   UpdateAdminUserCommand
 	auditQ    AuditQuery
@@ -288,13 +309,9 @@ func (s *adminWorkspaceServiceStub) Get(_ context.Context, principal identity.Pr
 	return s.item, s.err
 }
 
-func (s *adminServiceStub) ListUsers(_ context.Context, p identity.Principal) ([]AdminUserRecord, error) {
-	s.principal = p
+func (s *adminServiceStub) ListUsers(_ context.Context, p identity.Principal, status *identity.AccountStatus) ([]AdminUserRecord, error) {
+	s.principal, s.status = p, status
 	return s.users, s.err
-}
-func (s *adminServiceStub) CreateUser(_ context.Context, p identity.Principal, command CreateAdminUserCommand) (AdminUserRecord, error) {
-	s.principal, s.created = p, command
-	return s.user, s.err
 }
 func (s *adminServiceStub) UpdateUser(_ context.Context, p identity.Principal, id string, command UpdateAdminUserCommand) (AdminUserRecord, error) {
 	s.principal, s.updatedID, s.updated = p, id, command
@@ -769,7 +786,7 @@ func TestAdminRoutesAndValidation(t *testing.T) {
 	services.verifier.role = identity.RoleAdmin
 	services.admin.audits = append(services.admin.audits, AuditRecord{ID: 2, Entry: audit.Entry{ActorID: "i1234567", ActorKind: audit.ActorClient, Action: audit.ActionHostEnter}})
 	services.admin.user = AdminUserRecord{
-		ID: testUserID, Name: "alice", Role: identity.RoleUser, Quota: TotalsView{Hosts: 2},
+		ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusDisabled, Quota: TotalsView{Hosts: 2},
 		Usage: TotalsView{Hosts: 1}, CreatedAt: time.Now().UTC(),
 	}
 	router := newRouter(t, services, Options{})
@@ -781,9 +798,9 @@ func TestAdminRoutesAndValidation(t *testing.T) {
 		status int
 	}{
 		{http.MethodGet, "/api/admin/hosts", "", http.StatusOK},
-		{http.MethodGet, "/api/admin/users", "", http.StatusOK},
-		{http.MethodPost, "/api/admin/users", `{"name":"alice","password":"secret","role":"user","quota":{"hosts":2,"cpu_milli":2000,"mem_mib":4096}}`, http.StatusCreated},
-		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"disabled":false,"quota":{"hosts":2,"cpu_milli":2000,"mem_mib":4096}}`, http.StatusOK},
+		{http.MethodGet, "/api/admin/users?status=pending", "", http.StatusOK},
+		{http.MethodPost, "/api/admin/users", `{"name":"alice","password":"secret","role":"user"}`, http.StatusNotFound},
+		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"expected_status":"approved","status":"disabled"}`, http.StatusOK},
 		{http.MethodGet, "/api/admin/capacity", "", http.StatusOK},
 		{http.MethodGet, "/api/admin/audit?actor=u1234567&action=host.create&target=h1234567&since=2026-10-01T00:00:00Z&limit=5", "", http.StatusOK},
 	} {
@@ -795,7 +812,7 @@ func TestAdminRoutesAndValidation(t *testing.T) {
 			t.Fatalf("admin response leaked sensitive detail: %s", response.Body)
 		}
 	}
-	if services.admin.principal.Role != identity.RoleAdmin || services.admin.created.Password != "secret" || services.admin.updated.Disabled == nil || *services.admin.updated.Disabled || services.admin.updatedID != testUserID {
+	if services.admin.principal.Role != identity.RoleAdmin || services.admin.status == nil || *services.admin.status != identity.StatusPending || services.admin.updated.Status == nil || *services.admin.updated.Status != identity.StatusDisabled || services.admin.updated.ExpectedStatus != identity.StatusApproved || services.admin.updatedID != testUserID {
 		t.Fatalf("admin service commands not mapped: %#v", services.admin)
 	}
 	if services.admin.auditQ.Limit != 5 || services.admin.auditQ.Actor != testUserID || services.admin.auditQ.Action != "host.create" || services.admin.auditQ.Since == nil {
@@ -812,7 +829,6 @@ func TestAdminRoutesAndValidation(t *testing.T) {
 		assertError(t, request(userRouter, http.MethodGet, path, "", key, ""), http.StatusForbidden, "forbidden")
 	}
 	for _, route := range []struct{ method, path, body string }{
-		{http.MethodPost, "/api/admin/users", `{"name":"alice","password":"secret","role":"other"}`},
 		{http.MethodPatch, "/api/admin/users/" + testUserID, `{}`},
 		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"password":""}`},
 		{http.MethodGet, "/api/admin/audit?limit=501", ""},
@@ -974,6 +990,42 @@ func TestLoginMeAndLogoutKeepCredentialOutOfJSON(t *testing.T) {
 	if cleared.Name != portalCookieName || cleared.MaxAge >= 0 || !cleared.HttpOnly || !cleared.Secure || cleared.SameSite != http.SameSiteStrictMode {
 		t.Fatalf("cleared cookie = %#v", cleared)
 	}
+}
+
+func TestInitialSuperAdminSessionIsRestrictedToPasswordChange(t *testing.T) {
+	services := newServices()
+	services.verifier.role = identity.RoleSuperAdmin
+	services.verifier.mustChange = true
+	router := newRouter(t, services, Options{CookieSecure: true})
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	if me := requestWithCookie(router, http.MethodGet, "/api/me", cookie, ""); me.Code != http.StatusOK {
+		t.Fatalf("restricted session GET /api/me = %d %s", me.Code, me.Body)
+	}
+	assertError(t, requestWithCookie(router, http.MethodGet, "/api/admin/users", cookie, ""), http.StatusForbidden, "forbidden")
+	changed := requestWithCookieBody(router, http.MethodPost, "/api/me/password", `{"current_password":"admin","new_password":"new-admin-password"}`, cookie, "https://portal.example.test")
+	if changed.Code != http.StatusNoContent || services.auth.changeCalls != 1 || services.auth.changeP.Role != identity.RoleSuperAdmin ||
+		services.auth.changeOld != "admin" || services.auth.changeNew != "new-admin-password" {
+		t.Fatalf("password change = %d %s, calls=%d principal=%#v", changed.Code, changed.Body, services.auth.changeCalls, services.auth.changeP)
+	}
+	cleared := changed.Result().Cookies()[0]
+	if cleared.Name != portalCookieName || cleared.MaxAge >= 0 || !cleared.HttpOnly || !cleared.Secure {
+		t.Fatalf("password change did not clear the old session cookie: %#v", cleared)
+	}
+}
+
+func TestPublicRegistrationCreatesAccountWithoutSession(t *testing.T) {
+	services := newServices()
+	services.auth.registerUser = UserView{ID: testUserID, Name: "new-user", Role: identity.RoleUser}
+	router := newRouter(t, services, Options{})
+	response := request(router, http.MethodPost, "/api/auth/register", `{"name":"new-user","password":"long-secret"}`, "", "")
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"role":"user"`) || len(response.Result().Cookies()) != 0 {
+		t.Fatalf("registration response = %d %s, cookies=%v", response.Code, response.Body, response.Result().Cookies())
+	}
+	if services.auth.registerName != "new-user" || services.auth.registerPass != "long-secret" || services.auth.registerIP != "192.0.2.1" || strings.Contains(response.Body.String(), "long-secret") {
+		t.Fatal("registration arguments or response were invalid")
+	}
+	services.auth.registerErr = domain.NewError(domain.CodeRateLimited, "registration rate limit reached")
+	assertError(t, request(router, http.MethodPost, "/api/auth/register", `{"name":"new-user","password":"long-secret"}`, "", ""), http.StatusTooManyRequests, "rate_limited")
 }
 
 func TestHostOperationsAndMissingDependencyResponses(t *testing.T) {
@@ -1172,8 +1224,7 @@ func TestMissingOptionalPortsReturnSanitizedUnavailable(t *testing.T) {
 		{http.MethodGet, "/api/workspaces/" + testWorkspaceID, ""},
 		{http.MethodDelete, "/api/workspaces/" + testWorkspaceID, ""},
 		{http.MethodGet, "/api/admin/users", ""},
-		{http.MethodPost, "/api/admin/users", `{"name":"alice","password":"secret","role":"user"}`},
-		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"disabled":true}`},
+		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"expected_status":"approved","status":"disabled"}`},
 		{http.MethodGet, "/api/admin/capacity", ""},
 		{http.MethodGet, "/api/admin/audit", ""},
 	} {
@@ -1305,8 +1356,7 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 		{http.MethodPost, "/api/workspaces", `{"name":"workspace"}`},
 		{http.MethodGet, "/api/admin/hosts", ""},
 		{http.MethodGet, "/api/admin/users", ""},
-		{http.MethodPost, "/api/admin/users", `{"name":"alice","password":"password","role":"user"}`},
-		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"disabled":true}`},
+		{http.MethodPatch, "/api/admin/users/" + testUserID, `{"expected_status":"approved","status":"disabled"}`},
 		{http.MethodGet, "/api/admin/capacity", ""},
 		{http.MethodGet, "/api/admin/audit", ""},
 	} {
@@ -1391,8 +1441,8 @@ func newServices() *services {
 		}}},
 		tokens: &tokenServiceStub{}, tasks: &taskServiceStub{}, conversations: &conversationServiceStub{},
 		admin: &adminServiceStub{
-			users:    []AdminUserRecord{{ID: testUserID, Name: "alice", Role: identity.RoleUser, Quota: TotalsView{Hosts: 2}, CreatedAt: time.Now().UTC()}},
-			user:     AdminUserRecord{ID: testUserID, Name: "alice", Role: identity.RoleUser, Quota: TotalsView{Hosts: 2}, CreatedAt: time.Now().UTC()},
+			users:    []AdminUserRecord{{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusPending, Quota: TotalsView{Hosts: 2}, CreatedAt: time.Now().UTC()}},
+			user:     AdminUserRecord{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusPending, Quota: TotalsView{Hosts: 2}, CreatedAt: time.Now().UTC()},
 			capacity: CapacityRecord{Limit: TotalsView{CPUMilli: 10000, MemMiB: 32768}, Allocated: TotalsView{CPUMilli: 500, MemMiB: 1536}, HostsByState: map[host.State]int{host.StateRunning: 1}},
 			audits: []AuditRecord{{ID: 1, At: time.Now().UTC(), Entry: audit.Entry{
 				ActorID: testUserID, ActorKind: audit.ActorAPIKey, Action: audit.ActionHostCreate, Target: testHostID,
@@ -1461,14 +1511,20 @@ func TestSyncOnlyCredentialFence(t *testing.T) {
 		{http.MethodGet, "/api/hosts"},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/enter"},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/observation-ticket"},
+		{http.MethodPost, "/api/tasks"},
+		{http.MethodGet, "/api/tasks/q1234567"},
+		{http.MethodPost, "/api/tasks/q1234567/actions"},
 	} {
-		response := request(router, tc.method, tc.path, "", "Bearer "+deviceCode, "")
+		response := request(router, tc.method, tc.path, `{"host_id":"h1234567","model_id":"model-a","objective":"test","action":"pause","expected_status":"queued"}`, "Bearer "+deviceCode, "")
 		if response.Code != http.StatusForbidden {
-			t.Errorf("device credential accessed Host route %s %s: %d %s; want 403", tc.method, tc.path, response.Code, response.Body)
+			t.Errorf("device credential accessed forbidden route %s %s: %d %s; want 403", tc.method, tc.path, response.Code, response.Body)
 		}
 	}
 	if services.hosts.principal.Kind == identity.KindDevice {
 		t.Fatalf("device Host route reached Host service: %#v", services.hosts.principal)
+	}
+	if services.tasks.submitCalls != 0 || services.tasks.getID != "" || services.tasks.actionCalls != 0 {
+		t.Fatalf("device Task routes reached Task service: submit=%d get=%q actions=%d", services.tasks.submitCalls, services.tasks.getID, services.tasks.actionCalls)
 	}
 	services.workspaceOps.deviceItems = nil
 	listed = request(router, http.MethodGet, "/api/device/workspaces", "", "Bearer "+deviceCode, "")

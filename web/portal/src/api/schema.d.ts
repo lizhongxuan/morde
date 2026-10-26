@@ -15,9 +15,29 @@ export interface paths {
         put?: never;
         /**
          * Log in to the portal
-         * @description Sets the ch_portal session cookie. Login attempts are rate limited.
+         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
          */
         post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register a standard user account
+         * @description Creates a pending user account with role=user. Registration is rate limited and does not create a login session. The name admin is reserved case-insensitively.
+         */
+        post: operations["register"];
         delete?: never;
         options?: never;
         head?: never;
@@ -52,6 +72,26 @@ export interface paths {
         get: operations["getMe"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change the current user's password
+         * @description Requires the current password. For the initial super administrator, this is the only mutation allowed until the password is changed. A successful change revokes every current session and requires logging in again.
+         */
+        post: operations["changeMyPassword"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1810,8 +1850,7 @@ export interface paths {
         /** List users without credential data */
         get: operations["listUsers"];
         put?: never;
-        /** Create a user */
-        post: operations["createUser"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1833,7 +1872,7 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Update a user's role, quota, disabled state, or password */
+        /** Review a user's status, change their role, or update quota */
         patch: operations["updateUser"];
         trace?: never;
     };
@@ -1937,7 +1976,7 @@ export interface components {
         ErrorResponse: {
             error: {
                 /** @enum {string} */
-                code: "invalid_argument" | "unauthenticated" | "forbidden" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
+                code: "invalid_argument" | "unauthenticated" | "forbidden" | "account_pending" | "account_rejected" | "account_disabled" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
                 message: string;
                 details: {
                     [key: string]: unknown;
@@ -2048,18 +2087,32 @@ export interface components {
         User: {
             id: components["schemas"]["UserId"];
             name: string;
-            /** @enum {string} */
-            role: "user" | "admin";
+            role: components["schemas"]["UserRole"];
+            status: components["schemas"]["AccountStatus"];
+            must_change_password: boolean;
             quota: components["schemas"]["Quota"];
             usage: components["schemas"]["Usage"];
         };
+        RegisterRequest: {
+            name: string;
+            password: string;
+        };
+        /** @enum {string} */
+        AccountStatus: "pending" | "rejected" | "approved" | "disabled";
+        /** @enum {string} */
+        UserRole: "user" | "admin" | "super_admin";
         Me: {
             id: components["schemas"]["UserId"];
             name: string;
-            /** @enum {string} */
-            role: "user" | "admin";
+            role: components["schemas"]["UserRole"];
+            status: components["schemas"]["AccountStatus"];
+            must_change_password: boolean;
             quota: components["schemas"]["Quota"];
             usage: components["schemas"]["Usage"];
+        };
+        ChangePasswordRequest: {
+            current_password: string;
+            new_password: string;
         };
         UserPreferences: {
             assistant_name: string;
@@ -2581,7 +2634,10 @@ export interface components {
             platform: "desktop" | "android" | "ios";
             display_name: string;
             workspace_ids: components["schemas"]["WorkspaceId"][];
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description The installation and its credentials expire 30 days after the latest Portal approval.
+             */
             expires_at: string;
             revoked: boolean;
             /** Format: date-time */
@@ -2601,7 +2657,10 @@ export interface components {
             device_code: string;
             user_code: string;
             verification_uri: string;
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description Expiration time of this one-time pairing code.
+             */
             expires_at: string;
             interval_seconds: number;
         };
@@ -2611,16 +2670,25 @@ export interface components {
         PollClientAuthorizationResponse: {
             /** @enum {string} */
             state: "authorization_pending" | "denied" | "expired" | "approved";
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description Expiration time of this one-time pairing code.
+             */
             expires_at: string;
             installation_id?: components["schemas"]["ClientInstallationId"];
             /** @description Returned once after approval */
             client_credential?: string;
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description Installation credential expiry, fixed at 30 days after the latest Portal approval.
+             */
             client_expires_at?: string;
             /** @description Desktop-only credential returned once after approval */
             sync_credential?: string;
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description Same expiry as the paired client installation.
+             */
             sync_expires_at?: string;
             workspace_ids?: components["schemas"]["WorkspaceId"][];
         };
@@ -2633,7 +2701,10 @@ export interface components {
             display_name: string;
             wants_workspace_sync: boolean;
             renewal_installation_id?: components["schemas"]["ClientInstallationId"];
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description Expiration time of this one-time pairing code.
+             */
             expires_at: string;
         };
         ApproveClientAuthorizationRequest: {
@@ -3174,19 +3245,11 @@ export interface components {
             message: components["schemas"]["Message"];
             task: components["schemas"]["Task"];
         };
-        CreateUserRequest: {
-            name: string;
-            password: string;
-            /** @enum {string} */
-            role: "user" | "admin";
-            quota?: components["schemas"]["Quota"];
-        };
         AdminUser: {
             id: components["schemas"]["UserId"];
             name: string;
-            /** @enum {string} */
-            role: "user" | "admin";
-            disabled: boolean;
+            role: components["schemas"]["UserRole"];
+            status: components["schemas"]["AccountStatus"];
             quota: components["schemas"]["Quota"];
             usage: components["schemas"]["Usage"];
             /** Format: date-time */
@@ -3229,11 +3292,10 @@ export interface components {
             next_cursor: string | null;
         };
         UpdateUserRequest: {
-            /** @enum {string} */
-            role?: "user" | "admin";
+            expected_status: components["schemas"]["AccountStatus"];
+            status?: components["schemas"]["AccountStatus"];
+            role?: components["schemas"]["UserRole"];
             quota?: components["schemas"]["Quota"];
-            disabled?: boolean;
-            password?: string;
         };
     };
     responses: {
@@ -3388,6 +3450,37 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    register: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Registered user */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        user: components["schemas"]["User"];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Error"];
         };
@@ -3431,6 +3524,32 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    changeMyPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Password changed and existing sessions revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };
@@ -6307,7 +6426,9 @@ export interface operations {
     };
     listUsers: {
         parameters: {
-            query?: never;
+            query?: {
+                status?: components["schemas"]["AccountStatus"];
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6327,35 +6448,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            default: components["responses"]["Error"];
-        };
-    };
-    createUser: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateUserRequest"];
-            };
-        };
-        responses: {
-            /** @description Created user */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AdminUser"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -6387,6 +6479,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

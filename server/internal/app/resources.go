@@ -152,7 +152,7 @@ func (s *TokenService) DeleteAPIKey(ctx context.Context, principal identity.Prin
 
 func requireSession(principal identity.Principal) error {
 	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
-		(principal.Role != identity.RoleUser && principal.Role != identity.RoleAdmin) || principal.HostScope != "" {
+		(principal.Role != identity.RoleUser && !principal.Role.IsAdmin()) || principal.HostScope != "" {
 		return domain.NewError(domain.CodeForbidden, "portal session required")
 	}
 	return nil

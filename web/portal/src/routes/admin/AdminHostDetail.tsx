@@ -6,7 +6,7 @@ import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../../app/f
 export function AdminHostDetail() {
   const { id = '' } = useParams();
   const hosts = useQuery({ queryKey: ['admin', 'hosts'], queryFn: portalApi.adminHosts });
-  const users = useQuery({ queryKey: ['admin', 'users'], queryFn: portalApi.adminUsers });
+  const users = useQuery({ queryKey: ['admin', 'users'], queryFn: () => portalApi.adminUsers() });
   if (hosts.isPending || users.isPending) return <div className="loading-card" role="status">正在读取电脑信息…</div>;
   if (hosts.isError || users.isError) {
     const error = hosts.isError ? hosts.error : users.error;

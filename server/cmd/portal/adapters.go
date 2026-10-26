@@ -22,7 +22,18 @@ import (
 	"morde/server/internal/worker"
 )
 
-type authAdapter struct{ service *app.CredentialService }
+type authAdapter struct {
+	service *app.CredentialService
+	users   *app.UserService
+}
+
+func (a authAdapter) Register(ctx context.Context, name, password, ip string) (api.UserView, error) {
+	value, err := a.users.Register(ctx, name, password, ip)
+	if err != nil {
+		return api.UserView{}, err
+	}
+	return userView(value), nil
+}
 
 func (a authAdapter) Login(ctx context.Context, name, password, ip string) (api.LoginResult, error) {
 	value, err := a.service.Login(ctx, name, password, ip)
@@ -40,6 +51,10 @@ func (a authAdapter) Logout(ctx context.Context, principal identity.Principal) e
 	return a.service.Logout(ctx, principal)
 }
 
+func (a authAdapter) ChangePassword(ctx context.Context, principal identity.Principal, current, next string) error {
+	return a.service.ChangePassword(ctx, principal, current, next)
+}
+
 func (a authAdapter) CurrentUser(ctx context.Context, principal identity.Principal) (api.UserView, error) {
 	value, err := a.service.CurrentUser(ctx, principal)
 	if err != nil {
@@ -50,8 +65,9 @@ func (a authAdapter) CurrentUser(ctx context.Context, principal identity.Princip
 
 func userView(value app.UserSummary) api.UserView {
 	return api.UserView{
-		ID: value.ID, Name: value.Name, Role: value.Role,
-		Quota: totals(value.Quota), Usage: totals(value.Usage),
+		ID: value.ID, Name: value.Name, Role: value.Role, Status: value.Status,
+		MustChangePassword: value.MustChangePassword,
+		Quota:              totals(value.Quota), Usage: totals(value.Usage),
 	}
 }
 
@@ -130,8 +146,8 @@ type adminAdapter struct {
 	}
 }
 
-func (a adminAdapter) ListUsers(ctx context.Context, principal identity.Principal) ([]api.AdminUserRecord, error) {
-	values, err := a.users.List(ctx, principal)
+func (a adminAdapter) ListUsers(ctx context.Context, principal identity.Principal, status *identity.AccountStatus) ([]api.AdminUserRecord, error) {
+	values, err := a.users.List(ctx, principal, status)
 	if err != nil {
 		return nil, err
 	}
@@ -142,21 +158,6 @@ func (a adminAdapter) ListUsers(ctx context.Context, principal identity.Principa
 	return result, nil
 }
 
-func (a adminAdapter) CreateUser(ctx context.Context, principal identity.Principal, command api.CreateAdminUserCommand) (api.AdminUserRecord, error) {
-	var quota *app.ResourceUsage
-	if command.Quota != nil {
-		value := usage(*command.Quota)
-		quota = &value
-	}
-	created, err := a.users.Create(ctx, principal, app.CreateUserCommand{
-		Name: command.Name, Password: command.Password, Role: command.Role, Quota: quota,
-	})
-	if err != nil {
-		return api.AdminUserRecord{}, err
-	}
-	return adminUser(created), nil
-}
-
 func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Principal, id string, command api.UpdateAdminUserCommand) (api.AdminUserRecord, error) {
 	var quota *app.ResourceUsage
 	if command.Quota != nil {
@@ -164,7 +165,7 @@ func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Princip
 		quota = &value
 	}
 	updated, err := a.users.Update(ctx, principal, id, app.UpdateUserCommand{
-		Role: command.Role, Password: command.Password, Disabled: command.Disabled, Quota: quota,
+		ExpectedStatus: command.ExpectedStatus, Role: command.Role, Status: command.Status, Quota: quota,
 	})
 	if err != nil {
 		return api.AdminUserRecord{}, err
@@ -202,7 +203,7 @@ func (a adminAdapter) ListAudit(ctx context.Context, principal identity.Principa
 
 func adminUser(value app.UserSummary) api.AdminUserRecord {
 	return api.AdminUserRecord{
-		ID: value.ID, Name: value.Name, Role: value.Role, Disabled: value.Disabled,
+		ID: value.ID, Name: value.Name, Role: value.Role, Status: value.Status,
 		Quota: totals(value.Quota), Usage: totals(value.Usage), CreatedAt: value.CreatedAt,
 	}
 }

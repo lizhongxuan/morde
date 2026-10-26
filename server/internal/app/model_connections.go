@@ -129,7 +129,7 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if err := validateModelPrincipal(principal); err != nil {
 		return ModelConnectionView{}, err
 	}
-	if command.Shared && principal.Role != identity.RoleAdmin {
+	if command.Shared && !principal.Role.IsAdmin() {
 		return ModelConnectionView{}, domain.NewError(domain.CodeForbidden, "administrator role required for shared model connections")
 	}
 	if err := validateModelConnectionCommand(command, s.allowedHost, true); err != nil {
@@ -303,7 +303,7 @@ func (s *ModelConnectionService) ResolveEndpoint(ctx context.Context, ownerID, m
 
 func validateModelPrincipal(principal identity.Principal) error {
 	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) ||
-		(principal.Role != identity.RoleUser && principal.Role != identity.RoleAdmin) || principal.HostScope != "" ||
+		(principal.Role != identity.RoleUser && !principal.Role.IsAdmin()) || principal.HostScope != "" ||
 		len(principal.HostIDs) != 0 || len(principal.Scopes) != 0 {
 		return domain.NewError(domain.CodeForbidden, "portal session required")
 	}
@@ -315,7 +315,7 @@ func canUseModelConnection(principal identity.Principal, record ModelConnectionR
 }
 
 func canManageModelConnection(principal identity.Principal, record ModelConnectionRecord) bool {
-	return record.OwnerID == principal.UserID || (record.OwnerID == "" && principal.Role == identity.RoleAdmin)
+	return record.OwnerID == principal.UserID || (record.OwnerID == "" && principal.Role.IsAdmin())
 }
 
 func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {

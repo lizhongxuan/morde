@@ -385,6 +385,7 @@ func createTestClientInstallation(t *testing.T, pool *pgxpool.Pool, ownerID stri
 func TestMigrationRetiresUnlinkedDeviceTokens(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
+	owner := createTestUser(t, store, 2, 10_000, 20_000)
 	provider, closeProvider, err := newMigrationProvider(pool)
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +394,6 @@ func TestMigrationRetiresUnlinkedDeviceTokens(t *testing.T) {
 	if _, err := provider.DownTo(ctx, 43); err != nil {
 		t.Fatal(err)
 	}
-	owner := createTestUser(t, store, 2, 10_000, 20_000)
 	legacy := clientTestToken(t, owner.ID, "", identity.KindDevice, nil)
 	if _, err := store.CreateToken(ctx, legacy); err != nil {
 		t.Fatal(err)
@@ -429,7 +429,7 @@ func TestMigrationRetiresUnlinkedDeviceTokens(t *testing.T) {
   workspace_ids=ARRAY['w1234567']::text[] WHERE id=$1`, pairingID, approvedID, owner.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
+	if _, err := provider.UpTo(ctx, 44); err != nil {
 		t.Fatal(err)
 	}
 	approved, err := store.GetClientInstallation(ctx, approvedID)
@@ -460,15 +460,6 @@ func TestMigrationRetiresUnlinkedDeviceTokens(t *testing.T) {
 func TestMigrationBackfillsClientTaskInstallationSnapshot(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
-	provider, closeProvider, err := newMigrationProvider(pool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeProvider()
-	if _, err := provider.Down(ctx); err != nil {
-		t.Fatalf("roll back task installation snapshot migration: %v", err)
-	}
-
 	owner := createTestUser(t, store, 2, 10_000, 20_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	installationID := createTestClientInstallation(t, pool, owner.ID, nil)
@@ -476,6 +467,15 @@ func TestMigrationBackfillsClientTaskInstallationSnapshot(t *testing.T) {
 	if _, err := store.CreateToken(ctx, clientToken); err != nil {
 		t.Fatalf("create client token: %v", err)
 	}
+	provider, closeProvider, err := newMigrationProvider(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProvider()
+	if _, err := provider.DownTo(ctx, 44); err != nil {
+		t.Fatalf("roll back task installation snapshot migration: %v", err)
+	}
+
 	conversationID := mustID(t, domain.NewConversationID)
 	if _, err := pool.Exec(ctx, `INSERT INTO conversations (id,owner_id,host_id,title) VALUES ($1,$2,$3,'pre-migration')`,
 		conversationID, owner.ID, hostValue.ID); err != nil {
@@ -490,7 +490,7 @@ func TestMigrationBackfillsClientTaskInstallationSnapshot(t *testing.T) {
 		t.Fatalf("create pre-migration client task: %v", err)
 	}
 
-	if _, err := provider.Up(ctx); err != nil {
+	if _, err := provider.UpTo(ctx, 45); err != nil {
 		t.Fatalf("apply task installation snapshot migration: %v", err)
 	}
 	loaded, err := store.GetTask(ctx, taskID, owner.ID)
@@ -502,17 +502,17 @@ func TestMigrationBackfillsClientTaskInstallationSnapshot(t *testing.T) {
 func TestMigrationRejectsClientTaskWithoutClientToken(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
+	owner := createTestUser(t, store, 2, 10_000, 20_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	provider, closeProvider, err := newMigrationProvider(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := provider.Down(ctx); err != nil {
+	if _, err := provider.DownTo(ctx, 44); err != nil {
 		t.Fatalf("roll back task installation snapshot migration: %v", err)
 	}
 
-	owner := createTestUser(t, store, 2, 10_000, 20_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	conversationID := mustID(t, domain.NewConversationID)
 	if _, err := pool.Exec(ctx, `INSERT INTO conversations (id,owner_id,host_id,title) VALUES ($1,$2,$3,'orphan-client-task')`,
 		conversationID, owner.ID, hostValue.ID); err != nil {

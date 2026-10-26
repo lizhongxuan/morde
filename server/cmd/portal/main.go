@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -30,7 +29,6 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/config"
 	"morde/server/internal/domain"
-	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/gateway"
 	"morde/server/internal/httpserver"
@@ -76,11 +74,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return err
 		}
 		return migrate(ctx, path, args[1], stdout)
-	case "user":
-		if len(args) < 2 || args[1] != "add" {
-			return fmt.Errorf("usage: portal user add --name name [--role admin|user] [--config path]")
-		}
-		return addUser(ctx, args[2:], stdin, stdout, stderr)
 	case "workspace":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: portal workspace verify [--config path] | import-legacy --workspace id [--config path]")
@@ -107,7 +100,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: portal serve|migrate up|migrate status|user add|workspace verify|workspace import-legacy")
+	return fmt.Errorf("usage: portal serve|migrate up|migrate status|workspace verify|workspace import-legacy")
 }
 
 func parseWorkspaceImportFlags(args []string, stderr io.Writer) (string, string, error) {
@@ -172,6 +165,9 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 	store := postgres.New(pool)
+	if err := app.EnsureInitialAdmin(ctx, store); err != nil {
+		return fmt.Errorf("initialize administrator: %w", err)
+	}
 	workspaceBlocks, err := workspacefs.Open(cfg.WorkspaceStorage.RootDir)
 	if err != nil {
 		return fmt.Errorf("open workspace block storage: %w", err)
@@ -292,7 +288,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	users, err := app.NewUserService(store, store, countedAudit)
+	users, err := app.NewUserService(store, store)
 	if err != nil {
 		return err
 	}
@@ -409,7 +405,7 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	admin := adminAdapter{users: users, audit: auditService, capacity: hosts}
 	apiHandler, err := api.New(api.Deps{
-		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials},
+		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientAuthorizations: clientAuthorizations,
 		Tasks: taskService, Schedules: scheduleService, Notifications: notificationService, ExecutionControl: executionControlService,
@@ -681,72 +677,6 @@ func schemaVersions(ctx context.Context, pool *pgxpool.Pool) (int64, int64, erro
 		return 0, 0, fmt.Errorf("read migration status: %w", err)
 	}
 	return current, latest, nil
-}
-
-func addUser(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("user add", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	configPath := flags.String("config", defaultConfigPath, "path to portal.yaml")
-	name := flags.String("name", "", "user name")
-	roleValue := flags.String("role", string(identity.RoleAdmin), "user role: admin or user")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 || strings.TrimSpace(*name) == "" {
-		return fmt.Errorf("usage: portal user add --name name [--role admin|user] [--config path]")
-	}
-	role := identity.Role(*roleValue)
-	if role != identity.RoleAdmin && role != identity.RoleUser {
-		return fmt.Errorf("role must be admin or user")
-	}
-	password, err := readPassword(stdin)
-	if err != nil {
-		return err
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	pool, err := openPool(ctx, cfg.Database)
-	if err != nil {
-		return err
-	}
-	defer pool.Close()
-	if err := postgres.CheckSchema(ctx, pool); err != nil {
-		return err
-	}
-	store := postgres.New(pool)
-	auditService, err := app.NewAuditService(store)
-	if err != nil {
-		return err
-	}
-	users, err := app.NewUserService(store, store, auditService)
-	if err != nil {
-		return err
-	}
-	created, err := users.Create(ctx, identity.Principal{Kind: identity.KindSystem, Role: identity.RoleAdmin}, app.CreateUserCommand{
-		Name: *name, Password: password, Role: role,
-	})
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintf(stdout, "created user %s (%s) with role %s\n", created.Name, created.ID, created.Role)
-	return err
-}
-
-func readPassword(reader io.Reader) (string, error) {
-	if reader == nil {
-		return "", errors.New("password must be provided on stdin")
-	}
-	value, err := io.ReadAll(io.LimitReader(bufio.NewReader(reader), 75))
-	if err != nil {
-		return "", fmt.Errorf("read password from stdin: %w", err)
-	}
-	value = []byte(strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r"))
-	if len(value) == 0 || len(value) > 72 {
-		return "", errors.New("password from stdin must contain 1 to 72 bytes")
-	}
-	return string(value), nil
 }
 
 func openPool(ctx context.Context, cfg config.Database) (*pgxpool.Pool, error) {

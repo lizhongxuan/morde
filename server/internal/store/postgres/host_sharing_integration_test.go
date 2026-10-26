@@ -64,8 +64,8 @@ func TestHostSharingPersistenceAndTicketActor(t *testing.T) {
 		t.Fatalf("consumed member ticket = %#v, %v", ticket, err)
 	}
 
-	member.Disabled = true
-	if _, err := store.UpdateUser(ctx, "", member); err != nil {
+	member.Status = identity.StatusDisabled
+	if _, err := store.UpdateUser(ctx, "system", identity.StatusApproved, member); err != nil {
 		t.Fatal(err)
 	}
 	access, err = store.GetHostActorAccess(ctx, created.ID, member.ID)

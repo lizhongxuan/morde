@@ -82,6 +82,37 @@ describe('RouteGuard', () => {
     expect(screen.queryByText('旧管理数据')).toBeNull();
     await waitFor(() => expect(queryClient.getQueryData(['admin', 'users'])).toBeUndefined());
   });
+
+  it('super admin 首次登录必须先改密', async () => {
+    vi.mocked(portalApi.me).mockResolvedValue({ id: 'u1234567', name: 'admin', role: 'super_admin', must_change_password: true } as never);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/admin']}><Routes>
+      <Route element={<RouteGuard loginPath="/admin/login" />}>
+        <Route path="/admin/change-password" element={<p>修改密码页面</p>} />
+        <Route element={<AdminGuard deniedTo="/admin/access-denied" />}><Route path="/admin" element={<p>管理后台数据</p>} /></Route>
+      </Route>
+      <Route path="/admin/login" element={<p>管理登录页面</p>} />
+    </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('修改密码页面')).toBeInTheDocument();
+    expect(screen.queryByText('管理后台数据')).toBeNull();
+  });
+
+  it('super admin 改密后可进入管理后台', async () => {
+    vi.mocked(portalApi.me).mockResolvedValue({ id: 'u1234567', name: 'admin', role: 'super_admin', must_change_password: false } as never);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/admin']}><Routes>
+      <Route element={<RouteGuard loginPath="/admin/login" />}>
+        <Route path="/admin/change-password" element={<p>修改密码页面</p>} />
+        <Route element={<AdminGuard deniedTo="/admin/access-denied" />}><Route path="/admin" element={<p>管理后台数据</p>} /></Route>
+        <Route path="/admin/access-denied" element={<p>没有管理权限</p>} />
+      </Route>
+      <Route path="/admin/login" element={<p>管理登录页面</p>} />
+    </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('管理后台数据')).toBeInTheDocument();
+    expect(screen.queryByText('没有管理权限')).toBeNull();
+  });
 });
 
 function LoginLocation() {

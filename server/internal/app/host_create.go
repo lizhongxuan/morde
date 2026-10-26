@@ -474,15 +474,18 @@ func (s *hostService) createRequest(ctx context.Context, value host.Host) (Sandb
 }
 
 func (s *hostService) waitHostReady(ctx context.Context, client SandboxClient, value host.Host, deadline time.Time) error {
+	lastStage := "sandbox_start"
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("wait for host %s readiness: %w", value.ID, err)
 		}
 		if !time.Now().Before(deadline) {
+			s.logger.Warn("host readiness timed out", zap.String("host_id", value.ID), zap.String("stage", lastStage))
 			return s.failCreate(ctx, client, value, "ready_timeout", "")
 		}
 		remote, err := client.Get(ctx, value.SandboxID)
 		if err != nil {
+			lastStage = "sandbox_status"
 			if errors.Is(err, ErrSandboxNotFound) {
 				return s.failCreate(ctx, client, value, "orchestrator_error", "")
 			}
@@ -492,40 +495,47 @@ func (s *hostService) waitHostReady(ctx context.Context, client SandboxClient, v
 		} else {
 			switch remote.State {
 			case SandboxRunning:
-				if err := s.probeReady(ctx, client, value); err == nil {
+				stage, err := s.probeReady(ctx, client, value)
+				if err == nil {
 					if _, err := s.hosts.TransitionHost(ctx, value.ID, host.StateCreating, host.StateRunning, ""); err != nil {
 						return err
 					}
 					s.observeHostReady("running", value.CreatedAt)
 					return nil
 				}
+				lastStage = stage
 			case SandboxFailed, SandboxTerminated:
 				return s.failCreate(ctx, client, value, "orchestrator_error", "")
+			default:
+				lastStage = "sandbox_start"
 			}
 		}
 		if err := waitContext(ctx, deadline, s.pollInterval); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return s.failCreate(ctx, client, value, "ready_timeout", "")
+				continue
 			}
 			return err
 		}
 	}
 }
 
-func (s *hostService) probeReady(ctx context.Context, client SandboxClient, value host.Host) error {
+func (s *hostService) probeReady(ctx context.Context, client SandboxClient, value host.Host) (string, error) {
 	upstream, err := client.Endpoint(ctx, value.SandboxID, 8080)
 	if err != nil {
-		return err
+		return "aio_endpoint", err
 	}
 	key, err := s.sealer.Open(value.AIOKeyEnc)
 	if err != nil {
-		return err
+		return "aio_credential", err
 	}
 	upstream.APIKey = string(key)
 	if err := s.probe.Ready(ctx, upstream); err != nil {
-		return err
+		return "aio_health", err
 	}
-	return s.runtime.Handshake(ctx, value.ID)
+	if err := s.runtime.Handshake(ctx, value.ID); err != nil {
+		return "runtime_handshake", err
+	}
+	return "", nil
 }
 
 func (s *hostService) failCreate(ctx context.Context, client SandboxClient, value host.Host, reason, trustedSandboxID string) error {
@@ -732,7 +742,7 @@ func validatePrincipal(principal identity.Principal) error {
 	if !domain.ValidUserID(principal.UserID) {
 		return domain.NewError(domain.CodeUnauthenticated, "authentication required")
 	}
-	if principal.Role != identity.RoleUser && principal.Role != identity.RoleAdmin {
+	if principal.Role != identity.RoleUser && !principal.Role.IsAdmin() {
 		return domain.NewError(domain.CodeForbidden, "access denied")
 	}
 	switch principal.Kind {

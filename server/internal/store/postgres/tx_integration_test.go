@@ -711,8 +711,14 @@ func createTestUser(t *testing.T, store *Store, quotaHosts, quotaCPU, quotaMemor
 	}
 	user, err := store.CreateUser(context.Background(), identity.User{
 		ID: id, Name: "user-" + id, PasswordHash: "hash", Role: identity.RoleUser,
+		Status:     identity.StatusPending,
 		QuotaHosts: quotaHosts, QuotaCPUMilli: quotaCPU, QuotaMemMiB: quotaMemory,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user.Status = identity.StatusApproved
+	user, err = store.UpdateUser(context.Background(), "system", identity.StatusPending, user)
 	if err != nil {
 		t.Fatal(err)
 	}

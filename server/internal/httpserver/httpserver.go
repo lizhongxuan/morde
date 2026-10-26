@@ -399,7 +399,7 @@ func statusForCode(code domain.ErrorCode) int {
 		return http.StatusBadRequest
 	case domain.CodeUnauthenticated:
 		return http.StatusUnauthorized
-	case domain.CodeForbidden:
+	case domain.CodeForbidden, domain.CodeAccountPending, domain.CodeAccountRejected, domain.CodeAccountDisabled:
 		return http.StatusForbidden
 	case domain.CodeNotFound:
 		return http.StatusNotFound

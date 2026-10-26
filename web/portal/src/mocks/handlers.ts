@@ -2,7 +2,7 @@ import { http, HttpResponse } from "msw";
 import type { components } from "../api/schema";
 import type { HostMemberPermission } from "../app/api";
 
-type User = { id: string; name: string; role: "admin" | "user"; disabled?: boolean; quota: { hosts: number; cpu_milli: number; mem_mib: number }; usage: { hosts: number; cpu_milli: number; mem_mib: number } };
+type User = { id: string; name: string; role: components["schemas"]["UserRole"]; status: components["schemas"]["AccountStatus"]; must_change_password: boolean; quota: { hosts: number; cpu_milli: number; mem_mib: number }; usage: { hosts: number; cpu_milli: number; mem_mib: number } };
 type AuditLog = { id: number; at: string; actor_id: string; actor_kind: string; action: string; target: string; detail: Record<string, unknown>; ip: string };
 type Workspace = components["schemas"]["Workspace"];
 type WorkspaceRef = components["schemas"]["WorkspaceRef"];
@@ -29,8 +29,9 @@ type AdminWorkspace = components["schemas"]["AdminWorkspace"];
 type VisibleAdminWorkspace = Omit<Workspace, "state"> & { state: "ready" | "deleting" };
 type MockExecutionControl = ExecutionControl & { drainChecks?: number };
 
-const demoUser: User = { id: "u1a2b3c4", name: "demo", role: "admin", disabled: false, quota: { hosts: 5, cpu_milli: 8000, mem_mib: 16384 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } };
+const demoUser: User = { id: "u1a2b3c4", name: "demo", role: "admin", status: "approved", must_change_password: false, quota: { hosts: 5, cpu_milli: 8000, mem_mib: 16384 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } };
 const memberUser: User = { ...demoUser, id: "umember1", name: "member", role: "user" };
+const initialAdmin: User = { ...demoUser, id: "uadmin01", name: "admin", role: "super_admin", must_change_password: true };
 const templates = [{ id: "std-2c4g", name: "标准 2 核 4G", description: "适合日常浏览与开发", isolation: "container", resources: { cpu_milli: 500, mem_mib: 1536, cpu_limit_milli: 2000, mem_limit_mib: 4096 }, workspace_size_mib: 20480, ttl_seconds: 28800, idle_timeout_seconds: 7200, on_idle: "disabled", keep_workspace_default: true }];
 let hosts: Host[] = [];
 let workspaces: Workspace[] = [];
@@ -63,7 +64,7 @@ const taskSubmitReplays = new Map<string, { request: string; response: Task }>()
 const messageSubmitReplays = new Map<string, { request: string; response: { message: Message; task: Task } }>();
 const executionControls = new Map<string, MockExecutionControl>();
 const executionActionReplays = new Map<string, { request: string; response: ExecutionControl }>();
-const users: User[] = [demoUser];
+const users: User[] = [demoUser, memberUser, initialAdmin];
 const passwords = new Map<string, string>();
 const loginAccounts = new Map<string, { user: User; password: string }>();
 const sessions = new Map<string, { userId: string; name: string }>();
@@ -347,8 +348,9 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   for (const timer of taskActionTimers) clearTimeout(timer);
   taskActionTimers.clear();
   hostReleaseStartedAt.clear();
-  Object.assign(demoUser, { id: "u1a2b3c4", name: "demo", role: "admin", disabled: false, quota: { hosts: 5, cpu_milli: 8000, mem_mib: 16384 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } });
-  Object.assign(memberUser, { ...demoUser, id: "umember1", name: "member", role: "user" });
+  Object.assign(demoUser, { id: "u1a2b3c4", name: "demo", role: "admin", status: "approved", must_change_password: false, quota: { hosts: 5, cpu_milli: 8000, mem_mib: 16384 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } });
+  Object.assign(memberUser, { ...demoUser, id: "umember1", name: "member", role: "user", status: "approved", must_change_password: false });
+  Object.assign(initialAdmin, { ...demoUser, id: "uadmin01", name: "admin", role: "super_admin", status: "approved", must_change_password: true });
   sessions.clear();
   hosts = [];
   hostMembers = new Map();
@@ -382,11 +384,11 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   messageSubmitReplays.clear();
   executionControls.clear();
   executionActionReplays.clear();
-  users.splice(0, users.length, demoUser);
+  users.splice(0, users.length, demoUser, memberUser, initialAdmin);
   passwords.clear();
   loginAccounts.clear();
   loginAccounts.set("demo", { user: demoUser, password: "demo" });
-  loginAccounts.set("admin", { user: demoUser, password: "admin" });
+  loginAccounts.set("admin", { user: initialAdmin, password: "admin" });
   loginAccounts.set("member", { user: memberUser, password: "member" });
   auditLogs = [
     { id: 3, at: now(), actor_id: demoUser.id, actor_kind: "user", action: "host.create", target: "h-audit-demo", detail: { name: "示例主机" }, ip: "127.0.0.1" },
@@ -533,26 +535,43 @@ function sessionUser(cookies: Record<string, string>): User | null {
   }
   if (!session) return null;
   const user = users.find((item) => item.id === session.userId) ?? (memberUser.id === session.userId ? memberUser : undefined);
-  if (!user || user.disabled) return null;
+  if (!user || user.status !== "approved") return null;
   return session.name === user.name ? user : { ...user, name: session.name };
+}
+
+const isAdmin = (user: User) => user.role === "admin" || user.role === "super_admin";
+const validAccountStatus = (status: string): status is User["status"] => ["pending", "rejected", "approved", "disabled"].includes(status);
+const nextAccountStatuses: Record<User["status"], User["status"][]> = {
+  pending: ["approved", "rejected"], rejected: ["approved"], approved: ["disabled"], disabled: ["approved"],
+};
+function revokeUserSessions(userId: string) {
+  for (const [sessionId, session] of sessions) {
+    if (session.userId !== userId) continue;
+    sessions.delete(sessionId);
+    if (typeof localStorage !== "undefined") localStorage.removeItem(`${sessionStoragePrefix}${sessionId}`);
+  }
 }
 
 const unauthenticated = () => failure("unauthenticated", "请先登录", 401);
 // Keep this first so protected handlers cannot run before the session check.
 const sessionGuard = http.all("/api/*", ({ request, cookies }) => {
   const path = new URL(request.url).pathname;
-  if (path === "/api/auth/login" || path === "/api/auth/logout" || sessionUser(cookies)) return;
-  return unauthenticated();
+  if (path === "/api/auth/login" || path === "/api/auth/register" || path === "/api/auth/logout") return;
+  const user = sessionUser(cookies);
+  if (!user) return unauthenticated();
+  if (user.must_change_password && !(path === "/api/me" || path === "/api/me/password")) {
+    return failure("forbidden", "请先修改超级管理员密码", 403);
+  }
 });
 
 const findHost = (hostId: string, user: User) => {
   completeDeletions();
   const host = hosts.find((item) => item.id === hostId);
-  return host && (user.role === "admin" || host.owner_id === user.id) ? host : undefined;
+  return host && (isAdmin(user) || host.owner_id === user.id) ? host : undefined;
 };
 const findTask = (taskId: string, user: User) => {
   const task = tasks.find((item) => item.id === taskId);
-  return task && (user.role === "admin" || task.owner_id === user.id) ? task : undefined;
+  return task && (isAdmin(user) || task.owner_id === user.id) ? task : undefined;
 };
 function createMockTask(user: User, hostID: string, modelID: string, conversationID: string, objective: string, budget?: components["schemas"]["TaskBudget"]): Task {
   const timestamp = now();
@@ -653,13 +672,28 @@ function hostsByState() {
 
 export const handlers = [
   sessionGuard,
+  http.post("/api/auth/register", async ({ request }) => {
+    const body = await request.json().catch(() => ({})) as { name?: string; password?: string };
+    const name = body.name?.trim();
+    if (!name || name.length < 3 || name.length > 64 || !body.password || body.password.length < 8 || body.password.length > 72) return failure("invalid_argument", "用户名或密码无效", 400);
+    if (name.toLowerCase() === "admin" || loginAccounts.has(name) || users.some((user) => user.name === name)) return failure("conflict", "用户名已被使用", 409);
+    const user: User = { id: id("u"), name, role: "user", status: "pending", must_change_password: false, quota: demoUser.quota, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } };
+    users.push(user);
+    passwords.set(user.id, body.password);
+    return json({ user }, 201);
+  }),
   http.post("/api/auth/login", async ({ request }) => {
     const body = await request.json().catch(() => ({})) as { name?: string; password?: string };
     const account = loginAccounts.get(body.name ?? "");
     const user = account ? users.find((item) => item.id === account.user.id) ?? account.user : users.find((item) => item.name === body.name);
     const password = account?.password ?? (user ? passwords.get(user.id) : undefined);
-    if (!user || user.disabled || body.password !== password) return failure("unauthenticated", "用户名或密码错误", 401);
-    const displayUser = body.name === "admin" ? { ...user, name: "admin" } : user;
+    if (!user || body.password !== password) return failure("unauthenticated", "用户名或密码错误", 401);
+    if (user.status !== "approved") return failure(`account_${user.status === "pending" ? "pending" : user.status === "rejected" ? "rejected" : "disabled"}`, "账号当前状态不允许登录", 403);
+    const hostname = new URL(request.url).hostname;
+    if (user.must_change_password && body.password === "admin" && hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "[::1]" && hostname !== "::1") {
+      return failure("unauthenticated", "用户名或密码错误", 401);
+    }
+    const displayUser = user;
     const sessionId = globalThis.crypto?.randomUUID?.() ?? id("s");
     const session = { userId: user.id, name: displayUser.name };
     sessions.set(sessionId, session);
@@ -676,6 +710,19 @@ export const handlers = [
     return empty({ "Set-Cookie": `${sessionCookieName}=; Path=/; Max-Age=0; SameSite=Lax` });
   }),
   http.get("/api/me", ({ cookies }) => json(userWithUsage(sessionUser(cookies)!))),
+  http.post("/api/me/password", async ({ request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    if (user.name !== "admin" || user.role !== "super_admin") return failure("forbidden", "只有超级管理员可以修改此密码", 403);
+    const body = await request.json().catch(() => ({})) as { current_password?: string; new_password?: string };
+    const account = loginAccounts.get("admin");
+    if (!body.current_password || body.current_password !== account?.password) return failure("unauthenticated", "当前密码错误", 401);
+    if (!body.new_password || body.new_password.length < 8 || body.new_password.length > 72) return failure("invalid_argument", "新密码长度必须为 8 至 72 个字符", 400);
+    user.must_change_password = false;
+    passwords.set(user.id, body.new_password);
+    loginAccounts.set("admin", { user, password: body.new_password });
+    revokeUserSessions(user.id);
+    return empty({ "Set-Cookie": `${sessionCookieName}=; Path=/; Max-Age=0; SameSite=Lax` });
+  }),
   http.post("/api/client-authorizations/inspect", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
     const body = await request.json().catch(() => ({})) as { user_code?: string };
@@ -789,7 +836,7 @@ export const handlers = [
     const allowedPermissions = new Set<HostMemberPermission>(["desktop:view", "desktop:control", "terminal:control", "mcp:control"]);
     if (!Array.isArray(body.permissions) || !body.permissions.length || !body.permissions.every((permission): permission is HostMemberPermission => typeof permission === "string" && allowedPermissions.has(permission as HostMemberPermission))) return failure("invalid_argument", "共享权限无效", 400);
     const target = users.find((item) => item.id === body.user_id) ?? (memberUser.id === body.user_id ? memberUser : undefined);
-    if (!target || target.disabled) return failure("not_found", "用户不存在", 404);
+    if (!target || target.status !== "approved") return failure("not_found", "用户不存在", 404);
     const members = hostMembers.get(host.id) ?? [];
     const existing = members.find((item) => item.user_id === body.user_id);
     const permissions = Array.from(new Set(body.permissions));
@@ -1360,7 +1407,7 @@ export const handlers = [
   }),
   http.get("/api/tasks", ({ cookies }) => {
     const user = sessionUser(cookies)!;
-    const visible = tasks.filter((task) => user.role === "admin" || task.owner_id === user.id)
+    const visible = tasks.filter((task) => isAdmin(user) || task.owner_id === user.id)
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
     const items: TaskSummary[] = visible.map((task) => ({
       id: task.id, owner_id: task.owner_id, host_id: task.host_id, conversation_id: task.conversation_id,
@@ -1461,36 +1508,60 @@ export const handlers = [
     key.revoked = true;
     return empty();
   }),
-  http.get("/api/admin/hosts", ({ cookies }) => { const user = sessionUser(cookies)!; completeDeletions(); return user.role === "admin" ? json({ items: hosts.map(materializeHost) }) : failure("forbidden", "没有执行此操作的权限", 403); }),
+  http.get("/api/admin/hosts", ({ cookies }) => { const user = sessionUser(cookies)!; completeDeletions(); return isAdmin(user) ? json({ items: hosts.map(materializeHost) }) : failure("forbidden", "没有执行此操作的权限", 403); }),
   http.get("/api/admin/workspaces", ({ cookies }) => {
     const user = sessionUser(cookies)!;
-    if (user.role !== "admin") return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!isAdmin(user)) return failure("forbidden", "没有执行此操作的权限", 403);
     completeDeletions();
     return json({ items: workspaces.filter(isVisibleAdminWorkspace).map(adminWorkspaceView), next_cursor: null });
   }),
   http.get("/api/admin/workspaces/:workspaceId", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
-    if (user.role !== "admin") return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!isAdmin(user)) return failure("forbidden", "没有执行此操作的权限", 403);
     completeDeletions();
     const workspace = workspaces.filter(isVisibleAdminWorkspace).find((item) => item.id === String(params.workspaceId));
     return workspace ? json(adminWorkspaceView(workspace)) : failure("not_found", "工作区不存在", 404);
   }),
-  http.get("/api/admin/users", ({ cookies }) => { const user = sessionUser(cookies)!; return user.role === "admin" ? json({ items: users.map(userWithUsage) }) : failure("forbidden", "没有执行此操作的权限", 403); }),
-  http.post("/api/admin/users", async ({ request, cookies }) => {
-    if (sessionUser(cookies)!.role !== "admin") return failure("forbidden", "没有执行此操作的权限", 403);
-    const body = await request.json().catch(() => ({})) as { name?: string; password?: string; role?: "admin" | "user"; quota?: User["quota"] };
-    const name = body.name?.trim();
-    if (!name || !body.password) return failure("invalid_argument", "用户名和初始密码不能为空", 400);
-    if (loginAccounts.has(name) || users.some((user) => user.name === name)) return failure("invalid_state", "用户名已存在", 409);
-    const user: User = { id: id("u"), name, role: body.role ?? "user", disabled: false, quota: body.quota ?? demoUser.quota, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 } };
-    users.push(user);
-    passwords.set(user.id, body.password);
-    return json(user, 201);
+  http.get("/api/admin/users", ({ request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    if (!isAdmin(user)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const requested = new URL(request.url).searchParams.getAll("status");
+    if (requested.length > 1 || (requested.length === 1 && !validAccountStatus(requested[0]!))) return failure("invalid_argument", "账号状态无效", 400);
+    return json({ items: users.filter((item) => !requested.length || item.status === requested[0]).map(userWithUsage) });
   }),
-  http.patch("/api/admin/users/:userId", async ({ params, request, cookies }) => { if (sessionUser(cookies)!.role !== "admin") return failure("forbidden", "没有执行此操作的权限", 403); const user = users.find((item) => item.id === String(params.userId)); if (!user) return failure("not_found", "用户不存在", 404); Object.assign(user, await request.json().catch(() => ({}))); return json(userWithUsage(user)); }),
-  http.get("/api/admin/capacity", ({ cookies }) => sessionUser(cookies)!.role === "admin" ? json({ limit: capacityLimit, allocated: capacityUsage(), hosts_by_state: hostsByState() }) : failure("forbidden", "没有执行此操作的权限", 403)),
+  http.patch("/api/admin/users/:userId", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const user = users.find((item) => item.id === String(params.userId));
+    if (!user) return failure("not_found", "用户不存在", 404);
+    if (user.name === "admin" || user.role === "super_admin") return failure("forbidden", "超级管理员账号受保护", 403);
+    const body = await request.json().catch(() => ({})) as { expected_status?: string; status?: string; role?: string; quota?: User["quota"] };
+    if (body.expected_status === undefined || !validAccountStatus(body.expected_status)) return failure("invalid_argument", "expected_status 无效", 400);
+    if (body.expected_status !== user.status) return failure("conflict", "账号状态已变化，请刷新列表", 409);
+    if (body.status !== undefined && !validAccountStatus(body.status)) return failure("invalid_argument", "账号状态无效", 400);
+    if (body.role !== undefined && body.role !== "user" && body.role !== "admin") return failure("invalid_argument", "角色无效", 400);
+    if (body.status === undefined && body.role === undefined && body.quota === undefined) return failure("invalid_argument", "至少需要一个更新字段", 400);
+    const nextStatus = body.status ?? user.status;
+    if (body.status !== undefined && !nextAccountStatuses[user.status].includes(body.status)) return failure("conflict", "不允许此账号状态转换", 409);
+    if (body.status !== undefined && actor.id === user.id) return failure("forbidden", "不能修改自己的账号状态", 403);
+    if (body.role !== undefined) {
+      if (user.status !== "approved" || nextStatus !== "approved") return failure("conflict", "只有已通过账号可以调整角色", 409);
+      if (actor.id === user.id) return failure("forbidden", "不能修改自己的角色", 403);
+    }
+    if (body.quota !== undefined) {
+      if (!body.quota || Object.values(body.quota).some((value) => !Number.isInteger(value) || value < 0)) return failure("invalid_argument", "配额无效", 400);
+    }
+    const credentialsChanged = nextStatus !== user.status || body.role !== undefined;
+    user.status = nextStatus;
+    if (body.role !== undefined) user.role = body.role;
+    if (body.quota !== undefined) user.quota = body.quota;
+    if (credentialsChanged) revokeUserSessions(user.id);
+    auditLogs.unshift({ id: auditLogs.length + 1, at: now(), actor_id: actor.id, actor_kind: "user", action: "user.update", target: user.id, detail: { ...(body.status ? { status: body.status } : {}), ...(body.role ? { role: body.role } : {}), ...(body.quota ? { quota: body.quota } : {}) }, ip: "127.0.0.1" });
+    return json(userWithUsage(user));
+  }),
+  http.get("/api/admin/capacity", ({ cookies }) => isAdmin(sessionUser(cookies)!) ? json({ limit: capacityLimit, allocated: capacityUsage(), hosts_by_state: hostsByState() }) : failure("forbidden", "没有执行此操作的权限", 403)),
   http.get("/api/admin/audit", ({ request, cookies }) => {
-    if (sessionUser(cookies)!.role !== "admin") return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
     const params = new URL(request.url).searchParams;
     const actor = params.get("actor")?.toLowerCase();
     const action = params.get("action")?.toLowerCase();

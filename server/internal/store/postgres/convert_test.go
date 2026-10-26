@@ -9,6 +9,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/store/postgres/sqlcgen"
 
@@ -69,10 +70,10 @@ func TestDomainConversions(t *testing.T) {
 
 	gotUser := userDomain(sqlcgen.User{
 		ID: "u1234567", Name: "operator", PasswordHash: "hash", Role: "admin",
-		QuotaHosts: 3, QuotaCpuMilli: 4000, QuotaMemMib: 8192, Disabled: true,
+		QuotaHosts: 3, QuotaCpuMilli: 4000, QuotaMemMib: 8192, Status: "disabled", MustChangePassword: true,
 		CreatedAt: deletedAt, UpdatedAt: deletedAt,
 	})
-	if gotUser.Role != "admin" || gotUser.QuotaCPUMilli != 4000 || !gotUser.Disabled {
+	if gotUser.Role != "admin" || gotUser.QuotaCPUMilli != 4000 || gotUser.Status != identity.StatusDisabled || !gotUser.MustChangePassword {
 		t.Fatalf("user conversion lost fields: %+v", gotUser)
 	}
 

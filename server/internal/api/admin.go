@@ -20,13 +20,13 @@ type adminUserListResponse struct {
 }
 
 type adminUserResponse struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Role      identity.Role `json:"role"`
-	Disabled  bool          `json:"disabled"`
-	Quota     TotalsView    `json:"quota"`
-	Usage     TotalsView    `json:"usage"`
-	CreatedAt time.Time     `json:"created_at"`
+	ID        string                 `json:"id"`
+	Name      string                 `json:"name"`
+	Role      identity.Role          `json:"role"`
+	Status    identity.AccountStatus `json:"status"`
+	Quota     TotalsView             `json:"quota"`
+	Usage     TotalsView             `json:"usage"`
+	CreatedAt time.Time              `json:"created_at"`
 }
 
 type capacityResponse struct {
@@ -50,19 +50,11 @@ type auditResponse struct {
 	IP        string          `json:"ip"`
 }
 
-type createAdminUserRequest struct {
-	Name     string        `json:"name"`
-	Password string        `json:"password"`
-	Role     identity.Role `json:"role"`
-	Quota    *TotalsView   `json:"quota"`
-}
-
 func (h *api) registerAdmin(group *gin.RouterGroup) {
 	group.GET("/admin/hosts", h.listAllHosts)
 	group.GET("/admin/workspaces", h.listAdminWorkspaces)
 	group.GET("/admin/workspaces/:id", h.getAdminWorkspace)
 	group.GET("/admin/users", h.listUsers)
-	group.POST("/admin/users", h.createUser)
 	group.PATCH("/admin/users/:id", h.updateUser)
 	group.GET("/admin/capacity", h.getCapacity)
 	group.GET("/admin/audit", h.listAudit)
@@ -99,7 +91,20 @@ func (h *api) listUsers(c *gin.Context) {
 		serviceUnavailable(c)
 		return
 	}
-	items, err := h.deps.Admin.ListUsers(c.Request.Context(), principal)
+	var status *identity.AccountStatus
+	if values, exists := c.Request.URL.Query()["status"]; exists {
+		if len(values) != 1 {
+			writeError(c, domain.InvalidArgument("status", "status must appear once"))
+			return
+		}
+		value := identity.AccountStatus(values[0])
+		if !value.Valid() {
+			writeError(c, domain.InvalidArgument("status", "invalid account status"))
+			return
+		}
+		status = &value
+	}
+	items, err := h.deps.Admin.ListUsers(c.Request.Context(), principal, status)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -114,40 +119,6 @@ func (h *api) listUsers(c *gin.Context) {
 		response.Items = append(response.Items, view)
 	}
 	c.JSON(http.StatusOK, response)
-}
-
-func (h *api) createUser(c *gin.Context) {
-	principal, ok := requireAdmin(c)
-	if !ok {
-		return
-	}
-	if h.deps.Admin == nil {
-		serviceUnavailable(c)
-		return
-	}
-	var request createAdminUserRequest
-	if !decodeJSON(c, &request) {
-		return
-	}
-	if strings.TrimSpace(request.Name) == "" || request.Password == "" || !validRole(request.Role) {
-		writeError(c, domain.InvalidArgument("user", "name, password, and valid role are required"))
-		return
-	}
-	if request.Quota != nil && !validTotals(*request.Quota) {
-		writeError(c, domain.InvalidArgument("quota", "quota values must be non-negative"))
-		return
-	}
-	item, err := h.deps.Admin.CreateUser(c.Request.Context(), principal, CreateAdminUserCommand(request))
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-	view, err := toAdminUserResponse(item)
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-	c.JSON(http.StatusCreated, view)
 }
 
 func (h *api) updateUser(c *gin.Context) {
@@ -168,6 +139,29 @@ func (h *api) updateUser(c *gin.Context) {
 		return
 	}
 	var command UpdateAdminUserCommand
+	for name := range raw {
+		if name != "expected_status" && name != "status" && name != "role" && name != "quota" {
+			writeError(c, domain.InvalidArgument("body", "contains an unsupported user field"))
+			return
+		}
+	}
+	if data, exists := raw["expected_status"]; exists {
+		if err := json.Unmarshal(data, &command.ExpectedStatus); err != nil || !command.ExpectedStatus.Valid() {
+			writeError(c, domain.InvalidArgument("expected_status", "invalid account status"))
+			return
+		}
+	} else {
+		writeError(c, domain.InvalidArgument("expected_status", "expected_status is required"))
+		return
+	}
+	if data, exists := raw["status"]; exists {
+		var value identity.AccountStatus
+		if err := json.Unmarshal(data, &value); err != nil || !value.Valid() {
+			writeError(c, domain.InvalidArgument("status", "invalid account status"))
+			return
+		}
+		command.Status = &value
+	}
 	if data, exists := raw["role"]; exists {
 		var value identity.Role
 		if err := json.Unmarshal(data, &value); err != nil || !validRole(value) {
@@ -184,23 +178,7 @@ func (h *api) updateUser(c *gin.Context) {
 		}
 		command.Quota = value
 	}
-	if data, exists := raw["disabled"]; exists {
-		var value *bool
-		if err := json.Unmarshal(data, &value); err != nil || value == nil {
-			writeError(c, domain.InvalidArgument("disabled", "disabled must be a boolean"))
-			return
-		}
-		command.Disabled = value
-	}
-	if data, exists := raw["password"]; exists {
-		var value *string
-		if err := json.Unmarshal(data, &value); err != nil || value == nil || *value == "" {
-			writeError(c, domain.InvalidArgument("password", "password is required"))
-			return
-		}
-		command.Password = value
-	}
-	if command.Role == nil && command.Quota == nil && command.Disabled == nil && command.Password == nil {
+	if command.Role == nil && command.Status == nil && command.Quota == nil {
 		writeError(c, domain.InvalidArgument("body", "at least one user field is required"))
 		return
 	}
@@ -315,7 +293,7 @@ func auditQuery(c *gin.Context) (AuditQuery, error) {
 }
 
 func toAdminUserResponse(item AdminUserRecord) (adminUserResponse, error) {
-	if !domain.ValidUserID(item.ID) || !validRole(item.Role) || !validTotals(item.Quota) || !validTotals(item.Usage) {
+	if !domain.ValidUserID(item.ID) || !validStoredRole(item.Role) || !item.Status.Valid() || !validTotals(item.Quota) || !validTotals(item.Usage) {
 		return adminUserResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return adminUserResponse(item), nil
@@ -327,7 +305,7 @@ func requireAdmin(c *gin.Context) (identity.Principal, bool) {
 		unauthenticated(c)
 		return identity.Principal{}, false
 	}
-	if principal.Role != identity.RoleAdmin {
+	if !principal.Role.IsAdmin() {
 		writeError(c, domain.NewError(domain.CodeForbidden, "forbidden"))
 		c.Abort()
 		return identity.Principal{}, false
@@ -337,6 +315,10 @@ func requireAdmin(c *gin.Context) (identity.Principal, bool) {
 
 func validRole(role identity.Role) bool {
 	return role == identity.RoleUser || role == identity.RoleAdmin
+}
+
+func validStoredRole(role identity.Role) bool {
+	return validRole(role) || role == identity.RoleSuperAdmin
 }
 
 func validTotals(value TotalsView) bool {

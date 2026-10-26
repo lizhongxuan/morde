@@ -166,7 +166,7 @@ func TestAuthorizeMCPRuntimeActionRevalidatesActorKeyAndOwner(t *testing.T) {
 	if err := service.AuthorizeMCPRuntimeAction(context.Background(), actorID, actorID, tokenID, hostID, approved, identity.ScopeComputerOperate); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("Host owner changed = %v", err)
 	}
-	users.values[actorID] = identity.User{ID: actorID, Disabled: true}
+	users.values[actorID] = identity.User{ID: actorID, Status: identity.StatusDisabled}
 	if err := check(); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("disabled member = %v", err)
 	}

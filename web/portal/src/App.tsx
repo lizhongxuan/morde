@@ -12,6 +12,8 @@ import { Clients } from './routes/Clients';
 import { Downloads } from './routes/Downloads';
 import { Hosts } from './routes/Hosts';
 import { Login } from './routes/Login';
+import { Register } from './routes/Register';
+import { ChangePassword } from './routes/ChangePassword';
 import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
 import { TaskDetail } from './routes/TaskDetail';
@@ -41,6 +43,7 @@ function AdminAccessDenied() {
 function UserRoutes() {
   return <Routes>
     <Route path="/login" element={<Login />} />
+    <Route path="/register" element={<Register />} />
     <Route path="/download" element={<Downloads />} />
     <Route element={<RouteGuard />}>
       <Route element={<PortalLayout />}>
@@ -64,7 +67,8 @@ function UserRoutes() {
 
 function AdminRoutes() {
   return <Routes>
-    <Route path="/admin/login" element={<Login defaultTo="/admin/" />} />
+    <Route path="/admin/login" element={<Login defaultTo="/admin/" allowRegister={false} />} />
+    <Route path="/admin/change-password" element={<ChangePassword />} />
     <Route element={<RouteGuard loginPath="/admin/login" />}>
       <Route path="/admin/access-denied" element={<AdminAccessDenied />} />
       <Route element={<AdminGuard deniedTo="/admin/access-denied" />}>

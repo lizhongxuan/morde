@@ -15,7 +15,9 @@ export const portalApi = {
   onboardingStatus: async () => unwrapApiResponse(await api.GET('/api/onboarding/status')),
   ensureDefaultHost: async (body: components['schemas']['EnsureDefaultHostRequest'] = {}) => unwrapApiResponse(await api.POST('/api/me/default-host', { body })),
   login: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/login', { body: { name, password } })),
+  register: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/register', { body: { name, password } })),
   logout: async () => unwrapApiResponse(await api.POST('/api/auth/logout')),
+  changePassword: async (body: components['schemas']['ChangePasswordRequest']) => unwrapApiResponse(await api.POST('/api/me/password', { body })),
   hosts: async () => unwrapApiResponse(await api.GET('/api/hosts')),
   sharedHosts: async () => unwrapApiResponse(await api.GET('/api/shared-hosts')),
   hostMembers: async (id: string) => unwrapApiResponse(await api.GET('/api/hosts/{id}/members', { params: { path: { id } } })),
@@ -152,8 +154,9 @@ export const portalApi = {
     params: { query: { limit: 50, ...(cursor ? { cursor } : {}) } },
   })),
   adminWorkspace: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/workspaces/{id}', { params: { path: { id } } })),
-  adminUsers: async () => unwrapApiResponse(await api.GET('/api/admin/users')),
-  createUser: async (body: components['schemas']['CreateUserRequest']) => unwrapApiResponse(await api.POST('/api/admin/users', { body })),
+  adminUsers: async (status?: components['schemas']['AccountStatus']) => unwrapApiResponse(await api.GET('/api/admin/users', {
+    params: { query: status ? { status } : {} },
+  })),
   updateUser: async (id: string, body: components['schemas']['UpdateUserRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/users/{id}', { params: { path: { id } }, body })),
   capacity: async () => unwrapApiResponse(await api.GET('/api/admin/capacity')),
   audit: async (params: URLSearchParams) => {

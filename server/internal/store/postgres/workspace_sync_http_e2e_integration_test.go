@@ -220,11 +220,14 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	waitWorkspaceSyncWatch(t, liveRunTwo)
 	waitWorkspaceSyncFile(t, liveTwo, "new.txt", "live from first device\n", liveRunTwo)
 	waitWorkspaceSyncReplicaCursor(t, ctx, store, value.ID, "device:"+deviceIDs[1], 2)
+	waitWorkspaceSyncWatch(t, liveRunTwo)
 	writeWorkspaceSyncE2EFile(t, liveTwo, "README.md", []byte("live edit from second device\n"))
 	waitWorkspaceSyncRevision(t, ctx, store, value.ID, 3, liveRunTwo)
 	waitWorkspaceSyncFile(t, liveOne, "README.md", "live edit from second device\n", liveRunOne)
 	waitWorkspaceSyncReplicaCursor(t, ctx, store, value.ID, "device:"+deviceIDs[0], 3)
 	waitWorkspaceSyncReplicaCursor(t, ctx, store, value.ID, "device:"+deviceIDs[1], 3)
+	waitWorkspaceSyncWatch(t, liveRunOne)
+	waitWorkspaceSyncWatch(t, liveRunTwo)
 	latest, err := store.GetWorkspace(ctx, value.ID)
 	if err != nil || latest.Revision < 3 {
 		t.Fatalf("live sync workspace revision = %d, %v", latest.Revision, err)
@@ -263,6 +266,10 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	writeWorkspaceSyncE2EFile(t, liveOne, "handoff-local.txt", []byte("local work before leaving\n"))
 	handoffRevision, err := recoveredClient.HandoffCheckpoint(ctx, client.LiveSyncOptions{WorkspaceID: value.ID, Directory: liveOne})
 	if err != nil || handoffRevision != 5 {
+		var conflict *client.LiveConflictError
+		if errors.As(err, &conflict) {
+			t.Fatalf("local-to-cloud handoff checkpoint = revision %d, %v, conflicts=%#v", handoffRevision, err, conflict.Conflicts)
+		}
 		t.Fatalf("local-to-cloud handoff checkpoint = revision %d, %v", handoffRevision, err)
 	}
 	assertWorkspaceSyncFile(t, liveOne, "disk-full.txt", "resume after storage recovery\n")

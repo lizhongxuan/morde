@@ -127,9 +127,9 @@ type WorkspaceBlockUsageStore interface {
 type UserStore interface {
 	GetUserByID(context.Context, string) (identity.User, error)
 	GetUserByName(context.Context, string) (identity.User, error)
-	ListUsers(context.Context) ([]identity.User, error)
+	ListUsersByStatus(context.Context, *identity.AccountStatus) ([]identity.User, error)
 	CreateUser(context.Context, identity.User) (identity.User, error)
-	UpdateUser(context.Context, string, identity.User) (identity.User, error)
+	UpdateUserWithAudit(context.Context, string, identity.AccountStatus, identity.User, audit.Entry) (identity.User, error)
 }
 
 type TokenStore interface {

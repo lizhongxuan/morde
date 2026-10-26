@@ -96,8 +96,7 @@ type CreatedAPIKey struct {
 }
 
 type AdminService interface {
-	ListUsers(context.Context, identity.Principal) ([]AdminUserRecord, error)
-	CreateUser(context.Context, identity.Principal, CreateAdminUserCommand) (AdminUserRecord, error)
+	ListUsers(context.Context, identity.Principal, *identity.AccountStatus) ([]AdminUserRecord, error)
 	UpdateUser(context.Context, identity.Principal, string, UpdateAdminUserCommand) (AdminUserRecord, error)
 	Capacity(context.Context, identity.Principal) (CapacityRecord, error)
 	ListAudit(context.Context, identity.Principal, AuditQuery) ([]AuditRecord, error)
@@ -107,24 +106,17 @@ type AdminUserRecord struct {
 	ID        string
 	Name      string
 	Role      identity.Role
-	Disabled  bool
+	Status    identity.AccountStatus
 	Quota     TotalsView
 	Usage     TotalsView
 	CreatedAt time.Time
 }
 
-type CreateAdminUserCommand struct {
-	Name     string
-	Password string
-	Role     identity.Role
-	Quota    *TotalsView
-}
-
 type UpdateAdminUserCommand struct {
-	Role     *identity.Role
-	Quota    *TotalsView
-	Disabled *bool
-	Password *string
+	ExpectedStatus identity.AccountStatus
+	Role           *identity.Role
+	Status         *identity.AccountStatus
+	Quota          *TotalsView
 }
 
 type CapacityRecord struct {

@@ -43,10 +43,10 @@ for key in CH_WORKSPACE_STORAGE_ROOT_DIR CH_SITE_STORAGE_ROOT_DIR; do
   [[ $path == /* && -d $path && ! -L $path && $(stat -c '%u:%a' "$path") == "$portal_uid:700" ]] || die "$key must be a mode 0700 directory owned by $portal_user"
   runuser -u "$portal_user" -- test -w "$path" || die "$portal_user cannot write $key"
 done
-for path in "$repo_root" "$repo_root/deploy/single/portal.yaml" "$repo_root/web/portal/dist/index.html" "$repo_root/web/portal/dist/admin/index.html" "$repo_root/web/workbench/dist/index.html"; do
+for path in "$repo_root" "$repo_root/deploy/single/portal.yaml" "$repo_root/web/portal/dist/index.html" "$repo_root/web/portal/dist/admin/index.html" "$repo_root/web/portal/dist/app/index.html" "$repo_root/web/workbench/dist/index.html"; do
   runuser -u "$portal_user" -- test -r "$path" || die "$portal_user cannot read $path"
 done
-for path in "$repo_root" "$repo_root/web/portal/dist" "$repo_root/web/workbench/dist"; do
+for path in "$repo_root" "$repo_root/web/portal/dist" "$repo_root/web/portal/dist/app" "$repo_root/web/workbench/dist"; do
   runuser -u "$portal_user" -- test -x "$path" || die "$portal_user cannot traverse $path"
 done
 runuser -u "$portal_user" -- test -x "$repo_root/.local/bin/portal" || die 'Portal binary is missing or not executable by the service account'

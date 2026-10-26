@@ -223,6 +223,30 @@ func TestTaskServiceSubmitCreatesHostBoundConversationAndIdempotencyHash(t *test
 	}
 }
 
+func TestTaskServiceSubmitCapturesClientInstallationAuthorization(t *testing.T) {
+	store := &taskStoreStub{}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := taskTestPrincipal()
+	principal.Kind = identity.KindClient
+	principal.TokenID = "t7654321"
+	principal.ClientInstallationID = "i1234567"
+	if _, err := service.Submit(context.Background(), principal, SubmitTaskCommand{
+		HostID: "h1234567", ModelID: "model-a", Objective: "review this project", IdempotencyKey: "client-submit-001",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.submissions) != 1 {
+		t.Fatalf("SubmitTask calls = %d, want 1", len(store.submissions))
+	}
+	authorization := store.submissions[0].Task.Authorization
+	if authorization.Kind != string(identity.KindClient) || authorization.TokenID != principal.TokenID || authorization.ClientInstallationID != principal.ClientInstallationID {
+		t.Fatalf("client authorization snapshot = %#v", authorization)
+	}
+}
+
 func TestTaskServiceApplicationTargetIsValidatedAndBoundToTaskHash(t *testing.T) {
 	store := &taskStoreStub{}
 	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})

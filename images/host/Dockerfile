@@ -2,8 +2,14 @@ FROM scratch AS runtime-build
 COPY --from=runtime /morde-runtime /usr/local/bin/morde-runtime
 
 FROM ghcr.io/agent-infra/sandbox:1.11.0@sha256:6328d7fd2f0ff0b4c147c3d05b3df1ce331f4a482eb6e550ecd64ed1fcf906e7 AS bubblewrap-build
+ARG TARGETARCH
 RUN apt-get update \
-    && printf '%s\n' 'deb-src http://ports.ubuntu.com/ubuntu-ports noble main universe' > /etc/apt/sources.list.d/noble-src.list \
+    && case "$TARGETARCH" in \
+        amd64) ubuntu_source=http://archive.ubuntu.com/ubuntu ;; \
+        arm64) ubuntu_source=http://ports.ubuntu.com/ubuntu-ports ;; \
+        *) echo "unsupported bubblewrap build architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac \
+    && printf 'deb-src %s noble main universe\n' "$ubuntu_source" > /etc/apt/sources.list.d/noble-src.list \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libcap-dev libselinux1-dev pkg-config \
     && cd /tmp \

@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!packages/
+!packages/WeChatLinux_arm64.deb
+!packages/CloudHub_arm64_5.0.5_2601301023.deb

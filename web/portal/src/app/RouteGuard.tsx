@@ -36,6 +36,7 @@ export function AdminGuard({ deniedTo = '/assistant' }: { deniedTo?: string }) {
     void queryClient.cancelQueries({ queryKey: ['admin'] }).then(() => queryClient.removeQueries({ queryKey: ['admin'] }));
     void refresh();
   }, [queryClient, refresh, revoked]);
-  if (revoked || user?.role !== 'admin') return <Navigate to={deniedTo} replace />;
+  if (user?.must_change_password) return <Navigate to="/admin/change-password" replace />;
+  if (revoked || (user?.role !== 'admin' && user?.role !== 'super_admin')) return <Navigate to={deniedTo} replace />;
   return <Outlet />;
 }

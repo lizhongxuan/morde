@@ -5,7 +5,7 @@ import { formatBytes, formatCpu, formatDate, formatMemory, hostStateLabel } from
 
 export function AdminUserDetail() {
   const { id = '' } = useParams();
-  const users = useQuery({ queryKey: ['admin', 'users'], queryFn: portalApi.adminUsers });
+  const users = useQuery({ queryKey: ['admin', 'users'], queryFn: () => portalApi.adminUsers() });
   const hosts = useQuery({ queryKey: ['admin', 'hosts'], queryFn: portalApi.adminHosts });
   const workspaces = useInfiniteQuery({
     queryKey: ['admin', 'workspaces', 'user', id],
@@ -25,9 +25,9 @@ export function AdminUserDetail() {
 
   return <section>
     <Link className="back-link" to="/admin/users">‹ 返回用户列表</Link>
-    <div className="page-heading"><div><p className="eyebrow">用户详情</p><h1>{user.name}</h1><p className="muted mono">{user.id}</p></div><span className={`status status-${user.disabled ? 'disabled' : 'ready'}`}>{user.disabled ? '已禁用登录' : '登录正常'}</span></div>
+    <div className="page-heading"><div><p className="eyebrow">用户详情</p><h1>{user.name}</h1><p className="muted mono">{user.id}</p></div><span className={`status status-${user.status === 'approved' ? 'ready' : 'disabled'}`}>{user.status === 'approved' ? '登录正常' : user.status === 'disabled' ? '已禁用登录' : user.status === 'pending' ? '等待审核' : '审核未通过'}</span></div>
     <div className="admin-detail-facts">
-      <article><span>角色</span><strong>{user.role === 'admin' ? '管理员' : '普通用户'}</strong></article>
+      <article><span>角色</span><strong>{user.role === 'super_admin' ? '超级管理员' : user.role === 'admin' ? '管理员' : '普通用户'}</strong></article>
       <article><span>云端电脑</span><strong>{ownedHosts.length}{user.quota ? ` / ${user.quota.hosts} 台` : ' 台'}</strong></article>
       <article><span>CPU 使用 / 配额</span><strong>{user.usage && user.quota ? `${formatCpu(user.usage.cpu_milli)} / ${formatCpu(user.quota.cpu_milli)}` : '未提供'}</strong></article>
       <article><span>内存使用 / 配额</span><strong>{user.usage && user.quota ? `${formatMemory(user.usage.mem_mib)} / ${formatMemory(user.quota.mem_mib)}` : '未提供'}</strong></article>

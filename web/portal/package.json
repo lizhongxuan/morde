@@ -9,11 +9,13 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --strictPort",
     "predev": "msw init public --save",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && npm --prefix ../../project/nanoMuse/web run build && node scripts/copy-morde-mobile.mjs",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src vite.config.ts --max-warnings=0",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/copy-morde-mobile.node-test.mjs",
     "test:watch": "vitest",
+    "test:release": "node --test scripts/validate-desktop-release.node-test.mjs",
+    "validate:desktop-release": "node scripts/validate-desktop-release.mjs",
     "generate:api": "openapi-typescript ../../server/openapi/portal.yaml -o src/api/schema.d.ts",
     "e2e": "playwright test"
   },

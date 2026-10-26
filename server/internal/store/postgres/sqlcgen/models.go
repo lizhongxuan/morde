@@ -543,16 +543,17 @@ type Token struct {
 }
 
 type User struct {
-	ID            string             `json:"id"`
-	Name          string             `json:"name"`
-	PasswordHash  string             `json:"password_hash"`
-	Role          string             `json:"role"`
-	QuotaHosts    int32              `json:"quota_hosts"`
-	QuotaCpuMilli int32              `json:"quota_cpu_milli"`
-	QuotaMemMib   int32              `json:"quota_mem_mib"`
-	Disabled      bool               `json:"disabled"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	ID                 string             `json:"id"`
+	Name               string             `json:"name"`
+	PasswordHash       string             `json:"password_hash"`
+	Role               string             `json:"role"`
+	QuotaHosts         int32              `json:"quota_hosts"`
+	QuotaCpuMilli      int32              `json:"quota_cpu_milli"`
+	QuotaMemMib        int32              `json:"quota_mem_mib"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Status             string             `json:"status"`
+	MustChangePassword bool               `json:"must_change_password"`
 }
 
 type UserPreference struct {

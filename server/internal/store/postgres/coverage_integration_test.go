@@ -97,8 +97,8 @@ func TestStoreRoundTrips(t *testing.T) {
 		t.Fatalf("ListUsers() = %d, %v", len(users), err)
 	}
 	owner.Name = owner.Name + "-updated"
-	owner.Disabled = true
-	if got, err := store.UpdateUser(ctx, "", owner); err != nil || got.Name != owner.Name || !got.Disabled {
+	owner.Status = identity.StatusDisabled
+	if got, err := store.UpdateUser(ctx, "system", identity.StatusApproved, owner); err != nil || got.Name != owner.Name || got.Status != identity.StatusDisabled {
 		t.Fatalf("UpdateUser() = %#v, %v", got, err)
 	}
 	if err := CheckSchema(ctx, pool); err != nil {

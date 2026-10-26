@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
-import { formatBytes } from '../app/format';
-import { getDesktopDownloads } from '../app/desktopDownloads';
+import { formatBytes, formatDate } from '../app/format';
+import { desktopCapabilityNames, getDesktopDownloads } from '../app/desktopDownloads';
 
 const platformNames = {
   'macos:arm64': 'macOS · Apple 芯片',
@@ -36,6 +36,8 @@ export function Downloads() {
                 <div className="download-card-copy">
                   <h2>{label}</h2>
                   <p>{artifact.filename} · {formatBytes(artifact.bytes)}</p>
+                  <p>已验收：{artifact.acceptance.capabilities.map((capability) => desktopCapabilityNames[capability]).join('、')}</p>
+                  <p>验收时间：{formatDate(artifact.acceptance.verified_at)} · {artifact.acceptance.signature_status === 'signed_and_notarized' ? '已签名并公证' : artifact.acceptance.signature_status === 'signed' ? '已签名' : '无需平台签名'}</p>
                   <details><summary>查看 SHA-256 校验值</summary><code>{artifact.sha256}</code></details>
                 </div>
                 <a className="button button-primary" href={artifact.download_url} download={artifact.filename} aria-label={`下载 ${label}`}>下载</a>

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -30,13 +31,14 @@ type ResourceUsage struct {
 }
 
 type UserSummary struct {
-	ID        string
-	Name      string
-	Role      identity.Role
-	Disabled  bool
-	CreatedAt time.Time
-	Quota     ResourceUsage
-	Usage     ResourceUsage
+	ID                 string
+	Name               string
+	Role               identity.Role
+	Status             identity.AccountStatus
+	MustChangePassword bool
+	CreatedAt          time.Time
+	Quota              ResourceUsage
+	Usage              ResourceUsage
 }
 
 type LoginResult struct {
@@ -94,7 +96,7 @@ func (s *CredentialService) Login(ctx context.Context, name, password, ip string
 		return LoginResult{}, err
 	}
 	user, err := s.users.GetUserByName(ctx, name)
-	validUser := err == nil && !user.Disabled
+	validUser := err == nil
 	hash := s.dummyHash
 	if validUser {
 		hash = []byte(user.PasswordHash)
@@ -110,6 +112,18 @@ func (s *CredentialService) Login(ctx context.Context, name, password, ip string
 		}
 		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
 			return LoginResult{}, err
+		}
+		return LoginResult{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
+	}
+	if user.Status != identity.StatusApproved {
+		if auditErr := s.audit.Write(ctx, audit.Entry{ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionLoginFailed, IP: ip}); auditErr != nil {
+			return LoginResult{}, fmt.Errorf("write blocked login audit: %w", auditErr)
+		}
+		return LoginResult{}, accountStatusError(user.Status)
+	}
+	if user.Role == identity.RoleSuperAdmin && user.MustChangePassword && password == "admin" && !isLoopbackIP(ip) {
+		if auditErr := s.audit.Write(ctx, audit.Entry{ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionLoginFailed, IP: ip}); auditErr != nil {
+			return LoginResult{}, fmt.Errorf("write blocked login audit: %w", auditErr)
 		}
 		return LoginResult{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
 	}
@@ -137,12 +151,40 @@ func (s *CredentialService) Logout(ctx context.Context, principal identity.Princ
 	return s.audit.Write(ctx, audit.Entry{ActorID: principal.TokenID, ActorKind: audit.ActorSession, Action: audit.ActionLogout})
 }
 
+func (s *CredentialService) ChangePassword(ctx context.Context, principal identity.Principal, currentPassword, newPassword string) error {
+	if principal.Kind != identity.KindSession || principal.Role != identity.RoleSuperAdmin ||
+		!domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) {
+		return domain.NewError(domain.CodeForbidden, "only the super administrator can change this password")
+	}
+	user, err := s.users.GetUserByID(ctx, principal.UserID)
+	if err != nil || user.Name != "admin" || user.Role != identity.RoleSuperAdmin || user.Status != identity.StatusApproved {
+		return domain.NewError(domain.CodeForbidden, "only the super administrator can change this password")
+	}
+	if currentPassword == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword)) != nil {
+		return domain.NewError(domain.CodeUnauthenticated, "current password is incorrect")
+	}
+	hash, err := hashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	user.PasswordHash = string(hash)
+	user.MustChangePassword = false
+	_, err = s.users.UpdateUserWithAudit(ctx, user.ID, user.Status, user, audit.Entry{
+		ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionUserUpdate,
+		Target: user.ID, Detail: map[string]any{"password_changed": true},
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *CredentialService) CurrentUser(ctx context.Context, principal identity.Principal) (UserSummary, error) {
 	if err := validateUserPrincipal(principal); err != nil {
 		return UserSummary{}, err
 	}
 	user, err := s.users.GetUserByID(ctx, principal.UserID)
-	if err != nil || user.Disabled {
+	if err != nil || user.Status != identity.StatusApproved {
 		return UserSummary{}, domain.NewError(domain.CodeUnauthenticated, "authentication required")
 	}
 	hosts, err := s.hosts.ListHostsByOwner(ctx, user.ID)
@@ -192,7 +234,7 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 		}
 		return domain.NewError(domain.CodeUnauthenticated, "task owner is unavailable")
 	}
-	if user.Disabled {
+	if user.Status != identity.StatusApproved {
 		return domain.NewError(domain.CodeUnauthenticated, "task owner is unavailable")
 	}
 	value, err := s.hosts.GetHost(ctx, hostID)
@@ -337,7 +379,7 @@ func (s *CredentialService) verify(ctx context.Context, raw string, want identit
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
 	user, err := s.users.GetUserByID(ctx, token.OwnerID)
-	if err != nil || user.Disabled {
+	if err != nil || user.Status != identity.StatusApproved {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
 	role := user.Role
@@ -345,7 +387,8 @@ func (s *CredentialService) verify(ctx context.Context, raw string, want identit
 		role = identity.RoleUser
 	}
 	principal := identity.Principal{
-		UserID: user.ID, Role: role, Kind: want, TokenID: token.ID, ClientInstallationID: token.ClientInstallationID,
+		UserID: user.ID, Role: role, MustChangePassword: user.MustChangePassword && want == identity.KindSession,
+		Kind: want, TokenID: token.ID, ClientInstallationID: token.ClientInstallationID,
 		HostIDs: append([]string(nil), token.HostIDs...), WorkspaceIDs: append([]string(nil), token.WorkspaceIDs...),
 		Scopes: append([]identity.Scope(nil), token.Scopes...),
 	}
@@ -392,10 +435,29 @@ func validDeviceToken(token identity.Token) bool {
 
 func userSummary(user identity.User, usage ResourceUsage) UserSummary {
 	return UserSummary{
-		ID: user.ID, Name: user.Name, Role: user.Role, Disabled: user.Disabled, CreatedAt: user.CreatedAt,
+		ID: user.ID, Name: user.Name, Role: user.Role, Status: user.Status,
+		MustChangePassword: user.MustChangePassword, CreatedAt: user.CreatedAt,
 		Quota: ResourceUsage{Hosts: user.QuotaHosts, CPUMilli: user.QuotaCPUMilli, MemMiB: user.QuotaMemMiB},
 		Usage: usage,
 	}
+}
+
+func accountStatusError(status identity.AccountStatus) error {
+	switch status {
+	case identity.StatusPending:
+		return domain.NewError(domain.CodeAccountPending, "account is awaiting administrator review")
+	case identity.StatusRejected:
+		return domain.NewError(domain.CodeAccountRejected, "account review was not approved")
+	case identity.StatusDisabled:
+		return domain.NewError(domain.CodeAccountDisabled, "account is disabled")
+	default:
+		return domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
+	}
+}
+
+func isLoopbackIP(value string) bool {
+	address := net.ParseIP(value)
+	return address != nil && address.IsLoopback()
 }
 
 func validateUserPrincipal(principal identity.Principal) error {

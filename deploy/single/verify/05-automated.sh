@@ -29,7 +29,7 @@ run_mock_e2e() {
   )
 }
 
-check A05.01 'portal lint, typecheck, unit tests, and production build' run_project_gates "$ROOT_DIR/web/portal" || true
+check A05.01 'portal lint, typecheck, unit tests, and production build including /app' run_project_gates "$ROOT_DIR/web/portal" || true
 check A05.01 'workbench lint, typecheck, unit tests, and production build' run_project_gates "$ROOT_DIR/web/workbench" || true
 # $1 belongs to the inner bash process.
 # shellcheck disable=SC2016

@@ -259,7 +259,7 @@ func (s *hostReplicaService) verifyPrincipal(ctx context.Context, principal iden
 		}
 		return fmt.Errorf("load Host replica owner: %w", err)
 	}
-	if user.Disabled {
+	if user.Status != identity.StatusApproved {
 		return domain.NewError(domain.CodeUnauthenticated, "host replica owner is unavailable")
 	}
 	return nil
@@ -283,7 +283,7 @@ func (s *hostReplicaService) loadPrincipal(ctx context.Context, hostID string, g
 		}
 		return identity.Principal{}, host.Host{}, fmt.Errorf("load Host replica owner: %w", err)
 	}
-	if user.Disabled {
+	if user.Status != identity.StatusApproved {
 		return identity.Principal{}, host.Host{}, domain.NewError(domain.CodeUnauthenticated, "host replica owner is unavailable")
 	}
 	return identity.Principal{

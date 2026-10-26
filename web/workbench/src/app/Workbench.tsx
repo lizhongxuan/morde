@@ -7,6 +7,7 @@ import {
   type GatewayHost,
   type GatewayTerminalSession,
 } from '../api/gateway';
+import { ApiError } from '../api/client';
 import FileManager from '../components/FileManager';
 import TopBar from '../components/TopBar';
 
@@ -385,7 +386,13 @@ export default function Workbench() {
     } catch (error) {
       setControlActionError(messageOf(error));
       try {
-        applyControl(await gatewayApi.control());
+        const latest = await gatewayApi.control();
+        applyControl(latest);
+        if (error instanceof ApiError && error.status === 409 && controlRequestRef.current === request &&
+          latest.control_version !== request.expected_control_version && latest.active_transition?.request_id !== request.request_id) {
+          controlRequestRef.current = null;
+          setControlRequest(null);
+        }
       } catch (statusError) {
         setControlError(messageOf(statusError));
       }

@@ -3,6 +3,7 @@
 
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import socket
@@ -43,6 +44,19 @@ class DeploymentTests(unittest.TestCase):
         ):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 reader.parse_values(io.StringIO(source), ["CH_DATA_KEY_FILE"])
+
+    def test_admin_bootstrap_has_no_credential_file_or_cli_user_creation(self):
+        for name in (".env.example", "portal.yaml", "install-portal-service.sh", "read-env-values.py"):
+            with self.subTest(name=name):
+                self.assertNotIn("CH_ADMIN_CREDENTIALS_FILE", (ROOT / name).read_text())
+        with self.assertRaisesRegex(ValueError, "approved non-secret keys"):
+            reader.parse_values(io.StringIO("CH_ADMIN_CREDENTIALS_FILE=/etc/cloudhost/admin.yaml\n"), ["CH_ADMIN_CREDENTIALS_FILE"])
+
+        instructions = (ROOT / "README.md").read_text()
+        self.assertIn("默认密码为 `admin`", instructions)
+        self.assertIn("受信任的 SSH 本地隧道", instructions)
+        self.assertIn("初始状态为待审核", instructions)
+        self.assertIn("`portal user add` 入口均已移除", instructions)
 
     def test_preload_is_required_before_docker_can_start(self):
         preload = (ROOT / "morde-network-preload.service").read_text()
@@ -96,20 +110,21 @@ class DeploymentTests(unittest.TestCase):
             result = subprocess.run(["bash", "-n", str(ROOT / script)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_installer_requires_user_admin_and_workbench_entries(self):
+    def test_installer_requires_user_admin_mobile_and_workbench_entries(self):
         installer = (ROOT / "install-portal-service.sh").read_text()
         for entry in (
             "$repo_root/web/portal/dist/index.html",
             "$repo_root/web/portal/dist/admin/index.html",
+            "$repo_root/web/portal/dist/app/index.html",
             "$repo_root/web/workbench/dist/index.html",
         ):
             self.assertIn(entry, installer)
-        self.assertNotIn("web/portal/dist/app/index.html", installer)
 
-    def test_mvp_automated_gates_exclude_mobile_workspace(self):
+    def test_automated_portal_gate_builds_the_mobile_app(self):
         gates = (ROOT / "verify/05-automated.sh").read_text()
-        self.assertNotIn("project/nanoMuse", gates)
-        self.assertIn("portal lint, typecheck, unit tests, and production build", gates)
+        package = json.loads((ROOT.parents[1] / "web/portal/package.json").read_text())
+        self.assertIn("npm run build", gates)
+        self.assertIn("project/nanoMuse/web run build", package["scripts"]["build"])
 
     def test_installer_accepts_only_existing_local_docker_socket(self):
         installer = (ROOT / "install-portal-service.sh").read_text()

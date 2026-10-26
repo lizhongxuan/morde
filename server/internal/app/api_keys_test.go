@@ -253,7 +253,7 @@ func TestAuthorizeTaskActionRevalidatesAPIKeyAndSessionOwner(t *testing.T) {
 	if err := service.AuthorizeTaskAction(context.Background(), "u1234567", identity.KindSession, "t7654321", "h1234567", nil, identity.ScopeTaskRead); err != nil {
 		t.Fatalf("session task should not depend on session lifetime: %v", err)
 	}
-	users.values["u1234567"] = identity.User{ID: "u1234567", Disabled: true}
+	users.values["u1234567"] = identity.User{ID: "u1234567", Status: identity.StatusDisabled}
 	if err := service.AuthorizeTaskAction(context.Background(), "u1234567", identity.KindSession, "t7654321", "h1234567", nil, identity.ScopeTaskRead); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("disabled owner = %v", err)
 	}

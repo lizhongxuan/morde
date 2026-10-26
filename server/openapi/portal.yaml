@@ -55,7 +55,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Log in to the portal
-      description: Sets the ch_portal session cookie. Login attempts are rate limited.
+      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
       security: []
       requestBody:
         required: true
@@ -78,6 +78,33 @@ paths:
                   user: { $ref: '#/components/schemas/User' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Register a standard user account
+      description: Creates a pending user account with role=user. Registration is rate limited and does not create a login session. The name admin is reserved case-insensitively.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Registered user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/RateLimited' }
         default: { $ref: '#/components/responses/Error' }
   /api/auth/logout:
@@ -106,6 +133,25 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/password:
+    post:
+      tags: [Auth]
+      operationId: changeMyPassword
+      summary: Change the current user's password
+      description: Requires the current password. For the initial super administrator, this is the only mutation allowed until the password is changed. A successful change revokes every current session and requires logging in again.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+      responses:
+        '204': { description: Password changed and existing sessions revoked }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
   /api/me/preferences:
     get:
@@ -2546,6 +2592,10 @@ paths:
       summary: List users without credential data
       security:
         - portalSession: []
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/AccountStatus' }
       responses:
         '200':
           description: Users
@@ -2561,28 +2611,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Admin]
-      operationId: createUser
-      summary: Create a user
-      security:
-        - portalSession: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CreateUserRequest' }
-      responses:
-        '201':
-          description: Created user
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/AdminUser' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
   /api/admin/users/{id}:
     parameters:
       - name: id
@@ -2592,7 +2620,7 @@ paths:
     patch:
       tags: [Admin]
       operationId: updateUser
-      summary: Update a user's role, quota, disabled state, or password
+      summary: Review a user's status, change their role, or update quota
       security:
         - portalSession: []
       requestBody:
@@ -2610,6 +2638,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/capacity:
     get:
@@ -2885,7 +2914,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_argument, unauthenticated, forbidden, not_found, conflict, quota_exceeded, capacity_exceeded, workspace_busy, workspace_conflict, transfer_expired, invalid_state, idempotency_conflict, event_cursor_expired, unsupported, request_too_large, result_too_large, rate_limited, internal, upstream_error, host_not_ready, upstream_timeout]
+              enum: [invalid_argument, unauthenticated, forbidden, account_pending, account_rejected, account_disabled, not_found, conflict, quota_exceeded, capacity_exceeded, workspace_busy, workspace_conflict, transfer_expired, invalid_state, idempotency_conflict, event_cursor_expired, unsupported, request_too_large, result_too_large, rate_limited, internal, upstream_error, host_not_ready, upstream_timeout]
             message: { type: string }
             details: { type: object, additionalProperties: true }
     HostId: { type: string, pattern: '^h[a-z0-9]{7}$' }
@@ -3023,22 +3052,46 @@ components:
         mem_mib: { type: integer, minimum: 0 }
     User:
       type: object
-      required: [id, name, role, quota, usage]
+      required: [id, name, role, status, must_change_password, quota, usage]
       properties:
         id: { $ref: '#/components/schemas/UserId' }
         name: { type: string }
-        role: { type: string, enum: [user, admin] }
+        role: { $ref: '#/components/schemas/UserRole' }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        must_change_password: { type: boolean }
         quota: { $ref: '#/components/schemas/Quota' }
         usage: { $ref: '#/components/schemas/Usage' }
+    RegisterRequest:
+      type: object
+      required: [name, password]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 3, maxLength: 64 }
+        password: { type: string, minLength: 8, maxLength: 72, writeOnly: true }
+    AccountStatus:
+      type: string
+      enum: [pending, rejected, approved, disabled]
+    UserRole:
+      type: string
+      enum: [user, admin, super_admin]
     Me:
       type: object
-      required: [id, name, role, quota, usage]
+      required: [id, name, role, status, must_change_password, quota, usage]
       properties:
         id: { $ref: '#/components/schemas/UserId' }
         name: { type: string }
-        role: { type: string, enum: [user, admin] }
+        role: { $ref: '#/components/schemas/UserRole' }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        must_change_password: { type: boolean }
         quota: { $ref: '#/components/schemas/Quota' }
         usage: { $ref: '#/components/schemas/Usage' }
+    ChangePasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      additionalProperties: false
+      properties:
+        current_password: { type: string, minLength: 1, maxLength: 72, writeOnly: true }
+        new_password: { type: string, minLength: 8, maxLength: 72, writeOnly: true }
     UserPreferences:
       type: object
       required: [assistant_name, selected_model_id, default_host_id, updated_at]
@@ -4335,22 +4388,14 @@ components:
       properties:
         message: { $ref: '#/components/schemas/Message' }
         task: { $ref: '#/components/schemas/Task' }
-    CreateUserRequest:
-      type: object
-      required: [name, password, role]
-      properties:
-        name: { type: string, minLength: 1 }
-        password: { type: string, minLength: 1, writeOnly: true }
-        role: { type: string, enum: [user, admin] }
-        quota: { $ref: '#/components/schemas/Quota' }
     AdminUser:
       type: object
-      required: [id, name, role, disabled, quota, usage, created_at]
+      required: [id, name, role, status, quota, usage, created_at]
       properties:
         id: { $ref: '#/components/schemas/UserId' }
         name: { type: string }
-        role: { type: string, enum: [user, admin] }
-        disabled: { type: boolean }
+        role: { $ref: '#/components/schemas/UserRole' }
+        status: { $ref: '#/components/schemas/AccountStatus' }
         quota: { $ref: '#/components/schemas/Quota' }
         usage: { $ref: '#/components/schemas/Usage' }
         created_at: { type: string, format: date-time }
@@ -4394,9 +4439,11 @@ components:
       additionalProperties: false
     UpdateUserRequest:
       type: object
-      minProperties: 1
+      required: [expected_status]
+      minProperties: 2
+      additionalProperties: false
       properties:
-        role: { type: string, enum: [user, admin] }
+        expected_status: { $ref: '#/components/schemas/AccountStatus' }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        role: { $ref: '#/components/schemas/UserRole' }
         quota: { $ref: '#/components/schemas/Quota' }
-        disabled: { type: boolean }
-        password: { type: string, minLength: 1, writeOnly: true }

@@ -168,11 +168,11 @@ func (s *Store) ClaimClientAuthorization(ctx context.Context, id string, secretH
 			!equalStringSlices(syncToken.WorkspaceIDs, pairing.WorkspaceIDs)) {
 			return domain.InvalidArgument("credential", "sync credential is invalid")
 		}
-		var disabled bool
-		if err := tx.QueryRow(ctx, `SELECT disabled FROM users WHERE id=$1`, pairing.OwnerID).Scan(&disabled); err != nil {
+		var approved bool
+		if err := tx.QueryRow(ctx, `SELECT status='approved' FROM users WHERE id=$1`, pairing.OwnerID).Scan(&approved); err != nil {
 			return fmt.Errorf("check client owner: %w", err)
 		}
-		if disabled {
+		if !approved {
 			return identity.ErrInvalidCredential
 		}
 		result, err = scanClientInstallation(tx.QueryRow(ctx, `SELECT id,owner_id,display_name,platform,workspace_ids,

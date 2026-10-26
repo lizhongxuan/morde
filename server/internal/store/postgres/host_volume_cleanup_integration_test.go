@@ -13,6 +13,7 @@ func TestOrphanHostVolumeCleanupSurvivesMissingHostAndGuardsHostReuse(t *testing
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	instanceID, hostID := "cleanup-test", "h7654321"
+	createTestSuperAdmin(t, store)
 	user := createTestUser(t, store, 1, 2000, 4096)
 
 	pending, err := store.EnsureOrphanHostVolumeCleanup(ctx, instanceID, hostID, "default", "orphan-sandbox", 1, true)

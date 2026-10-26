@@ -50,7 +50,7 @@ func (s *hostSharingService) Invite(ctx context.Context, principal identity.Prin
 		return host.Member{}, err
 	}
 	user, err := s.users.GetUserByID(ctx, userID)
-	if err != nil || user.Disabled {
+	if err != nil || user.Status != identity.StatusApproved {
 		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
 			return host.Member{}, err
 		}

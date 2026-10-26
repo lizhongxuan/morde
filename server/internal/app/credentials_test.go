@@ -37,9 +37,12 @@ func (s *credentialUsers) GetUserByName(_ context.Context, name string) (identit
 	return identity.User{}, domain.NewError(domain.CodeNotFound, "user not found")
 }
 
-func (s *credentialUsers) ListUsers(context.Context) ([]identity.User, error) {
+func (s *credentialUsers) ListUsersByStatus(_ context.Context, status *identity.AccountStatus) ([]identity.User, error) {
 	values := make([]identity.User, 0, len(s.values))
 	for _, user := range s.values {
+		if status != nil && user.Status != *status {
+			continue
+		}
 		values = append(values, user)
 	}
 	return values, nil
@@ -58,9 +61,13 @@ func (s *credentialUsers) CreateUser(_ context.Context, user identity.User) (ide
 	return user, nil
 }
 
-func (s *credentialUsers) UpdateUser(_ context.Context, _ string, user identity.User) (identity.User, error) {
-	if _, ok := s.values[user.ID]; !ok {
+func (s *credentialUsers) UpdateUserWithAudit(_ context.Context, _ string, expected identity.AccountStatus, user identity.User, _ audit.Entry) (identity.User, error) {
+	current, ok := s.values[user.ID]
+	if !ok {
 		return identity.User{}, domain.NewError(domain.CodeNotFound, "user not found")
+	}
+	if current.Status != expected {
+		return identity.User{}, domain.NewError(domain.CodeConflict, "account status changed")
 	}
 	user.UpdatedAt = time.Now().UTC()
 	s.values[user.ID] = user
@@ -199,7 +206,7 @@ func newCredentialFixture(t *testing.T) (*CredentialService, *credentialUsers, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	users := &credentialUsers{values: map[string]identity.User{"u1234567": {ID: "u1234567", Name: "alice", PasswordHash: string(hash), Role: identity.RoleUser}}}
+	users := &credentialUsers{values: map[string]identity.User{"u1234567": {ID: "u1234567", Name: "alice", PasswordHash: string(hash), Role: identity.RoleUser, Status: identity.StatusApproved}}}
 	hosts := &credentialHosts{}
 	workspaces := &credentialWorkspaces{values: map[string]workspace.Workspace{}}
 	tokens := &credentialTokens{values: map[string]identity.Token{}}
@@ -347,36 +354,50 @@ func TestCredentialServiceRejectsMismatchedTicketReceiptAudience(t *testing.T) {
 	}
 }
 
-func TestUserServiceHashesPasswordAndNeverAuditsIt(t *testing.T) {
+func TestRegistrationHashesPasswordAndCreatesPendingUser(t *testing.T) {
 	users := &credentialUsers{values: map[string]identity.User{}}
-	hosts := &credentialHosts{}
-	auditor := &credentialAudit{}
-	service, err := NewUserService(users, hosts, auditor)
+	service, err := NewUserService(users, &credentialHosts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := service.Create(context.Background(), identity.Principal{Role: identity.RoleAdmin, Kind: identity.KindSystem}, CreateUserCommand{
-		Name: "  bob ", Password: "safe password", Role: identity.RoleUser,
-	})
-	if err != nil || created.Name != "bob" || created.Quota != (ResourceUsage{Hosts: 3, CPUMilli: 4000, MemMiB: 8192}) {
-		t.Fatalf("Create() = %#v, %v", created, err)
+	created, err := service.Register(context.Background(), "  bob ", "safe password", "192.0.2.1")
+	if err != nil || created.Name != "bob" || created.Role != identity.RoleUser || created.Status != identity.StatusPending ||
+		created.Quota != (ResourceUsage{Hosts: 3, CPUMilli: 4000, MemMiB: 8192}) {
+		t.Fatalf("Register() = %#v, %v", created, err)
 	}
 	stored := users.values[created.ID]
 	if stored.PasswordHash == "safe password" || bcrypt.CompareHashAndPassword([]byte(stored.PasswordHash), []byte("safe password")) != nil {
 		t.Fatal("user password was not bcrypt hashed")
 	}
-	if len(auditor.entries[0].Detail) != 1 || auditor.entries[0].Detail["role"] != identity.RoleUser {
-		t.Fatalf("audit detail contains unexpected fields: %#v", auditor.entries[0].Detail)
-	}
-	if _, err := service.Create(context.Background(), identity.Principal{Role: identity.RoleAdmin, Kind: identity.KindSystem}, CreateUserCommand{
-		Name: "bob", Password: "safe password", Role: identity.RoleUser,
-	}); domain.CodeOf(err) != domain.CodeInvalidState {
+	if _, err := service.Register(context.Background(), "bob", "safe password", "192.0.2.1"); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("duplicate user error = %v", err)
 	}
-	if _, err := service.Create(context.Background(), identity.Principal{Role: identity.RoleAdmin, Kind: identity.KindSystem}, CreateUserCommand{
-		Name: "long", Password: string(make([]byte, 73)), Role: identity.RoleUser,
-	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := service.Register(context.Background(), "long", string(make([]byte, 73)), "192.0.2.1"); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("long password error = %v", err)
+	}
+}
+
+func TestRegistrationCreatesOnlyOrdinaryUsersAndLimitsAttempts(t *testing.T) {
+	users := &credentialUsers{values: map[string]identity.User{}}
+	service, err := NewUserService(users, &credentialHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Register(context.Background(), "ab", "password123", "192.0.2.1"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("short username error = %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		name := "new-user-" + string(rune('a'+i))
+		value, err := service.Register(context.Background(), name, "password123", "192.0.2.1")
+		if err != nil || value.Role != identity.RoleUser || value.Status != identity.StatusPending {
+			t.Fatalf("Register() = %#v, %v", value, err)
+		}
+	}
+	if _, err := service.Register(context.Background(), "new-user-z", "password123", "192.0.2.1"); domain.CodeOf(err) != domain.CodeRateLimited {
+		t.Fatalf("sixth registration error = %v", err)
+	}
+	if _, err := service.Register(context.Background(), "AdMiN", "password123", "192.0.2.2"); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("reserved admin name error = %v", err)
 	}
 }
 

@@ -152,7 +152,7 @@ SET host_ids = array_append(host_ids, $3)
 WHERE id=$1 AND owner_id=$2 AND kind='api_key' AND revoked_at IS NULL
   AND expires_at > clock_timestamp() AND 'host:create'=ANY(scopes)
   AND cardinality(host_ids) < 500
-  AND EXISTS (SELECT 1 FROM users WHERE id=$2 AND disabled=FALSE)`,
+  AND EXISTS (SELECT 1 FROM users WHERE id=$2 AND status='approved')`,
 				params.GrantTokenID, params.Host.OwnerID, params.Host.ID)
 			if err != nil {
 				return fmt.Errorf("grant newly created host to API key: %w", err)

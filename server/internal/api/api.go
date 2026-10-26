@@ -166,7 +166,7 @@ func (h *api) limitBody(c *gin.Context) {
 }
 
 func (h *api) authenticate(c *gin.Context) {
-	if c.FullPath() == "/api/auth/login" {
+	if c.FullPath() == "/api/auth/login" || c.FullPath() == "/api/auth/register" {
 		c.Next()
 		return
 	}
@@ -260,6 +260,11 @@ func (h *api) authenticate(c *gin.Context) {
 		h.authFailure(c, c.GetString("auth_kind"))
 		return
 	}
+	if principal.Kind == identity.KindSession && principal.MustChangePassword && !passwordChangeRoute(c.Request.Method, c.FullPath()) {
+		writeError(c, domain.NewError(domain.CodeForbidden, "password change is required before continuing"))
+		c.Abort()
+		return
+	}
 	if principal.Kind == identity.KindDevice && !deviceCredentialRoute(c.Request.Method, c.FullPath()) {
 		writeError(c, domain.NewError(domain.CodeForbidden, "device credential is limited to authorized workspace synchronization"))
 		c.Abort()
@@ -277,6 +282,11 @@ func (h *api) authenticate(c *gin.Context) {
 	}
 	c.Set(principalKey, principal)
 	c.Next()
+}
+
+func passwordChangeRoute(method, path string) bool {
+	return (method == http.MethodGet && path == "/api/me") ||
+		(method == http.MethodPost && (path == "/api/me/password" || path == "/api/auth/logout"))
 }
 
 func (h *api) checkOrigin(c *gin.Context) {

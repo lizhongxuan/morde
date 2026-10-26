@@ -10,20 +10,21 @@ import (
 )
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, disabled)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, disabled, created_at, updated_at
+INSERT INTO users (id, name, password_hash, role, status, must_change_password, quota_hosts, quota_cpu_milli, quota_mem_mib)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, created_at, updated_at, status, must_change_password
 `
 
 type CreateUserParams struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	PasswordHash  string `json:"password_hash"`
-	Role          string `json:"role"`
-	QuotaHosts    int32  `json:"quota_hosts"`
-	QuotaCpuMilli int32  `json:"quota_cpu_milli"`
-	QuotaMemMib   int32  `json:"quota_mem_mib"`
-	Disabled      bool   `json:"disabled"`
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	PasswordHash       string `json:"password_hash"`
+	Role               string `json:"role"`
+	Status             string `json:"status"`
+	MustChangePassword bool   `json:"must_change_password"`
+	QuotaHosts         int32  `json:"quota_hosts"`
+	QuotaCpuMilli      int32  `json:"quota_cpu_milli"`
+	QuotaMemMib        int32  `json:"quota_mem_mib"`
 }
 
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
@@ -32,10 +33,11 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		arg.Name,
 		arg.PasswordHash,
 		arg.Role,
+		arg.Status,
+		arg.MustChangePassword,
 		arg.QuotaHosts,
 		arg.QuotaCpuMilli,
 		arg.QuotaMemMib,
-		arg.Disabled,
 	)
 	var i User
 	err := row.Scan(
@@ -46,15 +48,16 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.QuotaHosts,
 		&i.QuotaCpuMilli,
 		&i.QuotaMemMib,
-		&i.Disabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.MustChangePassword,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, disabled, created_at, updated_at FROM users WHERE id = $1
+SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, created_at, updated_at, status, must_change_password FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id string) (User, error) {
@@ -68,15 +71,16 @@ func (q *Queries) GetUserByID(ctx context.Context, id string) (User, error) {
 		&i.QuotaHosts,
 		&i.QuotaCpuMilli,
 		&i.QuotaMemMib,
-		&i.Disabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.MustChangePassword,
 	)
 	return i, err
 }
 
 const getUserByName = `-- name: GetUserByName :one
-SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, disabled, created_at, updated_at FROM users WHERE name = $1
+SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, created_at, updated_at, status, must_change_password FROM users WHERE name = $1
 `
 
 func (q *Queries) GetUserByName(ctx context.Context, name string) (User, error) {
@@ -90,15 +94,16 @@ func (q *Queries) GetUserByName(ctx context.Context, name string) (User, error) 
 		&i.QuotaHosts,
 		&i.QuotaCpuMilli,
 		&i.QuotaMemMib,
-		&i.Disabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.MustChangePassword,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, disabled, created_at, updated_at FROM users ORDER BY created_at DESC, id
+SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, created_at, updated_at, status, must_change_password FROM users ORDER BY created_at DESC, id
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -118,9 +123,46 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.QuotaHosts,
 			&i.QuotaCpuMilli,
 			&i.QuotaMemMib,
-			&i.Disabled,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Status,
+			&i.MustChangePassword,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUsersByStatus = `-- name: ListUsersByStatus :many
+SELECT id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, created_at, updated_at, status, must_change_password FROM users WHERE status = $1 ORDER BY created_at DESC, id
+`
+
+func (q *Queries) ListUsersByStatus(ctx context.Context, status string) ([]User, error) {
+	rows, err := q.db.Query(ctx, listUsersByStatus, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []User
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.PasswordHash,
+			&i.Role,
+			&i.QuotaHosts,
+			&i.QuotaCpuMilli,
+			&i.QuotaMemMib,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Status,
+			&i.MustChangePassword,
 		); err != nil {
 			return nil, err
 		}
@@ -134,21 +176,24 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 
 const updateUser = `-- name: UpdateUser :one
 UPDATE users
-SET name = $2, password_hash = $3, role = $4, quota_hosts = $5,
-    quota_cpu_milli = $6, quota_mem_mib = $7, disabled = $8, updated_at = now()
-WHERE id = $1
-RETURNING id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, disabled, created_at, updated_at
+SET name = $2, password_hash = $3, role = $4, status = $5,
+    must_change_password = $6, quota_hosts = $7,
+    quota_cpu_milli = $8, quota_mem_mib = $9, updated_at = now()
+WHERE id = $1 AND status = $10::text
+RETURNING id, name, password_hash, role, quota_hosts, quota_cpu_milli, quota_mem_mib, created_at, updated_at, status, must_change_password
 `
 
 type UpdateUserParams struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	PasswordHash  string `json:"password_hash"`
-	Role          string `json:"role"`
-	QuotaHosts    int32  `json:"quota_hosts"`
-	QuotaCpuMilli int32  `json:"quota_cpu_milli"`
-	QuotaMemMib   int32  `json:"quota_mem_mib"`
-	Disabled      bool   `json:"disabled"`
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	PasswordHash       string `json:"password_hash"`
+	Role               string `json:"role"`
+	Status             string `json:"status"`
+	MustChangePassword bool   `json:"must_change_password"`
+	QuotaHosts         int32  `json:"quota_hosts"`
+	QuotaCpuMilli      int32  `json:"quota_cpu_milli"`
+	QuotaMemMib        int32  `json:"quota_mem_mib"`
+	ExpectedStatus     string `json:"expected_status"`
 }
 
 func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, error) {
@@ -157,10 +202,12 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		arg.Name,
 		arg.PasswordHash,
 		arg.Role,
+		arg.Status,
+		arg.MustChangePassword,
 		arg.QuotaHosts,
 		arg.QuotaCpuMilli,
 		arg.QuotaMemMib,
-		arg.Disabled,
+		arg.ExpectedStatus,
 	)
 	var i User
 	err := row.Scan(
@@ -171,9 +218,10 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		&i.QuotaHosts,
 		&i.QuotaCpuMilli,
 		&i.QuotaMemMib,
-		&i.Disabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Status,
+		&i.MustChangePassword,
 	)
 	return i, err
 }
