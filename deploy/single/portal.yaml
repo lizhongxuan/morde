@@ -1,0 +1,81 @@
+instance: cloudhost
+listen:
+  api: 127.0.0.1:7080
+  gateway: 127.0.0.1:7081
+  metrics: 127.0.0.1:7082
+http:
+  read_header_timeout: 10s
+  read_timeout: 60s
+  write_timeout: 60s
+  idle_timeout: 120s
+  shutdown_timeout: 30s
+  api_max_body_bytes: 1048576
+  mcp_max_body_bytes: 4194304
+domains:
+  scheme: ${CH_SCHEME}
+  portal: ${CH_PORTAL_DOMAIN}
+  host_suffix: ${CH_HOST_SUFFIX}
+  cookie_secure: ${CH_COOKIE_SECURE}
+database:
+  dsn: ${CH_DATABASE_DSN}
+  max_conns: 16
+security:
+  data_key_file: ${CH_DATA_KEY_FILE}
+  cookie_key_file: ${CH_COOKIE_KEY_FILE}
+  session_ttl: 12h
+  ticket_ttl: 60s
+  host_cookie_ttl: 8h
+  login_rate_limit: 5/min
+models:
+  allowed_hosts: [api.openai.com]
+orchestrator:
+  profiles:
+    container:
+      base_url: ${CH_OSB_URL}
+      api_key: ${CH_OSB_API_KEY}
+      request_timeout: 30s
+      network_guard_path: ${CH_NETWORK_GUARD_PATH}
+templates:
+  dir: ${CH_TEMPLATE_DIR}
+  default: std-2c4g
+hosts:
+  ready_timeout: 3m
+  ready_poll_interval: 2s
+capacity:
+  cpu_milli: 2000
+  mem_mib: 4096
+reconciler:
+  interval: 30s
+  renew_before: 10m
+  activity_flush_interval: 30s
+storage:
+  driver: docker
+  docker_host: ${CH_DOCKER_HOST}
+  docker_data_dir: ${CH_DOCKER_DATA_DIR}
+  min_free_bytes: ${CH_DOCKER_MIN_FREE_BYTES}
+workspace_storage:
+  root_dir: ${CH_WORKSPACE_STORAGE_ROOT_DIR}
+  max_workspace_bytes: ${CH_WORKSPACE_MAX_BYTES}
+  max_owner_bytes: ${CH_WORKSPACE_OWNER_MAX_BYTES}
+  min_free_bytes: ${CH_WORKSPACE_MIN_FREE_BYTES}
+site_storage:
+  root_dir: ${CH_SITE_STORAGE_ROOT_DIR}
+  max_release_bytes: ${CH_SITE_STORAGE_MAX_RELEASE_BYTES}
+  max_owner_bytes: ${CH_SITE_STORAGE_MAX_OWNER_BYTES}
+  min_free_bytes: ${CH_SITE_STORAGE_MIN_FREE_BYTES}
+gateway:
+  workbench_dir: web/workbench/dist
+  upstream_cache_ttl: 30s
+  credential_cache_ttl: 10s
+  preview_port_min: 1024
+  preview_port_deny: [8080, 5900, 6080, 8091, 8100, 9222]
+  max_body_bytes: 104857600
+mcp:
+  enabled: true
+  max_output_bytes: 65536
+  screenshot_max_width: 1280
+portal_web:
+  dir: web/portal/dist
+log:
+  level: info
+  format: json

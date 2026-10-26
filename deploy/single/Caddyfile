@@ -1,0 +1,17 @@
+{
+	on_demand_tls {
+		ask http://127.0.0.1:7080/__ch/cert-authorize
+	}
+}
+
+{$CH_CADDY_PORTAL_ADDRESS} {
+	{$CH_CADDY_PORTAL_TLS}
+	@certificateAuth path /__ch/cert-authorize
+	respond @certificateAuth 404
+	reverse_proxy 127.0.0.1:7080
+}
+
+{$CH_CADDY_HOST_ADDRESS} {
+	{$CH_CADDY_HOST_TLS}
+	reverse_proxy 127.0.0.1:7081
+}

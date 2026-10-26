@@ -1,0 +1,25 @@
+# The API key is supplied with OPENSANDBOX_SERVER_API_KEY by Compose.
+
+[server]
+host = "127.0.0.1"
+port = 18080
+eip = "127.0.0.1"
+
+[proxy]
+resolve_internal = false
+
+[runtime]
+type = "docker"
+execd_image = "docker.io/opensandbox/execd:release-1.1.1@sha256:cda2bc35409bbf57561599b316cafb899598f7dce671332e7ceda14eb1cfeded"
+
+[docker]
+network_mode = "cloudhost"
+publish_host = "127.0.0.1"
+pids_limit = 4096
+seccomp_profile = "unconfined"
+drop_capabilities = ["NET_RAW"]
+sandbox_binds = ["/etc/cloudhost/resolv.conf:/etc/resolv.conf:ro"]
+
+[secure_runtime]
+type = "gvisor"
+docker_runtime = "runsc"

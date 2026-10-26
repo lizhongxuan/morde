@@ -1,0 +1,3 @@
+[mcp_servers.cloudhost]
+url = "https://portal.example.com/mcp"
+bearer_token_env_var = "CH_CLOUDHOST_API_KEY"

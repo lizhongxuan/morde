@@ -1,0 +1,79 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - depguard
+    - errcheck
+    - errorlint
+    - ineffassign
+    - staticcheck
+    - govet
+    - unused
+    - forbidigo
+  settings:
+    depguard:
+      rules:
+        domain:
+          list-mode: lax
+          files:
+            - "internal/domain/**/*.go"
+          allow:
+            - $gostd
+        app:
+          list-mode: lax
+          files:
+            - "internal/app/**/*.go"
+          deny:
+            - pkg: github.com/gin-gonic/gin
+              desc: HTTP framework belongs in adapters
+            - pkg: github.com/jackc/pgx/v5
+              desc: database access belongs in adapters
+            - pkg: morde/server/internal/store/postgres/sqlcgen
+              desc: generated database code belongs in adapters
+            - pkg: morde/server/internal/config
+              desc: config is converted to app options by cmd
+            - pkg: morde/server/internal/(api|gateway|mcp|httpserver|worker|store|orchestrator|aio|storage)
+              desc: app cannot depend on adapters
+        gin:
+          list-mode: lax
+          files:
+            - "internal/**/*.go"
+            - "cmd/**/*.go"
+          deny:
+            - pkg: github.com/gin-gonic/gin
+              desc: Gin is allowed only in HTTP adapters and cmd
+          allow:
+            - morde/server/internal/api
+            - morde/server/internal/gateway
+            - morde/server/internal/httpserver
+            - morde/server/cmd
+    forbidigo:
+      forbid:
+        - pattern: "zap\\.L\\("
+          msg: inject a logger instead of using the global logger
+        - pattern: "zap\\.S\\("
+          msg: inject a logger instead of using the global logger
+        - pattern: "zap\\.ReplaceGlobals"
+          msg: do not use global loggers
+        - pattern: "prometheus\\.MustRegister"
+          msg: inject a private registry
+        - pattern: "prometheus\\.DefaultRegisterer"
+          msg: inject a private registry
+        - pattern: "gin\\.Default"
+          msg: use gin.New with explicit middleware
+        - pattern: "log/slog"
+          msg: use the injected zap logger
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - morde/server

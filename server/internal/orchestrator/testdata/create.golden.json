@@ -1,0 +1,10 @@
+{
+  "image": {"uri": "registry.local/cloudhost/host:1.0.0"},
+  "entrypoint": ["/usr/local/bin/morde-host-entrypoint"],
+  "timeout": 28800,
+  "resourceRequests": {"cpu": "500m", "memory": "1536Mi"},
+  "resourceLimits": {"cpu": "2", "memory": "4Gi"},
+  "env": {"MORDE_HOST_ID": "h1234567", "MORDE_RUNTIME_BOOTSTRAP_KEY": "redacted", "MORDE_RUNTIME_GENERATION": "1", "SANDBOX_API_KEY": "redacted", "TZ": "Asia/Shanghai", "WORKSPACE": "/home/gem/workspace"},
+  "metadata": {"ch-env": "hostctl", "ch-host": "h1234567", "ch-owner": "cli", "ch-workspace": ""},
+  "volumes": [{"name": "profile-data", "mountPath": "/home/gem", "pvc": {"claimName": "profile-h1234567", "createIfNotExists": true, "deleteOnSandboxTermination": false, "storage": "5Gi"}}, {"name": "workspace", "mountPath": "/home/gem/workspace", "pvc": {"claimName": "ws-w1234567", "createIfNotExists": true, "deleteOnSandboxTermination": false, "storage": "20Gi"}}, {"name": "runtime-data", "mountPath": "/var/lib/morde-runtime", "pvc": {"claimName": "runtime-h1234567", "createIfNotExists": true, "deleteOnSandboxTermination": false, "storage": "1Gi"}}]
+}
