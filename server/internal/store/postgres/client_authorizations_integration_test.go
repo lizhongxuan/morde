@@ -390,7 +390,7 @@ func TestMigrationRetiresUnlinkedDeviceTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := provider.Down(ctx); err != nil {
+	if _, err := provider.DownTo(ctx, 43); err != nil {
 		t.Fatal(err)
 	}
 	owner := createTestUser(t, store, 2, 10_000, 20_000)
@@ -448,7 +448,7 @@ func TestMigrationRetiresUnlinkedDeviceTokens(t *testing.T) {
 	if _, err := store.CreateToken(ctx, clientTestToken(t, owner.ID, "", identity.KindDevice, nil)); err == nil {
 		t.Fatal("new unlinked device token passed database constraint")
 	}
-	if _, err := provider.Down(ctx); err != nil {
+	if _, err := provider.DownTo(ctx, 43); err != nil {
 		t.Fatal(err)
 	}
 	retired, err = store.GetTokenByID(ctx, legacy.ID)
@@ -496,5 +496,49 @@ func TestMigrationBackfillsClientTaskInstallationSnapshot(t *testing.T) {
 	loaded, err := store.GetTask(ctx, taskID, owner.ID)
 	if err != nil || loaded.Task.Authorization.ClientInstallationID != installationID {
 		t.Fatalf("backfilled client task authorization = %#v, err=%v", loaded.Task.Authorization, err)
+	}
+}
+
+func TestMigrationRejectsClientTaskWithoutClientToken(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	provider, closeProvider, err := newMigrationProvider(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProvider()
+	if _, err := provider.Down(ctx); err != nil {
+		t.Fatalf("roll back task installation snapshot migration: %v", err)
+	}
+
+	owner := createTestUser(t, store, 2, 10_000, 20_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	conversationID := mustID(t, domain.NewConversationID)
+	if _, err := pool.Exec(ctx, `INSERT INTO conversations (id,owner_id,host_id,title) VALUES ($1,$2,$3,'orphan-client-task')`,
+		conversationID, owner.ID, hostValue.ID); err != nil {
+		t.Fatalf("create pre-migration conversation: %v", err)
+	}
+	orphanTokenID := mustID(t, domain.NewTokenID)
+	taskID := mustID(t, domain.NewTaskID)
+	if _, err := pool.Exec(ctx, `INSERT INTO tasks (
+  id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes,
+  budget_active_seconds, budget_tool_calls, budget_model_tokens
+) VALUES ($1,$2,$3,$4,'model-test','orphan pre-migration client task','queued','client',$5,'{}',1800,100,50000)`,
+		taskID, owner.ID, conversationID, hostValue.ID, orphanTokenID); err != nil {
+		t.Fatalf("create client task with missing token: %v", err)
+	}
+
+	if _, err := provider.Up(ctx); err == nil || !strings.Contains(err.Error(), "client task(s) have no matching client token") {
+		t.Fatalf("migration error = %v, want missing client token diagnostic", err)
+	}
+	var hasInstallationSnapshot bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM information_schema.columns
+  WHERE table_schema=current_schema() AND table_name='tasks' AND column_name='auth_client_installation_id'
+)`).Scan(&hasInstallationSnapshot); err != nil {
+		t.Fatalf("check migration rollback: %v", err)
+	}
+	if hasInstallationSnapshot {
+		t.Fatal("failed migration left the task installation snapshot column behind")
 	}
 }
