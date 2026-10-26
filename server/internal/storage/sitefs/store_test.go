@@ -506,6 +506,10 @@ func TestStoreSerializesFreeSpaceReservationsAcrossInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	chunk := make([]byte, 64<<20)
+	if _, err := rand.Read(chunk); err != nil {
+		t.Fatal(err)
+	}
 	freeBytes, err := availableBytes(root)
 	if err != nil {
 		t.Fatal(err)
@@ -513,18 +517,17 @@ func TestStoreSerializesFreeSpaceReservationsAcrossInstances(t *testing.T) {
 	if freeBytes > uint64(^uint64(0)>>1) {
 		t.Fatal("filesystem free space exceeds int64 test range")
 	}
-	chunk := make([]byte, 64<<20)
 	reserveWindow := uint64(len(chunk)) + uint64(32<<20)
 	if freeBytes <= uint64(len(chunk))+reserveWindow {
 		t.Fatal("filesystem has too little free space for this test")
 	}
 	first.minFreeBytes = int64(freeBytes) - int64(reserveWindow)
 	second.minFreeBytes = int64(freeBytes) - int64(reserveWindow)
-	if _, err := rand.Read(chunk); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := firstFile.Write(chunk); err != nil {
 		t.Fatalf("first instance write failed: %v", err)
+	}
+	if err := firstFile.Close(); err != nil {
+		t.Fatalf("sync first instance write: %v", err)
 	}
 	if _, err := secondFile.Write(chunk); !errors.Is(err, ErrInsufficientFree) {
 		t.Fatalf("second instance should observe consumed capacity, got %v", err)

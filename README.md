@@ -32,10 +32,7 @@ Morde 是一个让用户和 AI 共用云端电脑与工作区的平台。它在�
 | `server/` | Go 服务、Portal API、Gateway、MCP、后台任务、数据库迁移与 OpenAPI 契约 |
 | `web/portal/` | 用户 PC Web 与管理后台 Web |
 | `web/workbench/` | Host 内的网页工作台 |
-| `project/morde-runtime/` | Host 内的受控运行端 |
-| `project/morde-sync/` | 本机与云端共用的文件同步引擎 |
-| `project/morde-desktop/` | 当前 MVP 的 macOS 本机配套端 |
-| `project/nanoMuse/` | 后续多端客户端的代码底座；不属于当前 MVP 构建 |
+|  |
 | `images/`、`deploy/single/` | Host 镜像与单机部署文件 |
 | `examples/agent/` | Codex 平台 MCP 接入示例 |
 | `docs/` | 需求、实施合同、设计与验证记录 |
