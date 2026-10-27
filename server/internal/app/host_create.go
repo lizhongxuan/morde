@@ -25,20 +25,22 @@ import (
 // HostServiceOptions are the app-layer dependencies and config values needed
 // by the shared Portal API and MCP HostService implementation.
 type HostServiceOptions struct {
-	Hosts        HostStore
-	Workspaces   WorkspaceStore
-	Tokens       TokenStore
-	Sandboxes    SandboxRouter
-	Volumes      VolumeDeleter
-	DiskCapacity DiskCapacityChecker
-	Probe        HostProbe
-	Runtime      RuntimeHandshaker
-	Audit        AuditWriter
-	CreateLocks  HostCreateLockStore
-	Sealer       *Sealer
-	Templates    map[string]template.Template
-	Capacity     Capacity
-	Instance     string
+	Hosts             HostStore
+	Users             UserStore
+	Workspaces        WorkspaceStore
+	Tokens            TokenStore
+	Sandboxes         SandboxRouter
+	Volumes           VolumeDeleter
+	DiskCapacity      DiskCapacityChecker
+	Probe             HostProbe
+	Runtime           RuntimeHandshaker
+	Audit             AuditWriter
+	CreateLocks       HostCreateLockStore
+	Sealer            *Sealer
+	Templates         map[string]template.Template
+	DefaultTemplateID string
+	Capacity          Capacity
+	Instance          string
 
 	Scheme            string
 	PortalURL         string
@@ -53,36 +55,38 @@ type HostServiceOptions struct {
 }
 
 type hostService struct {
-	hosts        HostStore
-	workspaces   WorkspaceStore
-	tokens       TokenStore
-	sandboxes    SandboxRouter
-	volumes      VolumeDeleter
-	diskCapacity DiskCapacityChecker
-	probe        HostProbe
-	runtime      RuntimeHandshaker
-	audit        AuditWriter
-	createLocks  HostCreateLockStore
-	sealer       *Sealer
-	templates    map[string]template.Template
-	capacity     Capacity
-	instance     string
-	scheme       string
-	portalURL    string
-	hostSuffix   string
-	ticketTTL    time.Duration
-	readyTimeout time.Duration
-	pollInterval time.Duration
-	notifyCreate func(context.Context, string) error
-	observeReady func(string, time.Duration)
-	countAudit   func()
-	logger       *zap.Logger
+	hosts             HostStore
+	users             UserStore
+	workspaces        WorkspaceStore
+	tokens            TokenStore
+	sandboxes         SandboxRouter
+	volumes           VolumeDeleter
+	diskCapacity      DiskCapacityChecker
+	probe             HostProbe
+	runtime           RuntimeHandshaker
+	audit             AuditWriter
+	createLocks       HostCreateLockStore
+	sealer            *Sealer
+	templates         map[string]template.Template
+	defaultTemplateID string
+	capacity          Capacity
+	instance          string
+	scheme            string
+	portalURL         string
+	hostSuffix        string
+	ticketTTL         time.Duration
+	readyTimeout      time.Duration
+	pollInterval      time.Duration
+	notifyCreate      func(context.Context, string) error
+	observeReady      func(string, time.Duration)
+	countAudit        func()
+	logger            *zap.Logger
 }
 
 // NewHostService constructs the one HostService implementation shared by
 // HTTP and MCP adapters. Worker creation progress is exposed by AdvanceCreate.
 func NewHostService(options HostServiceOptions) (*hostService, error) {
-	if options.Hosts == nil || options.Workspaces == nil || options.Tokens == nil ||
+	if options.Hosts == nil || options.Users == nil || options.Workspaces == nil || options.Tokens == nil ||
 		options.Sandboxes == nil || options.Volumes == nil || options.DiskCapacity == nil || options.Probe == nil || options.Runtime == nil ||
 		options.Audit == nil || options.CreateLocks == nil || options.Sealer == nil || options.NotifyCreate == nil ||
 		options.ObserveHostReady == nil || options.CountAuditFailure == nil {
@@ -106,6 +110,9 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 	if len(options.Templates) == 0 {
 		return nil, fmt.Errorf("host service templates are required")
 	}
+	if _, ok := options.Templates[options.DefaultTemplateID]; !ok {
+		return nil, fmt.Errorf("host service default template is required")
+	}
 
 	profiles := options.Sandboxes.Profiles()
 	templates := make(map[string]template.Template, len(options.Templates))
@@ -119,10 +126,10 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 		templates[id] = value
 	}
 	return &hostService{
-		hosts: options.Hosts, workspaces: options.Workspaces, tokens: options.Tokens,
+		hosts: options.Hosts, users: options.Users, workspaces: options.Workspaces, tokens: options.Tokens,
 		sandboxes: options.Sandboxes, volumes: options.Volumes, diskCapacity: options.DiskCapacity,
 		probe: options.Probe, runtime: options.Runtime, audit: options.Audit, createLocks: options.CreateLocks, sealer: options.Sealer,
-		templates: templates, capacity: options.Capacity, instance: options.Instance,
+		templates: templates, defaultTemplateID: options.DefaultTemplateID, capacity: options.Capacity, instance: options.Instance,
 		scheme: options.Scheme, portalURL: options.PortalURL, hostSuffix: options.HostSuffix,
 		ticketTTL: options.TicketTTL, readyTimeout: options.ReadyTimeout,
 		pollInterval: options.ReadyPollInterval, notifyCreate: options.NotifyCreate,
@@ -142,14 +149,8 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		if !principal.HasScope(identity.ScopeHostCreate) {
 			return host.Host{}, domain.NewError(domain.CodeForbidden, "API key scope is insufficient")
 		}
-		if len(command.WorkspaceIDs) != 0 {
-			return host.Host{}, domain.NewError(domain.CodeForbidden, "API keys can only create an unbound host")
-		}
 	}
-	tmpl, ok := s.templates[command.TemplateID]
-	if !ok {
-		return host.Host{}, domain.NewError(domain.CodeNotFound, "template not found")
-	}
+	tmpl := s.templates[s.defaultTemplateID]
 	if command.Name != "" && len(command.Name) > 100 {
 		return host.Host{}, domain.InvalidArgument("name", "host name is too long")
 	}
@@ -179,10 +180,9 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 			return host.Host{}, err
 		}
 		record, err := idempotencyRecord(principal.UserID, "host.create", command.IdempotencyKey, struct {
-			TemplateID   string   `json:"template_id"`
 			Name         string   `json:"name"`
 			WorkspaceIDs []string `json:"workspace_ids"`
-		}{tmpl.ID, name, sortedWorkspaceIDs}, "", "")
+		}{name, sortedWorkspaceIDs}, "", "")
 		if err != nil {
 			return host.Host{}, err
 		}
@@ -210,21 +210,13 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		}
 	}
 
-	requestCPU, err := template.CPUMilli(tmpl.Resources.Requests.CPU)
-	if err != nil || requestCPU > math.MaxInt32 {
-		return host.Host{}, domain.InvalidArgument("template", "template cpu request is invalid")
+	user, err := s.users.GetUserByID(ctx, principal.UserID)
+	if err != nil {
+		return host.Host{}, err
 	}
-	requestMemory, err := template.MemMiB(tmpl.Resources.Requests.Memory)
-	if err != nil || requestMemory > math.MaxInt32 {
-		return host.Host{}, domain.InvalidArgument("template", "template memory request is invalid")
-	}
-	limitCPU, err := template.CPUMilli(tmpl.Resources.Limits.CPU)
-	if err != nil || limitCPU > math.MaxInt32 {
-		return host.Host{}, domain.InvalidArgument("template", "template cpu limit is invalid")
-	}
-	limitMemory, err := template.MemMiB(tmpl.Resources.Limits.Memory)
-	if err != nil || limitMemory > math.MaxInt32 {
-		return host.Host{}, domain.InvalidArgument("template", "template memory limit is invalid")
+	if user.DefaultHostCPUMilli <= 0 || user.DefaultHostMemMiB <= 0 ||
+		user.DefaultHostCPUMilli > math.MaxInt32 || user.DefaultHostMemMiB > math.MaxInt32 {
+		return host.Host{}, domain.NewError(domain.CodeInvalidState, "default host resources are invalid")
 	}
 	if err := s.diskCapacity.CheckCapacity(ctx); err != nil {
 		s.logger.Warn("host create blocked by storage capacity check", zap.Error(err))
@@ -234,35 +226,10 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		return host.Host{}, domain.NewError(domain.CodeUpstreamError, "host storage capacity is unavailable")
 	}
 
-	keyBytes := make([]byte, 32)
-	if _, err := rand.Read(keyBytes); err != nil {
-		return host.Host{}, fmt.Errorf("generate host api key: %w", err)
-	}
-	key := base64.RawURLEncoding.EncodeToString(keyBytes)
-	clear(keyBytes)
-	sealedKey, err := s.sealer.Seal([]byte(key))
+	value, err := s.newHostRecord(principal.UserID, name, tmpl, host.StateCreating,
+		user.DefaultHostCPUMilli, user.DefaultHostMemMiB, user.DefaultHostCPUMilli, user.DefaultHostMemMiB)
 	if err != nil {
-		return host.Host{}, fmt.Errorf("seal host api key: %w", err)
-	}
-	runtimeCredentialBytes := make([]byte, 32)
-	if _, err := rand.Read(runtimeCredentialBytes); err != nil {
-		return host.Host{}, fmt.Errorf("generate host runtime credential: %w", err)
-	}
-	runtimeCredential := base64.RawURLEncoding.EncodeToString(runtimeCredentialBytes)
-	clear(runtimeCredentialBytes)
-	sealedRuntimeCredential, err := s.sealer.Seal([]byte(runtimeCredential))
-	if err != nil {
-		return host.Host{}, fmt.Errorf("seal host runtime credential: %w", err)
-	}
-	now := time.Now().UTC()
-	expires := now.Add(tmpl.Lifecycle.TTL)
-	value := host.Host{
-		OwnerID: principal.UserID, Name: name,
-		TemplateID: tmpl.ID, RuntimeProfile: tmpl.Isolation,
-		State: host.StateCreating, CPUMilli: int(requestCPU), MemMiB: int(requestMemory),
-		CPULimitMilli: int(limitCPU), MemLimitMiB: int(limitMemory),
-		AIOKeyEnc: sealedKey, RuntimeCredentialEnc: sealedRuntimeCredential,
-		RuntimeGeneration: 1, ExpiresAt: &expires,
+		return host.Host{}, err
 	}
 	var created host.Host
 	var replayed bool
@@ -272,14 +239,10 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		if createErr != nil {
 			return host.Host{}, fmt.Errorf("generate host id: %w", createErr)
 		}
-		grantTokenID := ""
-		if principal.Kind == identity.KindAPIKey {
-			grantTokenID = principal.TokenID
-		}
 		createRecord := idempotency
 		createRecord.ResourceID = value.ID
 		created, replayed, createErr = s.hosts.CreateHost(ctx, CreateHostParams{
-			Host: value, WorkspaceIDs: sortedWorkspaceIDs, Capacity: s.capacity, GrantTokenID: grantTokenID, Idempotency: createRecord,
+			Host: value, WorkspaceIDs: sortedWorkspaceIDs, Capacity: s.capacity, Idempotency: createRecord,
 		})
 		if createErr == nil || !isUniqueViolation(createErr) {
 			break
@@ -304,6 +267,77 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		}
 	}
 	return created, nil
+}
+
+func (s *hostService) newHostRecord(ownerID, name string, tmpl template.Template, state host.State, cpu, mem, cpuLimit, memLimit int) (host.Host, error) {
+	keyBytes := make([]byte, 32)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return host.Host{}, fmt.Errorf("generate host api key: %w", err)
+	}
+	key := base64.RawURLEncoding.EncodeToString(keyBytes)
+	clear(keyBytes)
+	sealedKey, err := s.sealer.Seal([]byte(key))
+	if err != nil {
+		return host.Host{}, fmt.Errorf("seal host api key: %w", err)
+	}
+	runtimeCredentialBytes := make([]byte, 32)
+	if _, err := rand.Read(runtimeCredentialBytes); err != nil {
+		return host.Host{}, fmt.Errorf("generate host runtime credential: %w", err)
+	}
+	runtimeCredential := base64.RawURLEncoding.EncodeToString(runtimeCredentialBytes)
+	clear(runtimeCredentialBytes)
+	sealedRuntimeCredential, err := s.sealer.Seal([]byte(runtimeCredential))
+	if err != nil {
+		return host.Host{}, fmt.Errorf("seal host runtime credential: %w", err)
+	}
+	value := host.Host{
+		OwnerID: ownerID, Name: name,
+		TemplateID: tmpl.ID, RuntimeProfile: tmpl.Isolation,
+		State: state, CPUMilli: cpu, MemMiB: mem,
+		CPULimitMilli: cpuLimit, MemLimitMiB: memLimit,
+		AIOKeyEnc: sealedKey, RuntimeCredentialEnc: sealedRuntimeCredential,
+		RuntimeGeneration: 1,
+	}
+	if state == host.StateCreating {
+		expires := time.Now().UTC().Add(tmpl.Lifecycle.TTL)
+		value.ExpiresAt = &expires
+	}
+	return value, nil
+}
+
+func (s *hostService) EnsureDefaultStopped(ctx context.Context, user identity.User) (host.Host, bool, error) {
+	if !domain.ValidUserID(user.ID) {
+		return host.Host{}, false, domain.InvalidArgument("user_id", "user id is invalid")
+	}
+	user, err := s.users.GetUserByID(ctx, user.ID)
+	if err != nil {
+		return host.Host{}, false, err
+	}
+	if user.DefaultHostCPUMilli <= 0 || user.DefaultHostMemMiB <= 0 ||
+		user.DefaultHostCPUMilli > math.MaxInt32 || user.DefaultHostMemMiB > math.MaxInt32 {
+		return host.Host{}, false, domain.NewError(domain.CodeInvalidState, "default host resources are invalid")
+	}
+	tmpl := s.templates[s.defaultTemplateID]
+	value, err := s.newHostRecord(user.ID, tmpl.Name, tmpl, host.StateStopped,
+		user.DefaultHostCPUMilli, user.DefaultHostMemMiB, user.DefaultHostCPUMilli, user.DefaultHostMemMiB)
+	if err != nil {
+		return host.Host{}, false, err
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		value.ID, err = domain.NewHostID()
+		if err != nil {
+			return host.Host{}, false, fmt.Errorf("generate host id: %w", err)
+		}
+		created, didCreate, createErr := s.hosts.EnsureDefaultHost(ctx, CreateHostParams{Host: value, Capacity: s.capacity})
+		if createErr == nil {
+			return created, didCreate, nil
+		}
+		if !isUniqueViolation(createErr) {
+			return host.Host{}, false, createErr
+		}
+		err = createErr
+	}
+	return host.Host{}, false, fmt.Errorf("%w: %w", domain.ErrIDAttemptsExhausted, err)
 }
 
 // AdvanceCreate performs one host's recoverable create workflow. It is
@@ -440,8 +474,8 @@ func (s *hostService) createRequest(ctx context.Context, value host.Host) (Sandb
 	return SandboxCreateRequest{
 		Image: tmpl.Image, Entrypoint: append([]string(nil), tmpl.Entrypoint...),
 		Timeout:  tmpl.Lifecycle.TTL,
-		Requests: SandboxResources{CPU: tmpl.Resources.Requests.CPU, Memory: tmpl.Resources.Requests.Memory},
-		Limits:   SandboxResources{CPU: tmpl.Resources.Limits.CPU, Memory: tmpl.Resources.Limits.Memory},
+		Requests: SandboxResources{CPU: strconv.Itoa(value.CPUMilli) + "m", Memory: strconv.Itoa(value.MemMiB) + "Mi"},
+		Limits:   SandboxResources{CPU: strconv.Itoa(value.CPULimitMilli) + "m", Memory: strconv.Itoa(value.MemLimitMiB) + "Mi"},
 		Env: map[string]string{
 			"SANDBOX_API_KEY": string(key), "MORDE_RUNTIME_BOOTSTRAP_KEY": runtimeCredentialString,
 			"MORDE_HOST_REPLICA_KEY": replicaCredential, "MORDE_PORTAL_URL": s.portalURL,

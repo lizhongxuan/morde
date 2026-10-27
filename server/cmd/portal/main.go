@@ -165,8 +165,15 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 	store := postgres.New(pool)
+	serviceInstanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		return fmt.Errorf("load service instance identity: %w", err)
+	}
 	if err := app.EnsureInitialAdmin(ctx, store); err != nil {
 		return fmt.Errorf("initialize administrator: %w", err)
+	}
+	if err := store.RetireTaskExecution(ctx); err != nil {
+		return fmt.Errorf("retire task execution before serving: %w", err)
 	}
 	workspaceBlocks, err := workspacefs.Open(cfg.WorkspaceStorage.RootDir)
 	if err != nil {
@@ -226,6 +233,18 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model connections: %w", err)
 	}
+	modelGateway, err := app.NewModelGatewayService(store, modelConnections, modelClient)
+	if err != nil {
+		return fmt.Errorf("initialize model gateway: %w", err)
+	}
+	modelUsageAdmin, err := app.NewModelUsageAdminService(store)
+	if err != nil {
+		return fmt.Errorf("initialize model usage admin: %w", err)
+	}
+	instantChat, err := app.NewInstantChatService(store, modelGateway)
+	if err != nil {
+		return fmt.Errorf("initialize instant chat: %w", err)
+	}
 	aioClient := aio.New(nil)
 	volumes, err := newVolumeDeleter(cfg.Storage)
 	if err != nil {
@@ -258,9 +277,9 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 	hosts, err := app.NewHostService(app.HostServiceOptions{
-		Hosts: store, Workspaces: store, Tokens: store,
+		Hosts: store, Users: store, Workspaces: store, Tokens: store,
 		Sandboxes: router, Probe: aioClient, Runtime: runtimeControl, Audit: auditService, CreateLocks: store, Sealer: sealer, Volumes: volumes, DiskCapacity: volumes,
-		Templates: templates, Capacity: app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB},
+		Templates: templates, DefaultTemplateID: cfg.Templates.Default, Capacity: app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB},
 		Instance: cfg.Instance, Scheme: cfg.Domains.Scheme, PortalURL: cfg.Domains.Scheme + "://" + cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
 		TicketTTL: cfg.Security.TicketTTL, ReadyTimeout: cfg.Hosts.ReadyTimeout,
 		ReadyPollInterval: cfg.Hosts.ReadyPollInterval, NotifyCreate: queue.Notify,
@@ -269,6 +288,10 @@ func serve(ctx context.Context, configPath string) error {
 		},
 		CountAuditFailure: auditFailures.Inc, Logger: logger,
 	})
+	if err != nil {
+		return err
+	}
+	adminHostResources, err := app.NewAdminHostResourcesService(store, app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB}, router)
 	if err != nil {
 		return err
 	}
@@ -284,9 +307,17 @@ func serve(ctx context.Context, configPath string) error {
 	credentials, err := app.NewCredentialService(store, store, store, countedAudit, app.CredentialOptions{
 		SessionTTL: cfg.Security.SessionTTL, TicketTTL: cfg.Security.TicketTTL,
 		LoginLimit: loginLimit(cfg.Security.LoginRateLimit), LoginWindow: time.Minute,
-	})
+	}, hosts)
 	if err != nil {
 		return err
+	}
+	tasks, err := app.NewTaskService(store, credentials, modelConnections)
+	if err != nil {
+		return fmt.Errorf("initialize task service: %w", err)
+	}
+	conversations, err := app.NewConversationService(store, credentials)
+	if err != nil {
+		return fmt.Errorf("initialize conversation service: %w", err)
 	}
 	users, err := app.NewUserService(store, store)
 	if err != nil {
@@ -315,19 +346,11 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	tokens, err := app.NewTokenService(store, store, countedAudit, 30*24*time.Hour, 365*24*time.Hour, hostSharing)
+	tokens, err := app.NewTokenService(store, countedAudit, 30*24*time.Hour, 365*24*time.Hour)
 	if err != nil {
 		return err
 	}
-	clientAuthorizations, err := app.NewClientAuthorizationService(store, store)
-	if err != nil {
-		return err
-	}
-	taskService, err := app.NewTaskService(store, credentials, modelConnections)
-	if err != nil {
-		return err
-	}
-	scheduleService, err := app.NewScheduleService(store, credentials, modelConnections)
+	clientLogin, err := app.NewClientLoginService(store, credentials)
 	if err != nil {
 		return err
 	}
@@ -339,23 +362,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize onboarding service: %w", err)
 	}
-	executionControlService, err := app.NewExecutionControlService(store, auditService)
-	if err != nil {
-		return err
-	}
 	controlService, err := app.NewControlService(store, credentials, store, store, store, runtimeControl, auditService, store)
-	if err != nil {
-		return err
-	}
-	runtimeTools, err := app.NewRuntimeToolExecutor(store, credentials, runtimeControl, runtimeControl)
-	if err != nil {
-		return err
-	}
-	agentTools, err := app.NewScheduleAgentToolExecutor(runtimeTools, scheduleService)
-	if err != nil {
-		return err
-	}
-	agent, err := app.NewAgent(store, modelConnections, modelClient, credentials, runtimeControl, agentTools)
 	if err != nil {
 		return err
 	}
@@ -367,13 +374,6 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("generate task worker identity: %w", err)
 	}
-	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
-		Store: store, Executor: agent, WorkerID: workerSuffix,
-		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond, Logger: logger,
-	})
-	if err != nil {
-		return err
-	}
 	taskStopWorker, err := worker.NewTaskStopWorker(worker.TaskStopWorkerOptions{
 		Store: store, Executor: runtimeControl, WorkerID: workerSuffix + "-stop",
 		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond,
@@ -382,13 +382,9 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	conversationService, err := app.NewConversationService(store, credentials)
-	if err != nil {
-		return err
-	}
 	mcpHandler, err := mcp.New(mcp.Deps{
 		Config: cfg.MCP, Domains: cfg.Domains, Hosts: hosts, Applications: mcpRuntimeTools, RuntimeTools: mcpRuntimeTools,
-		Tasks: taskService, Schedules: scheduleService, Auth: credentials, Audit: auditService, Logger: logger, Metrics: registry,
+		Auth: credentials, Audit: auditService, Logger: logger, Metrics: registry,
 		PreviewPortMin: cfg.Gateway.PreviewPortMin, PreviewPortDeny: cfg.Gateway.PreviewPortDeny,
 	})
 	if err != nil {
@@ -407,13 +403,14 @@ func serve(ctx context.Context, configPath string) error {
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, Sites: siteService, Templates: templateAdapter{values: templates},
-		Tokens: tokenAdapter{service: tokens}, ClientAuthorizations: clientAuthorizations,
-		Tasks: taskService, Schedules: scheduleService, Notifications: notificationService, ExecutionControl: executionControlService,
-		Control: controlService, Conversations: conversationService, ModelConnections: modelConnections, Onboarding: onboardingService, Admin: admin, AdminWorkspaces: adminWorkspaces,
+		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
+		Notifications: notificationService,
+		Control:       controlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
+		ModelConnections: modelConnections, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin, Onboarding: onboardingService, Admin: admin, AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
 		Readiness: readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
 	}, api.Options{
-		Logger: logger, Metrics: registry, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
+		Logger: logger, Metrics: registry, ServiceInstanceID: serviceInstanceID, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
 		MCPMaxBodyBytes: cfg.HTTP.MCPMaxBodyBytes, CookieSecure: cfg.Domains.CookieSecure,
 		SessionTTL: cfg.Security.SessionTTL,
 		HostScheme: cfg.Domains.Scheme, PortalDomain: cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
@@ -438,10 +435,6 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	scheduleWorker, err := worker.NewScheduleWorker(scheduleService, time.Second, logger)
-	if err != nil {
-		return err
-	}
 	notificationWorker, err := worker.NewNotificationWorker(worker.NotificationWorkerOptions{
 		Service: notificationService, PollInterval: time.Second, BatchSize: 100, Logger: logger,
 	})
@@ -452,7 +445,7 @@ func serve(ctx context.Context, configPath string) error {
 	gatewayServer := httpserver.NewServer(cfg.Listen.Gateway, gatewayHandler, cfg.HTTP)
 	metricsServer := httpserver.NewServer(cfg.Listen.Metrics, metricsHandler(registry), cfg.HTTP)
 	logger.Info("portal starting", zap.String("instance", cfg.Instance), zap.Int64("migration_version", migrationVersion), zap.String("api", cfg.Listen.API), zap.String("gateway", cfg.Listen.Gateway), zap.String("metrics", cfg.Listen.Metrics))
-	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskWorker, taskStopWorker, scheduleWorker, notificationWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
 func migrate(ctx context.Context, configPath, action string, stdout io.Writer) error {
@@ -798,7 +791,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskWorker *worker.TaskWorker, taskStopWorker *worker.TaskStopWorker, scheduleWorker *worker.ScheduleWorker, notificationWorker *worker.NotificationWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -813,12 +806,8 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- background.Run(workerCtx) }()
-	taskWorkerDone := make(chan error, 1)
-	go func() { taskWorkerDone <- taskWorker.Run(workerCtx) }()
 	taskStopWorkerDone := make(chan error, 1)
 	go func() { taskStopWorkerDone <- taskStopWorker.Run(workerCtx) }()
-	scheduleWorkerDone := make(chan error, 1)
-	go func() { scheduleWorkerDone <- scheduleWorker.Run(workerCtx) }()
 	notificationWorkerDone := make(chan error, 1)
 	go func() { notificationWorkerDone <- notificationWorker.Run(workerCtx) }()
 	serverErrors := make(chan error, len(servers))
@@ -858,14 +847,8 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	if err := <-workerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop worker: %w", err)
 	}
-	if err := <-taskWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
-		runErr = fmt.Errorf("stop task worker: %w", err)
-	}
 	if err := <-taskStopWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop task action worker: %w", err)
-	}
-	if err := <-scheduleWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
-		runErr = fmt.Errorf("stop schedule worker: %w", err)
 	}
 	if err := <-notificationWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop notification worker: %w", err)

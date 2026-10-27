@@ -37,7 +37,7 @@ orchestrator:
       network_guard_path: ${CH_NETWORK_GUARD_PATH}
 templates:
   dir: ${CH_TEMPLATE_DIR}
-  default: std-2c4g
+  default: std-1c2g
 hosts:
   ready_timeout: 3m
   ready_poll_interval: 2s

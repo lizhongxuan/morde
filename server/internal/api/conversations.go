@@ -22,7 +22,7 @@ type ConversationService interface {
 
 type conversationResponse struct {
 	ID        string    `json:"id"`
-	HostID    string    `json:"host_id"`
+	HostID    string    `json:"host_id,omitempty"`
 	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -237,7 +237,7 @@ func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
 }
 
 func toConversationResponse(value conversation.Conversation) (conversationResponse, error) {
-	if !domain.ValidConversationID(value.ID) || !domain.ValidHostID(value.HostID) || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
+	if !domain.ValidConversationID(value.ID) || (value.HostID != "" && !domain.ValidHostID(value.HostID)) || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return conversationResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return conversationResponse{ID: value.ID, HostID: value.HostID, Title: value.Title, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}, nil

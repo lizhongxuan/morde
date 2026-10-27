@@ -15,9 +15,29 @@ export interface paths {
         put?: never;
         /**
          * Log in to the portal
-         * @description Sets the ch_portal session cookie. Login attempts are rate limited.
+         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
          */
         post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register a standard user account
+         * @description Creates a pending user account with role=user. Registration is rate limited and does not create a login session. The name admin is reserved case-insensitively.
+         */
+        post: operations["register"];
         delete?: never;
         options?: never;
         head?: never;
@@ -33,8 +53,68 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Revoke the current portal session */
+        /**
+         * Revoke the current portal session or installed client
+         * @description A browser session revokes itself. An installation-bound desktop Web session revokes its entire installation, including Client, Sync, Web, ticket and Gateway access.
+         */
         post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/client-login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Log in on a native client
+         * @description Approved accounts sign in with name and password. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set. Reusing one Idempotency-Key for the same request rotates unconfirmed credentials; late earlier responses must be discarded by the client.
+         */
+        post: operations["clientLogin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/client-web-session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Renew a desktop user Web session
+         * @description Requires an active desktop Client bearer credential. The returned Session is installation-bound, has at most one hour of life, and cannot access Admin routes.
+         */
+        post: operations["renewClientWebSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/client-logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revoke the current native client installation */
+        post: operations["clientLogout"];
         delete?: never;
         options?: never;
         head?: never;
@@ -52,6 +132,26 @@ export interface paths {
         get: operations["getMe"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change the current user's password
+         * @description Requires the current password. For the initial super administrator, this is the only mutation allowed until the password is changed. A successful change revokes every current session and requires logging in again.
+         */
+        post: operations["changeMyPassword"];
         delete?: never;
         options?: never;
         head?: never;
@@ -145,13 +245,13 @@ export interface paths {
         };
         /**
          * List the current user's hosts
-         * @description Deleted hosts are omitted. Portal sessions see hosts allowed by account role; API keys require host:read and see only their host allow-list and hosts created by that key.
+         * @description Deleted hosts are omitted. Portal sessions and API keys see hosts currently accessible to the account; ownership and sharing are checked on each request.
          */
         get: operations["listHosts"];
         put?: never;
         /**
          * Create a host
-         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys require host:create and may create only an unbound host.
+         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys may create only an unbound host within the account quota and default resource target.
          */
         post: operations["createHost"];
         delete?: never;
@@ -171,14 +271,14 @@ export interface paths {
         };
         /**
          * Get a host
-         * @description Portal sessions follow account role and ownership; API keys require host:read and an allowed host ID.
+         * @description Portal sessions follow account role and ownership; API keys require current account access to this host.
          */
         get: operations["getHost"];
         put?: never;
         post?: never;
         /**
          * Delete a host
-         * @description API keys require host:manage and an allowed host ID. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
+         * @description API keys require current account ownership of this host. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
          */
         delete: operations["deleteHost"];
         options?: never;
@@ -197,7 +297,7 @@ export interface paths {
         };
         /**
          * Get the AI and user control state for a host
-         * @description Portal sessions can inspect their owned hosts. API keys require computer:observe and an allowed host ID. The active transition omits internal task snapshots and runtime receipts.
+         * @description Portal sessions can inspect their owned hosts. API keys require current account access to observe this host. The active transition omits internal task snapshots and runtime receipts.
          */
         get: operations["getHostControl"];
         put?: never;
@@ -221,7 +321,7 @@ export interface paths {
         put?: never;
         /**
          * Release host compute while retaining data
-         * @description API keys require host:manage and an allowed host ID. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks are active or user control is enabled. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
+         * @description API keys require current account ownership of this host. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks are active or user control is enabled. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
          */
         post: operations["releaseHost"];
         delete?: never;
@@ -243,7 +343,7 @@ export interface paths {
         put?: never;
         /**
          * Restore compute for a stopped host
-         * @description API keys require host:manage and an allowed host ID. Restore retains the Host ID, owner, Workspace, and runtime data volume, rotates the runtime credential, and advances one runtime generation. An uncertain sandbox create remains fenced for manual reconciliation.
+         * @description API keys require current account ownership of this host. Restore retains the Host ID, owner, Workspace, and runtime data volume, rotates the runtime credential, and advances one runtime generation. An uncertain sandbox create remains fenced for manual reconciliation.
          */
         post: operations["restoreHost"];
         delete?: never;
@@ -265,7 +365,7 @@ export interface paths {
         put?: never;
         /**
          * Hand control of a host between AI and the user
-         * @description Portal sessions can operate their owned hosts. API keys require computer:operate and an allowed host ID. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
+         * @description Portal sessions can operate their owned hosts. API keys require current account permission to operate this host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
          */
         post: operations["actOnHostControl"];
         delete?: never;
@@ -419,7 +519,7 @@ export interface paths {
         put?: never;
         /**
          * Renew a host's lifetime
-         * @description API keys require host:manage and an allowed host ID.
+         * @description API keys require current account ownership of this host.
          */
         post: operations["renewHost"];
         delete?: never;
@@ -441,7 +541,7 @@ export interface paths {
         put?: never;
         /**
          * Issue a one-time ticket to enter a host
-         * @description Only the host owner may enter. Administrators may view and manage other hosts but cannot enter them.
+         * @description Portal sessions and native client credentials may enter a host they own. Administrators may view and manage other hosts but cannot enter them. A native client ticket binds the resulting Gateway cookie to its revocable installation.
          */
         post: operations["enterHost"];
         delete?: never;
@@ -467,7 +567,7 @@ export interface paths {
         put?: never;
         /**
          * Grant an existing user scoped access to a host
-         * @description Owner-only. Accepts desktop:view, desktop:control, terminal:control, and mcp:control in any de-duplicated combination. desktop:control also grants desktop:view. MCP use also requires a caller-owned API Key with computer:observe or computer:operate scope and this Host in its allow-list; revoked sharing access is checked again for each operation. No Workspace access, Host management, or re-sharing is granted.
+         * @description Owner-only. Accepts desktop:view, desktop:control, terminal:control, and mcp:control in any de-duplicated combination. desktop:control also grants desktop:view. MCP use also requires a valid caller-owned API Key and current permission to observe or operate this Host; revoked sharing access is checked again for each operation. No Workspace access, Host management, or re-sharing is granted.
          */
         post: operations["inviteHostMember"];
         delete?: never;
@@ -532,7 +632,7 @@ export interface paths {
         put?: never;
         /**
          * Issue a one-time ticket for an authorized desktop or terminal user
-         * @description The current Portal user must own the host or have the permission selected by target. The default target is desktop and requires desktop:view (also implied by desktop:control); terminal requires terminal:control and opens a terminal-only page. The resulting Host cookie keeps member identity separate from Host ownership; every Gateway request rechecks the exact permission.
+         * @description The current Portal user or native client must own the host or have the permission selected by target. Native clients may request desktop observation only. The default target is desktop and requires desktop:view (also implied by desktop:control); Portal sessions may request terminal when granted terminal:control. The resulting Host cookie keeps member identity separate from Host ownership; every Gateway request rechecks the exact permission and client installation state.
          */
         post: operations["issueHostObservationTicket"];
         delete?: never;
@@ -757,7 +857,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read paired device synchronization progress
+         * Read active desktop synchronization progress
          * @description Portal sessions only. Returns only the latest active session for each currently authorized device. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted.
          */
         get: operations["listDeviceWorkspaceSyncProgress"];
@@ -940,7 +1040,7 @@ export interface paths {
         };
         /**
          * List workspaces bound to a host
-         * @description Portal sessions follow account role and ownership; API keys require host:read and an allowed host ID.
+         * @description Portal sessions follow account role and ownership; API keys require current account access to this host.
          */
         get: operations["listHostWorkspaceBindings"];
         put?: never;
@@ -1109,322 +1209,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/conversations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List the current user's conversations
-         * @description Each conversation is bound to one Host. API keys require task:read and current access to that Host.
-         */
-        get: operations["listConversations"];
-        put?: never;
-        /**
-         * Create a conversation
-         * @description Requires an explicitly selected Host. API keys require task:submit and access to that Host. Creating a conversation does not start a task.
-         */
-        post: operations["createConversation"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/conversations/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Get a conversation
-         * @description API keys require task:read and current access to the conversation's bound Host.
-         */
-        get: operations["getConversation"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/conversations/{id}/messages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * List messages in a conversation
-         * @description API keys require task:read and current access to the conversation's bound Host.
-         */
-        get: operations["listConversationMessages"];
-        put?: never;
-        /**
-         * Append a user message and submit or supplement its task
-         * @description Requires task:submit for API keys. The requested Host must equal the conversation's bound Host. model_id must identify a model configured for the caller. An active task receives a supplemental instruction only when its Host and model match; otherwise the request conflicts. A completed task is never replayed by appending a message.
-         */
-        post: operations["appendConversationMessage"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/execution": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get the current owner's AI execution gate
-         * @description Portal sessions only. API keys cannot inspect or control the owner-wide gate. The gate state is independent of Host control and activity leases.
-         */
-        get: operations["getExecutionControl"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/execution/stop-all": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Stop all owner-scoped AI task execution
-         * @description Portal sessions only. The expected_epoch compare-and-set advances the gate before cancelling queued tasks and disabling all owner schedules. In-flight work remains stopping until the stop worker confirms every operation safe. This endpoint does not change Host control state or activity leases. Re-enabling the gate does not revive cancelled tasks or re-enable schedules.
-         */
-        post: operations["stopAllExecution"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/execution/enable": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Enable new owner-scoped AI task execution
-         * @description Portal sessions only. Enable requires the current expected_epoch and a fully drained disabled state. It does not resume or requeue cancelled tasks or re-enable schedules.
-         */
-        post: operations["enableExecution"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/tasks": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List the current user's tasks
-         * @description API keys require task:read. Results are limited to tasks in the caller's current authorization scope.
-         */
-        get: operations["listTasks"];
-        put?: never;
-        /**
-         * Submit a persistent task
-         * @description API keys require task:submit and access to the selected Host. If conversation_id is omitted, a new conversation bound to that Host is created in the same transaction. If supplied, its bound Host must match. A task is committed before it is accepted; Host and model are never silently substituted.
-         */
-        post: operations["submitTask"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/tasks/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["TaskId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Get a task
-         * @description API keys require task:read and current access to the task's host.
-         */
-        get: operations["getTask"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/tasks/{id}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["TaskId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Stream task progress events
-         * @description Server-sent events use a per-task monotonically increasing sequence and persist before delivery. Reconnect with after or Last-Event-ID to replay missed events. Assistant task.message events carry only user-visible output_text deltas with stable message_id and turn_id; after a complete provider response is validated, the final assistant message is saved and a task.message event with content and done=true is emitted. Reasoning and function-argument deltas are never emitted. task.step events omit duplicate assistant text and tool arguments. Replaying a user request with the same Idempotency-Key returns its existing task without dispatching another one. Disconnecting does not keep a task alive or cancel it. After a terminal task's latest events are replayed, the stream closes; reconnecting at the current sequence returns 204 so EventSource stops reconnecting. When the requested cursor has expired, the stream emits a non-persisted task.snapshot_required control event with its SSE id and data.sequence set to the current event sequence; the client reloads authoritative task and conversation data, then EventSource reconnects after that sequence. A 409 is returned only when a safe recovery cursor cannot be established.
-         */
-        get: operations["streamTaskEvents"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/tasks/{id}/actions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["TaskId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Perform an idempotent task action
-         * @description Requires task:control, current access to the task Host, and an Idempotency-Key. Pause, resume, and cancel use expected_status compare-and-set; pause accepts queued or running, resume accepts paused, and cancel accepts queued, running, waiting_user, or paused. Cancel may return unsettled operation IDs when stop is not yet confirmed; Task details expose the pending stop request and unsettled operation IDs. Retry applies only to one failed batch item. Respond applies only to the current persisted approval request and its exact version; stale or changed decisions conflict. Approval decisions are bound to the tool call, arguments, and Host fence and are never transferable to another action. answer_clarification applies only to the exact active clarification request ID and version; the answer is persisted before the task is queued for recovery.
-         */
-        post: operations["taskAction"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/schedules": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List schedules in the caller's authorization scope
-         * @description API keys require schedule:read. Results are filtered by owner and the key's current host allow-list.
-         */
-        get: operations["listSchedules"];
-        put?: never;
-        /**
-         * Create and enable a task schedule
-         * @description API keys require schedule:manage and access to the selected Host. The owner execution gate must be enabled. The schedule and its next occurrence are committed atomically; no task runs before its scheduled time.
-         */
-        post: operations["createSchedule"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/schedules/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * Get a schedule and its latest run
-         * @description API keys require schedule:read and current access to the schedule's Host.
-         */
-        get: operations["getSchedule"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        /**
-         * Update a schedule using optimistic concurrency
-         * @description API keys require schedule:manage and current access to both the existing and requested Host. expected_version must match; existing runs retain their immutable schedule snapshot.
-         */
-        patch: operations["updateSchedule"];
-        trace?: never;
-    };
-    "/api/schedules/{id}/actions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Enable or disable a schedule
-         * @description API keys require schedule:manage. Enabling requires the owner execution gate to be enabled. Disabling leaves the current run alone by default; cancel must be explicit and remains stopping until confirmed. This action never reports cancellation before task-stop evidence arrives.
-         */
-        post: operations["scheduleAction"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/schedules/{id}/runs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * List a schedule's run history
-         * @description API keys require schedule:read and current access to the schedule's Host. Each scheduled occurrence appears at most once; coalesced missed occurrences are summarized by coalesced_count.
-         */
-        get: operations["listScheduleRuns"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/notifications": {
         parameters: {
             query?: never;
@@ -1434,7 +1218,7 @@ export interface paths {
         };
         /**
          * List the current user's in-app notifications
-         * @description Portal sessions only; API keys cannot read owner-wide notifications. Related task content is redacted when current authorization no longer allows access. Marking read does not approve or execute an action.
+         * @description Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Related task content is redacted when current authorization no longer allows access. Marking read does not approve or execute an action.
          */
         get: operations["listNotifications"];
         put?: never;
@@ -1458,7 +1242,7 @@ export interface paths {
         put?: never;
         /**
          * Mark a notification as read
-         * @description Portal sessions only. Idempotent. This does not accept or execute an associated pending request; use the task action API with its current request ID and version.
+         * @description Portal sessions and native client credentials may mark a historical notification read. Idempotent; this does not execute any task action.
          */
         post: operations["markNotificationRead"];
         delete?: never;
@@ -1479,7 +1263,7 @@ export interface paths {
         put?: never;
         /**
          * Create an API key
-         * @description Portal sessions only. The API key is returned once and never appears in list responses. Scopes and host_ids are immutable; revoke and create a replacement to change them. A shared Host may be included in host_ids only while the current user has mcp:control on that Host. Each MCP operation also requires the matching API Key computer scope; sharing does not grant host management or Workspace access.
+         * @description Portal sessions only. The key is returned once. Each request uses the account's current permissions; disabled accounts and revoked sharing take effect immediately. Existing scoped keys are revoked during migration.
          */
         post: operations["createAPIKey"];
         delete?: never;
@@ -1488,112 +1272,15 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/device-authorizations": {
+    "/api/instant-chat/conversations": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put?: never;
-        /**
-         * Start a desktop device authorization
-         * @description Unauthenticated device-code initiation. The device code is a pending credential with no access until a signed-in user approves the displayed user code.
-         */
-        post: operations["startDeviceAuthorization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/device-authorizations/token": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Poll device authorization status
-         * @description The pending device credential may only query its own authorization state. After approval, it becomes a workspace-scoped sync credential.
-         */
-        post: operations["pollDeviceAuthorization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/device-authorizations/inspect": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Inspect the device requesting access
-         * @description Portal sessions only. Returns the device name and code expiry before the user grants workspace access.
-         */
-        post: operations["inspectDeviceAuthorization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/device-authorizations/approve": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Approve a desktop pairing request
-         * @description Portal sessions only. The user explicitly chooses the workspace grants. Empty grants pair the device without granting file access.
-         */
-        post: operations["approveDeviceAuthorization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/device-authorizations/deny": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Deny a desktop pairing request */
-        post: operations["denyDeviceAuthorization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/devices": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List the current user's paired devices */
-        get: operations["listDevices"];
+        /** List the current user's instant chat conversations */
+        get: operations["listInstantChatConversations"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1602,45 +1289,76 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/devices/{id}": {
+    "/api/instant-chat/conversations/{id}/messages": {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["TokenId"];
+                id: components["schemas"]["ConversationId"];
+            };
+            cookie?: never;
+        };
+        /** List messages in an instant chat conversation */
+        get: operations["listInstantChatMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/instant-chat/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a message and receive an immediate AI reply
+         * @description Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
+         */
+        post: operations["sendInstantChatMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/clients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List current user's client installations */
+        get: operations["listClients"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/clients/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ClientInstallationId"];
             };
             cookie?: never;
         };
         get?: never;
         put?: never;
         post?: never;
-        /**
-         * Revoke a paired device credential
-         * @description Revocation is checked on every request; later workspace transfer requests and commits are rejected.
-         */
-        delete: operations["revokeDevice"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/devices/{id}/workspaces": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["TokenId"];
-            };
-            cookie?: never;
-        };
-        get?: never;
-        /**
-         * Replace the workspaces a paired device may synchronize
-         * @description Portal sessions only. An empty list removes all workspace access while leaving the device paired.
-         */
-        put: operations["replaceDeviceWorkspaces"];
-        post?: never;
-        delete?: never;
+        /** Revoke a client installation, its credentials, tickets and Gateway sessions */
+        delete: operations["revokeClient"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1654,8 +1372,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List workspaces granted to the current device
-         * @description Requires a live paired device credential. Returns only workspaces currently owned by the credential owner and included in its current workspace grants. The response contains workspace metadata only; it never returns file paths, manifests, or file contents.
+         * List ready workspaces owned by the current desktop client
+         * @description Requires an active installation-bound Sync credential. Authorization is checked against current owner and ready state on each request; no static workspace grants are stored.
          */
         get: operations["listDeviceWorkspaces"];
         put?: never;
@@ -1680,6 +1398,26 @@ export interface paths {
         post?: never;
         /** Delete an API key */
         delete: operations["deleteAPIKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/available-models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List configured models without connection settings or secrets
+         * @description Portal sessions and restricted client credentials may read this minimal catalog.
+         */
+        get: operations["listAvailableModels"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1778,6 +1516,65 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/hosts/{id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        /** Read the effective host resources, version and update status */
+        get: operations["getAdminHostResources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change a host's CPU and memory resources
+         * @description Stopped host changes apply on next start. Running Docker hosts are adjusted and read back before success, without restarting the container. An unknown runtime outcome keeps the old effective value and reserves capacity until reconciled.
+         */
+        patch: operations["updateAdminHostResources"];
+        trace?: never;
+    };
+    "/api/admin/workspaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List workspace metadata for administrators */
+        get: operations["listAdminWorkspaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/workspaces/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /** Get workspace metadata and Host associations for administrators */
+        get: operations["getAdminWorkspace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/users": {
         parameters: {
             query?: never;
@@ -1788,8 +1585,7 @@ export interface paths {
         /** List users without credential data */
         get: operations["listUsers"];
         put?: never;
-        /** Create a user */
-        post: operations["createUser"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1811,7 +1607,7 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Update a user's role, quota, disabled state, or password */
+        /** Review a user's status, change their role, or update quota */
         patch: operations["updateUser"];
         trace?: never;
     };
@@ -1915,7 +1711,7 @@ export interface components {
         ErrorResponse: {
             error: {
                 /** @enum {string} */
-                code: "invalid_argument" | "unauthenticated" | "forbidden" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
+                code: "invalid_argument" | "unauthenticated" | "forbidden" | "account_pending" | "account_rejected" | "account_disabled" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
                 message: string;
                 details: {
                     [key: string]: unknown;
@@ -1949,6 +1745,7 @@ export interface components {
             permissions: components["schemas"]["HostMemberPermission"][];
         };
         TokenId: string;
+        ClientInstallationId: string;
         ConversationId: string;
         TaskId: string;
         ModelConnectionId: string;
@@ -1958,7 +1755,6 @@ export interface components {
         BatchItemId: string;
         ClarificationId: string;
         ArtifactId: string;
-        ScheduleId: string;
         ScheduleRunId: string;
         NotificationId: string;
         CreateModelConnectionRequest: {
@@ -2025,18 +1821,32 @@ export interface components {
         User: {
             id: components["schemas"]["UserId"];
             name: string;
-            /** @enum {string} */
-            role: "user" | "admin";
+            role: components["schemas"]["UserRole"];
+            status: components["schemas"]["AccountStatus"];
+            must_change_password: boolean;
             quota: components["schemas"]["Quota"];
             usage: components["schemas"]["Usage"];
         };
+        RegisterRequest: {
+            name: string;
+            password: string;
+        };
+        /** @enum {string} */
+        AccountStatus: "pending" | "rejected" | "approved" | "disabled";
+        /** @enum {string} */
+        UserRole: "user" | "admin" | "super_admin";
         Me: {
             id: components["schemas"]["UserId"];
             name: string;
-            /** @enum {string} */
-            role: "user" | "admin";
+            role: components["schemas"]["UserRole"];
+            status: components["schemas"]["AccountStatus"];
+            must_change_password: boolean;
             quota: components["schemas"]["Quota"];
             usage: components["schemas"]["Usage"];
+        };
+        ChangePasswordRequest: {
+            current_password: string;
+            new_password: string;
         };
         UserPreferences: {
             assistant_name: string;
@@ -2054,7 +1864,7 @@ export interface components {
             tools: boolean;
             vision: boolean;
         };
-        /** @description A checked model with text and tool support. Vision is an independent capability; when false, the model remains usable for non-visual tasks while the Portal hides desktop capability. */
+        /** @description A checked text model available for instant chat. Tool and vision capabilities remain informational. */
         OnboardingModel: {
             id: components["schemas"]["ModelConnectionId"];
             name: string;
@@ -2066,7 +1876,7 @@ export interface components {
             /** @enum {string} */
             state: "creating" | "running" | "stopping" | "stopped" | "failed" | "deleting";
         };
-        /** @description A model is ready for task submission when checked text and tool capabilities are available. Vision is surfaced per model and does not gate non-visual task submission; the Portal uses it to show or hide desktop capability. */
+        /** @description A checked text model allows instant chat even when the default computer is stopped. */
         OnboardingStatus: {
             /** @enum {string} */
             model_status: "ready" | "not_configured" | "selection_required" | "selected_unavailable";
@@ -2078,7 +1888,7 @@ export interface components {
             default_host_id: components["schemas"]["HostId"] | null;
             can_submit: boolean;
             /** @enum {string} */
-            next_action: "configure_model" | "create_or_retry_computer" | "choose_computer" | "wait_for_computer" | "resume_computer" | "choose_another_computer" | "contact_admin" | "submit_task" | "review_setup";
+            next_action: "configure_model" | "start_chat";
         };
         EnsureDefaultHostRequest: {
             host_id?: components["schemas"]["HostId"];
@@ -2540,8 +2350,6 @@ export interface components {
         APIKey: {
             id: components["schemas"]["TokenId"];
             name: string;
-            host_ids: components["schemas"]["HostId"][];
-            scopes: components["schemas"]["APIKeyScope"][];
             /** Format: date-time */
             expires_at: string;
             /** Format: date-time */
@@ -2550,17 +2358,55 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
-        /** @enum {string} */
-        APIKeyScope: "host:read" | "host:create" | "host:manage" | "host:delete_data" | "computer:observe" | "computer:operate" | "task:read" | "task:submit" | "task:control" | "schedule:read" | "schedule:manage";
-        Device: {
-            id: components["schemas"]["TokenId"];
-            name: string;
-            workspace_ids: components["schemas"]["WorkspaceId"][];
-            /** Format: date-time */
+        ClientInstallation: {
+            id: components["schemas"]["ClientInstallationId"];
+            /** @enum {string} */
+            platform: "desktop" | "android" | "ios";
+            display_name: string;
+            /**
+             * Format: date-time
+             * @description The installation and Client credential expire 30 days after the latest client login.
+             */
             expires_at: string;
             revoked: boolean;
             /** Format: date-time */
             created_at: string;
+            /** Format: date-time */
+            last_used_at: string | null;
+        };
+        ClientLoginRequest: {
+            name: string;
+            password: string;
+            /** @enum {string} */
+            platform: "desktop" | "android" | "ios";
+            display_name: string;
+            renewal_installation_id?: components["schemas"]["ClientInstallationId"];
+        };
+        ClientLoginResponse: {
+            installation_id: components["schemas"]["ClientInstallationId"];
+            client_credential: string;
+            /** Format: date-time */
+            client_expires_at: string;
+            /** @description Desktop only */
+            sync_credential?: string;
+            /**
+             * Format: date-time
+             * @description Desktop only
+             */
+            sync_expires_at?: string;
+            /** @description Desktop only; install-bound user Web Session */
+            web_session_credential?: string;
+            /**
+             * Format: date-time
+             * @description Desktop only
+             */
+            web_session_expires_at?: string;
+            user: components["schemas"]["User"];
+        };
+        ClientWebSessionResponse: {
+            web_session_credential: string;
+            /** Format: date-time */
+            web_session_expires_at: string;
         };
         DeviceWorkspace: {
             id: components["schemas"]["WorkspaceId"];
@@ -2570,45 +2416,6 @@ export interface components {
             /** @enum {string} */
             state: "ready" | "deleting";
         };
-        StartDeviceAuthorizationRequest: {
-            name: string;
-        };
-        StartDeviceAuthorizationResponse: {
-            device_code: string;
-            user_code: string;
-            verification_uri: string;
-            /** Format: date-time */
-            expires_at: string;
-            interval_seconds: number;
-        };
-        PollDeviceAuthorizationRequest: {
-            device_code: string;
-        };
-        PollDeviceAuthorizationResponse: {
-            /** @enum {string} */
-            state: "authorization_pending" | "authorized" | "denied" | "expired" | "revoked";
-            /** Format: date-time */
-            expires_at: string;
-        };
-        InspectDeviceAuthorizationRequest: {
-            user_code: string;
-        };
-        InspectDeviceAuthorizationResponse: {
-            name: string;
-            /** Format: date-time */
-            expires_at: string;
-        };
-        ApproveDeviceAuthorizationRequest: {
-            user_code: string;
-            name?: string;
-            workspace_ids: components["schemas"]["WorkspaceId"][];
-        };
-        DenyDeviceAuthorizationRequest: {
-            user_code: string;
-        };
-        ReplaceDeviceWorkspacesRequest: {
-            workspace_ids: components["schemas"]["WorkspaceId"][];
-        };
         AuditLog: {
             /** Format: int64 */
             id: number;
@@ -2616,7 +2423,7 @@ export interface components {
             at: string;
             actor_id: string;
             /** @enum {string} */
-            actor_kind: "session" | "api_key" | "host_cookie" | "system";
+            actor_kind: "session" | "api_key" | "client" | "host_cookie" | "system";
             action: string;
             target: string;
             detail: {
@@ -2642,261 +2449,46 @@ export interface components {
             password: string;
         };
         CreateHostRequest: {
-            template_id: string;
             name?: string;
             workspace_ids?: components["schemas"]["WorkspaceId"][];
         };
         CreateAPIKeyRequest: {
             name: string;
             ttl_seconds?: number;
-            host_ids: components["schemas"]["HostId"][];
-            scopes: components["schemas"]["APIKeyScope"][];
         };
         CreatedAPIKey: {
             id: components["schemas"]["TokenId"];
             key: string;
-            host_ids: components["schemas"]["HostId"][];
-            scopes: components["schemas"]["APIKeyScope"][];
             /** Format: date-time */
             expires_at: string;
         };
-        Conversation: {
+        InstantChatConversation: {
             id: components["schemas"]["ConversationId"];
-            host_id: components["schemas"]["HostId"];
             title: string;
+            model_id: string;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
         };
-        ConversationPage: {
-            items: components["schemas"]["Conversation"][];
-            next_cursor: string | null;
-        };
-        CreateConversationRequest: {
-            host_id: components["schemas"]["HostId"];
-            title?: string;
-        };
-        Message: {
-            id: components["schemas"]["MessageId"];
+        InstantChatMessage: {
+            id: string;
             conversation_id: components["schemas"]["ConversationId"];
             /** @enum {string} */
             role: "user" | "assistant";
             content: string;
-            task_id: components["schemas"]["TaskId"];
             /** Format: date-time */
             created_at: string;
         };
-        MessagePage: {
-            items: components["schemas"]["Message"][];
-            next_cursor: string | null;
-        };
-        /** @enum {string} */
-        TaskStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "cancelling" | "completed" | "failed" | "cancelled";
-        /**
-         * @description A dispatched operation with an ambiguous outcome is unknown and must be reconciled before any retry.
-         * @enum {string}
-         */
-        OperationStatus: "prepared" | "dispatched" | "succeeded" | "failed" | "cancelled" | "unknown";
-        TaskStep: {
-            id: components["schemas"]["StepId"];
-            sequence: number;
-            /** @enum {string} */
-            kind: "plan" | "tool" | "wait" | "result";
-            /** @enum {string} */
-            status: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
-            title: string;
-            summary: string;
-            /** Format: date-time */
-            created_at: string;
-        };
-        TaskEvent: {
-            task_id: components["schemas"]["TaskId"];
-            sequence: number;
-            /** @enum {string} */
-            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result";
-            /** Format: date-time */
-            created_at: string;
-            /** @description For assistant task.message deltas the fields are role=assistant, message_id, turn_id, and delta. The terminal message has the same IDs plus content and done=true; partial or failed responses do not get a terminal message or a conversation Message row. */
-            payload: {
-                [key: string]: unknown;
-            };
-        };
-        TaskBudget: {
-            /** @default 1800 */
-            active_seconds: number;
-            /** @default 100 */
-            tool_calls: number;
-            /** @default 50000 */
-            model_tokens: number;
-        };
-        /** @description IANA timezone is required. Repeated DST wall times use the earlier instant; nonexistent wall times are skipped. */
-        ScheduleTiming: components["schemas"]["OnceScheduleTiming"] | components["schemas"]["DailyScheduleTiming"] | components["schemas"]["WeeklyScheduleTiming"];
-        OnceScheduleTiming: {
-            /** @constant */
-            kind: "once";
-            /**
-             * Format: date-time
-             * @description RFC3339 instant with an explicit UTC offset.
-             */
-            run_at: string;
-            /** @description IANA tz database name used for display. */
-            time_zone: string;
-        };
-        DailyScheduleTiming: {
-            /** @constant */
-            kind: "daily";
-            /**
-             * Format: date
-             * @description First eligible local calendar date.
-             */
-            starts_on: string;
-            local_time: string;
-            /** @description IANA tz database name. */
-            time_zone: string;
-        };
-        WeeklyScheduleTiming: {
-            /** @constant */
-            kind: "weekly";
-            /**
-             * Format: date
-             * @description First eligible local calendar date.
-             */
-            starts_on: string;
-            local_time: string;
-            /** @description IANA tz database name. */
-            time_zone: string;
-            weekdays: number[];
-        };
-        /**
-         * @description completed means a one-time schedule's occurrence has been consumed, not necessarily that its Task has finished.
-         * @enum {string}
-         */
-        ScheduleStatus: "enabled" | "disabled" | "completed";
-        /**
-         * @description Occurrences up to one minute late still run normally. After that grace, skip records missed occurrences without running them; run_once coalesces them into at most one run for the latest due occurrence.
-         * @enum {string}
-         */
-        MisfirePolicy: "skip" | "run_once";
-        /** @enum {string} */
-        ScheduleRunStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "stopping" | "completed" | "failed" | "cancelled" | "skipped" | "missed";
-        /** @enum {string} */
-        ObservationField: "text" | "value";
-        ObservationSpec: {
-            /**
-             * Format: uri
-             * @description Absolute HTTP or HTTPS page URL without credentials or a fragment.
-             */
-            url: string;
-            /** @description CSS selector resolved by the browser; this is never evaluated as JavaScript. */
-            selector: string;
-            field: components["schemas"]["ObservationField"];
-        };
-        /** @enum {string} */
-        ObservationOutcome: "unknown" | "baseline" | "changed" | "no_change";
-        ScheduleRun: {
-            id: components["schemas"]["ScheduleRunId"];
-            schedule_id: components["schemas"]["ScheduleId"];
-            schedule_version: number;
-            /** @description Stable key for this local schedule occurrence. */
-            occurrence_key: string;
-            /**
-             * Format: date-time
-             * @description UTC instant; null when the local wall time does not exist due to a DST gap.
-             */
-            scheduled_at: string | null;
-            /** @description Earlier missed occurrences folded into this run. */
-            coalesced_count: number;
-            status: components["schemas"]["ScheduleRunStatus"];
-            /** @enum {string|null} */
-            skip_reason: "dst_gap" | "overlap" | "authorization_ended" | null;
-            task_id: components["schemas"]["TaskId"] | null;
-            observation_outcome: components["schemas"]["ObservationOutcome"];
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-            /** Format: date-time */
-            finished_at: string | null;
-        };
-        Schedule: {
-            id: components["schemas"]["ScheduleId"];
-            version: number;
-            status: components["schemas"]["ScheduleStatus"];
-            host_id: components["schemas"]["HostId"];
+        InstantChatSendRequest: {
+            conversation_id?: components["schemas"]["ConversationId"];
             model_id: string;
-            objective: string;
-            timing: components["schemas"]["ScheduleTiming"];
-            budget: components["schemas"]["TaskBudget"];
-            misfire_policy: components["schemas"]["MisfirePolicy"];
-            /** @description Successful no-change runs never create completion notifications. */
-            notification_events: ("completed" | "failed" | "waiting_user")[];
-            observation: components["schemas"]["ObservationSpec"] | null;
-            /** Format: date-time */
-            next_run_at: string | null;
-            last_run: components["schemas"]["ScheduleRun"] | null;
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
+            content: string;
         };
-        SchedulePage: {
-            items: components["schemas"]["Schedule"][];
-            next_cursor: string | null;
-        };
-        ScheduleRunPage: {
-            items: components["schemas"]["ScheduleRun"][];
-            next_cursor: string | null;
-        };
-        CreateScheduleRequest: {
-            host_id: components["schemas"]["HostId"];
-            /** @description Must identify a model explicitly configured by the caller; no fallback is performed. */
-            model_id: string;
-            objective: string;
-            timing: components["schemas"]["ScheduleTiming"];
-            budget?: components["schemas"]["TaskBudget"];
-            /** @default skip */
-            misfire_policy: components["schemas"]["MisfirePolicy"];
-            /**
-             * @default [
-             *       "completed",
-             *       "failed",
-             *       "waiting_user"
-             *     ]
-             */
-            notification_events: ("completed" | "failed" | "waiting_user")[];
-            observation?: components["schemas"]["ObservationSpec"];
-        };
-        UpdateScheduleRequest: {
-            expected_version: number;
-            host_id?: components["schemas"]["HostId"];
-            model_id?: string;
-            objective?: string;
-            timing?: components["schemas"]["ScheduleTiming"];
-            budget?: components["schemas"]["TaskBudget"];
-            misfire_policy?: components["schemas"]["MisfirePolicy"];
-            notification_events?: ("completed" | "failed" | "waiting_user")[];
-            observation?: components["schemas"]["ObservationSpec"] | null;
-        };
-        ScheduleEnableRequest: {
-            /** @constant */
-            action: "enable";
-            expected_version: number;
-        };
-        ScheduleDisableRequest: {
-            /** @constant */
-            action: "disable";
-            expected_version: number;
-            /**
-             * @default continue
-             * @enum {string}
-             */
-            current_run_action: "continue" | "cancel";
-        };
-        ScheduleActionRequest: components["schemas"]["ScheduleEnableRequest"] | components["schemas"]["ScheduleDisableRequest"];
-        ScheduleActionResponse: {
-            schedule: components["schemas"]["Schedule"];
-            current_run: components["schemas"]["ScheduleRun"] | null;
+        InstantChatSendResponse: {
+            conversation: components["schemas"]["InstantChatConversation"];
+            message: components["schemas"]["InstantChatMessage"];
+            reply: components["schemas"]["InstantChatMessage"];
         };
         Notification: {
             id: components["schemas"]["NotificationId"];
@@ -2918,244 +2510,82 @@ export interface components {
             items: components["schemas"]["Notification"][];
             next_cursor: string | null;
         };
-        TaskUsage: {
-            active_seconds: number;
-            tool_calls: number;
-            /** @description Null when provider usage is unavailable; unknown usage must not be presented as zero. */
-            model_tokens: number | null;
+        HostResourcesTarget: {
+            cpu_milli: number;
+            mem_mib: number;
         };
-        TaskBatchItemInput: {
-            key: string;
-            input: string;
-        };
-        RetryBatchItemRequest: {
-            /** @constant */
-            action: "retry_batch_item";
-            batch_item_id: components["schemas"]["BatchItemId"];
-        };
-        TaskActionRequest: components["schemas"]["RetryBatchItemRequest"] | components["schemas"]["RespondToPendingRequest"] | components["schemas"]["AnswerClarificationRequest"] | components["schemas"]["PauseTaskRequest"] | components["schemas"]["ResumeTaskRequest"] | components["schemas"]["CancelTaskRequest"];
-        ExecutionControlActionRequest: {
-            /** Format: int64 */
-            expected_epoch: number;
-        };
-        ExecutionControl: {
+        AdminHostResources: {
+            host_id: components["schemas"]["HostId"];
             /** @enum {string} */
-            state: "enabled" | "stopping" | "disabled";
-            /** Format: int64 */
-            epoch: number;
-            /**
-             * Format: int64
-             * @description Number of tasks awaiting durable stop confirmation.
-             */
-            pending_task_count: number;
-        };
-        PauseTaskRequest: {
-            /** @constant */
-            action: "pause";
-            /** @enum {string} */
-            expected_status: "queued" | "running";
-        };
-        ResumeTaskRequest: {
-            /** @constant */
-            action: "resume";
-            /** @constant */
-            expected_status: "paused";
-        };
-        CancelTaskRequest: {
-            /** @constant */
-            action: "cancel";
-            /** @enum {string} */
-            expected_status: "queued" | "running" | "waiting_user" | "paused";
-        };
-        TaskActionResponse: {
-            task_id: components["schemas"]["TaskId"];
-            /** @enum {string} */
-            action: "retry_batch_item" | "respond" | "answer_clarification" | "pause" | "resume" | "cancel";
-            status: components["schemas"]["TaskStatus"];
-            unsettled_operation_ids: components["schemas"]["OperationId"][];
-        };
-        RespondToPendingRequest: {
-            /** @constant */
-            action: "respond";
-            pending_id: string;
-            pending_version: number;
-            /** @enum {string} */
-            decision: "approve" | "reject";
-        };
-        AnswerClarificationRequest: {
-            /** @constant */
-            action: "answer_clarification";
-            clarification_id: components["schemas"]["ClarificationId"];
-            /** Format: int64 */
-            clarification_version: number;
-            /** @description Non-empty UTF-8 answer; whitespace-only values and NUL characters are rejected. */
-            answer: string;
-        };
-        TaskPendingRequest: {
-            id: string;
-            version: number;
-            /** @constant */
-            kind: "approval";
-            title: string;
-            object: string;
-            content: string;
-            impact: string;
-        };
-        TaskClarificationRequest: {
-            id: components["schemas"]["ClarificationId"];
+            state: "creating" | "running" | "stopping" | "stopped" | "failed" | "deleting" | "deleted";
+            resources: components["schemas"]["HostResourcesTarget"];
             /** Format: int64 */
             version: number;
-            /** @description UTF-8 question without NUL characters. */
-            question: string;
-        };
-        TaskStopRequest: {
-            id: string;
-            /** @enum {string} */
-            action: "pause" | "cancel";
-            /** @enum {string} */
-            status: "pending" | "completed";
-            /** Format: date-time */
-            safe_after: string;
-            unsettled_operation_ids: components["schemas"]["OperationId"][];
-        };
-        TaskBatchItem: {
-            id: components["schemas"]["BatchItemId"];
-            key: string;
-            /** @enum {string} */
-            status: "queued" | "running" | "succeeded" | "failed" | "unknown";
-            /** Format: int32 */
-            attempt: number;
-            result: string | null;
-            error: string | null;
-        };
-        TaskArtifact: {
-            id: components["schemas"]["ArtifactId"];
-            step_id: components["schemas"]["StepId"];
-            label: string;
-            /** @description Relative to the task Workspace */
-            path: string;
-            media_type: string;
-            batch_item_id: components["schemas"]["BatchItemId"] | null;
             /**
-             * Format: int32
-             * @description Zero for task-level artifacts; otherwise the associated item attempt.
-             */
-            batch_attempt: number;
-            /** Format: date-time */
-            created_at: string;
-        };
-        Task: {
-            id: components["schemas"]["TaskId"];
-            owner_id: components["schemas"]["UserId"];
-            host_id: components["schemas"]["HostId"];
-            /**
-             * @description Optional fixed target application on this Host.
+             * @description Unknown requires runtime reconciliation before another adjustment.
              * @enum {string}
              */
-            application_id?: "wechat";
-            conversation_id: components["schemas"]["ConversationId"];
-            /** @description The explicitly selected, user-configured model identifier. */
-            model_id: string;
-            objective: string;
-            status: components["schemas"]["TaskStatus"];
-            current_step?: string | null;
-            result?: string | null;
-            waiting_reason?: string | null;
-            budget: components["schemas"]["TaskBudget"];
-            usage: components["schemas"]["TaskUsage"];
-            steps: components["schemas"]["TaskStep"][];
-            batch_items: components["schemas"]["TaskBatchItem"][];
-            artifacts: components["schemas"]["TaskArtifact"][];
-            pending_request: components["schemas"]["TaskPendingRequest"] | null;
-            /** @description Present only while waiting for an answer to the task's active clarification request. */
-            clarification_request: components["schemas"]["TaskClarificationRequest"] | null;
-            stop_request: components["schemas"]["TaskStopRequest"] | null;
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-            /** Format: date-time */
-            finished_at?: string | null;
+            update_state: "idle" | "applying" | "unknown";
         };
-        TaskSummary: {
-            id: components["schemas"]["TaskId"];
-            owner_id: components["schemas"]["UserId"];
-            host_id: components["schemas"]["HostId"];
-            /**
-             * @description Optional fixed target application on this Host.
-             * @enum {string}
-             */
-            application_id?: "wechat";
-            conversation_id: components["schemas"]["ConversationId"];
-            model_id: string;
-            objective: string;
-            status: components["schemas"]["TaskStatus"];
-            current_step?: string | null;
-            budget: components["schemas"]["TaskBudget"];
-            usage: components["schemas"]["TaskUsage"];
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-        };
-        TaskPage: {
-            items: components["schemas"]["TaskSummary"][];
-            next_cursor: string | null;
-        };
-        SubmitTaskRequest: {
-            host_id: components["schemas"]["HostId"];
-            /**
-             * @description Optional target application on this Host; requires a running Morde-managed application launch and does not add operation permissions.
-             * @enum {string}
-             */
-            application_id?: "wechat";
-            /** @description Must identify a model explicitly configured by the caller; no fallback is performed. */
-            model_id: string;
-            conversation_id?: components["schemas"]["ConversationId"];
-            objective: string;
-            budget?: components["schemas"]["TaskBudget"];
-            batch_items?: components["schemas"]["TaskBatchItemInput"][];
-        };
-        AppendMessageRequest: {
-            host_id: components["schemas"]["HostId"];
-            /**
-             * @description Must match the active task target when a conversation has an active task.
-             * @enum {string}
-             */
-            application_id?: "wechat";
-            /** @description Must identify a model explicitly configured for the caller; no fallback is performed. */
-            model_id: string;
-            content: string;
-            budget?: components["schemas"]["TaskBudget"];
-        };
-        AppendMessageResponse: {
-            message: components["schemas"]["Message"];
-            task: components["schemas"]["Task"];
-        };
-        CreateUserRequest: {
-            name: string;
-            password: string;
-            /** @enum {string} */
-            role: "user" | "admin";
-            quota?: components["schemas"]["Quota"];
+        UpdateAdminHostResourcesRequest: {
+            cpu_milli: number;
+            mem_mib: number;
+            /** Format: int64 */
+            expected_version: number;
         };
         AdminUser: {
             id: components["schemas"]["UserId"];
             name: string;
-            /** @enum {string} */
-            role: "user" | "admin";
-            disabled: boolean;
+            role: components["schemas"]["UserRole"];
+            status: components["schemas"]["AccountStatus"];
             quota: components["schemas"]["Quota"];
             usage: components["schemas"]["Usage"];
+            default_host_resources: components["schemas"]["HostResourcesTarget"];
             /** Format: date-time */
             created_at: string;
         };
-        UpdateUserRequest: {
+        AdminWorkspaceBinding: {
+            host_id: components["schemas"]["HostId"];
+            host_name: string;
             /** @enum {string} */
-            role?: "user" | "admin";
+            state: "preparing" | "active" | "unbinding" | "detached" | "failed";
+            /** @enum {string} */
+            sync_state: "healthy" | "conflict";
+            /** Format: int64 */
+            desired_revision: number;
+            /** Format: int64 */
+            applied_revision: number;
+        };
+        AdminWorkspace: {
+            id: components["schemas"]["WorkspaceId"];
+            owner_id: components["schemas"]["UserId"];
+            owner_name: string;
+            name: string;
+            /** @enum {string} */
+            state: "ready" | "deleting";
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            bindings: components["schemas"]["AdminWorkspaceBinding"][];
+        };
+        AdminWorkspacePage: {
+            items: components["schemas"]["AdminWorkspace"][];
+            /** @description Opaque cursor for the next page; null when exhausted. */
+            next_cursor: string | null;
+        };
+        UpdateUserRequest: {
+            expected_status: components["schemas"]["AccountStatus"];
+            status?: components["schemas"]["AccountStatus"];
+            role?: components["schemas"]["UserRole"];
             quota?: components["schemas"]["Quota"];
-            disabled?: boolean;
-            password?: string;
+            default_host_resources?: components["schemas"]["HostResourcesTarget"];
         };
     };
     responses: {
@@ -3266,10 +2696,7 @@ export interface components {
         WorkspaceId: components["schemas"]["WorkspaceId"];
         SiteId: components["schemas"]["SiteId"];
         SiteReleaseId: components["schemas"]["SiteReleaseId"];
-        ConversationId: components["schemas"]["ConversationId"];
-        TaskId: components["schemas"]["TaskId"];
         ModelConnectionId: components["schemas"]["ModelConnectionId"];
-        ScheduleId: components["schemas"]["ScheduleId"];
         NotificationId: components["schemas"]["NotificationId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
@@ -3310,6 +2737,37 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    register: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Registered user */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        user: components["schemas"]["User"];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Error"];
         };
@@ -3324,6 +2782,81 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Session revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    clientLogin: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClientLoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Installation and credentials returned once */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientLoginResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    renewClientWebSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New installation-bound Web session */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientWebSessionResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    clientLogout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installation and all bound credentials revoked */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -3353,6 +2886,32 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    changeMyPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Password changed and existing sessions revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
         };
     };
@@ -5039,588 +4598,6 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listConversations: {
-        parameters: {
-            query?: {
-                limit?: components["parameters"]["PageLimit"];
-                /** @description Opaque cursor from the previous page. */
-                cursor?: components["parameters"]["PageCursor"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Conversations */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConversationPage"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            default: components["responses"]["Error"];
-        };
-    };
-    createConversation: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateConversationRequest"];
-            };
-        };
-        responses: {
-            /** @description Original conversation returned for an identical idempotent retry */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Conversation"];
-                };
-            };
-            /** @description Conversation created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Conversation"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    getConversation: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Conversation */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Conversation"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listConversationMessages: {
-        parameters: {
-            query?: {
-                limit?: components["parameters"]["PageLimit"];
-                /** @description Opaque cursor from the previous page. */
-                cursor?: components["parameters"]["PageCursor"];
-            };
-            header?: never;
-            path: {
-                id: components["parameters"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Messages in chronological order */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MessagePage"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    appendConversationMessage: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path: {
-                id: components["parameters"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AppendMessageRequest"];
-            };
-        };
-        responses: {
-            /** @description Message and task accepted */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AppendMessageResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            413: components["responses"]["RequestTooLarge"];
-            default: components["responses"]["Error"];
-        };
-    };
-    getExecutionControl: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Execution gate state */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ExecutionControl"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            default: components["responses"]["Error"];
-        };
-    };
-    stopAllExecution: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ExecutionControlActionRequest"];
-            };
-        };
-        responses: {
-            /** @description Gate closed or stopping */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ExecutionControl"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    enableExecution: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ExecutionControlActionRequest"];
-            };
-        };
-        responses: {
-            /** @description Gate enabled */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ExecutionControl"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listTasks: {
-        parameters: {
-            query?: {
-                limit?: components["parameters"]["PageLimit"];
-                /** @description Opaque cursor from the previous page. */
-                cursor?: components["parameters"]["PageCursor"];
-                status?: components["schemas"]["TaskStatus"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Tasks */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskPage"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            default: components["responses"]["Error"];
-        };
-    };
-    submitTask: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SubmitTaskRequest"];
-            };
-        };
-        responses: {
-            /** @description Task accepted */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Task"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            413: components["responses"]["RequestTooLarge"];
-            default: components["responses"]["Error"];
-        };
-    };
-    getTask: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["TaskId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Task */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Task"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    streamTaskEvents: {
-        parameters: {
-            query?: {
-                after?: number;
-            };
-            header?: {
-                "Last-Event-ID"?: string;
-            };
-            path: {
-                id: components["parameters"]["TaskId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Ordered task events */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/event-stream": string;
-                };
-            };
-            /** @description Terminal task has no events after the supplied cursor; stop reconnecting */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    taskAction: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path: {
-                id: components["parameters"]["TaskId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TaskActionRequest"];
-            };
-        };
-        responses: {
-            /** @description Action accepted. Stop actions may include operations whose stop is not yet confirmed. */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TaskActionResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listSchedules: {
-        parameters: {
-            query?: {
-                limit?: components["parameters"]["PageLimit"];
-                /** @description Opaque cursor from the previous page. */
-                cursor?: components["parameters"]["PageCursor"];
-                status?: components["schemas"]["ScheduleStatus"];
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Schedule page */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SchedulePage"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            default: components["responses"]["Error"];
-        };
-    };
-    createSchedule: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateScheduleRequest"];
-            };
-        };
-        responses: {
-            /** @description Enabled schedule */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Schedule"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    getSchedule: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Schedule */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Schedule"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    updateSchedule: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateScheduleRequest"];
-            };
-        };
-        responses: {
-            /** @description Updated schedule */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Schedule"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    scheduleAction: {
-        parameters: {
-            query?: never;
-            header: {
-                /** @description Reuse only for an exact retry of the same operation and normalized request. */
-                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
-            };
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ScheduleActionRequest"];
-            };
-        };
-        responses: {
-            /** @description Schedule action accepted; any requested current-run cancellation may still be pending */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ScheduleActionResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listScheduleRuns: {
-        parameters: {
-            query?: {
-                limit?: components["parameters"]["PageLimit"];
-                /** @description Opaque cursor from the previous page. */
-                cursor?: components["parameters"]["PageCursor"];
-            };
-            header?: never;
-            path: {
-                id: components["parameters"]["ScheduleId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Schedule run page */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ScheduleRunPage"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
     listNotifications: {
         parameters: {
             query?: {
@@ -5722,147 +4699,7 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    startDeviceAuthorization: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["StartDeviceAuthorizationRequest"];
-            };
-        };
-        responses: {
-            /** @description One-time pairing codes */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["StartDeviceAuthorizationResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            429: components["responses"]["RateLimited"];
-            default: components["responses"]["Error"];
-        };
-    };
-    pollDeviceAuthorization: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PollDeviceAuthorizationRequest"];
-            };
-        };
-        responses: {
-            /** @description Authorization state */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PollDeviceAuthorizationResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            default: components["responses"]["Error"];
-        };
-    };
-    inspectDeviceAuthorization: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InspectDeviceAuthorizationRequest"];
-            };
-        };
-        responses: {
-            /** @description Pending device details */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InspectDeviceAuthorizationResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    approveDeviceAuthorization: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ApproveDeviceAuthorizationRequest"];
-            };
-        };
-        responses: {
-            /** @description Approved device without its secret */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Device"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            429: components["responses"]["RateLimited"];
-            default: components["responses"]["Error"];
-        };
-    };
-    denyDeviceAuthorization: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DenyDeviceAuthorizationRequest"];
-            };
-        };
-        responses: {
-            /** @description Pairing denied */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listDevices: {
+    listInstantChatConversations: {
         parameters: {
             query?: never;
             header?: never;
@@ -5871,71 +4708,116 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Devices without credential secrets */
+            /** @description Conversations */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
-                        items: components["schemas"]["Device"][];
+                        items: components["schemas"]["InstantChatConversation"][];
                     };
                 };
             };
-            401: components["responses"]["Unauthorized"];
             default: components["responses"]["Error"];
         };
     };
-    revokeDevice: {
+    listInstantChatMessages: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                id: components["parameters"]["TokenId"];
+                id: components["schemas"]["ConversationId"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Device revoked */
+            /** @description Messages */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["InstantChatMessage"][];
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    sendInstantChatMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstantChatSendRequest"];
+            };
+        };
+        responses: {
+            /** @description Saved exchange */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstantChatSendResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listClients: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installations without credentials */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["ClientInstallation"][];
+                    };
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeClient: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ClientInstallationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installation revoked */
             204: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    replaceDeviceWorkspaces: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["TokenId"];
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ReplaceDeviceWorkspacesRequest"];
-            };
-        };
-        responses: {
-            /** @description Updated device grants */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Device"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -5948,7 +4830,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current device grants and minimal workspace metadata */
+            /** @description Ready owned workspace metadata */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5984,6 +4866,38 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAvailableModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Configured models */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: {
+                            id: components["schemas"]["ModelConnectionId"];
+                            name: string;
+                            model_name: string;
+                            capabilities: {
+                                text: boolean;
+                                tools: boolean;
+                                vision: boolean;
+                            };
+                        }[];
+                    };
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
@@ -6188,9 +5102,120 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listUsers: {
+    getAdminHostResources: {
         parameters: {
             query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Host resource target */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminHostResources"];
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminHostResources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminHostResourcesRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated saved target */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminHostResources"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminWorkspaces: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workspace metadata and Host associations, without paths or file content */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminWorkspacePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminWorkspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workspace metadata without paths or file content */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminWorkspace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listUsers: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["AccountStatus"];
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6210,35 +5235,6 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            default: components["responses"]["Error"];
-        };
-    };
-    createUser: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateUserRequest"];
-            };
-        };
-        responses: {
-            /** @description Created user */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AdminUser"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -6270,6 +5266,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

@@ -579,7 +579,10 @@ WITH latest AS (
     s.planned_bytes, s.confirmed_bytes, s.updated_at
   FROM workspaces w
   JOIN tokens t ON t.owner_id=w.owner_id AND t.kind='device'
-    AND t.revoked_at IS NULL AND t.expires_at > now() AND w.id=ANY(t.workspace_ids)
+    AND t.revoked_at IS NULL AND t.expires_at > now()
+    AND t.scopes=ARRAY['workspace:sync']::text[] AND cardinality(t.workspace_ids)=0
+  JOIN client_installations ci ON ci.id=t.client_installation_id AND ci.owner_id=w.owner_id
+    AND ci.platform='desktop' AND ci.revoked_at IS NULL AND ci.expires_at>now()
   JOIN workspace_sync_sessions s ON s.workspace_id=w.id AND s.owner_id=w.owner_id
     AND s.replica_id='device:' || t.id
   WHERE w.id=$1 AND w.owner_id=$2 AND w.state='ready' AND w.deleted_at IS NULL

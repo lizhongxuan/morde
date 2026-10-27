@@ -8,10 +8,10 @@ const artifact = {
   acceptance: {
     status: 'verified', verified_at: '2026-10-26T00:00:00.000Z', evidence_ref: 'T22.10/macos-arm64/2026-10-26',
     signature_status: 'signed_and_notarized',
-    capabilities: ['install', 'launch_idle_network', 'task_approval_host', 'workspace_sync_recovery', 'update', 'uninstall'],
+    capabilities: ['install', 'launch_idle_network', 'user_web_workbench', 'workspace_sync_recovery', 'update', 'uninstall'],
   },
 };
-const manifest = (artifacts: unknown[]) => ({ schema_version: 2, version: '0.1.0', portal_url: portalURL, artifacts });
+const manifest = (artifacts: unknown[]) => ({ schema_version: 3, version: '0.1.0', portal_url: portalURL, artifacts });
 
 describe('desktop downloads manifest', () => {
   it('accepts only an installer published for this Portal origin', () => {
@@ -19,6 +19,8 @@ describe('desktop downloads manifest', () => {
       .toEqual({ version: '0.1.0', artifacts: [artifact] });
     expect(() => parseDesktopDownloads({ ...manifest([artifact]), portal_url: 'https://other.example/' }, 'https://morde.example'))
       .toThrow('与当前页面不一致');
+    expect(() => parseDesktopDownloads({ ...manifest([artifact]), schema_version: 2 }, 'https://morde.example'))
+      .toThrow('格式无效');
   });
 
   it('rejects unknown targets, duplicate packages, and non-download URLs', () => {
@@ -32,6 +34,7 @@ describe('desktop downloads manifest', () => {
     expect(parseDesktopDownloads(manifest([artifact, pending]), 'https://morde.example').artifacts).toEqual([artifact]);
     expect(parseDesktopDownloads(manifest([pending]), 'https://morde.example')).toEqual({ version: null, artifacts: [] });
     expect(() => parseDesktopDownloads(manifest([{ ...artifact, acceptance: { ...artifact.acceptance, capabilities: ['install'] } }]), 'https://morde.example')).toThrow('无效条目');
+    expect(() => parseDesktopDownloads(manifest([{ ...artifact, acceptance: { ...artifact.acceptance, capabilities: ['install', 'launch_idle_network', 'task_approval_host', 'workspace_sync_recovery', 'update', 'uninstall'] } }]), 'https://morde.example')).toThrow('无效条目');
     expect(() => parseDesktopDownloads(manifest([{ ...artifact, acceptance: { ...artifact.acceptance, verified_at: 'yesterday' } }]), 'https://morde.example')).toThrow('无效条目');
   });
 

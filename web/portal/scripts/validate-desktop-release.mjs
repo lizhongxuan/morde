@@ -3,7 +3,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const capabilitySet = ['install', 'launch_idle_network', 'task_approval_host', 'workspace_sync_recovery', 'update', 'uninstall'];
+const capabilitySet = ['install', 'launch_idle_network', 'user_web_workbench', 'workspace_sync_recovery', 'update', 'uninstall'];
 const targets = { macos: { arm64: '.dmg', x64: '.dmg' }, windows: { x64: '.exe' }, linux: { x64: '.AppImage' } };
 const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
@@ -31,7 +31,7 @@ function validAcceptance(acceptance, platform) {
 
 export function validateDesktopRelease(manifestPath, publicRoot) {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  if (!record(manifest) || manifest.schema_version !== 2 || typeof manifest.version !== 'string' || !versionPattern.test(manifest.version) || !Array.isArray(manifest.artifacts) || manifest.artifacts.length === 0) {
+  if (!record(manifest) || manifest.schema_version !== 3 || typeof manifest.version !== 'string' || !versionPattern.test(manifest.version) || !Array.isArray(manifest.artifacts) || manifest.artifacts.length === 0) {
     throw new Error('桌面发行清单无效或没有已验收安装包');
   }
   const seen = new Set();

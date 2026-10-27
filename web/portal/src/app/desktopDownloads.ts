@@ -14,16 +14,16 @@ export type DesktopDownload = {
   };
 };
 
-export type DesktopCapability = 'install' | 'launch_idle_network' | 'task_approval_host' | 'workspace_sync_recovery' | 'update' | 'uninstall';
+export type DesktopCapability = 'install' | 'launch_idle_network' | 'user_web_workbench' | 'workspace_sync_recovery' | 'update' | 'uninstall';
 export type DesktopDownloads = { version: string | null; artifacts: DesktopDownload[] };
 
 const emptyDownloads: DesktopDownloads = { version: null, artifacts: [] };
 const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-const capabilities: DesktopCapability[] = ['install', 'launch_idle_network', 'task_approval_host', 'workspace_sync_recovery', 'update', 'uninstall'];
+const capabilities: DesktopCapability[] = ['install', 'launch_idle_network', 'user_web_workbench', 'workspace_sync_recovery', 'update', 'uninstall'];
 export const desktopCapabilityNames: Record<DesktopCapability, string> = {
   install: '原生安装',
   launch_idle_network: '启动与闲置网络',
-  task_approval_host: '任务、审批与 Host',
+  user_web_workbench: '用户 Web 与云端工作台',
   workspace_sync_recovery: 'Workspace 同步与恢复',
   update: '更新',
   uninstall: '卸载',
@@ -76,7 +76,7 @@ function parseDownload(value: unknown, version: string): DesktopDownload | null 
 }
 
 export function parseDesktopDownloads(value: unknown, currentOrigin: string): DesktopDownloads {
-  if (!isRecord(value) || value.schema_version !== 2 || typeof value.version !== 'string' || !versionPattern.test(value.version) || typeof value.portal_url !== 'string' || !Array.isArray(value.artifacts)) {
+  if (!isRecord(value) || value.schema_version !== 3 || typeof value.version !== 'string' || !versionPattern.test(value.version) || typeof value.portal_url !== 'string' || !Array.isArray(value.artifacts)) {
     throw new Error('安装包发布清单格式无效');
   }
   let portalURL: URL;

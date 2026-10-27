@@ -22,7 +22,7 @@ func TestOnboardingRoutesUsePortalSessionAndReturnBoundedStatus(t *testing.T) {
 			ModelStatus: app.ModelReady, AvailableModels: []app.OnboardingModel{{ID: "p1234567", Name: "shared", Capabilities: app.ModelCapabilities{Text: true, Tools: true, Vision: false}}},
 			ComputerStatus: app.ComputerReady,
 			Computers:      []app.OnboardingComputer{{ID: testHostID, Name: "worker", State: host.StateRunning}},
-			CanSubmit:      true, NextAction: "submit_task",
+			CanSubmit:      true, NextAction: "start_chat",
 		},
 	}
 	deps := services.deps()

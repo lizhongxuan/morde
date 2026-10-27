@@ -568,7 +568,9 @@ export default function Workbench() {
             )}
             {loaded.has('files') && (
               <div className="tab-panel tab-panel-files" aria-hidden={visibleActive !== 'files'} inert={visibleActive !== 'files'}>
-                <FileManager />
+                {vscodeAvailable
+                  ? <FileManager />
+                  : <p className="panel-loading" role="status">请先接管电脑后使用文件。</p>}
               </div>
             )}
             {loaded.has('vscode') && (

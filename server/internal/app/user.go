@@ -17,10 +17,11 @@ import (
 )
 
 type UpdateUserCommand struct {
-	ExpectedStatus identity.AccountStatus
-	Status         *identity.AccountStatus
-	Role           *identity.Role
-	Quota          *ResourceUsage
+	ExpectedStatus       identity.AccountStatus
+	Status               *identity.AccountStatus
+	Role                 *identity.Role
+	Quota                *ResourceUsage
+	DefaultHostResources *HostResources
 }
 
 type UserService struct {
@@ -57,7 +58,8 @@ func (s *UserService) Register(ctx context.Context, name, password, ip string) (
 	}
 	user, err := s.users.CreateUser(ctx, identity.User{
 		ID: id, Name: name, PasswordHash: string(passwordHash), Role: identity.RoleUser,
-		Status: identity.StatusPending, QuotaHosts: 3, QuotaCPUMilli: 4000, QuotaMemMiB: 8192,
+		Status: identity.StatusPending, QuotaHosts: 1, QuotaCPUMilli: 4000, QuotaMemMiB: 8192,
+		DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -96,7 +98,7 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 		return UserSummary{}, err
 	}
 	if !domain.ValidUserID(userID) || !validStatus(command.ExpectedStatus) ||
-		(command.Role == nil && command.Status == nil && command.Quota == nil) {
+		(command.Role == nil && command.Status == nil && command.Quota == nil && command.DefaultHostResources == nil) {
 		return UserSummary{}, domain.InvalidArgument("user", "user id and at least one field are required")
 	}
 	user, err := s.users.GetUserByID(ctx, userID)
@@ -142,6 +144,18 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 		user.QuotaCPUMilli = command.Quota.CPUMilli
 		user.QuotaMemMiB = command.Quota.MemMiB
 		changes["quota"] = map[string]int{"hosts": user.QuotaHosts, "cpu_milli": user.QuotaCPUMilli, "mem_mib": user.QuotaMemMiB}
+	}
+	if command.DefaultHostResources != nil {
+		if command.DefaultHostResources.CPUMilli <= 0 || command.DefaultHostResources.MemMiB <= 0 {
+			return UserSummary{}, domain.InvalidArgument("default_host_resources", "host resources must be positive")
+		}
+		user.DefaultHostCPUMilli = command.DefaultHostResources.CPUMilli
+		user.DefaultHostMemMiB = command.DefaultHostResources.MemMiB
+		changes["default_host_resources"] = map[string]int{"cpu_milli": user.DefaultHostCPUMilli, "mem_mib": user.DefaultHostMemMiB}
+	}
+	if int64(user.QuotaHosts)*int64(user.DefaultHostCPUMilli) > int64(user.QuotaCPUMilli) ||
+		int64(user.QuotaHosts)*int64(user.DefaultHostMemMiB) > int64(user.QuotaMemMiB) {
+		return UserSummary{}, domain.InvalidArgument("quota", "quota CPU and memory must cover the host limit and default resources")
 	}
 	user, err = s.users.UpdateUserWithAudit(ctx, adminActorID(principal), command.ExpectedStatus, user, audit.Entry{
 		ActorID: adminActorID(principal), ActorKind: adminActorKind(principal), Action: audit.ActionUserUpdate,
@@ -210,6 +224,9 @@ func hashPassword(password string) ([]byte, error) {
 func allocatedUsage(values []host.Host) ResourceUsage {
 	usage := ResourceUsage{}
 	for _, value := range values {
+		if value.DeletedAt == nil && value.State != host.StateDeleted {
+			usage.Hosts++
+		}
 		allocated := value.State == host.StateCreating || value.State == host.StateRunning || value.State == host.StateStopping || value.State == host.StateDeleting
 		if value.State == host.StateFailed {
 			allocated = value.SandboxID != ""
@@ -223,7 +240,6 @@ func allocatedUsage(values []host.Host) ResourceUsage {
 			}
 		}
 		if allocated {
-			usage.Hosts++
 			usage.CPUMilli += value.CPUMilli
 			usage.MemMiB += value.MemMiB
 		}

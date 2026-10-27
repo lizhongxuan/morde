@@ -6,7 +6,6 @@ import { useToast } from '../app/toast';
 const primaryLinks = [
   { to: '/', label: '工作台', icon: '⌂', end: true },
   { to: '/assistant', label: 'AI 助手', icon: '✧' },
-  { to: '/tasks', label: '任务与计划', icon: '✓' },
   { to: '/hosts', label: '云端电脑', icon: '▣' },
   { to: '/workspaces', label: '工作区', icon: '▱' },
 ];
@@ -18,9 +17,9 @@ const settingLinks = [
 ];
 
 const titles: Record<string, string> = {
-  '/': '工作台', '/assistant': 'AI 助手', '/tasks': '任务与计划', '/hosts': '云端电脑',
+  '/': '工作台', '/assistant': 'AI 助手', '/hosts': '云端电脑',
   '/hosts/new': '创建电脑', '/workspaces': '工作区', '/connections': '模型连接',
-  '/clients': '客户端', '/client-authorize': '客户端授权', '/apikeys': 'API Key',
+  '/clients': '客户端', '/apikeys': 'API Key',
   '/notifications': '通知', '/download': '下载 Morde Desktop',
 };
 
@@ -29,7 +28,7 @@ export function PortalLayout() {
   const { notify } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
-  const pageTitle = titles[location.pathname] ?? (location.pathname.startsWith('/tasks/') ? '任务详情' : 'PC 用户端');
+  const pageTitle = titles[location.pathname] ?? 'PC 用户端';
   const logout = async () => {
     try { await signOut(); navigate('/login', { replace: true }); }
     catch (error) { notify(`退出登录失败：${errorDetails(error).message}`, 'error'); }
@@ -52,7 +51,7 @@ export function PortalLayout() {
       </div>
     </aside>
     <main className="morde-main">
-      <header className="morde-topbar"><div className="morde-crumb"><span>PC 用户端</span><span aria-hidden="true">›</span><strong>{pageTitle}</strong></div><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><span aria-hidden="true">▣</span><span>手机端</span></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><span aria-hidden="true">♧</span><span>通知</span></Link><span className="morde-top-user">{user?.name}</span></div></header>
+      <header className="morde-topbar"><div className="morde-crumb"><span>PC 用户端</span><span aria-hidden="true">›</span><h1 className="morde-crumb-title">{pageTitle}</h1></div><div className="morde-top-actions"><a className="morde-notification-link" href="/app/" aria-label="打开手机端"><span aria-hidden="true">▣</span><span>手机端</span></a><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><span aria-hidden="true">♧</span><span>通知</span></Link><span className="morde-top-user">{user?.name}</span></div></header>
       <div id="main-content" className="morde-page" tabIndex={-1}><Outlet /></div>
     </main>
   </div>;

@@ -105,13 +105,17 @@ func (p Principal) HasScope(scope Scope) bool {
 			return false
 		}
 	}
+	if p.Kind == KindAPIKey {
+		switch scope {
+		case ScopeHostRead, ScopeHostCreate, ScopeHostManage, ScopeHostDeleteData, ScopeComputerObserve, ScopeComputerOperate:
+			return true
+		default:
+			return false
+		}
+	}
 	switch p.Kind {
 	case KindDevice:
 		if scope != ScopeWorkspaceSync {
-			return false
-		}
-	case KindAPIKey:
-		if !ValidScope(scope) || scope == ScopeWorkspaceSync {
 			return false
 		}
 	default:
@@ -135,15 +139,7 @@ func (p Principal) AllowsHost(hostID string) bool {
 	if p.Kind == KindClient {
 		return domain.ValidClientInstallationID(p.ClientInstallationID)
 	}
-	if p.Kind != KindAPIKey {
-		return false
-	}
-	for _, allowed := range p.HostIDs {
-		if allowed == hostID {
-			return true
-		}
-	}
-	return false
+	return p.Kind == KindAPIKey && domain.ValidHostID(hostID)
 }
 
 func (p Principal) AllowsWorkspace(workspaceID string) bool {
@@ -153,15 +149,8 @@ func (p Principal) AllowsWorkspace(workspaceID string) bool {
 	if p.Kind == KindSession {
 		return true
 	}
-	if p.Kind != KindDevice || !p.HasScope(ScopeWorkspaceSync) {
-		return false
-	}
-	for _, allowed := range p.WorkspaceIDs {
-		if allowed == workspaceID {
-			return true
-		}
-	}
-	return false
+	return p.Kind == KindDevice && p.HasScope(ScopeWorkspaceSync) &&
+		domain.ValidClientInstallationID(p.ClientInstallationID) && domain.ValidWorkspaceID(workspaceID)
 }
 
 func (p Principal) CanAccessHost(hostID string, scope Scope) bool {
@@ -187,17 +176,19 @@ type Principal struct {
 var ErrInvalidCredential = errors.New("invalid credential")
 
 type User struct {
-	ID                 string
-	Name               string
-	PasswordHash       string
-	Role               Role
-	Status             AccountStatus
-	MustChangePassword bool
-	QuotaHosts         int
-	QuotaCPUMilli      int
-	QuotaMemMiB        int
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID                  string
+	Name                string
+	PasswordHash        string
+	Role                Role
+	Status              AccountStatus
+	MustChangePassword  bool
+	QuotaHosts          int
+	QuotaCPUMilli       int
+	QuotaMemMiB         int
+	DefaultHostCPUMilli int
+	DefaultHostMemMiB   int
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type Token struct {
@@ -220,30 +211,13 @@ type Token struct {
 	CreatedAt            time.Time
 }
 
-type ClientAuthorization struct {
-	ID                    string
-	DisplayName           string
-	Platform              string
-	WantsWorkspaceSync    bool
-	RenewalInstallationID string
-	SecretHash            []byte
-	UserCodeHash          []byte
-	State                 string
-	InstallationID        string
-	OwnerID               string
-	WorkspaceIDs          []string
-	ExpiresAt             time.Time
-	CreatedAt             time.Time
-}
-
 type ClientInstallation struct {
-	ID           string
-	OwnerID      string
-	DisplayName  string
-	Platform     string
-	WorkspaceIDs []string
-	ExpiresAt    time.Time
-	CreatedAt    time.Time
-	LastUsedAt   *time.Time
-	RevokedAt    *time.Time
+	ID          string
+	OwnerID     string
+	DisplayName string
+	Platform    string
+	ExpiresAt   time.Time
+	CreatedAt   time.Time
+	LastUsedAt  *time.Time
+	RevokedAt   *time.Time
 }

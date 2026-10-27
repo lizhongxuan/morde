@@ -186,7 +186,7 @@ func TestWorkspaceServiceListsGetsAndHidesForeignOrDeleted(t *testing.T) {
 	}
 }
 
-func TestWorkspaceServiceListsOnlyDeviceGrantedOwnedWorkspaceMetadata(t *testing.T) {
+func TestWorkspaceServiceListsReadyOwnedWorkspaceMetadataForDevice(t *testing.T) {
 	store := &workspaceServiceStore{values: map[string]workspace.Workspace{
 		"w1234567": {ID: "w1234567", OwnerID: "u1234567", Name: "granted", State: workspace.StateReady, Revision: 3},
 		"w2345678": {ID: "w2345678", OwnerID: "u1234567", Name: "ungranted", State: workspace.StateReady, Revision: 4},
@@ -199,16 +199,16 @@ func TestWorkspaceServiceListsOnlyDeviceGrantedOwnedWorkspaceMetadata(t *testing
 	}
 	principal := identity.Principal{
 		UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleUser, Kind: identity.KindDevice,
-		WorkspaceIDs: []string{"w1234567", "w3456789", "w4567890"}, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+		ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
 	}
 	items, err := service.ListDeviceWorkspaces(context.Background(), principal)
-	if err != nil || len(items) != 1 || items[0] != (DeviceWorkspaceInfo{ID: "w1234567", Name: "granted", Revision: 3, State: workspace.StateReady}) {
+	if err != nil || len(items) != 2 {
 		t.Fatalf("ListDeviceWorkspaces() = %#v, %v", items, err)
 	}
-	principal.WorkspaceIDs = nil
+	principal.ClientInstallationID = ""
 	items, err = service.ListDeviceWorkspaces(context.Background(), principal)
 	if err != nil || items == nil || len(items) != 0 {
-		t.Fatalf("ListDeviceWorkspaces(empty grants) = %#v, %v", items, err)
+		t.Fatalf("ListDeviceWorkspaces(unbound installation) = %#v, %v", items, err)
 	}
 	principal.Scopes = nil
 	if _, err := service.ListDeviceWorkspaces(context.Background(), principal); domain.CodeOf(err) != domain.CodeForbidden {

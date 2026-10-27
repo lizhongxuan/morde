@@ -50,6 +50,9 @@ type loginRequest struct {
 func (h *api) registerAuth(group *gin.RouterGroup) {
 	group.POST("/auth/register", h.register)
 	group.POST("/auth/login", h.login)
+	group.POST("/auth/client-login", h.clientLogin)
+	group.POST("/auth/client-web-session", h.clientWebSession)
+	group.POST("/auth/client-logout", h.clientLogout)
 	group.POST("/auth/logout", h.logout)
 	group.GET("/me", h.me)
 	group.POST("/me/password", h.changePassword)
@@ -107,7 +110,17 @@ func (h *api) logout(c *gin.Context) {
 		unauthenticated(c)
 		return
 	}
-	if err := h.deps.Auth.Logout(c.Request.Context(), principal); err != nil {
+	var err error
+	if principal.ClientInstallationID != "" {
+		if h.deps.ClientLogin == nil {
+			serviceUnavailable(c)
+			return
+		}
+		err = h.deps.ClientLogin.LogoutWebSession(c.Request.Context(), principal, c.ClientIP())
+	} else {
+		err = h.deps.Auth.Logout(c.Request.Context(), principal)
+	}
+	if err != nil {
 		writeError(c, err)
 		return
 	}

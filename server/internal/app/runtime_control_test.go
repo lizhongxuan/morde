@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"morde-runtime/runtimecore"
 	"morde-runtime/runtimehttp"
@@ -19,6 +20,36 @@ import (
 	"morde/server/internal/domain/host"
 	"morde/server/internal/runtimeclient"
 )
+
+func TestRuntimeTaskLeaseUsesShorterTaskOrHostDeadline(t *testing.T) {
+	now := time.Date(2026, time.October, 27, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		expiry time.Time
+		want   time.Time
+	}{
+		{name: "short task lease", expiry: now.Add(10 * time.Second), want: now.Add(10 * time.Second)},
+		{name: "long task lease", expiry: now.Add(time.Minute), want: now.Add(25 * time.Second)},
+		{name: "expired task lease", expiry: now.Add(-time.Second), want: now.Add(-time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := boundedRuntimeLeaseExpiry(now, tc.expiry); !got.Equal(tc.want) {
+				t.Fatalf("host lease expiry = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	service, _, manager, server := newRuntimeControlTest(t, 0, 0, runtimeclient.ModeBlocked, host.ControlAI, "")
+	defer func() { _ = manager.Close() }()
+	defer server.Close()
+	session, err := service.Connect(context.Background(), "h1234567", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if err := session.SetTaskLease(context.Background(), "q1234567", 1, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("host should accept bounded lease: %v", err)
+	}
+}
 
 func TestRuntimeControlConnectActivatesBlockedAIAndPersistsInstance(t *testing.T) {
 	service, hosts, manager, server := newRuntimeControlTest(t, 0, 0, runtimeclient.ModeBlocked, host.ControlAI, "")

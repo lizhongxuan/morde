@@ -161,7 +161,7 @@ func TestStoreQueriesAndConversions(t *testing.T) {
 	}
 	user := identity.User{
 		ID: "u1234567", Name: "new-user", PasswordHash: "hash", Role: identity.RoleUser,
-		Status: identity.StatusPending,
+		Status: identity.StatusPending, DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048,
 	}
 	if _, err := s.CreateUser(ctx, user); err != nil {
 		t.Fatal(err)

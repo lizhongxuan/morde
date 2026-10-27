@@ -13,26 +13,36 @@ import (
 
 func conversationDomain(row sqlcgen.Conversation) conversation.Conversation {
 	return conversation.Conversation{
-		ID: row.ID, OwnerID: row.OwnerID, HostID: row.HostID, Title: row.Title,
-		CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
+		ID: row.ID, OwnerID: row.OwnerID, HostID: row.HostID.String, ModelID: row.ModelID, Title: row.Title,
+		MessageSequence: row.MessageSeq,
+		CreatedAt:       row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
 }
 
 func messageDomain(row sqlcgen.ConversationMessage) conversation.Message {
 	return conversation.Message{
 		ID: row.ID, ConversationID: row.ConversationID, OwnerID: row.OwnerID,
-		Role: conversation.Role(row.Role), Content: row.Content, TaskID: row.TaskID,
+		Role: conversation.Role(row.Role), Content: row.Content, TaskID: row.TaskID.String,
+		ModelID: row.ModelID, Sequence: row.Sequence, SourceKind: row.SourceKind,
+		SourceExchangeID: row.SourceExchangeID, RequestedConversationID: row.RequestedConversationID,
 		CreatedAt: row.CreatedAt.Time,
 	}
 }
 
 func taskDomain(row sqlcgen.Task) task.Task {
 	return task.Task{
-		ID: row.ID, OwnerID: row.OwnerID, ConversationID: row.ConversationID, HostID: row.HostID,
+		ID: row.ID, OwnerID: row.OwnerID, ConversationID: row.ConversationID, HostID: row.HostID.String,
+		ExecutionLocation: row.ExecutionLocation, WorkspaceID: row.WorkspaceID.String,
+		InputRevision: int64Pointer(row.InputRevision), ContextDigest: append([]byte(nil), row.ContextDigest...),
+		AgentInstanceID: row.AgentInstanceID, AgentGeneration: row.AgentGeneration, AgentSessionID: row.AgentSessionID,
+		AgentEngineVersion: row.AgentEngineVersion, AgentProfileVersion: row.AgentProfileVersion,
+		CheckpointDigest: append([]byte(nil), row.CheckpointDigest...), CheckpointThroughSequence: row.CheckpointThroughSeq,
+		EventSequence: row.EventSeq,
 		ApplicationID: row.ApplicationID, ModelID: row.ModelID, Objective: row.Objective, Status: task.Status(row.Status),
 		Authorization: task.Authorization{
 			Kind: row.AuthKind, TokenID: row.AuthTokenID,
 			ClientInstallationID: row.AuthClientInstallationID.String, Scopes: row.AuthScopes,
+			Version: row.AuthVersion, ExpiresAt: timePointer(row.AuthExpiresAt),
 		},
 		Budget:      task.Budget{ActiveSeconds: int64(row.BudgetActiveSeconds), ToolCalls: int64(row.BudgetToolCalls), ModelTokens: int64(row.BudgetModelTokens)},
 		Usage:       task.Usage{ActiveSeconds: row.UsageActiveSeconds, ToolCalls: row.UsageToolCalls, ModelTokens: int64Pointer(row.UsageModelTokens)},

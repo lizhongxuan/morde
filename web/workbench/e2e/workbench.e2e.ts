@@ -45,9 +45,16 @@ test("mock workbench edits files, uploads, downloads, and keeps browser frame mo
   await browserFrame.evaluate((frame) => { frame.dataset.preserved = "true"; });
   expect(vncLoads).toBe(2);
 
-  await page.getByRole("button", { name: "文件", exact: true }).focus();
+  await page.getByRole("button", { name: "文件", exact: true }).click();
+  await expect(page.getByText("请先接管电脑后使用文件。")).toBeVisible();
   const initialListRequestPromise = page.waitForRequest(fileListRequest);
-  await page.keyboard.press("Enter");
+  const takeoverRequest = page.waitForRequest((request) =>
+    new URL(request.url()).pathname === "/__ch/api/control/actions" && request.method() === "POST",
+  );
+  await page.getByRole("button", { name: "接管电脑" }).click();
+  await takeoverRequest;
+  await page.getByRole("button", { name: "重试接管" }).click();
+  await expect(vscodeTab).toBeEnabled({ timeout: 5000 });
   await expect(page.getByRole("button", { name: "README.md" })).toBeVisible();
   expect(await (await initialListRequestPromise).postDataJSON()).toEqual({
     path: "/home/gem/workspace",
@@ -143,17 +150,8 @@ test("mock workbench edits files, uploads, downloads, and keeps browser frame mo
     new URL(request.url()).pathname === "/__ch/api/terminal-session" && request.method() === "PUT",
   );
   await page.getByRole("button", { name: "终端", exact: true }).click();
-  await expect(page.getByText("请先接管电脑后使用终端。", { exact: true })).toBeVisible();
   await expect(browserFrame).toHaveAttribute("data-preserved", "true");
-  expect(vncLoads).toBe(2);
-
-  const takeoverRequest = page.waitForRequest((request) =>
-    new URL(request.url()).pathname === "/__ch/api/control/actions" && request.method() === "POST",
-  );
-  await page.getByRole("button", { name: "接管电脑" }).click();
-  await takeoverRequest;
-  await page.getByRole("button", { name: "重试接管" }).click();
-  await expect(vscodeTab).toBeEnabled({ timeout: 5000 });
+  expect(vncLoads).toBe(3);
   await terminalRequest;
   await expect(page.getByTitle("主机终端")).toBeVisible();
   const terminal = page.frameLocator('iframe[title="主机终端"]');

@@ -101,6 +101,10 @@ func TestStoreRoundTrips(t *testing.T) {
 	if got, err := store.UpdateUser(ctx, "system", identity.StatusApproved, owner); err != nil || got.Name != owner.Name || got.Status != identity.StatusDisabled {
 		t.Fatalf("UpdateUser() = %#v, %v", got, err)
 	}
+	owner.Status = identity.StatusApproved
+	if _, err := store.UpdateUser(ctx, "system", identity.StatusDisabled, owner); err != nil {
+		t.Fatalf("restore approved owner for remaining round trips: %v", err)
+	}
 	if err := CheckSchema(ctx, pool); err != nil {
 		t.Fatalf("CheckSchema() error = %v", err)
 	}

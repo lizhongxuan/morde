@@ -33,9 +33,15 @@ func validClarificationQuestion(value string) bool {
 	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00') && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 4096
 }
 
+func (s *Store) withTaskSnapshot(ctx context.Context, fn func(pgx.Tx) error) error {
+	return withTx(ctx, func(ctx context.Context) (pgx.Tx, error) {
+		return s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	}, fn)
+}
+
 func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetails, error) {
 	var result app.TaskDetails
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		queries := sqlcgen.New(tx)
 		row, err := queries.GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: ownerID})
 		if err != nil {
@@ -180,10 +186,10 @@ func (s *Store) taskEventPage(ctx context.Context, ownerID, taskID string, after
 		return app.TaskEventPage{}, domain.InvalidArgument("limit", "event limit is out of range")
 	}
 	var result app.TaskEventPage
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		var current int64
 		var status string
-		err := tx.QueryRow(ctx, `SELECT host_id, status, event_seq FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).
+		err := tx.QueryRow(ctx, `SELECT COALESCE(host_id, ''), status, event_seq FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).
 			Scan(&result.HostID, &status, &current)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
@@ -285,17 +291,18 @@ func (s *Store) ClaimNextTask(ctx context.Context, worker string, leaseDuration 
 		var hostID string
 		var taskEpoch int64
 		err := tx.QueryRow(ctx, `
-SELECT t.id, t.owner_id, t.host_id, t.execution_epoch FROM tasks AS t
+SELECT t.id, t.owner_id, COALESCE(t.host_id,''), t.execution_epoch FROM tasks AS t
 WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()))
+  AND t.execution_location='server'
   AND EXISTS (
     SELECT 1 FROM owner_execution_controls AS ec
     WHERE ec.owner_id=t.owner_id AND ec.state='enabled' AND ec.epoch=t.execution_epoch
   )
-  AND EXISTS (
+  AND (t.host_id IS NULL OR EXISTS (
     SELECT 1 FROM hosts AS h
     WHERE h.id=t.host_id AND h.owner_id=t.owner_id
-      AND h.state='running' AND h.deleted_at IS NULL AND h.control_state='ai'
-  )
+      AND h.state<>'deleted' AND h.deleted_at IS NULL
+  ))
 ORDER BY t.created_at, t.id
 LIMIT 1`).Scan(&id, &ownerID, &hostID, &taskEpoch)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -321,21 +328,13 @@ FOR UPDATE SKIP LOCKED`, id, ownerID, gate.epoch).Scan(&oldVersion)
 		if err != nil {
 			return fmt.Errorf("lock candidate task for claim: %w", err)
 		}
-		// Keep the task -> Host lock order used by operation writes. This second
-		// check waits out a concurrent control transition and observes its
-		// committed fence before changing the task lease.
-		var aiAllowed bool
-		err = tx.QueryRow(ctx, `
-SELECT state='running' AND deleted_at IS NULL AND control_state='ai'
-FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, hostID, ownerID).Scan(&aiAllowed)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("lock Host AI control fence for task claim: %w", err)
-		}
-		if !aiAllowed {
-			return nil
+		if hostID != "" {
+			if err := lockTaskTargetHost(ctx, tx, hostID, ownerID); err != nil {
+				if domain.CodeOf(err) == domain.CodeNotFound {
+					return nil
+				}
+				return err
+			}
 		}
 		found = true
 		if oldVersion == int64(^uint64(0)>>1) {
@@ -504,6 +503,21 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	}
 	var result task.Event
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
+		if message := progress.AssistantMessage; message != nil {
+			// AppendMessage locks the conversation first; use the same order so
+			// concurrent user and assistant messages cannot deadlock.
+			var locked string
+			err := tx.QueryRow(ctx, `SELECT c.id FROM conversations c JOIN tasks t
+ON t.conversation_id=c.id AND t.owner_id=c.owner_id
+WHERE t.id=$1 AND c.id=$2 AND c.owner_id=$3 FOR UPDATE OF c`,
+				progress.TaskID, message.ConversationID, message.OwnerID).Scan(&locked)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.InvalidArgument("assistant_message", "assistant message does not belong to the task")
+			}
+			if err != nil {
+				return fmt.Errorf("lock assistant message conversation: %w", err)
+			}
+		}
 		var current sqlcgen.Task
 		err := tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
@@ -575,7 +589,8 @@ WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.seque
 		finished := progress.Status == task.StatusCompleted || progress.Status == task.StatusFailed || progress.Status == task.StatusCancelled
 		var sequence int64
 		err = tx.QueryRow(ctx, `UPDATE tasks SET status=$4, current_step=$5, result=$6, waiting_reason=$7,
-usage_active_seconds=$8, usage_tool_calls=$9, usage_model_tokens=$10,
+usage_active_seconds=$8, usage_tool_calls=$9,
+usage_model_tokens=CASE WHEN execution_location='server' THEN usage_model_tokens ELSE $10 END,
 lease_owner=CASE WHEN $4='running' THEN lease_owner ELSE '' END,
 lease_expires_at=CASE WHEN $4='running' THEN lease_expires_at ELSE NULL END,
 finished_at=CASE WHEN $11 THEN clock_timestamp() WHEN $4='running' THEN NULL ELSE finished_at END,
@@ -774,7 +789,7 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := requireCurrentLease(ctx, tx, row, leaseOwner, value.LeaseVersion); err != nil {
 			return err
 		}
-		if value.HostID != row.HostID {
+		if value.HostID != row.HostID.String {
 			return domain.InvalidArgument("operation.host_id", "operation host does not match task host")
 		}
 		existing, err := loadOperationByKey(ctx, tx, value.TaskID, value.Key)
@@ -790,6 +805,9 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			return fmt.Errorf("read existing task operation: %w", err)
 		}
 		if err := requireOperationHostFence(ctx, tx, ownerID, value); err != nil {
+			return err
+		}
+		if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO task_operations (id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result)
@@ -919,6 +937,11 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 				return err
 			}
 		}
+		if adoptingPrepared || rearming || update.Status == task.OperationDispatched {
+			if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
+				return err
+			}
+		}
 		if operation.Status == update.Status && !adoptingPrepared {
 			if operation.ExternalID == update.ExternalID && operation.Result == update.Result {
 				result = operation
@@ -1006,8 +1029,10 @@ func requireOperationHostFence(ctx context.Context, tx pgx.Tx, ownerID string, o
 	var runtimeGeneration, controlVersion int64
 	var runtimeInstanceID string
 	var controlState string
-	err := tx.QueryRow(ctx, `SELECT runtime_generation, COALESCE(runtime_instance_id,''), control_version, control_state FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`,
-		operation.HostID, ownerID).Scan(&runtimeGeneration, &runtimeInstanceID, &controlVersion, &controlState)
+	var hostState string
+	var deleted bool
+	err := tx.QueryRow(ctx, `SELECT runtime_generation, COALESCE(runtime_instance_id,''), control_version, control_state, state, deleted_at IS NOT NULL FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`,
+		operation.HostID, ownerID).Scan(&runtimeGeneration, &runtimeInstanceID, &controlVersion, &controlState, &hostState, &deleted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeNotFound, "host not found")
 	}
@@ -1015,10 +1040,30 @@ func requireOperationHostFence(ctx context.Context, tx pgx.Tx, ownerID string, o
 		return fmt.Errorf("read host operation fence: %w", err)
 	}
 	if operation.RuntimeGeneration != runtimeGeneration || operation.RuntimeInstanceID != runtimeInstanceID ||
-		operation.ControlVersion != controlVersion || controlState != "ai" {
+		operation.ControlVersion != controlVersion || controlState != "ai" || hostState != "running" || deleted {
 		err := domain.NewError(domain.CodeInvalidState, "host runtime or control state changed")
 		err.Details["reason"] = "control_changed"
 		return err
+	}
+	return nil
+}
+
+// The Host fence lock is held while checking its managed application state.
+func requireRunningTaskApplication(ctx context.Context, tx pgx.Tx, value sqlcgen.Task) error {
+	if value.ApplicationID == "" {
+		return nil
+	}
+	var running bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM host_application_launches a JOIN hosts h ON h.id=a.host_id AND h.owner_id=a.owner_id
+WHERE a.host_id=$1 AND a.owner_id=$2 AND a.application_id=$3 AND a.status='running'
+  AND a.runtime_generation=h.runtime_generation AND a.runtime_instance_id=h.runtime_instance_id
+  AND a.control_version=h.control_version)`, value.HostID.String, value.OwnerID, value.ApplicationID).Scan(&running)
+	if err != nil {
+		return fmt.Errorf("check task application launch: %w", err)
+	}
+	if !running {
+		return domain.NewError(domain.CodeInvalidState, "target application is not running on this Host")
 	}
 	return nil
 }

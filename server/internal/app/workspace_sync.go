@@ -366,7 +366,9 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 		if errors.Is(err, errIncompleteWorkspaceSync) {
 			return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace sync is missing acknowledged blocks")
 		}
-		_ = s.store.FailWorkspaceSyncSession(ctx, workspaceID, sessionID)
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			_ = s.store.FailWorkspaceSyncSession(ctx, workspaceID, sessionID)
+		}
 		return workspace.SyncSession{}, err
 	}
 	record, err := idempotencyRecord(value.OwnerID, "workspace.sync.commit", idempotencyKey, struct {

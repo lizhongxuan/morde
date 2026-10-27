@@ -13,18 +13,15 @@ import (
 )
 
 func TestLifecycleAndPrivatePreviewTools(t *testing.T) {
-	hosts := &hostServiceStub{value: host.Host{ID: "host_test", OwnerID: "user_test", State: host.StateRunning}}
+	hosts := &hostServiceStub{value: host.Host{ID: "h1234567", OwnerID: "user_test", State: host.StateRunning}}
 	service := &service{deps: Deps{PreviewPortMin: 1024, PreviewPortDeny: []int{8080}, Hosts: hosts, Domains: config.Domains{Scheme: "https", HostSuffix: "hosts.example.test"}}}
 	principal := identity.Principal{
 		UserID: "user_test", Role: identity.RoleUser, Kind: identity.KindAPIKey,
-		HostIDs: []string{"host_test"}, Scopes: []identity.Scope{
-			identity.ScopeHostRead, identity.ScopeHostManage, identity.ScopeComputerObserve,
-		},
 	}
 	ctx := context.Background()
 
 	for _, name := range []string{"host_list", "host_get", "host_delete", "host_renew"} {
-		args := map[string]any{"host_id": "host_test"}
+		args := map[string]any{"host_id": "h1234567"}
 		if name == "host_list" {
 			args = map[string]any{}
 		}
@@ -45,21 +42,21 @@ func TestLifecycleAndPrivatePreviewTools(t *testing.T) {
 		t.Fatalf("unknown lifecycle error = %v", err)
 	}
 
-	value, err := service.preview(ctx, principal, map[string]any{"host_id": "host_test", "port": json.Number("3000")})
+	value, err := service.preview(ctx, principal, map[string]any{"host_id": "h1234567", "port": json.Number("3000")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := json.Marshal(value)
-	if err != nil || string(encoded) != `{"url":"https://3000-host_test.hosts.example.test"}` {
+	if err != nil || string(encoded) != `{"url":"https://3000-h1234567.hosts.example.test"}` {
 		t.Fatalf("private preview = %s, %v", encoded, err)
 	}
 	for _, port := range []string{"80", "8080", "5900", "6080", "8091", "8100", "9222", "65536"} {
-		if _, err := service.preview(ctx, principal, map[string]any{"host_id": "host_test", "port": json.Number(port)}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		if _, err := service.preview(ctx, principal, map[string]any{"host_id": "h1234567", "port": json.Number(port)}); domain.CodeOf(err) != domain.CodeInvalidArgument {
 			t.Fatalf("denied preview port %s error = %v", port, err)
 		}
 	}
 	hosts.getErr = domain.NewError(domain.CodeNotFound, "not found")
-	if _, err := service.preview(ctx, principal, map[string]any{"host_id": "host_test", "port": json.Number("3000")}); domain.CodeOf(err) != domain.CodeNotFound {
+	if _, err := service.preview(ctx, principal, map[string]any{"host_id": "h1234567", "port": json.Number("3000")}); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("unauthorized preview error = %v", err)
 	}
 }

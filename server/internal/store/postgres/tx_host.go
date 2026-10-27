@@ -87,30 +87,44 @@ func (s *Store) CreateHost(ctx context.Context, params app.CreateHostParams) (ho
 		}
 
 		queries := sqlcgen.New(tx)
-		user, err := queries.GetUserByID(ctx, params.Host.OwnerID)
-		if err != nil {
+		var quotaHosts, quotaCPU, quotaMem, defaultCPU, defaultMem int
+		var ownerStatus string
+		if err := tx.QueryRow(ctx, `SELECT quota_hosts, quota_cpu_milli, quota_mem_mib,
+       default_host_cpu_milli, default_host_mem_mib, status
+FROM users WHERE id=$1 FOR UPDATE`, params.Host.OwnerID).Scan(
+			&quotaHosts, &quotaCPU, &quotaMem, &defaultCPU, &defaultMem, &ownerStatus,
+		); err != nil {
 			return storeError("get host owner", "user", err)
 		}
+		if ownerStatus != "approved" {
+			return domain.NewError(domain.CodeForbidden, "account is not approved")
+		}
+		var hostCount int64
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM hosts
+WHERE owner_id=$1 AND deleted_at IS NULL AND state <> 'deleted'`, params.Host.OwnerID).Scan(&hostCount); err != nil {
+			return fmt.Errorf("read owner host count: %w", err)
+		}
+		if hostCount >= int64(quotaHosts) {
+			return hostCountQuotaError(quotaHosts)
+		}
+		params.Host.CPUMilli, params.Host.CPULimitMilli = defaultCPU, defaultCPU
+		params.Host.MemMiB, params.Host.MemLimitMiB = defaultMem, defaultMem
 
-		var userHosts, userCPU, userMemory int64
-		if err := tx.QueryRow(ctx, allocatedUsageSQL, params.Host.OwnerID).Scan(&userHosts, &userCPU, &userMemory); err != nil {
+		var userCPU, userMemory int64
+		if err := tx.QueryRow(ctx, allocatedResourceUsageSQL, params.Host.OwnerID).Scan(&userCPU, &userMemory); err != nil {
 			return fmt.Errorf("read owner host allocation: %w", err)
 		}
-		if err := validateAllocation("host_count", userHosts, 1, int64(user.QuotaHosts), domain.CodeQuotaExceeded); err != nil {
+		if err := validateAllocation("cpu_milli", userCPU, int64(params.Host.CPUMilli), int64(quotaCPU), domain.CodeQuotaExceeded); err != nil {
 			return err
 		}
-		if err := validateAllocation("cpu_milli", userCPU, int64(params.Host.CPUMilli), int64(user.QuotaCpuMilli), domain.CodeQuotaExceeded); err != nil {
-			return err
-		}
-		if err := validateAllocation("mem_mib", userMemory, int64(params.Host.MemMiB), int64(user.QuotaMemMib), domain.CodeQuotaExceeded); err != nil {
+		if err := validateAllocation("mem_mib", userMemory, int64(params.Host.MemMiB), int64(quotaMem), domain.CodeQuotaExceeded); err != nil {
 			return err
 		}
 
-		var clusterHosts, clusterCPU, clusterMemory int64
-		if err := tx.QueryRow(ctx, allocatedUsageSQL, nil).Scan(&clusterHosts, &clusterCPU, &clusterMemory); err != nil {
+		var clusterCPU, clusterMemory int64
+		if err := tx.QueryRow(ctx, allocatedResourceUsageSQL, nil).Scan(&clusterCPU, &clusterMemory); err != nil {
 			return fmt.Errorf("read cluster host allocation: %w", err)
 		}
-		_ = clusterHosts
 		if err := validateAllocation("cpu_milli", clusterCPU, int64(params.Host.CPUMilli), params.Capacity.CPUMilli, domain.CodeCapacityExceeded); err != nil {
 			return err
 		}
@@ -146,22 +160,6 @@ VALUES ($1, $2, $3, $4, $4, 'preparing', 1, $5, 0)`,
 				return workspaceBindingInsertError(err)
 			}
 		}
-		if params.GrantTokenID != "" {
-			tag, err := tx.Exec(ctx, `UPDATE tokens
-SET host_ids = array_append(host_ids, $3)
-WHERE id=$1 AND owner_id=$2 AND kind='api_key' AND revoked_at IS NULL
-  AND expires_at > clock_timestamp() AND 'host:create'=ANY(scopes)
-  AND cardinality(host_ids) < 500
-  AND EXISTS (SELECT 1 FROM users WHERE id=$2 AND status='approved')`,
-				params.GrantTokenID, params.Host.OwnerID, params.Host.ID)
-			if err != nil {
-				return fmt.Errorf("grant newly created host to API key: %w", err)
-			}
-			if tag.RowsAffected() != 1 {
-				return domain.NewError(domain.CodeForbidden, "API key cannot be granted access to the new host")
-			}
-		}
-
 		row, err := queries.GetHost(ctx, params.Host.ID)
 		if err != nil {
 			return fmt.Errorf("read created host: %w", err)
@@ -178,6 +176,13 @@ WHERE id=$1 AND owner_id=$2 AND kind='api_key' AND revoked_at IS NULL
 		return host.Host{}, false, err
 	}
 	return created, replayed, nil
+}
+
+func hostCountQuotaError(limit int) error {
+	err := domain.NewError(domain.CodeQuotaExceeded, "host quota exceeded")
+	err.Details["dimension"] = "hosts"
+	err.Details["limit"] = limit
+	return err
 }
 
 func validateHostCreateIdempotency(record app.IdempotencyRecord) error {
@@ -202,14 +207,17 @@ func hostCreateReplayInTx(ctx context.Context, tx pgx.Tx, ownerID, hostID string
 	return value, nil
 }
 
-const allocatedUsageSQL = `
-SELECT count(*)::bigint,
-       COALESCE(sum(h.cpu_milli), 0)::bigint,
-       COALESCE(sum(h.mem_mib), 0)::bigint
+const allocatedResourceUsageSQL = `
+SELECT COALESCE(sum(GREATEST(h.cpu_milli, COALESCE(h.resource_target_cpu_milli, h.cpu_milli),
+                         CASE WHEN h.resource_update_state <> 'idle' THEN h.cpu_limit_milli ELSE 0 END)), 0)::bigint,
+       COALESCE(sum(GREATEST(h.mem_mib, COALESCE(h.resource_target_mem_mib, h.mem_mib),
+                         CASE WHEN h.resource_update_state <> 'idle' THEN h.mem_limit_mib ELSE 0 END)), 0)::bigint
 FROM hosts h
 WHERE h.deleted_at IS NULL
   AND ($1::text IS NULL OR h.owner_id = $1)
   AND (
+	    h.resource_update_state <> 'idle'
+	    OR
 	    h.state IN ('creating', 'running', 'stopping', 'deleting')
     OR (h.state = 'failed' AND (
       h.sandbox_id IS NOT NULL
@@ -229,8 +237,12 @@ INSERT INTO hosts (
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())`
 
 func validateCreateHost(params app.CreateHostParams) error {
+	return validateHostInsert(params, host.StateCreating)
+}
+
+func validateHostInsert(params app.CreateHostParams, state host.State) error {
 	h := params.Host
-	if !domain.ValidHostID(h.ID) || !domain.ValidUserID(h.OwnerID) || h.State != host.StateCreating ||
+	if !domain.ValidHostID(h.ID) || !domain.ValidUserID(h.OwnerID) || h.State != state ||
 		h.TemplateID == "" || h.RuntimeProfile == "" || len(h.AIOKeyEnc) == 0 || len(h.RuntimeCredentialEnc) == 0 || h.RuntimeGeneration <= 0 {
 		return domain.InvalidArgument("host", "host creation fields are invalid")
 	}

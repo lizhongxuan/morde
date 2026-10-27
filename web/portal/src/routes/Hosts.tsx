@@ -31,6 +31,7 @@ export function Hosts() {
     queryKey: ['hosts'], queryFn: portalApi.hosts,
     refetchInterval: (query) => query.state.data?.items.some((host) => unsettled.has(host.state)) ? 3000 : query.state.data?.items.length ? 30000 : false,
   });
+  const atLimit = !!user && (hosts.data?.items.length ?? 0) >= user.quota.hosts;
   const [deleting, setDeleting] = useState<Host | null>(null);
   const [lifecycleAction, setLifecycleAction] = useState<{ host: Host; action: 'release' | 'restore' } | null>(null);
   const update = useMutation({
@@ -57,23 +58,12 @@ export function Hosts() {
 
   const sharedHosts = useQuery({ queryKey: ['shared-hosts'], queryFn: portalApi.sharedHosts });
   const enterShared = async (host: Awaited<ReturnType<typeof portalApi.sharedHosts>>['items'][number], entryTarget: 'desktop' | 'terminal') => {
-    const tab = window.open('about:blank', '_blank');
-    if (!tab) { notify('浏览器阻止了新窗口，请允许弹窗后重试。', 'error'); return; }
-    tab.opener = null;
-    try {
-      const ticket = await portalApi.issueObservationTicket(host.id, entryTarget);
-      const destination = resolveObservationTicketURL(ticket.url, host.url);
-      tab.location.replace(destination);
-    } catch (error) {
-      tab.close();
-      const details = errorDetails(error);
-      if (details.code === 'not_found' || details.code === 'forbidden') void sharedHosts.refetch();
-      notify(details.message, 'error');
-    }
+    try { enterHostInNewTab(host.id, entryTarget); }
+    catch (error) { notify(errorDetails(error).message, 'error'); }
   };
 
   return <section>
-    <div className="page-heading"><div><p className="eyebrow">你的云端电脑</p><h1>云端电脑</h1><p className="muted">电脑停在云端，任务、应用与文件都留在自己的隔离环境里。</p></div><div className="inline-actions"><Link className="button button-secondary" to="/workspaces">工作目录</Link><Link className="button button-primary" to="/hosts/new">创建电脑</Link></div></div>
+    <div className="page-heading"><div><p className="eyebrow">你的云端电脑</p><h1>云端电脑</h1><p className="muted">电脑与文件都保存在你的云端空间。</p></div><div className="inline-actions"><Link className="button button-secondary" to="/workspaces">工作目录</Link>{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>创建电脑</button> : <Link className="button button-primary" to="/hosts/new">创建电脑</Link>}</div></div>
     {hosts.isPending ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError ? <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div> : !hosts.data?.items.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <div className="host-list">
       {hosts.data.items.map((host) => {
         return <HostCard key={host.id} host={host} busy={update.isPending && update.variables?.host.id === host.id} canEnter={host.owner_id === user?.id} onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ host, action: 'restore' })} onDelete={() => setDeleting(host)} />;
@@ -136,20 +126,4 @@ function HostCard({ host, busy, canEnter, onEnter, onRenew, onRelease, onRestore
       <button type="button" className="button button-danger-quiet" onClick={onDelete} disabled={host.state === 'deleting' || host.state === 'creating' || host.state === 'stopping' || busy} aria-label={`删除主机 ${name}`}>删除</button>
     </div>
   </article>;
-}
-
-function resolveObservationTicketURL(ticketURL: string, hostURL: string): string {
-  let host: URL;
-  let target: URL;
-  try {
-    host = new URL(hostURL, window.location.origin);
-    target = new URL(ticketURL, host);
-  } catch {
-    throw new Error('共享桌面入口地址无效，已阻止打开。');
-  }
-  if (!['http:', 'https:'].includes(host.protocol) || target.origin !== host.origin || target.pathname !== '/__ch/auth'
-    || !target.searchParams.get('t') || target.username || target.password || target.hash) {
-    throw new Error('共享桌面入口地址无效，已阻止打开。');
-  }
-  return target.href;
 }

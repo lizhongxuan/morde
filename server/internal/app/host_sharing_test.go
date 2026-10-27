@@ -215,6 +215,18 @@ func TestClientSharedHostTicketsAreObservationOnlyAndAudited(t *testing.T) {
 	}
 }
 
+func TestInstalledWebSharedHostTerminalTicketIsInstallationBound(t *testing.T) {
+	service, _, tokens, _ := newSharingService(t, []host.Permission{host.PermissionTerminalControl})
+	principal := sharingSession(sharingMemberID)
+	principal.ClientInstallationID = "i1234567"
+	if _, err := service.IssueTerminalTicket(context.Background(), principal, sharingHostID); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.value.ClientInstallationID != principal.ClientInstallationID || tokens.value.ActorUserID != sharingMemberID {
+		t.Fatalf("installed Web shared Host ticket = %#v", tokens.value)
+	}
+}
+
 func TestHostTerminalTicketIsScopedAndRequiresTerminalPermission(t *testing.T) {
 	service, _, tokens, auditor := newSharingService(t, []host.Permission{host.PermissionTerminalControl})
 	info, err := service.IssueTerminalTicket(context.Background(), sharingSession(sharingMemberID), sharingHostID)

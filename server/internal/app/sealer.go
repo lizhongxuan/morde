@@ -37,6 +37,10 @@ func LoadSealer(path string) (*Sealer, error) {
 }
 
 func (s *Sealer) Seal(plain []byte) ([]byte, error) {
+	return s.sealWithAAD(plain, nil)
+}
+
+func (s *Sealer) sealWithAAD(plain, aad []byte) ([]byte, error) {
 	if s == nil || s.aead == nil {
 		return nil, fmt.Errorf("data sealer is not initialized")
 	}
@@ -44,15 +48,19 @@ func (s *Sealer) Seal(plain []byte) ([]byte, error) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("generate data nonce: %w", err)
 	}
-	return s.aead.Seal(nonce, nonce, plain, nil), nil
+	return s.aead.Seal(nonce, nonce, plain, aad), nil
 }
 
 func (s *Sealer) Open(ciphertext []byte) ([]byte, error) {
+	return s.openWithAAD(ciphertext, nil)
+}
+
+func (s *Sealer) openWithAAD(ciphertext, aad []byte) ([]byte, error) {
 	if s == nil || s.aead == nil || len(ciphertext) < s.aead.NonceSize()+s.aead.Overhead() {
 		return nil, fmt.Errorf("encrypted data is invalid")
 	}
 	nonce, body := ciphertext[:s.aead.NonceSize()], ciphertext[s.aead.NonceSize():]
-	plain, err := s.aead.Open(nil, nonce, body, nil)
+	plain, err := s.aead.Open(nil, nonce, body, aad)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt data: %w", err)
 	}

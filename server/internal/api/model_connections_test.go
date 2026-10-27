@@ -149,12 +149,13 @@ func TestModelConnectionCheckReturnsSafeProviderCategory(t *testing.T) {
 	services := newServices()
 	deps := services.deps()
 	deps.ModelConnections = manager
+	deps.ModelGateway = &modelGatewayHTTPTest{checkErr: manager.checkErr}
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
-	response := requestWithCookieBody(router, http.MethodPost, "/api/model-connections/p1234567/check", "{}", cookie, "https://portal.example.test")
+	response := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/model-connections/p1234567/check", "{}", cookie, "https://portal.example.test", "Idempotency-Key", "probe-key-0001")
 	body := response.Body.String()
 	if response.Code != http.StatusBadGateway || !strings.Contains(body, "authentication_rejected") || strings.Contains(body, "provider-secret") || strings.Contains(body, "private provider error") {
 		t.Fatalf("provider check response = %d %s", response.Code, body)

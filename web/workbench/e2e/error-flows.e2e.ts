@@ -27,6 +27,10 @@ test("[mock] shows readable file read, upload, and download errors", async ({ br
         expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       }),
     }));
+    await context.route("**/__ch/api/control", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ host_id: "h1234567", control_state: "user", control_version: 1, active_transition: null }),
+    }));
     await context.route("**/vnc/index.html*", (route) => route.fulfill({
       contentType: "text/html",
       body: "<!doctype html><html class=\"noVNC_connected\"><title>local desktop mock</title></html>",

@@ -406,10 +406,11 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 				conversationID, value.OwnerID, value.HostID, truncateScheduleTitle(value.Objective)); err != nil {
 				return fmt.Errorf("create scheduled conversation: %w", err)
 			}
-			taskValue := task.Task{
+			taskValue := normalizeNewTask(task.Task{
 				ID: taskID, OwnerID: value.OwnerID, ConversationID: conversationID, HostID: value.HostID,
-				ModelID: value.ModelID, Objective: value.Objective, Status: task.StatusQueued, Authorization: value.Authorization, Budget: value.Budget,
-			}
+				ExecutionLocation: "server", ModelID: value.ModelID, Objective: value.Objective, Status: task.StatusQueued,
+				Authorization: value.Authorization, Budget: value.Budget,
+			})
 			if err := validateTask(taskValue); err != nil {
 				return err
 			}

@@ -8,15 +8,21 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"morde-runtime/contract"
+	"morde-runtime/workspacereplica"
 	"morde-sync/client"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,8 +67,6 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 		Verifier:      unusedWorkspaceSyncVerifier{},
 		Auth:          unusedWorkspaceSyncAuth{},
 		WorkspaceSync: syncService,
-		Tasks:         unusedWorkspaceSyncTasks{},
-		Conversations: unusedWorkspaceSyncConversations{},
 		MCPDisabled:   true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,
@@ -176,6 +180,12 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(directoryB, "before-leaving.txt")); err != nil || string(data) != "checkpointed on Host A\n" {
 		t.Fatalf("Host B restored checkpoint data = %q, %v", data, err)
 	}
+	if err := clientB.ConfirmDownloadedLiveBaseline(ctx, workspaceValue.ID, directoryB, checkpointRevision); err != nil {
+		t.Fatalf("Host B did not establish a live baseline from its download: %v", err)
+	}
+	if err := clientB.ValidateLiveBaseline(ctx, workspaceValue.ID, directoryB, nil); err != nil {
+		t.Fatalf("Host B cannot resume its downloaded baseline: %v", err)
+	}
 	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostB, bindingB.BindingVersion, workspaceValue.ID,
 		rootCredentialB, initialB.Session.ID, checkpointRevision)
 	hostHandoffActivate(t, httpClient, httpServer.URL, hostB, bindingB.BindingVersion, workspaceValue.ID, rootCredentialB)
@@ -185,6 +195,172 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 		activeB.DesiredRevision != checkpointRevision || activeB.Workspace.Revision != checkpointRevision {
 		t.Fatalf("Host B binding after verified restore = %#v, %v", activeB, err)
 	}
+}
+
+func TestHostWorkspaceLiveSyncAppliedReceiptThroughHTTPAndPostgres(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Host workspace ownership updates require Linux")
+	}
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "host-live-applied-http-e2e")
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostValue, rootCredential := createHostHandoffTestHost(t, ctx, store, sealer, owner.ID,
+		app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "blocks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blocks.Close() })
+	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := api.New(api.Deps{
+		Hosts: unusedWorkspaceSyncHostService{}, HostReplicas: hostReplicas,
+		TLSAuthorizer: unusedWorkspaceSyncTLSAuthorizer{}, Verifier: unusedWorkspaceSyncVerifier{},
+		Auth: unusedWorkspaceSyncAuth{}, WorkspaceSync: syncService, MCPDisabled: true,
+	}, api.Options{
+		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,
+		MCPMaxBodyBytes: 16 << 20, SessionTTL: time.Hour, HostScheme: "https",
+		PortalDomain: "portal.example.test", HostSuffix: "example-hosts.test", PreviewPortMin: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initialAttempts atomic.Int32
+	var appliedAttempts atomic.Int32
+	appliedSessions := make(chan string, 2)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/applied") {
+			body, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				http.Error(w, "invalid receipt", http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var receipt struct {
+				SessionID       string `json:"session_id"`
+				AppliedRevision int64  `json:"applied_revision"`
+			}
+			if json.Unmarshal(body, &receipt) == nil {
+				if receipt.AppliedRevision == 0 && initialAttempts.Add(1) == 1 {
+					http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+					return
+				}
+				if receipt.AppliedRevision == 1 {
+					attempt := appliedAttempts.Add(1)
+					if attempt <= 2 {
+						appliedSessions <- receipt.SessionID
+					}
+					if attempt == 1 {
+						http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+						return
+					}
+				}
+			}
+		}
+		router.ServeHTTP(w, r)
+	}))
+	t.Cleanup(httpServer.Close)
+	root := t.TempDir()
+	manager := hostWorkspaceAppliedTestManager{hostID: hostValue.ID, generation: hostValue.RuntimeGeneration}
+	controllerErrors := make(chan error, 32)
+	controller, err := workspacereplica.New(workspacereplica.Options{
+		HostID: hostValue.ID, Generation: hostValue.RuntimeGeneration, PortalURL: httpServer.URL,
+		BootstrapCredential: rootCredential, WorkspaceRoot: root,
+		WorkspaceUID: uint32(os.Getuid()), WorkspaceGID: uint32(os.Getgid()), Manager: manager,
+		PollInterval: time.Second,
+		OnError: func(err error) {
+			select {
+			case controllerErrors <- err:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- controller.Run(runCtx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Host workspace controller stopped unexpectedly: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Host workspace controller did not stop")
+		}
+	})
+
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		binding, getErr := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if getErr == nil && binding.State == workspace.BindingActive && binding.AppliedRevision == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Host did not apply and activate initial binding: %+v, %v", binding, getErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := initialAttempts.Load(); got < 2 {
+		t.Fatalf("initial Host applied receipt attempts = %d, want retry after temporary failure", got)
+	}
+	writeWorkspaceSyncE2EFile(t, filepath.Join(root, workspaceValue.ID), "from-host.txt", []byte("saved on Host\n"))
+	for {
+		binding, getErr := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if getErr == nil && binding.AppliedRevision == 1 && binding.Workspace.Revision == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			var errors []error
+			for len(controllerErrors) > 0 {
+				errors = append(errors, <-controllerErrors)
+			}
+			t.Fatalf("Host live sync did not advance applied revision: %+v, %v; receipt attempts=%d; controller errors=%v",
+				binding, getErr, appliedAttempts.Load(), errors)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := appliedAttempts.Load(); got < 2 {
+		t.Fatalf("Host applied receipt attempts = %d, want one failure and a retry", got)
+	}
+	first, second := <-appliedSessions, <-appliedSessions
+	if first == "" || second != first {
+		t.Fatalf("Host applied receipt changed session on retry: %q, %q", first, second)
+	}
+	manifest, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, 1, "", "", 100)
+	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Path != "from-host.txt" {
+		t.Fatalf("Host live sync manifest = %+v, %v", manifest, err)
+	}
+}
+
+type hostWorkspaceAppliedTestManager struct {
+	hostID     string
+	generation int64
+}
+
+func (m hostWorkspaceAppliedTestManager) Capabilities(contract.CapabilitiesRequest) (contract.CapabilitiesResponse, error) {
+	return contract.CapabilitiesResponse{
+		ProtocolVersion: contract.ProtocolVersion, HostID: m.hostID, RuntimeGeneration: m.generation,
+		RuntimeInstanceID: "instance-1", ControlVersion: 1,
+	}, nil
+}
+
+func (hostWorkspaceAppliedTestManager) SetWorkspaceBindings(context.Context, contract.SetWorkspaceBindingsRequest) (contract.SetWorkspaceBindingsResponse, error) {
+	return contract.SetWorkspaceBindingsResponse{}, nil
 }
 
 func createHostHandoffTestHost(t *testing.T, ctx context.Context, store *Store, sealer *app.Sealer, ownerID string,

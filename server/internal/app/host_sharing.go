@@ -161,7 +161,7 @@ func (s *hostSharingService) issueHostTicket(ctx context.Context, principal iden
 	}
 	expiresAt := time.Now().UTC().Add(s.ticketTTL)
 	var credential string
-	if principal.Kind == identity.KindClient {
+	if principal.ClientInstallationID != "" {
 		_, credential, err = issueClientTicket(ctx, s.tokens, value.OwnerID, principal.UserID, value.ID, principal.ClientInstallationID, expiresAt)
 	} else if owner {
 		_, credential, err = issueCredentialWithPreviewPort(ctx, s.tokens, value.OwnerID, identity.KindTicket, value.ID, "", expiresAt, nil, nil, 0)

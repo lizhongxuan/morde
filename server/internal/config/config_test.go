@@ -290,6 +290,28 @@ func TestLoadTemplatesValidatesDirectoryAndTemplateFiles(t *testing.T) {
 	}
 }
 
+func TestDeploymentTemplatesExposeRequestedHostSizes(t *testing.T) {
+	dir := filepath.Join("..", "..", "..", "deploy", "single", "templates")
+	templates, err := LoadTemplates(dir, map[string]Profile{"container": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]struct{ cpu, memory string }{
+		"std-1c2g": {cpu: "1", memory: "2Gi"},
+		"std-2c2g": {cpu: "2", memory: "2Gi"},
+		"std-2c4g": {cpu: "2", memory: "4Gi"},
+	}
+	if len(templates) != len(want) {
+		t.Fatalf("deployment templates = %d, want %d", len(templates), len(want))
+	}
+	for id, resources := range want {
+		tmpl, ok := templates[id]
+		if !ok || tmpl.Resources.Limits.CPU != resources.cpu || tmpl.Resources.Limits.Memory != resources.memory {
+			t.Fatalf("template %s = %#v, want limits %s CPU / %s memory", id, tmpl.Resources.Limits, resources.cpu, resources.memory)
+		}
+	}
+}
+
 func TestLoadTemplatesReportsInvalidFilesAndDuplicateIDs(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -22,7 +22,6 @@ import (
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/notification"
-	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -59,6 +58,9 @@ type hostServiceStub struct {
 func (s *hostServiceStub) Create(_ context.Context, p identity.Principal, cmd app.CreateHostCommand) (host.Host, error) {
 	s.principal, s.created = p, cmd
 	return s.item, s.err
+}
+func (s *hostServiceStub) EnsureDefaultStopped(context.Context, identity.User) (host.Host, bool, error) {
+	return s.item, false, s.err
 }
 func (s *hostServiceStub) List(_ context.Context, p identity.Principal) ([]host.Host, error) {
 	s.principal = p
@@ -244,15 +246,13 @@ func (s templateReaderStub) ListTemplates(context.Context) ([]TemplateRecord, er
 }
 
 type tokenServiceStub struct {
-	apiKeys       []identity.Token
-	created       CreatedAPIKey
-	err           error
-	principal     identity.Principal
-	tokenID       string
-	apiKeyName    string
-	apiKeyHostIDs []string
-	apiKeyScopes  []identity.Scope
-	apiKeyTTL     time.Duration
+	apiKeys    []identity.Token
+	created    CreatedAPIKey
+	err        error
+	principal  identity.Principal
+	tokenID    string
+	apiKeyName string
+	apiKeyTTL  time.Duration
 }
 
 func (s *tokenServiceStub) ListAPIKeys(_ context.Context, p identity.Principal) ([]identity.Token, error) {
@@ -262,8 +262,8 @@ func (s *tokenServiceStub) ListAPIKeys(_ context.Context, p identity.Principal) 
 	}
 	return s.apiKeys, s.err
 }
-func (s *tokenServiceStub) CreateAPIKey(_ context.Context, p identity.Principal, name string, hostIDs []string, scopes []identity.Scope, ttl time.Duration) (CreatedAPIKey, error) {
-	s.principal, s.apiKeyName, s.apiKeyHostIDs, s.apiKeyScopes, s.apiKeyTTL = p, name, hostIDs, scopes, ttl
+func (s *tokenServiceStub) CreateAPIKey(_ context.Context, p identity.Principal, name string, ttl time.Duration) (CreatedAPIKey, error) {
+	s.principal, s.apiKeyName, s.apiKeyTTL = p, name, ttl
 	if p.Kind != identity.KindSession {
 		return CreatedAPIKey{}, domain.NewError(domain.CodeForbidden, "portal session required")
 	}
@@ -335,12 +335,12 @@ func TestHostCreateMapsDTOAndDoesNotExposeCredentialMaterial(t *testing.T) {
 	services.hosts.item.SandboxID = "private-sandbox-id"
 	services.hosts.item.AIOKeyEnc = []byte("encrypted-aio-key")
 	router := newRouter(t, services, Options{CookieSecure: true})
-	body := `{"template_id":"std-2c4g","name":"work"}`
+	body := `{"name":"work"}`
 	response := requestWithHeader(router, http.MethodPost, "/api/hosts", body, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-host-create-01")
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-	if services.hosts.created.TemplateID != "std-2c4g" || services.hosts.created.Name != "work" || len(services.hosts.created.WorkspaceIDs) != 0 || services.hosts.created.IdempotencyKey != "route-host-create-01" {
+	if services.hosts.created.Name != "work" || len(services.hosts.created.WorkspaceIDs) != 0 || services.hosts.created.IdempotencyKey != "route-host-create-01" {
 		t.Fatalf("create command = %#v", services.hosts.created)
 	}
 	if services.hosts.principal.Kind != identity.KindAPIKey || services.hosts.principal.UserID != testUserID {
@@ -479,7 +479,7 @@ func TestAuthRequiredAndApplicationErrorsAreSafe(t *testing.T) {
 	assertError(t, response, http.StatusUnauthorized, "unauthenticated")
 
 	services.hosts.err = &domain.Error{Code: domain.CodeQuotaExceeded, Message: "private-aio-key must not appear", Details: map[string]any{"key": "private-aio-key"}}
-	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g"}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-error-host-01")
+	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-error-host-01")
 	assertError(t, response, http.StatusConflict, "quota_exceeded")
 	if strings.Contains(response.Body.String(), "private-aio-key") || strings.Contains(response.Body.String(), "key\"") {
 		t.Fatalf("error response leaked secret details: %s", response.Body)
@@ -710,16 +710,15 @@ func TestTemplateWorkspaceAndAPIKeyRoutes(t *testing.T) {
 	if response := requestWithCookie(router, http.MethodGet, "/api/apikeys", cookie, ""); response.Code != http.StatusOK {
 		t.Fatalf("GET API keys as Session = %d %s", response.Code, response.Body)
 	}
-	createBody := `{"name":"automation","ttl_seconds":3600,"host_ids":[],"scopes":["task:submit"]}`
+	createBody := `{"name":"automation","ttl_seconds":3600}`
 	if response := requestWithCookieBody(router, http.MethodPost, "/api/apikeys", createBody, cookie, "https://portal.example.test"); response.Code != http.StatusCreated {
 		t.Fatalf("POST API key as Session = %d %s", response.Code, response.Body)
 	}
 	if response := requestWithCookie(router, http.MethodDelete, "/api/apikeys/"+testTokenID, cookie, "https://portal.example.test"); response.Code != http.StatusNoContent {
 		t.Fatalf("DELETE API key as Session = %d %s", response.Code, response.Body)
 	}
-	if services.workspaceOps.delID != testWorkspaceID || services.tokens.apiKeyName != "automation" || services.tokens.apiKeyTTL != time.Hour ||
-		len(services.tokens.apiKeyHostIDs) != 0 || len(services.tokens.apiKeyScopes) != 1 || services.tokens.apiKeyScopes[0] != identity.ScopeTaskSubmit {
-		t.Fatalf("service arguments: workspace=%q key=%q hosts=%#v scopes=%#v ttl=%s", services.workspaceOps.delID, services.tokens.apiKeyName, services.tokens.apiKeyHostIDs, services.tokens.apiKeyScopes, services.tokens.apiKeyTTL)
+	if services.workspaceOps.delID != testWorkspaceID || services.tokens.apiKeyName != "automation" || services.tokens.apiKeyTTL != time.Hour {
+		t.Fatalf("service arguments: workspace=%q key=%q ttl=%s", services.workspaceOps.delID, services.tokens.apiKeyName, services.tokens.apiKeyTTL)
 	}
 }
 
@@ -760,24 +759,25 @@ func TestWorkspaceCRUDUsesNewContractAndIdempotencyKey(t *testing.T) {
 	}
 }
 
-func TestTaskAndConversationRoutesAreRegisteredThroughPortalAPI(t *testing.T) {
-	services := newServices()
-	router := newRouter(t, services, Options{})
+func TestRetiredTaskRoutesAreNotRegistered(t *testing.T) {
+	router := newRouter(t, newServices(), Options{})
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
-	request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"host_id":"h1234567","model_id":"model-a","objective":"check route"}`))
-	request.Host = "portal.example.test"
-	request.AddCookie(cookie)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Origin", "https://portal.example.test")
-	request.Header.Set("Idempotency-Key", "route-test-001")
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted || services.tasks.submitCalls != 1 || services.tasks.submitCommand.IdempotencyKey != "route-test-001" {
-		t.Fatalf("POST /api/tasks = %d %s; calls=%d command=%#v", response.Code, response.Body, services.tasks.submitCalls, services.tasks.submitCommand)
-	}
-	response = requestWithCookie(router, http.MethodGet, "/api/conversations", cookie, "")
-	if response.Code != http.StatusOK || services.conversations.listCalls != 1 {
-		t.Fatalf("GET /api/conversations = %d %s; calls=%d", response.Code, response.Body, services.conversations.listCalls)
+	for _, route := range []struct{ method, path string }{
+		{http.MethodPost, "/api/tasks"},
+		{http.MethodGet, "/api/tasks/q1234567"},
+		{http.MethodPost, "/api/tasks/q1234567/actions"},
+		{http.MethodGet, "/api/tasks/q1234567/events"},
+		{http.MethodPost, "/api/schedules"},
+		{http.MethodGet, "/api/schedules"},
+		{http.MethodGet, "/api/conversations"},
+		{http.MethodPost, "/api/conversations/c1234567/messages"},
+		{http.MethodGet, "/api/execution"},
+		{http.MethodPost, "/api/execution/enable"},
+	} {
+		response := requestWithCookie(router, route.method, route.path, cookie, "")
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("retired route %s %s = %d %s", route.method, route.path, response.Code, response.Body)
+		}
 	}
 }
 
@@ -787,7 +787,7 @@ func TestAdminRoutesAndValidation(t *testing.T) {
 	services.admin.audits = append(services.admin.audits, AuditRecord{ID: 2, Entry: audit.Entry{ActorID: "i1234567", ActorKind: audit.ActorClient, Action: audit.ActionHostEnter}})
 	services.admin.user = AdminUserRecord{
 		ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusDisabled, Quota: TotalsView{Hosts: 2},
-		Usage: TotalsView{Hosts: 1}, CreatedAt: time.Now().UTC(),
+		Usage: TotalsView{Hosts: 1}, DefaultHostResources: HostResourcesView{CPUMilli: 1000, MemMiB: 2048}, CreatedAt: time.Now().UTC(),
 	}
 	router := newRouter(t, services, Options{})
 	key := "Bearer " + apiKeyCredential()
@@ -1240,7 +1240,7 @@ func TestMissingOptionalPortsReturnSanitizedUnavailable(t *testing.T) {
 	}
 	for _, route := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/apikeys", ""},
-		{http.MethodPost, "/api/apikeys", `{"name":"automation","host_ids":[],"scopes":["task:submit"]}`},
+		{http.MethodPost, "/api/apikeys", `{"name":"automation"}`},
 		{http.MethodDelete, "/api/apikeys/" + testTokenID, ""},
 	} {
 		var response *httptest.ResponseRecorder
@@ -1345,7 +1345,7 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	for _, route := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/hosts", ""},
-		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g"}`},
+		{http.MethodPost, "/api/hosts", `{}`},
 		{http.MethodDelete, "/api/hosts/" + testHostID, ""},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/renew", ""},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/enter", ""},
@@ -1376,7 +1376,7 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 	}
 	for _, route := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/apikeys", ""},
-		{http.MethodPost, "/api/apikeys", `{"name":"automation","host_ids":[],"scopes":["task:submit"]}`},
+		{http.MethodPost, "/api/apikeys", `{"name":"automation"}`},
 		{http.MethodDelete, "/api/apikeys/" + testTokenID, ""},
 	} {
 		var response *httptest.ResponseRecorder
@@ -1394,14 +1394,14 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 type services struct {
 	hosts           *hostServiceStub
 	hostReplica     *hostReplicaServiceStub
+	tasks           TaskService
+	conversations   ConversationService
 	verifier        verifierStub
 	auth            *authServiceStub
 	workspaceOps    *workspaceServiceStub
 	sites           *siteServiceStub
 	templates       templateReaderStub
 	tokens          *tokenServiceStub
-	tasks           *taskServiceStub
-	conversations   *conversationServiceStub
 	admin           *adminServiceStub
 	adminWorkspaces *adminWorkspaceServiceStub
 	readiness       readinessStub
@@ -1439,10 +1439,10 @@ func newServices() *services {
 			ID: "std-2c4g", Name: "Standard", Isolation: "container", Resources: ResourceRecord{CPUMilli: 500, MemMiB: 1536, CPULimitMilli: 2000, MemLimitMiB: 4096},
 			WorkspaceSizeMiB: 20480, TTLSeconds: 86400, IdleTimeoutSeconds: 3600, OnIdle: "disabled", KeepWorkspaceDefault: true,
 		}}},
-		tokens: &tokenServiceStub{}, tasks: &taskServiceStub{}, conversations: &conversationServiceStub{},
+		tokens: &tokenServiceStub{},
 		admin: &adminServiceStub{
-			users:    []AdminUserRecord{{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusPending, Quota: TotalsView{Hosts: 2}, CreatedAt: time.Now().UTC()}},
-			user:     AdminUserRecord{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusPending, Quota: TotalsView{Hosts: 2}, CreatedAt: time.Now().UTC()},
+			users:    []AdminUserRecord{{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusPending, Quota: TotalsView{Hosts: 2}, DefaultHostResources: HostResourcesView{CPUMilli: 1000, MemMiB: 2048}, CreatedAt: time.Now().UTC()}},
+			user:     AdminUserRecord{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusPending, Quota: TotalsView{Hosts: 2}, DefaultHostResources: HostResourcesView{CPUMilli: 1000, MemMiB: 2048}, CreatedAt: time.Now().UTC()},
 			capacity: CapacityRecord{Limit: TotalsView{CPUMilli: 10000, MemMiB: 32768}, Allocated: TotalsView{CPUMilli: 500, MemMiB: 1536}, HostsByState: map[host.State]int{host.StateRunning: 1}},
 			audits: []AuditRecord{{ID: 1, At: time.Now().UTC(), Entry: audit.Entry{
 				ActorID: testUserID, ActorKind: audit.ActorAPIKey, Action: audit.ActionHostCreate, Target: testHostID,
@@ -1478,8 +1478,9 @@ func (s *services) deps() Deps {
 	return Deps{
 		Hosts: s.hosts, TLSAuthorizer: s.hosts, Verifier: s.verifier, Auth: s.auth,
 		HostReplicas: s.hostReplica,
+		Tasks:        s.tasks, Conversations: s.conversations,
 		WorkspaceOps: s.workspaceOps, Sites: s.sites, Templates: s.templates, Tokens: s.tokens,
-		Tasks: s.tasks, Conversations: s.conversations, Admin: s.admin, AdminWorkspaces: s.adminWorkspaces, Readiness: s.readiness,
+		Admin: s.admin, AdminWorkspaces: s.adminWorkspaces, Readiness: s.readiness,
 	}
 }
 
@@ -1511,9 +1512,6 @@ func TestSyncOnlyCredentialFence(t *testing.T) {
 		{http.MethodGet, "/api/hosts"},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/enter"},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/observation-ticket"},
-		{http.MethodPost, "/api/tasks"},
-		{http.MethodGet, "/api/tasks/q1234567"},
-		{http.MethodPost, "/api/tasks/q1234567/actions"},
 	} {
 		response := request(router, tc.method, tc.path, `{"host_id":"h1234567","model_id":"model-a","objective":"test","action":"pause","expected_status":"queued"}`, "Bearer "+deviceCode, "")
 		if response.Code != http.StatusForbidden {
@@ -1523,36 +1521,11 @@ func TestSyncOnlyCredentialFence(t *testing.T) {
 	if services.hosts.principal.Kind == identity.KindDevice {
 		t.Fatalf("device Host route reached Host service: %#v", services.hosts.principal)
 	}
-	if services.tasks.submitCalls != 0 || services.tasks.getID != "" || services.tasks.actionCalls != 0 {
-		t.Fatalf("device Task routes reached Task service: submit=%d get=%q actions=%d", services.tasks.submitCalls, services.tasks.getID, services.tasks.actionCalls)
-	}
 	services.workspaceOps.deviceItems = nil
 	listed = request(router, http.MethodGet, "/api/device/workspaces", "", "Bearer "+deviceCode, "")
 	if listed.Code != http.StatusOK || listed.Body.String() != `{"items":[]}` {
 		t.Fatalf("empty device workspace list = %d %s", listed.Code, listed.Body)
 	}
-}
-
-type clientRouteTaskService struct {
-	*taskServiceStub
-	submitPrincipal identity.Principal
-	eventPrincipal  identity.Principal
-	actionPrincipal identity.Principal
-}
-
-func (s *clientRouteTaskService) Submit(ctx context.Context, principal identity.Principal, command app.SubmitTaskCommand) (app.TaskSubmissionResult, error) {
-	s.submitPrincipal = principal
-	return s.taskServiceStub.Submit(ctx, principal, command)
-}
-
-func (s *clientRouteTaskService) ListEvents(ctx context.Context, principal identity.Principal, id string, after int64, limit int32) (app.TaskEventPage, error) {
-	s.eventPrincipal = principal
-	return s.taskServiceStub.ListEvents(ctx, principal, id, after, limit)
-}
-
-func (s *clientRouteTaskService) RequestAction(ctx context.Context, principal identity.Principal, taskID string, action task.Action, expected task.Status, key string) (app.TaskActionResult, error) {
-	s.actionPrincipal = principal
-	return s.taskServiceStub.RequestAction(ctx, principal, taskID, action, expected, key)
 }
 
 type clientRouteHostSharing struct {
@@ -1569,6 +1542,8 @@ func (s *clientRouteHostSharing) IssueObservationTicket(_ context.Context, princ
 
 func TestClientCredentialPositiveRouteContract(t *testing.T) {
 	services := newServices()
+	tasks := &taskServiceStub{}
+	conversations := &conversationServiceStub{}
 	clientCredential, _, err := identity.NewCredential(identity.KindClient, testTokenID)
 	if err != nil {
 		t.Fatal(err)
@@ -1577,48 +1552,17 @@ func TestClientCredentialPositiveRouteContract(t *testing.T) {
 	services.hosts.enterResult = app.EnterInfo{
 		URL: "https://h1234567.example-hosts.test/__ch/auth?t=entry", ExpiresAt: time.Now().Add(time.Minute),
 	}
-	services.tasks.events = []task.Event{{
-		TaskID: "q1234567", Sequence: 1, Type: "task.status", Payload: []byte(`{"status":"queued"}`), CreatedAt: time.Now().UTC(),
-	}}
-	tasks := &clientRouteTaskService{taskServiceStub: services.tasks}
 	notices := &notificationAPITestService{page: app.NotificationPage{Items: []notification.Notification{{
 		ID: "n1234567", OwnerID: testUserID, TaskID: "q1234567", EventSequence: 1,
 		Kind: notification.KindCompleted, Summary: "任务已完成", CreatedAt: time.Now().UTC(),
 	}}}}
 	sharing := &clientRouteHostSharing{}
 	deps := services.deps()
-	deps.Tasks, deps.Notifications, deps.HostSharing = tasks, notices, sharing
+	deps.Notifications, deps.HostSharing = notices, sharing
+	deps.Tasks, deps.Conversations = tasks, conversations
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	submitted := requestWithHeader(router, http.MethodPost, "/api/tasks",
-		`{"host_id":"h1234567","application_id":"wechat","model_id":"model-a","objective":"summarize files","batch_items":[]}`,
-		authorization, "", "Idempotency-Key", "client-submit-001")
-	if submitted.Code != http.StatusAccepted || tasks.submitPrincipal.Kind != identity.KindClient || tasks.submitPrincipal.TokenID != testTokenID {
-		t.Fatalf("client task submission = %d %s, principal=%#v", submitted.Code, submitted.Body, tasks.submitPrincipal)
-	}
-	action := requestWithHeader(router, http.MethodPost, "/api/tasks/q1234567/actions",
-		`{"action":"pause","expected_status":"queued"}`, authorization, "", "Idempotency-Key", "client-action-001")
-	if action.Code != http.StatusAccepted || tasks.actionPrincipal.Kind != identity.KindClient || tasks.actionPrincipal.TokenID != testTokenID ||
-		tasks.action != task.ActionPause || tasks.actionKey != "client-action-001" {
-		t.Fatalf("client task action = %d %s, principal=%#v action=%q key=%q", action.Code, action.Body, tasks.actionPrincipal, tasks.action, tasks.actionKey)
-	}
-
-	eventsRequest := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=0", nil)
-	eventsRequest.Host = "portal.example.test"
-	eventsRequest.Header.Set("Authorization", authorization)
-	eventsContext, cancelEvents := context.WithCancel(eventsRequest.Context())
-	eventsRequest = eventsRequest.WithContext(eventsContext)
-	eventsTimer := time.AfterFunc(25*time.Millisecond, cancelEvents)
-	eventsResponse := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
-	router.ServeHTTP(eventsResponse, eventsRequest)
-	eventsTimer.Stop()
-	cancelEvents()
-	if eventsResponse.Code != http.StatusOK || tasks.eventPrincipal.Kind != identity.KindClient || tasks.eventPrincipal.TokenID != testTokenID ||
-		!strings.Contains(eventsResponse.Body.String(), "event: task.status") || !strings.Contains(eventsResponse.Body.String(), "id: 1") {
-		t.Fatalf("client task events = %d %s, principal=%#v", eventsResponse.Code, eventsResponse.Body, tasks.eventPrincipal)
 	}
 
 	listedNotices := request(router, http.MethodGet, "/api/notifications", "", authorization, "")
@@ -1638,6 +1582,18 @@ func TestClientCredentialPositiveRouteContract(t *testing.T) {
 	if observationTicket.Code != http.StatusOK || sharing.calls != 1 || sharing.principal.Kind != identity.KindClient || sharing.principal.TokenID != testTokenID {
 		t.Fatalf("client Host observation ticket = %d %s, calls=%d principal=%#v", observationTicket.Code, observationTicket.Body, sharing.calls, sharing.principal)
 	}
+	listedTasks := request(router, http.MethodGet, "/api/tasks", "", authorization, "")
+	if listedTasks.Code != http.StatusOK || tasks.listCalls != 1 {
+		t.Fatalf("client task list = %d %s, calls=%d", listedTasks.Code, listedTasks.Body, tasks.listCalls)
+	}
+	createdTask := requestWithHeader(router, http.MethodPost, "/api/tasks", `{"model_id":"model-a","objective":"continue in cloud"}`, authorization, "", "Idempotency-Key", "client-task-001")
+	if createdTask.Code != http.StatusAccepted || tasks.submitCalls != 1 || tasks.submitCommand.HostID != "" {
+		t.Fatalf("client cloud task = %d %s, calls=%d command=%#v", createdTask.Code, createdTask.Body, tasks.submitCalls, tasks.submitCommand)
+	}
+	listedConversations := request(router, http.MethodGet, "/api/conversations", "", authorization, "")
+	if listedConversations.Code != http.StatusOK || conversations.listCalls != 1 {
+		t.Fatalf("client conversation list = %d %s, calls=%d", listedConversations.Code, listedConversations.Body, conversations.listCalls)
+	}
 }
 
 func TestClientCredentialRouteFence(t *testing.T) {
@@ -1650,7 +1606,7 @@ func TestClientCredentialRouteFence(t *testing.T) {
 	}
 	auth := "Bearer " + client
 	allowed := request(router, http.MethodGet, "/api/hosts", "", auth, "")
-	if allowed.Code != http.StatusOK || services.hosts.principal.Kind != identity.KindClient {
+	if allowed.Code != http.StatusOK || services.hosts.principal.Kind != identity.KindClient || services.hosts.principal.Role != identity.RoleUser {
 		t.Fatalf("client host list = %d %s, principal = %#v", allowed.Code, allowed.Body, services.hosts.principal)
 	}
 	for _, tc := range []struct{ method, path, body string }{
@@ -1668,78 +1624,92 @@ func TestClientCredentialRouteFence(t *testing.T) {
 	}
 }
 
-type clientAuthorizationHTTPStub struct {
-	ClientAuthorizationService
+type clientLoginHTTPStub struct {
+	ClientLoginService
 	principal identity.Principal
+	key       string
 }
 
-func (s *clientAuthorizationHTTPStub) Start(context.Context, string, string, bool, string, string) (app.ClientAuthorizationStart, error) {
-	return app.ClientAuthorizationStart{DeviceCode: "chc_demo", UserCode: "ABCDEFGH", ExpiresAt: time.Now().Add(time.Minute), Interval: 3}, nil
+func (s *clientLoginHTTPStub) Login(_ context.Context, _, _, _, _, _, key, _ string) (app.ClientLoginResult, error) {
+	s.key = key
+	return app.ClientLoginResult{InstallationID: "i1234567", ClientCredential: "client-secret",
+		ClientExpiresAt: time.Now().Add(time.Hour), SyncCredential: "sync-secret", SyncExpiresAt: time.Now().Add(time.Hour),
+		WebSessionCredential: "web-secret", WebSessionExpiresAt: time.Now().Add(time.Hour),
+		User: app.UserSummary{ID: testUserID, Name: "alice", Role: identity.RoleUser, Status: identity.StatusApproved}}, nil
 }
-func (s *clientAuthorizationHTTPStub) Poll(context.Context, string, string) (app.ClientAuthorizationStatus, error) {
-	return app.ClientAuthorizationStatus{State: "authorization_pending", ExpiresAt: time.Now().Add(time.Minute)}, nil
-}
-func (s *clientAuthorizationHTTPStub) Inspect(_ context.Context, principal identity.Principal, _ string, _ string) (app.ClientAuthorizationRequest, error) {
+func (s *clientLoginHTTPStub) WebSession(_ context.Context, principal identity.Principal) (app.ClientWebSessionResult, error) {
 	s.principal = principal
-	return app.ClientAuthorizationRequest{Platform: "desktop", DisplayName: "laptop", WantsWorkspaceSync: true, ExpiresAt: time.Now().Add(time.Minute)}, nil
+	return app.ClientWebSessionResult{Credential: "web-secret", ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
-func (s *clientAuthorizationHTTPStub) Approve(_ context.Context, principal identity.Principal, _ string, _ []string, _ string) (app.ClientInfo, error) {
-	s.principal = principal
-	return app.ClientInfo{ID: "i1234567", Platform: "desktop", DisplayName: "laptop", WorkspaceIDs: []string{}, ExpiresAt: time.Now().Add(time.Hour)}, nil
-}
-func (s *clientAuthorizationHTTPStub) Deny(_ context.Context, principal identity.Principal, _ string, _ string) error {
+func (s *clientLoginHTTPStub) Logout(_ context.Context, principal identity.Principal, _ string) error {
 	s.principal = principal
 	return nil
 }
-func (s *clientAuthorizationHTTPStub) List(_ context.Context, principal identity.Principal) ([]app.ClientInfo, error) {
+func (s *clientLoginHTTPStub) LogoutWebSession(_ context.Context, principal identity.Principal, _ string) error {
+	s.principal = principal
+	return nil
+}
+func (s *clientLoginHTTPStub) List(_ context.Context, principal identity.Principal) ([]app.ClientInfo, error) {
 	s.principal = principal
 	return []app.ClientInfo{}, nil
 }
-func (s *clientAuthorizationHTTPStub) Revoke(_ context.Context, principal identity.Principal, _, _ string) error {
+func (s *clientLoginHTTPStub) Revoke(_ context.Context, principal identity.Principal, _, _ string) error {
 	s.principal = principal
 	return nil
 }
 
-func TestClientAuthorizationHTTPContract(t *testing.T) {
+func TestClientLoginHTTPContract(t *testing.T) {
 	services := newServices()
-	stub := &clientAuthorizationHTTPStub{}
+	stub := &clientLoginHTTPStub{}
 	deps := services.deps()
-	deps.ClientAuthorizations = stub
+	deps.ClientLogin = stub
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := request(router, http.MethodPost, "/api/client-authorizations", `{"platform":"desktop","display_name":"laptop","wants_workspace_sync":true}`, "", "")
-	if started.Code != http.StatusCreated || !strings.Contains(started.Body.String(), `"verification_uri":"/client-authorize"`) {
-		t.Fatalf("start = %d %s", started.Code, started.Body)
+	started := requestWithHeader(router, http.MethodPost, "/api/auth/client-login",
+		`{"name":"alice","password":"secret","platform":"desktop","display_name":"laptop"}`, "", "", "Idempotency-Key", "login-12345678")
+	if started.Code != http.StatusOK || !strings.Contains(started.Body.String(), `"web_session_credential":"web-secret"`) ||
+		stub.key != "login-12345678" || started.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("login = %d %s, key=%q cookie=%q", started.Code, started.Body, stub.key, started.Header().Get("Set-Cookie"))
 	}
-	pending := request(router, http.MethodPost, "/api/client-authorizations/token", `{"device_code":"chc_demo"}`, "", "")
-	if pending.Code != http.StatusOK || !strings.Contains(pending.Body.String(), `"state":"authorization_pending"`) {
-		t.Fatalf("poll = %d %s", pending.Code, pending.Body)
+	client, _, err := identity.NewCredential(identity.KindClient, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := "Bearer " + client
+	web := request(router, http.MethodPost, "/api/auth/client-web-session", "", auth, "")
+	if web.Code != http.StatusOK || !strings.Contains(web.Body.String(), `"web_session_credential":"web-secret"`) ||
+		stub.principal.Kind != identity.KindClient {
+		t.Fatalf("web session = %d %s, principal=%#v", web.Code, web.Body, stub.principal)
+	}
+	logout := request(router, http.MethodPost, "/api/auth/client-logout", "", auth, "")
+	if logout.Code != http.StatusNoContent || stub.principal.Kind != identity.KindClient {
+		t.Fatalf("logout = %d %s", logout.Code, logout.Body)
+	}
+	for _, path := range []string{"/api/client-authorizations", "/api/client-authorizations/token",
+		"/api/client-authorizations/inspect", "/api/client-authorizations/approve", "/api/client-authorizations/deny"} {
+		if response := request(router, http.MethodPost, path, "{}", "", ""); response.Code != http.StatusNotFound {
+			t.Errorf("old pairing %s = %d", path, response.Code)
+		}
 	}
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	origin := "https://portal.example.test"
-	inspect := requestWithCookieBody(router, http.MethodPost, "/api/client-authorizations/inspect", `{"user_code":"ABCDEFGH"}`, cookie, origin)
-	if inspect.Code != http.StatusOK || !strings.Contains(inspect.Body.String(), `"wants_workspace_sync":true`) {
-		t.Fatalf("inspect = %d %s", inspect.Code, inspect.Body)
-	}
-	missingGrants := requestWithCookieBody(router, http.MethodPost, "/api/client-authorizations/approve", `{"user_code":"ABCDEFGH"}`, cookie, origin)
-	assertError(t, missingGrants, http.StatusBadRequest, "invalid_argument")
-	approved := requestWithCookieBody(router, http.MethodPost, "/api/client-authorizations/approve", `{"user_code":"ABCDEFGH","workspace_ids":[]}`, cookie, origin)
-	if approved.Code != http.StatusOK || strings.Contains(approved.Body.String(), "credential") {
-		t.Fatalf("approve = %d %s", approved.Code, approved.Body)
-	}
 	listed := requestWithCookie(router, http.MethodGet, "/api/clients", cookie, "")
 	if listed.Code != http.StatusOK || listed.Body.String() != `{"items":[]}` {
 		t.Fatalf("clients = %d %s", listed.Code, listed.Body)
 	}
-	denied := requestWithCookieBody(router, http.MethodPost, "/api/client-authorizations/deny", `{"user_code":"ABCDEFGH"}`, cookie, origin)
-	if denied.Code != http.StatusNoContent {
-		t.Fatalf("deny = %d %s", denied.Code, denied.Body)
-	}
 	revoked := requestWithCookie(router, http.MethodDelete, "/api/clients/i1234567", cookie, origin)
 	if revoked.Code != http.StatusNoContent || stub.principal.Kind != identity.KindSession {
 		t.Fatalf("revoke = %d %s, principal %#v", revoked.Code, revoked.Body, stub.principal)
+	}
+	listed = request(router, http.MethodGet, "/api/clients", "", auth, "")
+	if listed.Code != http.StatusOK || stub.principal.Kind != identity.KindClient || stub.principal.UserID != testUserID {
+		t.Fatalf("native clients = %d %s, principal %#v", listed.Code, listed.Body, stub.principal)
+	}
+	revoked = request(router, http.MethodDelete, "/api/clients/i1234567", "", auth, "")
+	if revoked.Code != http.StatusNoContent || stub.principal.Kind != identity.KindClient || stub.principal.Role != identity.RoleUser {
+		t.Fatalf("native revoke = %d %s, principal %#v", revoked.Code, revoked.Body, stub.principal)
 	}
 }
 

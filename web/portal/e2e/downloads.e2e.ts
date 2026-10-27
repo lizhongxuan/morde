@@ -2,7 +2,7 @@ import { expect, test, type Browser } from '@playwright/test';
 
 const portalUrl = process.env.CH_PORTAL_E2E_URL ?? 'http://127.0.0.1:5183';
 const manifest = {
-  schema_version: 2,
+  schema_version: 3,
   version: '0.1.0',
   portal_url: portalUrl.endsWith('/') ? portalUrl : `${portalUrl}/`,
   artifacts: [
@@ -12,7 +12,7 @@ const manifest = {
       acceptance: {
         status: 'verified', verified_at: '2026-10-26T00:00:00.000Z', evidence_ref: 'T22.10/macos-arm64/2026-10-26',
         signature_status: 'signed_and_notarized',
-        capabilities: ['install', 'launch_idle_network', 'task_approval_host', 'workspace_sync_recovery', 'update', 'uninstall'],
+        capabilities: ['install', 'launch_idle_network', 'user_web_workbench', 'workspace_sync_recovery', 'update', 'uninstall'],
       },
     },
     {
@@ -60,6 +60,7 @@ test('[mock] downloads the package selected in the published manifest', async ({
     await page.goto(`${portalUrl}/download`);
     await expect(page.getByText('版本 0.1.0')).toBeVisible();
     await expect(page.getByRole('heading', { name: 'macOS · Apple 芯片' })).toBeVisible();
+    await expect(page.getByText('用户 Web 与云端工作台', { exact: false })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Windows · 64 位' })).toHaveCount(0);
     const downloadPromise = page.waitForEvent('download');
     await page.getByRole('link', { name: '下载 macOS · Apple 芯片' }).click();

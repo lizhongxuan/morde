@@ -534,7 +534,7 @@ func (s *hostService) IssueTicket(ctx context.Context, principal identity.Princi
 	}
 	expiresAt := time.Now().UTC().Add(s.ticketTTL)
 	var credential string
-	if principal.Kind == identity.KindClient {
+	if principal.ClientInstallationID != "" {
 		_, credential, err = issueClientTicket(ctx, s.tokens, principal.UserID, principal.UserID, value.ID, principal.ClientInstallationID, expiresAt)
 	} else {
 		_, credential, err = issueCredential(ctx, s.tokens, principal.UserID, identity.KindTicket, value.ID, "", expiresAt)
@@ -572,7 +572,12 @@ func (s *hostService) IssuePreviewTicket(ctx context.Context, principal identity
 		return EnterInfo{}, invalidHostState(value.State)
 	}
 	expiresAt := time.Now().UTC().Add(s.ticketTTL)
-	_, credential, err := issueCredentialWithPreviewPort(ctx, s.tokens, principal.UserID, identity.KindTicket, value.ID, "", expiresAt, nil, nil, port)
+	var credential string
+	if principal.ClientInstallationID != "" {
+		_, credential, err = issueInstallationTicket(ctx, s.tokens, principal.UserID, principal.UserID, value.ID, principal.ClientInstallationID, expiresAt, port)
+	} else {
+		_, credential, err = issueCredentialWithPreviewPort(ctx, s.tokens, principal.UserID, identity.KindTicket, value.ID, "", expiresAt, nil, nil, port)
+	}
 	if err != nil {
 		return EnterInfo{}, err
 	}

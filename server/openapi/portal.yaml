@@ -29,15 +29,11 @@ tags:
   - name: Devices
     description: Workspace synchronization credentials issued to approved desktop clients.
   - name: Clients
-    description: User-approved desktop and mobile client installations.
+    description: Desktop and mobile client installations authorized by account login.
   - name: Models
     description: Session-managed model connections and capability checks.
-  - name: Conversations
-    description: Persistent assistant conversations and messages.
-  - name: Tasks
-    description: Persistent delegated tasks and progress events.
-  - name: Schedules
-    description: Persistent one-time and recurring task schedules.
+  - name: Instant Chat
+    description: Immediate text conversations without background tasks.
   - name: Notifications
     description: In-app notifications for Portal sessions and native client credentials.
   - name: Admin
@@ -50,6 +46,148 @@ security:
   - portalSession: []
   - bearerToken: []
 paths:
+  /api/capabilities:
+    get:
+      tags: [Portal]
+      operationId: getCapabilities
+      summary: Discover this Morde service before login
+      description: The persisted service identifier partitions client data across installations. A null protocol or minimum version means it is not declared, not that an unfinished capability is available. Only assembled capabilities are listed. The default request size has route-specific exceptions.
+      security: []
+      responses:
+        '200':
+          description: Public service identity and supported capabilities
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service_instance_id, api_version, hub_version, event_version, minimum_client_version, supported_features, default_max_request_bytes]
+                properties:
+                  service_instance_id: { type: string, format: uuid }
+                  api_version: { type: string }
+                  hub_version: { type: [string, 'null'] }
+                  event_version: { type: [string, 'null'] }
+                  minimum_client_version: { type: [string, 'null'] }
+                  supported_features:
+                    type: array
+                    description: An absent feature is unavailable or not yet declared.
+                    items: { type: string }
+                  default_max_request_bytes: { type: integer, format: int64, minimum: 1 }
+        '503': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/model/v1/chat/completions:
+    post:
+      tags: [Models]
+      operationId: createPlatformChatCompletion
+      summary: Run one metered platform-model inference
+      description: Requires a user Session or installation-bound Client, an explicitly configured model budget, and an Idempotency-Key. This endpoint returns tool calls without executing them. It supports text, inline base64 images, function tools, temperature and text streaming; unsupported options such as stop sequences, remote image URLs and forced tool choice are rejected. A repeated call is not dispatched again; if its result was not saved by the caller, reconcile instead of retrying with a new key. No complete request or response is retained by the model ledger.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model, messages]
+              properties:
+                model: { $ref: '#/components/schemas/ModelConnectionId' }
+                messages:
+                  type: array
+                  minItems: 1
+                  maxItems: 128
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [role]
+                    properties:
+                      role: { type: string, enum: [system, developer, user, assistant, tool] }
+                      content:
+                        oneOf:
+                          - { type: string }
+                          - { type: 'null' }
+                          - type: array
+                            items:
+                              type: object
+                              additionalProperties: false
+                              required: [type]
+                              properties:
+                                type: { type: string, enum: [text, image_url] }
+                                text: { type: string }
+                                image_url:
+                                  type: object
+                                  additionalProperties: false
+                                  required: [url]
+                                  properties:
+                                    url: { type: string, description: 'Inline data:image/...;base64 URL only.' }
+                                    detail: { type: string, enum: [auto] }
+                      tool_call_id: { type: string }
+                      tool_calls:
+                        type: array
+                        items: { $ref: '#/components/schemas/ModelGatewayToolCall' }
+                tools:
+                  type: array
+                  items: { $ref: '#/components/schemas/ModelGatewayTool' }
+                tool_choice: { type: string, enum: [auto] }
+                stream: { type: boolean }
+                stream_options:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    include_usage: { type: boolean }
+                max_tokens: { type: integer, minimum: 1, maximum: 32768 }
+                max_completion_tokens: { type: integer, minimum: 1, maximum: 32768 }
+                temperature: { type: number, minimum: 0, maximum: 2 }
+      responses:
+        '200':
+          description: OpenAI-compatible completion or SSE chunks ending with DONE. Missing provider usage or over-budget usage is recorded and returned as an error; a partially emitted stream has an error event and no DONE marker.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, object, created, model, choices, usage]
+                properties:
+                  id: { type: string }
+                  object: { const: chat.completion }
+                  created: { type: integer, format: int64 }
+                  model: { $ref: '#/components/schemas/ModelConnectionId' }
+                  choices:
+                    type: array
+                    items:
+                      type: object
+                      required: [index, message, finish_reason]
+                      properties:
+                        index: { const: 0 }
+                        finish_reason: { type: string, enum: [stop, tool_calls, length, content_filter] }
+                        message:
+                          type: object
+                          required: [role, content]
+                          properties:
+                            role: { const: assistant }
+                            content: { type: string }
+                            tool_calls: { type: array, items: { $ref: '#/components/schemas/ModelGatewayToolCall' } }
+                  usage:
+                    oneOf:
+                      - { type: 'null' }
+                      - type: object
+                        required: [prompt_tokens, completion_tokens, total_tokens]
+                        properties:
+                          prompt_tokens: { type: integer, format: int64, minimum: 0 }
+                          completion_tokens: { type: integer, format: int64, minimum: 0 }
+                          total_tokens: { type: integer, format: int64, minimum: 0 }
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Error' }
   /api/auth/login:
     post:
       tags: [Auth]
@@ -111,11 +249,63 @@ paths:
     post:
       tags: [Auth]
       operationId: logout
-      summary: Revoke the current portal session
+      summary: Revoke the current portal session or installed client
+      description: A browser session revokes itself. An installation-bound Web session revokes its entire installation, including Client, Sync, Web, ticket and Gateway access.
       security:
         - portalSession: []
       responses:
         '204': { description: Session revoked }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/auth/client-login:
+    post:
+      tags: [Clients]
+      operationId: clientLogin
+      summary: Log in on a native client
+      description: Approved accounts sign in with name and password. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set. Reusing one Idempotency-Key for the same request rotates unconfirmed credentials; late earlier responses must be discarded by the client.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClientLoginRequest' }
+      responses:
+        '200':
+          description: Installation and credentials returned once
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClientLoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/auth/client-web-session:
+    post:
+      tags: [Clients]
+      operationId: renewClientWebSession
+      summary: Renew an installed desktop or iOS user Web session
+      description: Requires an active desktop or iOS Client bearer credential. The returned Session is installation-bound, has at most one hour of life, and cannot access Admin routes. Android support is unchanged.
+      security: [{ bearerToken: [] }]
+      responses:
+        '200':
+          description: New installation-bound Web session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClientWebSessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/auth/client-logout:
+    post:
+      tags: [Clients]
+      operationId: clientLogout
+      summary: Revoke the current native client installation
+      security: [{ bearerToken: [] }]
+      responses:
+        '204': { description: Installation and all bound credentials revoked }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
   /api/me:
@@ -256,7 +446,7 @@ paths:
       tags: [Hosts]
       operationId: listHosts
       summary: List the current user's hosts
-      description: Deleted hosts are omitted. Portal sessions see hosts allowed by account role; API keys require host:read and see only their host allow-list and hosts created by that key.
+      description: Deleted hosts are omitted. Portal sessions and API keys see hosts currently accessible to the account; ownership and sharing are checked on each request.
       responses:
         '200':
           description: Hosts
@@ -275,7 +465,7 @@ paths:
       tags: [Hosts]
       operationId: createHost
       summary: Create a host
-      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys require host:create and may create only an unbound host.
+      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys may create only an unbound host within the account quota and default resource target.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -302,7 +492,7 @@ paths:
       tags: [Hosts]
       operationId: getHost
       summary: Get a host
-      description: Portal sessions follow account role and ownership; API keys require host:read and an allowed host ID.
+      description: Portal sessions follow account role and ownership; API keys require current account access to this host.
       responses:
         '200':
           description: Host
@@ -317,7 +507,7 @@ paths:
       tags: [Hosts]
       operationId: deleteHost
       summary: Delete a host
-      description: API keys require host:manage and an allowed host ID. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
+      description: API keys require current account ownership of this host. Host deletion unbinds every workspace and removes Host-only runtime data; independent workspace content is never deleted by this operation. A restore with an uncertain sandbox create is fenced from deletion until an operator reconciles the remote state.
       responses:
         '202':
           description: Host is being deleted
@@ -336,7 +526,7 @@ paths:
       tags: [Hosts]
       operationId: getHostControl
       summary: Get the AI and user control state for a host
-      description: Portal sessions can inspect their owned hosts. API keys require computer:observe and an allowed host ID. The active transition omits internal task snapshots and runtime receipts.
+      description: Portal sessions can inspect their owned hosts. API keys require current account access to observe this host. The active transition omits internal task snapshots and runtime receipts.
       responses:
         '200':
           description: Current control fence and active handoff, if any
@@ -355,7 +545,7 @@ paths:
       tags: [Hosts]
       operationId: releaseHost
       summary: Release host compute while retaining data
-      description: API keys require host:manage and an allowed host ID. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks are active or user control is enabled. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
+      description: API keys require current account ownership of this host. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks are active or user control is enabled. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
       requestBody:
         required: false
         content:
@@ -385,7 +575,7 @@ paths:
       tags: [Hosts]
       operationId: restoreHost
       summary: Restore compute for a stopped host
-      description: API keys require host:manage and an allowed host ID. Restore retains the Host ID, owner, Workspace, and runtime data volume, rotates the runtime credential, and advances one runtime generation. An uncertain sandbox create remains fenced for manual reconciliation.
+      description: API keys require current account ownership of this host. Restore retains the Host ID, owner, Workspace, and runtime data volume, rotates the runtime credential, and advances one runtime generation. An uncertain sandbox create remains fenced for manual reconciliation.
       responses:
         '202':
           description: Restore is in progress or already underway
@@ -404,7 +594,7 @@ paths:
       tags: [Hosts]
       operationId: actOnHostControl
       summary: Hand control of a host between AI and the user
-      description: Portal sessions can operate their owned hosts. API keys require computer:operate and an allowed host ID. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
+      description: Portal sessions can operate their owned hosts. API keys require current account permission to operate this host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
       requestBody:
         required: true
         content:
@@ -654,7 +844,7 @@ paths:
       tags: [Hosts]
       operationId: renewHost
       summary: Renew a host's lifetime
-      description: API keys require host:manage and an allowed host ID.
+      description: API keys require current account ownership of this host.
       responses:
         '200':
           description: Host with updated expiry
@@ -698,7 +888,7 @@ paths:
       tags: [Host sharing]
       operationId: inviteHostMember
       summary: Grant an existing user scoped access to a host
-      description: Owner-only. Accepts desktop:view, desktop:control, terminal:control, and mcp:control in any de-duplicated combination. desktop:control also grants desktop:view. MCP use also requires a caller-owned API Key with computer:observe or computer:operate scope and this Host in its allow-list; revoked sharing access is checked again for each operation. No Workspace access, Host management, or re-sharing is granted.
+      description: Owner-only. Accepts desktop:view, desktop:control, terminal:control, and mcp:control in any de-duplicated combination. desktop:control also grants desktop:view. MCP use also requires a valid caller-owned API Key and current permission to observe or operate this Host; revoked sharing access is checked again for each operation. No Workspace access, Host management, or re-sharing is granted.
       security:
         - portalSession: []
       requestBody:
@@ -1150,7 +1340,7 @@ paths:
     get:
       tags: [Workspaces]
       operationId: listDeviceWorkspaceSyncProgress
-      summary: Read paired device synchronization progress
+      summary: Read active desktop synchronization progress
       description: Portal sessions only. Returns only the latest active session for each currently authorized device. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted.
       security:
         - portalSession: []
@@ -1396,7 +1586,7 @@ paths:
       tags: [Hosts]
       operationId: listHostWorkspaceBindings
       summary: List workspaces bound to a host
-      description: Portal sessions follow account role and ownership; API keys require host:read and an allowed host ID.
+      description: Portal sessions follow account role and ownership; API keys require current account access to this host.
       security:
         - portalSession: []
         - bearerToken: []
@@ -1698,426 +1888,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
-  /api/conversations:
-    get:
-      tags: [Conversations]
-      operationId: listConversations
-      summary: List the current user's conversations
-      description: Each conversation is bound to one Host. API keys require task:read and current access to that Host.
-      parameters:
-        - $ref: '#/components/parameters/PageLimit'
-        - $ref: '#/components/parameters/PageCursor'
-      responses:
-        '200':
-          description: Conversations
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ConversationPage' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Conversations]
-      operationId: createConversation
-      summary: Create a conversation
-      description: Requires an explicitly selected Host. API keys require task:submit and access to that Host. Creating a conversation does not start a task.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CreateConversationRequest' }
-      responses:
-        '201':
-          description: Conversation created
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Conversation' }
-        '200':
-          description: Original conversation returned for an identical idempotent retry
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Conversation' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/conversations/{id}:
-    parameters:
-      - $ref: '#/components/parameters/ConversationId'
-    get:
-      tags: [Conversations]
-      operationId: getConversation
-      summary: Get a conversation
-      description: API keys require task:read and current access to the conversation's bound Host.
-      responses:
-        '200':
-          description: Conversation
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Conversation' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/conversations/{id}/messages:
-    parameters:
-      - $ref: '#/components/parameters/ConversationId'
-    get:
-      tags: [Conversations]
-      operationId: listConversationMessages
-      summary: List messages in a conversation
-      description: API keys require task:read and current access to the conversation's bound Host.
-      parameters:
-        - $ref: '#/components/parameters/PageLimit'
-        - $ref: '#/components/parameters/PageCursor'
-      responses:
-        '200':
-          description: Messages in chronological order
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/MessagePage' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Conversations]
-      operationId: appendConversationMessage
-      summary: Append a user message and submit or supplement its task
-      description: Requires task:submit for API keys. The requested Host must equal the conversation's bound Host. model_id must identify a model configured for the caller. An active task receives a supplemental instruction only when its Host and model match; otherwise the request conflicts. A completed task is never replayed by appending a message.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/AppendMessageRequest' }
-      responses:
-        '202':
-          description: Message and task accepted
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/AppendMessageResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '413': { $ref: '#/components/responses/RequestTooLarge' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/execution:
-    get:
-      tags: [Tasks]
-      operationId: getExecutionControl
-      summary: Get the current owner's AI execution gate
-      description: Portal sessions only. API keys cannot inspect or control the owner-wide gate. The gate state is independent of Host control and activity leases.
-      security:
-        - portalSession: []
-      responses:
-        '200':
-          description: Execution gate state
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ExecutionControl' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/execution/stop-all:
-    post:
-      tags: [Tasks]
-      operationId: stopAllExecution
-      summary: Stop all owner-scoped AI task execution
-      description: Portal sessions only. The expected_epoch compare-and-set advances the gate before cancelling queued tasks and disabling all owner schedules. In-flight work remains stopping until the stop worker confirms every operation safe. This endpoint does not change Host control state or activity leases. Re-enabling the gate does not revive cancelled tasks or re-enable schedules.
-      security:
-        - portalSession: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ExecutionControlActionRequest' }
-      responses:
-        '200':
-          description: Gate closed or stopping
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ExecutionControl' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/execution/enable:
-    post:
-      tags: [Tasks]
-      operationId: enableExecution
-      summary: Enable new owner-scoped AI task execution
-      description: Portal sessions only. Enable requires the current expected_epoch and a fully drained disabled state. It does not resume or requeue cancelled tasks or re-enable schedules.
-      security:
-        - portalSession: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ExecutionControlActionRequest' }
-      responses:
-        '200':
-          description: Gate enabled
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ExecutionControl' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/tasks:
-    get:
-      tags: [Tasks]
-      operationId: listTasks
-      summary: List the current user's tasks
-      description: API keys require task:read. Results are limited to tasks in the caller's current authorization scope.
-      parameters:
-        - $ref: '#/components/parameters/PageLimit'
-        - $ref: '#/components/parameters/PageCursor'
-        - name: status
-          in: query
-          schema: { $ref: '#/components/schemas/TaskStatus' }
-      responses:
-        '200':
-          description: Tasks
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/TaskPage' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Tasks]
-      operationId: submitTask
-      summary: Submit a persistent task
-      description: API keys require task:submit and access to the selected Host. If conversation_id is omitted, a new conversation bound to that Host is created in the same transaction. If supplied, its bound Host must match. A task is committed before it is accepted; Host and model are never silently substituted.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/SubmitTaskRequest' }
-      responses:
-        '202':
-          description: Task accepted
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Task' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '413': { $ref: '#/components/responses/RequestTooLarge' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/tasks/{id}:
-    parameters:
-      - $ref: '#/components/parameters/TaskId'
-    get:
-      tags: [Tasks]
-      operationId: getTask
-      summary: Get a task
-      description: API keys require task:read and current access to the task's host.
-      responses:
-        '200':
-          description: Task
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Task' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/tasks/{id}/events:
-    parameters:
-      - $ref: '#/components/parameters/TaskId'
-    get:
-      tags: [Tasks]
-      operationId: streamTaskEvents
-      summary: Stream task progress events
-      description: Server-sent events use a per-task monotonically increasing sequence and persist before delivery. Reconnect with after or Last-Event-ID to replay missed events. Assistant task.message events carry only user-visible output_text deltas with stable message_id and turn_id; after a complete provider response is validated, the final assistant message is saved and a task.message event with content and done=true is emitted. Reasoning and function-argument deltas are never emitted. task.step events omit duplicate assistant text and tool arguments. Replaying a user request with the same Idempotency-Key returns its existing task without dispatching another one. Disconnecting does not keep a task alive or cancel it. After a terminal task's latest events are replayed, the stream closes; reconnecting at the current sequence returns 204 so EventSource stops reconnecting. When the requested cursor has expired, the stream emits a non-persisted task.snapshot_required control event with its SSE id and data.sequence set to the current event sequence; the client reloads authoritative task and conversation data, then EventSource reconnects after that sequence. A 409 is returned only when a safe recovery cursor cannot be established.
-      parameters:
-        - name: after
-          in: query
-          schema: { type: integer, format: int64, minimum: 0 }
-        - name: Last-Event-ID
-          in: header
-          schema: { type: string, pattern: '^[0-9]+$' }
-      responses:
-        '200':
-          description: Ordered task events
-          content:
-            text/event-stream:
-              schema: { type: string }
-        '204': { description: Terminal task has no events after the supplied cursor; stop reconnecting }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/tasks/{id}/actions:
-    parameters:
-      - $ref: '#/components/parameters/TaskId'
-    post:
-      tags: [Tasks]
-      operationId: taskAction
-      summary: Perform an idempotent task action
-      description: Requires task:control, current access to the task Host, and an Idempotency-Key. Pause, resume, and cancel use expected_status compare-and-set; pause accepts queued or running, resume accepts paused, and cancel accepts queued, running, waiting_user, or paused. Cancel may return unsettled operation IDs when stop is not yet confirmed; Task details expose the pending stop request and unsettled operation IDs. Retry applies only to one failed batch item. Respond applies only to the current persisted approval request and its exact version; stale or changed decisions conflict. Approval decisions are bound to the tool call, arguments, and Host fence and are never transferable to another action. answer_clarification applies only to the exact active clarification request ID and version; the answer is persisted before the task is queued for recovery.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/TaskActionRequest' }
-      responses:
-        '202':
-          description: Action accepted. Stop actions may include operations whose stop is not yet confirmed.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/TaskActionResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/schedules:
-    get:
-      tags: [Schedules]
-      operationId: listSchedules
-      summary: List schedules in the caller's authorization scope
-      description: API keys require schedule:read. Results are filtered by owner and the key's current host allow-list.
-      parameters:
-        - $ref: '#/components/parameters/PageLimit'
-        - $ref: '#/components/parameters/PageCursor'
-        - name: status
-          in: query
-          schema: { $ref: '#/components/schemas/ScheduleStatus' }
-      responses:
-        '200':
-          description: Schedule page
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/SchedulePage' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        default: { $ref: '#/components/responses/Error' }
-    post:
-      tags: [Schedules]
-      operationId: createSchedule
-      summary: Create and enable a task schedule
-      description: API keys require schedule:manage and access to the selected Host. The owner execution gate must be enabled. The schedule and its next occurrence are committed atomically; no task runs before its scheduled time.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CreateScheduleRequest' }
-      responses:
-        '201':
-          description: Enabled schedule
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Schedule' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/schedules/{id}:
-    parameters:
-      - $ref: '#/components/parameters/ScheduleId'
-    get:
-      tags: [Schedules]
-      operationId: getSchedule
-      summary: Get a schedule and its latest run
-      description: API keys require schedule:read and current access to the schedule's Host.
-      responses:
-        '200':
-          description: Schedule
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Schedule' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
-    patch:
-      tags: [Schedules]
-      operationId: updateSchedule
-      summary: Update a schedule using optimistic concurrency
-      description: API keys require schedule:manage and current access to both the existing and requested Host. expected_version must match; existing runs retain their immutable schedule snapshot.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/UpdateScheduleRequest' }
-      responses:
-        '200':
-          description: Updated schedule
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Schedule' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/schedules/{id}/actions:
-    parameters:
-      - $ref: '#/components/parameters/ScheduleId'
-    post:
-      tags: [Schedules]
-      operationId: scheduleAction
-      summary: Enable or disable a schedule
-      description: API keys require schedule:manage. Enabling requires the owner execution gate to be enabled. Disabling leaves the current run alone by default; cancel must be explicit and remains stopping until confirmed. This action never reports cancellation before task-stop evidence arrives.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ScheduleActionRequest' }
-      responses:
-        '202':
-          description: Schedule action accepted; any requested current-run cancellation may still be pending
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ScheduleActionResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/schedules/{id}/runs:
-    parameters:
-      - $ref: '#/components/parameters/ScheduleId'
-    get:
-      tags: [Schedules]
-      operationId: listScheduleRuns
-      summary: List a schedule's run history
-      description: API keys require schedule:read and current access to the schedule's Host. Each scheduled occurrence appears at most once; coalesced missed occurrences are summarized by coalesced_count.
-      parameters:
-        - $ref: '#/components/parameters/PageLimit'
-        - $ref: '#/components/parameters/PageCursor'
-      responses:
-        '200':
-          description: Schedule run page
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ScheduleRunPage' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
   /api/notifications:
     get:
       tags: [Notifications]
@@ -2148,7 +1918,7 @@ paths:
       tags: [Notifications]
       operationId: markNotificationRead
       summary: Mark a notification as read
-      description: Portal sessions and native client credentials may mark a notification read. Idempotent. This does not accept or execute an associated pending request; use the task action API with its current request ID and version.
+      description: Portal sessions and native client credentials may mark a historical notification read. Idempotent; this does not execute any task action.
       security:
         - portalSession: []
         - bearerToken: []
@@ -2182,7 +1952,7 @@ paths:
       tags: [Tokens]
       operationId: createAPIKey
       summary: Create an API key
-      description: Portal sessions only. The API key is returned once and never appears in list responses. Scopes and host_ids are immutable; revoke and create a replacement to change them. A shared Host may be included in host_ids only while the current user has mcp:control on that Host. Each MCP operation also requires the matching API Key computer scope; sharing does not grant host management or Workspace access.
+      description: Portal sessions only. The key is returned once. Each request uses the account's current permissions; disabled accounts and revoked sharing take effect immediately. Existing scoped keys are revoked during migration.
       security:
         - portalSession: []
       requestBody:
@@ -2199,103 +1969,358 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
-  /api/client-authorizations:
+  /api/instant-chat/conversations:
+    get:
+      tags: [Instant Chat]
+      operationId: listInstantChatConversations
+      summary: List the current user's instant chat conversations
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Conversations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/InstantChatConversation' } }
+        default: { $ref: '#/components/responses/Error' }
+  /api/instant-chat/conversations/{id}/messages:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+    get:
+      tags: [Instant Chat]
+      operationId: listInstantChatMessages
+      summary: List messages in an instant chat conversation
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/InstantChatMessage' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/instant-chat/messages:
     post:
-      tags: [Clients]
-      operationId: startClientAuthorization
-      summary: Start one-time native client pairing
-      security: []
+      tags: [Instant Chat]
+      operationId: sendInstantChatMessage
+      summary: Send a message and receive an immediate AI reply
+      description: Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
+      security: [{ portalSession: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128 }
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/StartClientAuthorizationRequest' }
+            schema: { $ref: '#/components/schemas/InstantChatSendRequest' }
+      responses:
+        '200':
+          description: Saved exchange
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstantChatSendResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations:
+    get:
+      tags: [Tasks]
+      operationId: listConversations
+      summary: List the current user's cloud task conversations
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Conversation page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationPage' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Tasks]
+      operationId: createConversation
+      summary: Create a persistent cloud task conversation
+      description: A conversation is independent of any Host. A Host may be selected separately for each task.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversationRequest' }
       responses:
         '201':
-          description: Pending client pairing code
+          description: Created conversation
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/StartClientAuthorizationResponse' }
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '200':
+          description: Exact idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
         '400': { $ref: '#/components/responses/BadRequest' }
-        '429': { $ref: '#/components/responses/RateLimited' }
         default: { $ref: '#/components/responses/Error' }
-  /api/client-authorizations/token:
-    post:
-      tags: [Clients]
-      operationId: pollClientAuthorization
-      summary: Poll pending pairing and claim credentials once
-      description: Approval returns client and optional sync credentials exactly once. A repeated claim is rejected; the server stores only secret hashes.
-      security: []
-      requestBody:
+  /api/conversations/{id}:
+    parameters:
+      - name: id
+        in: path
         required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/PollClientAuthorizationRequest' }
+        schema: { $ref: '#/components/schemas/ConversationId' }
+    get:
+      tags: [Tasks]
+      operationId: getConversation
+      summary: Get an owned conversation
+      security: [{ portalSession: [] }, { clientCredential: [] }]
       responses:
         '200':
-          description: Pairing state or one-time credentials
+          description: Conversation
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/PollClientAuthorizationResponse' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '429': { $ref: '#/components/responses/RateLimited' }
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
-  /api/client-authorizations/inspect:
-    post:
-      tags: [Clients]
-      operationId: inspectClientAuthorization
-      summary: Inspect a client pairing request
-      security: [{ portalSession: [] }]
-      requestBody:
+  /api/conversations/{id}/messages:
+    parameters:
+      - name: id
+        in: path
         required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/InspectClientAuthorizationRequest' }
+        schema: { $ref: '#/components/schemas/ConversationId' }
+    get:
+      tags: [Tasks]
+      operationId: listConversationMessages
+      summary: List persistent conversation messages
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
       responses:
         '200':
-          description: Pairing details without secrets
+          description: Message page in chronological order
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/InspectClientAuthorizationResponse' }
+              schema: { $ref: '#/components/schemas/ConversationMessagePage' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
-  /api/client-authorizations/approve:
     post:
-      tags: [Clients]
-      operationId: approveClientAuthorization
-      summary: Approve a client and explicit workspace grants
-      security: [{ portalSession: [] }]
+      tags: [Tasks]
+      operationId: appendConversationMessage
+      summary: Append a message and queue a cloud task
+      description: The selected model and optional Host apply to this task only. The server-side dsh Agent can continue after the client disconnects.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ApproveClientAuthorizationRequest' }
+            schema: { $ref: '#/components/schemas/AppendConversationMessageRequest' }
+      responses:
+        '202':
+          description: Message and queued task
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppendConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks:
+    get:
+      tags: [Tasks]
+      operationId: listTasks
+      summary: List the current user's cloud tasks
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TaskStatus' }
       responses:
         '200':
-          description: Approved installation without secrets
+          description: Task page
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ClientInstallation' }
+              schema: { $ref: '#/components/schemas/TaskPage' }
         default: { $ref: '#/components/responses/Error' }
-  /api/client-authorizations/deny:
     post:
-      tags: [Clients]
-      operationId: denyClientAuthorization
-      summary: Deny a client pairing request
-      security: [{ portalSession: [] }]
+      tags: [Tasks]
+      operationId: submitTask
+      summary: Submit a durable cloud task
+      description: The server owns the dsh Agent lifecycle. An optional Host is only a target for approved computer operations and is not where the Agent process runs.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/DenyClientAuthorizationRequest' }
+            schema: { $ref: '#/components/schemas/SubmitTaskRequest' }
       responses:
-        '204': { description: Pairing denied }
+        '202':
+          description: Persisted task awaiting execution
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      summary: Get an owned task and its durable progress
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Task snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/actions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: actOnTask
+      summary: Pause, resume, cancel, or retry one batch item
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskActionRequest' }
+      responses:
+        '202':
+          description: Action accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/inputs:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: answerTaskInput
+      summary: Answer a versioned clarification and resume a task
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskInputRequest' }
+      responses:
+        '202':
+          description: Input accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/approvals/{approval_id}/responses:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: approval_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ClarificationId' }
+    post:
+      tags: [Tasks]
+      operationId: respondToTaskApproval
+      summary: Approve or reject a specific versioned task approval
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskApprovalResponseRequest' }
+      responses:
+        '202':
+          description: Decision accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/events:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Tasks]
+      operationId: streamTaskEvents
+      summary: Stream durable task events
+      description: Disconnecting the event stream does not cancel the task. If the cursor expires, the stream emits task.snapshot_required and the client must fetch the task snapshot.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: Last-Event-ID
+          in: header
+          schema: { type: string, pattern: '^[0-9]+$' }
+      responses:
+        '200':
+          description: Server-sent task events
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '204': { description: No newer events for an already terminal task }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/clients:
     get:
       tags: [Clients]
       operationId: listClients
       summary: List current user's client installations
-      security: [{ portalSession: [] }]
+      description: Requires a portal session or native Client credential; only installations of the current account are returned.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       responses:
         '200':
           description: Installations without credentials
@@ -2316,8 +2341,9 @@ paths:
     delete:
       tags: [Clients]
       operationId: revokeClient
-      summary: Revoke a client installation, its sync credential, and Gateway sessions
-      security: [{ portalSession: [] }]
+      summary: Revoke a client installation, its credentials, tickets and Gateway sessions
+      description: Requires a portal session or native Client credential. Only an installation belonging to the current account can be revoked; its credentials are revoked together.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       responses:
         '204': { description: Installation revoked }
         default: { $ref: '#/components/responses/Error' }
@@ -2325,13 +2351,13 @@ paths:
     get:
       tags: [Devices]
       operationId: listDeviceWorkspaces
-      summary: List workspaces granted to the current device
-      description: Requires a live paired device credential. Returns only workspaces currently owned by the credential owner and included in its current workspace grants. The response contains workspace metadata only; it never returns file paths, manifests, or file contents.
+      summary: List ready workspaces owned by the current desktop client
+      description: Requires an active installation-bound Sync credential. Authorization is checked against current owner and ready state on each request; no static workspace grants are stored.
       security:
         - bearerToken: []
       responses:
         '200':
-          description: Current device grants and minimal workspace metadata
+          description: Ready owned workspace metadata
           content:
             application/json:
               schema:
@@ -2367,7 +2393,7 @@ paths:
       security: [{ portalSession: [] }, { bearerToken: [] }]
       responses:
         '200':
-          description: Models usable for a task
+          description: Configured models
           content:
             application/json:
               schema:
@@ -2505,9 +2531,20 @@ paths:
       tags: [Models]
       operationId: checkModelConnection
       summary: Check a model connection and discover capabilities
-      description: Portal sessions only. Checks access to the connection server-side, performs a model capability probe, and returns only the text, tools, and vision capability flags. The API key is never returned.
+      description: Portal sessions only. Requires a configured account model budget and an Idempotency-Key. The selected probe is reserved and settled in the same ledger as model requests. An omitted capability means all; text, tools and vision can also be checked independently, using a new key for each. False means not yet verified or unsupported. Verified capabilities are combined only while the connection version is unchanged. Unknown usage remains pending for reconciliation and cannot be silently retried; the API key is never returned.
       security:
         - portalSession: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                capability: { type: string, enum: [all, text, tools, vision], default: all }
       responses:
         '200':
           description: Verified model capabilities
@@ -2545,6 +2582,45 @@ paths:
                     items: { $ref: '#/components/schemas/Host' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/hosts/{id}/resources:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    get:
+      tags: [Admin]
+      operationId: getAdminHostResources
+      summary: Read the effective host resources, version and update status
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Host resource target
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminHostResources' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Admin]
+      operationId: updateAdminHostResources
+      summary: Change a host's CPU and memory resources
+      description: Stopped host changes apply on next start. Running Docker hosts are adjusted and read back before success, without restarting the container. An unknown runtime outcome keeps the old effective value and reserves capacity until reconciled.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAdminHostResourcesRequest' }
+      responses:
+        '200':
+          description: Updated saved target
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminHostResources' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/workspaces:
     get:
@@ -2655,6 +2731,152 @@ paths:
               schema: { $ref: '#/components/schemas/Capacity' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/model-usage/unknown:
+    get:
+      tags: [Admin]
+      operationId: listUnknownModelUsage
+      summary: List model calls with unknown provider usage
+      description: Requires an approved administrator's unbound Portal session. Entries are oldest first, at most 100 at a time. Dispatched calls that may still be running are excluded.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: owner_id, in: query, schema: { $ref: '#/components/schemas/UserId' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200':
+          description: Unknown calls; no prompt, response, or credential is returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [owner_id, source, call_id, model_id, provider_model, reserved_tokens, created_at, unknown_at]
+                      properties:
+                        owner_id: { $ref: '#/components/schemas/UserId' }
+                        source: { type: string, enum: [client, chat, task, probe] }
+                        call_id: { type: string }
+                        model_id: { type: string }
+                        provider_model: { type: string }
+                        task_id: { type: string }
+                        reserved_tokens: { type: integer, format: int64, minimum: 1 }
+                        created_at: { type: string, format: date-time }
+                        unknown_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/model-usage/reconcile:
+    post:
+      tags: [Admin]
+      operationId: reconcileUnknownModelUsage
+      summary: Record provider-verified usage for an unknown model call
+      description: An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. Only unknown calls can be reconciled. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict. This does not restore an unpersisted model response or restart the call.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [owner_id, source, call_id, input_tokens, output_tokens, evidence]
+              properties:
+                owner_id: { $ref: '#/components/schemas/UserId' }
+                source: { type: string, enum: [client, chat, task, probe] }
+                call_id: { type: string, minLength: 8, maxLength: 128 }
+                input_tokens: { type: integer, format: int64, minimum: 0 }
+                output_tokens: { type: integer, format: int64, minimum: 0 }
+                evidence:
+                  type: string
+                  minLength: 8
+                  maxLength: 512
+                  description: Provider reference and verification explanation, at least 8 characters and at most 512 UTF-8 bytes after trimming; omit secrets and request/response content. Saved in the administrator audit record.
+      responses:
+        '200':
+          description: Usage reconciled or an identical prior submission replayed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [replayed]
+                properties:
+                  replayed: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/model-usage-budget:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+    get:
+      tags: [Admin]
+      operationId: getModelAccountBudget
+      summary: Get a user's platform model budget and current use
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Configured budget and usage; an unconfigured account has zero limits and cannot call platform models.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [owner_id, configured, token_limit, max_concurrent, used_tokens, in_flight, has_unknown]
+                properties:
+                  owner_id: { $ref: '#/components/schemas/UserId' }
+                  configured: { type: boolean }
+                  token_limit: { type: integer, format: int64, minimum: 0 }
+                  max_concurrent: { type: integer, minimum: 0, maximum: 100 }
+                  used_tokens: { type: integer, format: int64, minimum: 0, description: Settled usage plus current reservations and unknown calls. }
+                  in_flight: { type: integer, minimum: 0 }
+                  has_unknown: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Admin]
+      operationId: setModelAccountBudget
+      summary: Set a user's platform model budget
+      description: Requires an approved administrator's unbound Portal session. Lowering a limit below current usage does not cancel dispatched calls; it blocks new reservations until usage is below the limit. Every update is audited.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token_limit, max_concurrent]
+              properties:
+                token_limit: { type: integer, format: int64, minimum: 1 }
+                max_concurrent: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: Updated budget and current usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [owner_id, configured, token_limit, max_concurrent, used_tokens, in_flight, has_unknown]
+                properties:
+                  owner_id: { $ref: '#/components/schemas/UserId' }
+                  configured: { type: boolean }
+                  token_limit: { type: integer, format: int64, minimum: 0 }
+                  max_concurrent: { type: integer, minimum: 0, maximum: 100 }
+                  used_tokens: { type: integer, format: int64, minimum: 0 }
+                  in_flight: { type: integer, minimum: 0 }
+                  has_unknown: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/audit:
     get:
@@ -2773,6 +2995,11 @@ components:
       scheme: bearer
       bearerFormat: chk_, chd_, or chc_
       description: Bearer platform API key (`chk_`), scoped sync credential (`chd_`), or restricted client credential (`chc_`).
+    clientCredential:
+      type: http
+      scheme: bearer
+      bearerFormat: chc_
+      description: Native desktop/mobile client credential. It cannot access administrator or API-key management routes.
     hostReplicaBootstrap:
       type: http
       scheme: bearer
@@ -2804,26 +3031,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/SiteReleaseId' }
-    ConversationId:
-      name: id
-      in: path
-      required: true
-      schema: { $ref: '#/components/schemas/ConversationId' }
-    TaskId:
-      name: id
-      in: path
-      required: true
-      schema: { $ref: '#/components/schemas/TaskId' }
     ModelConnectionId:
       name: id
       in: path
       required: true
       schema: { $ref: '#/components/schemas/ModelConnectionId' }
-    ScheduleId:
-      name: id
-      in: path
-      required: true
-      schema: { $ref: '#/components/schemas/ScheduleId' }
     NotificationId:
       name: id
       in: path
@@ -2904,6 +3116,35 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    ModelGatewayToolCall:
+      type: object
+      additionalProperties: false
+      required: [id, type, function]
+      properties:
+        id: { type: string }
+        type: { const: function }
+        function:
+          type: object
+          additionalProperties: false
+          required: [name, arguments]
+          properties:
+            name: { type: string }
+            arguments: { type: string }
+    ModelGatewayTool:
+      type: object
+      additionalProperties: false
+      required: [type, function]
+      properties:
+        type: { const: function }
+        function:
+          type: object
+          additionalProperties: false
+          required: [name, parameters]
+          properties:
+            name: { type: string }
+            description: { type: string }
+            parameters: { type: object }
+            strict: { type: boolean }
     ErrorResponse:
       type: object
       required: [error]
@@ -2967,7 +3208,6 @@ components:
     BatchItemId: { type: string, pattern: '^b[a-z0-9]{7}$' }
     ClarificationId: { type: string, pattern: '^r[a-z0-9]{7}$' }
     ArtifactId: { type: string, pattern: '^a[a-z0-9]{7}$' }
-    ScheduleId: { type: string, pattern: '^j[a-z0-9]{7}$' }
     ScheduleRunId: { type: string, pattern: '^y[a-z0-9]{7}$' }
     NotificationId: { type: string, pattern: '^n[a-z0-9]{7}$' }
     CreateModelConnectionRequest:
@@ -3115,7 +3355,7 @@ components:
         tools: { type: boolean }
         vision: { type: boolean }
     OnboardingModel:
-      description: A checked model with text and tool support. Vision is an independent capability; when false, the model remains usable for non-visual tasks while the Portal hides desktop capability.
+      description: A checked text model available for instant chat. Tool and vision capabilities remain informational.
       type: object
       required: [id, name, capabilities]
       properties:
@@ -3130,7 +3370,7 @@ components:
         name: { type: string }
         state: { type: string, enum: [creating, running, stopping, stopped, failed, deleting] }
     OnboardingStatus:
-      description: A model is ready for task submission when checked text and tool capabilities are available. Vision is surfaced per model and does not gate non-visual task submission; the Portal uses it to show or hide desktop capability.
+      description: A checked text model allows instant chat even when the default computer is stopped.
       type: object
       required: [model_status, models, selected_model_id, computer_status, computers, default_host_id, can_submit, next_action]
       properties:
@@ -3149,7 +3389,7 @@ components:
         can_submit: { type: boolean }
         next_action:
           type: string
-          enum: [configure_model, create_or_retry_computer, choose_computer, wait_for_computer, resume_computer, choose_another_computer, contact_admin, submit_task, review_setup]
+          enum: [configure_model, start_chat]
     EnsureDefaultHostRequest:
       type: object
       properties:
@@ -3661,123 +3901,59 @@ components:
         keep_workspace_default: { type: boolean }
     APIKey:
       type: object
-      required: [id, name, host_ids, scopes, expires_at, last_used_at, revoked, created_at]
+      required: [id, name, expires_at, last_used_at, revoked, created_at]
       properties:
         id: { $ref: '#/components/schemas/TokenId' }
         name: { type: string }
-        host_ids:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/HostId' }
-        scopes:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/APIKeyScope' }
         expires_at: { type: string, format: date-time }
         last_used_at: { type: [string, 'null'], format: date-time }
         revoked: { type: boolean }
         created_at: { type: string, format: date-time }
-    APIKeyScope:
-      type: string
-      enum: ['host:read', 'host:create', 'host:manage', 'host:delete_data', 'computer:observe', 'computer:operate', 'task:read', 'task:submit', 'task:control', 'schedule:read', 'schedule:manage']
     ClientInstallation:
       type: object
       additionalProperties: false
-      required: [id, platform, display_name, workspace_ids, expires_at, revoked, created_at, last_used_at]
+      required: [id, platform, display_name, expires_at, revoked, created_at, last_used_at]
       properties:
         id: { $ref: '#/components/schemas/ClientInstallationId' }
         platform: { type: string, enum: [desktop, android, ios] }
         display_name: { type: string, minLength: 1, maxLength: 100 }
-        workspace_ids: { type: array, maxItems: 500, uniqueItems: true, items: { $ref: '#/components/schemas/WorkspaceId' } }
         expires_at:
           type: string
           format: date-time
-          description: The installation and its credentials expire 30 days after the latest Portal approval.
+          description: The installation and Client credential expire 30 days after the latest client login.
         revoked: { type: boolean }
         created_at: { type: string, format: date-time }
         last_used_at: { type: [string, 'null'], format: date-time }
-    StartClientAuthorizationRequest:
+    ClientLoginRequest:
       type: object
       additionalProperties: false
-      required: [platform, display_name, wants_workspace_sync]
+      required: [name, password, platform, display_name]
       properties:
+        name: { type: string }
+        password: { type: string, writeOnly: true }
         platform: { type: string, enum: [desktop, android, ios] }
         display_name: { type: string, minLength: 1, maxLength: 100 }
-        wants_workspace_sync: { type: boolean }
         renewal_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
-    StartClientAuthorizationResponse:
+    ClientLoginResponse:
       type: object
       additionalProperties: false
-      required: [device_code, user_code, verification_uri, expires_at, interval_seconds]
+      required: [installation_id, client_credential, client_expires_at, user]
       properties:
-        device_code: { type: string, pattern: '^chc_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', description: One-time pairing secret returned only by this response }
-        user_code: { type: string, pattern: '^[A-HJ-NP-Z2-9]{8}$' }
-        verification_uri: { type: string }
-        expires_at:
-          type: string
-          format: date-time
-          description: Expiration time of this one-time pairing code.
-        interval_seconds: { type: integer, minimum: 1 }
-    PollClientAuthorizationRequest:
-      type: object
-      additionalProperties: false
-      required: [device_code]
-      properties:
-        device_code: { type: string, pattern: '^chc_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true }
-    PollClientAuthorizationResponse:
-      type: object
-      additionalProperties: false
-      required: [state, expires_at]
-      properties:
-        state: { type: string, enum: [authorization_pending, denied, expired, approved] }
-        expires_at:
-          type: string
-          format: date-time
-          description: Expiration time of this one-time pairing code.
         installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
-        client_credential: { type: string, pattern: '^chc_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', description: Returned once after approval }
-        client_expires_at:
-          type: string
-          format: date-time
-          description: Installation credential expiry, fixed at 30 days after the latest Portal approval.
-        sync_credential: { type: string, pattern: '^chd_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', description: Desktop-only credential returned once after approval }
-        sync_expires_at:
-          type: string
-          format: date-time
-          description: Same expiry as the paired client installation.
-        workspace_ids: { type: array, items: { $ref: '#/components/schemas/WorkspaceId' } }
-    InspectClientAuthorizationRequest:
+        client_credential: { type: string, pattern: '^chc_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true }
+        client_expires_at: { type: string, format: date-time }
+        sync_credential: { type: string, pattern: '^chd_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true, description: Desktop only }
+        sync_expires_at: { type: string, format: date-time, description: Desktop only }
+        web_session_credential: { type: string, pattern: '^chs_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true, description: Desktop only; install-bound user Web Session }
+        web_session_expires_at: { type: string, format: date-time, description: Desktop only }
+        user: { $ref: '#/components/schemas/User' }
+    ClientWebSessionResponse:
       type: object
       additionalProperties: false
-      required: [user_code]
+      required: [web_session_credential, web_session_expires_at]
       properties:
-        user_code: { type: string }
-    InspectClientAuthorizationResponse:
-      type: object
-      additionalProperties: false
-      required: [platform, display_name, wants_workspace_sync, expires_at]
-      properties:
-        platform: { type: string, enum: [desktop, android, ios] }
-        display_name: { type: string }
-        wants_workspace_sync: { type: boolean }
-        renewal_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
-        expires_at:
-          type: string
-          format: date-time
-          description: Expiration time of this one-time pairing code.
-    ApproveClientAuthorizationRequest:
-      type: object
-      additionalProperties: false
-      required: [user_code, workspace_ids]
-      properties:
-        user_code: { type: string }
-        workspace_ids: { type: array, maxItems: 500, uniqueItems: true, items: { $ref: '#/components/schemas/WorkspaceId' } }
-    DenyClientAuthorizationRequest:
-      type: object
-      additionalProperties: false
-      required: [user_code]
-      properties:
-        user_code: { type: string }
+        web_session_credential: { type: string, pattern: '^chs_t[a-z0-9]{7}_[A-Za-z0-9_-]{43}$', writeOnly: true }
+        web_session_expires_at: { type: string, format: date-time }
     DeviceWorkspace:
       type: object
       required: [id, name, revision, state]
@@ -3826,9 +4002,7 @@ components:
         password: { type: string, minLength: 1, writeOnly: true }
     CreateHostRequest:
       type: object
-      required: [template_id]
       properties:
-        template_id: { type: string }
         name: { type: string }
         workspace_ids:
           type: array
@@ -3838,42 +4012,58 @@ components:
       additionalProperties: false
     CreateAPIKeyRequest:
       type: object
-      required: [name, host_ids, scopes]
+      required: [name]
       properties:
         name: { type: string, minLength: 1 }
         ttl_seconds: { type: integer, minimum: 1, maximum: 31536000 }
-        host_ids:
-          type: array
-          maxItems: 500
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/HostId' }
-        scopes:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/APIKeyScope' }
       additionalProperties: false
     CreatedAPIKey:
       type: object
-      required: [id, key, host_ids, scopes, expires_at]
+      required: [id, key, expires_at]
       properties:
         id: { $ref: '#/components/schemas/TokenId' }
         key: { type: string, pattern: '^chk_' }
-        host_ids:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/HostId' }
-        scopes:
-          type: array
-          uniqueItems: true
-          items: { $ref: '#/components/schemas/APIKeyScope' }
         expires_at: { type: string, format: date-time }
+    InstantChatConversation:
+      type: object
+      required: [id, title, model_id, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/ConversationId' }
+        title: { type: string }
+        model_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    InstantChatMessage:
+      type: object
+      required: [id, conversation_id, role, content, created_at]
+      properties:
+        id: { type: string }
+        conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+    InstantChatSendRequest:
+      type: object
+      additionalProperties: false
+      required: [model_id, content]
+      properties:
+        conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        model_id: { type: string }
+        content: { type: string, minLength: 1, maxLength: 32768 }
+    InstantChatSendResponse:
+      type: object
+      required: [conversation, message, reply]
+      properties:
+        conversation: { $ref: '#/components/schemas/InstantChatConversation' }
+        message: { $ref: '#/components/schemas/InstantChatMessage' }
+        reply: { $ref: '#/components/schemas/InstantChatMessage' }
     Conversation:
       type: object
-      required: [id, host_id, title, created_at, updated_at]
+      required: [id, title, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/ConversationId' }
         host_id: { $ref: '#/components/schemas/HostId' }
-        title: { type: string }
+        title: { type: string, maxLength: 120 }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     ConversationPage:
@@ -3882,14 +4072,7 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/Conversation' } }
         next_cursor: { type: [string, 'null'] }
-    CreateConversationRequest:
-      type: object
-      required: [host_id]
-      properties:
-        host_id: { $ref: '#/components/schemas/HostId' }
-        title: { type: string, maxLength: 120 }
-      additionalProperties: false
-    Message:
+    ConversationMessage:
       type: object
       required: [id, conversation_id, role, content, task_id, created_at]
       properties:
@@ -3899,19 +4082,81 @@ components:
         content: { type: string }
         task_id: { $ref: '#/components/schemas/TaskId' }
         created_at: { type: string, format: date-time }
-    MessagePage:
+    ConversationMessagePage:
       type: object
       required: [items, next_cursor]
       properties:
-        items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        items: { type: array, items: { $ref: '#/components/schemas/ConversationMessage' } }
         next_cursor: { type: [string, 'null'] }
+    CreateConversationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        host_id: { $ref: '#/components/schemas/HostId' }
+        title: { type: string, maxLength: 120 }
+    AppendConversationMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [model_id, content]
+      properties:
+        host_id: { $ref: '#/components/schemas/HostId' }
+        application_id: { type: string, maxLength: 64 }
+        model_id: { type: string, minLength: 1, maxLength: 256 }
+        content: { type: string, minLength: 1, maxLength: 32768 }
+        budget:
+          oneOf:
+            - { $ref: '#/components/schemas/TaskBudgetRequest' }
+            - { type: 'null' }
+    AppendConversationMessageResponse:
+      type: object
+      required: [message, task]
+      properties:
+        message: { $ref: '#/components/schemas/ConversationMessage' }
+        task: { $ref: '#/components/schemas/Task' }
     TaskStatus:
       type: string
       enum: [queued, running, waiting_user, pausing, paused, cancelling, completed, failed, cancelled]
-    OperationStatus:
-      type: string
-      enum: [prepared, dispatched, succeeded, failed, cancelled, unknown]
-      description: A dispatched operation with an ambiguous outcome is unknown and must be reconciled before any retry.
+    TaskBudgetRequest:
+      type: object
+      additionalProperties: false
+      required: [active_seconds, tool_calls, model_tokens]
+      properties:
+        active_seconds: { type: integer, minimum: 1, maximum: 1800 }
+        tool_calls: { type: integer, minimum: 1, maximum: 100 }
+        model_tokens: { type: integer, minimum: 1, maximum: 50000 }
+    TaskBudget:
+      type: object
+      required: [active_seconds, tool_calls, model_tokens]
+      properties:
+        active_seconds: { type: integer, minimum: 1 }
+        tool_calls: { type: integer, minimum: 1 }
+        model_tokens: { type: integer, minimum: 1 }
+    TaskUsage:
+      type: object
+      required: [active_seconds, tool_calls, model_tokens]
+      properties:
+        active_seconds: { type: integer, minimum: 0 }
+        tool_calls: { type: integer, minimum: 0 }
+        model_tokens: { type: [integer, 'null'], minimum: 0 }
+    TaskSummary:
+      type: object
+      required: [id, owner_id, execution_location, conversation_id, model_id, objective, status, current_step, budget, usage, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/TaskId' }
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        host_id: { $ref: '#/components/schemas/HostId', description: Optional target Host for computer operations; the dsh Agent runs independently on the server. }
+        execution_location: { type: string, enum: [server, legacy] }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        application_id: { type: string }
+        conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        model_id: { type: string }
+        objective: { type: string }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        current_step: { type: [string, 'null'] }
+        budget: { $ref: '#/components/schemas/TaskBudget' }
+        usage: { $ref: '#/components/schemas/TaskUsage' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     TaskStep:
       type: object
       required: [id, sequence, kind, status, title, summary, created_at]
@@ -3921,8 +4166,132 @@ components:
         kind: { type: string, enum: [plan, tool, wait, result] }
         status: { type: string, enum: [queued, running, waiting_user, succeeded, failed, unknown] }
         title: { type: string }
-        summary: { type: string, maxLength: 2000 }
+        summary: { type: string }
         created_at: { type: string, format: date-time }
+    TaskBatchItem:
+      type: object
+      required: [id, key, status, attempt, result, error]
+      properties:
+        id: { $ref: '#/components/schemas/BatchItemId' }
+        key: { type: string }
+        status: { type: string, enum: [queued, running, succeeded, failed, unknown] }
+        attempt: { type: integer, minimum: 1 }
+        result: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+    TaskArtifact:
+      type: object
+      required: [id, step_id, label, path, media_type, batch_item_id, batch_attempt, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/ArtifactId' }
+        step_id: { $ref: '#/components/schemas/StepId' }
+        label: { type: string }
+        path: { type: string, description: Workspace-relative path }
+        media_type: { type: string }
+        batch_item_id: { oneOf: [{ $ref: '#/components/schemas/BatchItemId' }, { type: 'null' }] }
+        batch_attempt: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    TaskPendingRequest:
+      type: object
+      required: [id, version, kind, title, object, content, impact]
+      properties:
+        id: { $ref: '#/components/schemas/ClarificationId' }
+        version: { type: integer, minimum: 1 }
+        kind: { const: approval }
+        title: { type: string }
+        object: { type: string }
+        content: { type: string }
+        impact: { type: string }
+    TaskClarificationRequest:
+      type: object
+      required: [id, version, question]
+      properties:
+        id: { $ref: '#/components/schemas/ClarificationId' }
+        version: { type: integer, minimum: 1 }
+        question: { type: string }
+    TaskStopRequest:
+      type: object
+      required: [id, action, status, safe_after, unsettled_operation_ids]
+      properties:
+        id: { type: string, pattern: '^x[a-z0-9]{7}$' }
+        action: { type: string, enum: [pause, cancel] }
+        status: { type: string, enum: [pending, completed] }
+        safe_after: { type: string, format: date-time }
+        unsettled_operation_ids: { type: array, items: { $ref: '#/components/schemas/OperationId' } }
+    Task:
+      allOf:
+        - { $ref: '#/components/schemas/TaskSummary' }
+        - type: object
+          required: [result, waiting_reason, steps, batch_items, artifacts, pending_request, clarification_request, stop_request, finished_at]
+          properties:
+            result: { type: [string, 'null'] }
+            waiting_reason: { type: [string, 'null'] }
+            steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
+            batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
+            artifacts: { type: array, items: { $ref: '#/components/schemas/TaskArtifact' } }
+            pending_request: { oneOf: [{ $ref: '#/components/schemas/TaskPendingRequest' }, { type: 'null' }] }
+            clarification_request: { oneOf: [{ $ref: '#/components/schemas/TaskClarificationRequest' }, { type: 'null' }] }
+            stop_request: { oneOf: [{ $ref: '#/components/schemas/TaskStopRequest' }, { type: 'null' }] }
+            finished_at: { type: [string, 'null'], format: date-time }
+    TaskPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/TaskSummary' } }
+        next_cursor: { type: [string, 'null'] }
+    SubmitTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [model_id, objective]
+      properties:
+        host_id: { $ref: '#/components/schemas/HostId' }
+        application_id: { type: string, maxLength: 64 }
+        model_id: { type: string, minLength: 1, maxLength: 256 }
+        conversation_id: { oneOf: [{ $ref: '#/components/schemas/ConversationId' }, { type: 'null' }] }
+        objective: { type: string, minLength: 1, maxLength: 32768 }
+        budget:
+          oneOf:
+            - { $ref: '#/components/schemas/TaskBudgetRequest' }
+            - { type: 'null' }
+        batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItemInput' } }
+    TaskBatchItemInput:
+      type: object
+      additionalProperties: false
+      required: [key, input]
+      properties:
+        key: { type: string, minLength: 1, maxLength: 100 }
+        input: { type: string, minLength: 1, maxLength: 32768 }
+    TaskActionRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action: { type: string, enum: [retry_batch_item, pause, resume, cancel] }
+        expected_status: { $ref: '#/components/schemas/TaskStatus' }
+        batch_item_id: { $ref: '#/components/schemas/BatchItemId' }
+      description: retry_batch_item requires batch_item_id only; pause, resume and cancel require expected_status only.
+    TaskInputRequest:
+      type: object
+      additionalProperties: false
+      required: [clarification_id, clarification_version, answer]
+      properties:
+        clarification_id: { $ref: '#/components/schemas/ClarificationId' }
+        clarification_version: { type: integer, minimum: 1 }
+        answer: { type: string, minLength: 1, maxLength: 16384 }
+    TaskApprovalResponseRequest:
+      type: object
+      additionalProperties: false
+      required: [version, decision]
+      properties:
+        version: { type: integer, minimum: 1 }
+        decision: { type: string, enum: [approve, reject] }
+    TaskActionResponse:
+      type: object
+      required: [task_id, action, status, unsettled_operation_ids]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        action: { type: string }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        unsettled_operation_ids: { type: array, items: { $ref: '#/components/schemas/OperationId' } }
     TaskEvent:
       type: object
       required: [task_id, sequence, type, created_at, payload]
@@ -3931,205 +4300,7 @@ components:
         sequence: { type: integer, minimum: 1 }
         type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result] }
         created_at: { type: string, format: date-time }
-        payload:
-          type: object
-          additionalProperties: true
-          description: For assistant task.message deltas the fields are role=assistant, message_id, turn_id, and delta. The terminal message has the same IDs plus content and done=true; partial or failed responses do not get a terminal message or a conversation Message row.
-    TaskBudget:
-      type: object
-      required: [active_seconds, tool_calls, model_tokens]
-      properties:
-        active_seconds: { type: integer, minimum: 1, maximum: 1800, default: 1800 }
-        tool_calls: { type: integer, minimum: 1, maximum: 100, default: 100 }
-        model_tokens: { type: integer, minimum: 1, maximum: 50000, default: 50000 }
-      additionalProperties: false
-    ScheduleTiming:
-      oneOf:
-        - $ref: '#/components/schemas/OnceScheduleTiming'
-        - $ref: '#/components/schemas/DailyScheduleTiming'
-        - $ref: '#/components/schemas/WeeklyScheduleTiming'
-      description: IANA timezone is required. Repeated DST wall times use the earlier instant; nonexistent wall times are skipped.
-    OnceScheduleTiming:
-      type: object
-      required: [kind, run_at, time_zone]
-      properties:
-        kind: { type: string, const: once }
-        run_at: { type: string, format: date-time, description: RFC3339 instant with an explicit UTC offset. }
-        time_zone: { type: string, minLength: 1, maxLength: 64, description: IANA tz database name used for display. }
-      additionalProperties: false
-    DailyScheduleTiming:
-      type: object
-      required: [kind, starts_on, local_time, time_zone]
-      properties:
-        kind: { type: string, const: daily }
-        starts_on: { type: string, format: date, description: First eligible local calendar date. }
-        local_time: { type: string, pattern: '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$' }
-        time_zone: { type: string, minLength: 1, maxLength: 64, description: IANA tz database name. }
-      additionalProperties: false
-    WeeklyScheduleTiming:
-      type: object
-      required: [kind, starts_on, local_time, time_zone, weekdays]
-      properties:
-        kind: { type: string, const: weekly }
-        starts_on: { type: string, format: date, description: First eligible local calendar date. }
-        local_time: { type: string, pattern: '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$' }
-        time_zone: { type: string, minLength: 1, maxLength: 64, description: IANA tz database name. }
-        weekdays:
-          type: array
-          minItems: 1
-          maxItems: 7
-          uniqueItems: true
-          items: { type: integer, minimum: 1, maximum: 7, description: 'ISO weekday, Monday=1 through Sunday=7.' }
-      additionalProperties: false
-    ScheduleStatus:
-      type: string
-      enum: [enabled, disabled, completed]
-      description: completed means a one-time schedule's occurrence has been consumed, not necessarily that its Task has finished.
-    MisfirePolicy:
-      type: string
-      enum: [skip, run_once]
-      description: Occurrences up to one minute late still run normally. After that grace, skip records missed occurrences without running them; run_once coalesces them into at most one run for the latest due occurrence.
-    ScheduleRunStatus:
-      type: string
-      enum: [queued, running, waiting_user, pausing, paused, stopping, completed, failed, cancelled, skipped, missed]
-    ObservationField:
-      type: string
-      enum: [text, value]
-    ObservationSpec:
-      type: object
-      required: [url, selector, field]
-      properties:
-        url: { type: string, format: uri, minLength: 1, maxLength: 2048, pattern: '^https?://', description: Absolute HTTP or HTTPS page URL without credentials or a fragment. }
-        selector: { type: string, minLength: 1, maxLength: 1024, description: CSS selector resolved by the browser; this is never evaluated as JavaScript. }
-        field: { $ref: '#/components/schemas/ObservationField' }
-      additionalProperties: false
-    ObservationOutcome:
-      type: string
-      enum: [unknown, baseline, changed, no_change]
-    ScheduleRun:
-      type: object
-      required: [id, schedule_id, schedule_version, occurrence_key, scheduled_at, coalesced_count, status, skip_reason, task_id, observation_outcome, created_at, updated_at, finished_at]
-      properties:
-        id: { $ref: '#/components/schemas/ScheduleRunId' }
-        schedule_id: { $ref: '#/components/schemas/ScheduleId' }
-        schedule_version: { type: integer, minimum: 1 }
-        occurrence_key: { type: string, minLength: 1, maxLength: 128, description: Stable key for this local schedule occurrence. }
-        scheduled_at: { type: [string, 'null'], format: date-time, description: UTC instant; null when the local wall time does not exist due to a DST gap. }
-        coalesced_count: { type: integer, minimum: 0, description: Earlier missed occurrences folded into this run. }
-        status: { $ref: '#/components/schemas/ScheduleRunStatus' }
-        skip_reason: { type: [string, 'null'], enum: [dst_gap, overlap, authorization_ended, null] }
-        task_id: { oneOf: [{ $ref: '#/components/schemas/TaskId' }, { type: 'null' }] }
-        observation_outcome: { $ref: '#/components/schemas/ObservationOutcome' }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-        finished_at: { type: [string, 'null'], format: date-time }
-    Schedule:
-      type: object
-      required: [id, version, status, host_id, model_id, objective, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, created_at, updated_at]
-      properties:
-        id: { $ref: '#/components/schemas/ScheduleId' }
-        version: { type: integer, minimum: 1 }
-        status: { $ref: '#/components/schemas/ScheduleStatus' }
-        host_id: { $ref: '#/components/schemas/HostId' }
-        model_id: { type: string, minLength: 1 }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
-        timing: { $ref: '#/components/schemas/ScheduleTiming' }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-        misfire_policy: { $ref: '#/components/schemas/MisfirePolicy' }
-        notification_events:
-          type: array
-          uniqueItems: true
-          items: { type: string, enum: [completed, failed, waiting_user] }
-          description: Successful no-change runs never create completion notifications.
-        observation:
-          oneOf:
-            - $ref: '#/components/schemas/ObservationSpec'
-            - type: 'null'
-        next_run_at: { type: [string, 'null'], format: date-time }
-        last_run:
-          oneOf:
-            - $ref: '#/components/schemas/ScheduleRun'
-            - type: 'null'
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-    SchedulePage:
-      type: object
-      required: [items, next_cursor]
-      properties:
-        items: { type: array, items: { $ref: '#/components/schemas/Schedule' } }
-        next_cursor: { type: [string, 'null'] }
-    ScheduleRunPage:
-      type: object
-      required: [items, next_cursor]
-      properties:
-        items: { type: array, items: { $ref: '#/components/schemas/ScheduleRun' } }
-        next_cursor: { type: [string, 'null'] }
-    CreateScheduleRequest:
-      type: object
-      required: [host_id, model_id, objective, timing]
-      properties:
-        host_id: { $ref: '#/components/schemas/HostId' }
-        model_id: { type: string, minLength: 1, description: Must identify a model explicitly configured by the caller; no fallback is performed. }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
-        timing: { $ref: '#/components/schemas/ScheduleTiming' }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-        misfire_policy: { $ref: '#/components/schemas/MisfirePolicy', default: skip }
-        notification_events:
-          type: array
-          uniqueItems: true
-          items: { type: string, enum: [completed, failed, waiting_user] }
-          default: [completed, failed, waiting_user]
-        observation: { $ref: '#/components/schemas/ObservationSpec' }
-      additionalProperties: false
-    UpdateScheduleRequest:
-      type: object
-      required: [expected_version]
-      minProperties: 2
-      properties:
-        expected_version: { type: integer, minimum: 1 }
-        host_id: { $ref: '#/components/schemas/HostId' }
-        model_id: { type: string, minLength: 1 }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
-        timing: { $ref: '#/components/schemas/ScheduleTiming' }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-        misfire_policy: { $ref: '#/components/schemas/MisfirePolicy' }
-        notification_events:
-          type: array
-          uniqueItems: true
-          items: { type: string, enum: [completed, failed, waiting_user] }
-        observation:
-          oneOf:
-            - $ref: '#/components/schemas/ObservationSpec'
-            - type: 'null'
-      additionalProperties: false
-    ScheduleEnableRequest:
-      type: object
-      required: [action, expected_version]
-      properties:
-        action: { type: string, const: enable }
-        expected_version: { type: integer, minimum: 1 }
-      additionalProperties: false
-    ScheduleDisableRequest:
-      type: object
-      required: [action, expected_version]
-      properties:
-        action: { type: string, const: disable }
-        expected_version: { type: integer, minimum: 1 }
-        current_run_action: { type: string, enum: [continue, cancel], default: continue }
-      additionalProperties: false
-    ScheduleActionRequest:
-      oneOf:
-        - $ref: '#/components/schemas/ScheduleEnableRequest'
-        - $ref: '#/components/schemas/ScheduleDisableRequest'
-    ScheduleActionResponse:
-      type: object
-      required: [schedule, current_run]
-      properties:
-        schedule: { $ref: '#/components/schemas/Schedule' }
-        current_run:
-          oneOf:
-            - $ref: '#/components/schemas/ScheduleRun'
-            - type: 'null'
+        payload: {}
     Notification:
       type: object
       required: [id, kind, task_id, event_sequence, summary, redacted, actionable, created_at, read_at]
@@ -4149,248 +4320,33 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/Notification' } }
         next_cursor: { type: [string, 'null'] }
-    TaskUsage:
+    HostResourcesTarget:
       type: object
-      required: [active_seconds, tool_calls, model_tokens]
-      properties:
-        active_seconds: { type: integer, minimum: 0 }
-        tool_calls: { type: integer, minimum: 0 }
-        model_tokens: { type: [integer, 'null'], minimum: 0, description: Null when provider usage is unavailable; unknown usage must not be presented as zero. }
-    TaskBatchItemInput:
-      type: object
-      required: [key, input]
-      properties:
-        key: { type: string, minLength: 1, maxLength: 128 }
-        input: { type: string, minLength: 1, maxLength: 16384 }
+      required: [cpu_milli, mem_mib]
       additionalProperties: false
-    RetryBatchItemRequest:
-      type: object
-      required: [action, batch_item_id]
       properties:
-        action: { type: string, const: retry_batch_item }
-        batch_item_id: { $ref: '#/components/schemas/BatchItemId' }
-      additionalProperties: false
-    TaskActionRequest:
-      oneOf:
-        - $ref: '#/components/schemas/RetryBatchItemRequest'
-        - $ref: '#/components/schemas/RespondToPendingRequest'
-        - $ref: '#/components/schemas/AnswerClarificationRequest'
-        - $ref: '#/components/schemas/PauseTaskRequest'
-        - $ref: '#/components/schemas/ResumeTaskRequest'
-        - $ref: '#/components/schemas/CancelTaskRequest'
-    ExecutionControlActionRequest:
+        cpu_milli: { type: integer, minimum: 1 }
+        mem_mib: { type: integer, minimum: 1 }
+    AdminHostResources:
       type: object
-      required: [expected_epoch]
+      required: [host_id, state, resources, version, update_state]
       properties:
-        expected_epoch: { type: integer, format: int64, minimum: 1 }
-      additionalProperties: false
-    ExecutionControl:
-      type: object
-      required: [state, epoch, pending_task_count]
-      properties:
-        state: { type: string, enum: [enabled, stopping, disabled] }
-        epoch: { type: integer, format: int64, minimum: 1 }
-        pending_task_count: { type: integer, format: int64, minimum: 0, description: Number of tasks awaiting durable stop confirmation. }
-      additionalProperties: false
-    PauseTaskRequest:
-      type: object
-      required: [action, expected_status]
-      properties:
-        action: { type: string, const: pause }
-        expected_status: { type: string, enum: [queued, running] }
-      additionalProperties: false
-    ResumeTaskRequest:
-      type: object
-      required: [action, expected_status]
-      properties:
-        action: { type: string, const: resume }
-        expected_status: { type: string, const: paused }
-      additionalProperties: false
-    CancelTaskRequest:
-      type: object
-      required: [action, expected_status]
-      properties:
-        action: { type: string, const: cancel }
-        expected_status: { type: string, enum: [queued, running, waiting_user, paused] }
-      additionalProperties: false
-    TaskActionResponse:
-      type: object
-      required: [task_id, action, status, unsettled_operation_ids]
-      properties:
-        task_id: { $ref: '#/components/schemas/TaskId' }
-        action: { type: string, enum: [retry_batch_item, respond, answer_clarification, pause, resume, cancel] }
-        status: { $ref: '#/components/schemas/TaskStatus' }
-        unsettled_operation_ids:
-          type: array
-          items: { $ref: '#/components/schemas/OperationId' }
-      additionalProperties: false
-    RespondToPendingRequest:
-      type: object
-      required: [action, pending_id, pending_version, decision]
-      properties:
-        action: { type: string, const: respond }
-        pending_id: { type: string, pattern: '^r[a-z0-9]{7}$' }
-        pending_version: { type: integer, minimum: 1 }
-        decision: { type: string, enum: [approve, reject] }
-      additionalProperties: false
-    AnswerClarificationRequest:
-      type: object
-      required: [action, clarification_id, clarification_version, answer]
-      properties:
-        action: { type: string, const: answer_clarification }
-        clarification_id: { $ref: '#/components/schemas/ClarificationId' }
-        clarification_version: { type: integer, format: int64, minimum: 1 }
-        answer: { type: string, minLength: 1, maxLength: 16384, description: Non-empty UTF-8 answer; whitespace-only values and NUL characters are rejected. }
-      additionalProperties: false
-    TaskPendingRequest:
-      type: object
-      required: [id, version, kind, title, object, content, impact]
-      properties:
-        id: { type: string, pattern: '^r[a-z0-9]{7}$' }
-        version: { type: integer, minimum: 1 }
-        kind: { type: string, const: approval }
-        title: { type: string, maxLength: 512 }
-        object: { type: string, maxLength: 512 }
-        content: { type: string, maxLength: 512 }
-        impact: { type: string, maxLength: 512 }
-    TaskClarificationRequest:
-      type: object
-      required: [id, version, question]
-      properties:
-        id: { $ref: '#/components/schemas/ClarificationId' }
+        host_id: { $ref: '#/components/schemas/HostId' }
+        state: { type: string, enum: [creating, running, stopping, stopped, failed, deleting, deleted] }
+        resources: { $ref: '#/components/schemas/HostResourcesTarget' }
         version: { type: integer, format: int64, minimum: 1 }
-        question: { type: string, minLength: 1, maxLength: 4096, description: UTF-8 question without NUL characters. }
+        update_state: { type: string, enum: [idle, applying, unknown], description: Unknown requires runtime reconciliation before another adjustment. }
+    UpdateAdminHostResourcesRequest:
+      type: object
+      required: [cpu_milli, mem_mib, expected_version]
       additionalProperties: false
-    TaskStopRequest:
-      type: object
-      required: [id, action, status, safe_after, unsettled_operation_ids]
       properties:
-        id: { type: string, pattern: '^x[a-z0-9]{7}$' }
-        action: { type: string, enum: [pause, cancel] }
-        status: { type: string, enum: [pending, completed] }
-        safe_after: { type: string, format: date-time }
-        unsettled_operation_ids:
-          type: array
-          items: { $ref: '#/components/schemas/OperationId' }
-      additionalProperties: false
-    TaskBatchItem:
-      type: object
-      required: [id, key, status, attempt, result, error]
-      properties:
-        id: { $ref: '#/components/schemas/BatchItemId' }
-        key: { type: string }
-        status: { type: string, enum: [queued, running, succeeded, failed, unknown] }
-        attempt: { type: integer, format: int32, minimum: 1 }
-        result: { type: [string, 'null'] }
-        error: { type: [string, 'null'] }
-    TaskArtifact:
-      type: object
-      required: [id, step_id, label, path, media_type, batch_item_id, batch_attempt, created_at]
-      properties:
-        id: { $ref: '#/components/schemas/ArtifactId' }
-        step_id: { $ref: '#/components/schemas/StepId' }
-        label: { type: string }
-        path: { type: string, description: Relative to the task Workspace }
-        media_type: { type: string }
-        batch_item_id:
-          anyOf:
-            - $ref: '#/components/schemas/BatchItemId'
-            - type: 'null'
-        batch_attempt: { type: integer, format: int32, minimum: 0, description: Zero for task-level artifacts; otherwise the associated item attempt. }
-        created_at: { type: string, format: date-time }
-    Task:
-      type: object
-      required: [id, owner_id, host_id, conversation_id, model_id, objective, status, budget, usage, steps, batch_items, artifacts, pending_request, clarification_request, stop_request, created_at, updated_at]
-      properties:
-        id: { $ref: '#/components/schemas/TaskId' }
-        owner_id: { $ref: '#/components/schemas/UserId' }
-        host_id: { $ref: '#/components/schemas/HostId' }
-        application_id: { type: string, enum: [wechat], description: Optional fixed target application on this Host. }
-        conversation_id: { $ref: '#/components/schemas/ConversationId' }
-        model_id: { type: string, minLength: 1, description: "The explicitly selected, user-configured model identifier." }
-        objective: { type: string }
-        status: { $ref: '#/components/schemas/TaskStatus' }
-        current_step: { type: [string, 'null'] }
-        result: { type: [string, 'null'] }
-        waiting_reason: { type: [string, 'null'] }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-        usage: { $ref: '#/components/schemas/TaskUsage' }
-        steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
-        batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
-        artifacts: { type: array, items: { $ref: '#/components/schemas/TaskArtifact' } }
-        pending_request:
-          oneOf:
-            - $ref: '#/components/schemas/TaskPendingRequest'
-            - type: 'null'
-        clarification_request:
-          oneOf:
-            - $ref: '#/components/schemas/TaskClarificationRequest'
-            - type: 'null'
-          description: Present only while waiting for an answer to the task's active clarification request.
-        stop_request:
-          oneOf:
-            - $ref: '#/components/schemas/TaskStopRequest'
-            - type: 'null'
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-        finished_at: { type: [string, 'null'], format: date-time }
-    TaskSummary:
-      type: object
-      required: [id, owner_id, host_id, conversation_id, model_id, objective, status, budget, usage, created_at, updated_at]
-      properties:
-        id: { $ref: '#/components/schemas/TaskId' }
-        owner_id: { $ref: '#/components/schemas/UserId' }
-        host_id: { $ref: '#/components/schemas/HostId' }
-        application_id: { type: string, enum: [wechat], description: Optional fixed target application on this Host. }
-        conversation_id: { $ref: '#/components/schemas/ConversationId' }
-        model_id: { type: string, minLength: 1 }
-        objective: { type: string }
-        status: { $ref: '#/components/schemas/TaskStatus' }
-        current_step: { type: [string, 'null'] }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-        usage: { $ref: '#/components/schemas/TaskUsage' }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-    TaskPage:
-      type: object
-      required: [items, next_cursor]
-      properties:
-        items: { type: array, items: { $ref: '#/components/schemas/TaskSummary' } }
-        next_cursor: { type: [string, 'null'] }
-    SubmitTaskRequest:
-      type: object
-      required: [host_id, model_id, objective]
-      properties:
-        host_id: { $ref: '#/components/schemas/HostId' }
-        application_id: { type: string, enum: [wechat], description: Optional target application on this Host; requires a running Morde-managed application launch and does not add operation permissions. }
-        model_id: { type: string, minLength: 1, description: Must identify a model explicitly configured by the caller; no fallback is performed. }
-        conversation_id: { $ref: '#/components/schemas/ConversationId' }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-        batch_items:
-          type: array
-          maxItems: 100
-          items: { $ref: '#/components/schemas/TaskBatchItemInput' }
-      additionalProperties: false
-    AppendMessageRequest:
-      type: object
-      required: [host_id, model_id, content]
-      properties:
-        host_id: { $ref: '#/components/schemas/HostId' }
-        application_id: { type: string, enum: [wechat], description: Must match the active task target when a conversation has an active task. }
-        model_id: { type: string, minLength: 1, description: Must identify a model explicitly configured for the caller; no fallback is performed. }
-        content: { type: string, minLength: 1, maxLength: 32768 }
-        budget: { $ref: '#/components/schemas/TaskBudget' }
-      additionalProperties: false
-    AppendMessageResponse:
-      type: object
-      required: [message, task]
-      properties:
-        message: { $ref: '#/components/schemas/Message' }
-        task: { $ref: '#/components/schemas/Task' }
+        cpu_milli: { type: integer, minimum: 1 }
+        mem_mib: { type: integer, minimum: 1 }
+        expected_version: { type: integer, format: int64, minimum: 1 }
     AdminUser:
       type: object
-      required: [id, name, role, status, quota, usage, created_at]
+      required: [id, name, role, status, quota, usage, default_host_resources, created_at]
       properties:
         id: { $ref: '#/components/schemas/UserId' }
         name: { type: string }
@@ -4398,6 +4354,7 @@ components:
         status: { $ref: '#/components/schemas/AccountStatus' }
         quota: { $ref: '#/components/schemas/Quota' }
         usage: { $ref: '#/components/schemas/Usage' }
+        default_host_resources: { $ref: '#/components/schemas/HostResourcesTarget' }
         created_at: { type: string, format: date-time }
     AdminWorkspaceBinding:
       type: object
@@ -4447,3 +4404,4 @@ components:
         status: { $ref: '#/components/schemas/AccountStatus' }
         role: { $ref: '#/components/schemas/UserRole' }
         quota: { $ref: '#/components/schemas/Quota' }
+        default_host_resources: { $ref: '#/components/schemas/HostResourcesTarget' }

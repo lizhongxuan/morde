@@ -90,7 +90,7 @@ func (h *api) listAvailableModels(c *gin.Context) {
 	}
 	result := make([]model, 0, len(items))
 	for _, item := range items {
-		if item.CheckedAt == nil || !item.Capabilities.Text || !item.Capabilities.Tools {
+		if item.CheckedAt == nil || !item.Capabilities.Text {
 			continue
 		}
 		result = append(result, model{ID: item.ID, Name: item.Name, ModelName: item.ModelName,
@@ -240,11 +240,17 @@ func (h *api) checkModelConnection(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if h.deps.ModelConnections == nil {
+	if h.deps.ModelGateway == nil {
 		serviceUnavailable(c)
 		return
 	}
-	capabilities, err := h.deps.ModelConnections.Check(c.Request.Context(), principal, id)
+	request := struct {
+		Capability string `json:"capability"`
+	}{Capability: "all"}
+	if c.Request.ContentLength != 0 && !decodeStrictModelJSON(c, &request) {
+		return
+	}
+	capabilities, err := h.deps.ModelGateway.CheckModelCapability(c.Request.Context(), principal, id, c.GetHeader("Idempotency-Key"), request.Capability)
 	if err != nil {
 		writeError(c, err)
 		return

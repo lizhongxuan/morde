@@ -106,50 +106,26 @@ export const portalApi = {
       params: { path: { id, session_id: sessionId, digest } },
     }));
   },
-  inspectClientAuthorization: async (userCode: string) => unwrapApiResponse(await api.POST('/api/client-authorizations/inspect', { body: { user_code: userCode } })),
-  approveClientAuthorization: async (body: { user_code: string; workspace_ids: string[] }) => unwrapApiResponse(await api.POST('/api/client-authorizations/approve', { body })),
-  denyClientAuthorization: async (userCode: string) => unwrapApiResponse(await api.POST('/api/client-authorizations/deny', { body: { user_code: userCode } })),
   clients: async () => unwrapApiResponse(await api.GET('/api/clients')),
   revokeClient: async (id: string) => unwrapApiResponse(await api.DELETE('/api/clients/{id}', { params: { path: { id } } })),
-  tasks: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/tasks', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
-  conversations: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
-  conversationMessages: async (id: string, cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', { params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
-  submitTask: async (body: components['schemas']['SubmitTaskRequest'], idempotencyKey?: string) => unwrapApiResponse(await api.POST('/api/tasks', {
-    params: { header: { 'Idempotency-Key': idempotencyKey ?? newIdempotencyKey() } }, body,
+  instantChatConversations: async () => unwrapApiResponse(await api.GET('/api/instant-chat/conversations')),
+  instantChatMessages: async (id: string) => unwrapApiResponse(await api.GET('/api/instant-chat/conversations/{id}/messages', { params: { path: { id } } })),
+  sendInstantChatMessage: async (body: components['schemas']['InstantChatSendRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/instant-chat/messages', {
+    params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
-  appendConversationMessage: async (id: string, body: components['schemas']['AppendMessageRequest'], idempotencyKey?: string) => unwrapApiResponse(await api.POST('/api/conversations/{id}/messages', {
-    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey ?? newIdempotencyKey() } }, body,
-  })),
-  task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
-  taskAction: async (id: string, body: components['schemas']['TaskActionRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/actions', {
-    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
-  })),
-  schedules: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/schedules', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
-  schedule: async (id: string) => unwrapApiResponse(await api.GET('/api/schedules/{id}', { params: { path: { id } } })),
-  createSchedule: async (body: components['schemas']['CreateScheduleRequest']) => unwrapApiResponse(await api.POST('/api/schedules', {
-    params: { header: { 'Idempotency-Key': newIdempotencyKey() } }, body,
-  })),
-  updateSchedule: async (id: string, body: components['schemas']['UpdateScheduleRequest']) => unwrapApiResponse(await api.PATCH('/api/schedules/{id}', { params: { path: { id } }, body })),
-  scheduleAction: async (id: string, body: components['schemas']['ScheduleActionRequest']) => unwrapApiResponse(await api.POST('/api/schedules/{id}/actions', {
-    params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body,
-  })),
-  scheduleRuns: async (id: string, cursor?: string) => unwrapApiResponse(await api.GET('/api/schedules/{id}/runs', { params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
   notifications: async (cursor?: string, unreadOnly = false) => unwrapApiResponse(await api.GET('/api/notifications', { params: { query: { limit: 100, unread_only: unreadOnly, ...(cursor ? { cursor } : {}) } } })),
   markNotificationRead: async (id: string) => unwrapApiResponse(await api.POST('/api/notifications/{id}/read', { params: { path: { id } } })),
-  executionControl: async () => unwrapApiResponse(await api.GET('/api/execution')),
-  stopAllExecution: async (expectedEpoch: number) => unwrapApiResponse(await api.POST('/api/execution/stop-all', {
-    params: { header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { expected_epoch: expectedEpoch },
-  })),
-  enableExecution: async (expectedEpoch: number) => unwrapApiResponse(await api.POST('/api/execution/enable', {
-    params: { header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { expected_epoch: expectedEpoch },
-  })),
   apiKeys: async () => unwrapApiResponse(await api.GET('/api/apikeys')),
   createApiKey: async (body: components['schemas']['CreateAPIKeyRequest']) => unwrapApiResponse(await api.POST('/api/apikeys', { body })),
   deleteApiKey: async (id: string) => unwrapApiResponse(await api.DELETE('/api/apikeys/{id}', { params: { path: { id } } })),
   modelConnections: async () => unwrapApiResponse(await api.GET('/api/model-connections')),
   createModelConnection: async (body: components['schemas']['CreateModelConnectionRequest']) => unwrapApiResponse(await api.POST('/api/model-connections', { body })),
-  checkModelConnection: async (id: string) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', { params: { path: { id } } })),
+  checkModelConnection: async (id: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } },
+  })),
   adminHosts: async () => unwrapApiResponse(await api.GET('/api/admin/hosts')),
+  adminHostResources: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/hosts/{id}/resources', { params: { path: { id } } })),
+  updateAdminHostResources: async (id: string, body: components['schemas']['UpdateAdminHostResourcesRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/hosts/{id}/resources', { params: { path: { id } }, body })),
   adminWorkspaces: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/admin/workspaces', {
     params: { query: { limit: 50, ...(cursor ? { cursor } : {}) } },
   })),
@@ -158,6 +134,12 @@ export const portalApi = {
     params: { query: status ? { status } : {} },
   })),
   updateUser: async (id: string, body: components['schemas']['UpdateUserRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/users/{id}', { params: { path: { id } }, body })),
+  adminUnknownModelUsage: async (ownerID: string) => unwrapApiResponse(await api.GET('/api/admin/model-usage/unknown', {
+    params: { query: { owner_id: ownerID, limit: 100 } },
+  })),
+  reconcileModelUsage: async (body: operations['reconcileUnknownModelUsage']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.POST('/api/admin/model-usage/reconcile', { body })),
+  adminModelAccountBudget: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/model-usage-budget', { params: { path: { id } } })),
+  setAdminModelAccountBudget: async (id: string, body: operations['setModelAccountBudget']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/admin/users/{id}/model-usage-budget', { params: { path: { id } }, body })),
   capacity: async () => unwrapApiResponse(await api.GET('/api/admin/capacity')),
   audit: async (params: URLSearchParams) => {
     const query: AuditQuery = {};
@@ -191,16 +173,10 @@ export function errorDetails(error: unknown): { code?: string; message: string; 
   return { code: value?.code, message: errorMessage(error), retryAfter };
 }
 
-export function enterHostInNewTab(id: string): Promise<void> {
-  const tab = window.open('about:blank', '_blank');
-  if (!tab) return Promise.reject(new Error('浏览器阻止了新窗口，请允许弹窗后重试。'));
+export function enterHostInNewTab(id: string, target?: 'desktop' | 'terminal'): void {
+  const destination = new URL(`/host-entry/${encodeURIComponent(id)}`, window.location.origin);
+  if (target) destination.searchParams.set('target', target);
+  const tab = window.open(destination.href, '_blank');
+  if (!tab) throw new Error('浏览器阻止了新窗口，请允许弹窗后重试。');
   tab.opener = null;
-  return portalApi.enterHost(id).then(({ url }) => {
-    const ticket = new URL(url);
-    if (ticket.pathname !== '/__ch/auth' || !ticket.searchParams.has('t')) throw new Error('服务器返回了无效的云端电脑入口');
-    tab.location.href = ticket.href;
-  }).catch((error: unknown) => {
-    tab.close();
-    throw error;
-  });
 }

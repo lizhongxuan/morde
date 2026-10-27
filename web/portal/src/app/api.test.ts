@@ -5,16 +5,24 @@ import { enterHostInNewTab, portalApi } from './api';
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-  it('opens the one-time Host entry without changing its destination', async () => {
-    const tab = { opener: null as Window | null, location: { href: '' }, close: vi.fn() };
-    vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
-    vi.spyOn(portalApi, 'enterHost').mockResolvedValue({ url: 'https://h1234567.hosts.test/__ch/auth?t=one-time', expires_at: '2026-10-25T00:01:00Z' });
+  it('opens a visible same-origin Host handoff page in a new tab', async () => {
+    const tab = { opener: window as Window | null };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    const enter = vi.spyOn(portalApi, 'enterHost');
     await enterHostInNewTab('h1234567');
-    const ticket = new URL(tab.location.href);
-    expect(ticket.searchParams.get('t')).toBe('one-time');
-    expect(ticket.pathname).toBe('/__ch/auth');
-    expect(ticket.searchParams.has('next')).toBe(false);
-    expect(tab.close).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/h1234567`, '_blank');
+    expect(tab.opener).toBeNull();
+    expect(enter).not.toHaveBeenCalled();
+  });
+
+  it('opens a shared terminal through the same-origin Host handoff page', () => {
+    const tab = { opener: window as Window | null };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    const ticket = vi.spyOn(portalApi, 'issueObservationTicket');
+    enterHostInNewTab('h1234567', 'terminal');
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/h1234567?target=terminal`, '_blank');
+    expect(tab.opener).toBeNull();
+    expect(ticket).not.toHaveBeenCalled();
   });
 
   it('sends schema-typed requests with request IDs and Cookie credentials', async () => {
@@ -30,14 +38,27 @@ describe('typed Portal API client', () => {
       }, { status: 201 });
     }));
 
-    expect((await portalApi.createHost({ template_id: 'std-2c4g', workspace_ids: [] }, 'host-create-key-001')).id).toBe('h1234567');
+    expect((await portalApi.createHost({ workspace_ids: [] }, 'host-create-key-001')).id).toBe('h1234567');
     const request = requests[0]!;
     expect([request.method, new URL(request.url).pathname]).toEqual(['POST', '/api/hosts']);
     expect(request.headers.get('X-Request-Id')).toBeTruthy();
     expect(request.headers.get('Content-Type')).toContain('application/json');
     expect(request.headers.get('Idempotency-Key')).toBe('host-create-key-001');
     expect(request.credentials).toBe('include');
-    expect(await request.json()).toEqual({ template_id: 'std-2c4g', workspace_ids: [] });
+    expect(await request.json()).toEqual({ workspace_ids: [] });
+  });
+
+  it('sends a stable idempotency key for a metered model connection check', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ text: true, tools: false, vision: false });
+    }));
+
+    await portalApi.checkModelConnection('p1234567', 'model-probe-key-001');
+
+    expect(new URL(request!.url).pathname).toBe('/api/model-connections/p1234567/check');
+    expect(request!.headers.get('Idempotency-Key')).toBe('model-probe-key-001');
   });
 
   it('requests owner-scoped Site and release pages with bounded cursors', async () => {
@@ -123,29 +144,9 @@ describe('typed Portal API client', () => {
       return Response.json({ id: 'h1234567' }, { status: 201 });
     }));
 
-    await expect(portalApi.createHost({ template_id: 'std-2c4g', workspace_ids: [] }, 'host-create-retry-001')).rejects.toThrow('主机已创建，但响应丢失');
-    await expect(portalApi.createHost({ template_id: 'std-2c4g', workspace_ids: [] }, 'host-create-retry-001')).resolves.toMatchObject({ id: 'h1234567' });
+    await expect(portalApi.createHost({ workspace_ids: [] }, 'host-create-retry-001')).rejects.toThrow('主机已创建，但响应丢失');
+    await expect(portalApi.createHost({ workspace_ids: [] }, 'host-create-retry-001')).resolves.toMatchObject({ id: 'h1234567' });
     expect(keys).toEqual(['host-create-retry-001', 'host-create-retry-001']);
-  });
-
-  it('attaches a supplied retry key or generates a key for task actions', async () => {
-    const requests: Request[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push(new Request(input, init));
-      return Response.json({ task_id: 'q1234567', action: 'pause', status: 'pausing', unsettled_operation_ids: [] }, { status: 202 });
-    }));
-
-    const body = { action: 'pause', expected_status: 'running' } as const;
-    await portalApi.taskAction('q1234567', body, 'task-action-retry-001');
-    await portalApi.taskAction('q1234567', body);
-
-    expect(requests[0]?.method).toBe('POST');
-    expect(new URL(requests[0]!.url).pathname).toBe('/api/tasks/q1234567/actions');
-    expect(requests[0]?.headers.get('Idempotency-Key')).toBe('task-action-retry-001');
-    const idempotencyKey = requests[1]?.headers.get('Idempotency-Key');
-    expect(typeof idempotencyKey).toBe('string');
-    expect(idempotencyKey as string).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    expect(await requests[0]!.json()).toEqual(body);
   });
 
   it('confirms possible process termination when releasing a host', async () => {
@@ -174,26 +175,20 @@ describe('typed Portal API client', () => {
     expect(await request!.json()).toEqual({ confirm_process_termination: false });
   });
 
-  it('uses caller-provided idempotency keys for task submission and conversation messages', async () => {
+  it('uses caller-provided and generated keys for instant chat', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(new Request(input, init));
       return Response.json({});
     }));
 
-    await portalApi.submitTask({ host_id: 'h1234567', model_id: 'model-a', objective: '检查项目' }, 'task-retry-key-001');
-    await portalApi.appendConversationMessage('c1234567', {
-      host_id: 'h1234567', model_id: 'model-a', content: '继续检查',
-    }, 'message-retry-key-001');
-    await portalApi.submitTask({ host_id: 'h1234567', model_id: 'model-a', objective: '默认任务键' });
-    await portalApi.appendConversationMessage('c1234567', {
-      host_id: 'h1234567', model_id: 'model-a', content: '默认消息键',
-    });
+    await portalApi.sendInstantChatMessage({ model_id: 'p1234567', content: '你好' }, 'chat-retry-key-001');
+    await portalApi.sendInstantChatMessage({ conversation_id: 'c1234567', model_id: 'p1234567', content: '继续' });
 
     const keys = requests.map((request) => request.headers.get('Idempotency-Key'));
-    expect(keys.slice(0, 2)).toEqual(['task-retry-key-001', 'message-retry-key-001']);
-    expect(keys[2]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    expect(keys[3]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
+    expect(keys[0]).toBe('chat-retry-key-001');
+    expect(keys[1]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual(['/api/instant-chat/messages', '/api/instant-chat/messages']);
   });
 
   it('creates a standalone workspace with an idempotency key and deletes hosts without legacy query flags', async () => {

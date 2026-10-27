@@ -68,8 +68,16 @@ type modelClientStub struct {
 	err          error
 }
 
-func (c *modelClientStub) Complete(context.Context, ModelRequest) (ModelResponse, error) {
-	return ModelResponse{}, errors.New("not used")
+func (c *modelClientStub) Complete(_ context.Context, request ModelRequest) (ModelResponse, error) {
+	c.endpoint = request.Endpoint
+	if c.err != nil {
+		return ModelResponse{}, c.err
+	}
+	if request.RequiredTool != "morde_capability_probe" || !c.capabilities.Text || !c.capabilities.Tools || !c.capabilities.Vision {
+		return ModelResponse{}, errors.New("probe is unavailable")
+	}
+	return ModelResponse{Text: "red", ToolCalls: []ModelToolCall{{CallID: "probe-1", Name: request.RequiredTool, Arguments: `{"color":"red"}`}},
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}, nil
 }
 
 func (c *modelClientStub) Check(_ context.Context, endpoint ModelEndpoint) (ModelCapabilities, error) {
@@ -90,11 +98,20 @@ func modelConnectionTestService(t *testing.T, store *modelConnectionStoreStub, c
 	return service
 }
 
+func checkModelForTest(t *testing.T, service *ModelConnectionService, client *modelClientStub, principal identity.Principal, id string) (ModelCapabilities, error) {
+	t.Helper()
+	gateway, err := NewModelGatewayService(&modelGatewayStoreTest{}, service, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gateway.CheckModel(context.Background(), principal, id, "probe-key-0001")
+}
+
 func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
 		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
 	})
@@ -112,7 +129,7 @@ func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
 	if err != nil || configured {
 		t.Fatalf("unverified model configured = %t, err=%v", configured, err)
 	}
-	capabilities, err := service.Check(context.Background(), principal, created.ID)
+	capabilities, err := checkModelForTest(t, service, client, principal, created.ID)
 	if err != nil || !capabilities.Text || !capabilities.Tools || !capabilities.Vision {
 		t.Fatalf("Check() = %+v, %v", capabilities, err)
 	}
@@ -133,17 +150,17 @@ func TestCheckedTextToolModelWithoutVisionCanRunNonVisualTasks(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: false}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
 		Name: "text and tools", BaseURL: "https://api.openai.com/v1", ModelName: "text-tool-model", APIKey: "secret-value",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	capabilities, err := service.Check(context.Background(), principal, created.ID)
-	if err != nil || !capabilities.Text || !capabilities.Tools || capabilities.Vision {
-		t.Fatalf("Check() = %+v, %v", capabilities, err)
-	}
+	checkedAt := time.Now().UTC()
+	stored := store.values[created.ID]
+	stored.Capabilities, stored.CheckedAt = client.capabilities, &checkedAt
+	store.values[created.ID] = stored
 	configured, err := service.IsConfiguredModel(context.Background(), principal.UserID, created.ID)
 	if err != nil || !configured {
 		t.Fatalf("no-vision model configured = %t, err=%v", configured, err)
@@ -192,7 +209,7 @@ func TestModelConnectionRejectsUnapprovedEndpointsAndResetsChecks(t *testing.T) 
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 	for _, endpoint := range []string{
 		"http://api.openai.com/v1", "https://evil.example/v1", "https://127.0.0.1/v1",
 		"https://user:pass@api.openai.com/v1", "https://api.openai.com/v1?token=secret", "https://api.openai.com:8443/v1",
@@ -210,7 +227,7 @@ func TestModelConnectionRejectsUnapprovedEndpointsAndResetsChecks(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Check(context.Background(), principal, created.ID); err != nil {
+	if _, err := checkModelForTest(t, service, client, principal, created.ID); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
@@ -237,17 +254,27 @@ func TestModelConnectionCheckClassifiesProviderErrorWithoutSecrets(t *testing.T)
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{err: &ModelClientError{Kind: ModelErrorAuthentication}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
 		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.Check(context.Background(), principal, created.ID)
+	_, err = checkModelForTest(t, service, client, principal, created.ID)
 	var appErr *domain.Error
 	if !errors.As(err, &appErr) || appErr.Code != domain.CodeUpstreamError || appErr.Details["reason"] != string(ModelErrorAuthentication) || strings.Contains(err.Error(), "secret-value") {
 		t.Fatalf("provider error = %#v", err)
+	}
+}
+
+func TestModelConnectionDirectCheckIsDisabledWithoutLedger(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelClientStub{}
+	service := modelConnectionTestService(t, store, client)
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	if _, err := service.Check(context.Background(), principal, "p1234567"); domain.CodeOf(err) != domain.CodeUnsupported || client.endpoint.APIKey != "" {
+		t.Fatalf("unmetered model check was allowed: %v", err)
 	}
 }
 

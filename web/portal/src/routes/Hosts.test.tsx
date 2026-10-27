@@ -3,12 +3,11 @@ import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError } from '../api/client';
 import { portalApi } from '../app/api';
 import { ToastProvider } from '../app/toast';
 import { Hosts } from './Hosts';
 
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567' } }) }));
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567', quota: { hosts: 2 } } }) }));
 
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 const pollingHostCases: [Host['state'], string][] = [
@@ -157,55 +156,27 @@ describe('Hosts', () => {
     expect(revoke).not.toHaveBeenCalled();
   });
 
-  it('opens a shared desktop using a same-origin one-time observation ticket', async () => {
+  it('opens a shared desktop through the same-origin handoff page', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: ownedHost.id, name: '共享电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:view'] }] });
-    const ticket = vi.spyOn(portalApi, 'issueObservationTicket').mockResolvedValue({ url: `${ownedHost.url}/__ch/auth?t=one-time`, expires_at: '2026-10-25T00:01:00Z' });
-    const replace = vi.fn();
-    const close = vi.fn();
-    const popup = { opener: window, location: { replace }, close } as unknown as Window;
+    const ticket = vi.spyOn(portalApi, 'issueObservationTicket');
+    const popup = { opener: window } as Window;
     const open = vi.spyOn(window, 'open').mockReturnValue(popup);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     await user.click(await screen.findByRole('button', { name: '查看桌面' }));
-    await waitFor(() => expect(ticket).toHaveBeenCalledWith(ownedHost.id, 'desktop'));
-    await waitFor(() => expect(replace).toHaveBeenCalledWith(`${ownedHost.url}/__ch/auth?t=one-time`));
-    expect(open).toHaveBeenCalledWith('about:blank', '_blank');
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${ownedHost.id}?target=desktop`, '_blank');
     expect(popup.opener).toBeNull();
-    expect(close).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    { code: 'not_found', status: 404 },
-    { code: 'forbidden', status: 403 },
-  ])('refreshes shared Hosts after a revoked member is denied an entry ticket ($code)', async ({ code, status }) => {
-    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
-    const sharedHosts = vi.spyOn(portalApi, 'sharedHosts')
-      .mockResolvedValueOnce({ items: [{ id: ownedHost.id, name: '共享电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:view'] }] })
-      .mockResolvedValueOnce({ items: [] });
-    vi.spyOn(portalApi, 'issueObservationTicket').mockRejectedValue(new ApiError({ message: '无法访问这台主机', code, status }));
-    const close = vi.fn();
-    vi.spyOn(window, 'open').mockReturnValue({ opener: window, location: { replace: vi.fn() }, close } as unknown as Window);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
-
-    await user.click(await screen.findByRole('button', { name: '查看桌面' }));
-
-    await waitFor(() => expect(sharedHosts).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText('还没有人与你共享云端电脑。')).toBeInTheDocument();
-    expect(screen.queryByText('共享电脑')).not.toBeInTheDocument();
-    expect(close).toHaveBeenCalledOnce();
+    expect(ticket).not.toHaveBeenCalled();
   });
 
   it('gives a terminal-only member a terminal entry without showing desktop access', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: ownedHost.id, name: '终端共享电脑', state: 'running', url: ownedHost.url, permissions: ['terminal:control'] }] });
-    const ticket = vi.spyOn(portalApi, 'issueObservationTicket').mockResolvedValue({ url: `${ownedHost.url}/__ch/auth?t=one-time&next=%2F__ch%2Fterminal%2F`, expires_at: '2026-10-25T00:01:00Z' });
-    const replace = vi.fn();
-    const open = vi.spyOn(window, 'open').mockReturnValue({ opener: window, location: { replace }, close: vi.fn() } as unknown as Window);
+    const ticket = vi.spyOn(portalApi, 'issueObservationTicket');
+    const open = vi.spyOn(window, 'open').mockReturnValue({ opener: window } as Window);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
@@ -213,25 +184,7 @@ describe('Hosts', () => {
     expect(await screen.findByRole('button', { name: '打开终端' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: '查看桌面' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '打开终端' }));
-    await waitFor(() => expect(ticket).toHaveBeenCalledWith(ownedHost.id, 'terminal'));
-    await waitFor(() => expect(replace).toHaveBeenCalledWith(`${ownedHost.url}/__ch/auth?t=one-time&next=%2F__ch%2Fterminal%2F`));
-    expect(open).toHaveBeenCalledWith('about:blank', '_blank');
-  });
-
-  it('rejects and closes a shared desktop ticket from a different origin', async () => {
-    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
-    vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: ownedHost.id, name: '共享电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:view'] }] });
-    vi.spyOn(portalApi, 'issueObservationTicket').mockResolvedValue({ url: 'https://attacker.example/__ch/auth?t=one-time', expires_at: '2026-10-25T00:01:00Z' });
-    const replace = vi.fn();
-    const close = vi.fn();
-    vi.spyOn(window, 'open').mockReturnValue({ opener: window, location: { replace }, close } as unknown as Window);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    const user = userEvent.setup();
-    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
-
-    await user.click(await screen.findByRole('button', { name: '查看桌面' }));
-    expect(await screen.findByText('共享桌面入口地址无效，已阻止打开。')).toBeInTheDocument();
-    expect(replace).not.toHaveBeenCalled();
-    expect(close).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${ownedHost.id}?target=terminal`, '_blank');
+    expect(ticket).not.toHaveBeenCalled();
   });
 });

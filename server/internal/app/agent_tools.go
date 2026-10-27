@@ -21,6 +21,10 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func validBoundedText(value string, maxRunes int) bool {
+	return utf8.ValidString(value) && strings.TrimSpace(value) != "" && utf8.RuneCountInString(value) <= maxRunes
+}
+
 type AgentHostFence struct {
 	RuntimeGeneration int64
 	RuntimeInstanceID string

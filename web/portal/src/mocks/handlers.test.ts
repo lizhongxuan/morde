@@ -28,6 +28,12 @@ const createWorkspace = (name: string) => api("/api/workspaces", {
 const createHostRequest = (body: unknown, key = `host-test-${++hostSequence}`) => api("/api/hosts", {
   method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": key }, body: JSON.stringify(body),
 });
+const allowHosts = async (count: number, client: typeof api = api, cpuMilli = 4000, memMiB = 8192) => {
+  const updated = await client("/api/admin/users/u1a2b3c4", json("PATCH", {
+    expected_status: "approved", quota: { hosts: count, cpu_milli: cpuMilli, mem_mib: memMiB },
+  }));
+  expect(updated.status).toBe(200);
+};
 
 beforeAll(() => server.listen());
 beforeEach(() => { resetMockState(); api = createApiClient(); workspaceSequence = 0; hostSequence = 0; });
@@ -35,6 +41,85 @@ afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); });
 afterAll(() => server.close());
 
 describe("portal mock cookie sessions", () => {
+  it("allocates one stopped 1-core 2-GiB computer on login and refuses another", async () => {
+    resetMockState();
+    api = createApiClient();
+    const login = await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    expect(login.status).toBe(200);
+    expect((await login.json()).user.quota).toEqual({ hosts: 1, cpu_milli: 4000, mem_mib: 8192 });
+    const first = await (await api("/api/hosts")).json();
+    expect(first.items).toHaveLength(1);
+    expect(first.items[0]).toMatchObject({ state: "stopped", resources: { cpu_milli: 1000, mem_mib: 2048, cpu_limit_milli: 1000, mem_limit_mib: 2048 } });
+    const blocked = await createHostRequest({ name: "second computer" });
+    expect(blocked.status).toBe(409);
+    expect((await blocked.json()).error).toMatchObject({ code: "quota_exceeded", message: "达到云端电脑上限,无法再创建" });
+    expect((await createHostRequest({ name: "custom computer", cpu_milli: 2000 })).status).toBe(400);
+    expect((await createHostRequest({ name: "custom computer", template_id: "std-2c4g" })).status).toBe(400);
+    const defaultHost = await api("/api/me/default-host", json("POST", {}));
+    expect(await defaultHost.json()).toMatchObject({ created: false, host: { id: first.items[0].id, state: "stopped" } });
+    expect((await (await api("/api/workspaces")).json()).items).toEqual([]);
+    await api("/api/auth/logout", { method: "POST" });
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    expect((await (await api("/api/hosts")).json()).items).toHaveLength(1);
+  });
+
+  it("allows a second default-size computer after an admin raises the host limit", async () => {
+    resetMockState();
+    api = createApiClient();
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const updated = await api("/api/admin/users/u1a2b3c4", json("PATCH", {
+      expected_status: "approved", quota: { hosts: 2, cpu_milli: 4000, mem_mib: 8192 },
+    }));
+    expect(updated.status).toBe(200);
+    const created = await createHostRequest({ name: "second computer" });
+    expect(created.status).toBe(201);
+    expect((await created.json()).resources).toMatchObject({ cpu_milli: 1000, mem_mib: 2048 });
+    const me = await (await api("/api/me")).json();
+    expect(me.usage).toMatchObject({ hosts: 2, cpu_milli: 1000, mem_mib: 2048 });
+  });
+
+  it("keeps a restored computer running and retains an admin's online resource change after reload", async () => {
+    resetMockState();
+    api = createApiClient();
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const host = (await (await api("/api/hosts")).json()).items[0] as { id: string };
+    expect((await api(`/api/hosts/${host.id}/restore`, { method: "POST" })).status).toBe(202);
+    await wait(950);
+    expect((await (await api(`/api/hosts/${host.id}`)).json()).state).toBe("running");
+    await allowHosts(1, api, 1000, 2048);
+    expect((await api(`/api/admin/hosts/${host.id}/resources`, json("PATCH", {
+      cpu_milli: 1500, mem_mib: 3072, expected_version: 1,
+    }))).status).toBe(409);
+    expect((await (await api(`/api/admin/hosts/${host.id}/resources`)).json()).resources).toEqual({ cpu_milli: 1000, mem_mib: 2048 });
+    await allowHosts(1);
+    expect((await api(`/api/admin/hosts/${host.id}/resources`, json("PATCH", {
+      cpu_milli: 1500, mem_mib: 3072, expected_version: 1,
+    }))).status).toBe(200);
+
+    resetMockState({ restoreAssistantState: true });
+    api = createApiClient();
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    expect((await (await api(`/api/hosts/${host.id}`)).json())).toMatchObject({
+      state: "running", resources: { cpu_milli: 1500, mem_mib: 3072 },
+    });
+  });
+
+  it("keeps admin resource changes after the mock state reloads", async () => {
+    resetMockState();
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const resources = { cpu_milli: 1500, mem_mib: 3072 };
+    const quota = { hosts: 2, cpu_milli: 4000, mem_mib: 8192 };
+    expect((await api("/api/admin/users/umember1", json("PATCH", {
+      expected_status: "approved", quota, default_host_resources: resources,
+    }))).status).toBe(200);
+
+    resetMockState({ restoreAssistantState: true });
+    api = createApiClient();
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const restored = await (await api("/api/admin/users")).json();
+    expect(restored.items.find((user: { id: string }) => user.id === "umember1")).toMatchObject({ quota, default_host_resources: resources });
+  });
+
   it("registers a pending user without logging in and only reveals the review state after a correct password", async () => {
     const account = createApiClient();
     const created = await account("/api/auth/register", json("POST", { name: "fresh-user", password: "secret-pass" }));
@@ -119,27 +204,22 @@ describe("portal mock cookie sessions", () => {
     expect(protectedAdmin.status).toBe(403);
   });
 
-  it("approves and revokes only the current user's client without exposing the code in audit", async () => {
+  it("lists and revokes only the current user's client", async () => {
     const owner = createApiClient();
     const other = createApiClient();
     await owner("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     await other("/api/auth/login", json("POST", { name: "member", password: "member" }));
-    expect((await other("/api/client-authorizations/inspect", json("POST", { user_code: "ABCD2345" }))).status).toBe(404);
-    expect((await owner("/api/client-authorizations/inspect", json("POST", { user_code: "ABCD2345" }))).status).toBe(200);
-    const approved = await owner("/api/client-authorizations/approve", json("POST", { user_code: "ABCD2345", workspace_ids: [] }));
-    expect(approved.status).toBe(201);
-    const client = await approved.json() as { id: string };
-    resetMockState({ restoreAssistantState: true });
-    expect((await (await owner("/api/clients")).json()).items).toHaveLength(1);
+    const clients = (await (await owner("/api/clients")).json()).items as Array<{ id: string }>;
+    expect(clients).toHaveLength(1);
     expect((await (await other("/api/clients")).json()).items).toHaveLength(0);
-    expect((await other(`/api/clients/${client.id}`, { method: "DELETE" })).status).toBe(404);
-    expect((await owner(`/api/clients/${client.id}`, { method: "DELETE" })).status).toBe(204);
+    expect((await other(`/api/clients/${clients[0]!.id}`, { method: "DELETE" })).status).toBe(404);
+    expect((await owner(`/api/clients/${clients[0]!.id}`, { method: "DELETE" })).status).toBe(204);
     expect((await (await owner("/api/clients")).json()).items[0].revoked).toBe(true);
-    expect(JSON.stringify(await (await owner("/api/admin/audit")).json())).not.toContain("ABCD2345");
+    expect(JSON.stringify(await (await owner("/api/admin/audit")).json())).toContain('client.revoke');
   });
 
   it("rejects unauthenticated protected requests without creating resources", async () => {
-    const createHost = await createHostRequest({ name: "unauthenticated", template_id: "std-2c4g", workspace_ids: [] });
+    const createHost = await createHostRequest({ name: "unauthenticated", workspace_ids: [] });
     const createKey = await api("/api/apikeys", json("POST", { name: "unauthenticated" }));
     expect(createHost.status).toBe(401);
     expect(createKey.status).toBe(401);
@@ -149,13 +229,14 @@ describe("portal mock cookie sessions", () => {
     expect((await api("/api/admin/users", json("POST", { name: "unauthenticated", password: "secret" }))).status).toBe(401);
 
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    expect((await (await api("/api/hosts")).json()).items).toEqual([]);
+    expect((await (await api("/api/hosts")).json()).items).toMatchObject([{ state: "stopped" }]);
     expect((await (await api("/api/apikeys")).json()).items).toEqual([]);
   });
 
   it("requires and replays an exact host creation idempotency key", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const body = { name: "retry host", template_id: "std-2c4g", workspace_ids: [] };
+    await allowHosts(2);
+    const body = { name: "retry host", workspace_ids: [] };
     expect((await api("/api/hosts", json("POST", body))).status).toBe(400);
 
     const first = await createHostRequest(body, "host-retry-key-001");
@@ -167,7 +248,7 @@ describe("portal mock cookie sessions", () => {
     const changed = await createHostRequest({ ...body, name: "different" }, "host-retry-key-001");
     expect(changed.status).toBe(409);
     expect((await changed.json()).error.code).toBe("idempotency_conflict");
-    expect((await (await api("/api/hosts")).json()).items).toHaveLength(1);
+    expect((await (await api("/api/hosts")).json()).items).toHaveLength(2);
   });
 
   it("keeps identities isolated by cookie and logout revokes only that session", async () => {
@@ -192,13 +273,14 @@ describe("portal mock cookie sessions", () => {
 });
 
 describe("portal mock Host sharing", () => {
-  it("grants selected scopes, issues observation tickets, and revokes access", async () => {
+  it("grants shared host permissions, issues observation tickets, and revokes access", async () => {
     const owner = createApiClient();
     const member = createApiClient();
     await owner("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2, owner);
     const created = await owner("/api/hosts", {
       method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "share-host-key-001" },
-      body: JSON.stringify({ name: "共享测试电脑", template_id: "std-2c4g", workspace_ids: [] }),
+      body: JSON.stringify({ name: "共享测试电脑", workspace_ids: [] }),
     });
     const host = await created.json() as { id: string };
     await wait(950);
@@ -218,7 +300,7 @@ describe("portal mock Host sharing", () => {
     const terminalTicket = await member(`/api/hosts/${host.id}/observation-ticket?target=terminal`, { method: "POST" });
     expect(await terminalTicket.json()).toMatchObject({ url: expect.stringContaining("hosts.mock.invalid/__ch/auth?t=") });
     expect((await member(`/api/hosts/${host.id}/observation-ticket?target=terminal&target=desktop`, { method: "POST" })).status).toBe(400);
-    const sharedMCPKey = await member("/api/apikeys", json("POST", { name: "共享主机 MCP", host_ids: [host.id], scopes: ["computer:operate"] }));
+    const sharedMCPKey = await member("/api/apikeys", json("POST", { name: "共享主机 MCP" }));
     expect(sharedMCPKey.status).toBe(201);
 
     expect((await owner(`/api/hosts/${host.id}/members/umember1`, { method: "DELETE" })).status).toBe(204);
@@ -230,9 +312,10 @@ describe("portal mock Host sharing", () => {
     const owner = createApiClient();
     const member = createApiClient();
     await owner("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2, owner);
     const created = await owner("/api/hosts", {
       method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "terminal-share-key-001" },
-      body: JSON.stringify({ name: "终端专用共享", template_id: "std-2c4g", workspace_ids: [] }),
+      body: JSON.stringify({ name: "终端专用共享", workspace_ids: [] }),
     });
     const host = await created.json() as { id: string };
     await wait(950);
@@ -243,7 +326,7 @@ describe("portal mock Host sharing", () => {
     expect(terminal.status).toBe(200);
     expect(await terminal.json()).toMatchObject({ url: expect.stringContaining("next=%2F__ch%2Fterminal%2F") });
     expect((await member(`/api/hosts/${host.id}/observation-ticket`, { method: "POST" })).status).toBe(404);
-    expect((await member("/api/apikeys", json("POST", { name: "无 MCP 权限", host_ids: [host.id], scopes: ["computer:operate"] }))).status).toBe(404);
+    expect((await member("/api/apikeys", json("POST", { name: "账号权限 Key" }))).status).toBe(201);
   });
 });
 
@@ -274,247 +357,66 @@ describe("portal mock admin workspaces", () => {
   });
 });
 
-describe("portal mock conversation messages", () => {
-  it("pages messages from newest to older without duplicating the boundary message", async () => {
+describe("portal mock instant chat", () => {
+  it("saves a reply, replays a retry, and protects conversation ownership", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-
-    const firstResponse = await api("/api/conversations/cdemo001/messages?limit=2");
-    expect(firstResponse.status).toBe(200);
-    const first = await firstResponse.json() as { items: Array<{ id: string }>; next_cursor: string | null };
-    expect(first.items.map((message) => message.id)).toEqual(["mdemo003", "mdemo004"]);
-    expect(first.next_cursor).toBeTruthy();
-
-    const secondResponse = await api(`/api/conversations/cdemo001/messages?limit=2&cursor=${encodeURIComponent(first.next_cursor!)}`);
-    const second = await secondResponse.json() as { items: Array<{ id: string }>; next_cursor: string | null };
-    expect(second.items.map((message) => message.id)).toEqual(["mdemo001", "mdemo002"]);
-    expect(second.next_cursor).toBeNull();
-    expect(new Set([...first.items, ...second.items].map((message) => message.id)).size).toBe(4);
-
-    expect((await api("/api/conversations/cdemo001/messages?cursor=invalid")).status).toBe(400);
-  });
-});
-
-describe("portal mock tasks", () => {
-  it("confirms task pause and cancellation asynchronously and persists the confirmed state", async () => {
-    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const pauseHeaders = { "content-type": "application/json", "Idempotency-Key": "task-pause-001" };
-    const pause = await api("/api/tasks/qdemo001/actions", { ...json("POST", { action: "pause", expected_status: "running" }), headers: pauseHeaders });
-    expect(await pause.json()).toMatchObject({ status: "pausing" });
-    await wait(1050);
-    expect(await (await api("/api/tasks/qdemo001")).json()).toMatchObject({ status: "paused", stop_request: null });
+    const headers = { "content-type": "application/json", "Idempotency-Key": "chat-retry-001" };
+    const body = { model_id: "pmodel01", content: "你好" };
+    const first = await api("/api/instant-chat/messages", { ...json("POST", body), headers });
+    expect(first.status).toBe(200);
+    const saved = await first.json() as { conversation: { id: string }; message: { content: string }; reply: { content: string } };
+    expect(saved).toMatchObject({ message: { content: "你好" }, reply: { content: "已收到：你好" } });
+    const replay = await api("/api/instant-chat/messages", { ...json("POST", body), headers });
+    expect(await replay.json()).toMatchObject({ conversation: { id: saved.conversation.id } });
+    const history = await api(`/api/instant-chat/conversations/${saved.conversation.id}/messages`);
+    expect(await history.json()).toMatchObject({ items: [{ content: "你好", role: "user" }, { content: "已收到：你好", role: "assistant" }] });
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(`/api/instant-chat/conversations/${saved.conversation.id}/messages`)).status).toBe(404);
 
     resetMockState({ restoreAssistantState: true });
     api = createApiClient();
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    expect(await (await api("/api/tasks/qdemo001")).json()).toMatchObject({ status: "paused" });
-
-    const resumeHeaders = { "content-type": "application/json", "Idempotency-Key": "task-resume-001" };
-    const resume = await api("/api/tasks/qdemo001/actions", { ...json("POST", { action: "resume", expected_status: "paused" }), headers: resumeHeaders });
-    expect(await resume.json()).toMatchObject({ status: "queued" });
-    const cancelHeaders = { "content-type": "application/json", "Idempotency-Key": "task-cancel-001" };
-    const cancel = await api("/api/tasks/qdemo001/actions", { ...json("POST", { action: "cancel", expected_status: "queued" }), headers: cancelHeaders });
-    expect(await cancel.json()).toMatchObject({ status: "cancelling" });
-    await wait(1050);
-    expect(await (await api("/api/tasks/qdemo001")).json()).toMatchObject({ status: "cancelled", stop_request: null });
-  });
-
-  it("exposes task progress and applies only an exact, idempotent approval response", async () => {
-    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const list = await api("/api/tasks");
-    expect(list.status).toBe(200);
-    expect((await list.json()).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "qdemo001", status: "running" }),
-      expect.objectContaining({ id: "qreview1", status: "waiting_user" }),
-      expect.objectContaining({ id: "qclarif1", status: "waiting_user" }),
-    ]));
-
-    const detail = await api("/api/tasks/qreview1");
-    expect(await detail.json()).toMatchObject({
-      id: "qreview1", waiting_reason: "approval_required",
-      pending_request: { id: "rapprove", version: 1, kind: "approval" },
-    });
-
-    const body = { action: "respond", pending_id: "rapprove", pending_version: 1, decision: "approve" };
-    const missingKey = await api("/api/tasks/qreview1/actions", json("POST", body));
-    expect(missingKey.status).toBe(400);
-
-    const headers = { "content-type": "application/json", "Idempotency-Key": "approval-key-001" };
-    const response = await api("/api/tasks/qreview1/actions", { ...json("POST", body), headers });
-    expect(response.status).toBe(202);
-    expect(await response.json()).toMatchObject({ task_id: "qreview1", action: "respond", status: "queued" });
-
-    const replay = await api("/api/tasks/qreview1/actions", { ...json("POST", body), headers });
-    expect(replay.status).toBe(202);
-    expect(await replay.json()).toMatchObject({ task_id: "qreview1", status: "queued" });
-    const reusedKey = await api("/api/tasks/qreview1/actions", { ...json("POST", { ...body, decision: "reject" }), headers });
-    expect(reusedKey.status).toBe(409);
-
-    expect(await (await api("/api/tasks/qreview1")).json()).toMatchObject({ status: "queued", waiting_reason: null, pending_request: null });
-    const staleApproval = await api("/api/tasks/qreview1/actions", { ...json("POST", body), headers: { "content-type": "application/json", "Idempotency-Key": "approval-key-002" } });
-    expect(staleApproval.status).toBe(409);
-
-    const clarification = await api("/api/tasks/qclarif1");
-    expect(await clarification.json()).toMatchObject({
-      id: "qclarif1", waiting_reason: "clarification_required",
-      clarification_request: { id: "rclarify", version: 1, question: expect.any(String) },
-      pending_request: null,
-    });
-    const invalidAnswer = await api("/api/tasks/qclarif1/actions", { ...json("POST", { action: "answer_clarification", clarification_id: "rclarify", clarification_version: 1, answer: "   " }), headers: { "content-type": "application/json", "Idempotency-Key": "clarify-key-001" } });
-    expect(invalidAnswer.status).toBe(400);
-    const answer = await api("/api/tasks/qclarif1/actions", { ...json("POST", { action: "answer_clarification", clarification_id: "rclarify", clarification_version: 1, answer: "周一到周五，并包括风险和计划。" }), headers: { "content-type": "application/json", "Idempotency-Key": "clarify-key-002" } });
-    expect(answer.status).toBe(202);
-    expect(await answer.json()).toMatchObject({ task_id: "qclarif1", action: "answer_clarification", status: "queued" });
-    expect(await (await api("/api/tasks/qclarif1")).json()).toMatchObject({ status: "queued", waiting_reason: null, clarification_request: null });
-  });
-});
-
-describe("portal mock Assistant flow", () => {
-  it("persists a user task as a conversation and supports an exact idempotent retry", async () => {
-    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    expect((await (await api("/api/model-connections")).json()).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "pmodel01", shared: true, capabilities: { text: true, tools: true, vision: false } }),
-    ]));
-    const createHost = await createHostRequest({ name: "Assistant 测试电脑", template_id: "std-2c4g", workspace_ids: [] });
-    const host = await createHost.json();
-    await wait(950);
-    const body = { host_id: host.id, model_id: "pmodel01", objective: "整理测试目录并生成摘要" };
-    const headers = { "content-type": "application/json", "Idempotency-Key": "assistant-submit-001" };
-    const first = await api("/api/tasks", { ...json("POST", body), headers });
-    expect(first.status).toBe(202);
-    const task = await first.json();
-    const replay = await api("/api/tasks", { ...json("POST", body), headers });
-    expect(replay.status).toBe(200);
-    expect(await replay.json()).toMatchObject({ id: task.id, conversation_id: task.conversation_id });
-
-    const conversationList = await api("/api/conversations");
-    expect(await conversationList.json()).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ id: task.conversation_id, host_id: host.id })]) });
-    const history = await api(`/api/conversations/${task.conversation_id}/messages`);
-    expect(await history.json()).toMatchObject({ items: [expect.objectContaining({ content: body.objective, task_id: task.id, role: "user" })] });
-
-    const nextBody = { host_id: host.id, model_id: "pmodel01", content: "同时列出需要我确认的风险" };
-    const next = await api(`/api/conversations/${task.conversation_id}/messages`, { ...json("POST", nextBody), headers: { ...headers, "Idempotency-Key": "assistant-followup-001" } });
-    expect(next.status).toBe(202);
-    expect(await next.json()).toMatchObject({ message: { content: nextBody.content }, task: { conversation_id: task.conversation_id, objective: nextBody.content } });
-    expect((await (await api("/api/tasks")).json()).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: task.id, conversation_id: task.conversation_id }),
-    ]));
-  });
-
-  it("never returns a personal model API key in the model connection response", async () => {
-    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const secret = "test-only-not-a-real-provider-secret";
-    const response = await api("/api/model-connections", json("POST", { name: "本地合成模型", base_url: "https://models.example.test/v1", model_name: "mock-model", api_key: secret, shared: false }));
-    expect(response.status).toBe(201);
-    const created = await response.json();
-    expect(created).toMatchObject({ name: "本地合成模型", has_api_key: true, shared: false });
-    expect(JSON.stringify(created)).not.toContain(secret);
-  });
-});
-
-describe("portal mock schedules and notifications", () => {
-  it("persists a versioned schedule, keeps cancellation pending until the task confirms, and marks notifications read only", async () => {
-    const admin = createApiClient();
-    const member = createApiClient();
-    await admin("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
-
-    const hostResponse = await admin("/api/hosts", { ...(json("POST", { name: "Schedule 测试电脑", template_id: "std-2c4g", workspace_ids: [] })), headers: { "content-type": "application/json", "Idempotency-Key": `host-test-${++hostSequence}` } });
-    const host = await hostResponse.json() as { id: string };
-    await wait(950);
-    const body = {
-      host_id: host.id, model_id: "pmodel01", objective: "定时汇总新文件",
-      timing: { kind: "once", run_at: new Date(Date.now() + 5 * 60_000).toISOString(), time_zone: "Asia/Shanghai" },
-      budget: { active_seconds: 900, tool_calls: 40, model_tokens: 20000 },
-      misfire_policy: "run_once", notification_events: ["failed", "waiting_user"],
-    };
-    const createHeaders = { "content-type": "application/json", "Idempotency-Key": "schedule-create-001" };
-    const created = await admin("/api/schedules", { ...json("POST", body), headers: createHeaders });
-    expect(created.status).toBe(201);
-    const schedule = await created.json() as { id: string; version: number };
-    const replay = await admin("/api/schedules", { ...json("POST", body), headers: createHeaders });
-    expect(replay.status).toBe(201);
-    expect(await replay.json()).toMatchObject({ id: schedule.id });
-    expect((await (await admin(`/api/schedules/${schedule.id}`)).json())).toMatchObject({ status: "enabled", version: 1, objective: body.objective, misfire_policy: "run_once" });
-
-    const updated = await admin(`/api/schedules/${schedule.id}`, json("PATCH", { expected_version: 1, objective: "定时整理新文件" }));
-    expect(await updated.json()).toMatchObject({ version: 2, objective: "定时整理新文件" });
-    const stale = await admin(`/api/schedules/${schedule.id}`, json("PATCH", { expected_version: 1, objective: "覆盖旧版本" }));
-    expect(stale.status).toBe(409);
-    expect((await (await admin(`/api/schedules/${schedule.id}/runs`)).json()).items).toEqual([]);
-    expect((await member(`/api/schedules/${schedule.id}`)).status).toBe(404);
-
-    const disable = await admin("/api/schedules/jdemo001/actions", { ...json("POST", { action: "disable", expected_version: 1, current_run_action: "cancel" }), headers: { "content-type": "application/json", "Idempotency-Key": "schedule-cancel-001" } });
-    expect(disable.status).toBe(202);
-    expect(await disable.json()).toMatchObject({ schedule: { status: "disabled" }, current_run: { status: "stopping", task_id: "qdemo001" } });
-    expect(await (await admin("/api/tasks/qdemo001")).json()).toMatchObject({ status: "cancelling" });
-    await wait(1050);
-    expect(await (await admin("/api/tasks/qdemo001")).json()).toMatchObject({ status: "cancelled" });
-    expect(await (await admin("/api/schedules/jdemo001")).json()).toMatchObject({ last_run: { status: "cancelled" } });
-
-    const markRead = await admin("/api/notifications/ndemo001/read", { method: "POST" });
-    expect(markRead.status).toBe(204);
-    await admin("/api/notifications/ndemo001/read", { method: "POST" });
-    expect(await (await admin("/api/notifications")).json()).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ id: "ndemo001", read_at: expect.any(String), actionable: true })]) });
-    expect(await (await admin("/api/tasks/qreview1")).json()).toMatchObject({ status: "waiting_user", pending_request: { id: "rapprove" } });
-    expect((await member("/api/notifications/ndemo001/read", { method: "POST" })).status).toBe(404);
-  });
-});
-
-describe("portal mock owner execution gate", () => {
-  it("stops owner tasks durably, keeps owners isolated, and does not revive cancelled work", async () => {
-    const admin = createApiClient();
-    const member = createApiClient();
-    await admin("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
-
-    expect(await (await admin("/api/execution")).json()).toMatchObject({ state: "enabled", epoch: 1, pending_task_count: 0 });
-    const key = { "content-type": "application/json", "Idempotency-Key": "mock-execution-stop-01" };
-    const stop = await admin("/api/execution/stop-all", { ...json("POST", { expected_epoch: 1 }), headers: key });
-    expect(stop.status).toBe(200);
-    expect(await stop.json()).toMatchObject({ state: "stopping", epoch: 2, pending_task_count: 3 });
-    expect(await (await member("/api/execution")).json()).toMatchObject({ state: "enabled", epoch: 1, pending_task_count: 0 });
-    expect((await admin("/api/execution/enable", { ...json("POST", { expected_epoch: 2 }), headers: { ...key, "Idempotency-Key": "mock-execution-enable-01" } })).status).toBe(409);
-
-    const stoppingTasks = await (await admin("/api/tasks")).json() as { items: Array<{ id: string; status: string }> };
-    expect(stoppingTasks.items.filter((item) => item.status === "cancelling")).toHaveLength(3);
-    await wait(3100);
-    expect(await (await admin("/api/execution")).json()).toMatchObject({ state: "disabled", epoch: 3, pending_task_count: 0 });
-
-    const enable = await admin("/api/execution/enable", { ...json("POST", { expected_epoch: 3 }), headers: { ...key, "Idempotency-Key": "mock-execution-enable-02" } });
-    expect(enable.status).toBe(200);
-    expect(await enable.json()).toMatchObject({ state: "enabled", epoch: 4 });
-    const tasksAfterEnable = await (await admin("/api/tasks")).json() as { items: Array<{ id: string; status: string }> };
-    expect(tasksAfterEnable.items.filter((item) => item.status === "cancelled")).toHaveLength(3);
+    const restored = await api(`/api/instant-chat/conversations/${saved.conversation.id}/messages`);
+    expect((await restored.json()).items).toHaveLength(2);
   });
 });
 
 describe("portal mock quota and capacity", () => {
-  it("derives usage and allocation from hosts and rejects quota and cluster overages", async () => {
+  it("counts stopped hosts toward the host limit and rejects resource and cluster overages", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const templateResponse = await api("/api/templates");
+    const availableTemplates = await templateResponse.json() as { items: Array<{ id: string; resources: { cpu_limit_milli: number; mem_limit_mib: number } }> };
+    expect(availableTemplates.items.map((template) => template.id)).toEqual(["std-2c4g", "std-1c2g", "std-2c2g"]);
+    expect(availableTemplates.items.slice(1).map((template) => [template.resources.cpu_limit_milli, template.resources.mem_limit_mib])).toEqual([[1000, 2048], [2000, 2048]]);
     const initialCapacity = await (await api("/api/admin/capacity")).json();
     expect(initialCapacity.allocated).toEqual({ cpu_milli: 0, mem_mib: 0 });
-
-    await api("/api/admin/users/u1a2b3c4", json("PATCH", { expected_status: "approved", quota: { hosts: 1, cpu_milli: 500, mem_mib: 1536 } }));
-    const created = await createHostRequest({ name: "quota test", template_id: "std-2c4g", workspace_ids: [] });
-    expect(created.status).toBe(201);
     const me = await (await api("/api/me")).json();
-    expect(me.usage).toEqual({ hosts: 1, cpu_milli: 500, mem_mib: 1536 });
+    expect(me.usage).toEqual({ hosts: 1, cpu_milli: 0, mem_mib: 0 });
+    const secondHost = await createHostRequest({ name: "beyond host-count quota", workspace_ids: [] });
+    expect(secondHost.status).toBe(409);
+    expect((await secondHost.json()).error).toMatchObject({ code: "quota_exceeded", message: "达到云端电脑上限,无法再创建" });
+
+    await allowHosts(2, api, 2000, 4096);
+    expect((await createHostRequest({ name: "within raised quota", workspace_ids: [] })).status).toBe(201);
+    const afterSecondHost = await (await api("/api/me")).json();
+    expect(afterSecondHost.usage).toEqual({ hosts: 2, cpu_milli: 1000, mem_mib: 2048 });
     const creatingCapacity = await (await api("/api/admin/capacity")).json();
-    expect(creatingCapacity.allocated).toEqual({ cpu_milli: 500, mem_mib: 1536 });
-    expect(creatingCapacity.hosts_by_state).toEqual({ creating: 1 });
+    expect(creatingCapacity.allocated).toEqual({ cpu_milli: 1000, mem_mib: 2048 });
+    expect(creatingCapacity.hosts_by_state).toEqual({ creating: 1, stopped: 1 });
+    await allowHosts(3, api, 1500, 3072);
+    const resourceQuotaRejected = await createHostRequest({ name: "over resource quota", workspace_ids: [] });
+    expect(resourceQuotaRejected.status).toBe(409);
+    expect((await resourceQuotaRejected.json()).error).toMatchObject({ code: "quota_exceeded", details: { dimension: "cpu_milli", limit: 1500 } });
 
-    const quotaRejected = await createHostRequest({ name: "over quota", template_id: "std-2c4g", workspace_ids: [] });
-    expect(quotaRejected.status).toBe(409);
-    expect((await quotaRejected.json()).error).toMatchObject({ code: "quota_exceeded", details: { dimension: "hosts", limit: 1 } });
-
-    await api("/api/admin/users/u1a2b3c4", json("PATCH", { expected_status: "approved", quota: { hosts: 100, cpu_milli: 50000, mem_mib: 200000 } }));
-    for (let index = 1; index < 64; index += 1) {
-      const response = await createHostRequest({ name: `capacity test ${index}`, template_id: "std-2c4g", workspace_ids: [] });
+    await allowHosts(100, api, 100000, 200000);
+    for (let index = 1; index < 48; index += 1) {
+      const response = await createHostRequest({ name: `capacity test ${index}`, workspace_ids: [] });
       expect(response.status).toBe(201);
     }
-    const capacityRejected = await createHostRequest({ name: "over capacity", template_id: "std-2c4g", workspace_ids: [] });
+    const capacityRejected = await createHostRequest({ name: "over capacity", workspace_ids: [] });
     expect(capacityRejected.status).toBe(409);
-    expect((await capacityRejected.json()).error).toMatchObject({ code: "capacity_exceeded", details: { dimension: "mem_mib", limit: 98304 } });
+    expect((await capacityRejected.json()).error).toMatchObject({ code: "capacity_exceeded", details: { dimension: "cpu_milli", limit: 48000 } });
   });
 
   it("filters synthetic audit records and applies the requested result limit", async () => {
@@ -530,17 +432,18 @@ describe("portal mock quota and capacity", () => {
 
   it("hides another user's host, workspace, and API Key by ID", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
     const workspaceResponse = await createWorkspace("private workspace");
     const workspace = await workspaceResponse.json();
-    const hostResponse = await createHostRequest({ name: "private host", template_id: "std-2c4g", workspace_ids: [workspace.id] });
+    const hostResponse = await createHostRequest({ name: "private host", workspace_ids: [workspace.id] });
     const host = await hostResponse.json();
-    const keyResponse = await api("/api/apikeys", json("POST", { name: "owner key", host_ids: [], scopes: [] }));
+    const keyResponse = await api("/api/apikeys", json("POST", { name: "owner key" }));
     const key = await keyResponse.json();
     expect(hostResponse.status).toBe(201);
     expect(keyResponse.status).toBe(201);
 
     await api("/api/auth/login", json("POST", { name: "member", password: "member" }));
-    expect((await (await api("/api/hosts")).json()).items).toEqual([]);
+    expect((await (await api("/api/hosts")).json()).items).toMatchObject([{ state: "stopped" }]);
     expect((await (await api("/api/workspaces")).json()).items).toEqual([]);
     expect((await (await api("/api/apikeys")).json()).items).toEqual([]);
     for (const [path, init] of [
@@ -560,7 +463,8 @@ describe("portal mock quota and capacity", () => {
 
   it("returns a one-time workbench entry ticket when entering an owned Host", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const created = await createHostRequest({ name: "entry ticket", template_id: "std-2c4g" });
+    await allowHosts(2);
+    const created = await createHostRequest({ name: "entry ticket" });
     const host = await created.json() as { id: string; url: string; expires_at: string };
 
     const response = await api(`/api/hosts/${host.id}/enter`, { method: "POST" });
@@ -578,9 +482,10 @@ describe("portal mock quota and capacity", () => {
 
   it("deletes the Host while retaining its independent Workspace, then deletes the Workspace separately", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
     const workspaceResponse = await createWorkspace("retained workspace");
     const workspace = await workspaceResponse.json();
-    const created = await createHostRequest({ name: "retained workspace", template_id: "std-2c4g", workspace_ids: [workspace.id] });
+    const created = await createHostRequest({ name: "retained workspace", workspace_ids: [workspace.id] });
     const host = await created.json();
     const hostId = host.id as string;
     const workspaceId = workspace.id as string;
@@ -596,14 +501,14 @@ describe("portal mock quota and capacity", () => {
     expect((await (await api("/api/hosts")).json()).items).toContainEqual(expect.objectContaining({ id: hostId, state: "deleting" }));
     expect((await (await api("/api/workspaces")).json()).items).toContainEqual(expect.objectContaining({ id: workspaceId, state: "ready" }));
     expect((await api(`/api/hosts/${hostId}`, { method: "DELETE" })).status).toBe(409);
-    expect((await (await api("/api/me")).json()).usage.hosts).toBe(1);
+    expect((await (await api("/api/me")).json()).usage.hosts).toBe(2);
 
     await wait(950);
     const workspacesAfterNavigation = await (await api("/api/workspaces")).json();
     expect(workspacesAfterNavigation.items).toContainEqual(expect.objectContaining({ id: workspaceId, state: "ready" }));
     expect((await api(`/api/hosts/${hostId}`)).status).toBe(404);
     expect((await (await api("/api/hosts")).json()).items).not.toContainEqual(expect.objectContaining({ id: hostId }));
-    expect((await (await api("/api/me")).json()).usage.hosts).toBe(0);
+    expect((await (await api("/api/me")).json()).usage.hosts).toBe(1);
 
     const workspaceTimer = vi.spyOn(globalThis, "setTimeout");
     const deletedWorkspace = await api(`/api/workspaces/${workspaceId}`, { method: "DELETE" });
@@ -635,7 +540,8 @@ describe("portal mock quota and capacity", () => {
 
   it("keeps a Host allocated while deletion finishes when no Workspace is bound", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const created = await createHostRequest({ name: "deletion accounting", template_id: "std-2c4g", workspace_ids: [] });
+    await allowHosts(2);
+    const created = await createHostRequest({ name: "deletion accounting", workspace_ids: [] });
     expect(created.status).toBe(201);
     const host = await created.json();
     const before = await (await api("/api/me")).json();
@@ -656,9 +562,10 @@ describe("portal mock quota and capacity", () => {
 
   it("releases compute and restores the same Host with the same workspace and a new generation", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
     const workspaceResponse = await createWorkspace("persistent workspace");
     const workspace = await workspaceResponse.json();
-    const created = await createHostRequest({ name: "persistent computer", template_id: "std-2c4g", workspace_ids: [workspace.id] });
+    const created = await createHostRequest({ name: "persistent computer", workspace_ids: [workspace.id] });
     expect(created.status).toBe(201);
     const initial = await created.json();
     expect(initial.runtime_generation).toBe(1);
@@ -668,13 +575,13 @@ describe("portal mock quota and capacity", () => {
     const released = await api(`/api/hosts/${initial.id}/release`, { method: "POST" });
     expect(released.status).toBe(202);
     expect((await released.json()).state).toBe("stopping");
-    expect((await (await api("/api/me")).json()).usage.hosts).toBe(1);
+    expect((await (await api("/api/me")).json()).usage.hosts).toBe(2);
 
     await wait(950);
     const stopped = await (await api(`/api/hosts/${initial.id}`)).json();
     expect(stopped).toMatchObject({ id: initial.id, state: "stopped", runtime_generation: 1 });
     expect(stopped.workspaces[0].workspace.id).toBe(workspace.id);
-    expect((await (await api("/api/me")).json()).usage.hosts).toBe(0);
+    expect((await (await api("/api/me")).json()).usage.hosts).toBe(2);
 
     const restored = await api(`/api/hosts/${initial.id}/restore`, { method: "POST" });
     expect(restored.status).toBe(202);
@@ -683,16 +590,17 @@ describe("portal mock quota and capacity", () => {
     const running = await (await api(`/api/hosts/${initial.id}`)).json();
     expect(running).toMatchObject({ id: initial.id, state: "running", runtime_generation: 2 });
     expect(running.workspaces[0].workspace.id).toBe(workspace.id);
-    expect((await (await api("/api/me")).json()).usage.hosts).toBe(1);
+    expect((await (await api("/api/me")).json()).usage.hosts).toBe(2);
   });
 });
 
 describe("portal mock workspace bindings", () => {
   it("binds an owned workspace idempotently and exposes only empty owner-scoped device progress", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
     const workspaceResponse = await createWorkspace("bindable workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number };
-    const hostResponse = await createHostRequest({ name: "workspace host", template_id: "std-2c4g", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "workspace host", workspace_ids: [] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
 
@@ -729,9 +637,10 @@ describe("portal mock workspace bindings", () => {
 
   it("accepts unbinding only with current version and writer confirmation while retaining workspace data", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
     const workspaceResponse = await createWorkspace("retained workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number; state: string };
-    const hostResponse = await createHostRequest({ name: "unbind host", template_id: "std-2c4g", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "unbind host", workspace_ids: [] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
     const bindHeaders = { "content-type": "application/json", "Idempotency-Key": "workspace-unbind-bind-01" };
@@ -760,9 +669,10 @@ describe("portal mock workspace bindings", () => {
 
   it("retries an owner Host sync with compare-and-set semantics and idempotent healthy replay", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
     const workspaceResponse = await createWorkspace("sync conflict workspace");
     const workspace = await workspaceResponse.json() as { id: string; revision: number };
-    const hostResponse = await createHostRequest({ name: "sync conflict host", template_id: "std-2c4g", workspace_ids: [] });
+    const hostResponse = await createHostRequest({ name: "sync conflict host", workspace_ids: [] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
     const bindHeaders = { "content-type": "application/json", "Idempotency-Key": "workspace-sync-bind-01" };

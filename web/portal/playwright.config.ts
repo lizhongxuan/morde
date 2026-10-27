@@ -27,7 +27,7 @@ export default defineConfig({
         {
           command: "npm run dev -- --port 5183",
           url: portalE2eUrl,
-          env: { VITE_MOCK_API: "1", VITE_WORKBENCH_URL: workbenchE2eUrl },
+          env: { VITE_MOCK_API: "1", VITE_WORKBENCH_URL: "https://workbench.mock.invalid" },
           reuseExistingServer: false,
           timeout: 60_000,
         },

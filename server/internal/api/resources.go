@@ -59,21 +59,17 @@ type tokenListResponse struct {
 }
 
 type tokenResponse struct {
-	ID         string           `json:"id"`
-	Name       string           `json:"name"`
-	HostIDs    []string         `json:"host_ids"`
-	Scopes     []identity.Scope `json:"scopes"`
-	ExpiresAt  time.Time        `json:"expires_at"`
-	LastUsedAt *time.Time       `json:"last_used_at"`
-	Revoked    bool             `json:"revoked"`
-	CreatedAt  time.Time        `json:"created_at"`
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	Revoked    bool       `json:"revoked"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type createAPIKeyRequest struct {
-	Name       string           `json:"name"`
-	TTLSeconds *int64           `json:"ttl_seconds"`
-	HostIDs    []string         `json:"host_ids"`
-	Scopes     []identity.Scope `json:"scopes"`
+	Name       string `json:"name"`
+	TTLSeconds *int64 `json:"ttl_seconds"`
 }
 
 func (h *api) registerResources(group *gin.RouterGroup) {
@@ -279,22 +275,8 @@ func toTokenList(items []identity.Token, kind identity.Kind) (tokenListResponse,
 		if !domain.ValidTokenID(item.ID) || item.Kind != kind || (kind == identity.KindAPIKey && item.HostID != "") {
 			return tokenListResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
-		hostIDs := make([]string, 0, len(item.HostIDs))
-		for _, hostID := range item.HostIDs {
-			if !domain.ValidHostID(hostID) {
-				return tokenListResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-			}
-			hostIDs = append(hostIDs, hostID)
-		}
-		scopes := make([]identity.Scope, 0, len(item.Scopes))
-		for _, scope := range item.Scopes {
-			if !identity.ValidScope(scope) {
-				return tokenListResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-			}
-			scopes = append(scopes, scope)
-		}
 		response.Items = append(response.Items, tokenResponse{
-			ID: item.ID, Name: item.Name, HostIDs: hostIDs, Scopes: scopes,
+			ID: item.ID, Name: item.Name,
 			ExpiresAt: item.ExpiresAt, LastUsedAt: item.LastUsedAt, Revoked: item.RevokedAt != nil,
 			CreatedAt: item.CreatedAt,
 		})
@@ -309,15 +291,11 @@ func (h *api) createAPIKey(c *gin.Context) {
 		return
 	}
 	var request createAPIKeyRequest
-	if !decodeJSON(c, &request) {
+	if !decodeStrictJSON(c, &request) {
 		return
 	}
 	if strings.TrimSpace(request.Name) == "" {
 		writeError(c, domain.InvalidArgument("name", "name is required"))
-		return
-	}
-	if request.HostIDs == nil || request.Scopes == nil {
-		writeError(c, domain.InvalidArgument("host_ids", "host_ids and scopes must be explicit arrays"))
 		return
 	}
 	var ttl time.Duration
@@ -328,7 +306,7 @@ func (h *api) createAPIKey(c *gin.Context) {
 		}
 		ttl = time.Duration(*request.TTLSeconds) * time.Second
 	}
-	created, err := h.deps.Tokens.CreateAPIKey(c.Request.Context(), principal, request.Name, request.HostIDs, request.Scopes, ttl)
+	created, err := h.deps.Tokens.CreateAPIKey(c.Request.Context(), principal, request.Name, ttl)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -339,12 +317,10 @@ func (h *api) createAPIKey(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, struct {
-		ID        string           `json:"id"`
-		Key       string           `json:"key"`
-		HostIDs   []string         `json:"host_ids"`
-		Scopes    []identity.Scope `json:"scopes"`
-		ExpiresAt time.Time        `json:"expires_at"`
-	}{ID: created.ID, Key: created.Key, HostIDs: created.HostIDs, Scopes: created.Scopes, ExpiresAt: created.ExpiresAt})
+		ID        string    `json:"id"`
+		Key       string    `json:"key"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}{ID: created.ID, Key: created.Key, ExpiresAt: created.ExpiresAt})
 }
 
 func (h *api) deleteAPIKey(c *gin.Context) {

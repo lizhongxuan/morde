@@ -1,14 +1,14 @@
-import { useMemo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError } from '../api/client';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
-import { formatBytes, formatCpu, formatDuration, formatMemory } from '../app/format';
+import { formatBytes } from '../app/format';
 import { useToast } from '../app/toast';
 
-type HostCreateInput = { template_id: string; name?: string; workspace_mode: 'new' | 'existing'; workspace_ids: string[] };
+type HostCreateInput = { name?: string; workspace_mode: 'new' | 'existing'; workspace_ids: string[] };
 type PendingHostCreate = {
   version: 1;
   fingerprint: string;
@@ -28,7 +28,6 @@ function isPendingHostCreate(value: unknown): value is PendingHostCreate {
   const input = pending.input;
   const validKey = (key: unknown) => typeof key === 'string' && /^[A-Za-z0-9._~-]{8,128}$/.test(key);
   return pending.version === 1 && !!input && typeof input === 'object' &&
-    typeof input.template_id === 'string' &&
     (input.name === undefined || typeof input.name === 'string') &&
     (input.workspace_mode === 'new' || input.workspace_mode === 'existing') &&
     Array.isArray(input.workspace_ids) && input.workspace_ids.every((id) => typeof id === 'string') &&
@@ -54,13 +53,11 @@ export function NewHost() {
   const client = useQueryClient();
   const { user } = useAuth();
   const { notify } = useToast();
-  const templates = useQuery({ queryKey: ['templates'], queryFn: portalApi.templates, staleTime: 300000 });
+  const hosts = useQuery({ queryKey: ['hosts'], queryFn: portalApi.hosts });
   const workspaces = useQuery({ queryKey: ['workspaces'], queryFn: portalApi.workspaces });
   const [restored] = useState(() => readPendingHostCreate(user?.id));
-  const [templateId, setTemplateId] = useState(restored.pending?.input.template_id ?? '');
   const [name, setName] = useState(restored.pending?.input.name ?? '');
   const [workspaceMode, setWorkspaceMode] = useState<'new' | 'existing'>(restored.pending?.input.workspace_mode ?? 'new');
-  const template = useMemo(() => templates.data?.items.find((item) => item.id === templateId) ?? templates.data?.items[0], [templates.data, templateId]);
   const [workspaceIds, setWorkspaceIds] = useState<string[]>(restored.pending?.input.workspace_ids ?? []);
   const pendingCreate = useRef<PendingHostCreate | null>(restored.pending);
   const [recoveryPending, setRecoveryPending] = useState(!!restored.pending);
@@ -83,7 +80,7 @@ export function NewHost() {
         }
         workspaceIDs = [workspaceID];
       }
-      return portalApi.createHost({ template_id: input.template_id, ...(input.name ? { name: input.name } : {}), workspace_ids: workspaceIDs }, pending.hostIdempotencyKey);
+      return portalApi.createHost({ ...(input.name ? { name: input.name } : {}), workspace_ids: workspaceIDs }, pending.hostIdempotencyKey);
     },
     onSuccess: () => {
       try { localStorage.removeItem(pendingCreateKey(user!.id)); } catch { /* A stale record only replays this same idempotent request. */ }
@@ -103,8 +100,8 @@ export function NewHost() {
   });
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!template || create.isPending || recoveryError || !user) return;
-    const input = { template_id: template.id, ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: workspaceMode, workspace_ids: workspaceIds };
+    if (create.isPending || recoveryError || !user) return;
+    const input = { ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: workspaceMode, workspace_ids: workspaceIds };
     const fingerprint = JSON.stringify(input);
     if (!pendingCreate.current || pendingCreate.current.fingerprint !== fingerprint) {
       pendingCreate.current = {
@@ -136,20 +133,16 @@ export function NewHost() {
     }
   };
 
-  if (templates.isPending) return <div className="loading-card">正在加载主机规格…</div>;
-  if (templates.isError) return <div className="error-card" role="alert">{errorDetails(templates.error).message}<button type="button" className="button button-secondary" onClick={() => void templates.refetch()}>重试</button></div>;
+  if (hosts.isPending) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
+  if (hosts.isError) return <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>;
+  if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <div className="notice notice-warning" role="alert">达到云端电脑上限,无法再创建</div>;
   return <section>
-    <div className="page-heading"><div><p className="eyebrow">我的主机</p><h1>创建主机</h1><p className="muted">选择运行规格和工作目录。</p></div><Link className="button button-quiet" to="/hosts">返回主机列表</Link></div>
+    <div className="page-heading"><div><p className="eyebrow">我的云端电脑</p><h1>创建云端电脑</h1><p className="muted">使用管理员为你设置的规格。</p></div><Link className="button button-quiet" to="/hosts">返回云端电脑列表</Link></div>
     {recoveryError && <div className="notice notice-warning" role="alert">无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></div>}
-    {!templates.data?.items.length ? <div className="empty-card"><h2>暂无可用规格</h2><p>请联系管理员配置主机模板。</p></div> : <form className="form-card form-stack" onSubmit={submit}>
+    <form className="form-card form-stack" onSubmit={submit}>
       {recoveryPending && !create.isPending && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会用相同请求编号核对结果；若已在主机列表确认，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}
       <label htmlFor="host-name">主机名称 <span className="muted">（可选）</span></label>
       <input id="host-name" value={name} maxLength={100} disabled={recoveryPending || recoveryError} onChange={(event) => setName(event.target.value)} placeholder="例如：数据分析" />
-      <label htmlFor="host-template">主机规格</label>
-      <select id="host-template" required value={templateId || template?.id || ''} disabled={recoveryPending || recoveryError} onChange={(event) => setTemplateId(event.target.value)}>
-        {templates.data?.items.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
-      </select>
-      {template && <div className="template-summary"><strong>{template.name}</strong><p>{template.description}</p><p>{formatCpu(template.resources.cpu_limit_milli)} · {formatMemory(template.resources.mem_limit_mib)} · 最长运行 {formatDuration(template.ttl_seconds)}</p></div>}
       <fieldset className="fieldset"><legend>工作目录</legend>
         <label className="radio-row"><input type="radio" name="workspace-mode" value="new" checked={workspaceMode === 'new'} disabled={recoveryPending || recoveryError} onChange={() => setWorkspaceMode('new')} />创建新的独立工作区</label>
         <label className="radio-row"><input type="radio" name="workspace-mode" value="existing" checked={workspaceMode === 'existing'} onChange={() => setWorkspaceMode('existing')} disabled={recoveryPending || recoveryError || workspaces.isPending || workspaces.isError} />绑定已有工作区</label>
@@ -160,6 +153,6 @@ export function NewHost() {
       </fieldset>
       <div className="notice notice-info">新工作区会先独立保存，再绑定到主机；删除主机时工作区内容仍会保留。</div>
       <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryError || (workspaceMode === 'existing' && !workspaceIds.length)}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建主机'}</button></div>
-    </form>}
+    </form>
   </section>;
 }

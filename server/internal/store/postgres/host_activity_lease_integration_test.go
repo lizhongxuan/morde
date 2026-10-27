@@ -300,7 +300,7 @@ func TestPostgresHostReleaseSerializesWithMCPRuntimeOperation(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 3, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "release-mcp-race-runtime"

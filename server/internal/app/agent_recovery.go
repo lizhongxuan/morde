@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	maxEventPage            = 100
 	maxRecoveryEvents       = 2048
 	maxRecoveryEventPayload = 4 << 20
 )

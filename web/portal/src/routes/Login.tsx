@@ -16,7 +16,7 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
   const queryFrom = new URLSearchParams(location.search).get('next');
   const registered = (location.state as { registered?: boolean } | null)?.registered === true;
   const requested = stateFrom || queryFrom || defaultTo;
-  const from = requested.startsWith('/') && !requested.startsWith('//') ? requested : defaultTo;
+  const from = requested.startsWith('/') && !requested.startsWith('//') && !requested.includes('\\') ? requested : defaultTo;
   if (loading) return <main className="loading-page">正在检查登录状态…</main>;
   if (user) return <Navigate to={from} replace />;
 
@@ -39,7 +39,7 @@ export function Login({ defaultTo = '/assistant', allowRegister = true }: { defa
     <section className="login-card" aria-labelledby="login-heading">
       <div className="login-brand"><span className="brand-mark">M</span><span>Morde 云端电脑</span></div>
       <h1 id="login-heading">登录</h1>
-      <p className="muted">登录后交办云端任务，管理你的电脑与文件。</p>
+      <p className="muted">登录后与 AI 助手对话，管理你的电脑与文件。</p>
       <Link className="login-download-link" to="/download">下载 Morde Desktop</Link>
       {registered && <p className="notice notice-success" role="status">申请已提交，等待管理员审核通过后才能登录。</p>}
       <form onSubmit={(event) => void submit(event)}>

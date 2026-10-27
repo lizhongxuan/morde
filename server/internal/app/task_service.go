@@ -2,10 +2,8 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -20,15 +18,14 @@ const (
 	taskReadScope    identity.Scope = identity.ScopeTaskRead
 	taskSubmitScope  identity.Scope = identity.ScopeTaskSubmit
 	taskControlScope identity.Scope = identity.ScopeTaskControl
-	defaultPageSize  int32          = 50
-	maxPageSize      int32          = 100
-	maxEventPage     int32          = 100
 )
-
-var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{8,128}$`)
 
 type ConfiguredModelCatalog interface {
 	IsConfiguredModel(context.Context, string, string) (bool, error)
+}
+
+type TaskExecutionAuthorizer interface {
+	AuthorizeTaskExecution(context.Context, identity.Principal, string, identity.Scope) (task.Authorization, error)
 }
 
 type SubmitTaskCommand struct {
@@ -57,25 +54,27 @@ type BatchItemInput struct {
 }
 
 type TaskService struct {
-	store      TaskStore
-	authorizer TaskAuthorizer
-	models     ConfiguredModelCatalog
-	actions    TaskActionRequester
+	store               TaskStore
+	authorizer          TaskAuthorizer
+	executionAuthorizer TaskExecutionAuthorizer
+	models              ConfiguredModelCatalog
+	actions             TaskActionRequester
 }
 
 func NewTaskService(store TaskStore, authorizer TaskAuthorizer, models ConfiguredModelCatalog) (*TaskService, error) {
-	if store == nil || authorizer == nil || models == nil {
+	executionAuthorizer, ok := authorizer.(TaskExecutionAuthorizer)
+	if store == nil || !ok || models == nil {
 		return nil, domain.NewError(domain.CodeInvalidArgument, "task service dependencies are required")
 	}
 	actions, _ := store.(TaskActionRequester)
-	return &TaskService{store: store, authorizer: authorizer, models: models, actions: actions}, nil
+	return &TaskService{store: store, authorizer: authorizer, executionAuthorizer: executionAuthorizer, models: models, actions: actions}, nil
 }
 
 func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, command SubmitTaskCommand) (TaskSubmissionResult, error) {
 	if err := validateTaskPrincipal(principal); err != nil {
 		return TaskSubmissionResult{}, err
 	}
-	if !domain.ValidHostID(command.HostID) {
+	if command.HostID != "" && !domain.ValidHostID(command.HostID) {
 		return TaskSubmissionResult{}, domain.InvalidArgument("host_id", "host id is invalid")
 	}
 	if command.ApplicationID != "" && !ValidHostApplicationID(command.ApplicationID) {
@@ -103,7 +102,8 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, command.HostID, taskSubmitScope); err != nil {
+	authorization, err := s.authorizeTask(ctx, principal, command.HostID, taskSubmitScope)
+	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
 	if err := s.validateModel(ctx, principal.UserID, command.ModelID); err != nil {
@@ -122,15 +122,9 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 			Title: truncateRunes(strings.TrimSpace(command.Objective), 120),
 		}
 	} else {
-		existing, getErr := s.store.GetConversation(ctx, conversationID, principal.UserID)
+		_, getErr := s.store.GetConversation(ctx, conversationID, principal.UserID)
 		if getErr != nil {
 			return TaskSubmissionResult{}, getErr
-		}
-		if _, err := authorizeTaskHost(ctx, s.authorizer, principal, existing.HostID, taskSubmitScope); err != nil {
-			return TaskSubmissionResult{}, hideTaskAccessError(err)
-		}
-		if existing.HostID != command.HostID {
-			return TaskSubmissionResult{}, domain.NewError(domain.CodeInvalidState, "task host does not match conversation host")
 		}
 	}
 
@@ -142,7 +136,7 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	if err != nil {
 		return TaskSubmissionResult{}, fmt.Errorf("generate task message id: %w", err)
 	}
-	requestHash, err := hashTaskRequest(struct {
+	requestHash, err := hashIdempotencyRequest(struct {
 		HostID         string           `json:"host_id"`
 		ApplicationID  string           `json:"application_id,omitempty"`
 		ModelID        string           `json:"model_id"`
@@ -163,7 +157,7 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		Task: task.Task{
 			ID: taskID, OwnerID: principal.UserID, ConversationID: conversationID,
 			HostID: command.HostID, ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Objective,
-			Status: task.StatusQueued, Authorization: authorizationSnapshot(principal), Budget: command.Budget,
+			ExecutionLocation: "server", Status: task.StatusQueued, Authorization: authorization, Budget: command.Budget,
 		},
 		Message: conversation.Message{
 			ID: messageID, ConversationID: conversationID, OwnerID: principal.UserID,
@@ -189,7 +183,7 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 	if !domain.ValidConversationID(conversationID) {
 		return TaskSubmissionResult{}, domain.NewError(domain.CodeNotFound, "conversation not found")
 	}
-	if !domain.ValidHostID(command.HostID) {
+	if command.HostID != "" && !domain.ValidHostID(command.HostID) {
 		return TaskSubmissionResult{}, domain.InvalidArgument("host_id", "host id is invalid")
 	}
 	if command.ApplicationID != "" && !ValidHostApplicationID(command.ApplicationID) {
@@ -210,15 +204,12 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 		return TaskSubmissionResult{}, err
 	}
 	command.Budget = budget
-	conversationValue, err := s.store.GetConversation(ctx, conversationID, principal.UserID)
-	if err != nil {
+	if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
 		return TaskSubmissionResult{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, conversationValue.HostID, taskSubmitScope); err != nil {
-		return TaskSubmissionResult{}, hideTaskAccessError(err)
-	}
-	if conversationValue.HostID != command.HostID {
-		return TaskSubmissionResult{}, domain.NewError(domain.CodeInvalidState, "message host does not match conversation host")
+	authorization, err := s.authorizeTask(ctx, principal, command.HostID, taskSubmitScope)
+	if err != nil {
+		return TaskSubmissionResult{}, err
 	}
 	if err := s.validateModel(ctx, principal.UserID, command.ModelID); err != nil {
 		return TaskSubmissionResult{}, err
@@ -231,7 +222,7 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 	if err != nil {
 		return TaskSubmissionResult{}, fmt.Errorf("generate task message id: %w", err)
 	}
-	requestHash, err := hashTaskRequest(struct {
+	requestHash, err := hashIdempotencyRequest(struct {
 		ConversationID string      `json:"conversation_id"`
 		HostID         string      `json:"host_id"`
 		ApplicationID  string      `json:"application_id,omitempty"`
@@ -250,7 +241,7 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 		Task: task.Task{
 			ID: taskID, OwnerID: principal.UserID, ConversationID: conversationID,
 			HostID: command.HostID, ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Content,
-			Status: task.StatusQueued, Authorization: authorizationSnapshot(principal), Budget: command.Budget,
+			ExecutionLocation: "server", Status: task.StatusQueued, Authorization: authorization, Budget: command.Budget,
 		},
 		Message: conversation.Message{
 			ID: messageID, ConversationID: conversationID, OwnerID: principal.UserID,
@@ -295,7 +286,7 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 	if err != nil {
 		return TaskDetails{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, details.Task.HostID, taskReadScope); err != nil {
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
 		return TaskDetails{}, hideTaskAccessError(err)
 	}
 	return details, nil
@@ -317,7 +308,7 @@ func (s *TaskService) RetryBatchItem(ctx context.Context, principal identity.Pri
 	if err != nil {
 		return err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, details.Task.HostID, taskControlScope); err != nil {
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
 	}
 	record, err := idempotencyRecord(principal.UserID, "task.batch_item.retry", idempotencyKey, struct {
@@ -351,7 +342,7 @@ func (s *TaskService) RespondToPendingRequest(ctx context.Context, principal ide
 	if err != nil {
 		return err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, details.Task.HostID, taskControlScope); err != nil {
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
 	}
 	record, err := idempotencyRecord(principal.UserID, "task.pending.respond", idempotencyKey, struct {
@@ -386,7 +377,7 @@ func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal 
 	if err != nil {
 		return err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, details.Task.HostID, taskControlScope); err != nil {
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
 	}
 	record, err := idempotencyRecord(principal.UserID, "task.clarification.answer", idempotencyKey, struct {
@@ -416,7 +407,7 @@ func (s *TaskService) ListEvents(ctx context.Context, principal identity.Princip
 	if err != nil && domain.CodeOf(err) != domain.CodeEventCursorExpired {
 		return TaskEventPage{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, page.HostID, taskReadScope); err != nil {
+	if _, err := s.authorizeTask(ctx, principal, page.HostID, taskReadScope); err != nil {
 		return TaskEventPage{}, hideTaskAccessError(err)
 	}
 	if err != nil {
@@ -444,33 +435,11 @@ func (s *TaskService) validateModel(ctx context.Context, ownerID, modelID string
 	return nil
 }
 
-func validateTaskPrincipal(principal identity.Principal) error {
-	if err := validatePrincipal(principal); err != nil {
-		return err
+func (s *TaskService) authorizeTask(ctx context.Context, principal identity.Principal, hostID string, scope identity.Scope) (task.Authorization, error) {
+	if s.executionAuthorizer == nil {
+		return task.Authorization{}, domain.NewError(domain.CodeUnsupported, "task authorization is unavailable")
 	}
-	if principal.Kind != identity.KindSession && principal.Kind != identity.KindAPIKey && principal.Kind != identity.KindClient {
-		return domain.NewError(domain.CodeUnauthenticated, "authentication required")
-	}
-	return nil
-}
-
-func authorizeTaskHost(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, hostID string, scope identity.Scope) (task.Authorization, error) {
-	if !domain.ValidHostID(hostID) {
-		return task.Authorization{}, domain.NewError(domain.CodeNotFound, "host not found")
-	}
-	if principal.Kind == identity.KindAPIKey {
-		if !principal.HasScope(scope) {
-			return task.Authorization{}, domain.NewError(domain.CodeForbidden, "task scope is required")
-		}
-		if !principal.AllowsHost(hostID) {
-			return task.Authorization{}, domain.NewError(domain.CodeNotFound, "host not found")
-		}
-	}
-	approvedScopes := append([]identity.Scope(nil), principal.Scopes...)
-	if err := authorizer.AuthorizeTaskAction(ctx, principal.UserID, principal.Kind, principal.TokenID, hostID, approvedScopes, scope); err != nil {
-		return task.Authorization{}, err
-	}
-	return authorizationSnapshot(principal), nil
+	return s.executionAuthorizer.AuthorizeTaskExecution(ctx, principal, hostID, scope)
 }
 
 func authorizedTaskHostIDs(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, scope identity.Scope) ([]string, error) {
@@ -506,46 +475,6 @@ func authorizedTaskHostIDs(ctx context.Context, authorizer TaskAuthorizer, princ
 	}
 	sort.Strings(allowed)
 	return allowed, nil
-}
-
-func authorizationSnapshot(principal identity.Principal) task.Authorization {
-	scopes := make([]string, 0, len(principal.Scopes))
-	for _, scope := range principal.Scopes {
-		scopes = append(scopes, string(scope))
-	}
-	sort.Strings(scopes)
-	return task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID, ClientInstallationID: principal.ClientInstallationID, Scopes: scopes}
-}
-
-func hideTaskAccessError(err error) error {
-	if domain.CodeOf(err) == domain.CodeForbidden || domain.CodeOf(err) == domain.CodeNotFound {
-		return domain.NewError(domain.CodeNotFound, "resource not found")
-	}
-	return err
-}
-
-func validateIdempotencyKey(value string) error {
-	if !idempotencyKeyPattern.MatchString(value) {
-		return domain.InvalidArgument("idempotency_key", "idempotency key is invalid")
-	}
-	return nil
-}
-
-func idempotencyRecord(ownerID, operation, key string, request any, resourceID, relatedID string) (IdempotencyRecord, error) {
-	hash, err := hashTaskRequest(request)
-	if err != nil {
-		return IdempotencyRecord{}, err
-	}
-	return IdempotencyRecord{OwnerID: ownerID, Operation: operation, Key: key, RequestHash: hash, ResourceID: resourceID, RelatedID: relatedID}, nil
-}
-
-func hashTaskRequest(value any) ([]byte, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("encode idempotency request: %w", err)
-	}
-	hash := sha256.Sum256(encoded)
-	return hash[:], nil
 }
 
 func normalizedBudget(value task.Budget) (task.Budget, error) {
@@ -588,25 +517,11 @@ func normalizedBatchInputs(values []BatchItemInput) []BatchItemInput {
 	return values
 }
 
-func validBoundedText(value string, maxRunes int) bool {
-	return utf8.ValidString(value) && strings.TrimSpace(value) != "" && utf8.RuneCountInString(value) <= maxRunes
-}
-
 func truncateRunes(value string, maxRunes int) string {
 	if utf8.RuneCountInString(value) <= maxRunes {
 		return value
 	}
 	return string([]rune(value)[:maxRunes])
-}
-
-func validatePageRequest(page PageRequest) error {
-	if page.Limit == 0 {
-		page.Limit = defaultPageSize
-	}
-	if page.Limit < 1 || page.Limit > maxPageSize || len(page.Cursor) > 1024 {
-		return domain.InvalidArgument("limit", "page request is out of range")
-	}
-	return nil
 }
 
 func validTaskStatus(status task.Status) bool {

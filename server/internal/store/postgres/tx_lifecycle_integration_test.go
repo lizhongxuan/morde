@@ -60,6 +60,9 @@ func TestHostComputeReleaseAndConcurrentRestore(t *testing.T) {
 		stopped.Workspaces[0].State != workspace.BindingActive || stopped.RuntimeGeneration != 1 || stopped.SandboxID != "" || stopped.RuntimeInstanceID != "" {
 		t.Fatalf("CompleteHostRelease() = %#v, %v", stopped, err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET quota_hosts=0 WHERE id=$1`, owner.ID); err != nil {
+		t.Fatalf("set former host-count limit before restore: %v", err)
+	}
 	workspaceAfter, err := store.GetWorkspace(ctx, workspaceValue.ID)
 	if err != nil || workspaceAfter != workspaceBefore {
 		t.Fatalf("workspace changed during compute release: %#v, err=%v; before %#v", workspaceAfter, err, workspaceBefore)
@@ -504,7 +507,7 @@ func TestApplicationLaunchReservationSerializesWithHostRelease(t *testing.T) {
 func TestBeginHostReleaseBlocksMCPRuntimeOperations(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 3, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "release-mcp-runtime"
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2 WHERE id=$1`, hostValue.ID, runtimeInstanceID); err != nil {

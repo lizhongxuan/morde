@@ -19,7 +19,7 @@ import (
 func TestPostgresExecutionControlStopsTasksAndReenablesWithoutRevival(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	scheduled, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID,
 		schedule.Timing{Kind: schedule.TimingDaily, StartsOn: time.Now().UTC().Format("2006-01-02"), LocalTime: "23:59", TimeZone: "UTC"},
@@ -136,7 +136,7 @@ WHERE id=$1`, runningTask.Task.ID); err != nil {
 func TestPostgresExecutionStopBarrierSerializesAgainstTaskSubmission(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 
 	var group sync.WaitGroup
@@ -184,7 +184,7 @@ func TestPostgresExecutionStopBarrierSerializesAgainstTaskSubmission(t *testing.
 func TestPostgresExecutionGateFencesOperationDispatch(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_execution_gate_test' WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
@@ -243,7 +243,7 @@ runtime_lease_safe_after=clock_timestamp()-interval '1 second' WHERE id=$1`, run
 func TestPostgresOwnerStopWaitsForMCPRuntimeCancellation(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "execution-mcp-stop-test-instance"
@@ -302,7 +302,7 @@ func executionControlIdempotency(ownerID, operation, key string) app.Idempotency
 func TestPostgresMissingExecutionGateFailsClosed(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	if _, err := store.pool.Exec(ctx, `DELETE FROM owner_execution_controls WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}

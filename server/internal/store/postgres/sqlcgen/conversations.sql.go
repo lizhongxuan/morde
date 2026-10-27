@@ -12,7 +12,7 @@ import (
 )
 
 const getConversation = `-- name: GetConversation :one
-SELECT id, owner_id, host_id, title, created_at, updated_at FROM conversations WHERE id = $1 AND owner_id = $2
+SELECT id, owner_id, host_id, title, created_at, updated_at, model_id, source_kind, message_seq FROM conversations WHERE id = $1 AND owner_id = $2
 `
 
 type GetConversationParams struct {
@@ -30,12 +30,15 @@ func (q *Queries) GetConversation(ctx context.Context, arg GetConversationParams
 		&i.Title,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ModelID,
+		&i.SourceKind,
+		&i.MessageSeq,
 	)
 	return i, err
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, conversation_id, owner_id, role, content, task_id, created_at FROM conversation_messages WHERE id = $1 AND owner_id = $2
+SELECT id, conversation_id, owner_id, role, content, task_id, created_at, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence FROM conversation_messages WHERE id = $1 AND owner_id = $2
 `
 
 type GetMessageParams struct {
@@ -54,12 +57,17 @@ func (q *Queries) GetMessage(ctx context.Context, arg GetMessageParams) (Convers
 		&i.Content,
 		&i.TaskID,
 		&i.CreatedAt,
+		&i.ModelID,
+		&i.SourceKind,
+		&i.SourceExchangeID,
+		&i.RequestedConversationID,
+		&i.Sequence,
 	)
 	return i, err
 }
 
 const listConversations = `-- name: ListConversations :many
-SELECT id, owner_id, host_id, title, created_at, updated_at FROM conversations
+SELECT id, owner_id, host_id, title, created_at, updated_at, model_id, source_kind, message_seq FROM conversations
 WHERE owner_id = $1
   AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
   AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz OR (created_at = $3::timestamptz AND id < $4))
@@ -97,6 +105,9 @@ func (q *Queries) ListConversations(ctx context.Context, arg ListConversationsPa
 			&i.Title,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ModelID,
+			&i.SourceKind,
+			&i.MessageSeq,
 		); err != nil {
 			return nil, err
 		}
@@ -109,19 +120,18 @@ func (q *Queries) ListConversations(ctx context.Context, arg ListConversationsPa
 }
 
 const listMessages = `-- name: ListMessages :many
-SELECT id, conversation_id, owner_id, role, content, task_id, created_at FROM conversation_messages
+SELECT id, conversation_id, owner_id, role, content, task_id, created_at, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence FROM conversation_messages
 WHERE owner_id = $1 AND conversation_id = $2
-  AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz OR (created_at = $3::timestamptz AND id < $4))
-ORDER BY created_at DESC, id DESC
-LIMIT $5
+  AND ($3::bigint = 0 OR sequence < $3::bigint)
+ORDER BY sequence DESC
+LIMIT $4
 `
 
 type ListMessagesParams struct {
-	OwnerID        string             `json:"owner_id"`
-	ConversationID string             `json:"conversation_id"`
-	Column3        pgtype.Timestamptz `json:"column_3"`
-	ID             string             `json:"id"`
-	Limit          int32              `json:"limit"`
+	OwnerID        string `json:"owner_id"`
+	ConversationID string `json:"conversation_id"`
+	Column3        int64  `json:"column_3"`
+	Limit          int32  `json:"limit"`
 }
 
 func (q *Queries) ListMessages(ctx context.Context, arg ListMessagesParams) ([]ConversationMessage, error) {
@@ -129,7 +139,6 @@ func (q *Queries) ListMessages(ctx context.Context, arg ListMessagesParams) ([]C
 		arg.OwnerID,
 		arg.ConversationID,
 		arg.Column3,
-		arg.ID,
 		arg.Limit,
 	)
 	if err != nil {
@@ -147,6 +156,11 @@ func (q *Queries) ListMessages(ctx context.Context, arg ListMessagesParams) ([]C
 			&i.Content,
 			&i.TaskID,
 			&i.CreatedAt,
+			&i.ModelID,
+			&i.SourceKind,
+			&i.SourceExchangeID,
+			&i.RequestedConversationID,
+			&i.Sequence,
 		); err != nil {
 			return nil, err
 		}

@@ -12,7 +12,7 @@ export function AdminWorkspaceDetail() {
 
   return <section>
     <Link className="back-link" to="/admin/workspaces">‹ 返回工作区列表</Link>
-    <div className="page-heading"><div><p className="eyebrow">工作区详情</p><h1>{workspace.name || workspace.id}</h1><p className="muted mono">{workspace.id}</p></div><span className={`status status-${workspace.state}`}>{workspace.state === 'ready' ? '可用' : workspace.state === 'deleting' ? '删除中' : workspace.state}</span></div>
+    <div className="page-heading detail-heading"><div><p className="eyebrow">工作区详情</p><h2>{workspace.name || workspace.id}</h2><p className="muted mono">{workspace.id}</p></div><span className={`status status-${workspace.state}`}>{workspace.state === 'ready' ? '可用' : workspace.state === 'deleting' ? '删除中' : workspace.state}</span></div>
     <div className="admin-detail-facts">
       <article><span>所有者</span><strong><Link to={`/admin/users/${encodeURIComponent(workspace.owner_id)}`}>{workspace.owner_name || workspace.owner_id}</Link></strong></article>
       <article><span>逻辑用量 / 配额</span><strong>{formatBytes(workspace.used_bytes)} / {formatBytes(workspace.quota_bytes)}</strong></article>

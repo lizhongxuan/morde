@@ -39,7 +39,7 @@ func (a *mcpRuntimeSharingAuthorizer) Authorize(_ context.Context, hostID, actor
 	return false, nil
 }
 
-func TestMCPComputerHostAuthorizerRequiresComputerScopeHostGrantAndLiveMCPShare(t *testing.T) {
+func TestMCPComputerHostAuthorizerUsesDynamicKeyGrantAndLiveMCPShare(t *testing.T) {
 	ownerID, actorID, hostID := "u7654321", "u1234567", "h1234567"
 	hostValue := host.Host{ID: hostID, OwnerID: ownerID, State: host.StateRunning}
 	sharing := &mcpRuntimeSharingAuthorizer{actorID: actorID, hostID: hostID, permission: host.PermissionMCPControl, allowed: true}
@@ -62,12 +62,12 @@ func TestMCPComputerHostAuthorizerRequiresComputerScopeHostGrantAndLiveMCPShare(
 	}
 	sharing.allowed = true
 	principal.HostIDs = nil
-	if _, err := authorizer.GetForComputer(context.Background(), principal, hostID, identity.ScopeComputerOperate); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("missing Host allow-list error = %v", err)
+	if _, err := authorizer.GetForComputer(context.Background(), principal, hostID, identity.ScopeComputerOperate); err != nil {
+		t.Fatalf("dynamic Host access error = %v", err)
 	}
-	principal.HostIDs = []string{hostID}
-	if _, err := authorizer.GetForComputer(context.Background(), principal, hostID, identity.ScopeComputerObserve); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("missing key scope error = %v", err)
+	principal.Scopes = nil
+	if _, err := authorizer.GetForComputer(context.Background(), principal, hostID, identity.ScopeComputerObserve); err != nil {
+		t.Fatalf("dynamic observation access error = %v", err)
 	}
 	if _, err := authorizer.GetForComputer(context.Background(), principal, hostID, identity.ScopeTaskSubmit); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("non-computer scope error = %v", err)
@@ -116,33 +116,16 @@ func TestAuthorizeMCPRuntimeActionRevalidatesActorKeyAndOwner(t *testing.T) {
 	ownerID, actorID, hostID, tokenID := "u7654321", "u1234567", "h1234567", "t1234567"
 	hosts.values = append(hosts.values, host.Host{ID: hostID, OwnerID: ownerID, State: host.StateRunning})
 	tokens.values[tokenID] = identity.Token{
-		ID: tokenID, OwnerID: actorID, Kind: identity.KindAPIKey, HostIDs: []string{hostID},
-		Scopes: []identity.Scope{identity.ScopeComputerOperate}, ExpiresAt: time.Now().Add(time.Hour),
+		ID: tokenID, OwnerID: actorID, Kind: identity.KindAPIKey, ExpiresAt: time.Now().Add(time.Hour),
 	}
-	approved := []identity.Scope{identity.ScopeComputerOperate}
 	check := func() error {
-		return service.AuthorizeMCPRuntimeAction(context.Background(), ownerID, actorID, tokenID, hostID, approved, identity.ScopeComputerOperate)
+		return service.AuthorizeMCPRuntimeAction(context.Background(), ownerID, actorID, tokenID, hostID, nil, identity.ScopeComputerOperate)
 	}
 	if err := check(); err != nil {
 		t.Fatalf("valid member key: %v", err)
 	}
 
-	if err := service.AuthorizeMCPRuntimeAction(context.Background(), ownerID, actorID, tokenID, hostID, nil, identity.ScopeComputerOperate); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("scope outside key's original grant = %v", err)
-	}
 	key := tokens.values[tokenID]
-	key.Scopes = nil
-	tokens.values[tokenID] = key
-	if err := check(); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("scope removed from current key = %v", err)
-	}
-	key.Scopes = approved
-	key.HostIDs = nil
-	tokens.values[tokenID] = key
-	if err := check(); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("Host removed from key allow-list = %v", err)
-	}
-	key.HostIDs = []string{hostID}
 	now := time.Now()
 	key.RevokedAt = &now
 	tokens.values[tokenID] = key
@@ -163,7 +146,7 @@ func TestAuthorizeMCPRuntimeActionRevalidatesActorKeyAndOwner(t *testing.T) {
 	}
 	key.OwnerID = actorID
 	tokens.values[tokenID] = key
-	if err := service.AuthorizeMCPRuntimeAction(context.Background(), actorID, actorID, tokenID, hostID, approved, identity.ScopeComputerOperate); domain.CodeOf(err) != domain.CodeNotFound {
+	if err := service.AuthorizeMCPRuntimeAction(context.Background(), actorID, actorID, tokenID, hostID, nil, identity.ScopeComputerOperate); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("Host owner changed = %v", err)
 	}
 	users.values[actorID] = identity.User{ID: actorID, Status: identity.StatusDisabled}
@@ -205,8 +188,7 @@ func TestMCPRuntimeLeaseCancelsWhenShareOrKeyIsRevokedOrExpired(t *testing.T) {
 			hostValue := host.Host{ID: hostID, OwnerID: ownerID, State: host.StateRunning}
 			hosts.values = append(hosts.values, hostValue)
 			token := identity.Token{
-				ID: tokenID, OwnerID: actorID, Kind: identity.KindAPIKey, HostIDs: []string{hostID},
-				Scopes: []identity.Scope{identity.ScopeComputerOperate}, ExpiresAt: time.Now().Add(time.Hour),
+				ID: tokenID, OwnerID: actorID, Kind: identity.KindAPIKey, ExpiresAt: time.Now().Add(time.Hour),
 			}
 			sharing := &mcpRuntimeSharingAuthorizer{actorID: actorID, hostID: hostID, allowed: scenario != "share revoked", permission: host.PermissionMCPControl}
 			switch scenario {
@@ -225,7 +207,6 @@ func TestMCPRuntimeLeaseCancelsWhenShareOrKeyIsRevokedOrExpired(t *testing.T) {
 			executor := &MCPRuntimeToolExecutor{store: store, hosts: hostAuthorizer, authorizer: service}
 			principal := identity.Principal{
 				UserID: actorID, Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: tokenID,
-				HostIDs: []string{hostID}, Scopes: []identity.Scope{identity.ScopeComputerOperate},
 			}
 			operation := MCPRuntimeOperation{
 				Key:           MCPRuntimeOperationKey{OwnerID: ownerID, ActorUserID: actorID, APIKeyID: tokenID, SessionID: "mcp-lease-session", HostID: hostID, IdempotencyKey: "mcp-lease-operation"},

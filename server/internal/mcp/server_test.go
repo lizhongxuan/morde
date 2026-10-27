@@ -20,7 +20,6 @@ import (
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
-	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/runtimeclient"
 )
@@ -37,7 +36,7 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 		PreviewPortMin: 1024, PreviewPortDeny: []int{8080},
 		Config:  config.MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 2},
 		Domains: config.Domains{Scheme: "https", HostSuffix: "hosts.example.test"},
-		Hosts:   hosts, Applications: newApplicationStatusServiceStub(), RuntimeTools: runtime, Tasks: newTaskServiceStub(), Schedules: scheduleServiceFake{}, Auth: apiKeyPrincipalVerifier{principal: identity.Principal{
+		Hosts:   hosts, Applications: newApplicationStatusServiceStub(), RuntimeTools: runtime, Auth: apiKeyPrincipalVerifier{principal: identity.Principal{
 			UserID: "user_test", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "token_test",
 			HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeHostCreate, identity.ScopeComputerOperate},
 		}}, Audit: audits,
@@ -70,15 +69,29 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTools := 22 + len(app.RuntimeComputerTools())
+	wantTools := 7 + len(app.RuntimeComputerTools())
 	if len(listed.Tools) != wantTools {
 		t.Fatalf("listed %d tools, want %d", len(listed.Tools), wantTools)
+	}
+	for _, tool := range listed.Tools {
+		if strings.HasPrefix(tool.Name, "task_") || strings.HasPrefix(tool.Name, "schedule_") {
+			t.Fatalf("retired tool %q remains visible", tool.Name)
+		}
+	}
+	for _, retired := range []string{"task_create", "task_get", "task_cancel", "schedule_create", "schedule_list", "schedule_update"} {
+		result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: retired, Arguments: map[string]any{}})
+		if err == nil && result != nil && !result.IsError {
+			t.Fatalf("retired tool %q remained callable: %+v", retired, result)
+		}
+	}
+	if hosts.createCalls.Load() != 0 || runtime.tool != "" {
+		t.Fatal("retired tool calls reached a Host or runtime executor")
 	}
 	if listed.Tools[0].InputSchema == nil {
 		t.Fatal("host_create schema is missing")
 	}
 
-	created, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "host_create", Arguments: map[string]any{"template_id": "python", "workspace_ids": []string{"w1234567"}, "idempotency_key": "host-create-key-001"}})
+	created, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "host_create", Arguments: map[string]any{"workspace_ids": []string{"w1234567"}, "idempotency_key": "host-create-key-001"}})
 	if err != nil || created.IsError {
 		t.Fatalf("host_create result=%+v err=%v", created, err)
 	}
@@ -118,27 +131,6 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 	if count := gatheredHistogramCount(t, registry, "cloudhost_mcp_tool_duration_seconds", map[string]string{"tool": "shell_exec"}); count != 1 {
 		t.Fatalf("shell duration samples = %d, want 1", count)
 	}
-}
-
-type scheduleServiceFake struct{}
-
-func (scheduleServiceFake) Create(context.Context, identity.Principal, app.CreateScheduleCommand, string) (schedule.Schedule, error) {
-	return schedule.Schedule{}, nil
-}
-func (scheduleServiceFake) List(context.Context, identity.Principal, app.ScheduleListRequest) (app.SchedulePage, error) {
-	return app.SchedulePage{}, nil
-}
-func (scheduleServiceFake) Get(context.Context, identity.Principal, string) (schedule.Schedule, error) {
-	return schedule.Schedule{}, nil
-}
-func (scheduleServiceFake) Update(context.Context, identity.Principal, string, app.UpdateScheduleCommand) (schedule.Schedule, error) {
-	return schedule.Schedule{}, nil
-}
-func (scheduleServiceFake) Action(context.Context, identity.Principal, string, app.ScheduleActionCommand, string) (app.ScheduleActionResult, error) {
-	return app.ScheduleActionResult{}, nil
-}
-func (scheduleServiceFake) Runs(context.Context, identity.Principal, string, app.PageRequest) (app.ScheduleRunPage, error) {
-	return app.ScheduleRunPage{}, nil
 }
 
 func TestNewDisabledAndInvalidDependencies(t *testing.T) {
@@ -224,13 +216,14 @@ func TestValidateToolArguments(t *testing.T) {
 		{name: "runtime idempotency key required", spec: toolByName("shell_exec"), json: `{"host_id":"host_test","command":"pwd"}`, wantErr: true},
 		{name: "runtime idempotency key invalid", spec: toolByName("shell_exec"), json: `{"host_id":"host_test","idempotency_key":"short","command":"pwd"}`, wantErr: true},
 		{name: "invalid port", spec: toolByName("preview_url"), json: `{"host_id":"host_test","port":65536}`, wantErr: true},
-		{name: "valid workspace IDs", spec: toolByName("host_create"), json: `{"template_id":"python","workspace_ids":["w1234567"],"idempotency_key":"host-create-key-001"}`},
-		{name: "host create idempotency key required", spec: toolByName("host_create"), json: `{"template_id":"python"}`, wantErr: true},
-		{name: "host create idempotency key invalid", spec: toolByName("host_create"), json: `{"template_id":"python","idempotency_key":"short"}`, wantErr: true},
-		{name: "legacy workspace object rejected", spec: toolByName("host_create"), json: `{"template_id":"python","workspace":{"mode":"existing","id":"w1234567"}}`, wantErr: true},
-		{name: "invalid workspace ID", spec: toolByName("host_create"), json: `{"template_id":"python","workspace_ids":["bad"]}`, wantErr: true},
-		{name: "duplicate workspace IDs", spec: toolByName("host_create"), json: `{"template_id":"python","workspace_ids":["w1234567","w1234567"]}`, wantErr: true},
-		{name: "workspace IDs must be strings", spec: toolByName("host_create"), json: `{"template_id":"python","workspace_ids":[1]}`, wantErr: true},
+		{name: "valid workspace IDs", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567"],"idempotency_key":"host-create-key-001"}`},
+		{name: "host create idempotency key required", spec: toolByName("host_create"), json: `{}`, wantErr: true},
+		{name: "host create idempotency key invalid", spec: toolByName("host_create"), json: `{"idempotency_key":"short"}`, wantErr: true},
+		{name: "legacy template rejected", spec: toolByName("host_create"), json: `{"template_id":"python","idempotency_key":"host-create-key-001"}`, wantErr: true},
+		{name: "legacy workspace object rejected", spec: toolByName("host_create"), json: `{"workspace":{"mode":"existing","id":"w1234567"}}`, wantErr: true},
+		{name: "invalid workspace ID", spec: toolByName("host_create"), json: `{"workspace_ids":["bad"],"idempotency_key":"host-create-key-001"}`, wantErr: true},
+		{name: "duplicate workspace IDs", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567","w1234567"],"idempotency_key":"host-create-key-001"}`, wantErr: true},
+		{name: "workspace IDs must be strings", spec: toolByName("host_create"), json: `{"workspace_ids":[1],"idempotency_key":"host-create-key-001"}`, wantErr: true},
 		{name: "legacy host delete option rejected", spec: toolByName("host_delete"), json: `{"host_id":"h1234567","keep_workspace":true}`, wantErr: true},
 		{name: "trailing JSON", spec: toolByName("host_get"), json: `{"host_id":"host_test"}{}`, wantErr: true},
 		{name: "reversed line range", spec: toolByName("file_read"), json: `{"host_id":"h1234567","idempotency_key":"test-file-read-0001","path":"x","start_line":3,"end_line":2}`, wantErr: true},
@@ -336,6 +329,9 @@ func (s *hostServiceStub) Create(_ context.Context, _ identity.Principal, comman
 	value.State = host.StateCreating
 	return value, nil
 }
+func (s *hostServiceStub) EnsureDefaultStopped(context.Context, identity.User) (host.Host, bool, error) {
+	return s.value, false, nil
+}
 func (s *hostServiceStub) List(context.Context, identity.Principal) ([]host.Host, error) {
 	return []host.Host{s.value}, nil
 }
@@ -363,7 +359,8 @@ func (s *hostServiceStub) RetryWorkspaceSync(context.Context, identity.Principal
 func (s *hostServiceStub) GetForComputer(ctx context.Context, principal identity.Principal, id string, scope identity.Scope) (host.Host, error) {
 	s.computerGetCalls.Add(1)
 	s.computerScope = scope
-	if principal.Kind != identity.KindAPIKey || !principal.CanAccessHost(id, scope) {
+	if principal.Kind != identity.KindAPIKey || !principal.CanAccessHost(id, scope) ||
+		s.value.ID != id || s.value.OwnerID != principal.UserID {
 		return host.Host{}, domain.NewError(domain.CodeForbidden, "computer scope is insufficient")
 	}
 	return s.Get(ctx, principal, id)

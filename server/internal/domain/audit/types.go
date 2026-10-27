@@ -11,6 +11,7 @@ const (
 	ActionHostRenew              Action = "host.renew"
 	ActionHostEnter              Action = "host.enter"
 	ActionHostControl            Action = "host.control"
+	ActionHostResourcesUpdate    Action = "host.resources.update"
 	ActionHostApplicationInstall Action = "host.application.install"
 	ActionHostApplicationLaunch  Action = "host.application.launch"
 	ActionHostApplicationStop    Action = "host.application.stop"
@@ -19,6 +20,8 @@ const (
 	ActionExecutionControl       Action = "execution.control"
 	ActionHostRelease            Action = "host.release"
 	ActionHostRestore            Action = "host.restore"
+	ActionModelBudgetUpdate      Action = "model.budget.update"
+	ActionModelUsageReconcile    Action = "model.usage.reconcile"
 	ActionAPIKeyCreate           Action = "apikey.create"
 	ActionAPIKeyDelete           Action = "apikey.delete"
 	ActionDevicePair             Action = "device.pair"
@@ -27,6 +30,8 @@ const (
 	ActionDeviceGrant            Action = "device.workspace_grant"
 	ActionClientPair             Action = "client.pair"
 	ActionClientDeny             Action = "client.deny"
+	ActionClientLogin            Action = "client.login"
+	ActionClientWebSession       Action = "client.web_session"
 	ActionClientRevoke           Action = "client.revoke"
 	ActionWorkspaceDelete        Action = "workspace.delete"
 	ActionUserCreate             Action = "user.create"
@@ -40,9 +45,9 @@ const (
 func (a Action) Valid() bool {
 	switch a {
 	case ActionLogin, ActionLoginFailed, ActionLogout,
-		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter, ActionHostControl, ActionHostApplicationInstall, ActionHostApplicationLaunch, ActionHostApplicationStop, ActionHostMemberInvite, ActionHostMemberRevoke, ActionExecutionControl, ActionHostRelease, ActionHostRestore,
+		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter, ActionHostControl, ActionHostResourcesUpdate, ActionHostApplicationInstall, ActionHostApplicationLaunch, ActionHostApplicationStop, ActionHostMemberInvite, ActionHostMemberRevoke, ActionExecutionControl, ActionHostRelease, ActionHostRestore, ActionModelBudgetUpdate, ActionModelUsageReconcile,
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
-		ActionClientPair, ActionClientDeny, ActionClientRevoke,
+		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientRevoke,
 		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionMCPCall,
 		ActionSystemLost, ActionOrphanDeleted, ActionSystemRenew:
 		return true

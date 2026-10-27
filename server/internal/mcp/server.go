@@ -23,8 +23,6 @@ import (
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
-	"morde/server/internal/domain/schedule"
-	"morde/server/internal/domain/task"
 )
 
 type Deps struct {
@@ -35,8 +33,6 @@ type Deps struct {
 	Hosts           app.HostService
 	Applications    applicationStatusService
 	RuntimeTools    runtimeComputerTools
-	Tasks           taskService
-	Schedules       scheduleService
 	Auth            app.Verifier
 	Audit           app.AuditWriter
 	Logger          *zap.Logger
@@ -73,24 +69,6 @@ type applicationStatusService interface {
 	Applications(context.Context, identity.Principal, string) (app.ApplicationsStatus, error)
 }
 
-type taskService interface {
-	Submit(context.Context, identity.Principal, app.SubmitTaskCommand) (app.TaskSubmissionResult, error)
-	List(context.Context, identity.Principal, app.TaskListRequest) (app.TaskPage, error)
-	Get(context.Context, identity.Principal, string) (app.TaskDetails, error)
-	RequestAction(context.Context, identity.Principal, string, task.Action, task.Status, string) (app.TaskActionResult, error)
-	RespondToPendingRequest(context.Context, identity.Principal, string, string, int64, task.PendingDecision, string) error
-	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error
-}
-
-type scheduleService interface {
-	Create(context.Context, identity.Principal, app.CreateScheduleCommand, string) (schedule.Schedule, error)
-	List(context.Context, identity.Principal, app.ScheduleListRequest) (app.SchedulePage, error)
-	Get(context.Context, identity.Principal, string) (schedule.Schedule, error)
-	Update(context.Context, identity.Principal, string, app.UpdateScheduleCommand) (schedule.Schedule, error)
-	Action(context.Context, identity.Principal, string, app.ScheduleActionCommand, string) (app.ScheduleActionResult, error)
-	Runs(context.Context, identity.Principal, string, app.PageRequest) (app.ScheduleRunPage, error)
-}
-
 type toolMetrics struct {
 	calls    *prometheus.CounterVec
 	duration *prometheus.HistogramVec
@@ -100,7 +78,7 @@ func New(d Deps) (http.Handler, error) {
 	if !d.Config.Enabled {
 		return http.NotFoundHandler(), nil
 	}
-	if d.Hosts == nil || d.Applications == nil || d.RuntimeTools == nil || d.Tasks == nil || d.Schedules == nil || d.Auth == nil || d.Audit == nil || d.Logger == nil || d.Metrics == nil {
+	if d.Hosts == nil || d.Applications == nil || d.RuntimeTools == nil || d.Auth == nil || d.Audit == nil || d.Logger == nil || d.Metrics == nil {
 		return nil, fmt.Errorf("mcp dependencies are required")
 	}
 	if d.Domains.Scheme != "http" && d.Domains.Scheme != "https" || strings.TrimSpace(d.Domains.HostSuffix) == "" {

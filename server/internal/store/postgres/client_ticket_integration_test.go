@@ -8,6 +8,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 )
 
@@ -25,7 +26,7 @@ func TestClientTicketConsumeReturnsInstallationAndRevocationRejectsPendingTicket
 	}
 
 	pendingID := createClientBoundTicket(t, ctx, store, owner.ID, installationID, hostValue.ID)
-	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1"); err != nil {
+	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", audit.ActorSession); err != nil {
 		t.Fatalf("revoke client installation: %v", err)
 	}
 	if _, err := store.ConsumeTicket(ctx, pendingID); !errors.Is(err, identity.ErrInvalidCredential) {

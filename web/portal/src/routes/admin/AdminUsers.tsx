@@ -61,7 +61,7 @@ export function AdminUsers() {
         {Object.entries(statusLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
       </select>
     </div>
-    <div className="table-wrap"><table><thead><tr><th>用户</th><th>角色 / 状态</th><th>主机使用</th><th>CPU 配额</th><th>内存配额</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
+    <div className="table-wrap"><table><thead><tr><th>用户</th><th>角色 / 状态</th><th>云端电脑数量</th><th>CPU 配额</th><th>内存配额</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
       {query.data?.items.map((item) => {
         const protectedAdmin = item.role === 'super_admin';
         const self = item.id === current?.id;
@@ -69,7 +69,7 @@ export function AdminUsers() {
         return <tr key={item.id}>
           <td><Link className="admin-table-link" to={`/admin/users/${encodeURIComponent(item.id)}`}><strong>{item.name}</strong><small className="table-sub mono">{item.id}</small></Link></td>
           <td>{item.role === 'super_admin' ? '超级管理员' : item.role === 'admin' ? '管理员' : '普通用户'} · {statusLabel[item.status]}</td>
-          <td>{item.usage.hosts} / {item.quota.hosts}</td>
+          <td>{item.usage.hosts}</td>
           <td>{formatCpu(item.usage.cpu_milli)} / {formatCpu(item.quota.cpu_milli)}</td>
           <td>{formatMemory(item.usage.mem_mib)} / {formatMemory(item.quota.mem_mib)}</td>
           <td>{formatDate(item.created_at)}</td>

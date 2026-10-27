@@ -57,17 +57,17 @@ func (s *coverageTokenStore) ConsumeTicket(ctx context.Context, id string) (Tick
 }
 
 func TestCoverageAPIKeyLifecycleAndCurrentUser(t *testing.T) {
-	credentials, users, hosts, _, tokens, _ := newCredentialFixture(t)
+	credentials, users, _, _, tokens, _ := newCredentialFixture(t)
 	store := &coverageTokenStore{credentialTokens: tokens}
 	writer := &credentialAudit{}
-	service, err := NewTokenService(hosts, store, writer, time.Hour, 24*time.Hour)
+	service, err := NewTokenService(store, writer, time.Hour, 24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	principal := identity.Principal{
 		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567",
 	}
-	created, err := service.CreateAPIKey(context.Background(), principal, "  editor  ", nil, []identity.Scope{identity.ScopeTaskSubmit}, 0)
+	created, err := service.CreateAPIKey(context.Background(), principal, "  editor  ", 0)
 	if err != nil || created.ID == "" || created.Key == "" {
 		t.Fatalf("CreateAPIKey() = %#v, %v", created, err)
 	}
@@ -82,7 +82,7 @@ func TestCoverageAPIKeyLifecycleAndCurrentUser(t *testing.T) {
 	}
 	verified, err := credentials.VerifyAPIKey(context.Background(), created.Key)
 	if err != nil || verified.Kind != identity.KindAPIKey || verified.UserID != principal.UserID || verified.TokenID != created.ID ||
-		len(verified.HostIDs) != 0 || len(verified.Scopes) != 1 || verified.Scopes[0] != identity.ScopeTaskSubmit {
+		len(verified.HostIDs) != 0 || len(verified.Scopes) != 0 {
 		t.Fatalf("VerifyAPIKey() = %#v, %v", verified, err)
 	}
 	current, err := credentials.CurrentUser(context.Background(), verified)
@@ -98,16 +98,16 @@ func TestCoverageAPIKeyLifecycleAndCurrentUser(t *testing.T) {
 	if _, err := service.ListAPIKeys(context.Background(), identity.Principal{}); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("ListAPIKeys() without credential = %v", err)
 	}
-	if _, err := service.CreateAPIKey(context.Background(), principal, "", nil, []identity.Scope{identity.ScopeTaskSubmit}, time.Hour); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := service.CreateAPIKey(context.Background(), principal, "", time.Hour); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("CreateAPIKey() with empty name = %v", err)
 	}
-	if _, err := service.CreateAPIKey(context.Background(), principal, "too long", nil, []identity.Scope{identity.ScopeTaskSubmit}, 25*time.Hour); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := service.CreateAPIKey(context.Background(), principal, "too long", 25*time.Hour); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("CreateAPIKey() above max ttl = %v", err)
 	}
-	if _, err := NewTokenService(nil, store, writer, time.Hour, time.Hour); err == nil {
+	if _, err := NewTokenService(nil, writer, time.Hour, time.Hour); err == nil {
 		t.Fatal("NewTokenService() accepted a missing store")
 	}
-	if _, err := NewTokenService(hosts, store, writer, 0, time.Hour); err == nil {
+	if _, err := NewTokenService(store, writer, 0, time.Hour); err == nil {
 		t.Fatal("NewTokenService() accepted invalid lifetimes")
 	}
 	if err := service.DeleteAPIKey(context.Background(), principal, "t7654321"); domain.CodeOf(err) != domain.CodeNotFound {
@@ -125,11 +125,11 @@ func TestCoverageAPIKeyLifecycleAndCurrentUser(t *testing.T) {
 		t.Fatalf("DeleteAPIKey() for another owner = %v", err)
 	}
 	failedAudit := &credentialAudit{err: errors.New("audit unavailable")}
-	failedService, err := NewTokenService(hosts, store, failedAudit, time.Hour, 24*time.Hour)
+	failedService, err := NewTokenService(store, failedAudit, time.Hour, 24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := failedService.CreateAPIKey(context.Background(), principal, "rollback", nil, []identity.Scope{identity.ScopeTaskSubmit}, time.Hour); err == nil {
+	if _, err := failedService.CreateAPIKey(context.Background(), principal, "rollback", time.Hour); err == nil {
 		t.Fatal("CreateAPIKey() ignored audit failure")
 	}
 }
@@ -227,7 +227,7 @@ func TestCoverageUserUsageOwnerIsolationAndUpdates(t *testing.T) {
 	}
 	admin := identity.Principal{Role: identity.RoleAdmin, Kind: identity.KindSystem}
 	items, err := userService.List(context.Background(), admin, nil)
-	want := ResourceUsage{Hosts: 5, CPUMilli: 1500, MemMiB: 2000}
+	want := ResourceUsage{Hosts: 7, CPUMilli: 1500, MemMiB: 2000}
 	if err != nil || len(items) != 1 || items[0].Usage != want {
 		t.Fatalf("UserService.List() = %#v, %v", items, err)
 	}
@@ -237,7 +237,7 @@ func TestCoverageUserUsageOwnerIsolationAndUpdates(t *testing.T) {
 		t.Fatalf("CurrentUser() = %#v, %v", current, err)
 	}
 	role := identity.RoleAdmin
-	quota := ResourceUsage{Hosts: 7, CPUMilli: 9000, MemMiB: 12000}
+	quota := ResourceUsage{Hosts: 7, CPUMilli: 9000, MemMiB: 16000}
 	updated, err := userService.Update(context.Background(), admin, member.UserID, UpdateUserCommand{
 		ExpectedStatus: identity.StatusApproved, Role: &role, Quota: &quota,
 	})
@@ -515,10 +515,10 @@ func TestCoverageConstructorsRejectInvalidDependencies(t *testing.T) {
 		t.Fatal("fixture credential service was nil")
 	}
 	options := CredentialOptions{SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute}
-	if _, err := NewCredentialService(nil, hosts, tokens, auditor, options); err == nil {
+	if _, err := NewCredentialService(nil, hosts, tokens, auditor, options, hosts); err == nil {
 		t.Fatal("NewCredentialService() accepted a missing user store")
 	}
-	if _, err := NewCredentialService(users, hosts, tokens, auditor, CredentialOptions{}); err == nil {
+	if _, err := NewCredentialService(users, hosts, tokens, auditor, CredentialOptions{}, hosts); err == nil {
 		t.Fatal("NewCredentialService() accepted invalid limits")
 	}
 	if _, err := NewUserService(nil, hosts); err == nil {

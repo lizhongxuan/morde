@@ -17,7 +17,10 @@ import (
 	"morde/server/internal/runtimeclient"
 )
 
-const runtimeControlPort = 8090
+const (
+	runtimeControlPort     = 8090
+	runtimeTaskLeaseWindow = 25 * time.Second
+)
 
 // RuntimeSession is a verified, per-call runtime connection. Its protocol
 // client is private so callers can only use methods that retain the verified
@@ -303,10 +306,19 @@ func (s *RuntimeSession) SetTaskLease(ctx context.Context, taskID string, leaseV
 	if s == nil || s.client == nil {
 		return domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
 	}
+	expiresAt = boundedRuntimeLeaseExpiry(time.Now().UTC(), expiresAt.UTC())
 	_, err := s.client.SetTaskLease(ctx, taskID, runtimeclient.SetTaskLeaseRequest{
-		HostFence: s.Fence, LeaseVersion: leaseVersion, ExpiresAt: expiresAt.UTC(),
+		HostFence: s.Fence, LeaseVersion: leaseVersion, ExpiresAt: expiresAt,
 	})
 	return err
+}
+
+func boundedRuntimeLeaseExpiry(now, taskExpiry time.Time) time.Time {
+	limit := now.Add(runtimeTaskLeaseWindow)
+	if taskExpiry.After(limit) {
+		return limit
+	}
+	return taskExpiry
 }
 
 func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64) (runtimeclient.Operation, error) {

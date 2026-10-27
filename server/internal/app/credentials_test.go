@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,7 +82,48 @@ func (uniqueViolationError) SQLState() string { return "23505" }
 
 type credentialHosts struct {
 	HostStore
-	values []host.Host
+	mu        sync.Mutex
+	values    []host.Host
+	ensureErr error
+}
+
+func (s *credentialHosts) EnsureDefaultStopped(_ context.Context, user identity.User) (host.Host, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ensureErr != nil {
+		return host.Host{}, false, s.ensureErr
+	}
+	for _, value := range s.values {
+		if value.OwnerID == user.ID && value.DeletedAt == nil && value.State != host.StateDeleted {
+			return value, false, nil
+		}
+	}
+	if user.QuotaHosts == 0 {
+		return host.Host{}, false, nil
+	}
+	value := host.Host{ID: "h1234567", OwnerID: user.ID, State: host.StateStopped, CPUMilli: 1000, MemMiB: 2048}
+	s.values = append(s.values, value)
+	return value, true, nil
+}
+
+func TestCredentialLoginEnsuresOneStoppedHostBeforeIssuingSession(t *testing.T) {
+	service, _, hosts, _, tokens, _ := newCredentialFixture(t)
+	for _, ip := range []string{"127.0.0.1", "127.0.0.2"} {
+		if _, err := service.Login(context.Background(), "alice", "correct horse", ip); err != nil {
+			t.Fatalf("Login() error = %v", err)
+		}
+	}
+	if len(hosts.values) != 1 || hosts.values[0].State != host.StateStopped {
+		t.Fatalf("login default hosts = %#v", hosts.values)
+	}
+	hosts.ensureErr = errors.New("storage unavailable")
+	before := len(tokens.values)
+	if _, err := service.Login(context.Background(), "alice", "correct horse", "127.0.0.3"); err == nil {
+		t.Fatal("Login() succeeded when default host storage failed")
+	}
+	if len(tokens.values) != before {
+		t.Fatal("Login() issued a session after default host storage failed")
+	}
 }
 
 func (s *credentialHosts) GetHost(_ context.Context, id string) (host.Host, error) {
@@ -206,14 +248,17 @@ func newCredentialFixture(t *testing.T) (*CredentialService, *credentialUsers, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	users := &credentialUsers{values: map[string]identity.User{"u1234567": {ID: "u1234567", Name: "alice", PasswordHash: string(hash), Role: identity.RoleUser, Status: identity.StatusApproved}}}
+	users := &credentialUsers{values: map[string]identity.User{"u1234567": {
+		ID: "u1234567", Name: "alice", PasswordHash: string(hash), Role: identity.RoleUser, Status: identity.StatusApproved,
+		QuotaHosts: 1, QuotaCPUMilli: 4000, QuotaMemMiB: 8192, DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048,
+	}}}
 	hosts := &credentialHosts{}
 	workspaces := &credentialWorkspaces{values: map[string]workspace.Workspace{}}
 	tokens := &credentialTokens{values: map[string]identity.Token{}}
 	auditor := &credentialAudit{}
 	service, err := NewCredentialService(users, hosts, tokens, auditor, CredentialOptions{
 		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
-	})
+	}, hosts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +295,7 @@ func TestCredentialServiceLoginVerifyLogoutAndRateLimit(t *testing.T) {
 	}
 }
 
-func TestCredentialServiceVerifiesRevocableWorkspaceScopedDevice(t *testing.T) {
+func TestCredentialServiceVerifiesRevocableDynamicWorkspaceDevice(t *testing.T) {
 	service, _, _, _, tokens, _ := newCredentialFixture(t)
 	raw, secretHash, err := identity.NewCredential(identity.KindDevice, "tdevice1")
 	if err != nil {
@@ -258,7 +303,7 @@ func TestCredentialServiceVerifiesRevocableWorkspaceScopedDevice(t *testing.T) {
 	}
 	tokens.values["tdevice1"] = identity.Token{
 		ID: "tdevice1", OwnerID: "u1234567", Kind: identity.KindDevice, Name: "PC",
-		SecretHash: secretHash, WorkspaceIDs: []string{"w1234567"}, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+		SecretHash: secretHash, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	if _, err := service.VerifyDevice(context.Background(), raw); !errors.Is(err, identity.ErrInvalidCredential) {
@@ -270,20 +315,19 @@ func TestCredentialServiceVerifiesRevocableWorkspaceScopedDevice(t *testing.T) {
 	tokens.clientActive = true
 	principal, err := service.VerifyDevice(context.Background(), raw)
 	if err != nil || principal.Kind != identity.KindDevice || principal.Role != identity.RoleUser ||
-		!principal.AllowsWorkspace("w1234567") || principal.AllowsWorkspace("w7654321") || principal.HasScope(identity.ScopeComputerOperate) {
+		!principal.AllowsWorkspace("w1234567") || !principal.AllowsWorkspace("w7654321") || principal.HasScope(identity.ScopeComputerOperate) {
 		t.Fatalf("VerifyDevice() principal=%#v err=%v", principal, err)
 	}
 	if _, err := service.VerifyAPIKey(context.Background(), raw); !errors.Is(err, identity.ErrInvalidCredential) {
 		t.Fatalf("VerifyAPIKey(device) error = %v", err)
 	}
 	token = tokens.values["tdevice1"]
-	token.WorkspaceIDs = nil
-	tokens.values[token.ID] = token
-	principal, err = service.VerifyDevice(context.Background(), raw)
-	if err != nil || principal.AllowsWorkspace("w1234567") {
-		t.Fatalf("VerifyDevice(updated grants) principal=%#v err=%v", principal, err)
-	}
 	token.WorkspaceIDs = []string{"w1234567"}
+	tokens.values[token.ID] = token
+	if _, err := service.VerifyDevice(context.Background(), raw); !errors.Is(err, identity.ErrInvalidCredential) {
+		t.Fatalf("VerifyDevice(static grants) err=%v", err)
+	}
+	token.WorkspaceIDs = nil
 	token.ExpiresAt = time.Now().Add(-time.Second)
 	tokens.values[token.ID] = token
 	if _, err := service.VerifyDevice(context.Background(), raw); !errors.Is(err, identity.ErrInvalidCredential) {
@@ -362,7 +406,8 @@ func TestRegistrationHashesPasswordAndCreatesPendingUser(t *testing.T) {
 	}
 	created, err := service.Register(context.Background(), "  bob ", "safe password", "192.0.2.1")
 	if err != nil || created.Name != "bob" || created.Role != identity.RoleUser || created.Status != identity.StatusPending ||
-		created.Quota != (ResourceUsage{Hosts: 3, CPUMilli: 4000, MemMiB: 8192}) {
+		created.Quota != (ResourceUsage{Hosts: 1, CPUMilli: 4000, MemMiB: 8192}) ||
+		created.DefaultHostResources != (HostResources{CPUMilli: 1000, MemMiB: 2048}) {
 		t.Fatalf("Register() = %#v, %v", created, err)
 	}
 	stored := users.values[created.ID]

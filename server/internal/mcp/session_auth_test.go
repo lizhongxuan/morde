@@ -34,7 +34,7 @@ func TestStreamableHTTPSessionUsesCurrentAPIKeyPrincipal(t *testing.T) {
 		PreviewPortMin: 1024,
 		Config:         config.MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 2},
 		Domains:        config.Domains{Scheme: "https", HostSuffix: "hosts.example.test"},
-		Hosts:          hosts, Applications: newApplicationStatusServiceStub(), RuntimeTools: &runtimeComputerToolsStub{}, Tasks: newTaskServiceStub(), Schedules: scheduleServiceFake{}, Auth: verifier, Audit: &auditStub{},
+		Hosts:          hosts, Applications: newApplicationStatusServiceStub(), RuntimeTools: &runtimeComputerToolsStub{}, Auth: verifier, Audit: &auditStub{},
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(),
 	})
 	if err != nil {
@@ -79,7 +79,7 @@ func TestStreamableHTTPSessionUsesCurrentAPIKeyPrincipal(t *testing.T) {
 	transport.setToken("chk_b")
 	createCalls := hosts.createCalls.Load()
 	created, callErr := session.CallTool(context.Background(), &sdk.CallToolParams{
-		Name: "host_create", Arguments: map[string]any{"template_id": "python", "idempotency_key": "host-create-key-002"},
+		Name: "host_create", Arguments: map[string]any{"idempotency_key": "host-create-key-002"},
 	})
 	if callErr == nil && created != nil && !created.IsError {
 		t.Errorf("host_create with another user's session succeeded: %+v", created)

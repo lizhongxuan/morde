@@ -13,7 +13,7 @@ import (
 func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "stop-pause-task", "pause this task"))
 	if err != nil {
@@ -73,7 +73,7 @@ func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_stop_test' WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 func TestPostgresPendingResponseAdvancesTaskLeaseVersion(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "pending-version-task", "wait for approval"))
 	if err != nil {
@@ -247,7 +247,7 @@ VALUES ($1,$2,1,'approval','Approve change','remote change','Approve this operat
 func TestPostgresCancelSettlesPendingClarification(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "clarification-cancel-submit", "perform task"))
 	if err != nil {

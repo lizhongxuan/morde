@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/httpserver"
 )
 
@@ -72,6 +73,20 @@ func (h *api) serveApp(c *gin.Context) {
 
 func (h *api) serveAdmin(c *gin.Context) {
 	httpserver.SetRoute(c, "admin_static")
+	for _, cookie := range c.Request.Cookies() {
+		if cookie.Name != portalCookieName {
+			continue
+		}
+		kind, _, _, err := identity.ParseCredential(cookie.Value)
+		if err != nil || kind != identity.KindSession {
+			continue
+		}
+		principal, err := h.deps.Verifier.VerifySession(c.Request.Context(), cookie.Value)
+		if err == nil && principal.ClientInstallationID != "" {
+			httpserver.WriteError(c, domain.NewError(domain.CodeForbidden, "client Web session cannot access administration"))
+			return
+		}
+	}
 	files := h.options.PortalFiles
 	if files == nil {
 		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))

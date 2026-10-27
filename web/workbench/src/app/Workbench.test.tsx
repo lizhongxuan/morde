@@ -48,6 +48,9 @@ describe('Workbench MVP navigation', () => {
     expect(screen.getByRole('button', { name: '终端' })).toBeVisible();
     expect(screen.getByRole('button', { name: '文件' })).toBeVisible();
     expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '文件' }));
+    expect(screen.getByText('请先接管电脑后使用文件。')).toBeVisible();
+    expect(screen.queryByLabelText('当前路径')).not.toBeInTheDocument();
     expect(screen.queryByText(/Codex|微信|QQ|飞书/)).not.toBeInTheDocument();
     await waitFor(() => expect(gatewayApi.host).toHaveBeenCalledOnce());
     appApi.forEach((call) => expect(call).not.toHaveBeenCalled());

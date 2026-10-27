@@ -77,12 +77,12 @@ func (a tokenAdapter) ListAPIKeys(ctx context.Context, principal identity.Princi
 	return a.service.ListAPIKeys(ctx, principal)
 }
 
-func (a tokenAdapter) CreateAPIKey(ctx context.Context, principal identity.Principal, name string, hostIDs []string, scopes []identity.Scope, ttl time.Duration) (api.CreatedAPIKey, error) {
-	value, err := a.service.CreateAPIKey(ctx, principal, name, hostIDs, scopes, ttl)
+func (a tokenAdapter) CreateAPIKey(ctx context.Context, principal identity.Principal, name string, ttl time.Duration) (api.CreatedAPIKey, error) {
+	value, err := a.service.CreateAPIKey(ctx, principal, name, ttl)
 	if err != nil {
 		return api.CreatedAPIKey{}, err
 	}
-	return api.CreatedAPIKey{ID: value.ID, Key: value.Key, HostIDs: value.HostIDs, Scopes: value.Scopes, ExpiresAt: value.ExpiresAt}, nil
+	return api.CreatedAPIKey{ID: value.ID, Key: value.Key, ExpiresAt: value.ExpiresAt}, nil
 }
 
 func (a tokenAdapter) DeleteAPIKey(ctx context.Context, principal identity.Principal, id string) error {
@@ -164,8 +164,12 @@ func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Princip
 		value := usage(*command.Quota)
 		quota = &value
 	}
+	var defaultHostResources *app.HostResources
+	if command.DefaultHostResources != nil {
+		defaultHostResources = &app.HostResources{CPUMilli: command.DefaultHostResources.CPUMilli, MemMiB: command.DefaultHostResources.MemMiB}
+	}
 	updated, err := a.users.Update(ctx, principal, id, app.UpdateUserCommand{
-		ExpectedStatus: command.ExpectedStatus, Role: command.Role, Status: command.Status, Quota: quota,
+		ExpectedStatus: command.ExpectedStatus, Role: command.Role, Status: command.Status, Quota: quota, DefaultHostResources: defaultHostResources,
 	})
 	if err != nil {
 		return api.AdminUserRecord{}, err
@@ -205,6 +209,7 @@ func adminUser(value app.UserSummary) api.AdminUserRecord {
 	return api.AdminUserRecord{
 		ID: value.ID, Name: value.Name, Role: value.Role, Status: value.Status,
 		Quota: totals(value.Quota), Usage: totals(value.Usage), CreatedAt: value.CreatedAt,
+		DefaultHostResources: api.HostResourcesView{CPUMilli: value.DefaultHostResources.CPUMilli, MemMiB: value.DefaultHostResources.MemMiB},
 	}
 }
 

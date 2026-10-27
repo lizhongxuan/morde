@@ -2,19 +2,13 @@ package identity
 
 import "testing"
 
-func TestAPIKeyPrincipalRequiresExplicitScopeAndHost(t *testing.T) {
-	key := Principal{Kind: KindAPIKey, Scopes: []Scope{ScopeComputerObserve}, HostIDs: []string{"h1234567"}}
+func TestAPIKeyPrincipalUsesCurrentAccountHostAuthorization(t *testing.T) {
+	key := Principal{Kind: KindAPIKey}
 	if !key.CanAccessHost("h1234567", ScopeComputerObserve) {
-		t.Fatal("explicit matching scope and Host should be allowed")
+		t.Fatal("valid host candidate should pass scope check before owner/share authorization")
 	}
-	for _, principal := range []Principal{
-		{Kind: KindAPIKey, Scopes: []Scope{ScopeComputerObserve}},
-		{Kind: KindAPIKey, HostIDs: []string{"h1234567"}},
-		{Kind: KindAPIKey, Scopes: []Scope{"*"}, HostIDs: []string{"h1234567"}},
-	} {
-		if principal.CanAccessHost("h1234567", ScopeComputerObserve) {
-			t.Fatalf("principal %#v gained access without explicit scope and Host", principal)
-		}
+	if key.CanAccessHost("bad", ScopeComputerObserve) || key.CanAccessHost("h1234567", ScopeTaskSubmit) {
+		t.Fatal("invalid host or retired task capability was allowed")
 	}
 	if (Principal{Kind: KindSession}).CanAccessHost("h1234567", ScopeComputerObserve) != true {
 		t.Fatal("session should retain its authenticated user authorization")
@@ -34,25 +28,28 @@ func TestValidScope(t *testing.T) {
 	}
 }
 
-func TestScheduleScopesStayExplicit(t *testing.T) {
-	key := Principal{Kind: KindAPIKey, HostIDs: []string{"h1234567"}, Scopes: []Scope{ScopeScheduleManage}}
-	if !key.CanAccessHost("h1234567", ScopeScheduleManage) {
-		t.Fatal("schedule:manage must allow a schedule operation for an explicitly permitted Host")
-	}
-	if key.CanAccessHost("h1234567", ScopeTaskSubmit) || key.CanAccessHost("h1234567", ScopeScheduleRead) {
-		t.Fatal("schedule:manage must not imply task:submit or schedule:read")
+func TestRetiredTaskAndScheduleScopesAreUnavailableToAPIKeys(t *testing.T) {
+	key := Principal{Kind: KindAPIKey}
+	for _, scope := range []Scope{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskControl, ScopeScheduleRead, ScopeScheduleManage} {
+		if key.CanAccessHost("h1234567", scope) {
+			t.Fatalf("retired scope %q was allowed", scope)
+		}
 	}
 }
 
-func TestDeviceCredentialIsLimitedToGrantedWorkspaces(t *testing.T) {
+func TestDeviceCredentialUsesDynamicWorkspaceAuthorization(t *testing.T) {
 	device := Principal{
-		Kind: KindDevice, WorkspaceIDs: []string{"w1234567"}, Scopes: []Scope{ScopeWorkspaceSync},
+		Kind: KindDevice, ClientInstallationID: "i1234567", Scopes: []Scope{ScopeWorkspaceSync},
 	}
-	if !device.AllowsWorkspace("w1234567") {
-		t.Fatal("device should access an explicitly granted workspace")
+	if !device.AllowsWorkspace("w1234567") || !device.AllowsWorkspace("w7654321") {
+		t.Fatal("device should allow candidate workspaces for an owner and ready check")
 	}
-	if device.AllowsWorkspace("w7654321") || device.HasScope(ScopeHostRead) {
-		t.Fatal("device gained access outside its workspace synchronization grant")
+	if device.AllowsWorkspace("bad") || device.HasScope(ScopeHostRead) {
+		t.Fatal("device gained access outside its workspace synchronization scope")
+	}
+	device.ClientInstallationID = ""
+	if device.AllowsWorkspace("w1234567") {
+		t.Fatal("unbound device accessed workspace")
 	}
 	apiKey := Principal{Kind: KindAPIKey, Scopes: []Scope{ScopeWorkspaceSync}}
 	if apiKey.HasScope(ScopeWorkspaceSync) {

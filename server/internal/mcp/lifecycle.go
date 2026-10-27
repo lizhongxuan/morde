@@ -63,7 +63,7 @@ func (s *service) lifecycle(ctx context.Context, p identity.Principal, name stri
 			}
 		}
 		value, err := s.deps.Hosts.Create(ctx, p, app.CreateHostCommand{
-			TemplateID: stringArg(args, "template_id"), Name: stringArg(args, "name"), WorkspaceIDs: workspaceIDs,
+			Name: stringArg(args, "name"), WorkspaceIDs: workspaceIDs,
 			IdempotencyKey: stringArg(args, "idempotency_key"),
 		})
 		if err != nil {

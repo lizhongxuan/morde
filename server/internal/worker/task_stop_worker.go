@@ -125,7 +125,7 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 	for ctx.Err() == nil {
 		if err := w.reconcileExecutionStops(ctx); err != nil {
 			w.logger.Error("reconcile owner execution stop failed", zap.String("error_type", fmt.Sprintf("%T", err)))
-			if !waitTaskWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(ctx, w.pollInterval) {
 				break
 			}
 			continue
@@ -136,13 +136,13 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 		}
 		if err != nil {
 			w.logger.Error("claim task stop failed", zap.String("error_type", fmt.Sprintf("%T", err)))
-			if !waitTaskWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(ctx, w.pollInterval) {
 				break
 			}
 			continue
 		}
 		if !ok {
-			if !waitTaskWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(ctx, w.pollInterval) {
 				break
 			}
 			continue
@@ -150,7 +150,7 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 		if err := w.validateClaim(claim); err != nil {
 			w.logger.Error("task stop claim is invalid", zap.String("error_type", fmt.Sprintf("%T", err)))
 			w.release(claim, ctx)
-			if !waitTaskWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(ctx, w.pollInterval) {
 				break
 			}
 			continue
@@ -160,7 +160,7 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 				w.logger.Error("task stop recovery deferred", zap.String("task_id", claim.Task.ID), zap.String("request_id", claim.Request.ID), zap.String("error_type", fmt.Sprintf("%T", err)))
 			}
 			w.release(claim, ctx)
-			if !waitTaskWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(ctx, w.pollInterval) {
 				break
 			}
 		}
@@ -371,5 +371,16 @@ func terminalOperationStatus(status task.OperationStatus) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func waitStopWorker(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
 	}
 }

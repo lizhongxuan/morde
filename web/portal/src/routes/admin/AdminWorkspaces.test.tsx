@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import type { components } from '../../api/schema';
 import { portalApi } from '../../app/api';
+import { ToastProvider } from '../../app/toast';
 import { AdminWorkspaceDetail } from './AdminWorkspaceDetail';
 import { AdminUserDetail } from './AdminUserDetail';
 import { AdminWorkspaces } from './AdminWorkspaces';
@@ -17,16 +18,17 @@ const workspace: components['schemas']['AdminWorkspace'] = {
 const user: components['schemas']['AdminUser'] = {
   id: 'u1234567', name: 'alice', role: 'user', status: 'approved',
   quota: { hosts: 2, cpu_milli: 4000, mem_mib: 8192 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 },
+  default_host_resources: { cpu_milli: 1000, mem_mib: 2048 },
   created_at: '2026-10-22T00:00:00Z',
 };
 
 function renderPage(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes>
+  return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/admin/workspaces" element={<AdminWorkspaces />} />
     <Route path="/admin/workspaces/:id" element={<AdminWorkspaceDetail />} />
     <Route path="/admin/users/:id" element={<AdminUserDetail />} />
-  </Routes></MemoryRouter></QueryClientProvider>);
+  </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
 describe('admin workspaces', () => {
@@ -55,6 +57,7 @@ describe('admin workspaces', () => {
   it('shows the user workspace metadata and finds it across pages', async () => {
     vi.spyOn(portalApi, 'adminUsers').mockResolvedValue({ items: [user] });
     vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'adminModelAccountBudget').mockResolvedValue({ owner_id: user.id, configured: false, token_limit: 0, max_concurrent: 0, used_tokens: 0, in_flight: 0, has_unknown: false });
     const list = vi.spyOn(portalApi, 'adminWorkspaces')
       .mockResolvedValueOnce({ items: [], next_cursor: 'next' })
       .mockResolvedValueOnce({ items: [workspace], next_cursor: null });

@@ -19,6 +19,7 @@ function userRecord(id: string, name: string, role: AdminUser['role'], status: A
     id, name, role, status,
     quota: { hosts: 2, cpu_milli: 2000, mem_mib: 4096 },
     usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 },
+    default_host_resources: { cpu_milli: 1000, mem_mib: 2048 },
     created_at: '2026-10-25T00:00:00Z',
   };
 }

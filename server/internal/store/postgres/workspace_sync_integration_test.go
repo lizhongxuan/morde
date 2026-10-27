@@ -483,14 +483,14 @@ func TestWorkspaceBindingDetachSerializesHostSyncSessionCreate(t *testing.T) {
 	}
 }
 
-func TestListDeviceWorkspaceSyncProgressRespectsCurrentGrantAndHidesDetails(t *testing.T) {
+func TestListDeviceWorkspaceSyncProgressRespectsActiveInstallationAndHidesDetails(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "device-progress")
-	makeDevice := func(name string, grants []string) identity.Token {
+	makeDevice := func(name string) identity.Token {
 		t.Helper()
-		installationID := createTestClientInstallation(t, pool, owner.ID, grants)
+		installationID := createTestClientInstallation(t, pool, owner.ID, nil)
 		id, err := domain.NewTokenID()
 		if err != nil {
 			t.Fatal(err)
@@ -501,7 +501,7 @@ func TestListDeviceWorkspaceSyncProgressRespectsCurrentGrantAndHidesDetails(t *t
 		}
 		token, err := store.CreateToken(ctx, identity.Token{
 			ID: id, OwnerID: owner.ID, ClientInstallationID: installationID, Kind: identity.KindDevice, Name: name,
-			WorkspaceIDs: grants, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+			Scopes:     []identity.Scope{identity.ScopeWorkspaceSync},
 			SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
 		})
 		if err != nil {
@@ -509,8 +509,8 @@ func TestListDeviceWorkspaceSyncProgressRespectsCurrentGrantAndHidesDetails(t *t
 		}
 		return token
 	}
-	device := makeDevice("authorized", []string{value.ID})
-	ungranted := makeDevice("ungranted", nil)
+	device := makeDevice("active")
+	revoked := makeDevice("revoked")
 	file := syncTestFile("private/path.txt", []byte("private"))
 	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{}, nil)
 	session.ReplicaID = "device:" + device.ID
@@ -523,9 +523,12 @@ func TestListDeviceWorkspaceSyncProgressRespectsCurrentGrantAndHidesDetails(t *t
 		t.Fatal(err)
 	}
 	ignored := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
-	ignored.ReplicaID = "device:" + ungranted.ID
+	ignored.ReplicaID = "device:" + revoked.ID
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, ignored, nil,
-		syncTestIdempotency(owner.ID, "workspace.sync.create", "progress:ungranted", ignored.ID)); err != nil {
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "progress:revoked", ignored.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeToken(ctx, revoked.ID, owner.ID); err != nil {
 		t.Fatal(err)
 	}
 

@@ -20,13 +20,14 @@ type adminUserListResponse struct {
 }
 
 type adminUserResponse struct {
-	ID        string                 `json:"id"`
-	Name      string                 `json:"name"`
-	Role      identity.Role          `json:"role"`
-	Status    identity.AccountStatus `json:"status"`
-	Quota     TotalsView             `json:"quota"`
-	Usage     TotalsView             `json:"usage"`
-	CreatedAt time.Time              `json:"created_at"`
+	ID                   string                 `json:"id"`
+	Name                 string                 `json:"name"`
+	Role                 identity.Role          `json:"role"`
+	Status               identity.AccountStatus `json:"status"`
+	Quota                TotalsView             `json:"quota"`
+	Usage                TotalsView             `json:"usage"`
+	DefaultHostResources HostResourcesView      `json:"default_host_resources"`
+	CreatedAt            time.Time              `json:"created_at"`
 }
 
 type capacityResponse struct {
@@ -52,6 +53,8 @@ type auditResponse struct {
 
 func (h *api) registerAdmin(group *gin.RouterGroup) {
 	group.GET("/admin/hosts", h.listAllHosts)
+	group.GET("/admin/hosts/:id/resources", h.getAdminHostResources)
+	group.PATCH("/admin/hosts/:id/resources", h.updateAdminHostResources)
 	group.GET("/admin/workspaces", h.listAdminWorkspaces)
 	group.GET("/admin/workspaces/:id", h.getAdminWorkspace)
 	group.GET("/admin/users", h.listUsers)
@@ -140,7 +143,7 @@ func (h *api) updateUser(c *gin.Context) {
 	}
 	var command UpdateAdminUserCommand
 	for name := range raw {
-		if name != "expected_status" && name != "status" && name != "role" && name != "quota" {
+		if name != "expected_status" && name != "status" && name != "role" && name != "quota" && name != "default_host_resources" {
 			writeError(c, domain.InvalidArgument("body", "contains an unsupported user field"))
 			return
 		}
@@ -178,7 +181,15 @@ func (h *api) updateUser(c *gin.Context) {
 		}
 		command.Quota = value
 	}
-	if command.Role == nil && command.Status == nil && command.Quota == nil {
+	if data, exists := raw["default_host_resources"]; exists {
+		var value *HostResourcesView
+		if err := json.Unmarshal(data, &value); err != nil || value == nil || value.CPUMilli <= 0 || value.MemMiB <= 0 {
+			writeError(c, domain.InvalidArgument("default_host_resources", "invalid host resources"))
+			return
+		}
+		command.DefaultHostResources = value
+	}
+	if command.Role == nil && command.Status == nil && command.Quota == nil && command.DefaultHostResources == nil {
 		writeError(c, domain.InvalidArgument("body", "at least one user field is required"))
 		return
 	}
@@ -293,7 +304,7 @@ func auditQuery(c *gin.Context) (AuditQuery, error) {
 }
 
 func toAdminUserResponse(item AdminUserRecord) (adminUserResponse, error) {
-	if !domain.ValidUserID(item.ID) || !validStoredRole(item.Role) || !item.Status.Valid() || !validTotals(item.Quota) || !validTotals(item.Usage) {
+	if !domain.ValidUserID(item.ID) || !validStoredRole(item.Role) || !item.Status.Valid() || !validTotals(item.Quota) || !validTotals(item.Usage) || item.DefaultHostResources.CPUMilli <= 0 || item.DefaultHostResources.MemMiB <= 0 {
 		return adminUserResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return adminUserResponse(item), nil

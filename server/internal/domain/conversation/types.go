@@ -10,20 +10,27 @@ const (
 )
 
 type Conversation struct {
-	ID        string
-	OwnerID   string
-	HostID    string
-	Title     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID              string
+	OwnerID         string
+	HostID          string
+	ModelID         string
+	Title           string
+	MessageSequence int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type Message struct {
-	ID             string
-	ConversationID string
-	OwnerID        string
-	Role           Role
-	Content        string
-	TaskID         string
-	CreatedAt      time.Time
+	ID                      string
+	ConversationID          string
+	OwnerID                 string
+	Role                    Role
+	Content                 string
+	TaskID                  string
+	ModelID                 string
+	Sequence                int64
+	SourceKind              string
+	SourceExchangeID        string
+	RequestedConversationID string
+	CreatedAt               time.Time
 }

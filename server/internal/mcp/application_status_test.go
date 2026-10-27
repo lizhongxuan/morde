@@ -64,7 +64,6 @@ func (s *applicationStatusServiceStub) snapshot() (int, identity.Principal, stri
 func TestHostCodexStatusMCPIsReadOnlyHostScopedAndSanitized(t *testing.T) {
 	principal := identity.Principal{
 		UserID: "user_test", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "token_test",
-		HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeComputerObserve},
 	}
 	applications := newApplicationStatusServiceStub()
 	runtime := &runtimeComputerToolsStub{}
@@ -128,7 +127,7 @@ func TestHostCodexStatusMCPIsReadOnlyHostScopedAndSanitized(t *testing.T) {
 	}
 }
 
-func TestHostCodexStatusMCPRequiresObserveGrantAndRunningOwnerHost(t *testing.T) {
+func TestHostCodexStatusMCPRequiresRunningOwnerHost(t *testing.T) {
 	tests := []struct {
 		name       string
 		principal  identity.Principal
@@ -136,23 +135,13 @@ func TestHostCodexStatusMCPRequiresObserveGrantAndRunningOwnerHost(t *testing.T)
 		wantCalls  int
 	}{
 		{
-			name:      "missing observe scope",
-			principal: identity.Principal{UserID: "user_test", Kind: identity.KindAPIKey, HostIDs: []string{"h1234567"}},
-			wantCalls: 0,
-		},
-		{
-			name:      "missing Host grant",
-			principal: identity.Principal{UserID: "user_test", Kind: identity.KindAPIKey, Scopes: []identity.Scope{identity.ScopeComputerObserve}},
-			wantCalls: 0,
-		},
-		{
 			name:       "stopped Host rejected by status service",
-			principal:  identity.Principal{UserID: "user_test", Kind: identity.KindAPIKey, HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeComputerObserve}},
+			principal:  identity.Principal{UserID: "user_test", Kind: identity.KindAPIKey},
 			serviceErr: domain.NewError(domain.CodeNotFound, "host not found"), wantCalls: 1,
 		},
 		{
 			name:       "non-owner Host rejected by status service",
-			principal:  identity.Principal{UserID: "user_test", Kind: identity.KindAPIKey, HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeComputerObserve}},
+			principal:  identity.Principal{UserID: "user_test", Kind: identity.KindAPIKey},
 			serviceErr: domain.NewError(domain.CodeNotFound, "host not found"), wantCalls: 1,
 		},
 	}
@@ -185,8 +174,7 @@ func TestHostCodexStatusMCPRequiresObserveGrantAndRunningOwnerHost(t *testing.T)
 
 func TestHostCodexStatusMCPRejectsUnsafeProbeResponseAndExtraCommand(t *testing.T) {
 	principal := identity.Principal{
-		UserID: "user_test", Kind: identity.KindAPIKey, HostIDs: []string{"h1234567"},
-		Scopes: []identity.Scope{identity.ScopeComputerObserve},
+		UserID: "user_test", Kind: identity.KindAPIKey,
 	}
 	for _, test := range []struct {
 		name      string
@@ -245,7 +233,7 @@ func newApplicationStatusMCPClient(t *testing.T, principal identity.Principal, a
 		Config:         config.MCP{Enabled: true, MaxOutputBytes: 4096, ScreenshotMaxWidth: 1280},
 		Domains:        config.Domains{Scheme: "https", HostSuffix: "hosts.example.test"},
 		Hosts:          &hostServiceStub{value: host.Host{ID: "h1234567", OwnerID: "user_test", State: host.StateRunning}},
-		Applications:   applications, RuntimeTools: runtime, Tasks: newTaskServiceStub(), Schedules: scheduleServiceFake{},
+		Applications:   applications, RuntimeTools: runtime,
 		Auth: apiKeyPrincipalVerifier{principal: principal}, Audit: audits, Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(),
 	})
 	if err != nil {

@@ -19,7 +19,6 @@ type CreateHostParams struct {
 	Host         host.Host
 	WorkspaceIDs []string
 	Capacity     Capacity
-	GrantTokenID string
 	Idempotency  IdempotencyRecord
 }
 

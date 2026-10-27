@@ -17,7 +17,7 @@ import (
 func TestPostgresScheduleOccurrenceAtomicallyCreatesTaskGraphAndDeduplicatesConcurrentPolls(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	scheduled := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
 	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: scheduled.Format(time.RFC3339), TimeZone: "UTC"}
@@ -109,7 +109,7 @@ func TestPostgresScheduleOccurrenceAtomicallyCreatesTaskGraphAndDeduplicatesConc
 func TestPostgresScheduleObservationConfigAndRunSnapshotPersist(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	scheduled := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
 	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: scheduled.Format(time.RFC3339), TimeZone: "UTC"}
@@ -148,7 +148,7 @@ func TestPostgresScheduleObservationConfigAndRunSnapshotPersist(t *testing.T) {
 func TestPostgresScheduleOverlapCreatesSkipWithoutSecondTask(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	active, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "schedule-overlap-task", "existing scheduled task"))
 	if err != nil {
@@ -187,10 +187,10 @@ VALUES ($1,$2,$3,$4,$5,$6,'queued',$7,$8)`, priorRunID, value.ID, owner.ID, valu
 	}
 }
 
-func TestPostgresRevokedScheduleKeyDoesNotBlockLaterDueSchedules(t *testing.T) {
+func TestPostgresSkippedScheduleDoesNotBlockLaterDueSchedules(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	events := []schedule.NotificationEvent{schedule.NotifyCompleted}
 
@@ -206,15 +206,24 @@ func TestPostgresRevokedScheduleKeyDoesNotBlockLaterDueSchedules(t *testing.T) {
 	validTiming := schedule.Timing{Kind: schedule.TimingOnce, RunAt: validTime.Format(time.RFC3339), TimeZone: "UTC"}
 	valid, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, validTiming, schedule.MisfireSkip, events)
 
-	service, err := app.NewScheduleService(store, scheduleAuthorizationTestDouble{}, scheduleModelTestDouble{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if processed, err := service.ProcessDue(ctx); err != nil || !processed {
-		t.Fatalf("ProcessDue(revoked) = %t, %v", processed, err)
-	}
-	if processed, err := service.ProcessDue(ctx); err != nil || !processed {
-		t.Fatalf("ProcessDue(valid) = %t, %v", processed, err)
+	// The scheduler is not currently wired; this checks the storage boundary for its decision.
+	for _, value := range []schedule.Schedule{revoked, valid} {
+		due, err := store.ListDueSchedules(ctx, time.Now().UTC(), 1)
+		if err != nil || len(due) != 1 || due[0].ID != value.ID {
+			t.Fatalf("due schedule = %#v, %v; want %s", due, err, value.ID)
+		}
+		occurrence := schedule.Occurrence{Key: value.NextOccurrenceKey, ScheduledAt: value.NextRunAt, CheckAt: *value.NextCheckAt, Status: schedule.RunQueued}
+		if value.ID == revoked.ID {
+			reason := schedule.SkipAuthorizationEnded
+			occurrence.Status, occurrence.SkipReason = schedule.RunSkipped, &reason
+		}
+		_, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+			ScheduleID: value.ID, OwnerID: owner.ID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+			Occurrence: occurrence, NotificationEvents: events,
+		})
+		if err != nil || !committed {
+			t.Fatalf("commit occurrence %s = %t, %v", value.ID, committed, err)
+		}
 	}
 
 	revokedResult, err := store.GetSchedule(ctx, owner.ID, revoked.ID)
@@ -234,25 +243,10 @@ func TestPostgresRevokedScheduleKeyDoesNotBlockLaterDueSchedules(t *testing.T) {
 	}
 }
 
-type scheduleAuthorizationTestDouble struct{}
-
-func (scheduleAuthorizationTestDouble) AuthorizeTaskAction(_ context.Context, _ string, kind identity.Kind, _ string, _ string, _ []identity.Scope, _ identity.Scope) error {
-	if kind == identity.KindAPIKey {
-		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
-	}
-	return nil
-}
-
-type scheduleModelTestDouble struct{}
-
-func (scheduleModelTestDouble) IsConfiguredModel(context.Context, string, string) (bool, error) {
-	return true, nil
-}
-
 func TestPostgresScheduleTriggerSerializesWithStopAllBarrier(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	scheduled := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
 	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: scheduled.Format(time.RFC3339), TimeZone: "UTC"}
@@ -324,7 +318,7 @@ func TestPostgresScheduleTriggerSerializesWithStopAllBarrier(t *testing.T) {
 func TestPostgresScheduleEnableDisableUsesOptimisticVersionAndRecomputesNextRun(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	timing := schedule.Timing{Kind: schedule.TimingDaily, StartsOn: time.Now().UTC().Format("2006-01-02"), LocalTime: "23:59", TimeZone: "UTC"}
 	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,

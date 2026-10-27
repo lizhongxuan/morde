@@ -12,7 +12,7 @@ const links = [
 ];
 
 const titles: Record<string, string> = {
-  '/admin': '总览', '/admin/users': '用户', '/admin/hosts': '云端电脑',
+  '/admin': '总览', '/admin/': '总览', '/admin/users': '用户', '/admin/hosts': '云端电脑',
   '/admin/workspaces': '工作区', '/admin/audit': '审计',
 };
 
@@ -21,7 +21,7 @@ export function AdminLayout() {
   const { notify } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
-  const title = titles[location.pathname] ?? (location.pathname.startsWith('/admin/users/') ? '用户详情' : location.pathname.startsWith('/admin/hosts/') ? '电脑详情' : '管理后台');
+  const title = titles[location.pathname] ?? (location.pathname.startsWith('/admin/users/') ? '用户详情' : location.pathname.startsWith('/admin/hosts/') ? '电脑详情' : location.pathname.startsWith('/admin/workspaces/') ? '工作区详情' : '管理后台');
   const logout = async () => {
     try { await signOut(); navigate('/admin/login', { replace: true }); }
     catch (error) { notify(`退出登录失败：${errorDetails(error).message}`, 'error'); }
@@ -42,7 +42,7 @@ export function AdminLayout() {
       </div>
     </aside>
     <main className="morde-main">
-      <header className="morde-topbar"><div className="morde-crumb"><span>管理后台</span><span aria-hidden="true">›</span><strong>{title}</strong></div><div className="morde-top-actions"><span className="morde-admin-role">管理员视图</span><span className="morde-top-user">{user?.name}</span></div></header>
+      <header className="morde-topbar"><div className="morde-crumb"><span>管理后台</span><span aria-hidden="true">›</span><h1 className="morde-crumb-title">{title}</h1></div><div className="morde-top-actions"><span className="morde-admin-role">管理员视图</span><span className="morde-top-user">{user?.name}</span></div></header>
       <div id="admin-content" className="morde-page admin-page" tabIndex={-1}><Outlet /></div>
     </main>
   </div>;

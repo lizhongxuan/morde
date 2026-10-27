@@ -143,12 +143,6 @@ func (s *service) dispatch(ctx context.Context, p identity.Principal, protocolSe
 	case "preview_url":
 		value, err := s.preview(ctx, p, args)
 		return value, nil, err
-	case "task_submit", "task_list", "task_get", "task_pause", "task_resume", "task_cancel", "task_respond":
-		value, err := s.task(ctx, p, name, args)
-		return value, nil, err
-	case "schedule_prepare", "schedule_create", "schedule_list", "schedule_get", "schedule_update", "schedule_enable", "schedule_disable", "schedule_runs":
-		value, err := s.schedule(ctx, p, name, args)
-		return value, nil, err
 	default:
 		value, image, err := s.hostTool(ctx, p, protocolSessionID, spec, args)
 		return value, image, err
@@ -197,16 +191,6 @@ func authorizeTool(principal identity.Principal, name string, args map[string]an
 		scopes = []identity.Scope{identity.ScopeHostManage}
 	case "host_renew":
 		scopes = []identity.Scope{identity.ScopeHostManage}
-	case "task_submit":
-		scopes = []identity.Scope{identity.ScopeTaskSubmit}
-	case "task_list", "task_get":
-		scopes = []identity.Scope{identity.ScopeTaskRead}
-	case "task_pause", "task_resume", "task_cancel", "task_respond":
-		scopes = []identity.Scope{identity.ScopeTaskControl}
-	case "schedule_prepare", "schedule_create", "schedule_update", "schedule_enable", "schedule_disable":
-		scopes = []identity.Scope{identity.ScopeScheduleManage}
-	case "schedule_list", "schedule_get", "schedule_runs":
-		scopes = []identity.Scope{identity.ScopeScheduleRead}
 	default:
 		if scope, ok := computerScopeForTool(name); ok {
 			scopes = []identity.Scope{scope}
@@ -219,13 +203,7 @@ func authorizeTool(principal identity.Principal, name string, args map[string]an
 			return domain.NewError(domain.CodeForbidden, "API key scope is insufficient")
 		}
 	}
-	if (name == "task_submit" || name == "schedule_prepare" || name == "schedule_create") && !principal.AllowsHost(stringArg(args, "host_id")) {
-		return domain.NewError(domain.CodeNotFound, "host not found")
-	}
-	if name != "host_create" && name != "host_list" && name != "task_list" && name != "task_get" &&
-		name != "task_pause" && name != "task_resume" && name != "task_cancel" && name != "task_respond" &&
-		name != "schedule_list" && name != "schedule_get" && name != "schedule_update" && name != "schedule_enable" && name != "schedule_disable" && name != "schedule_runs" &&
-		!principal.AllowsHost(stringArg(args, "host_id")) {
+	if name != "host_create" && name != "host_list" && !principal.AllowsHost(stringArg(args, "host_id")) {
 		return domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	return nil

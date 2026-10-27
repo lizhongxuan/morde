@@ -260,6 +260,9 @@ func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error)
 	if request.MaxOutputTokens < 1 || request.MaxOutputTokens > 32768 {
 		return nil, errors.New("model output token limit is invalid")
 	}
+	if request.Temperature != nil && (*request.Temperature < 0 || *request.Temperature > 2) {
+		return nil, errors.New("model temperature is invalid")
+	}
 	if len(request.Input) == 0 || len(request.Input) > maxInputs || len(request.Tools) > maxTools {
 		return nil, errors.New("model request input or tool count is invalid")
 	}
@@ -300,12 +303,19 @@ func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error)
 			Strict:      tool.Strict,
 		})
 	}
+	if request.RequiredTool != "" {
+		if _, ok := seen[request.RequiredTool]; !ok || choice != nil {
+			return nil, errors.New("required model tool is invalid")
+		}
+		choice = &toolChoice{Type: "function", Name: request.RequiredTool}
+	}
 	payload := responseRequest{
 		Model:           request.Endpoint.ModelID,
 		Instructions:    request.Instructions,
 		Input:           input,
 		Tools:           tools,
 		MaxOutputTokens: request.MaxOutputTokens,
+		Temperature:     request.Temperature,
 		Stream:          request.OnTextDelta != nil,
 		ToolChoice:      choice,
 	}
@@ -326,23 +336,52 @@ func encodeInput(item app.ModelInput) (any, int, error) {
 		if item.Role != "user" && item.Role != "assistant" && item.Role != "system" && item.Role != "developer" {
 			return nil, 0, errors.New("model message role is invalid")
 		}
-		if len(item.Text) > maxTextBytes || len(item.Images) > 8 {
+		if len(item.Text) > maxTextBytes || len(item.Images) > 8 || len(item.Parts) > 128 {
 			return nil, 0, errors.New("model message exceeds size limit")
 		}
-		content := make([]responseInputContent, 0, len(item.Images)+1)
-		if item.Text != "" {
-			content = append(content, responseInputContent{Type: "input_text", Text: item.Text})
+		if len(item.Parts) != 0 && (item.Text != "" || len(item.Images) != 0) {
+			return nil, 0, errors.New("model message content is ambiguous")
 		}
+		content := make([]responseInputContent, 0, len(item.Images)+len(item.Parts)+1)
 		total := 0
-		for _, image := range item.Images {
-			if len(image.Data) == 0 || len(image.Data) > maxImageBytes || !validImageMediaType(image.MediaType) {
-				return nil, 0, errors.New("model image input is invalid")
+		imageCount := 0
+		appendImage := func(image app.ModelImage) error {
+			imageCount++
+			if imageCount > 8 || len(image.Data) == 0 || len(image.Data) > maxImageBytes || !validImageMediaType(image.MediaType) {
+				return errors.New("model image input is invalid")
 			}
 			total += len(image.Data)
 			content = append(content, responseInputContent{
 				Type:     "input_image",
 				ImageURL: "data:" + image.MediaType + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
 			})
+			return nil
+		}
+		if item.Text != "" {
+			content = append(content, responseInputContent{Type: "input_text", Text: item.Text})
+		}
+		for _, image := range item.Images {
+			if err := appendImage(image); err != nil {
+				return nil, 0, err
+			}
+		}
+		for _, part := range item.Parts {
+			switch part.Type {
+			case "text":
+				if part.Image != nil || len(part.Text) > maxTextBytes {
+					return nil, 0, errors.New("model text content is invalid")
+				}
+				content = append(content, responseInputContent{Type: "input_text", Text: part.Text})
+			case "image":
+				if part.Image == nil || part.Text != "" {
+					return nil, 0, errors.New("model image content is invalid")
+				}
+				if err := appendImage(*part.Image); err != nil {
+					return nil, 0, err
+				}
+			default:
+				return nil, 0, errors.New("model message content is invalid")
+			}
 		}
 		if len(content) == 0 {
 			return nil, 0, errors.New("model message is empty")
@@ -622,6 +661,15 @@ func estimateRequestBytes(request app.ModelRequest) int64 {
 			}
 			size += int64(128 + 4*((len(image.Data)+2)/3))
 		}
+		for _, part := range input.Parts {
+			size += int64(1024 + 6*len(part.Text))
+			if part.Image != nil {
+				if len(part.Image.Data) > maxImageBytes || !validImageMediaType(part.Image.MediaType) {
+					return maxRequestBytes + 1
+				}
+				size += int64(128 + 4*((len(part.Image.Data)+2)/3))
+			}
+		}
 	}
 	for _, tool := range request.Tools {
 		size += int64(1024 + 6*(len(tool.Name)+len(tool.Description)+len(tool.Parameters)))
@@ -758,6 +806,7 @@ type responseRequest struct {
 	Tools           []responseTool `json:"tools,omitempty"`
 	ToolChoice      *toolChoice    `json:"tool_choice,omitempty"`
 	MaxOutputTokens int            `json:"max_output_tokens"`
+	Temperature     *float64       `json:"temperature,omitempty"`
 	Stream          bool           `json:"stream,omitempty"`
 }
 

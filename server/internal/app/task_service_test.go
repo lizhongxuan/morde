@@ -152,23 +152,6 @@ func (s *taskStoreStub) RequestTaskAction(_ context.Context, record IdempotencyR
 	return s.actionResult, nil
 }
 
-type taskAuthorizerStub struct {
-	err        error
-	hostErrors map[string]error
-	calls      int
-	lastHost   string
-	lastScope  identity.Scope
-}
-
-func (s *taskAuthorizerStub) AuthorizeTaskAction(_ context.Context, _ string, _ identity.Kind, _ string, hostID string, _ []identity.Scope, scope identity.Scope) error {
-	s.calls++
-	s.lastHost, s.lastScope = hostID, scope
-	if err, ok := s.hostErrors[hostID]; ok {
-		return err
-	}
-	return s.err
-}
-
 type modelCatalogStub struct {
 	configured bool
 	err        error
@@ -340,7 +323,7 @@ func TestTaskServiceRejectsUnscopedAPIKeyBeforeStoreWrite(t *testing.T) {
 	}
 }
 
-func TestTaskServiceAppendMessageRejectsConversationHostMismatch(t *testing.T) {
+func TestTaskServiceAppendMessageMaySwitchHostWithinConversation(t *testing.T) {
 	store := &taskStoreStub{conversations: map[string]conversation.Conversation{
 		"c1234567": {ID: "c1234567", OwnerID: "u1234567", HostID: "h7654321"},
 	}}
@@ -351,12 +334,12 @@ func TestTaskServiceAppendMessageRejectsConversationHostMismatch(t *testing.T) {
 	_, err = service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", AppendMessageCommand{
 		HostID: "h1234567", ModelID: "model-a", Content: "continue", IdempotencyKey: "retry-key-004",
 	})
-	if domain.CodeOf(err) != domain.CodeInvalidState || len(store.appends) != 0 {
-		t.Fatalf("host mismatch error=%v appends=%d", err, len(store.appends))
+	if err != nil || len(store.appends) != 1 || store.appends[0].Task.HostID != "h1234567" {
+		t.Fatalf("selected host was not applied per task: error=%v appends=%+v", err, store.appends)
 	}
 }
 
-func TestTaskServiceAppendHidesConversationBoundToUnauthorizedHost(t *testing.T) {
+func TestTaskServiceAppendDoesNotReuseConversationHostAuthorization(t *testing.T) {
 	store := &taskStoreStub{conversations: map[string]conversation.Conversation{
 		"c1234567": {ID: "c1234567", OwnerID: "u1234567", HostID: "h7654321"},
 	}}
@@ -370,12 +353,12 @@ func TestTaskServiceAppendHidesConversationBoundToUnauthorizedHost(t *testing.T)
 	_, err = service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", AppendMessageCommand{
 		HostID: "h1234567", ModelID: "model-a", Content: "continue", IdempotencyKey: "retry-key-012",
 	})
-	if domain.CodeOf(err) != domain.CodeNotFound || len(store.appends) != 0 || authorizer.lastHost != "h7654321" {
-		t.Fatalf("unauthorized conversation host error=%v appends=%d authorized_host=%s", err, len(store.appends), authorizer.lastHost)
+	if err != nil || len(store.appends) != 1 || authorizer.lastHost != "h1234567" {
+		t.Fatalf("selected host authorization error=%v appends=%d authorized_host=%s", err, len(store.appends), authorizer.lastHost)
 	}
 }
 
-func TestTaskServiceListPassesEmptyAPIKeyHostScopeAsEmptySlice(t *testing.T) {
+func TestTaskServiceListRejectsAPIKeyTaskScope(t *testing.T) {
 	store := &taskStoreStub{}
 	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
 	if err != nil {
@@ -385,11 +368,11 @@ func TestTaskServiceListPassesEmptyAPIKeyHostScopeAsEmptySlice(t *testing.T) {
 		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "t1234567",
 		Scopes: []identity.Scope{identity.ScopeTaskRead},
 	}
-	if _, err := service.List(context.Background(), principal, TaskListRequest{}); err != nil {
-		t.Fatal(err)
+	if _, err := service.List(context.Background(), principal, TaskListRequest{}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("API key task access should be denied: %v", err)
 	}
-	if store.listHostIDs == nil || len(store.listHostIDs) != 0 {
-		t.Fatalf("empty key Host allow-list became unrestricted: %#v", store.listHostIDs)
+	if store.listHostIDs != nil {
+		t.Fatalf("denied API key reached task storage: %#v", store.listHostIDs)
 	}
 }
 
@@ -603,14 +586,11 @@ func TestTaskServiceListFiltersKeyHostsThroughCurrentAuthorization(t *testing.T)
 		HostIDs: []string{"h7654321", "h1234567", "h1234567"}, Scopes: []identity.Scope{identity.ScopeTaskRead},
 	}
 	authorizer.err = domain.NewError(domain.CodeNotFound, "host not found")
-	if _, err := service.List(context.Background(), principal, TaskListRequest{}); err != nil {
-		t.Fatal(err)
+	if _, err := service.List(context.Background(), principal, TaskListRequest{}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("API key task access should be denied: %v", err)
 	}
-	if store.listHostIDs == nil || len(store.listHostIDs) != 0 {
-		t.Fatalf("revoked Host remained visible: %#v", store.listHostIDs)
-	}
-	if authorizer.calls != 2 {
-		t.Fatalf("duplicate Host was checked; calls=%d", authorizer.calls)
+	if store.listHostIDs != nil || authorizer.calls != 0 {
+		t.Fatalf("denied API key reached task storage/host authorization: hosts=%#v calls=%d", store.listHostIDs, authorizer.calls)
 	}
 }
 
@@ -626,8 +606,4 @@ func TestTaskServiceRejectsModelCatalogFailure(t *testing.T) {
 	if err == nil || len(store.submissions) != 0 {
 		t.Fatalf("catalog error=%v submissions=%d", err, len(store.submissions))
 	}
-}
-
-func taskTestPrincipal() identity.Principal {
-	return identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 }

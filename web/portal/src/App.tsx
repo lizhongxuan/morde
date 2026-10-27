@@ -7,17 +7,15 @@ import { PortalLayout } from './components/PortalLayout';
 import { ApiKeys } from './routes/ApiKeys';
 import { Assistant } from './routes/Assistant';
 import { Connections } from './routes/Connections';
-import { ClientAuthorization } from './routes/ClientAuthorization';
 import { Clients } from './routes/Clients';
 import { Downloads } from './routes/Downloads';
 import { Hosts } from './routes/Hosts';
+import { HostEntry } from './routes/HostEntry';
 import { Login } from './routes/Login';
 import { Register } from './routes/Register';
 import { ChangePassword } from './routes/ChangePassword';
 import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
-import { TaskDetail } from './routes/TaskDetail';
-import { Tasks } from './routes/Tasks';
 import { Dashboard } from './routes/Dashboard';
 import { Workspaces } from './routes/Workspaces';
 import { AdminAudit } from './routes/admin/AdminAudit';
@@ -46,18 +44,16 @@ function UserRoutes() {
     <Route path="/register" element={<Register />} />
     <Route path="/download" element={<Downloads />} />
     <Route element={<RouteGuard />}>
+      <Route path="host-entry/:id" element={<HostEntry />} />
       <Route element={<PortalLayout />}>
         <Route index element={<Dashboard />} />
         <Route path="assistant" element={<Assistant />} />
         <Route path="hosts" element={<Hosts />} />
         <Route path="hosts/new" element={<NewHost />} />
-        <Route path="tasks" element={<Tasks />} />
-        <Route path="tasks/:id" element={<TaskDetail />} />
         <Route path="notifications" element={<Notifications />} />
         <Route path="workspaces" element={<Workspaces />} />
         <Route path="connections" element={<Connections />} />
         <Route path="apikeys" element={<ApiKeys />} />
-        <Route path="client-authorize" element={<ClientAuthorization />} />
         <Route path="clients" element={<Clients />} />
       </Route>
     </Route>

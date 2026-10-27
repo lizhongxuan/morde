@@ -39,7 +39,7 @@ func (s *TaskService) RequestAction(
 	if err != nil {
 		return TaskActionResult{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, details.Task.HostID, taskControlScope); err != nil {
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return TaskActionResult{}, hideTaskAccessError(err)
 	}
 	requestID, err := domain.NewTaskActionID()

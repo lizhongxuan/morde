@@ -102,6 +102,8 @@ type Authorization struct {
 	TokenID              string
 	ClientInstallationID string
 	Scopes               []string
+	Version              int64
+	ExpiresAt            *time.Time
 }
 
 type Lease struct {
@@ -111,24 +113,36 @@ type Lease struct {
 }
 
 type Task struct {
-	ID             string
-	OwnerID        string
-	ConversationID string
-	HostID         string
-	ApplicationID  string
-	ModelID        string
-	Objective      string
-	Status         Status
-	Authorization  Authorization
-	Budget         Budget
-	Usage          Usage
-	Lease          Lease
-	CurrentStep    string
-	Result         string
-	WaitingReason  string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	FinishedAt     *time.Time
+	ID                        string
+	OwnerID                   string
+	ConversationID            string
+	HostID                    string
+	ExecutionLocation         string
+	ApplicationID             string
+	ModelID                   string
+	WorkspaceID               string
+	InputRevision             *int64
+	ContextDigest             []byte
+	AgentInstanceID           string
+	AgentGeneration           int64
+	AgentSessionID            string
+	AgentEngineVersion        string
+	AgentProfileVersion       string
+	CheckpointDigest          []byte
+	CheckpointThroughSequence int64
+	EventSequence             int64
+	Objective                 string
+	Status                    Status
+	Authorization             Authorization
+	Budget                    Budget
+	Usage                     Usage
+	Lease                     Lease
+	CurrentStep               string
+	Result                    string
+	WaitingReason             string
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+	FinishedAt                *time.Time
 }
 
 type Step struct {

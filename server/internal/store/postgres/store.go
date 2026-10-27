@@ -215,14 +215,14 @@ func (s *Store) CreateUser(ctx context.Context, value identity.User) (identity.U
 	if !domain.ValidUserID(value.ID) || strings.TrimSpace(value.Name) == "" || value.Name != strings.TrimSpace(value.Name) ||
 		strings.EqualFold(value.Name, "admin") || value.PasswordHash == "" || value.Role != identity.RoleUser ||
 		value.Status != identity.StatusPending || value.MustChangePassword || value.QuotaHosts < 0 ||
-		value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 {
+		value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 || value.DefaultHostCPUMilli <= 0 || value.DefaultHostMemMiB <= 0 {
 		return identity.User{}, domain.InvalidArgument("user", "new users must be pending standard accounts with valid fields")
 	}
 	row, err := s.q.CreateUser(ctx, sqlcgen.CreateUserParams{
 		ID: value.ID, Name: value.Name, PasswordHash: value.PasswordHash, Role: string(value.Role),
 		Status: string(value.Status), MustChangePassword: value.MustChangePassword,
 		QuotaHosts: int32(value.QuotaHosts), QuotaCpuMilli: int32(value.QuotaCPUMilli),
-		QuotaMemMib: int32(value.QuotaMemMiB),
+		QuotaMemMib: int32(value.QuotaMemMiB), DefaultHostCpuMilli: int32(value.DefaultHostCPUMilli), DefaultHostMemMib: int32(value.DefaultHostMemMiB),
 	})
 	if err != nil {
 		return identity.User{}, fmt.Errorf("create user: %w", err)
@@ -245,7 +245,7 @@ func (s *Store) UpdateUserWithAudit(ctx context.Context, actorID string, expecte
 func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, auditParams *sqlcgen.CreateAuditLogParams) (identity.User, error) {
 	if !domain.ValidUserID(value.ID) || !expectedStatus.Valid() || !value.Status.Valid() ||
 		(value.Role != identity.RoleUser && value.Role != identity.RoleAdmin && value.Role != identity.RoleSuperAdmin) ||
-		value.QuotaHosts < 0 || value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 {
+		value.QuotaHosts < 0 || value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 || value.DefaultHostCPUMilli <= 0 || value.DefaultHostMemMiB <= 0 {
 		return identity.User{}, domain.InvalidArgument("user", "user fields or expected status are invalid")
 	}
 	var updated identity.User
@@ -255,17 +255,18 @@ func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus i
 		}
 		var currentName, currentPasswordHash, currentRole, currentStatus string
 		var currentMustChangePassword bool
-		var currentQuotaHosts, currentQuotaCPUMilli, currentQuotaMemMiB int
+		var currentQuotaHosts, currentQuotaCPUMilli, currentQuotaMemMiB, currentDefaultCPU, currentDefaultMem int
 		if err := tx.QueryRow(ctx, `SELECT name, password_hash, role, status, must_change_password,
-quota_hosts, quota_cpu_milli, quota_mem_mib FROM users WHERE id=$1 FOR UPDATE`, value.ID).Scan(
+quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_host_mem_mib FROM users WHERE id=$1 FOR UPDATE`, value.ID).Scan(
 			&currentName, &currentPasswordHash, &currentRole, &currentStatus, &currentMustChangePassword,
-			&currentQuotaHosts, &currentQuotaCPUMilli, &currentQuotaMemMiB); err != nil {
+			&currentQuotaHosts, &currentQuotaCPUMilli, &currentQuotaMemMiB, &currentDefaultCPU, &currentDefaultMem); err != nil {
 			return storeError("update user", "user", err)
 		}
 		current := identity.User{
 			Name: currentName, PasswordHash: currentPasswordHash, Role: identity.Role(currentRole),
 			Status: identity.AccountStatus(currentStatus), MustChangePassword: currentMustChangePassword,
 			QuotaHosts: currentQuotaHosts, QuotaCPUMilli: currentQuotaCPUMilli, QuotaMemMiB: currentQuotaMemMiB,
+			DefaultHostCPUMilli: currentDefaultCPU, DefaultHostMemMiB: currentDefaultMem,
 		}
 		if current.Status != expectedStatus {
 			return domain.NewError(domain.CodeConflict, "account status changed; refresh the user list")
@@ -290,7 +291,7 @@ quota_hosts, quota_cpu_milli, quota_mem_mib FROM users WHERE id=$1 FOR UPDATE`, 
 			if current.Name != "admin" || current.Role != identity.RoleSuperAdmin || actorID != value.ID ||
 				value.Name != current.Name || value.Role != current.Role || value.Status != current.Status ||
 				value.QuotaHosts != current.QuotaHosts || value.QuotaCPUMilli != current.QuotaCPUMilli ||
-				value.QuotaMemMiB != current.QuotaMemMiB || value.MustChangePassword {
+				value.QuotaMemMiB != current.QuotaMemMiB || value.DefaultHostCPUMilli != current.DefaultHostCPUMilli || value.DefaultHostMemMiB != current.DefaultHostMemMiB || value.MustChangePassword {
 				return domain.NewError(domain.CodeForbidden, "the super administrator account is protected")
 			}
 		}
@@ -301,7 +302,7 @@ quota_hosts, quota_cpu_milli, quota_mem_mib FROM users WHERE id=$1 FOR UPDATE`, 
 			ID: value.ID, Name: value.Name, PasswordHash: value.PasswordHash, Role: string(value.Role),
 			Status: string(value.Status), MustChangePassword: value.MustChangePassword,
 			QuotaHosts: int32(value.QuotaHosts), QuotaCpuMilli: int32(value.QuotaCPUMilli),
-			QuotaMemMib: int32(value.QuotaMemMiB), ExpectedStatus: string(expectedStatus),
+			QuotaMemMib: int32(value.QuotaMemMiB), DefaultHostCpuMilli: int32(value.DefaultHostCPUMilli), DefaultHostMemMib: int32(value.DefaultHostMemMiB), ExpectedStatus: string(expectedStatus),
 		})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {

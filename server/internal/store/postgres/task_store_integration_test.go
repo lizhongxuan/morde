@@ -10,18 +10,20 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	auditdomain "morde/server/internal/domain/audit"
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "create-task", "first work")
@@ -119,10 +121,114 @@ func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
 	}
 }
 
+func TestPostgresConversationChangesTargetAndRejectsOperationAfterHostUnready(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20000, 40000)
+	firstHost := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	secondHost := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	first, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, firstHost.ID, "switch-first", "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='completed', finished_at=clock_timestamp() WHERE id=$1`, first.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, secondHost.ID); err != nil {
+		t.Fatal(err)
+	}
+	secondInput := newTestTaskSubmission(t, owner.ID, secondHost.ID, "switch-second", "second")
+	secondInput.Task.ConversationID = first.Conversation.ID
+	secondInput.Task.ModelID = "another-model"
+	secondInput.Message.ConversationID = first.Conversation.ID
+	secondInput.Idempotency.Operation = "append-message"
+	second, err := store.AppendMessage(ctx, secondInput)
+	if err != nil || second.Task.ID == first.Task.ID || second.Task.HostID != secondHost.ID || second.Task.ModelID != "another-model" {
+		t.Fatalf("new turn with changed target: result=%+v err=%v", second, err)
+	}
+	old, err := store.GetTask(ctx, first.Task.ID, owner.ID)
+	if err != nil || old.Task.HostID != firstHost.ID || old.Task.ModelID != "model-test" {
+		t.Fatalf("old task target changed: task=%+v err=%v", old.Task, err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "target-switch-worker", time.Minute)
+	if err != nil || !found || claimed.ID != second.Task.ID || claimed.HostID != secondHost.ID {
+		t.Fatalf("claim with stopped Host: task=%+v found=%t err=%v", claimed, found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='failed', runtime_instance_id='runtime-not-ready' WHERE id=$1`, secondHost.ID); err != nil {
+		t.Fatal(err)
+	}
+	unready := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "host-not-ready",
+		RequestHash: hashBytes("host-not-ready"), HostID: secondHost.ID, RuntimeGeneration: secondHost.RuntimeGeneration,
+		RuntimeInstanceID: "runtime-not-ready", ControlVersion: secondHost.ControlVersion,
+		LeaseVersion: claimed.Lease.Version, RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared}
+	if _, _, err := store.CreateOperation(ctx, unready, "target-switch-worker"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unready Host accepted an operation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='completed', lease_owner='', lease_expires_at=NULL,
+finished_at=clock_timestamp() WHERE id=$1`, second.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	thirdInput := newTestTaskSubmission(t, owner.ID, "", "switch-third", "model only")
+	thirdInput.Task.ConversationID = first.Conversation.ID
+	thirdInput.Message.ConversationID = first.Conversation.ID
+	third, err := store.SubmitTask(ctx, thirdInput)
+	if err != nil || third.Task.HostID != "" {
+		t.Fatalf("submit model-only task: result=%+v err=%v", third, err)
+	}
+	claimed, found, err = store.ClaimNextTask(ctx, "model-only-worker", time.Minute)
+	if err != nil || !found || claimed.ID != third.Task.ID || claimed.HostID != "" {
+		t.Fatalf("claim model-only task: task=%+v found=%t err=%v", claimed, found, err)
+	}
+	operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "no-target",
+		RequestHash: hashBytes("no-target"), HostID: firstHost.ID, RuntimeInstanceID: "runtime-test",
+		LeaseVersion: claimed.Lease.Version, RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared}
+	if _, _, err := store.CreateOperation(ctx, operation, "model-only-worker"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("model-only task obtained a Host operation: %v", err)
+	}
+}
+
+func TestPostgresNewTaskHasKnownZeroModelUsage(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 2, 10000, 20000)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "initial-usage", "model-only"))
+	if err != nil || created.Task.Usage.ModelTokens == nil || *created.Task.Usage.ModelTokens != 0 {
+		t.Fatalf("new task model usage = %+v, err=%v", created.Task.Usage, err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "usage-worker", time.Minute)
+	if err != nil || !found {
+		t.Fatalf("claim task: found=%t err=%v", found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET usage_model_tokens=18 WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	staleUsage := int64(0)
+	progress := app.TaskProgress{TaskID: claimed.ID, LeaseOwner: "usage-worker",
+		LeaseVersion: claimed.Lease.Version, Status: task.StatusRunning, Usage: task.Usage{ModelTokens: &staleUsage},
+		Event: task.Event{Type: "task.step", Payload: []byte(`{}`)}}
+	if _, err := store.CommitTaskProgress(ctx, progress); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || loaded.Task.Usage.ModelTokens == nil || *loaded.Task.Usage.ModelTokens != 18 {
+		t.Fatalf("stale progress overwrote settled model usage: usage=%+v err=%v", loaded.Task.Usage, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitTaskProgress(ctx, progress); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || loaded.Task.Usage.ModelTokens != nil {
+		t.Fatalf("unknown model usage was not retained: usage=%+v err=%v", loaded.Task.Usage, err)
+	}
+}
+
 func TestPostgresClientTaskAuthorizationSnapshotSurvivesReloadAndRevocation(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	installationID := createTestClientInstallation(t, store.pool, owner.ID, nil)
 	clientToken := clientTestToken(t, owner.ID, installationID, identity.KindClient, nil)
@@ -170,7 +276,7 @@ func TestPostgresClientTaskAuthorizationSnapshotSurvivesReloadAndRevocation(t *t
 	}
 	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
 		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
-	})
+	}, credentialDefaultHostNoop{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +284,7 @@ func TestPostgresClientTaskAuthorizationSnapshotSurvivesReloadAndRevocation(t *t
 		claimed.Authorization.TokenID, hostValue.ID, nil, identity.ScopeTaskSubmit); err != nil {
 		t.Fatalf("authorize task before installation revocation: %v", err)
 	}
-	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1"); err != nil {
+	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", auditdomain.ActorSession); err != nil {
 		t.Fatalf("revoke installation: %v", err)
 	}
 	if err := credentials.AuthorizeTaskAction(ctx, owner.ID, identity.Kind(claimed.Authorization.Kind),
@@ -187,10 +293,34 @@ func TestPostgresClientTaskAuthorizationSnapshotSurvivesReloadAndRevocation(t *t
 	}
 }
 
+func TestPostgresTaskWebSessionRetainsOwnerInstallation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 2, 10000, 20000)
+	other := createTestUser(t, store, 2, 10000, 20000)
+	installationID := createTestClientInstallation(t, store.pool, owner.ID, nil)
+	otherInstallationID := createTestClientInstallation(t, store.pool, other.ID, nil)
+	input := newTestTaskSubmission(t, owner.ID, "", "session-installation", "model-only task")
+	input.Task.Authorization.ClientInstallationID = installationID
+	created, err := store.SubmitTask(ctx, input)
+	if err != nil || created.Task.Authorization.ClientInstallationID != installationID {
+		t.Fatalf("session task lost installation: task=%+v err=%v", created.Task, err)
+	}
+	loaded, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || loaded.Task.Authorization.ClientInstallationID != installationID {
+		t.Fatalf("reloaded task lost installation: task=%+v err=%v", loaded.Task, err)
+	}
+	otherInput := newTestTaskSubmission(t, owner.ID, "", "cross-account-installation", "must fail")
+	otherInput.Task.Authorization.ClientInstallationID = otherInstallationID
+	if _, err := store.SubmitTask(ctx, otherInput); err == nil {
+		t.Fatal("task accepted an installation belonging to another account")
+	}
+}
+
 func TestPostgresTaskApplicationTargetRequiresCurrentLaunchAndSurvivesClaim(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	if err := store.SetRuntimeInstanceID(ctx, hostValue.ID, hostValue.RuntimeGeneration, hostValue.ControlVersion, "", "runtime-task-app"); err != nil {
 		t.Fatal(err)
@@ -198,15 +328,6 @@ func TestPostgresTaskApplicationTargetRequiresCurrentLaunchAndSurvivesClaim(t *t
 	hostValue.RuntimeInstanceID = "runtime-task-app"
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "app-target", "find a message")
 	submission.Task.ApplicationID = app.WechatApplicationID
-	if _, err := store.SubmitTask(ctx, submission); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("submit without a running managed application error = %v", err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO host_application_launches
-		(host_id, owner_id, launch_id, application_id, runtime_generation, runtime_instance_id, control_version, status)
-		VALUES ($1,$2,'launch_tasktarget01','wechat',$3,$4,$5,'running')`,
-		hostValue.ID, owner.ID, hostValue.RuntimeGeneration, hostValue.RuntimeInstanceID, hostValue.ControlVersion); err != nil {
-		t.Fatal(err)
-	}
 	created, err := store.SubmitTask(ctx, submission)
 	if err != nil || created.Task.ApplicationID != app.WechatApplicationID {
 		t.Fatalf("submit application task = %#v, err=%v", created, err)
@@ -218,6 +339,22 @@ func TestPostgresTaskApplicationTargetRequiresCurrentLaunchAndSurvivesClaim(t *t
 	claimed, found, err := store.ClaimNextTask(ctx, "application-worker", time.Minute)
 	if err != nil || !found || claimed.ID != created.Task.ID || claimed.ApplicationID != app.WechatApplicationID {
 		t.Fatalf("claim application task = %#v, found=%t, err=%v", claimed, found, err)
+	}
+	operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "app-action",
+		RequestHash: hashBytes("app-action"), HostID: hostValue.ID, RuntimeGeneration: hostValue.RuntimeGeneration,
+		RuntimeInstanceID: hostValue.RuntimeInstanceID, ControlVersion: hostValue.ControlVersion,
+		LeaseVersion: claimed.Lease.Version, RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared}
+	if _, _, err := store.CreateOperation(ctx, operation, "application-worker"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("operation without a running managed application error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_application_launches
+		(host_id, owner_id, launch_id, application_id, runtime_generation, runtime_instance_id, control_version, status)
+		VALUES ($1,$2,'launch_tasktarget01','wechat',$3,$4,$5,'running')`,
+		hostValue.ID, owner.ID, hostValue.RuntimeGeneration, hostValue.RuntimeInstanceID, hostValue.ControlVersion); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateOperation(ctx, operation, "application-worker"); err != nil {
+		t.Fatalf("operation with current application = %v", err)
 	}
 	appendRequest := app.TaskSubmission{
 		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID,
@@ -238,23 +375,25 @@ func TestPostgresTaskApplicationTargetRequiresCurrentLaunchAndSurvivesClaim(t *t
 	if _, err := pool.Exec(ctx, `UPDATE host_application_launches SET status='stopped' WHERE host_id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
-	newSubmission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "app-target-stopped", "another message")
-	newSubmission.Task.ApplicationID = app.WechatApplicationID
-	if _, err := store.SubmitTask(ctx, newSubmission); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("submit after application stop error = %v", err)
+	dispatch := app.OperationUpdate{TaskID: claimed.ID, OperationKey: operation.Key, LeaseOwner: "application-worker",
+		LeaseVersion: claimed.Lease.Version, RuntimeGeneration: hostValue.RuntimeGeneration,
+		RuntimeInstanceID: hostValue.RuntimeInstanceID, ControlVersion: hostValue.ControlVersion,
+		RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationDispatched}
+	if _, err := store.UpdateOperation(ctx, dispatch); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("dispatch after application stop error = %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE host_application_launches SET status='running', control_version=control_version+1 WHERE host_id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SubmitTask(ctx, newSubmission); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("submit with stale application Host fence error = %v", err)
+	if _, err := store.UpdateOperation(ctx, dispatch); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("dispatch with stale application Host fence error = %v", err)
 	}
 }
 
 func TestPostgresTaskEventPageDetectsAllEventsExpired(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "create-task", "event retention")
 	created, err := store.SubmitTask(ctx, submission)
@@ -273,10 +412,54 @@ func TestPostgresTaskEventPageDetectsAllEventsExpired(t *testing.T) {
 	}
 }
 
+func TestPostgresTaskSnapshotDoesNotMixConcurrentEvents(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 2, 10000, 20000)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "snapshot-event", "observe snapshot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first int64
+	if err := store.withTaskSnapshot(ctx, func(snapshot pgx.Tx) error {
+		if err := snapshot.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, created.Task.ID).Scan(&first); err != nil {
+			return err
+		}
+		if err := store.WithTx(ctx, func(writer pgx.Tx) error {
+			var next int64
+			if err := writer.QueryRow(ctx, `UPDATE tasks SET event_seq=event_seq+1 WHERE id=$1 RETURNING event_seq`, created.Task.ID).Scan(&next); err != nil {
+				return err
+			}
+			_, err := writer.Exec(ctx, `INSERT INTO task_events (task_id,sequence,event_type,payload) VALUES ($1,$2,'task.status','{}')`, created.Task.ID, next)
+			return err
+		}); err != nil {
+			return err
+		}
+		var stillVisible int64
+		if err := snapshot.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, created.Task.ID).Scan(&stillVisible); err != nil {
+			return err
+		}
+		if stillVisible != first {
+			t.Fatalf("one snapshot mixed events: first=%d later=%d", first, stillVisible)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var after int64
+	if err := pool.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, created.Task.ID).Scan(&after); err != nil || after != first+1 {
+		t.Fatalf("writer event not committed: before=%d after=%d err=%v", first, after, err)
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.EventSequence != after {
+		t.Fatalf("fresh task snapshot cursor = %d, want %d, err=%v", details.Task.EventSequence, after, err)
+	}
+}
+
 func TestPostgresAssistantTextDeltasAreOrderedLeasedAndFinalizedAtomically(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "streaming-assistant", "write a summary"))
 	if err != nil {
@@ -367,7 +550,7 @@ func TestPostgresAssistantTextDeltasAreOrderedLeasedAndFinalizedAtomically(t *te
 func TestPostgresPendingApprovalResponseIsVersionedAndAtomic(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "pending-submit-key", "approve an external action")
 	created, err := store.SubmitTask(ctx, submission)
@@ -430,7 +613,7 @@ func TestPostgresPendingApprovalResponseIsVersionedAndAtomic(t *testing.T) {
 func TestPostgresClarificationAnswerIsVersionedIdempotentAndRestorable(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "clarification-submit", "deploy the project"))
 	if err != nil {
@@ -498,7 +681,7 @@ func TestPostgresClarificationAnswerIsVersionedIdempotentAndRestorable(t *testin
 func TestPostgresTaskSubmissionRollbackAndHostScopedLists(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "create-task", "initial task"))
 	if err != nil {
@@ -554,10 +737,10 @@ func TestPostgresTaskSubmissionRollbackAndHostScopedLists(t *testing.T) {
 	}
 }
 
-func TestPostgresAITaskWritesRequireRunningAIHostAndPreserveReplays(t *testing.T) {
+func TestPostgresTaskWritesDuringUserTakeoverAndPreserveReplays(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "fenced-submit", "initial work")
@@ -597,58 +780,146 @@ func TestPostgresAITaskWritesRequireRunningAIHostAndPreserveReplays(t *testing.T
 		t.Fatalf("append replay after takeover = %#v, err=%v", replayedAppend, err)
 	}
 
-	blockedSubmit := newTestTaskSubmission(t, owner.ID, hostValue.ID, "blocked-submit", "must not start")
-	if _, err := store.SubmitTask(ctx, blockedSubmit); domain.CodeOf(err) != domain.CodeInvalidState {
+	newSubmit := newTestTaskSubmission(t, owner.ID, hostValue.ID, "takeover-submit", "server work")
+	if _, err := store.SubmitTask(ctx, newSubmit); err != nil {
 		t.Fatalf("new task submission during takeover error = %v", err)
 	}
-	blockedAppend := appendRequest
-	blockedAppend.Message.ID = mustID(t, domain.NewMessageID)
-	blockedAppend.Message.Content = "must not be appended"
-	blockedAppend.Idempotency = testIdempotency(owner.ID, "append-message", "blocked-append")
-	if _, err := store.AppendMessage(ctx, blockedAppend); domain.CodeOf(err) != domain.CodeInvalidState {
+	newAppend := appendRequest
+	newAppend.Message.ID = mustID(t, domain.NewMessageID)
+	newAppend.Message.Content = "continue server work"
+	newAppend.Idempotency = testIdempotency(owner.ID, "append-message", "takeover-append")
+	if _, err := store.AppendMessage(ctx, newAppend); err != nil {
 		t.Fatalf("new message append during takeover error = %v", err)
 	}
-	if claimedTask, claimed, err := store.ClaimNextTask(ctx, "worker-fenced", time.Minute); err != nil || claimed {
+	claimedTask, claimed, err := store.ClaimNextTask(ctx, "worker-fenced", time.Minute)
+	if err != nil || !claimed || claimedTask.ID != created.Task.ID {
 		t.Fatalf("claim during takeover = %#v, claimed=%t, err=%v", claimedTask, claimed, err)
 	}
+	operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimedTask.ID, Key: "takeover-operation",
+		RequestHash: hashBytes("takeover-operation"), HostID: hostValue.ID, RuntimeGeneration: hostValue.RuntimeGeneration,
+		RuntimeInstanceID: "runtime-during-takeover", ControlVersion: hostValue.ControlVersion,
+		LeaseVersion: claimedTask.Lease.Version, RuntimeLeaseVersion: claimedTask.Lease.Version, Status: task.OperationPrepared}
+	if _, _, err := store.CreateOperation(ctx, operation, "worker-fenced"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host operation during takeover error = %v", err)
+	}
 	messages, err := store.ListMessages(ctx, owner.ID, created.Conversation.ID, app.PageRequest{Limit: 20})
-	if err != nil || len(messages.Items) != 2 {
-		t.Fatalf("messages after rejected append = %d, err=%v", len(messages.Items), err)
+	if err != nil || len(messages.Items) != 3 {
+		t.Fatalf("messages after takeover append = %d, err=%v", len(messages.Items), err)
 	}
 }
 
-func TestPostgresAITaskWritesRequireRunningHost(t *testing.T) {
-	store, _ := newTemporaryStore(t)
-	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
-	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "running-host-seed", "queued work")); err != nil {
-		t.Fatalf("submit initial queued task: %v", err)
+func TestPostgresTaskProgressWithoutRunningHost(t *testing.T) {
+	for _, state := range []string{"creating", "stopped"} {
+		t.Run(state, func(t *testing.T) {
+			store, pool := newTemporaryStore(t)
+			ctx := context.Background()
+			owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+			hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
+			if _, err := pool.Exec(ctx, `UPDATE hosts SET state=$2 WHERE id=$1`, hostValue.ID, state); err != nil {
+				t.Fatal(err)
+			}
+			created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "non-running-host", "server work"))
+			if err != nil {
+				t.Fatalf("submit task with Host %s: %v", state, err)
+			}
+			appendRequest := app.TaskSubmission{
+				Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: "model-test"},
+				Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
+					OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue"},
+				Idempotency: testIdempotency(owner.ID, "append-message", "non-running-host-append"),
+			}
+			if _, err := store.AppendMessage(ctx, appendRequest); err != nil {
+				t.Fatalf("append with Host %s: %v", state, err)
+			}
+			claimed, found, err := store.ClaimNextTask(ctx, "worker-non-running", time.Minute)
+			if err != nil || !found || claimed.ID != created.Task.ID {
+				t.Fatalf("claim with Host %s = %#v, found=%t, err=%v", state, claimed, found, err)
+			}
+			stepID := mustID(t, domain.NewStepID)
+			event, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+				TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+				Status: task.StatusRunning, CurrentStep: stepID,
+				Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded}},
+				Event: task.Event{Type: "task.step", Payload: []byte(`{"status":"succeeded"}`)},
+			})
+			if err != nil || event.Type != "task.step" {
+				t.Fatalf("commit server progress with Host %s = %#v, err=%v", state, event, err)
+			}
+			operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "unready-host-operation",
+				RequestHash: hashBytes("unready-host-operation"), HostID: hostValue.ID, RuntimeGeneration: hostValue.RuntimeGeneration,
+				RuntimeInstanceID: "unready-runtime", ControlVersion: hostValue.ControlVersion,
+				LeaseVersion: claimed.Lease.Version, RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared}
+			if _, _, err := store.CreateOperation(ctx, operation, claimed.Lease.Owner); domain.CodeOf(err) != domain.CodeInvalidState {
+				t.Fatalf("Host operation while %s error = %v", state, err)
+			}
+		})
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET state='failed' WHERE id=$1`, hostValue.ID); err != nil {
+}
+
+func TestPostgresTaskTargetRejectsDeletedAndOtherOwnerHost(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	otherOwner := createTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	otherHost := createTestHost(t, ctx, store, otherOwner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "deleted-host-seed", "queued work"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "failed-host-submit", "must not start")); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("task submission on a non-running Host error = %v", err)
+	appendRequest := app.TaskSubmission{
+		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: "model-test"},
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
+			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue"},
+		Idempotency: testIdempotency(owner.ID, "append-message", "deleted-host-append"),
 	}
-	if claimedTask, claimed, err := store.ClaimNextTask(ctx, "worker-failed-host", time.Minute); err != nil || claimed {
-		t.Fatalf("claim on a non-running Host = %#v, claimed=%t, err=%v", claimedTask, claimed, err)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='deleted', deleted_at=clock_timestamp() WHERE id=$1`, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "deleted-host-submit", "must be rejected")); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("submit against deleted Host error = %v", err)
+	}
+	if _, err := store.AppendMessage(ctx, appendRequest); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("append against deleted Host error = %v", err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "deleted-host-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim against deleted Host: found=%t, err=%v", found, err)
+	}
+	valid, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "hostless-after-delete", "server work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "hostless-after-delete-worker", time.Minute)
+	if err != nil || !found || claimed.ID != valid.Task.ID {
+		t.Fatalf("deleted Host blocked an unrelated task: task=%#v, found=%t, err=%v", claimed, found, err)
+	}
+	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, otherHost.ID, "other-owner-host-submit", "must be rejected")); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("submit against another owner's Host error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='completed', finished_at=clock_timestamp() WHERE id=$1`, created.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	newTurn := newTestTaskSubmission(t, owner.ID, otherHost.ID, "other-owner-host-append", "must be rejected")
+	newTurn.Task.ConversationID = created.Conversation.ID
+	newTurn.Message.ConversationID = created.Conversation.ID
+	newTurn.Idempotency.Operation = "append-message"
+	if _, err := store.AppendMessage(ctx, newTurn); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("append against another owner's Host error = %v", err)
 	}
 }
 
-func TestPostgresAITaskFenceSerializesConcurrentSubmissionAndClaim(t *testing.T) {
+func TestPostgresTaskTargetDeletionSerializesConcurrentSubmissionAndClaim(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	queued, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "fence-race-existing", "queued work"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Hold the same exclusive Host lock BeginControlTransition uses, then race
-	// both task creation and claiming against the fence installation.
+	// Race task creation and claiming against the Host deletion lock.
 	fenceTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -670,7 +941,7 @@ func TestPostgresAITaskFenceSerializesConcurrentSubmissionAndClaim(t *testing.T)
 	started := make(chan struct{}, 2)
 	submitted := make(chan submitResult, 1)
 	claimed := make(chan claimResult, 1)
-	newSubmission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "fence-race-new", "blocked by takeover")
+	newSubmission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "fence-race-new", "blocked by deletion")
 	go func() {
 		started <- struct{}{}
 		value, err := store.SubmitTask(ctx, newSubmission)
@@ -685,7 +956,7 @@ func TestPostgresAITaskFenceSerializesConcurrentSubmissionAndClaim(t *testing.T)
 	<-started
 	waitForPostgresLockWait(t, ctx, pool, "%FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE%", 2)
 
-	if _, err := fenceTx.Exec(ctx, `UPDATE hosts SET control_state='taking_over', control_version=1 WHERE id=$1`, hostValue.ID); err != nil {
+	if _, err := fenceTx.Exec(ctx, `UPDATE hosts SET state='deleted', deleted_at=clock_timestamp() WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := fenceTx.Commit(ctx); err != nil {
@@ -693,7 +964,7 @@ func TestPostgresAITaskFenceSerializesConcurrentSubmissionAndClaim(t *testing.T)
 	}
 	select {
 	case result := <-submitted:
-		if domain.CodeOf(result.err) != domain.CodeInvalidState {
+		if domain.CodeOf(result.err) != domain.CodeNotFound {
 			t.Fatalf("racing task submission error = %v", result.err)
 		}
 	case <-ctx.Done():
@@ -742,7 +1013,7 @@ WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE $1`, 
 func TestPostgresTaskLeaseFencesOperationAndRecoversUnknown(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_test' WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
@@ -925,7 +1196,7 @@ func TestPostgresTaskLeaseFencesOperationAndRecoversUnknown(t *testing.T) {
 func TestPostgresAdoptsPreparedOperationAfterLeaseReclaim(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_test' WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
@@ -998,7 +1269,7 @@ func TestPostgresClaimNextTaskIsExclusiveAcrossStores(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	otherStore := New(pool)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "claim-race", "race workers"))
 	if err != nil {
@@ -1058,7 +1329,7 @@ func TestPostgresClaimNextTaskIsExclusiveAcrossStores(t *testing.T) {
 func TestPostgresTaskBatchItemAndValidatedArtifactPersistence(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "durable-primitives", "generate a report")
 	itemID := mustID(t, domain.NewBatchItemID)
@@ -1330,7 +1601,7 @@ func newFailedBatchRetryFixture(t *testing.T) failedBatchRetryFixture {
 	t.Helper()
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "failed-batch", "process the batch")
 	failedID := mustID(t, domain.NewBatchItemID)
@@ -1370,6 +1641,9 @@ func newFailedBatchRetryFixture(t *testing.T) failedBatchRetryFixture {
 	}
 	stepID := mustID(t, domain.NewStepID)
 	tokens := int64(29)
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET usage_model_tokens=$2 WHERE id=$1`, created.Task.ID, tokens); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
 		TaskID: created.Task.ID, LeaseOwner: "retry-worker", LeaseVersion: claimed.Lease.Version,
 		Status: task.StatusFailed, CurrentStep: stepID, Result: "prior task result", WaitingReason: "prior wait",

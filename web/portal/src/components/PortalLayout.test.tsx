@@ -13,5 +13,7 @@ describe('PortalLayout', () => {
     render(<ToastProvider><MemoryRouter><PortalLayout /></MemoryRouter></ToastProvider>);
 
     expect(screen.getByRole('link', { name: '打开手机端' })).toHaveAttribute('href', '/app/');
+    expect(screen.getByRole('heading', { level: 1, name: '工作台' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 });

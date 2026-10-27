@@ -2,14 +2,15 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
 import { ToastProvider } from '../app/toast';
 import { NewHost } from './NewHost';
 
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567' } }) }));
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567', quota: { hosts: 2 } } }) }));
 
 describe('NewHost workspace loading', () => {
+  beforeEach(() => { vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] }); });
   afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); });
 
   it('retries workspace loading and submits selected workspace IDs', async () => {
@@ -34,7 +35,7 @@ describe('NewHost workspace loading', () => {
 
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('status')).toHaveTextContent('正在加载工作目录');
+    expect(await screen.findByText('正在加载工作目录…')).toBeInTheDocument();
     expect(screen.queryByText('目前没有可用的工作区。')).not.toBeInTheDocument();
     await act(async () => { rejectInitial(new Error('工作目录服务不可用')); });
     expect(await screen.findByRole('alert')).toHaveTextContent('工作目录服务不可用');
@@ -49,7 +50,7 @@ describe('NewHost workspace loading', () => {
     const selectedWorkspace = screen.getByRole('checkbox', { name: /待挂载目录/ });
     await user.click(selectedWorkspace);
     await user.click(screen.getByRole('button', { name: '创建主机' }));
-    await waitFor(() => expect(createHost).toHaveBeenCalledWith({ template_id: 'std', workspace_ids: ['w1234567'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/)));
+    await waitFor(() => expect(createHost).toHaveBeenCalledWith({ workspace_ids: ['w1234567'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/)));
     expect(workspaces).toHaveBeenCalledTimes(3);
   });
 
@@ -87,7 +88,7 @@ describe('NewHost workspace loading', () => {
 
     await user.click(await screen.findByRole('button', { name: '创建主机' }));
     await waitFor(() => expect(createWorkspace).toHaveBeenCalledWith({ name: '项目工作区' }, expect.any(String)));
-    expect(createHost).toHaveBeenCalledWith({ template_id: 'std', workspace_ids: ['w7654321'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
+    expect(createHost).toHaveBeenCalledWith({ workspace_ids: ['w7654321'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
   });
 
   it('reuses accepted workspace and host creations after their responses are lost', async () => {
@@ -132,7 +133,7 @@ describe('NewHost workspace loading', () => {
     expect(await screen.findByText('主机已创建，但响应丢失')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '继续上次创建' }));
 
-    await waitFor(() => expect(createHost).toHaveBeenLastCalledWith({ template_id: 'std', workspace_ids: ['w7654321'] }, expect.any(String)));
+    await waitFor(() => expect(createHost).toHaveBeenLastCalledWith({ workspace_ids: ['w7654321'] }, expect.any(String)));
     expect(createWorkspace).toHaveBeenCalledTimes(2);
     expect(createWorkspace.mock.calls[1]?.[1]).toBe(createWorkspace.mock.calls[0]?.[1]);
     expect(createHost).toHaveBeenCalledTimes(2);
@@ -168,7 +169,7 @@ describe('NewHost workspace loading', () => {
     firstPage.unmount();
 
     renderPage();
-    expect(await screen.findByRole('status')).toHaveTextContent('上次创建结果尚未确认');
+    expect(await screen.findByText(/上次创建结果尚未确认/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '继续上次创建' }));
     await waitFor(() => expect(createHost).toHaveBeenCalledTimes(2));
     expect(createWorkspace).toHaveBeenCalledTimes(1);

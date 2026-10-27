@@ -15,6 +15,7 @@ import (
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/task"
 )
 
 type CredentialOptions struct {
@@ -30,15 +31,21 @@ type ResourceUsage struct {
 	MemMiB   int
 }
 
+type HostResources struct {
+	CPUMilli int
+	MemMiB   int
+}
+
 type UserSummary struct {
-	ID                 string
-	Name               string
-	Role               identity.Role
-	Status             identity.AccountStatus
-	MustChangePassword bool
-	CreatedAt          time.Time
-	Quota              ResourceUsage
-	Usage              ResourceUsage
+	ID                   string
+	Name                 string
+	Role                 identity.Role
+	Status               identity.AccountStatus
+	MustChangePassword   bool
+	CreatedAt            time.Time
+	Quota                ResourceUsage
+	DefaultHostResources HostResources
+	Usage                ResourceUsage
 }
 
 type LoginResult struct {
@@ -48,13 +55,18 @@ type LoginResult struct {
 }
 
 type CredentialService struct {
-	users     UserStore
-	hosts     HostStore
-	tokens    TokenStore
-	audit     AuditWriter
-	options   CredentialOptions
-	dummyHash []byte
-	limiter   loginLimiter
+	users        UserStore
+	hosts        HostStore
+	tokens       TokenStore
+	audit        AuditWriter
+	options      CredentialOptions
+	dummyHash    []byte
+	limiter      loginLimiter
+	defaultHosts DefaultHostEnsurer
+}
+
+type DefaultHostEnsurer interface {
+	EnsureDefaultStopped(context.Context, identity.User) (host.Host, bool, error)
 }
 
 type loginAttempt struct {
@@ -67,8 +79,8 @@ type loginLimiter struct {
 	attempts map[string]loginAttempt
 }
 
-func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, writer AuditWriter, options CredentialOptions) (*CredentialService, error) {
-	if users == nil || hosts == nil || tokens == nil || writer == nil {
+func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, writer AuditWriter, options CredentialOptions, defaultHosts DefaultHostEnsurer) (*CredentialService, error) {
+	if users == nil || hosts == nil || tokens == nil || writer == nil || defaultHosts == nil {
 		return nil, fmt.Errorf("credential service dependencies are required")
 	}
 	if options.SessionTTL <= 0 || options.TicketTTL <= 0 || options.LoginLimit <= 0 || options.LoginWindow <= 0 {
@@ -81,19 +93,47 @@ func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, w
 	return &CredentialService{
 		users: users, hosts: hosts, tokens: tokens, audit: writer,
 		options: options, dummyHash: dummyHash,
-		limiter: loginLimiter{attempts: make(map[string]loginAttempt)},
+		defaultHosts: defaultHosts,
+		limiter:      loginLimiter{attempts: make(map[string]loginAttempt)},
 	}, nil
 }
 
 func (s *CredentialService) Login(ctx context.Context, name, password, ip string) (LoginResult, error) {
+	user, err := s.authenticatePassword(ctx, name, password, ip)
+	if err != nil {
+		return LoginResult{}, err
+	}
+	if err := s.ensureDefaultHost(ctx, user); err != nil {
+		return LoginResult{}, err
+	}
+	expires := time.Now().Add(s.options.SessionTTL)
+	token, credential, err := issueCredential(ctx, s.tokens, user.ID, identity.KindSession, "", "session", expires)
+	if err != nil {
+		return LoginResult{}, err
+	}
+	if err := s.audit.Write(ctx, audit.Entry{ActorID: token.ID, ActorKind: audit.ActorSession, Action: audit.ActionLogin, IP: ip}); err != nil {
+		if revokeErr := s.tokens.RevokeToken(ctx, token.ID, user.ID); revokeErr != nil {
+			return LoginResult{}, fmt.Errorf("write login audit: %w (revoke session: %w)", err, revokeErr)
+		}
+		return LoginResult{}, fmt.Errorf("write login audit: %w", err)
+	}
+	return LoginResult{Credential: credential, ExpiresAt: expires, User: userSummary(user, ResourceUsage{})}, nil
+}
+
+func (s *CredentialService) ensureDefaultHost(ctx context.Context, user identity.User) error {
+	_, _, err := s.defaultHosts.EnsureDefaultStopped(ctx, user)
+	return err
+}
+
+func (s *CredentialService) authenticatePassword(ctx context.Context, name, password, ip string) (identity.User, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || password == "" {
-		return LoginResult{}, domain.InvalidArgument("name", "name and password are required")
+		return identity.User{}, domain.InvalidArgument("name", "name and password are required")
 	}
 	if retry, ok := s.limiter.allow(ip+"\x00"+strings.ToLower(name), time.Now(), s.options.LoginLimit, s.options.LoginWindow); !ok {
 		err := domain.NewError(domain.CodeRateLimited, "login rate limit reached")
 		err.RetryAfter = retry
-		return LoginResult{}, err
+		return identity.User{}, err
 	}
 	user, err := s.users.GetUserByName(ctx, name)
 	validUser := err == nil
@@ -108,37 +148,26 @@ func (s *CredentialService) Login(ctx context.Context, name, password, ip string
 			actorID, actorKind = user.ID, audit.ActorSession
 		}
 		if auditErr := s.audit.Write(ctx, audit.Entry{ActorID: actorID, ActorKind: actorKind, Action: audit.ActionLoginFailed, IP: ip}); auditErr != nil {
-			return LoginResult{}, fmt.Errorf("write failed login audit: %w", auditErr)
+			return identity.User{}, fmt.Errorf("write failed login audit: %w", auditErr)
 		}
 		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
-			return LoginResult{}, err
+			return identity.User{}, err
 		}
-		return LoginResult{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
+		return identity.User{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
 	}
 	if user.Status != identity.StatusApproved {
 		if auditErr := s.audit.Write(ctx, audit.Entry{ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionLoginFailed, IP: ip}); auditErr != nil {
-			return LoginResult{}, fmt.Errorf("write blocked login audit: %w", auditErr)
+			return identity.User{}, fmt.Errorf("write blocked login audit: %w", auditErr)
 		}
-		return LoginResult{}, accountStatusError(user.Status)
+		return identity.User{}, accountStatusError(user.Status)
 	}
 	if user.Role == identity.RoleSuperAdmin && user.MustChangePassword && password == "admin" && !isLoopbackIP(ip) {
 		if auditErr := s.audit.Write(ctx, audit.Entry{ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionLoginFailed, IP: ip}); auditErr != nil {
-			return LoginResult{}, fmt.Errorf("write blocked login audit: %w", auditErr)
+			return identity.User{}, fmt.Errorf("write blocked login audit: %w", auditErr)
 		}
-		return LoginResult{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
+		return identity.User{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
 	}
-	expires := time.Now().Add(s.options.SessionTTL)
-	token, credential, err := issueCredential(ctx, s.tokens, user.ID, identity.KindSession, "", "session", expires)
-	if err != nil {
-		return LoginResult{}, err
-	}
-	if err := s.audit.Write(ctx, audit.Entry{ActorID: token.ID, ActorKind: audit.ActorSession, Action: audit.ActionLogin, IP: ip}); err != nil {
-		if revokeErr := s.tokens.RevokeToken(ctx, token.ID, user.ID); revokeErr != nil {
-			return LoginResult{}, fmt.Errorf("write login audit: %w (revoke session: %w)", err, revokeErr)
-		}
-		return LoginResult{}, fmt.Errorf("write login audit: %w", err)
-	}
-	return LoginResult{Credential: credential, ExpiresAt: expires, User: userSummary(user, ResourceUsage{})}, nil
+	return user, nil
 }
 
 func (s *CredentialService) Logout(ctx context.Context, principal identity.Principal) error {
@@ -219,6 +248,37 @@ func (s *CredentialService) AuthorizeTaskAction(ctx context.Context, ownerID str
 	return s.authorizeHostAction(ctx, ownerID, ownerID, kind, tokenID, hostID, approvedScopes, required)
 }
 
+func (s *CredentialService) AuthorizeTaskExecution(ctx context.Context, principal identity.Principal, hostID string, required identity.Scope) (task.Authorization, error) {
+	if err := validateTaskPrincipal(principal); err != nil {
+		return task.Authorization{}, err
+	}
+	if !principal.HasScope(required) || (principal.Kind != identity.KindSession && principal.Kind != identity.KindClient) {
+		return task.Authorization{}, domain.NewError(domain.CodeForbidden, "task execution is not authorized")
+	}
+	if hostID != "" {
+		if _, err := authorizeTaskHost(ctx, s, principal, hostID, required); err != nil {
+			return task.Authorization{}, err
+		}
+	}
+	user, err := s.users.GetUserByID(ctx, principal.UserID)
+	if err != nil || user.Status != identity.StatusApproved {
+		return task.Authorization{}, domain.NewError(domain.CodeUnauthenticated, "task owner is unavailable")
+	}
+	token, err := s.tokens.GetTokenByID(ctx, principal.TokenID)
+	if err != nil || token.OwnerID != principal.UserID || token.Kind != principal.Kind || token.RevokedAt != nil ||
+		!token.ExpiresAt.After(time.Now()) || token.ClientInstallationID != principal.ClientInstallationID {
+		return task.Authorization{}, domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+	}
+	if token.ClientInstallationID != "" && !s.clientInstallationActive(ctx, token.ClientInstallationID, principal.UserID) {
+		return task.Authorization{}, domain.NewError(domain.CodeUnauthenticated, "task installation is unavailable")
+	}
+	authorization := authorizationSnapshot(principal)
+	authorization.Version = 1
+	expiresAt := token.ExpiresAt.UTC()
+	authorization.ExpiresAt = &expiresAt
+	return authorization, nil
+}
+
 func (s *CredentialService) AuthorizeMCPRuntimeAction(ctx context.Context, hostOwnerID, actorID, tokenID, hostID string, approvedScopes []identity.Scope, required identity.Scope) error {
 	return s.authorizeHostAction(ctx, hostOwnerID, actorID, identity.KindAPIKey, tokenID, hostID, approvedScopes, required)
 }
@@ -265,7 +325,7 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 		}
 		return nil
 	case identity.KindAPIKey:
-		if !domain.ValidTokenID(tokenID) || !identity.ValidScope(required) {
+		if !domain.ValidTokenID(tokenID) || (required != identity.ScopeComputerObserve && required != identity.ScopeComputerOperate) {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 		}
 		token, err := s.tokens.GetTokenByID(ctx, tokenID)
@@ -275,28 +335,13 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 			}
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 		}
-		if token.Kind != identity.KindAPIKey || token.OwnerID != actorID || token.RevokedAt != nil || !token.ExpiresAt.After(time.Now()) {
+		if token.Kind != identity.KindAPIKey || token.OwnerID != actorID || token.RevokedAt != nil || !token.ExpiresAt.After(time.Now()) || len(token.HostIDs) != 0 || len(token.Scopes) != 0 {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
-		}
-		if !containsHost(token.HostIDs, hostID) {
-			return domain.NewError(domain.CodeNotFound, "host not found")
-		}
-		if !containsScope(approvedScopes, required) || !containsScope(token.Scopes, required) {
-			return domain.NewError(domain.CodeForbidden, "API key scope is insufficient")
 		}
 		return nil
 	default:
 		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 	}
-}
-
-func containsScope(values []identity.Scope, required identity.Scope) bool {
-	for _, value := range values {
-		if value == required {
-			return true
-		}
-	}
-	return false
 }
 
 func clientTaskScope(required identity.Scope) bool {
@@ -307,15 +352,6 @@ func clientTaskScope(required identity.Scope) bool {
 	default:
 		return false
 	}
-}
-
-func containsHost(values []string, required string) bool {
-	for _, value := range values {
-		if value == required {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *CredentialService) ConsumeTicket(ctx context.Context, raw string) (Ticket, error) {
@@ -369,13 +405,17 @@ func (s *CredentialService) verify(ctx context.Context, raw string, want identit
 	if !validToken(token, want, secret, time.Now()) {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
+	if want == identity.KindAPIKey && (len(token.HostIDs) != 0 || len(token.Scopes) != 0 || len(token.WorkspaceIDs) != 0) {
+		return identity.Principal{}, identity.ErrInvalidCredential
+	}
 	if want == identity.KindDevice && (token.ClientInstallationID == "" || !validDeviceToken(token)) {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
 	if want == identity.KindClient && (token.ClientInstallationID == "" || len(token.Scopes) != 0 || len(token.HostIDs) != 0 || len(token.WorkspaceIDs) != 0) {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
-	if (want == identity.KindClient || want == identity.KindDevice) && !s.clientInstallationActive(ctx, token.ClientInstallationID, token.OwnerID) {
+	if (want == identity.KindClient || want == identity.KindDevice || want == identity.KindSession && token.ClientInstallationID != "") &&
+		!s.clientInstallationActive(ctx, token.ClientInstallationID, token.OwnerID) {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
 	user, err := s.users.GetUserByID(ctx, token.OwnerID)
@@ -383,7 +423,7 @@ func (s *CredentialService) verify(ctx context.Context, raw string, want identit
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
 	role := user.Role
-	if want != identity.KindSession {
+	if want != identity.KindSession || token.ClientInstallationID != "" {
 		role = identity.RoleUser
 	}
 	principal := identity.Principal{
@@ -417,28 +457,17 @@ func (s *CredentialService) ClientInstallationActive(ctx context.Context, id, ow
 }
 
 func validDeviceToken(token identity.Token) bool {
-	if token.HostID != "" || len(token.HostIDs) != 0 || len(token.Scopes) != 1 || token.Scopes[0] != identity.ScopeWorkspaceSync || len(token.WorkspaceIDs) > 500 {
-		return false
-	}
-	seen := make(map[string]struct{}, len(token.WorkspaceIDs))
-	for _, id := range token.WorkspaceIDs {
-		if !domain.ValidWorkspaceID(id) {
-			return false
-		}
-		if _, exists := seen[id]; exists {
-			return false
-		}
-		seen[id] = struct{}{}
-	}
-	return true
+	return token.HostID == "" && len(token.HostIDs) == 0 && len(token.Scopes) == 1 &&
+		token.Scopes[0] == identity.ScopeWorkspaceSync && len(token.WorkspaceIDs) == 0
 }
 
 func userSummary(user identity.User, usage ResourceUsage) UserSummary {
 	return UserSummary{
 		ID: user.ID, Name: user.Name, Role: user.Role, Status: user.Status,
 		MustChangePassword: user.MustChangePassword, CreatedAt: user.CreatedAt,
-		Quota: ResourceUsage{Hosts: user.QuotaHosts, CPUMilli: user.QuotaCPUMilli, MemMiB: user.QuotaMemMiB},
-		Usage: usage,
+		Quota:                ResourceUsage{Hosts: user.QuotaHosts, CPUMilli: user.QuotaCPUMilli, MemMiB: user.QuotaMemMiB},
+		DefaultHostResources: HostResources{CPUMilli: user.DefaultHostCPUMilli, MemMiB: user.DefaultHostMemMiB},
+		Usage:                usage,
 	}
 }
 
@@ -498,8 +527,13 @@ func issueCredential(ctx context.Context, store TokenStore, ownerID string, kind
 }
 
 func issueClientTicket(ctx context.Context, store TokenStore, ownerID, actorID, hostID, installationID string, expiresAt time.Time) (identity.Token, string, error) {
+	return issueInstallationTicket(ctx, store, ownerID, actorID, hostID, installationID, expiresAt, 0)
+}
+
+func issueInstallationTicket(ctx context.Context, store TokenStore, ownerID, actorID, hostID, installationID string, expiresAt time.Time, previewPort int) (identity.Token, string, error) {
 	if !domain.ValidUserID(ownerID) || !domain.ValidUserID(actorID) || !domain.ValidHostID(hostID) ||
-		!domain.ValidClientInstallationID(installationID) || !expiresAt.After(time.Now()) {
+		!domain.ValidClientInstallationID(installationID) || !expiresAt.After(time.Now()) ||
+		(previewPort != 0 && !domain.ValidPreviewTargetPort(previewPort)) {
 		return identity.Token{}, "", domain.InvalidArgument("ticket", "client ticket fields are invalid")
 	}
 	type issued struct {
@@ -516,7 +550,7 @@ func issueClientTicket(ctx context.Context, store TokenStore, ownerID, actorID, 
 			actor = actorID
 		}
 		token, err := store.CreateToken(ctx, identity.Token{ID: id, OwnerID: ownerID, ActorUserID: actor, Kind: identity.KindTicket,
-			HostID: hostID, ClientInstallationID: installationID, SecretHash: hash, ExpiresAt: expiresAt})
+			HostID: hostID, PreviewPort: previewPort, ClientInstallationID: installationID, SecretHash: hash, ExpiresAt: expiresAt})
 		if err != nil {
 			return issued{}, err
 		}

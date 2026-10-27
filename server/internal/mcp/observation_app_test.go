@@ -15,7 +15,6 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/config"
-	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 )
@@ -28,13 +27,12 @@ func TestDesktopObservationMCPAppIsReadOnlyAndKeepsImageFallback(t *testing.T) {
 	}}
 	principal := identity.Principal{
 		UserID: "user_test", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "token_test",
-		HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeComputerObserve},
 	}
 	handler, err := New(Deps{
 		PreviewPortMin: 1024, Config: config.MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 1280},
 		Domains:      config.Domains{Scheme: "https", Portal: "portal.example.test", HostSuffix: "hosts.example.test"},
 		Hosts:        &hostServiceStub{value: host.Host{ID: "h1234567", OwnerID: principal.UserID, State: host.StateRunning}},
-		Applications: newApplicationStatusServiceStub(), RuntimeTools: runtime, Tasks: newTaskServiceStub(), Schedules: scheduleServiceFake{},
+		Applications: newApplicationStatusServiceStub(), RuntimeTools: runtime,
 		Auth: apiKeyPrincipalVerifier{principal: principal}, Audit: &auditStub{}, Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(),
 	})
 	if err != nil {
@@ -115,8 +113,8 @@ func TestDesktopObservationMCPAppIsReadOnlyAndKeepsImageFallback(t *testing.T) {
 	if err := authorizeTool(principal, desktopScreenshotToolName, map[string]any{"host_id": "h1234567"}); err != nil {
 		t.Fatalf("observe-only key cannot take screenshot: %v", err)
 	}
-	if err := authorizeTool(principal, "desktop_click", map[string]any{"host_id": "h1234567"}); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("observe-only key authorized desktop_click: %v", err)
+	if err := authorizeTool(principal, "desktop_click", map[string]any{"host_id": "h1234567"}); err != nil {
+		t.Fatalf("account-authorized key cannot use desktop_click: %v", err)
 	}
 
 	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{

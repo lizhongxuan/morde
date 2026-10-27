@@ -1,0 +1,12 @@
+id: std-1c2g
+name: 标准 1 核 2G
+description: 浏览器、终端和文件，适合轻量任务
+image: registry.local/cloudhost/host:arm64-local-20261022-runtime-desktop-ready@sha256:bd295f34b577df6152d3a538201a36f0df89ac6e17fe24d999d5805c8a98a12c
+entrypoint: ["/usr/local/bin/morde-host-entrypoint"]
+resources:
+  requests: {cpu: "1", memory: "2Gi"}
+  limits: {cpu: "1", memory: "2Gi"}
+workspace: {mountPath: /home/gem/workspace, size: 20Gi}
+lifecycle: {ttl: 8h, idleTimeout: 2h, onIdle: disabled}
+keepWorkspaceDefault: true
+isolation: container

@@ -18,7 +18,7 @@ func TestMCPBehindLoopbackProxyValidatesHostAndOrigin(t *testing.T) {
 		PreviewPortMin: 1024,
 		Config:         config.MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 2},
 		Domains:        config.Domains{Scheme: "https", Portal: "portal.example.test", HostSuffix: "hosts.example.test"},
-		Hosts:          &hostServiceStub{}, Applications: newApplicationStatusServiceStub(), RuntimeTools: &runtimeComputerToolsStub{}, Tasks: newTaskServiceStub(), Schedules: scheduleServiceFake{}, Auth: verifierStub{}, Audit: &auditStub{},
+		Hosts:          &hostServiceStub{}, Applications: newApplicationStatusServiceStub(), RuntimeTools: &runtimeComputerToolsStub{}, Auth: verifierStub{}, Audit: &auditStub{},
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(),
 	})
 	if err != nil {

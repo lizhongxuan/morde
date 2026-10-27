@@ -100,7 +100,7 @@ func (h *api) actOnControl(service ControlService) gin.HandlerFunc {
 			return
 		}
 		var request controlActionRequest
-		if !decodeStrictTaskJSON(c, &request) {
+		if !decodeStrictJSON(c, &request) {
 			return
 		}
 		if request.Action != control.ActionTakeOver && request.Action != control.ActionRelease {

@@ -111,9 +111,9 @@ describe('Workspaces', () => {
     vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
     vi.mocked(portalApi.hosts).mockResolvedValueOnce({ items: [host] }).mockResolvedValue({ items: [{ ...host, workspaces: [binding] }] });
     const bind = vi.spyOn(portalApi, 'bindWorkspaceToHost').mockResolvedValue({ ...binding, state: 'preparing', applied_revision: 1 });
-    const enter = vi.spyOn(portalApi, 'enterHost').mockResolvedValue({ url: 'https://h1234567.hosts.test/__ch/auth?t=one-time', expires_at: '2026-10-24T12:00:00Z' });
-    const tab = { opener: window, location: { href: '' }, close: vi.fn() };
-    vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    const enter = vi.spyOn(portalApi, 'enterHost');
+    const tab = { opener: window };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
     const user = userEvent.setup();
     renderWorkspaces();
 
@@ -126,11 +126,9 @@ describe('Workspaces', () => {
     expect(screen.getByText('项目：文件已就绪')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: '打开主机 开发电脑' }));
-    await waitFor(() => expect(enter).toHaveBeenCalledWith(host.id));
-    const ticket = new URL(tab.location.href);
-    expect(ticket.searchParams.get('t')).toBe('one-time');
-    expect(ticket.pathname).toBe('/__ch/auth');
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${host.id}`, '_blank');
     expect(tab.opener).toBeNull();
+    expect(enter).not.toHaveBeenCalled();
     expect(screen.getByText(/Host 应用与设备传输进度分别显示/)).toBeInTheDocument();
   });
 

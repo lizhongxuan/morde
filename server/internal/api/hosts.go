@@ -68,7 +68,6 @@ type resourcesResponse struct {
 }
 
 type createHostRequest struct {
-	TemplateID   string          `json:"template_id"`
 	Name         string          `json:"name"`
 	WorkspaceIDs []string        `json:"workspace_ids"`
 	Workspace    json.RawMessage `json:"workspace"`
@@ -167,15 +166,11 @@ func (h *api) createHost(c *gin.Context) {
 		return
 	}
 	var request createHostRequest
-	if !decodeJSON(c, &request) {
+	if !decodeStrictJSON(c, &request) {
 		return
 	}
 	if request.Workspace != nil {
 		writeError(c, domain.InvalidArgument("workspace", "workspace is not a supported host creation field"))
-		return
-	}
-	if !domain.ValidTemplateID(request.TemplateID) {
-		writeError(c, domain.InvalidArgument("template_id", "invalid template id"))
 		return
 	}
 	if len(request.WorkspaceIDs) > workspace.MaxBindingsPerHost {
@@ -194,7 +189,7 @@ func (h *api) createHost(c *gin.Context) {
 		}
 		seenWorkspaceIDs[workspaceID] = struct{}{}
 	}
-	command := app.CreateHostCommand{TemplateID: request.TemplateID, Name: request.Name, WorkspaceIDs: request.WorkspaceIDs, IdempotencyKey: keys[0]}
+	command := app.CreateHostCommand{Name: request.Name, WorkspaceIDs: request.WorkspaceIDs, IdempotencyKey: keys[0]}
 	created, err := h.deps.Hosts.Create(c.Request.Context(), principal, command)
 	if err != nil {
 		writeError(c, err)

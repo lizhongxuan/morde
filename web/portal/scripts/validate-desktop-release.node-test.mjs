@@ -16,7 +16,7 @@ function fixture() {
   const manifestPath = join(root, 'public', 'downloads', 'manifest.json');
   mkdirSync(join(root, 'public', 'downloads'), { recursive: true });
   writeFileSync(manifestPath, JSON.stringify({
-    schema_version: 2,
+    schema_version: 3,
     version: '0.1.0',
     portal_url: 'https://morde.example/',
     artifacts: [{
@@ -26,7 +26,7 @@ function fixture() {
       acceptance: {
         status: 'verified', verified_at: '2026-10-26T00:00:00.000Z', evidence_ref: 'T22.10/macos-arm64/2026-10-26',
         signature_status: 'signed_and_notarized',
-        capabilities: ['install', 'launch_idle_network', 'task_approval_host', 'workspace_sync_recovery', 'update', 'uninstall'],
+        capabilities: ['install', 'launch_idle_network', 'user_web_workbench', 'workspace_sync_recovery', 'update', 'uninstall'],
       },
     }],
   }));
@@ -53,4 +53,13 @@ test('rejects packages that have not passed platform acceptance', (t) => {
   manifest.artifacts[0].acceptance.status = 'pending';
   writeFileSync(value.manifestPath, JSON.stringify(manifest));
   assert.throws(() => validateDesktopRelease(value.manifestPath, value.publicRoot), /未验收/);
+});
+
+test('rejects the retired task and approval acceptance contract', (t) => {
+  const value = fixture();
+  t.after(() => rmSync(value.root, { recursive: true, force: true }));
+  const manifest = JSON.parse(readFileSync(value.manifestPath, 'utf8'));
+  manifest.artifacts[0].acceptance.capabilities[2] = 'task_approval_host';
+  writeFileSync(value.manifestPath, JSON.stringify(manifest));
+  assert.throws(() => validateDesktopRelease(value.manifestPath, value.publicRoot), /桌面发行条目无效/);
 });

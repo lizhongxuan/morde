@@ -8,6 +8,9 @@ test("mock file management creates, renames, and confirms deleting a directory",
   await page.goto("/");
   await page.getByRole("button", { name: "文件", exact: true }).focus();
   await page.keyboard.press("Enter");
+  await expect(page.getByText("请先接管电脑后使用文件。")).toBeVisible();
+  await page.getByRole("button", { name: "接管电脑" }).click();
+  await page.getByRole("button", { name: "重试接管" }).click();
   await expect(page.getByRole("button", { name: "README.md" })).toBeVisible();
 
   const createRequestPromise = page.waitForRequest((request) =>

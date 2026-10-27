@@ -17,6 +17,16 @@ async function submitLogin(page: Page, username: string, password: string) {
   await page.getByRole("button", { name: "登录" }).click();
 }
 
+async function allowMoreHosts(page: Page) {
+  const status = await page.evaluate(async () => (await fetch('/api/admin/users/u1a2b3c4', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_status: 'approved', quota: { hosts: 3, cpu_milli: 4000, mem_mib: 8192 } }),
+  })).status);
+  expect(status).toBe(200);
+  await page.reload();
+  await expect(page.getByRole('link', { name: '创建电脑' })).toBeVisible();
+}
+
 test.describe("Portal feature mock flows", () => {
   test.skip(process.env.CH_REAL_E2E === "1", "mock scenario is disabled for a real-host run");
 
@@ -55,7 +65,7 @@ test.describe("Portal feature mock flows", () => {
     const page = await context.newPage();
     try {
       await page.goto(`${portalUrl}/hosts/new`);
-      await expect(page.getByRole("heading", { name: "创建主机" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "创建电脑" })).toBeVisible();
       await page.getByLabel(/主机名称/).fill("待恢复创建");
       await page.getByRole("button", { name: "创建主机" }).click();
       await expect(page.getByRole("button", { name: "继续上次创建" })).toBeVisible();
@@ -127,7 +137,7 @@ test.describe("Portal feature mock flows", () => {
       await page.getByLabel("用户名").fill(user.name);
       await page.getByLabel("密码").fill("local-only");
       await page.getByRole("button", { name: "登录" }).click();
-      await expect(page.getByRole("heading", { name: "我的工作区" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "工作区", exact: true })).toBeVisible();
       await expect(page.getByText("同步：已同步 v2")).toBeVisible();
       await expect.poll(async () => {
         conflict = true;
@@ -161,6 +171,10 @@ test.describe("Portal feature mock flows", () => {
     const hostName = `mock-workspace-host-${Date.now()}`;
 
     await signIn(page);
+    await allowMoreHosts(page);
+    await page.context().route('https://workbench.mock.invalid/**', (route) => route.fulfill({
+      status: 200, contentType: 'text/html', body: '<!doctype html><meta charset="utf-8"><h1>本地测试主机</h1>',
+    }));
     await page.getByRole("link", { name: "创建电脑" }).click();
     await page.getByLabel(/主机名称/).fill(hostName);
     await page.getByRole("button", { name: "创建主机" }).click();
@@ -180,7 +194,8 @@ test.describe("Portal feature mock flows", () => {
     await expect(deleteDialog).toContainText("绑定的独立工作区会自动解绑并保留在服务端，不随主机删除");
     await expect(deleteDialog).toContainText("正在运行的终端命令及服务会中止");
     await deleteDialog.getByRole("button", { name: "删除主机" }).click();
-    await expect(page.getByText("还没有主机")).toBeVisible();
+    await expect(host).toHaveCount(0);
+    await workbench.close();
 
     await page.getByRole("link", { name: "工作目录" }).click();
     const workspace = page.getByRole("row").filter({ hasText: workspaceId });
@@ -197,6 +212,7 @@ test.describe("Portal feature mock flows", () => {
   test("[mock] releases and restores the same cloud computer without losing its workspace", async ({ page }) => {
     const hostName = `mock-release-host-${Date.now()}`;
     await signIn(page);
+    await allowMoreHosts(page);
     await page.getByRole("link", { name: "创建电脑" }).click();
     await page.getByLabel(/主机名称/).fill(hostName);
     await page.getByRole("button", { name: "创建主机" }).click();
@@ -230,6 +246,7 @@ test.describe("Portal feature mock flows", () => {
     const targetName = `mock-workspace-target-${Date.now()}`;
 
     await signIn(page);
+    await allowMoreHosts(page);
     await page.getByRole("link", { name: "创建电脑" }).click();
     await page.getByLabel(/主机名称/).fill(sourceName);
     await page.getByRole("button", { name: "创建主机" }).click();
@@ -273,17 +290,16 @@ test.describe("Portal feature mock flows", () => {
   });
 
   test("[mock] admin can open and view each management page", async ({ page }) => {
-    await signIn(page, "admin");
+    await signIn(page);
     await page.getByRole("link", { name: "管理后台" }).click();
-    await expect(page.getByRole("heading", { name: "总览" })).toBeVisible();
-    await expect(page.getByText("当前没有云端电脑")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "总览", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "主机状态" })).toBeVisible();
 
     const adminNav = page.getByRole("navigation", { name: "管理导航" });
     await adminNav.getByRole("link", { name: "用户" }).click();
     await expect(page.getByRole("row").filter({ hasText: "demo" })).toBeVisible();
     await adminNav.getByRole("link", { name: "总览" }).click();
-    await expect(page.getByRole("heading", { name: "CPU", exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "内存", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "主机状态" })).toBeVisible();
     await adminNav.getByRole("link", { name: "审计" }).click();
     await expect(page.getByRole("row").filter({ hasText: "h-audit-demo" })).toBeVisible();
   });
@@ -340,27 +356,30 @@ test.describe("Portal feature mock flows", () => {
     const userName = `local-user-${Date.now()}`;
     const password = "local-only-password";
 
-    await signIn(page, "admin");
+    await signIn(page);
     await page.getByRole("link", { name: "管理后台" }).click();
+    await expect(page.getByRole('heading', { name: '主机状态' })).toBeVisible();
+    const registrationStatus = await page.evaluate(async ({ name, password: secret }) => (await fetch('/api/auth/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, password: secret }),
+    })).status, { name: userName, password });
+    expect(registrationStatus).toBe(201);
     const adminNav = page.getByRole("navigation", { name: "管理导航" });
     await adminNav.getByRole("link", { name: "用户" }).click();
-    await page.getByLabel("新用户名称").fill(userName);
-    await page.getByLabel("初始密码").fill(password);
-    await page.getByRole("button", { name: "创建用户" }).click();
     const userRow = page.getByRole("row").filter({ hasText: userName });
-    await expect(userRow).toContainText("普通用户 · 正常");
+    await expect(userRow).toContainText("普通用户 · 待审核");
+    await userRow.getByRole('button', { name: '通过审核' }).click();
+    await expect(userRow).toContainText('普通用户 · 已通过');
 
-    await page.getByRole("button", { name: `禁用用户 ${userName}` }).click();
-    const disableDialog = page.getByRole("dialog", { name: "禁用用户" });
-    await disableDialog.getByRole("button", { name: "禁用用户" }).click();
+    await userRow.getByRole('button', { name: '禁用账号' }).click();
     await expect(userRow).toContainText("已禁用");
 
     await page.getByRole("button", { name: "退出" }).click();
     await expect(page.getByLabel("用户名", { exact: true })).toBeVisible();
     await submitLogin(page, userName, password);
-    await expect(page.getByRole("alert")).toHaveText("用户名或密码错误，请重试。");
+    await expect(page.getByRole("alert")).toHaveText("账号已被禁用，请联系管理员。");
 
-    await submitLogin(page, "admin", "admin");
+    await submitLogin(page, "demo", "demo");
     const auditNav = page.getByRole("navigation", { name: "管理导航" });
     await auditNav.getByRole("link", { name: "审计" }).click();
     const since = await page.evaluate(() => {

@@ -27,49 +27,53 @@ const (
 	workspaceSyncJSONBodyLimit   = 16 << 20
 	workspaceSyncBlockBodyLimit  = 4 << 20
 	workspaceSyncActionBodyLimit = 32 << 10
+	modelGatewayBodyLimit        = 8 << 20
 )
 
 type Deps struct {
-	Hosts                app.HostService
-	HostSharing          app.HostSharingService
-	HostReplicas         app.HostReplicaService
-	TLSAuthorizer        app.HostTLSAuthorizer
-	Verifier             app.Verifier
-	Auth                 AuthService
-	WorkspaceOps         WorkspaceService
-	WorkspaceSync        WorkspaceSyncService
-	Sites                SiteService
-	Templates            TemplateReader
-	Tokens               TokenService
-	ClientAuthorizations ClientAuthorizationService
-	Tasks                TaskService
-	Schedules            ScheduleService
-	Notifications        NotificationService
-	ExecutionControl     ExecutionControlService
-	Control              ControlService
-	Conversations        ConversationService
-	ModelConnections     ModelConnectionManager
-	Onboarding           OnboardingManager
-	Admin                AdminService
-	AdminWorkspaces      AdminWorkspaceService
-	Readiness            ReadinessChecker
-	MCP                  http.Handler
-	MCPDisabled          bool
+	Hosts              app.HostService
+	HostSharing        app.HostSharingService
+	HostReplicas       app.HostReplicaService
+	TLSAuthorizer      app.HostTLSAuthorizer
+	Verifier           app.Verifier
+	Auth               AuthService
+	WorkspaceOps       WorkspaceService
+	WorkspaceSync      WorkspaceSyncService
+	Sites              SiteService
+	Templates          TemplateReader
+	Tokens             TokenService
+	ClientLogin        ClientLoginService
+	Notifications      NotificationService
+	Control            ControlService
+	Tasks              TaskService
+	Conversations      ConversationService
+	InstantChat        InstantChatService
+	ModelConnections   ModelConnectionManager
+	ModelGateway       ModelGateway
+	ModelUsageAdmin    ModelUsageAdmin
+	Onboarding         OnboardingManager
+	Admin              AdminService
+	AdminHostResources AdminHostResourcesService
+	AdminWorkspaces    AdminWorkspaceService
+	Readiness          ReadinessChecker
+	MCP                http.Handler
+	MCPDisabled        bool
 }
 
 type Options struct {
-	Logger          *zap.Logger
-	Metrics         prometheus.Registerer
-	APIMaxBodyBytes int64
-	MCPMaxBodyBytes int64
-	CookieSecure    bool
-	SessionTTL      time.Duration
-	HostScheme      string
-	PortalDomain    string
-	HostSuffix      string
-	PreviewPortMin  int
-	PreviewPortDeny []int
-	PortalFiles     fs.FS
+	Logger            *zap.Logger
+	Metrics           prometheus.Registerer
+	ServiceInstanceID string
+	APIMaxBodyBytes   int64
+	MCPMaxBodyBytes   int64
+	CookieSecure      bool
+	SessionTTL        time.Duration
+	HostScheme        string
+	PortalDomain      string
+	HostSuffix        string
+	PreviewPortMin    int
+	PreviewPortDeny   []int
+	PortalFiles       fs.FS
 }
 
 type api struct {
@@ -79,8 +83,8 @@ type api struct {
 }
 
 func New(deps Deps, options Options) (*gin.Engine, error) {
-	if deps.Hosts == nil || deps.TLSAuthorizer == nil || deps.Verifier == nil || deps.Auth == nil || deps.Tasks == nil || deps.Conversations == nil {
-		return nil, errors.New("api host, verifier, auth, workspace, task, and conversation services are required")
+	if deps.Hosts == nil || deps.TLSAuthorizer == nil || deps.Verifier == nil || deps.Auth == nil {
+		return nil, errors.New("api host, verifier, and auth services are required")
 	}
 	if options.APIMaxBodyBytes <= 0 || options.MCPMaxBodyBytes <= 0 || options.SessionTTL <= 0 {
 		return nil, errors.New("api body limits and credential lifetimes must be positive")
@@ -117,9 +121,8 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	engine.Use(h.securityHeaders)
 	engine.GET("/healthz", h.healthz)
 	engine.GET("/readyz", h.readyz)
+	engine.GET("/api/capabilities", h.capabilities)
 	engine.GET("/__ch/cert-authorize", h.authorizeTLS)
-	engine.POST("/api/client-authorizations", h.limitBody, h.createClientAuthorization)
-	engine.POST("/api/client-authorizations/token", h.limitBody, h.pollClientAuthorization)
 	h.registerHostReplicaRoutes(engine)
 	if deps.MCPDisabled {
 		engine.Any("/mcp", h.mcpDisabled)
@@ -133,17 +136,18 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerOnboarding(group)
 	h.registerHosts(group)
 	h.registerControl(group, deps.Control)
+	h.registerConversations(group, deps.Conversations, deps.Tasks)
+	h.registerTasks(group, deps.Tasks)
 	h.registerResources(group)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync)
 	h.registerSites(group)
-	h.registerClientAuthorizations(group)
-	h.registerTasks(group, deps.Tasks)
-	h.registerSchedules(group, deps.Schedules)
+	h.registerClients(group)
+	h.registerInstantChat(group)
 	h.registerNotifications(group, deps.Notifications)
-	h.registerExecutionControl(group, deps.ExecutionControl)
-	h.registerConversations(group, deps.Conversations, deps.Tasks)
 	h.registerModelConnections(group)
+	h.registerModelGateway(group)
 	h.registerAdmin(group)
+	h.registerAdminModelUsage(group)
 	engine.NoRoute(h.noRoute)
 	engine.NoMethod(func(c *gin.Context) {
 		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
@@ -154,6 +158,8 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 func (h *api) limitBody(c *gin.Context) {
 	limit := h.options.APIMaxBodyBytes
 	switch {
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/model/v1/chat/completions":
+		limit = modelGatewayBodyLimit
 	case c.Request.Method == http.MethodPost && strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-sessions"):
 		limit = workspaceSyncJSONBodyLimit
 	case c.Request.Method == http.MethodPut && strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-sessions/:session_id/blocks/:digest"):
@@ -166,7 +172,7 @@ func (h *api) limitBody(c *gin.Context) {
 }
 
 func (h *api) authenticate(c *gin.Context) {
-	if c.FullPath() == "/api/auth/login" || c.FullPath() == "/api/auth/register" {
+	if c.FullPath() == "/api/auth/login" || c.FullPath() == "/api/auth/register" || c.FullPath() == "/api/auth/client-login" {
 		c.Next()
 		return
 	}
@@ -234,6 +240,7 @@ func (h *api) authenticate(c *gin.Context) {
 				}
 				principal, err = verifier.VerifyClient(c.Request.Context(), parts[1])
 				principal.Kind = identity.KindClient
+				principal.Role = identity.RoleUser
 				c.Set("auth_kind", "client")
 			case identity.KindDevice:
 				verifier, ok := h.deps.Verifier.(interface {
@@ -260,8 +267,16 @@ func (h *api) authenticate(c *gin.Context) {
 		h.authFailure(c, c.GetString("auth_kind"))
 		return
 	}
+	if principal.Kind == identity.KindSession && principal.ClientInstallationID != "" {
+		principal.Role = identity.RoleUser
+	}
 	if principal.Kind == identity.KindSession && principal.MustChangePassword && !passwordChangeRoute(c.Request.Method, c.FullPath()) {
 		writeError(c, domain.NewError(domain.CodeForbidden, "password change is required before continuing"))
+		c.Abort()
+		return
+	}
+	if principal.Kind == identity.KindSession && principal.ClientInstallationID != "" && strings.HasPrefix(c.FullPath(), "/api/admin/") {
+		writeError(c, domain.NewError(domain.CodeForbidden, "client Web session cannot access administration"))
 		c.Abort()
 		return
 	}
@@ -411,19 +426,26 @@ func clientCredentialRoute(method, path string) bool {
 	switch method {
 	case http.MethodGet:
 		switch path {
-		case "/api/me", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
-			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id",
-			"/api/conversations", "/api/conversations/:id", "/api/conversations/:id/messages",
-			"/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events", "/api/notifications",
-			"/api/schedules", "/api/schedules/:id", "/api/schedules/:id/runs", "/api/available-models":
+		case "/api/me", "/api/clients", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
+			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
+			"/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
+			"/api/notifications", "/api/available-models":
 			return true
 		}
 	case http.MethodPost:
 		switch path {
-		case "/api/tasks", "/api/conversations/:id/messages", "/api/tasks/:id/actions",
-			"/api/notifications/:id/read", "/api/hosts/:id/enter", "/api/hosts/:id/observation-ticket":
+		case "/api/auth/client-web-session", "/api/auth/client-logout":
+			return true
+		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
+			"/api/tasks/:id/inputs", "/api/tasks/:id/approvals/:approval_id/responses":
+			return true
+		case "/api/model/v1/chat/completions":
+			return true
+		case "/api/notifications/:id/read", "/api/hosts/:id/enter", "/api/hosts/:id/observation-ticket":
 			return true
 		}
+	case http.MethodDelete:
+		return path == "/api/clients/:id"
 	}
 	return false
 }

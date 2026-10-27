@@ -118,8 +118,8 @@ func userDomain(row sqlcgen.User) identity.User {
 		ID: row.ID, Name: row.Name, PasswordHash: row.PasswordHash, Role: identity.Role(row.Role),
 		Status: identity.AccountStatus(row.Status), MustChangePassword: row.MustChangePassword,
 		QuotaHosts: int(row.QuotaHosts), QuotaCPUMilli: int(row.QuotaCpuMilli),
-		QuotaMemMiB: int(row.QuotaMemMib),
-		CreatedAt:   row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
+		QuotaMemMiB: int(row.QuotaMemMib), DefaultHostCPUMilli: int(row.DefaultHostCpuMilli), DefaultHostMemMiB: int(row.DefaultHostMemMib),
+		CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
 }
 

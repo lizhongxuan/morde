@@ -11,7 +11,6 @@ import (
 )
 
 type CreateHostCommand struct {
-	TemplateID     string
 	Name           string
 	WorkspaceIDs   []string
 	IdempotencyKey string
@@ -28,6 +27,7 @@ type EnterInfo struct {
 
 type HostService interface {
 	Create(context.Context, identity.Principal, CreateHostCommand) (host.Host, error)
+	EnsureDefaultStopped(context.Context, identity.User) (host.Host, bool, error)
 	List(context.Context, identity.Principal) ([]host.Host, error)
 	Get(context.Context, identity.Principal, string) (host.Host, error)
 	BindWorkspace(context.Context, identity.Principal, string, string, *int64, int64, string) (workspace.Binding, error)

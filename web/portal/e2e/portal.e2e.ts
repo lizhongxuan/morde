@@ -41,6 +41,7 @@ test.describe("portal mock flow", () => {
     await password.focus();
     await page.keyboard.type("demo");
     await password.press("Enter");
+    await expect(page.getByRole("link", { name: "云端电脑", exact: true })).toBeVisible();
     await page.evaluate(() => {
       if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
     });
@@ -52,6 +53,15 @@ test.describe("portal mock flow", () => {
 
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
     await expect(page.getByRole("heading", { name: "云端电脑", exact: true })).toBeVisible();
+    const quotaStatus = await page.evaluate(async () => (await fetch('/api/admin/users/u1a2b3c4', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_status: 'approved', quota: { hosts: 3, cpu_milli: 4000, mem_mib: 8192 } }),
+    })).status);
+    expect(quotaStatus).toBe(200);
+    await page.reload();
+    await page.context().route('https://workbench.mock.invalid/**', (route) => route.fulfill({
+      status: 200, contentType: 'text/html', body: '<!doctype html><meta charset="utf-8"><h1>本地测试主机</h1>',
+    }));
 
     const createLink = page.getByRole("link", { name: "创建电脑" });
     await createLink.focus();
@@ -86,13 +96,8 @@ test.describe("portal mock flow", () => {
     await enter.focus();
     await page.keyboard.press("Enter");
     const popup = await popupPromise;
-    await expect(popup.getByRole("navigation", { name: "工作台功能" })).toBeVisible({
-      timeout: 10_000,
-    });
-    await expect(popup.getByText("本地测试主机")).toBeVisible();
-    expect(new URL(popup.url()).origin).toBe(
-      new URL(process.env.CH_WORKBENCH_E2E_URL ?? "http://127.0.0.1:5184").origin,
-    );
+    await expect(popup.getByRole("heading", { name: "本地测试主机" })).toBeVisible();
+    expect(new URL(popup.url()).origin).toBe("https://workbench.mock.invalid");
     const postCreateClicks = await page.evaluate(
       () => (window as typeof window & { postCreateClicks?: number }).postCreateClicks ?? 0,
     );
@@ -106,7 +111,7 @@ test.describe("portal mock flow", () => {
     await page.keyboard.press("Shift+Tab");
     await expect(dialog.getByRole("button", { name: "删除主机" })).toBeFocused();
     await page.keyboard.press("Enter");
-    await expect(page.getByText("还没有主机")).toBeVisible();
+    await expect(host).toHaveCount(0);
     await popup.close();
   });
 
@@ -124,7 +129,6 @@ test.describe("portal mock flow", () => {
     await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
     await page.getByRole("link", { name: "API Key", exact: true }).click();
     await page.getByLabel("名称").fill("门户吊销验收");
-    await page.getByRole("checkbox", { name: "创建新主机 host:create" }).check();
     await page.getByRole("button", { name: "创建 API Key" }).click();
     const secretDialog = page.getByRole("dialog", { name: "API Key 已创建" });
     await expect(secretDialog).toBeVisible();

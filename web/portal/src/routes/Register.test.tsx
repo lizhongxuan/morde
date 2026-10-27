@@ -19,6 +19,7 @@ function renderRoute(path: string) {
   render(<QueryClientProvider client={client}><AuthProvider><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/register" element={<Register />} />
     <Route path="/login" element={<Login />} />
+    <Route path="/assistant" element={<p>助手页面</p>} />
     <Route path="/admin/login" element={<Login defaultTo="/admin/" allowRegister={false} />} />
   </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
   return client;
@@ -63,6 +64,17 @@ describe('registration page', () => {
   it('keeps registration off the administrator login page', () => {
     renderRoute('/admin/login');
     expect(screen.queryByRole('link', { name: '注册账号' })).not.toBeInTheDocument();
+  });
+
+  it('ignores a backslash-based cross-origin login return address', async () => {
+    vi.mocked(portalApi.login).mockResolvedValueOnce({ user: { id: 'u1234567', name: 'new-user', role: 'user' } } as never);
+    const user = userEvent.setup();
+    renderRoute('/login?next=%2F%5Cattacker.example');
+    await user.type(screen.getByRole('textbox', { name: '用户名' }), 'new-user');
+    await user.type(screen.getByLabelText('密码', { exact: true }), 'secret-pass');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    expect(await screen.findByText('助手页面')).toBeInTheDocument();
   });
 
   it.each([

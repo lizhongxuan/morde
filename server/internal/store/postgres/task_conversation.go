@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"morde/server/internal/app"
@@ -39,8 +41,8 @@ func (s *Store) CreateConversation(ctx context.Context, value conversation.Conve
 			return nil
 		}
 		_, err = tx.Exec(ctx, `
-INSERT INTO conversations (id, owner_id, host_id, title)
-VALUES ($1, $2, $3, $4)`, value.ID, value.OwnerID, value.HostID, value.Title)
+INSERT INTO conversations (id, owner_id, host_id, title, model_id)
+VALUES ($1, $2, $3, $4, $5)`, value.ID, value.OwnerID, nullableText(value.HostID), value.Title, value.ModelID)
 		if err != nil {
 			return fmt.Errorf("create conversation: %w", err)
 		}
@@ -93,28 +95,38 @@ func (s *Store) ListMessages(ctx context.Context, ownerID, conversationID string
 	if _, err := s.GetConversation(ctx, conversationID, ownerID); err != nil {
 		return app.MessagePage{}, err
 	}
-	limit, cursorAt, cursorID, err := pagination(page.Limit, page.Cursor)
+	limit, _, _, err := pagination(page.Limit, "")
 	if err != nil {
 		return app.MessagePage{}, err
 	}
+	var before int64
+	if page.Cursor != "" {
+		decoded, decodeErr := base64.RawURLEncoding.DecodeString(page.Cursor)
+		if decodeErr != nil {
+			return app.MessagePage{}, domain.InvalidArgument("cursor", "message cursor is invalid")
+		}
+		before, decodeErr = strconv.ParseInt(string(decoded), 10, 64)
+		if decodeErr != nil || before < 1 {
+			return app.MessagePage{}, domain.InvalidArgument("cursor", "message cursor is invalid")
+		}
+	}
 	rows, err := s.q.ListMessages(ctx, sqlcgen.ListMessagesParams{
-		OwnerID: ownerID, ConversationID: conversationID, Column3: cursorAt, ID: cursorID, Limit: limit + 1,
+		OwnerID: ownerID, ConversationID: conversationID, Column3: before, Limit: limit + 1,
 	})
 	if err != nil {
 		return app.MessagePage{}, fmt.Errorf("list conversation messages: %w", err)
 	}
 	items := mapRows(rows, messageDomain)
 	pageResult := app.MessagePage{Items: items}
-	pageResult.NextCursor = nextPageCursor(items, limit, func(value conversation.Message) (string, time.Time) {
-		return value.ID, value.CreatedAt
-	})
 	if int32(len(items)) > limit {
+		pageResult.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(items[limit-1].Sequence, 10)))
 		pageResult.Items = items[:limit]
 	}
 	return pageResult, nil
 }
 
 func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (app.TaskSubmissionResult, error) {
+	submission.Task = normalizeNewTask(submission.Task)
 	newConversation := submission.Conversation != nil
 	if submission.Task.ConversationID == "" {
 		switch {
@@ -141,6 +153,9 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		if submission.Conversation.HostID == "" {
 			submission.Conversation.HostID = submission.Task.HostID
 		}
+		if submission.Conversation.ModelID == "" {
+			submission.Conversation.ModelID = submission.Task.ModelID
+		}
 	}
 	if submission.Message.ConversationID == "" {
 		submission.Message.ConversationID = submission.Task.ConversationID
@@ -163,8 +178,7 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		if err := validateConversation(*submission.Conversation); err != nil {
 			return app.TaskSubmissionResult{}, err
 		}
-		if submission.Conversation.ID != submission.Task.ConversationID || submission.Conversation.OwnerID != submission.Task.OwnerID ||
-			submission.Conversation.HostID != submission.Task.HostID {
+		if submission.Conversation.ID != submission.Task.ConversationID || submission.Conversation.OwnerID != submission.Task.OwnerID {
 			return app.TaskSubmissionResult{}, domain.InvalidArgument("conversation", "conversation and task associations do not match")
 		}
 	}
@@ -196,30 +210,27 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		if err != nil {
 			return err
 		}
-		if err := lockAIHost(ctx, tx, submission.Task.HostID, submission.Task.OwnerID); err != nil {
-			return err
-		}
-		if err := requireRunningTaskApplication(ctx, tx, submission.Task); err != nil {
-			return err
+		if submission.Task.HostID != "" {
+			if err := lockTaskTargetHost(ctx, tx, submission.Task.HostID, submission.Task.OwnerID); err != nil {
+				return err
+			}
 		}
 		if submission.Conversation != nil {
-			_, err := tx.Exec(ctx, `INSERT INTO conversations (id, owner_id, host_id, title) VALUES ($1, $2, $3, $4)`,
-				submission.Conversation.ID, submission.Conversation.OwnerID, submission.Conversation.HostID, submission.Conversation.Title)
+			_, err := tx.Exec(ctx, `INSERT INTO conversations (id, owner_id, host_id, title, model_id) VALUES ($1, $2, $3, $4, $5)`,
+				submission.Conversation.ID, submission.Conversation.OwnerID, nullableText(submission.Conversation.HostID),
+				submission.Conversation.Title, submission.Conversation.ModelID)
 			if err != nil {
 				return fmt.Errorf("create task conversation: %w", err)
 			}
 		} else {
-			var hostID string
-			err := tx.QueryRow(ctx, `SELECT host_id FROM conversations WHERE id=$1 AND owner_id=$2 FOR UPDATE`,
-				submission.Task.ConversationID, submission.Task.OwnerID).Scan(&hostID)
+			var id string
+			err := tx.QueryRow(ctx, `SELECT id FROM conversations WHERE id=$1 AND owner_id=$2 FOR UPDATE`,
+				submission.Task.ConversationID, submission.Task.OwnerID).Scan(&id)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.NewError(domain.CodeNotFound, "conversation not found")
 			}
 			if err != nil {
 				return fmt.Errorf("lock task conversation: %w", err)
-			}
-			if hostID != submission.Task.HostID {
-				return domain.NewError(domain.CodeInvalidState, "task host does not match conversation host")
 			}
 		}
 		var activeTaskID string
@@ -245,8 +256,8 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		if err := insertBatchItems(ctx, tx, submission.Task.ID, submission.BatchItems); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`,
-			submission.Task.ConversationID, submission.Task.OwnerID)
+		_, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=clock_timestamp(), model_id=$3, host_id=$4 WHERE id=$1 AND owner_id=$2`,
+			submission.Task.ConversationID, submission.Task.OwnerID, submission.Task.ModelID, nullableText(submission.Task.HostID))
 		if err != nil {
 			return fmt.Errorf("touch task conversation: %w", err)
 		}
@@ -257,13 +268,14 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 }
 
 func (s *Store) AppendMessage(ctx context.Context, submission app.TaskSubmission) (app.TaskSubmissionResult, error) {
+	submission.Task = normalizeNewTask(submission.Task)
 	message := submission.Message
 	if !domain.ValidConversationID(message.ConversationID) || !domain.ValidUserID(message.OwnerID) ||
 		message.Role != conversation.RoleUser || message.Content == "" || !domain.ValidMessageID(message.ID) {
 		return app.TaskSubmissionResult{}, domain.InvalidArgument("message", "message fields are invalid")
 	}
 	if submission.Task.OwnerID != message.OwnerID || submission.Task.ConversationID != message.ConversationID ||
-		!domain.ValidHostID(submission.Task.HostID) || submission.Task.ModelID == "" {
+		(submission.Task.HostID != "" && !domain.ValidHostID(submission.Task.HostID)) || submission.Task.ModelID == "" {
 		return app.TaskSubmissionResult{}, domain.InvalidArgument("task", "task routing fields do not match message")
 	}
 	if submission.Idempotency.OwnerID != message.OwnerID {
@@ -331,8 +343,13 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 				return domain.NewError(domain.CodeInvalidState, "conversation task is stopping")
 			}
 			if targetTask.HostID != submission.Task.HostID || targetTask.ModelID != submission.Task.ModelID ||
-				targetTask.ApplicationID != submission.Task.ApplicationID || conversationRow.HostID != targetTask.HostID {
+				targetTask.ApplicationID != submission.Task.ApplicationID {
 				return domain.NewError(domain.CodeInvalidState, "message host, model and application must match the active task")
+			}
+		}
+		if targetTask.HostID != "" {
+			if err := lockTaskTargetHost(ctx, tx, targetTask.HostID, targetTask.OwnerID); err != nil {
+				return err
 			}
 		}
 		message.TaskID = targetTask.ID
@@ -350,16 +367,7 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 			}
 			return err
 		}
-		if err := lockAIHost(ctx, tx, targetTask.HostID, targetTask.OwnerID); err != nil {
-			return err
-		}
-		if err := requireRunningTaskApplication(ctx, tx, targetTask); err != nil {
-			return err
-		}
 		if newTask {
-			if targetTask.HostID != conversationRow.HostID {
-				return domain.NewError(domain.CodeInvalidState, "task host does not match conversation host")
-			}
 			payload, err := validateInitialTaskEvent(submission.InitialEvent.Type, submission.InitialEvent.Payload)
 			if err != nil {
 				return err
@@ -401,7 +409,8 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`, message.ConversationID, message.OwnerID)
+		_, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=clock_timestamp(), model_id=$3, host_id=$4 WHERE id=$1 AND owner_id=$2`,
+			message.ConversationID, message.OwnerID, targetTask.ModelID, nullableText(targetTask.HostID))
 		if err != nil {
 			return fmt.Errorf("touch conversation after message: %w", err)
 		}
@@ -409,6 +418,21 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 		return err
 	})
 	return result, err
+}
+
+// Hold the Host lock so deletion cannot race a task target check.
+func lockTaskTargetHost(ctx context.Context, tx pgx.Tx, hostID, ownerID string) error {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+SELECT state<>'deleted' AND deleted_at IS NULL
+FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, hostID, ownerID).Scan(&exists)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !exists) {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if err != nil {
+		return fmt.Errorf("lock task target Host: %w", err)
+	}
+	return nil
 }
 
 // lockAIHost holds a shared Host row lock until the surrounding transaction
@@ -427,33 +451,6 @@ FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, hostID, ownerID).Scan(&allowe
 	}
 	if !allowed {
 		return domain.NewError(domain.CodeInvalidState, "host is not available for AI tasks")
-	}
-	return nil
-}
-
-// The Host row lock taken by lockAIHost serializes this check with application
-// launch updates, which take the same Host lock before changing launch state.
-func requireRunningTaskApplication(ctx context.Context, tx pgx.Tx, value task.Task) error {
-	if value.ApplicationID == "" {
-		return nil
-	}
-	if !app.ValidHostApplicationID(value.ApplicationID) {
-		return domain.InvalidArgument("application_id", "application is not supported")
-	}
-	var running bool
-	err := tx.QueryRow(ctx, `
-SELECT EXISTS (
-  SELECT 1 FROM host_application_launches AS a
-  JOIN hosts AS h ON h.id=a.host_id AND h.owner_id=a.owner_id
-  WHERE a.host_id=$1 AND a.owner_id=$2 AND a.application_id=$3 AND a.status='running'
-    AND a.runtime_generation=h.runtime_generation AND a.runtime_instance_id=h.runtime_instance_id
-    AND a.control_version=h.control_version
-)`, value.HostID, value.OwnerID, value.ApplicationID).Scan(&running)
-	if err != nil {
-		return fmt.Errorf("check task application launch: %w", err)
-	}
-	if !running {
-		return domain.NewError(domain.CodeInvalidState, "target application is not running on this Host")
 	}
 	return nil
 }
@@ -478,6 +475,7 @@ func loadSubmissionResult(ctx context.Context, tx pgx.Tx, ownerID, taskID, messa
 }
 
 func insertTask(ctx context.Context, tx pgx.Tx, value task.Task, eventSequence int64, executionEpoch int64) error {
+	value = normalizeNewTask(value)
 	if executionEpoch < 1 {
 		return missingExecutionGateError()
 	}
@@ -486,15 +484,16 @@ INSERT INTO tasks (
   id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes,
   budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls,
   usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, finished_at, execution_epoch, application_id,
-  auth_client_installation_id
+  auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at
 ) VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::text[], '{}'::text[]),$11,$12,$13,$14,$15,$16,'',0,NULL,$17,$18,$19,$20,$21,$22,$23,$24
-)`, value.ID, value.OwnerID, value.ConversationID, value.HostID, value.ModelID, value.Objective,
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::text[], '{}'::text[]),$11,$12,$13,$14,$15,$16,'',0,NULL,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+)`, value.ID, value.OwnerID, value.ConversationID, nullableText(value.HostID), value.ModelID, value.Objective,
 		string(value.Status), value.Authorization.Kind, value.Authorization.TokenID, value.Authorization.Scopes,
 		value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
-		value.Usage.ActiveSeconds, value.Usage.ToolCalls, taskUsageTokens(value.Usage.ModelTokens),
+		value.Usage.ActiveSeconds, value.Usage.ToolCalls, int64(0),
 		eventSequence, value.CurrentStep, value.Result, value.WaitingReason, nullableTimestamp(value.FinishedAt), executionEpoch, value.ApplicationID,
-		nullableText(value.Authorization.ClientInstallationID))
+		nullableText(value.Authorization.ClientInstallationID), value.ExecutionLocation, nullableText(value.WorkspaceID),
+		value.InputRevision, value.ContextDigest, value.Authorization.Version, value.Authorization.ExpiresAt)
 	if err != nil {
 		return fmt.Errorf("insert task: %w", err)
 	}
@@ -502,8 +501,16 @@ INSERT INTO tasks (
 }
 
 func insertMessage(ctx context.Context, tx pgx.Tx, value conversation.Message) error {
-	_, err := tx.Exec(ctx, `INSERT INTO conversation_messages (id, conversation_id, owner_id, role, content, task_id) VALUES ($1,$2,$3,$4,$5,$6)`,
-		value.ID, value.ConversationID, value.OwnerID, string(value.Role), value.Content, value.TaskID)
+	var sequence int64
+	if err := tx.QueryRow(ctx, `UPDATE conversations SET message_seq=message_seq+1 WHERE id=$1 AND owner_id=$2 RETURNING message_seq`,
+		value.ConversationID, value.OwnerID).Scan(&sequence); err != nil {
+		return storeError("reserve message sequence", "conversation", err)
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO conversation_messages
+(id, conversation_id, owner_id, role, content, task_id, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence)
+VALUES ($1,$2,$3,$4,$5,$6,COALESCE(NULLIF($7, ''), (SELECT model_id FROM tasks WHERE id=$6), ''),$8,$9,$10,$11)`,
+		value.ID, value.ConversationID, value.OwnerID, string(value.Role), value.Content, nullableText(value.TaskID), value.ModelID,
+		stringOrDefault(value.SourceKind, "task"), value.SourceExchangeID, value.RequestedConversationID, sequence)
 	if err != nil {
 		return fmt.Errorf("insert conversation message: %w", err)
 	}

@@ -27,7 +27,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 	ctx := context.Background()
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 
-	owner := createTestUser(t, store, 1, 2000, 4096)
+	owner := createTestUser(t, store, 1, 20_000, 40_000)
 	created := createTestHost(t, ctx, store, owner.ID, capacity, nil)
 	if created.State != host.StateCreating || len(created.Workspaces) != 0 {
 		t.Fatalf("created host = %#v", created)
@@ -53,7 +53,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 	}
 
 	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, nil)); domain.CodeOf(err) != domain.CodeQuotaExceeded {
-		t.Fatalf("owner quota error = %v", err)
+		t.Fatalf("create another host past the host-count limit: %v", err)
 	}
 
 	capacityOwner := createTestUser(t, store, 3, 10_000, 20_000)
@@ -83,7 +83,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 		t.Fatalf("complete workspace deletion = %#v, err=%v", completed, err)
 	}
 
-	t.Run("parallel quota and workspace attach", func(t *testing.T) {
+	t.Run("parallel host creation and workspace attach", func(t *testing.T) {
 		parallelOwner := createTestUser(t, store, 1, 20_000, 40_000)
 		const attempts = 8
 		paramsList := make([]app.CreateHostParams, attempts)
@@ -115,7 +115,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 		}
 		for _, err := range failures {
 			if domain.CodeOf(err) != domain.CodeQuotaExceeded {
-				t.Errorf("parallel create error = %v", err)
+				t.Errorf("parallel create error = %v, want quota exceeded", err)
 			}
 		}
 
@@ -247,25 +247,8 @@ func TestHostCreateIdempotencyReplaysAtomically(t *testing.T) {
 	owner := createTestUser(t, store, 8, 20_000, 40_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "host-create-retry")
-	tokenID, err := domain.NewTokenID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, secretHash, err := identity.NewCredential(identity.KindAPIKey, tokenID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := store.CreateToken(ctx, identity.Token{
-		ID: tokenID, OwnerID: owner.ID, Kind: identity.KindAPIKey, HostIDs: []string{},
-		Scopes: []identity.Scope{identity.ScopeHostCreate}, Name: "host-create-retry",
-		SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("create Host create API key: %v", err)
-	}
 	params := testCreateHostParams(t, owner.ID, capacity, []string{workspaceValue.ID})
-	params.GrantTokenID = token.ID
-	requestHash := sha256.Sum256([]byte(`{"template_id":"small","name":"retry"}`))
+	requestHash := sha256.Sum256([]byte(`{"name":"retry"}`))
 	params.Idempotency = app.IdempotencyRecord{
 		OwnerID: owner.ID, Operation: "host.create", Key: "host-create-retry-001",
 		RequestHash: requestHash[:], ResourceID: params.Host.ID,
@@ -275,17 +258,13 @@ func TestHostCreateIdempotencyReplaysAtomically(t *testing.T) {
 	if err != nil || replayed || created.ID != params.Host.ID || len(created.Workspaces) != 1 {
 		t.Fatalf("first CreateHost() = %q, replay=%t, err=%v", created.ID, replayed, err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE users SET quota_hosts=0 WHERE id=$1`, owner.ID); err != nil {
-		t.Fatalf("lower owner quota after create: %v", err)
+	if _, err := pool.Exec(ctx, `UPDATE users SET quota_cpu_milli=0, quota_mem_mib=0 WHERE id=$1`, owner.ID); err != nil {
+		t.Fatalf("lower owner resource quota after create: %v", err)
 	}
 
 	retry, replayed, err := store.CreateHost(ctx, params)
 	if err != nil || !replayed || retry.ID != created.ID || len(retry.Workspaces) != 1 {
 		t.Fatalf("retry CreateHost() = %q, replay=%t, err=%v; want %q replay", retry.ID, replayed, err, created.ID)
-	}
-	updatedToken, err := store.GetTokenByID(ctx, token.ID)
-	if err != nil || len(updatedToken.HostIDs) != 1 || updatedToken.HostIDs[0] != created.ID {
-		t.Fatalf("API Key Host grant after replay = %#v, err=%v", updatedToken.HostIDs, err)
 	}
 	lookup, found, err := store.GetHostCreateReplay(ctx, params.Idempotency)
 	if err != nil || !found || lookup.ID != created.ID {
@@ -293,7 +272,7 @@ func TestHostCreateIdempotencyReplaysAtomically(t *testing.T) {
 	}
 
 	changed := params
-	changedHash := sha256.Sum256([]byte(`{"template_id":"small","name":"changed"}`))
+	changedHash := sha256.Sum256([]byte(`{"name":"changed"}`))
 	changed.Idempotency.RequestHash = changedHash[:]
 	if _, _, err := store.CreateHost(ctx, changed); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("same key with changed request error = %v, want idempotency conflict", err)
@@ -601,50 +580,114 @@ func TestWorkspaceBindingTransitionDoesNotRewindConcurrentWorkspaceRevision(t *t
 	}
 }
 
-func TestAPIKeyHostGrantCommitsWithHost(t *testing.T) {
-	store, _ := newTemporaryStore(t)
+func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) {
+	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
-	owner := createTestUser(t, store, 2, 10_000, 20_000)
-	tokenID, err := domain.NewTokenID()
-	if err != nil {
-		t.Fatal(err)
+	owner := createTestUser(t, store, 1, 10_000, 20_000)
+	const callers = 8
+	var wait sync.WaitGroup
+	results := make(chan host.Host, callers)
+	created := make(chan bool, callers)
+	errors := make(chan error, callers)
+	requests := make([]app.CreateHostParams, callers)
+	for index := range requests {
+		requests[index] = testCreateHostParams(t, owner.ID, capacity, nil)
+		requests[index].Host.State = host.StateStopped
+		requests[index].Host.ExpiresAt = nil
 	}
-	_, secretHash, err := identity.NewCredential(identity.KindAPIKey, tokenID)
-	if err != nil {
-		t.Fatal(err)
+	for _, params := range requests {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			value, didCreate, err := store.EnsureDefaultHost(ctx, params)
+			results <- value
+			created <- didCreate
+			errors <- err
+		}()
 	}
-	token, err := store.CreateToken(ctx, identity.Token{
-		ID: tokenID, OwnerID: owner.ID, Kind: identity.KindAPIKey,
-		HostIDs: []string{}, Scopes: []identity.Scope{identity.ScopeHostCreate},
-		Name: "create-host", SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatal(err)
+	wait.Wait()
+	close(results)
+	close(created)
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("EnsureDefaultHost() error = %v", err)
+		}
+	}
+	var firstID string
+	for value := range results {
+		if value.State != host.StateStopped || value.SandboxID != "" || value.CPUMilli != 1000 || value.MemMiB != 2048 {
+			t.Fatalf("default host = %#v", value)
+		}
+		if firstID == "" {
+			firstID = value.ID
+		} else if value.ID != firstID {
+			t.Fatalf("default host ids differed: %q, %q", firstID, value.ID)
+		}
+	}
+	var createdCount int
+	for value := range created {
+		if value {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("default host created %d times", createdCount)
 	}
 	params := testCreateHostParams(t, owner.ID, capacity, nil)
-	params.GrantTokenID = token.ID
-	created, _, err := store.CreateHost(ctx, params)
-	if err != nil {
-		t.Fatalf("create host and grant API key: %v", err)
+	if _, _, err := store.CreateHost(ctx, params); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("create over stopped host quota: %v", err)
 	}
-	updatedToken, err := store.GetTokenByID(ctx, token.ID)
-	if err != nil || len(updatedToken.HostIDs) != 1 || updatedToken.HostIDs[0] != created.ID {
-		t.Fatalf("API key host grants = %#v, err=%v", updatedToken.HostIDs, err)
-	}
-	if err := store.RevokeToken(ctx, token.ID, owner.ID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE users SET quota_hosts=2, default_host_cpu_milli=1500, default_host_mem_mib=3072 WHERE id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
-	failedParams := testCreateHostParams(t, owner.ID, capacity, nil)
-	failedParams.GrantTokenID = token.ID
-	if _, _, err := store.CreateHost(ctx, failedParams); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("revoked API key grant error = %v", err)
+	concurrentRequests := []app.CreateHostParams{params, testCreateHostParams(t, owner.ID, capacity, nil)}
+	type createResult struct {
+		value host.Host
+		err   error
 	}
-	if _, err := store.GetHost(ctx, failedParams.Host.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("host persisted after grant rollback: %v", err)
+	outcomes := make(chan createResult, len(concurrentRequests))
+	for _, request := range concurrentRequests {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			value, _, err := store.CreateHost(ctx, request)
+			outcomes <- createResult{value: value, err: err}
+		}()
 	}
-	if len(failedParams.WorkspaceIDs) != 0 {
-		t.Fatal("failed host request unexpectedly contained workspaces")
+	wait.Wait()
+	close(outcomes)
+	var successes, quotaFailures int
+	for outcome := range outcomes {
+		if outcome.err == nil {
+			successes++
+			value := outcome.value
+			if value.CPUMilli != 1500 || value.MemMiB != 3072 || value.CPULimitMilli != 1500 || value.MemLimitMiB != 3072 {
+				t.Fatalf("create using admin defaults = %#v", value)
+			}
+		} else if domain.CodeOf(outcome.err) == domain.CodeQuotaExceeded {
+			quotaFailures++
+		} else {
+			t.Fatalf("unexpected concurrent create error: %v", outcome.err)
+		}
+	}
+	if successes != 1 || quotaFailures != 1 {
+		t.Fatalf("concurrent creates: success=%d quota_exceeded=%d", successes, quotaFailures)
+	}
+	ensureParams := testCreateHostParams(t, owner.ID, capacity, nil)
+	ensureParams.Host.State = host.StateStopped
+	ensureParams.Host.ExpiresAt = nil
+	selected, didCreate, err := store.EnsureDefaultHost(ctx, ensureParams)
+	if err != nil || didCreate || selected.ID != firstID {
+		t.Fatalf("preserve selected default = %#v, created=%t, err=%v", selected, didCreate, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE user_preferences SET default_host_id='' WHERE user_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	selected, didCreate, err = store.EnsureDefaultHost(ctx, ensureParams)
+	if err != nil || didCreate || selected.ID != "" {
+		t.Fatalf("multiple hosts without selection = %#v, created=%t, err=%v", selected, didCreate, err)
 	}
 }
 
@@ -713,6 +756,7 @@ func createTestUser(t *testing.T, store *Store, quotaHosts, quotaCPU, quotaMemor
 		ID: id, Name: "user-" + id, PasswordHash: "hash", Role: identity.RoleUser,
 		Status:     identity.StatusPending,
 		QuotaHosts: quotaHosts, QuotaCPUMilli: quotaCPU, QuotaMemMiB: quotaMemory,
+		DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -721,6 +765,17 @@ func createTestUser(t *testing.T, store *Store, quotaHosts, quotaCPU, quotaMemor
 	user, err = store.UpdateUser(context.Background(), "system", identity.StatusPending, user)
 	if err != nil {
 		t.Fatal(err)
+	}
+	return user
+}
+
+func createPreRetirementTestUser(t *testing.T, store *Store, quotaHosts, quotaCPU, quotaMemory int) identity.User {
+	t.Helper()
+	user := createTestUser(t, store, quotaHosts, quotaCPU, quotaMemory)
+	// Historical execution tests need a gate that existed before migration 52.
+	result, err := store.pool.Exec(context.Background(), `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1 AND state='disabled'`, user.ID)
+	if err != nil || result.RowsAffected() != 1 {
+		t.Fatalf("enable historical execution for test: updated=%d err=%v", result.RowsAffected(), err)
 	}
 	return user
 }

@@ -17,7 +17,7 @@ import (
 func TestPostgresMCPRuntimeOperationDurabilityAndTakeoverSnapshot(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "mcp-runtime-test-instance"
@@ -164,7 +164,7 @@ func TestPostgresMCPRuntimeOperationDurabilityAndTakeoverSnapshot(t *testing.T) 
 func TestPostgresMCPRuntimeBeginCancelsExpiredPreparedOperation(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "mcp-expired-prepared-test-instance"
@@ -200,7 +200,7 @@ func TestPostgresMCPRuntimeBeginCancelsExpiredPreparedOperation(t *testing.T) {
 func TestPostgresMCPRuntimeCancellationUsesExpiredLeaseAndNotFoundEvidence(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "mcp-not-found-test-instance"
@@ -244,7 +244,7 @@ func TestPostgresMCPRuntimeCancellationUsesExpiredLeaseAndNotFoundEvidence(t *te
 func TestPostgresMCPRuntimeOperationRequiresOwnerAndHostFences(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	const runtimeInstanceID = "mcp-fence-test-instance"
@@ -276,7 +276,7 @@ func TestPostgresMCPRuntimeOperationRequiresOwnerAndHostFences(t *testing.T) {
 func TestPostgresMCPRuntimeContextIsIsolatedByAPIKey(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t1234567")
 	ensureMCPTestAPIKey(t, ctx, store, owner.ID, "t7654321")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
@@ -313,7 +313,7 @@ func TestPostgresMCPRuntimeContextIsIsolatedByAPIKey(t *testing.T) {
 func TestPostgresMCPRuntimePersistsActorSeparatelyFromHostOwner(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	actor := createTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, actor.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)

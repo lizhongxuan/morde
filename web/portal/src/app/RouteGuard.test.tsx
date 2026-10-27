@@ -27,13 +27,13 @@ describe('RouteGuard', () => {
 
   it('未登录时重定向到登录页并保留原始路由', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/client-authorize?user_code=ABCD2345#confirm']}><Routes>
-      <Route element={<RouteGuard />}><Route path="/client-authorize" element={<p>受保护页面</p>} /></Route>
+    render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/assistant?view=recent#chat']}><Routes>
+      <Route element={<RouteGuard />}><Route path="/assistant" element={<p>受保护页面</p>} /></Route>
       <Route path="/login" element={<LoginLocation />} />
     </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
 
     expect(await screen.findByText('登录页面')).toBeTruthy();
-    expect(screen.getByText('/client-authorize?user_code=ABCD2345#confirm')).toBeInTheDocument();
+    expect(screen.getByText('/assistant?view=recent#chat')).toBeInTheDocument();
     expect(screen.queryByText('受保护页面')).toBeNull();
   });
 

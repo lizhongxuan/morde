@@ -30,7 +30,7 @@ func TestHostServiceCreatePersistsEncryptedKeyAndNotifiesWorker(t *testing.T) {
 		return nil
 	}
 
-	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{TemplateID: "small", Name: "demo"})
+	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{Name: "demo"})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
@@ -54,9 +54,52 @@ func TestHostServiceCreatePersistsEncryptedKeyAndNotifiesWorker(t *testing.T) {
 	}
 }
 
+func TestHostServiceUsesSavedResourcesWhenStarting(t *testing.T) {
+	service, _ := newHostServiceTest(t)
+	value, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.CPUMilli, value.CPULimitMilli = 1500, 1500
+	value.MemMiB, value.MemLimitMiB = 3072, 3072
+	request, err := service.createRequest(context.Background(), value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Requests.CPU != "1500m" || request.Limits.CPU != "1500m" ||
+		request.Requests.Memory != "3072Mi" || request.Limits.Memory != "3072Mi" {
+		t.Fatalf("sandbox resources = %#v / %#v", request.Requests, request.Limits)
+	}
+}
+
+func TestHostServiceCreateUsesAccountDefaultResources(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	deps.users.value.DefaultHostCPUMilli = 1500
+	deps.users.value.DefaultHostMemMiB = 3072
+	value, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.CPUMilli != 1500 || value.MemMiB != 3072 || value.CPULimitMilli != 1500 || value.MemLimitMiB != 3072 {
+		t.Fatalf("created resources = %#v", value)
+	}
+}
+
+func TestHostServiceEnsuresStoppedDefaultWithoutStartingSandbox(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value, created, err := service.EnsureDefaultStopped(context.Background(), identity.User{ID: "u1234567"})
+	if err != nil || !created || value.State != host.StateStopped || value.ExpiresAt != nil {
+		t.Fatalf("EnsureDefaultStopped() = %#v, created=%t, err=%v", value, created, err)
+	}
+	again, created, err := service.EnsureDefaultStopped(context.Background(), identity.User{ID: "u1234567"})
+	if err != nil || created || again.ID != value.ID || deps.sandbox.createCalls != 0 {
+		t.Fatalf("repeated EnsureDefaultStopped() = %#v, created=%t, sandbox creates=%d, err=%v", again, created, deps.sandbox.createCalls, err)
+	}
+}
+
 func TestHostServiceCreateReplaysExactRequestBeforeCurrentCapacityChecks(t *testing.T) {
 	service, deps := newHostServiceTest(t)
-	command := CreateHostCommand{TemplateID: "small", Name: "retry", IdempotencyKey: "host-create-retry-001"}
+	command := CreateHostCommand{Name: "retry", IdempotencyKey: "host-create-retry-001"}
 	first, err := service.Create(context.Background(), hostServiceTestPrincipal(), command)
 	if err != nil {
 		t.Fatalf("first Create() error = %v", err)
@@ -84,7 +127,7 @@ func TestHostServiceCreateExistingWorkspaceChecksOwnerAndState(t *testing.T) {
 		State: workspace.StateReady,
 	}
 	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{
-		TemplateID: "small", WorkspaceIDs: []string{"w1234567"},
+		WorkspaceIDs: []string{"w1234567"},
 	})
 	if err != nil {
 		t.Fatalf("Create(existing workspace) error = %v", err)
@@ -101,7 +144,7 @@ func TestHostServiceCreateExistingWorkspaceChecksOwnerAndState(t *testing.T) {
 		State: workspace.StateReady,
 	}
 	if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{
-		TemplateID: "small", WorkspaceIDs: []string{"w7654321"},
+		WorkspaceIDs: []string{"w7654321"},
 	}); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("foreign workspace error = %v", err)
 	}
@@ -110,7 +153,7 @@ func TestHostServiceCreateExistingWorkspaceChecksOwnerAndState(t *testing.T) {
 func TestHostServiceCreateRetriesOnlyUniqueIDConflicts(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	deps.hosts.createConflicts = 1
-	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{TemplateID: "small"})
+	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{})
 	if err != nil {
 		t.Fatalf("Create() after unique conflict error = %v", err)
 	}
@@ -118,7 +161,7 @@ func TestHostServiceCreateRetriesOnlyUniqueIDConflicts(t *testing.T) {
 		t.Fatalf("create calls/host = %d / %#v", deps.hosts.createCalls, created)
 	}
 	deps.hosts.createErr = errors.New("database unavailable")
-	if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{TemplateID: "small"}); err == nil || deps.hosts.createCalls != 3 {
+	if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{}); err == nil || deps.hosts.createCalls != 3 {
 		t.Fatalf("Create() non-unique error = %v, create calls=%d", err, deps.hosts.createCalls)
 	}
 }
@@ -633,7 +676,7 @@ func TestHostServiceRestoreUnknownCreateIsFailClosed(t *testing.T) {
 	}
 }
 
-func TestHostServiceComputerReadUsesComputerScopeWithoutHostRead(t *testing.T) {
+func TestHostServiceAPIKeyHasDynamicHostAndComputerAccess(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateRunning)
 	deps.hosts.addHost(value)
@@ -645,8 +688,8 @@ func TestHostServiceComputerReadUsesComputerScopeWithoutHostRead(t *testing.T) {
 	if err != nil || got.ID != value.ID {
 		t.Fatalf("GetForComputer() = %#v, %v", got, err)
 	}
-	if _, err := service.Get(context.Background(), principal, value.ID); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("Get() without host:read error = %v", err)
+	if _, err := service.Get(context.Background(), principal, value.ID); err != nil {
+		t.Fatalf("Get() with dynamic API key grant error = %v", err)
 	}
 	if _, err := service.GetForComputer(context.Background(), principal, value.ID, identity.ScopeHostRead); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("GetForComputer() with non-computer scope error = %v", err)
@@ -700,6 +743,24 @@ func TestHostServiceClientOwnerIssueTicketBindsInstallationAndAuditActor(t *test
 		deps.audit.entries[0].ActorKind != audit.ActorClient || deps.audit.entries[0].Action != audit.ActionHostEnter ||
 		deps.audit.entries[0].Target != value.ID {
 		t.Fatalf("client enter audit = %#v", deps.audit.entries)
+	}
+}
+
+func TestHostServiceInstalledWebTicketsStayBoundToInstallation(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateRunning)
+	deps.hosts.addHost(value)
+	principal := hostServiceTestPrincipal()
+	principal.ClientInstallationID = "i1234567"
+	if _, err := service.IssueTicket(context.Background(), principal, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.IssuePreviewTicket(context.Background(), principal, value.ID, 5173); err != nil {
+		t.Fatal(err)
+	}
+	if len(deps.tokens.values) != 2 || deps.tokens.values[0].ClientInstallationID != principal.ClientInstallationID ||
+		deps.tokens.values[1].ClientInstallationID != principal.ClientInstallationID || deps.tokens.values[1].PreviewPort != 5173 {
+		t.Fatalf("installed Web tickets = %#v", deps.tokens.values)
 	}
 }
 
@@ -848,7 +909,7 @@ func TestHostServiceCreateAuditFailureDoesNotUndoCommittedHost(t *testing.T) {
 	deps.audit.err = errors.New("audit unavailable")
 	failures := 0
 	service.countAudit = func() { failures++ }
-	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{TemplateID: "small"})
+	created, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{})
 	if err != nil || created.State != host.StateCreating || failures != 1 {
 		t.Fatalf("Create() after audit error = %#v, %v, failures=%d", created, err, failures)
 	}
@@ -866,7 +927,7 @@ func TestHostServiceCreateChecksStorageBeforePersistingHost(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			service, deps := newHostServiceTest(t)
 			deps.diskCapacity.err = test.err
-			if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{TemplateID: "small"}); domain.CodeOf(err) != test.code {
+			if _, err := service.Create(context.Background(), hostServiceTestPrincipal(), CreateHostCommand{}); domain.CodeOf(err) != test.code {
 				t.Fatalf("Create() error = %v, want %s", err, test.code)
 			}
 			if deps.diskCapacity.calls != 1 || deps.hosts.createCalls != 0 || len(deps.workspaces.values) != 0 {
@@ -909,10 +970,12 @@ func newHostServiceTest(t *testing.T) (*hostService, hostServiceTestDeps) {
 	ready := &hostServiceTestProbe{}
 	runtimeReady := &hostServiceTestRuntimeHandshaker{}
 	diskCapacity := &hostServiceTestDiskCapacity{}
+	users := &hostServiceTestUsers{value: identity.User{ID: "u1234567", Status: identity.StatusApproved,
+		DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048}}
 	service, err := NewHostService(HostServiceOptions{
-		Hosts: hosts, Workspaces: workspaces, Tokens: tokens,
+		Hosts: hosts, Users: users, Workspaces: workspaces, Tokens: tokens,
 		Sandboxes: &hostServiceTestRouter{client: sandbox}, Volumes: &hostServiceTestVolume{}, DiskCapacity: diskCapacity, Probe: ready, Runtime: runtimeReady, Audit: auditWriter, CreateLocks: createLocks,
-		Sealer: sealer, Templates: map[string]template.Template{"small": hostServiceTestTemplate()},
+		Sealer: sealer, Templates: map[string]template.Template{"small": hostServiceTestTemplate()}, DefaultTemplateID: "small",
 		Capacity: Capacity{CPUMilli: 8000, MemMiB: 16384}, Instance: "test",
 		Scheme: "https", PortalURL: "https://portal.test", HostSuffix: "hosts.test", TicketTTL: time.Minute,
 		ReadyTimeout: 20 * time.Millisecond, ReadyPollInterval: time.Millisecond,
@@ -924,7 +987,7 @@ func newHostServiceTest(t *testing.T) (*hostService, hostServiceTestDeps) {
 		t.Fatal(err)
 	}
 	return service, hostServiceTestDeps{
-		hosts: hosts, workspaces: workspaces, tokens: tokens,
+		hosts: hosts, users: users, workspaces: workspaces, tokens: tokens,
 		sandbox: sandbox, probe: ready, runtime: runtimeReady, audit: auditWriter, sealer: sealer, createLocks: createLocks, diskCapacity: diskCapacity,
 	}
 }
@@ -941,6 +1004,7 @@ func (c *hostServiceTestDiskCapacity) CheckCapacity(context.Context) error {
 
 type hostServiceTestDeps struct {
 	hosts        *hostServiceTestHostStore
+	users        *hostServiceTestUsers
 	workspaces   *hostServiceTestWorkspaceStore
 	tokens       *hostServiceTestTokens
 	sandbox      *hostServiceTestSandbox
@@ -950,6 +1014,18 @@ type hostServiceTestDeps struct {
 	sealer       *Sealer
 	createLocks  *hostServiceTestCreateLocks
 	diskCapacity *hostServiceTestDiskCapacity
+}
+
+type hostServiceTestUsers struct {
+	UserStore
+	value identity.User
+}
+
+func (s *hostServiceTestUsers) GetUserByID(_ context.Context, id string) (identity.User, error) {
+	if id != s.value.ID {
+		return identity.User{}, domain.NewError(domain.CodeNotFound, "user not found")
+	}
+	return s.value, nil
 }
 
 type hostServiceTestRuntimeHandshaker struct {
@@ -1208,6 +1284,22 @@ func (s *hostServiceTestHostStore) CreateHost(_ context.Context, params CreateHo
 		s.idempotency[hostCreateTestIdempotencyKey(params.Idempotency)] = params.Idempotency
 	}
 	return cloneHostServiceHost(value), false, nil
+}
+
+func (s *hostServiceTestHostStore) EnsureDefaultHost(_ context.Context, params CreateHostParams) (host.Host, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, value := range s.values {
+		if value.OwnerID == params.Host.OwnerID && value.DeletedAt == nil && value.State != host.StateDeleted {
+			return cloneHostServiceHost(value), false, nil
+		}
+	}
+	value := cloneHostServiceHost(params.Host)
+	if s.values == nil {
+		s.values = make(map[string]host.Host)
+	}
+	s.values[value.ID] = value
+	return value, true, nil
 }
 
 func hostCreateTestIdempotencyKey(record IdempotencyRecord) string {

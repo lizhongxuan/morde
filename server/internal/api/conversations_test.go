@@ -72,6 +72,19 @@ func TestConversationCreateHandlerUsesIdempotencyAndReturnsReplayStatus(t *testi
 	}
 }
 
+func TestConversationCreateDoesNotRequireAHost(t *testing.T) {
+	service := &conversationServiceStub{}
+	engine := taskAPIRouter(nil, service)
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"cloud work"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "cloud-conv-001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || service.createCalls != 1 || service.created.HostID != "" {
+		t.Fatalf("hostless conversation = %d %s, command=%#v", response.Code, response.Body, service.created)
+	}
+}
+
 func TestConversationListReturnsEmptyItemsAndNullCursor(t *testing.T) {
 	engine := taskAPIRouter(nil, &conversationServiceStub{})
 	response := httptest.NewRecorder()

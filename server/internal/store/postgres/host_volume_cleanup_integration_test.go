@@ -7,13 +7,14 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 )
 
 func TestOrphanHostVolumeCleanupSurvivesMissingHostAndGuardsHostReuse(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	instanceID, hostID := "cleanup-test", "h7654321"
-	createTestSuperAdmin(t, store)
+	admin := createTestSuperAdmin(t, store)
 	user := createTestUser(t, store, 1, 2000, 4096)
 
 	pending, err := store.EnsureOrphanHostVolumeCleanup(ctx, instanceID, hostID, "default", "orphan-sandbox", 1, true)
@@ -31,6 +32,14 @@ func TestOrphanHostVolumeCleanupSurvivesMissingHostAndGuardsHostReuse(t *testing
 	closeProvider()
 	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("restore latest migration after rejected rollback: %v", err)
+	}
+	user, err = store.GetUserByID(ctx, user.ID)
+	if err != nil || user.Status != identity.StatusPending {
+		t.Fatalf("migrated user status = %q, %v; want pending", user.Status, err)
+	}
+	user.Status = identity.StatusApproved
+	if _, err := store.UpdateUser(ctx, admin.ID, identity.StatusPending, user); err != nil {
+		t.Fatalf("approve migrated user for cleanup checks: %v", err)
 	}
 	params := testCreateHostParams(t, user.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
 	params.Host.ID = hostID

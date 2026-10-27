@@ -43,7 +43,7 @@ func TestOnboardingConcurrentDefaultHostCreatesOnlyOneHost(t *testing.T) {
 			created++
 		}
 	}
-	if created != 1 || hosts.createCalls != 1 || len(hosts.values) != 1 {
+	if created != 1 || hosts.createCalls != 1 || len(hosts.values) != 1 || hosts.values[0].State != host.StateStopped {
 		t.Fatalf("concurrent first use: created results=%d create calls=%d hosts=%d", created, hosts.createCalls, len(hosts.values))
 	}
 }
@@ -67,24 +67,22 @@ func TestOnboardingMultipleHostsRequireExplicitSelection(t *testing.T) {
 	}
 }
 
-func TestOnboardingRestoresStoppedDefaultAndPersistsCapacityStatus(t *testing.T) {
+func TestOnboardingKeepsStoppedDefaultOff(t *testing.T) {
 	service, hosts, preferences, _ := newOnboardingTestService(t)
 	stopped := host.Host{ID: "h1234567", OwnerID: "u1234567", Name: "my computer", State: host.StateStopped, RuntimeGeneration: 2}
 	hosts.values = []host.Host{stopped}
 	preferences.value = UserPreferences{OwnerID: "u1234567", DefaultHostID: stopped.ID}
-	hosts.restoreErr = domain.NewError(domain.CodeCapacityExceeded, "capacity unavailable")
-
 	result, err := service.EnsureDefaultHost(context.Background(), onboardingTestPrincipal(), DefaultHostCommand{})
 	if err != nil {
 		t.Fatalf("EnsureDefaultHost() error = %v", err)
 	}
-	if hosts.restoreCalls != 1 || result.Host == nil || result.Host.ID != stopped.ID ||
-		result.Snapshot.ComputerStatus != ComputerCapacityUnavailable || preferences.value.LastHostIssue != "capacity_unavailable" {
-		t.Fatalf("restore capacity result = %#v; restore calls=%d preferences=%#v", result, hosts.restoreCalls, preferences.value)
+	if hosts.restoreCalls != 0 || result.Host == nil || result.Host.ID != stopped.ID ||
+		result.Snapshot.ComputerStatus != ComputerStopped || preferences.value.LastHostIssue != "" {
+		t.Fatalf("stopped default result = %#v; restore calls=%d preferences=%#v", result, hosts.restoreCalls, preferences.value)
 	}
 	status, err := service.Status(context.Background(), onboardingTestPrincipal())
-	if err != nil || status.ComputerStatus != ComputerCapacityUnavailable {
-		t.Fatalf("Status() after capacity failure = %#v, %v", status, err)
+	if err != nil || status.ComputerStatus != ComputerStopped {
+		t.Fatalf("Status() after ensuring stopped default = %#v, %v", status, err)
 	}
 }
 
@@ -125,7 +123,7 @@ func TestOnboardingModelSelectionRequiresConfiguredUsableModel(t *testing.T) {
 	}
 }
 
-func TestOnboardingModelNeedsTextAndToolsButNotVision(t *testing.T) {
+func TestOnboardingInstantChatAcceptsCheckedTextOnlyModel(t *testing.T) {
 	service, _, preferences, models := newOnboardingTestService(t)
 	models.items = append(models.items, ModelConnectionView{
 		ID: "p7654321", Name: "text only", CheckedAt: timePointer(time.Now()),
@@ -134,18 +132,18 @@ func TestOnboardingModelNeedsTextAndToolsButNotVision(t *testing.T) {
 	preferences.value = UserPreferences{OwnerID: "u1234567", SelectedModelID: "p1234567", DefaultHostID: "h1234567"}
 
 	status, err := service.Status(context.Background(), onboardingTestPrincipal())
-	if err != nil || status.ModelStatus != ModelReady || len(status.AvailableModels) != 1 || status.AvailableModels[0].ID != "p1234567" {
-		t.Fatalf("models without required tools were not filtered: %#v, %v", status, err)
+	if err != nil || status.ModelStatus != ModelReady || len(status.AvailableModels) != 2 || status.AvailableModels[1].ID != "p7654321" {
+		t.Fatalf("checked text-only model was not available: %#v, %v", status, err)
 	}
 	if status.AvailableModels[0].Capabilities.Vision {
 		t.Fatal("no-vision model was reported as vision-capable")
 	}
-	if _, err := service.SavePreferences(context.Background(), onboardingTestPrincipal(), SaveUserPreferencesCommand{SelectedModelID: "p7654321"}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("text-only model without tool support was accepted: %v", err)
+	if _, err := service.SavePreferences(context.Background(), onboardingTestPrincipal(), SaveUserPreferencesCommand{SelectedModelID: "p7654321"}); err != nil {
+		t.Fatalf("text-only model was rejected: %v", err)
 	}
 }
 
-func TestOnboardingStatusRequiresSelectedModelAndReadyHost(t *testing.T) {
+func TestOnboardingStatusRequiresSelectedModelButNotRunningHost(t *testing.T) {
 	service, hosts, preferences, _ := newOnboardingTestService(t)
 	preferences.value = UserPreferences{OwnerID: "u1234567", DefaultHostID: "h1234567"}
 	hosts.values = []host.Host{{ID: "h1234567", OwnerID: "u1234567", State: host.StateRunning}}
@@ -156,8 +154,13 @@ func TestOnboardingStatusRequiresSelectedModelAndReadyHost(t *testing.T) {
 	}
 	preferences.value.SelectedModelID = "p1234567"
 	status, err = service.Status(context.Background(), onboardingTestPrincipal())
-	if err != nil || !status.CanSubmit || status.ComputerStatus != ComputerReady || status.NextAction != "submit_task" {
+	if err != nil || !status.CanSubmit || status.ComputerStatus != ComputerReady || status.NextAction != "start_chat" {
 		t.Fatalf("ready status = %#v, %v", status, err)
+	}
+	hosts.values[0].State = host.StateStopped
+	status, err = service.Status(context.Background(), onboardingTestPrincipal())
+	if err != nil || !status.CanSubmit || status.NextAction != "start_chat" {
+		t.Fatalf("stopped host should still allow chat: %#v, %v", status, err)
 	}
 }
 
@@ -257,12 +260,23 @@ func (s *onboardingHostStub) Create(_ context.Context, principal identity.Princi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.createCalls++
-	if command.TemplateID != "std-2c4g" {
-		return host.Host{}, fmt.Errorf("unexpected template %q", command.TemplateID)
-	}
 	value := host.Host{ID: fmt.Sprintf("h%07d", s.createCalls), OwnerID: principal.UserID, Name: "Cloud computer", State: host.StateCreating, RuntimeGeneration: 1}
 	s.values = append(s.values, value)
 	return value, nil
+}
+
+func (s *onboardingHostStub) EnsureDefaultStopped(_ context.Context, user identity.User) (host.Host, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, value := range s.values {
+		if value.OwnerID == user.ID && value.DeletedAt == nil && value.State != host.StateDeleted {
+			return value, false, nil
+		}
+	}
+	s.createCalls++
+	value := host.Host{ID: fmt.Sprintf("h%07d", s.createCalls), OwnerID: user.ID, Name: "Cloud computer", State: host.StateStopped, RuntimeGeneration: 1}
+	s.values = append(s.values, value)
+	return value, true, nil
 }
 
 func (s *onboardingHostStub) List(context.Context, identity.Principal) ([]host.Host, error) {

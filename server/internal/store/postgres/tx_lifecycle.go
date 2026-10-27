@@ -294,7 +294,10 @@ WHERE host_id=$1 AND runtime_generation=$2 AND state IN ('creating','ready','unk
 		}
 		result, err := tx.Exec(ctx, `
 UPDATE hosts
-SET state='stopped', sandbox_id=NULL, runtime_instance_id=NULL, updated_at=now()
+SET state='stopped', sandbox_id=NULL, runtime_instance_id=NULL,
+    resource_version=CASE WHEN resource_update_state <> 'idle' THEN resource_version+1 ELSE resource_version END,
+    resource_update_state='idle', resource_target_cpu_milli=NULL, resource_target_mem_mib=NULL,
+    updated_at=now()
 	WHERE id=$1 AND state='stopping' AND runtime_generation=$2`, hostID, generation)
 		if err != nil {
 			return fmt.Errorf("complete host compute release: %w", err)
@@ -372,12 +375,9 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 		if err != nil {
 			return storeError("get host owner for restore", "user", err)
 		}
-		var ownerHosts, ownerCPU, ownerMemory int64
-		if err := tx.QueryRow(ctx, allocatedUsageSQL, current.OwnerID).Scan(&ownerHosts, &ownerCPU, &ownerMemory); err != nil {
+		var ownerCPU, ownerMemory int64
+		if err := tx.QueryRow(ctx, allocatedResourceUsageSQL, current.OwnerID).Scan(&ownerCPU, &ownerMemory); err != nil {
 			return fmt.Errorf("read owner host allocation for restore: %w", err)
-		}
-		if err := validateAllocation("host_count", ownerHosts, 1, int64(user.QuotaHosts), domain.CodeQuotaExceeded); err != nil {
-			return err
 		}
 		if err := validateAllocation("cpu_milli", ownerCPU, int64(current.CPUMilli), int64(user.QuotaCpuMilli), domain.CodeQuotaExceeded); err != nil {
 			return err
@@ -385,11 +385,10 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 		if err := validateAllocation("mem_mib", ownerMemory, int64(current.MemMiB), int64(user.QuotaMemMib), domain.CodeQuotaExceeded); err != nil {
 			return err
 		}
-		var totalHosts, totalCPU, totalMemory int64
-		if err := tx.QueryRow(ctx, allocatedUsageSQL, nil).Scan(&totalHosts, &totalCPU, &totalMemory); err != nil {
+		var totalCPU, totalMemory int64
+		if err := tx.QueryRow(ctx, allocatedResourceUsageSQL, nil).Scan(&totalCPU, &totalMemory); err != nil {
 			return fmt.Errorf("read cluster host allocation for restore: %w", err)
 		}
-		_ = totalHosts
 		if err := validateAllocation("cpu_milli", totalCPU, int64(current.CPUMilli), params.Capacity.CPUMilli, domain.CodeCapacityExceeded); err != nil {
 			return err
 		}

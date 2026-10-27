@@ -19,7 +19,7 @@ import (
 func TestPostgresNotificationConsumptionDeduplicatesAndScopesOwners(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	otherOwner := createTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 
@@ -242,7 +242,7 @@ func notificationEffectForTest(t *testing.T, event notification.TaskEvent) notif
 func TestPostgresNotificationCanceledConsumeCanBeRetried(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "notification-retry", "retry event")
 	created, err := store.SubmitTask(ctx, submission)
@@ -289,7 +289,7 @@ func TestPostgresNotificationCanceledConsumeCanBeRetried(t *testing.T) {
 func TestPostgresClarificationNotificationIsActionableWhileRequestIsPending(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "notification-clarification", "clarification task")
 	created, err := store.SubmitTask(ctx, submission)
@@ -349,7 +349,7 @@ func TestPostgresClarificationNotificationIsActionableWhileRequestIsPending(t *t
 func TestPostgresScheduledNotificationsUseRunSnapshot(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 
 	completedTask := commitNotificationTerminalTask(t, store, ctx, owner.ID, hostValue.ID, "schedule-notify-completed", task.StatusCompleted)
@@ -395,7 +395,7 @@ func TestPostgresScheduledNotificationsUseRunSnapshot(t *testing.T) {
 func TestPostgresScheduledObservationBaselinesAndSuppressesOnlyNoChange(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	spec := schedule.ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: schedule.ObservationText}
 	specJSON, err := json.Marshal(spec)

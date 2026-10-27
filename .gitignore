@@ -4,3 +4,4 @@ web/portal/public/downloads/
 .idea
 project
 docs
+node_modules

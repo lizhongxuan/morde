@@ -48,23 +48,39 @@ type ClientInstallation struct {
 	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
 }
 
+type ClientLoginRequest struct {
+	OwnerID        string             `json:"owner_id"`
+	KeyHash        []byte             `json:"key_hash"`
+	RequestHash    []byte             `json:"request_hash"`
+	InstallationID string             `json:"installation_id"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type Conversation struct {
-	ID        string             `json:"id"`
-	OwnerID   string             `json:"owner_id"`
-	HostID    string             `json:"host_id"`
-	Title     string             `json:"title"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	ID         string             `json:"id"`
+	OwnerID    string             `json:"owner_id"`
+	HostID     pgtype.Text        `json:"host_id"`
+	Title      string             `json:"title"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	ModelID    string             `json:"model_id"`
+	SourceKind string             `json:"source_kind"`
+	MessageSeq int64              `json:"message_seq"`
 }
 
 type ConversationMessage struct {
-	ID             string             `json:"id"`
-	ConversationID string             `json:"conversation_id"`
-	OwnerID        string             `json:"owner_id"`
-	Role           string             `json:"role"`
-	Content        string             `json:"content"`
-	TaskID         string             `json:"task_id"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	ID                      string             `json:"id"`
+	ConversationID          string             `json:"conversation_id"`
+	OwnerID                 string             `json:"owner_id"`
+	Role                    string             `json:"role"`
+	Content                 string             `json:"content"`
+	TaskID                  pgtype.Text        `json:"task_id"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	ModelID                 string             `json:"model_id"`
+	SourceKind              string             `json:"source_kind"`
+	SourceExchangeID        string             `json:"source_exchange_id"`
+	RequestedConversationID string             `json:"requested_conversation_id"`
+	Sequence                int64              `json:"sequence"`
 }
 
 type DeviceAuthorization struct {
@@ -78,30 +94,34 @@ type DeviceAuthorization struct {
 }
 
 type Host struct {
-	ID                   string             `json:"id"`
-	OwnerID              string             `json:"owner_id"`
-	Name                 string             `json:"name"`
-	TemplateID           string             `json:"template_id"`
-	RuntimeProfile       string             `json:"runtime_profile"`
-	SandboxID            pgtype.Text        `json:"sandbox_id"`
-	CreateAttemptedAt    pgtype.Timestamptz `json:"create_attempted_at"`
-	State                string             `json:"state"`
-	StateReason          string             `json:"state_reason"`
-	CpuMilli             int32              `json:"cpu_milli"`
-	MemMib               int32              `json:"mem_mib"`
-	CpuLimitMilli        int32              `json:"cpu_limit_milli"`
-	MemLimitMib          int32              `json:"mem_limit_mib"`
-	AioKeyEnc            []byte             `json:"aio_key_enc"`
-	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
-	LastActiveAt         pgtype.Timestamptz `json:"last_active_at"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
-	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
-	RuntimeGeneration    int64              `json:"runtime_generation"`
-	ControlVersion       int64              `json:"control_version"`
-	ControlState         string             `json:"control_state"`
-	RuntimeCredentialEnc []byte             `json:"runtime_credential_enc"`
-	RuntimeInstanceID    pgtype.Text        `json:"runtime_instance_id"`
+	ID                     string             `json:"id"`
+	OwnerID                string             `json:"owner_id"`
+	Name                   string             `json:"name"`
+	TemplateID             string             `json:"template_id"`
+	RuntimeProfile         string             `json:"runtime_profile"`
+	SandboxID              pgtype.Text        `json:"sandbox_id"`
+	CreateAttemptedAt      pgtype.Timestamptz `json:"create_attempted_at"`
+	State                  string             `json:"state"`
+	StateReason            string             `json:"state_reason"`
+	CpuMilli               int32              `json:"cpu_milli"`
+	MemMib                 int32              `json:"mem_mib"`
+	CpuLimitMilli          int32              `json:"cpu_limit_milli"`
+	MemLimitMib            int32              `json:"mem_limit_mib"`
+	AioKeyEnc              []byte             `json:"aio_key_enc"`
+	ExpiresAt              pgtype.Timestamptz `json:"expires_at"`
+	LastActiveAt           pgtype.Timestamptz `json:"last_active_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt              pgtype.Timestamptz `json:"deleted_at"`
+	RuntimeGeneration      int64              `json:"runtime_generation"`
+	ControlVersion         int64              `json:"control_version"`
+	ControlState           string             `json:"control_state"`
+	RuntimeCredentialEnc   []byte             `json:"runtime_credential_enc"`
+	RuntimeInstanceID      pgtype.Text        `json:"runtime_instance_id"`
+	ResourceVersion        int64              `json:"resource_version"`
+	ResourceUpdateState    string             `json:"resource_update_state"`
+	ResourceTargetCpuMilli pgtype.Int4        `json:"resource_target_cpu_milli"`
+	ResourceTargetMemMib   pgtype.Int4        `json:"resource_target_mem_mib"`
 }
 
 type HostActivityLease struct {
@@ -296,6 +316,28 @@ type OwnerExecutionControl struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RetiredInstantChatConversation struct {
+	ID        string             `json:"id"`
+	OwnerID   string             `json:"owner_id"`
+	ModelID   string             `json:"model_id"`
+	Title     string             `json:"title"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RetiredInstantChatExchange struct {
+	ID                      string             `json:"id"`
+	ConversationID          string             `json:"conversation_id"`
+	OwnerID                 string             `json:"owner_id"`
+	RequestKey              string             `json:"request_key"`
+	UserMessageID           string             `json:"user_message_id"`
+	AssistantMessageID      string             `json:"assistant_message_id"`
+	UserContent             string             `json:"user_content"`
+	AssistantContent        string             `json:"assistant_content"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	RequestedConversationID string             `json:"requested_conversation_id"`
+}
+
 type Schedule struct {
 	ID                    string             `json:"id"`
 	OwnerID               string             `json:"owner_id"`
@@ -345,6 +387,11 @@ type ScheduleRun struct {
 	ObservationFingerprint string             `json:"observation_fingerprint"`
 }
 
+type ServiceIdentity struct {
+	Singleton  bool        `json:"singleton"`
+	InstanceID pgtype.UUID `json:"instance_id"`
+}
+
 type Site struct {
 	ID                string             `json:"id"`
 	OwnerID           string             `json:"owner_id"`
@@ -379,7 +426,7 @@ type Task struct {
 	ID                       string             `json:"id"`
 	OwnerID                  string             `json:"owner_id"`
 	ConversationID           string             `json:"conversation_id"`
-	HostID                   string             `json:"host_id"`
+	HostID                   pgtype.Text        `json:"host_id"`
 	ModelID                  string             `json:"model_id"`
 	Objective                string             `json:"objective"`
 	Status                   string             `json:"status"`
@@ -406,6 +453,36 @@ type Task struct {
 	ExecutionEpoch           int64              `json:"execution_epoch"`
 	ApplicationID            string             `json:"application_id"`
 	AuthClientInstallationID pgtype.Text        `json:"auth_client_installation_id"`
+	ExecutionLocation        string             `json:"execution_location"`
+	WorkspaceID              pgtype.Text        `json:"workspace_id"`
+	InputRevision            pgtype.Int8        `json:"input_revision"`
+	ContextDigest            []byte             `json:"context_digest"`
+	AuthVersion              int64              `json:"auth_version"`
+	AuthExpiresAt            pgtype.Timestamptz `json:"auth_expires_at"`
+	AgentInstanceID          string             `json:"agent_instance_id"`
+	AgentGeneration          int64              `json:"agent_generation"`
+	AgentSessionID           string             `json:"agent_session_id"`
+	AgentEngineVersion       string             `json:"agent_engine_version"`
+	AgentProfileVersion      string             `json:"agent_profile_version"`
+	CheckpointDigest         []byte             `json:"checkpoint_digest"`
+	CheckpointThroughSeq     int64              `json:"checkpoint_through_seq"`
+}
+
+type TaskAgentCheckpoint struct {
+	TaskID          string             `json:"task_id"`
+	OwnerID         string             `json:"owner_id"`
+	AgentInstanceID string             `json:"agent_instance_id"`
+	AgentGeneration int64              `json:"agent_generation"`
+	AgentSessionID  string             `json:"agent_session_id"`
+	FromSeq         int64              `json:"from_seq"`
+	ThroughSeq      int64              `json:"through_seq"`
+	Digest          []byte             `json:"digest"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	EngineVersion   string             `json:"engine_version"`
+	ProfileVersion  string             `json:"profile_version"`
+	AuthVersion     int64              `json:"auth_version"`
+	LeaseVersion    int64              `json:"lease_version"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
 type TaskArtifact struct {
@@ -543,17 +620,19 @@ type Token struct {
 }
 
 type User struct {
-	ID                 string             `json:"id"`
-	Name               string             `json:"name"`
-	PasswordHash       string             `json:"password_hash"`
-	Role               string             `json:"role"`
-	QuotaHosts         int32              `json:"quota_hosts"`
-	QuotaCpuMilli      int32              `json:"quota_cpu_milli"`
-	QuotaMemMib        int32              `json:"quota_mem_mib"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
-	Status             string             `json:"status"`
-	MustChangePassword bool               `json:"must_change_password"`
+	ID                  string             `json:"id"`
+	Name                string             `json:"name"`
+	PasswordHash        string             `json:"password_hash"`
+	Role                string             `json:"role"`
+	QuotaHosts          int32              `json:"quota_hosts"`
+	QuotaCpuMilli       int32              `json:"quota_cpu_milli"`
+	QuotaMemMib         int32              `json:"quota_mem_mib"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	Status              string             `json:"status"`
+	MustChangePassword  bool               `json:"must_change_password"`
+	DefaultHostCpuMilli int32              `json:"default_host_cpu_milli"`
+	DefaultHostMemMib   int32              `json:"default_host_mem_mib"`
 }
 
 type UserPreference struct {

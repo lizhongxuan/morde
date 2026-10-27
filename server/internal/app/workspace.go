@@ -120,9 +120,9 @@ func (s *WorkspaceService) ListDeviceWorkspaces(ctx context.Context, principal i
 	if err != nil {
 		return nil, err
 	}
-	result := make([]DeviceWorkspaceInfo, 0, len(principal.WorkspaceIDs))
+	result := make([]DeviceWorkspaceInfo, 0, len(values))
 	for _, value := range values {
-		if value.OwnerID == principal.UserID && principal.AllowsWorkspace(value.ID) && value.State != workspace.StateDeleted && value.DeletedAt == nil {
+		if value.OwnerID == principal.UserID && principal.AllowsWorkspace(value.ID) && value.State == workspace.StateReady && value.DeletedAt == nil {
 			result = append(result, DeviceWorkspaceInfo{ID: value.ID, Name: value.Name, Revision: value.Revision, State: value.State})
 		}
 	}

@@ -215,7 +215,7 @@ func (s *OnboardingService) EnsureDefaultHost(ctx context.Context, principal ide
 	if value.ID == "" {
 		switch len(values) {
 		case 0:
-			value, err = s.hosts.Create(ctx, principal, CreateHostCommand{TemplateID: s.templateID})
+			value, result.Created, err = s.hosts.EnsureDefaultStopped(ctx, identity.User{ID: principal.UserID})
 			if err != nil {
 				if issue := defaultHostIssue(err); issue != "" {
 					preferences, err = s.preferences.SetDefaultHost(ctx, principal.UserID, "", issue)
@@ -227,11 +227,18 @@ func (s *OnboardingService) EnsureDefaultHost(ctx context.Context, principal ide
 				}
 				return DefaultHostResult{}, err
 			}
+			if value.ID == "" {
+				preferences, err = s.preferences.SetDefaultHost(ctx, principal.UserID, "", "quota_exceeded")
+				if err != nil {
+					return DefaultHostResult{}, err
+				}
+				snapshot, snapshotErr := s.snapshot(ctx, principal, preferences)
+				return DefaultHostResult{Snapshot: snapshot}, snapshotErr
+			}
 			preferences, err = s.preferences.SetDefaultHost(ctx, principal.UserID, value.ID, "")
 			if err != nil {
 				return DefaultHostResult{}, err
 			}
-			result.Created = true
 		case 1:
 			value = values[0]
 			preferences, err = s.preferences.SetDefaultHost(ctx, principal.UserID, value.ID, "")
@@ -244,22 +251,7 @@ func (s *OnboardingService) EnsureDefaultHost(ctx context.Context, principal ide
 		}
 	}
 
-	if value.State == host.StateStopped {
-		stoppedHost := value
-		value, err = s.hosts.Restore(ctx, principal, stoppedHost.ID)
-		if err != nil {
-			if issue := defaultHostIssue(err); issue != "" {
-				preferences, err = s.preferences.SetDefaultHost(ctx, principal.UserID, stoppedHost.ID, issue)
-				if err != nil {
-					return DefaultHostResult{}, err
-				}
-				snapshot, snapshotErr := s.snapshot(ctx, principal, preferences)
-				return DefaultHostResult{Snapshot: snapshot, Host: &stoppedHost, Created: result.Created}, snapshotErr
-			}
-			return DefaultHostResult{}, err
-		}
-	}
-	if preferences.LastHostIssue != "" && value.State != host.StateStopped {
+	if preferences.LastHostIssue != "" {
 		preferences, err = s.preferences.SetDefaultHost(ctx, principal.UserID, value.ID, "")
 		if err != nil {
 			return DefaultHostResult{}, err
@@ -349,8 +341,8 @@ func (s *OnboardingService) snapshot(ctx context.Context, principal identity.Pri
 			computerStatus = ComputerUnavailable
 		}
 	}
-	canSubmit := modelStatus == ModelReady && preferences.SelectedModelID != "" && selectedAvailable && computerStatus == ComputerReady
-	nextAction := nextOnboardingAction(modelStatus, computerStatus)
+	canSubmit := modelStatus == ModelReady && preferences.SelectedModelID != "" && selectedAvailable
+	nextAction := nextOnboardingAction(modelStatus)
 	preferences.DefaultHostID = defaultHostID
 	return OnboardingSnapshot{
 		Preferences: preferences, ModelStatus: modelStatus, AvailableModels: availableModels,
@@ -392,10 +384,8 @@ func validateOnboardingPrincipal(principal identity.Principal) error {
 	return nil
 }
 
-// Vision is an independent UI capability: text/tool models can submit
-// non-visual tasks, while the Portal uses Vision to hide desktop capability.
 func usableModel(model ModelConnectionView) bool {
-	return model.CheckedAt != nil && model.Capabilities.Text && model.Capabilities.Tools
+	return model.CheckedAt != nil && model.Capabilities.Text
 }
 
 func containsUsableModel(models []ModelConnectionView, id string) bool {
@@ -430,26 +420,9 @@ func defaultHostIssue(err error) string {
 	}
 }
 
-func nextOnboardingAction(modelStatus ModelStatus, computerStatus ComputerStatus) string {
+func nextOnboardingAction(modelStatus ModelStatus) string {
 	if modelStatus != ModelReady {
 		return "configure_model"
 	}
-	switch computerStatus {
-	case ComputerNotCreated, ComputerCapacityUnavailable:
-		return "create_or_retry_computer"
-	case ComputerQuotaExceeded:
-		return "contact_admin"
-	case ComputerSelectionRequired, ComputerAvailable:
-		return "choose_computer"
-	case ComputerCreating, ComputerRestoring, ComputerStopping:
-		return "wait_for_computer"
-	case ComputerStopped:
-		return "resume_computer"
-	case ComputerCreateFailed, ComputerRestoreFailed, ComputerUnavailable:
-		return "choose_another_computer"
-	case ComputerReady:
-		return "submit_task"
-	default:
-		return "review_setup"
-	}
+	return "start_chat"
 }

@@ -61,7 +61,7 @@ func (s *taskServiceStub) Submit(_ context.Context, _ identity.Principal, comman
 	s.submitCalls++
 	s.submitCommand = command
 	value := apiTestTask()
-	value.ApplicationID = command.ApplicationID
+	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
 	return app.TaskSubmissionResult{Task: value}, s.err
 }
 
@@ -70,7 +70,7 @@ func (s *taskServiceStub) AppendMessage(_ context.Context, _ identity.Principal,
 	s.appendCommand, s.appendID = command, id
 	now := time.Now().UTC()
 	value := apiTestTask()
-	value.ApplicationID = command.ApplicationID
+	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
 	return app.TaskSubmissionResult{
 		Task: value, Message: conversation.Message{
 			ID: "m1234567", ConversationID: id, Role: conversation.RoleUser, Content: command.Content,
@@ -171,6 +171,23 @@ func TestTaskSubmitRejectsUnknownFieldsBeforeCallingService(t *testing.T) {
 	}
 }
 
+func TestCloudTaskResponseDoesNotRequireAHost(t *testing.T) {
+	service := &taskServiceStub{}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"model_id":"model-a","objective":"continue in the cloud"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "cloud-task-001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusAccepted || service.submitCommand.HostID != "" || string(body["execution_location"]) != `"server"` || body["host_id"] != nil {
+		t.Fatalf("cloud task response = %d %s; command=%#v", response.Code, response.Body, service.submitCommand)
+	}
+}
+
 func TestTaskActionRetriesOneBatchItem(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
@@ -187,7 +204,7 @@ func TestTaskActionRetriesOneBatchItem(t *testing.T) {
 func TestTaskActionRespondsToExactPendingRequest(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
-	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/actions", strings.NewReader(`{"action":"respond","pending_id":"r1234567","pending_version":2,"decision":"approve"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/approvals/r1234567/responses", strings.NewReader(`{"version":2,"decision":"approve"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "approval-key-001")
 	response := httptest.NewRecorder()
@@ -202,7 +219,7 @@ func TestTaskActionRespondsToExactPendingRequest(t *testing.T) {
 func TestTaskActionAnswersExactClarification(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
-	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/actions", strings.NewReader(`{"action":"answer_clarification","clarification_id":"r1234567","clarification_version":2,"answer":"Use staging"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/inputs", strings.NewReader(`{"clarification_id":"r1234567","clarification_version":2,"answer":"Use staging"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "clarify-key-001")
 	response := httptest.NewRecorder()
@@ -623,7 +640,7 @@ func taskAPIRouter(tasks TaskService, conversations ConversationService) *gin.En
 func apiTestTask() task.Task {
 	now := time.Now().UTC()
 	return task.Task{
-		ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", ConversationID: "c1234567",
+		ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", ExecutionLocation: "server", ConversationID: "c1234567",
 		ModelID: "model-a", Objective: "summarize files", Status: task.StatusQueued,
 		Budget:    task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		CreatedAt: now, UpdatedAt: now,

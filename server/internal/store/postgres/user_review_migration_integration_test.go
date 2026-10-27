@@ -73,11 +73,18 @@ VALUES ($1, $2, 'session', $3, $4)`, tokenID, memberID, []byte("hash"), time.Now
 		{disabledID, string(identity.RoleUser), string(identity.StatusDisabled), false, "keep-disabled-hash"},
 	}
 	for _, check := range checks {
-		user, err := store.GetUserByID(ctx, check.id)
-		if err != nil || string(user.Role) != check.role || string(user.Status) != check.status ||
-			user.MustChangePassword != check.mustChange || user.PasswordHash != check.passwordHash {
-			t.Errorf("migrated user %s = %#v, %v", check.id, user, err)
+		var role, status, passwordHash string
+		var mustChange bool
+		err := pool.QueryRow(ctx, `SELECT role, status, must_change_password, password_hash FROM users WHERE id=$1`, check.id).
+			Scan(&role, &status, &mustChange, &passwordHash)
+		if err != nil || role != check.role || status != check.status ||
+			mustChange != check.mustChange || passwordHash != check.passwordHash {
+			t.Errorf("migrated user %s = role %q, status %q, must_change %t, password_hash %q, %v",
+				check.id, role, status, mustChange, passwordHash, err)
 		}
+	}
+	if _, err := provider.UpTo(ctx, 48); err != nil {
+		t.Fatalf("restore schema needed by current startup query: %v", err)
 	}
 	if err := app.EnsureInitialAdmin(ctx, store); err != nil {
 		t.Fatalf("startup failed to retain the fixed super administrator: %v", err)

@@ -66,7 +66,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 		deviceIDs[i] = tokenID
 		if _, err := store.CreateToken(ctx, identity.Token{
 			ID: tokenID, OwnerID: owner.ID, ClientInstallationID: installationID, Kind: identity.KindDevice, Name: fmt.Sprintf("sync device %d", i),
-			WorkspaceIDs: []string{value.ID}, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+			Scopes:     []identity.Scope{identity.ScopeWorkspaceSync},
 			SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
 		}); err != nil {
 			t.Fatal(err)
@@ -78,7 +78,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	}
 	credentialService, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
 		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
-	})
+	}, credentialDefaultHostNoop{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,8 +88,6 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 		Verifier:      credentialService,
 		Auth:          unusedWorkspaceSyncAuth{},
 		WorkspaceSync: syncService,
-		Tasks:         unusedWorkspaceSyncTasks{},
-		Conversations: unusedWorkspaceSyncConversations{},
 		MCPDisabled:   true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,
@@ -413,7 +411,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgresENOSPCRetryAfterRecovery(t *te
 	installationID := createTestClientInstallation(t, pool, owner.ID, []string{value.ID})
 	if _, err := store.CreateToken(ctx, identity.Token{
 		ID: tokenID, OwnerID: owner.ID, ClientInstallationID: installationID, Kind: identity.KindDevice, Name: "ext4 ENOSPC test device",
-		WorkspaceIDs: []string{value.ID}, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+		Scopes:     []identity.Scope{identity.ScopeWorkspaceSync},
 		SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
 	}); err != nil {
 		t.Fatal(err)
@@ -424,7 +422,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgresENOSPCRetryAfterRecovery(t *te
 	}
 	credentialService, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
 		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
-	})
+	}, credentialDefaultHostNoop{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,8 +436,6 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgresENOSPCRetryAfterRecovery(t *te
 		Verifier:      credentialService,
 		Auth:          unusedWorkspaceSyncAuth{},
 		WorkspaceSync: syncService,
-		Tasks:         unusedWorkspaceSyncTasks{},
-		Conversations: unusedWorkspaceSyncConversations{},
 		MCPDisabled:   true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,
@@ -779,8 +775,6 @@ func assertWorkspaceSyncFile(t *testing.T, root, name, expected string) {
 type unusedWorkspaceSyncHostService struct{ app.HostService }
 type unusedWorkspaceSyncTLSAuthorizer struct{ app.HostTLSAuthorizer }
 type unusedWorkspaceSyncAuth struct{ api.AuthService }
-type unusedWorkspaceSyncTasks struct{ api.TaskService }
-type unusedWorkspaceSyncConversations struct{ api.ConversationService }
 
 type workspaceSyncLiveRun struct {
 	name       string

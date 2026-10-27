@@ -456,7 +456,7 @@ func TestWorkspaceSyncServiceBlockStoreLockContention(t *testing.T) {
 	}
 }
 
-func TestWorkspaceSyncServiceRequiresExplicitDeviceWorkspaceGrant(t *testing.T) {
+func TestWorkspaceSyncServiceAuthorizesDeviceWorkspaceDynamically(t *testing.T) {
 	store := newSyncServiceStore()
 	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
 	if err != nil {
@@ -464,11 +464,11 @@ func TestWorkspaceSyncServiceRequiresExplicitDeviceWorkspaceGrant(t *testing.T) 
 	}
 	device := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: "t1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync}}
 	if _, err := service.GetManifest(context.Background(), device, store.workspace.ID, 0, "", "", 100); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("ungranted device error = %v", err)
+		t.Fatalf("unbound device error = %v", err)
 	}
-	device.WorkspaceIDs = []string{store.workspace.ID}
+	device.ClientInstallationID = "i1234567"
 	if _, err := service.GetManifest(context.Background(), device, store.workspace.ID, 0, "", "", 100); err != nil {
-		t.Fatalf("granted device manifest error = %v", err)
+		t.Fatalf("owned device manifest error = %v", err)
 	}
 	device.Scopes = nil
 	if _, err := service.GetManifest(context.Background(), device, store.workspace.ID, 0, "", "", 100); domain.CodeOf(err) != domain.CodeForbidden {

@@ -26,7 +26,7 @@ func TestSessionAfterServerWriteTimeout(t *testing.T) {
 		Config:       config.MCP{Enabled: true, MaxOutputBytes: 65536, ScreenshotMaxWidth: 1280},
 		Domains:      config.Domains{Scheme: "https", HostSuffix: "hosts.example.test"},
 		Hosts:        &hostServiceStub{value: host.Host{ID: "host_test", State: host.StateRunning}},
-		Applications: newApplicationStatusServiceStub(), RuntimeTools: &runtimeComputerToolsStub{}, Tasks: newTaskServiceStub(), Schedules: scheduleServiceFake{}, Auth: verifierStub{}, Audit: &auditStub{},
+		Applications: newApplicationStatusServiceStub(), RuntimeTools: &runtimeComputerToolsStub{}, Auth: verifierStub{}, Audit: &auditStub{},
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(),
 	})
 	if err != nil {

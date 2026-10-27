@@ -23,7 +23,7 @@ func TestRegisteredUserWaitsForApprovalBeforeLogin(t *testing.T) {
 	}
 	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
 		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 10, LoginWindow: time.Minute,
-	})
+	}, credentialDefaultHostNoop{})
 	if err != nil {
 		t.Fatal(err)
 	}

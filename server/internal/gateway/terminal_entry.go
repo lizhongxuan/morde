@@ -27,7 +27,7 @@ function applySession(value) {
     frame.src = url.pathname + url.search;
     frame.hidden = false;
     replaceButton.hidden = true;
-    showStatus('终端已连接。切换设备前请先断开当前终端窗口。');
+    showStatus('终端页面已打开。连接状态请以终端内提示为准；切换设备前请先断开当前终端窗口。');
     return true;
   }
   frame.hidden = true;

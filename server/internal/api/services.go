@@ -10,7 +10,6 @@ import (
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/notification"
-	"morde/server/internal/domain/schedule"
 	sitedomain "morde/server/internal/domain/site"
 	"morde/server/internal/domain/template"
 	"morde/server/internal/domain/workspace"
@@ -73,16 +72,15 @@ type ResourceRecord struct {
 
 type TokenService interface {
 	ListAPIKeys(context.Context, identity.Principal) ([]identity.Token, error)
-	CreateAPIKey(context.Context, identity.Principal, string, []string, []identity.Scope, time.Duration) (CreatedAPIKey, error)
+	CreateAPIKey(context.Context, identity.Principal, string, time.Duration) (CreatedAPIKey, error)
 	DeleteAPIKey(context.Context, identity.Principal, string) error
 }
 
-type ClientAuthorizationService interface {
-	Start(context.Context, string, string, bool, string, string) (app.ClientAuthorizationStart, error)
-	Poll(context.Context, string, string) (app.ClientAuthorizationStatus, error)
-	Inspect(context.Context, identity.Principal, string, string) (app.ClientAuthorizationRequest, error)
-	Approve(context.Context, identity.Principal, string, []string, string) (app.ClientInfo, error)
-	Deny(context.Context, identity.Principal, string, string) error
+type ClientLoginService interface {
+	Login(context.Context, string, string, string, string, string, string, string) (app.ClientLoginResult, error)
+	WebSession(context.Context, identity.Principal) (app.ClientWebSessionResult, error)
+	Logout(context.Context, identity.Principal, string) error
+	LogoutWebSession(context.Context, identity.Principal, string) error
 	List(context.Context, identity.Principal) ([]app.ClientInfo, error)
 	Revoke(context.Context, identity.Principal, string, string) error
 }
@@ -90,8 +88,6 @@ type ClientAuthorizationService interface {
 type CreatedAPIKey struct {
 	ID        string
 	Key       string
-	HostIDs   []string
-	Scopes    []identity.Scope
 	ExpiresAt time.Time
 }
 
@@ -102,21 +98,33 @@ type AdminService interface {
 	ListAudit(context.Context, identity.Principal, AuditQuery) ([]AuditRecord, error)
 }
 
+type AdminHostResourcesService interface {
+	Get(context.Context, identity.Principal, string) (app.HostResourceSnapshot, error)
+	Update(context.Context, identity.Principal, string, app.HostResources, int64) (app.HostResourceSnapshot, error)
+}
+
 type AdminUserRecord struct {
-	ID        string
-	Name      string
-	Role      identity.Role
-	Status    identity.AccountStatus
-	Quota     TotalsView
-	Usage     TotalsView
-	CreatedAt time.Time
+	ID                   string
+	Name                 string
+	Role                 identity.Role
+	Status               identity.AccountStatus
+	Quota                TotalsView
+	Usage                TotalsView
+	DefaultHostResources HostResourcesView
+	CreatedAt            time.Time
+}
+
+type HostResourcesView struct {
+	CPUMilli int `json:"cpu_milli"`
+	MemMiB   int `json:"mem_mib"`
 }
 
 type UpdateAdminUserCommand struct {
-	ExpectedStatus identity.AccountStatus
-	Role           *identity.Role
-	Status         *identity.AccountStatus
-	Quota          *TotalsView
+	ExpectedStatus       identity.AccountStatus
+	Role                 *identity.Role
+	Status               *identity.AccountStatus
+	Quota                *TotalsView
+	DefaultHostResources *HostResourcesView
 }
 
 type CapacityRecord struct {
@@ -141,15 +149,6 @@ type AuditRecord struct {
 
 type ReadinessChecker interface {
 	CheckReady(context.Context) error
-}
-
-type ScheduleService interface {
-	Create(context.Context, identity.Principal, app.CreateScheduleCommand, string) (schedule.Schedule, error)
-	List(context.Context, identity.Principal, app.ScheduleListRequest) (app.SchedulePage, error)
-	Get(context.Context, identity.Principal, string) (schedule.Schedule, error)
-	Update(context.Context, identity.Principal, string, app.UpdateScheduleCommand) (schedule.Schedule, error)
-	Action(context.Context, identity.Principal, string, app.ScheduleActionCommand, string) (app.ScheduleActionResult, error)
-	Runs(context.Context, identity.Principal, string, app.PageRequest) (app.ScheduleRunPage, error)
 }
 
 type NotificationService interface {

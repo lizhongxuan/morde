@@ -221,6 +221,7 @@ func pendingTestUser(t *testing.T) identity.User {
 	return identity.User{
 		ID: id, Name: "user-" + id, PasswordHash: "hash", Role: identity.RoleUser,
 		Status: identity.StatusPending, QuotaHosts: 3, QuotaCPUMilli: 4000, QuotaMemMiB: 8192,
+		DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048,
 	}
 }
 
@@ -242,9 +243,6 @@ VALUES ($1, $2, 'test client', 'desktop', now()+interval '1 day')`, installation
 			t.Fatal(err)
 		}
 		token := identity.Token{ID: id, OwnerID: ownerID, Kind: kind, SecretHash: []byte("secret-hash"), ExpiresAt: time.Now().Add(time.Hour)}
-		if kind == identity.KindAPIKey {
-			token.Scopes = []identity.Scope{identity.ScopeHostRead}
-		}
 		if kind == identity.KindDevice {
 			token.Scopes = []identity.Scope{identity.ScopeWorkspaceSync}
 			token.ClientInstallationID = installationID

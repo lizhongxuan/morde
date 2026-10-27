@@ -2,12 +2,7 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"io"
-	"mime"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -38,19 +33,21 @@ type taskPageResponse struct {
 }
 
 type taskSummaryResponse struct {
-	ID             string             `json:"id"`
-	OwnerID        string             `json:"owner_id"`
-	HostID         string             `json:"host_id"`
-	ApplicationID  string             `json:"application_id,omitempty"`
-	ConversationID string             `json:"conversation_id"`
-	ModelID        string             `json:"model_id"`
-	Objective      string             `json:"objective"`
-	Status         task.Status        `json:"status"`
-	CurrentStep    *string            `json:"current_step"`
-	Budget         taskBudgetResponse `json:"budget"`
-	Usage          taskUsageResponse  `json:"usage"`
-	CreatedAt      time.Time          `json:"created_at"`
-	UpdatedAt      time.Time          `json:"updated_at"`
+	ID                string             `json:"id"`
+	OwnerID           string             `json:"owner_id"`
+	HostID            string             `json:"host_id,omitempty"`
+	ExecutionLocation string             `json:"execution_location"`
+	WorkspaceID       string             `json:"workspace_id,omitempty"`
+	ApplicationID     string             `json:"application_id,omitempty"`
+	ConversationID    string             `json:"conversation_id"`
+	ModelID           string             `json:"model_id"`
+	Objective         string             `json:"objective"`
+	Status            task.Status        `json:"status"`
+	CurrentStep       *string            `json:"current_step"`
+	Budget            taskBudgetResponse `json:"budget"`
+	Usage             taskUsageResponse  `json:"usage"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
 type taskResponse struct {
@@ -178,15 +175,20 @@ type batchItemRequest struct {
 }
 
 type taskActionRequest struct {
-	Action               string               `json:"action"`
-	ExpectedStatus       task.Status          `json:"expected_status"`
-	BatchItemID          string               `json:"batch_item_id"`
-	PendingID            string               `json:"pending_id"`
-	PendingVersion       int64                `json:"pending_version"`
-	Decision             task.PendingDecision `json:"decision"`
-	ClarificationID      string               `json:"clarification_id"`
-	ClarificationVersion int64                `json:"clarification_version"`
-	Answer               string               `json:"answer"`
+	Action         string      `json:"action"`
+	ExpectedStatus task.Status `json:"expected_status"`
+	BatchItemID    string      `json:"batch_item_id"`
+}
+
+type taskInputRequest struct {
+	ClarificationID      string `json:"clarification_id"`
+	ClarificationVersion int64  `json:"clarification_version"`
+	Answer               string `json:"answer"`
+}
+
+type taskApprovalResponseRequest struct {
+	Version  int64                `json:"version"`
+	Decision task.PendingDecision `json:"decision"`
 }
 
 func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
@@ -197,6 +199,8 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks", h.submitTask(service))
 	group.GET("/tasks/:id", h.getTask(service))
 	group.POST("/tasks/:id/actions", h.taskAction(service))
+	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
+	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
 }
 
@@ -217,8 +221,7 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 		}
 		switch request.Action {
 		case "retry_batch_item":
-			if !domain.ValidBatchItemID(request.BatchItemID) || request.PendingID != "" || request.PendingVersion != 0 || request.Decision != "" || request.ExpectedStatus != "" ||
-				request.ClarificationID != "" || request.ClarificationVersion != 0 || request.Answer != "" {
+			if !domain.ValidBatchItemID(request.BatchItemID) || request.ExpectedStatus != "" {
 				writeError(c, domain.InvalidArgument("action", "retry_batch_item requires only a valid batch_item_id"))
 				return
 			}
@@ -228,38 +231,10 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 			}
 			c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: request.Action, Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
 			return
-		case "respond":
-			if request.BatchItemID != "" || request.ExpectedStatus != "" || request.ClarificationID != "" || request.ClarificationVersion != 0 || request.Answer != "" ||
-				!domain.ValidPendingRequestID(request.PendingID) || request.PendingVersion < 1 ||
-				(request.Decision != task.PendingDecisionApprove && request.Decision != task.PendingDecisionReject) {
-				writeError(c, domain.InvalidArgument("action", "respond requires a pending_id, positive pending_version, and approve or reject decision"))
-				return
-			}
-			if err := service.RespondToPendingRequest(c.Request.Context(), principal, taskID, request.PendingID, request.PendingVersion, request.Decision, c.GetHeader("Idempotency-Key")); err != nil {
-				writeError(c, err)
-				return
-			}
-			c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: request.Action, Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
-			return
-		case "answer_clarification":
-			if request.BatchItemID != "" || request.PendingID != "" || request.PendingVersion != 0 || request.Decision != "" || request.ExpectedStatus != "" ||
-				!domain.ValidPendingRequestID(request.ClarificationID) || request.ClarificationVersion < 1 || !validTaskText(request.Answer, 16384) ||
-				strings.ContainsRune(request.Answer, '\x00') || strings.TrimSpace(request.Answer) == "" {
-				writeError(c, domain.InvalidArgument("action", "answer_clarification requires a clarification_id, positive clarification_version, and answer"))
-				return
-			}
-			if err := service.AnswerClarificationRequest(c.Request.Context(), principal, taskID, request.ClarificationID, request.ClarificationVersion, request.Answer, c.GetHeader("Idempotency-Key")); err != nil {
-				writeError(c, err)
-				return
-			}
-			c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: request.Action, Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
-			return
 		case "pause", "resume", "cancel":
 			action := task.Action(request.Action)
-			if request.BatchItemID != "" || request.PendingID != "" || request.PendingVersion != 0 || request.Decision != "" || request.ClarificationID != "" ||
-				request.ClarificationVersion != 0 || request.Answer != "" ||
-				!validTaskActionExpectedStatus(action, request.ExpectedStatus) {
-				writeError(c, domain.InvalidArgument("action", "pause, resume, or cancel requires a valid expected_status and no other action fields"))
+			if request.BatchItemID != "" || !validTaskActionExpectedStatus(action, request.ExpectedStatus) {
+				writeError(c, domain.InvalidArgument("action", "pause, resume, or cancel requires a valid expected_status and no batch_item_id"))
 				return
 			}
 			result, err := service.RequestAction(c.Request.Context(), principal, taskID, action, request.ExpectedStatus, c.GetHeader("Idempotency-Key"))
@@ -273,9 +248,70 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 			})
 			return
 		default:
-			writeError(c, domain.InvalidArgument("action", "supported task actions are retry_batch_item, respond, answer_clarification, pause, resume, and cancel"))
+			writeError(c, domain.InvalidArgument("action", "supported task actions are retry_batch_item, pause, resume, and cancel"))
 			return
 		}
+	}
+}
+
+func (h *api) addTaskInput(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		var request taskInputRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if !domain.ValidPendingRequestID(request.ClarificationID) || request.ClarificationVersion < 1 || !validTaskText(request.Answer, 16384) ||
+			strings.ContainsRune(request.Answer, '\x00') || strings.TrimSpace(request.Answer) == "" {
+			writeError(c, domain.InvalidArgument("input", "a clarification id, positive version, and answer are required"))
+			return
+		}
+		if err := service.AnswerClarificationRequest(c.Request.Context(), principal, taskID, request.ClarificationID,
+			request.ClarificationVersion, request.Answer, c.GetHeader("Idempotency-Key")); err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: "answer_clarification", Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
+	}
+}
+
+func (h *api) respondToTaskApproval(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		approvalID, ok := safeIDParam(c, "approval_id", "approval_id", domain.ValidPendingRequestID)
+		if !ok {
+			return
+		}
+		var request taskApprovalResponseRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if request.Version < 1 || (request.Decision != task.PendingDecisionApprove && request.Decision != task.PendingDecisionReject) {
+			writeError(c, domain.InvalidArgument("approval", "a positive version and approve or reject decision are required"))
+			return
+		}
+		if err := service.RespondToPendingRequest(c.Request.Context(), principal, taskID, approvalID, request.Version,
+			request.Decision, c.GetHeader("Idempotency-Key")); err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: "respond", Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
 	}
 }
 
@@ -383,7 +419,10 @@ func (h *api) getTask(service TaskService) gin.HandlerFunc {
 }
 
 func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
-	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) || !domain.ValidHostID(value.HostID) ||
+	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
+		(value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
+		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
+		(value.ExecutionLocation != "server" && value.ExecutionLocation != "legacy") ||
 		!domain.ValidConversationID(value.ConversationID) || strings.TrimSpace(value.ModelID) == "" ||
 		(value.ApplicationID != "" && !app.ValidHostApplicationID(value.ApplicationID)) || !validTaskStatusResponse(value.Status) ||
 		value.Budget.Validate() != nil || value.Usage.ActiveSeconds < 0 || value.Usage.ToolCalls < 0 || (value.Usage.ModelTokens != nil && *value.Usage.ModelTokens < 0) ||
@@ -391,7 +430,8 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 		return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return taskSummaryResponse{
-		ID: value.ID, OwnerID: value.OwnerID, HostID: value.HostID, ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
+		ID: value.ID, OwnerID: value.OwnerID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation, WorkspaceID: value.WorkspaceID,
+		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
 		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, CurrentStep: stringPointer(value.CurrentStep),
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,
@@ -516,73 +556,7 @@ func requestBudget(c *gin.Context, request *taskBudgetRequest) (task.Budget, boo
 }
 
 func decodeStrictTaskJSON(c *gin.Context, target any) bool {
-	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(c, domain.InvalidArgument("body", "content type must be application/json"))
-		return false
-	}
-	decoder := json.NewDecoder(c.Request.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		writeTaskDecodeError(c, err)
-		return false
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("multiple json values")
-		}
-		writeTaskDecodeError(c, err)
-		return false
-	}
-	return true
-}
-
-func writeTaskDecodeError(c *gin.Context, err error) {
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		writeError(c, domain.NewError(domain.CodeRequestTooLarge, "request body too large"))
-		return
-	}
-	writeError(c, domain.InvalidArgument("body", "invalid json request"))
-}
-
-func requestPage(c *gin.Context) (app.PageRequest, bool) {
-	limitValues, exists := c.Request.URL.Query()["limit"]
-	limit := int64(50)
-	if exists {
-		if len(limitValues) != 1 {
-			writeError(c, domain.InvalidArgument("limit", "page limit is invalid"))
-			return app.PageRequest{}, false
-		}
-		parsed, err := strconv.ParseInt(limitValues[0], 10, 32)
-		if err != nil || parsed < 1 || parsed > 100 {
-			writeError(c, domain.InvalidArgument("limit", "page limit is invalid"))
-			return app.PageRequest{}, false
-		}
-		limit = parsed
-	}
-	cursor, ok := singleQuery(c, "cursor")
-	if !ok {
-		return app.PageRequest{}, false
-	}
-	if len(cursor) > 1024 {
-		writeError(c, domain.InvalidArgument("cursor", "page cursor is invalid"))
-		return app.PageRequest{}, false
-	}
-	return app.PageRequest{Limit: int32(limit), Cursor: cursor}, true
-}
-
-func singleQuery(c *gin.Context, key string) (string, bool) {
-	values, exists := c.Request.URL.Query()[key]
-	if !exists {
-		return "", true
-	}
-	if len(values) != 1 {
-		writeError(c, domain.InvalidArgument(key, "query parameter must appear once"))
-		return "", false
-	}
-	return values[0], true
+	return decodeStrictJSON(c, target)
 }
 
 func validTaskStatusResponse(value task.Status) bool {
@@ -620,19 +594,4 @@ func validBatchStatusResponse(value task.BatchItemStatus) bool {
 	default:
 		return false
 	}
-}
-
-func stringPointer(value string) *string {
-	if value == "" {
-		return nil
-	}
-	copy := value
-	return &copy
-}
-
-func cursorPointer(value string) *string {
-	if value == "" {
-		return nil
-	}
-	return &value
 }

@@ -10,7 +10,7 @@ import (
 )
 
 const getHost = `-- name: GetHost :one
-SELECT id, owner_id, name, template_id, runtime_profile, sandbox_id, create_attempted_at, state, state_reason, cpu_milli, mem_mib, cpu_limit_milli, mem_limit_mib, aio_key_enc, expires_at, last_active_at, created_at, updated_at, deleted_at, runtime_generation, control_version, control_state, runtime_credential_enc, runtime_instance_id FROM hosts WHERE id = $1
+SELECT id, owner_id, name, template_id, runtime_profile, sandbox_id, create_attempted_at, state, state_reason, cpu_milli, mem_mib, cpu_limit_milli, mem_limit_mib, aio_key_enc, expires_at, last_active_at, created_at, updated_at, deleted_at, runtime_generation, control_version, control_state, runtime_credential_enc, runtime_instance_id, resource_version, resource_update_state, resource_target_cpu_milli, resource_target_mem_mib FROM hosts WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -41,12 +41,16 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.ControlState,
 		&i.RuntimeCredentialEnc,
 		&i.RuntimeInstanceID,
+		&i.ResourceVersion,
+		&i.ResourceUpdateState,
+		&i.ResourceTargetCpuMilli,
+		&i.ResourceTargetMemMib,
 	)
 	return i, err
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT id, owner_id, name, template_id, runtime_profile, sandbox_id, create_attempted_at, state, state_reason, cpu_milli, mem_mib, cpu_limit_milli, mem_limit_mib, aio_key_enc, expires_at, last_active_at, created_at, updated_at, deleted_at, runtime_generation, control_version, control_state, runtime_credential_enc, runtime_instance_id FROM hosts WHERE deleted_at IS NULL ORDER BY created_at DESC, id
+SELECT id, owner_id, name, template_id, runtime_profile, sandbox_id, create_attempted_at, state, state_reason, cpu_milli, mem_mib, cpu_limit_milli, mem_limit_mib, aio_key_enc, expires_at, last_active_at, created_at, updated_at, deleted_at, runtime_generation, control_version, control_state, runtime_credential_enc, runtime_instance_id, resource_version, resource_update_state, resource_target_cpu_milli, resource_target_mem_mib FROM hosts WHERE deleted_at IS NULL ORDER BY created_at DESC, id
 `
 
 func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
@@ -83,6 +87,10 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 			&i.ControlState,
 			&i.RuntimeCredentialEnc,
 			&i.RuntimeInstanceID,
+			&i.ResourceVersion,
+			&i.ResourceUpdateState,
+			&i.ResourceTargetCpuMilli,
+			&i.ResourceTargetMemMib,
 		); err != nil {
 			return nil, err
 		}
@@ -95,7 +103,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 }
 
 const listHostsByOwner = `-- name: ListHostsByOwner :many
-SELECT id, owner_id, name, template_id, runtime_profile, sandbox_id, create_attempted_at, state, state_reason, cpu_milli, mem_mib, cpu_limit_milli, mem_limit_mib, aio_key_enc, expires_at, last_active_at, created_at, updated_at, deleted_at, runtime_generation, control_version, control_state, runtime_credential_enc, runtime_instance_id FROM hosts WHERE owner_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id
+SELECT id, owner_id, name, template_id, runtime_profile, sandbox_id, create_attempted_at, state, state_reason, cpu_milli, mem_mib, cpu_limit_milli, mem_limit_mib, aio_key_enc, expires_at, last_active_at, created_at, updated_at, deleted_at, runtime_generation, control_version, control_state, runtime_credential_enc, runtime_instance_id, resource_version, resource_update_state, resource_target_cpu_milli, resource_target_mem_mib FROM hosts WHERE owner_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id
 `
 
 func (q *Queries) ListHostsByOwner(ctx context.Context, ownerID string) ([]Host, error) {
@@ -132,6 +140,10 @@ func (q *Queries) ListHostsByOwner(ctx context.Context, ownerID string) ([]Host,
 			&i.ControlState,
 			&i.RuntimeCredentialEnc,
 			&i.RuntimeInstanceID,
+			&i.ResourceVersion,
+			&i.ResourceUpdateState,
+			&i.ResourceTargetCpuMilli,
+			&i.ResourceTargetMemMib,
 		); err != nil {
 			return nil, err
 		}

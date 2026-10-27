@@ -224,29 +224,7 @@ func (s *ModelConnectionService) Check(ctx context.Context, principal identity.P
 	if !domain.ValidModelConnectionID(id) {
 		return ModelCapabilities{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
-	record, err := s.store.GetModelConnection(ctx, id)
-	if err != nil {
-		return ModelCapabilities{}, err
-	}
-	if !canManageModelConnection(principal, record) {
-		return ModelCapabilities{}, domain.NewError(domain.CodeNotFound, "model connection not found")
-	}
-	key, err := s.sealer.Open(record.APIKeyCipher)
-	if err != nil {
-		return ModelCapabilities{}, fmt.Errorf("decrypt model API key: %w", err)
-	}
-	capabilities, err := s.client.Check(ctx, ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName})
-	if err != nil {
-		return ModelCapabilities{}, modelConnectionCheckError(err)
-	}
-	checkedAt := time.Now().UTC()
-	capabilities.ModelID = record.ID
-	record.Capabilities = capabilities
-	record.CheckedAt = &checkedAt
-	if _, err := s.store.UpdateModelConnection(ctx, record); err != nil {
-		return ModelCapabilities{}, err
-	}
-	return capabilities, nil
+	return ModelCapabilities{}, domain.NewError(domain.CodeUnsupported, "model checks require the metered model gateway")
 }
 
 func modelConnectionCheckError(err error) error {
@@ -299,6 +277,84 @@ func (s *ModelConnectionService) ResolveEndpoint(ctx context.Context, ownerID, m
 		return ModelEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
 	return ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, nil
+}
+
+func (s *ModelConnectionService) ResolveGatewayEndpoint(ctx context.Context, ownerID, modelID string, needsTools, needsVision bool) (ModelGatewayEndpoint, error) {
+	if !domain.ValidUserID(ownerID) || !domain.ValidModelConnectionID(modelID) {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	record, err := s.store.GetModelConnection(ctx, modelID)
+	if err != nil {
+		return ModelGatewayEndpoint{}, err
+	}
+	if (record.OwnerID != "" && record.OwnerID != ownerID) || record.CheckedAt == nil || !record.Capabilities.Text ||
+		(needsTools && !record.Capabilities.Tools) || (needsVision && !record.Capabilities.Vision) {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	key, err := s.sealer.Open(record.APIKeyCipher)
+	if err != nil {
+		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
+	}
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt}, nil
+}
+
+func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, principal identity.Principal, id string) (ModelGatewayEndpoint, error) {
+	if err := validateClientAccountPrincipal(principal); err != nil {
+		return ModelGatewayEndpoint{}, err
+	}
+	if err := validateModelPrincipal(principal); err != nil {
+		return ModelGatewayEndpoint{}, err
+	}
+	if principal.ClientInstallationID != "" && principal.Role.IsAdmin() {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeForbidden, "administrator portal session required")
+	}
+	if !domain.ValidModelConnectionID(id) {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	record, err := s.store.GetModelConnection(ctx, id)
+	if err != nil {
+		return ModelGatewayEndpoint{}, err
+	}
+	if !canManageModelConnection(principal, record) {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	key, err := s.sealer.Open(record.APIKeyCipher)
+	if err != nil {
+		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
+	}
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt}, nil
+}
+
+func (s *ModelConnectionService) SaveProbeCapabilities(ctx context.Context, principal identity.Principal, id string, expected time.Time, capabilities ModelCapabilities) (ModelCapabilities, error) {
+	if err := validateClientAccountPrincipal(principal); err != nil {
+		return ModelCapabilities{}, err
+	}
+	if err := validateModelPrincipal(principal); err != nil {
+		return ModelCapabilities{}, err
+	}
+	record, err := s.store.GetModelConnection(ctx, id)
+	if err != nil {
+		return ModelCapabilities{}, err
+	}
+	if !canManageModelConnection(principal, record) || (principal.ClientInstallationID != "" && principal.Role.IsAdmin()) {
+		return ModelCapabilities{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	if !record.UpdatedAt.Equal(expected) {
+		return ModelCapabilities{}, domain.NewError(domain.CodeConflict, "model connection changed during check")
+	}
+	if record.CheckedAt != nil {
+		capabilities.Text = capabilities.Text || record.Capabilities.Text
+		capabilities.Tools = capabilities.Tools || record.Capabilities.Tools
+		capabilities.Vision = capabilities.Vision || record.Capabilities.Vision
+	}
+	checkedAt := time.Now().UTC()
+	capabilities.ModelID = id
+	record.Capabilities, record.CheckedAt = capabilities, &checkedAt
+	_, err = s.store.UpdateModelConnection(ctx, record)
+	if err != nil {
+		return ModelCapabilities{}, err
+	}
+	return capabilities, nil
 }
 
 func validateModelPrincipal(principal identity.Principal) error {

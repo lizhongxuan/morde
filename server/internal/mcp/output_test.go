@@ -62,12 +62,12 @@ func TestToolErrorsPanicAndAuditFailure(t *testing.T) {
 			deps: Deps{Hosts: hosts, Audit: failingAudit{}, Logger: zap.NewNop()}, metrics: metrics, auditFailures: auditFailures,
 		}
 		request := &sdk.CallToolRequest{
-			Params: &sdk.CallToolParamsRaw{Arguments: []byte(`{"host_id":"host_test"}`)},
+			Params: &sdk.CallToolParamsRaw{Arguments: []byte(`{"host_id":"h1234567"}`)},
 			Extra: &sdk.RequestExtra{
 				TokenInfo: &auth.TokenInfo{UserID: "user_test", Extra: map[string]any{
 					principalTokenInfoKey: identity.Principal{
 						UserID: "user_test", Role: identity.RoleUser, Kind: identity.KindAPIKey,
-						HostIDs: []string{"host_test"}, Scopes: []identity.Scope{identity.ScopeHostRead},
+						TokenID: "token_test",
 					},
 				}},
 				Header: http.Header{"X-Request-Id": []string{"request_test"}},

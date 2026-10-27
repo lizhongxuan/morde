@@ -20,19 +20,17 @@ function renderPage() {
 describe('Notifications', () => {
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
-  it('marks a notification as read without acting on the associated task', async () => {
+  it('shows historical notifications without a dead task link', async () => {
     vi.spyOn(portalApi, 'notifications').mockResolvedValueOnce({ items: [unread], next_cursor: null }).mockResolvedValue({ items: [read], next_cursor: null });
     const markRead = vi.spyOn(portalApi, 'markNotificationRead').mockResolvedValue(undefined);
-    const taskAction = vi.spyOn(portalApi, 'taskAction');
     const user = userEvent.setup();
     renderPage();
 
     expect(await screen.findByText('需要补充任务信息。')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '打开任务详情' })).toHaveAttribute('href', '/tasks/q1234567');
+    expect(screen.queryByRole('link', { name: '打开任务详情' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '标记已读' }));
 
     await waitFor(() => expect(markRead).toHaveBeenCalledWith(unread.id));
-    expect(taskAction).not.toHaveBeenCalled();
     expect(await screen.findByText('已读')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '标记已读' })).not.toBeInTheDocument();
   });
@@ -41,7 +39,7 @@ describe('Notifications', () => {
     vi.spyOn(portalApi, 'notifications').mockResolvedValue({ items: [{ ...unread, redacted: true, summary: null, actionable: false }], next_cursor: null });
     renderPage();
     expect(await screen.findByText('相关内容因当前权限而隐藏。')).toBeInTheDocument();
-    expect(screen.getByText('关联请求已处理、已失效或当前不可访问。')).toBeInTheDocument();
+    expect(screen.queryByText('关联请求已处理、已失效或当前不可访问。')).not.toBeInTheDocument();
     expect(screen.queryByText(unread.summary!)).not.toBeInTheDocument();
   });
 

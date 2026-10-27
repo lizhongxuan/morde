@@ -16,10 +16,17 @@ type ModelInput struct {
 	Role      string
 	Text      string
 	Images    []ModelImage
+	Parts     []ModelContentPart
 	CallID    string
 	Name      string
 	Arguments string
 	Output    string
+}
+
+type ModelContentPart struct {
+	Type  string
+	Text  string
+	Image *ModelImage
 }
 
 type ModelImage struct {
@@ -39,7 +46,9 @@ type ModelRequest struct {
 	Instructions    string
 	Input           []ModelInput
 	Tools           []ModelTool
+	RequiredTool    string
 	MaxOutputTokens int
+	Temperature     *float64
 	OnTextDelta     func(string) error
 }
 

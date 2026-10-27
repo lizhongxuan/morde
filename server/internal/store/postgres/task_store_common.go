@@ -142,7 +142,8 @@ func validateIdempotency(record app.IdempotencyRecord) error {
 }
 
 func validateConversation(value conversation.Conversation) error {
-	if !domain.ValidConversationID(value.ID) || !domain.ValidUserID(value.OwnerID) || !domain.ValidHostID(value.HostID) {
+	if !domain.ValidConversationID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
+		(value.HostID != "" && !domain.ValidHostID(value.HostID)) {
 		return domain.InvalidArgument("conversation", "conversation fields are invalid")
 	}
 	return nil
@@ -150,7 +151,7 @@ func validateConversation(value conversation.Conversation) error {
 
 func validateMessage(value conversation.Message) error {
 	if !domain.ValidMessageID(value.ID) || !domain.ValidConversationID(value.ConversationID) ||
-		!domain.ValidUserID(value.OwnerID) || !domain.ValidTaskID(value.TaskID) ||
+		!domain.ValidUserID(value.OwnerID) || (value.TaskID != "" && !domain.ValidTaskID(value.TaskID)) ||
 		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || strings.TrimSpace(value.Content) == "" {
 		return domain.InvalidArgument("message", "message fields are invalid")
 	}
@@ -159,9 +160,15 @@ func validateMessage(value conversation.Message) error {
 
 func validateTask(value task.Task) error {
 	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
-		!domain.ValidConversationID(value.ConversationID) || !domain.ValidHostID(value.HostID) ||
+		!domain.ValidConversationID(value.ConversationID) || (value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
 		value.ModelID == "" || strings.TrimSpace(value.Objective) == "" || value.Status != task.StatusQueued ||
-		(value.ApplicationID != "" && !app.ValidHostApplicationID(value.ApplicationID)) {
+		value.ExecutionLocation != "server" || value.Authorization.Version < 1 ||
+		(value.ApplicationID != "" && (value.HostID == "" || !app.ValidHostApplicationID(value.ApplicationID))) ||
+		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
+		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
+		(value.InputRevision != nil && *value.InputRevision < 0) || (len(value.ContextDigest) != 0 && len(value.ContextDigest) != 32) ||
+		value.AgentInstanceID != "" || value.AgentGeneration != 0 || value.AgentSessionID != "" ||
+		value.AgentEngineVersion != "" || value.AgentProfileVersion != "" || len(value.CheckpointDigest) != 0 {
 		return domain.InvalidArgument("task", "task fields are invalid")
 	}
 	if err := value.Budget.Validate(); err != nil {
@@ -175,6 +182,16 @@ func validateTask(value task.Task) error {
 		return domain.InvalidArgument("task", "new tasks cannot include prior usage, lease, or completion data")
 	}
 	return nil
+}
+
+func normalizeNewTask(value task.Task) task.Task {
+	if value.ExecutionLocation == "" {
+		value.ExecutionLocation = "server"
+	}
+	if value.Authorization.Version == 0 {
+		value.Authorization.Version = 1
+	}
+	return value
 }
 
 func validateInitialTaskEvent(eventType string, payload []byte) ([]byte, error) {

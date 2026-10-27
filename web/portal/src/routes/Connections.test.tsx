@@ -26,7 +26,10 @@ describe('Connections', () => {
     const create = vi.spyOn(portalApi, 'createModelConnection').mockResolvedValue(model);
     const user = userEvent.setup();
     renderPage();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByText('连接 AI 对话工具')).not.toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '添加个人模型' }));
+    expect(screen.getByRole('dialog', { name: '添加个人模型' })).toBeInTheDocument();
     await user.type(screen.getByLabelText('显示名称'), '我的模型');
     await user.type(screen.getByLabelText('模型名称'), 'morde-test');
     await user.type(screen.getByLabelText('服务地址'), 'https://models.example.test/v1');
@@ -47,5 +50,18 @@ describe('Connections', () => {
 
     await waitFor(() => expect(check).toHaveBeenCalledWith(model.id));
     expect(await screen.findByText(/检查结果：文本可用.*工具调用可用.*视觉不可用/)).toBeInTheDocument();
+  });
+
+  it('opens the model form from the Add Model button and closes it without saving', async () => {
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [model] });
+    const create = vi.spyOn(portalApi, 'createModelConnection');
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '＋ 添加模型' }));
+    expect(screen.getByRole('dialog', { name: '添加个人模型' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
   });
 });

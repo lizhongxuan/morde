@@ -16,6 +16,7 @@ type HostStore interface {
 	ListHostsByOwner(context.Context, string) ([]host.Host, error)
 	GetHostCreateReplay(context.Context, IdempotencyRecord) (host.Host, bool, error)
 	CreateHost(context.Context, CreateHostParams) (host.Host, bool, error)
+	EnsureDefaultHost(context.Context, CreateHostParams) (host.Host, bool, error)
 	FailUnattemptedCreate(context.Context, string, string) (host.Host, bool, error)
 	MarkCreateAttempt(context.Context, string) error
 	SetSandboxID(context.Context, string, host.State, *string) error
@@ -140,16 +141,13 @@ type TokenStore interface {
 	ConsumeTicket(context.Context, string) (Ticket, error)
 }
 
-type ClientAuthorizationStore interface {
-	CreateClientAuthorization(context.Context, identity.ClientAuthorization) error
-	GetClientAuthorization(context.Context, string) (identity.ClientAuthorization, error)
-	GetClientAuthorizationByCode(context.Context, []byte) (identity.ClientAuthorization, error)
-	ApproveClientAuthorization(context.Context, []byte, string, []string, string, string, time.Time) (identity.ClientInstallation, error)
-	DenyClientAuthorization(context.Context, []byte, string, string) error
-	ClaimClientAuthorization(context.Context, string, []byte, identity.Token, *identity.Token) (identity.ClientInstallation, error)
+// ClientLoginStore commits installation credentials and audit as one operation.
+type ClientLoginStore interface {
+	LoginClient(context.Context, identity.ClientInstallation, []byte, []byte, string, string, func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error)
+	IssueClientWebSession(context.Context, identity.Principal, identity.Token) error
 	ListClientInstallations(context.Context, string) ([]identity.ClientInstallation, error)
 	GetClientInstallation(context.Context, string) (identity.ClientInstallation, error)
-	RevokeClientInstallation(context.Context, string, string, string) error
+	RevokeClientInstallation(context.Context, string, string, string, audit.ActorKind) error
 }
 
 type AuditStore interface {
