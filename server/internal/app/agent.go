@@ -494,7 +494,8 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 			if verification.Status == AgentVerified {
 				verifyStep.Status = task.StepSucceeded
 				verifyStep.Summary = safeStepSummary(verification.Summary, "Independent runtime verification succeeded.")
-				if err := a.persistVerifiedArtifacts(ctx, current, verifyStep, batchScope, verification.Artifacts); err != nil {
+				verifiedArtifacts, err := a.persistVerifiedArtifacts(ctx, current, verifyStep, batchScope, verification.Artifacts)
+				if err != nil {
 					verifyStep.Status = task.StepFailed
 					verifyStep.Summary = "Verified artifact metadata could not be safely recorded."
 					return a.fail(ctx, current, verifyStep, usage, AgentErrorVerification, nil)
@@ -502,7 +503,7 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 				if batchScope != nil {
 					return a.completeBatchItem(ctx, current, *batchScope, verifyStep, usage, response.Text, map[string]any{"verification": verification.Summary, "usage_known": usage.ModelTokens != nil})
 				}
-				return a.complete(ctx, current, verifyStep, usage, response.Text, map[string]any{"verification": verification.Summary, "usage_known": usage.ModelTokens != nil}, verification.ObservationFingerprint)
+				return a.completeWithArtifacts(ctx, current, verifyStep, usage, response.Text, map[string]any{"verification": verification.Summary, "usage_known": usage.ModelTokens != nil}, verification.ObservationFingerprint, verifiedArtifacts)
 			}
 			if verification.Status == AgentVerifyUnknown {
 				verifyStep.Status = task.StepUnknown
@@ -731,6 +732,11 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 					toolStep.Summary = "The tool request is no longer authorized."
 					return a.fail(ctx, current, toolStep, usage, AgentErrorAuthorization, nil)
 				}
+				if domain.CodeOf(prepareErr) == domain.CodeWorkspaceConflict {
+					toolStep.Status = task.StepWaitingUser
+					toolStep.Summary = "The Workspace changed after this task was submitted. Submit a new task to use the updated files."
+					return a.wait(ctx, current, toolStep, usage, "workspace_input_changed", map[string]any{"tool": call.Name})
+				}
 				if domain.CodeOf(prepareErr) == domain.CodeQuotaExceeded {
 					toolStep.Status = task.StepWaitingUser
 					toolStep.Summary = "The tool call budget is exhausted."
@@ -784,14 +790,24 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 			if err != nil {
 				return AgentRunResult{}, fmt.Errorf("generate task operation ID: %w", err)
 			}
+			var inputRevision *int64
+			if preparation.WorkspaceID != "" {
+				inputRevision = current.InputRevision
+			}
 			operation, replayed, err := a.store.CreateOperation(ctx, task.Operation{
 				ID: operationID, TaskID: current.ID, Key: operationKey, RequestHash: hash[:], HostID: current.HostID,
 				WorkspaceID: preparation.WorkspaceID, BindingVersion: preparation.BindingVersion,
+				InputRevision:     inputRevision,
 				RuntimeGeneration: fence.RuntimeGeneration, RuntimeInstanceID: fence.RuntimeInstanceID,
 				ControlVersion: fence.ControlVersion, LeaseVersion: current.Lease.Version, RuntimeLeaseVersion: current.Lease.Version,
 				Status: task.OperationPrepared,
 			}, current.Lease.Owner)
 			if err != nil {
+				if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+					toolStep.Status = task.StepWaitingUser
+					toolStep.Summary = "The Workspace changed after this task was submitted. Submit a new task to use the updated files."
+					return a.wait(ctx, current, toolStep, usage, "workspace_input_changed", map[string]any{"tool": call.Name})
+				}
 				toolStep.Status = task.StepFailed
 				toolStep.Summary = "The tool operation could not be registered."
 				return a.fail(ctx, current, toolStep, usage, AgentErrorTool, nil)
@@ -884,17 +900,29 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 			executeCancel()
 			usage.ActiveSeconds = activeUsage(baseActiveSeconds, started)
 			if executeErr == nil && ctx.Err() == nil && !executeBudgetExpired && toolResult.Status == AgentToolNeedsUser {
-				message := "目标应用已失去焦点，本次没有发送输入。请切回目标应用后继续任务。"
+				reason := toolResult.WaitingReason
+				if reason == "" {
+					reason = "desktop_focus_changed"
+				}
+				var message string
+				switch reason {
+				case "workspace_input_changed":
+					message = "Workspace changed after this task was submitted. Submit a new task to use the updated files."
+				case "desktop_focus_changed":
+					message = "目标应用已失去焦点，本次没有发送输入。请切回目标应用后继续任务。"
+				default:
+					reason, message = "tool_needs_user", "The Host requires user attention before the task can continue."
+				}
 				if _, err := a.store.UpdateOperation(ctx, OperationUpdate{
 					TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 					LeaseVersion: current.Lease.Version, Status: task.OperationFailed,
-					ExternalID: boundedExternalID(toolResult.ExternalID), Result: `{"error":"desktop_focus_changed"}`,
+					ExternalID: boundedExternalID(toolResult.ExternalID), Result: `{"error":"` + reason + `"}`,
 				}); err != nil {
 					return AgentRunResult{}, err
 				}
 				toolStep.Status = task.StepWaitingUser
 				toolStep.Summary = message
-				return a.wait(ctx, current, toolStep, usage, "desktop_focus_changed", map[string]any{
+				return a.wait(ctx, current, toolStep, usage, reason, map[string]any{
 					"tool": call.Name, "operation_key": operationKey, "message": message,
 				})
 			}
@@ -1073,18 +1101,14 @@ func (a *Agent) refreshTask(ctx context.Context, claimed task.Task) (TaskDetails
 }
 
 func (a *Agent) commit(ctx context.Context, current task.Task, step task.Step, usage task.Usage, status task.Status, waitingReason, result, eventType string, detail any, pending ...*task.PendingRequest) (task.Step, error) {
-	return a.commitWithObservation(ctx, current, step, usage, status, waitingReason, result, eventType, detail, "", nil, pending...)
-}
-
-func (a *Agent) commitWithObservationFingerprint(ctx context.Context, current task.Task, step task.Step, usage task.Usage, result string, detail any, fingerprint string) (task.Step, error) {
-	return a.commitWithObservation(ctx, current, step, usage, task.StatusCompleted, "", result, "task.result", detail, fingerprint, nil)
+	return a.commitWithObservation(ctx, current, step, usage, status, waitingReason, result, eventType, detail, "", nil, nil, pending...)
 }
 
 func (a *Agent) commitModelResponse(ctx context.Context, current task.Task, step task.Step, usage task.Usage, detail any, message *conversation.Message) (task.Step, error) {
-	return a.commitWithObservation(ctx, current, step, usage, task.StatusRunning, "", current.Result, "task.step", detail, "", message)
+	return a.commitWithObservation(ctx, current, step, usage, task.StatusRunning, "", current.Result, "task.step", detail, "", message, nil)
 }
 
-func (a *Agent) commitWithObservation(ctx context.Context, current task.Task, step task.Step, usage task.Usage, status task.Status, waitingReason, result, eventType string, detail any, fingerprint string, assistantMessage *conversation.Message, pending ...*task.PendingRequest) (task.Step, error) {
+func (a *Agent) commitWithObservation(ctx context.Context, current task.Task, step task.Step, usage task.Usage, status task.Status, waitingReason, result, eventType string, detail any, fingerprint string, assistantMessage *conversation.Message, artifacts []task.Artifact, pending ...*task.PendingRequest) (task.Step, error) {
 	usage = boundedTaskUsage(current, usage)
 	detail = addAgentBatchCheckpoint(ctx, detail)
 	payload, err := agentStepEvent(step, usage, detail)
@@ -1098,7 +1122,7 @@ func (a *Agent) commitWithObservation(ctx context.Context, current task.Task, st
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		Status: status, CurrentStep: step.ID, Result: result, WaitingReason: waitingReason, Usage: usage,
 		ObservationFingerprint: fingerprint,
-		Steps:                  []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: eventType, Payload: payload},
+		Steps:                  []task.Step{step}, Artifacts: artifacts, Event: task.Event{TaskID: current.ID, Type: eventType, Payload: payload},
 		AssistantMessage: assistantMessage,
 	}
 	if len(pending) == 1 {
@@ -1226,13 +1250,18 @@ func (a *Agent) waitForClarification(ctx context.Context, current task.Task, seq
 	return AgentRunResult{TaskID: current.ID, Status: task.StatusWaitingUser, Result: current.Result, WaitingReason: "clarification_required", Usage: usage}, nil
 }
 
-func (a *Agent) complete(ctx context.Context, current task.Task, step task.Step, usage task.Usage, result string, detail any, observationFingerprint string) (AgentRunResult, error) {
+func (a *Agent) completeWithArtifacts(ctx context.Context, current task.Task, step task.Step, usage task.Usage, result string, detail any, observationFingerprint string, artifacts []task.Artifact) (AgentRunResult, error) {
 	if len(result) > agentUserVisibleResultBytes || !utf8.ValidString(result) {
 		return a.fail(ctx, current, step, usage, AgentErrorModelOutput, nil)
 	}
 	usage = boundedTaskUsage(current, usage)
-	_, err := a.commitWithObservationFingerprint(ctx, current, step, usage, result, detail, observationFingerprint)
+	_, err := a.commitWithObservation(ctx, current, step, usage, task.StatusCompleted, "", result, "task.result", detail, observationFingerprint, nil, artifacts)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			step.Status = task.StepWaitingUser
+			step.Summary = "Workspace changed after this task was submitted. Submit a new task to use the updated files."
+			return a.wait(ctx, current, step, usage, "workspace_input_changed", nil)
+		}
 		return AgentRunResult{}, err
 	}
 	return AgentRunResult{TaskID: current.ID, Status: task.StatusCompleted, Result: result, Usage: usage}, nil

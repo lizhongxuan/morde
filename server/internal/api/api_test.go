@@ -486,6 +486,52 @@ func TestAuthRequiredAndApplicationErrorsAreSafe(t *testing.T) {
 	}
 }
 
+func TestHostReleaseConflictErrorOnlyReturnsValidatedScope(t *testing.T) {
+	services := newServices()
+	router := newRouter(t, services, Options{})
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	for _, test := range []struct {
+		name, reason, key, value, wantMessage string
+	}{
+		{"workspace", "host_release_uncommitted_sync", "workspace_id", testWorkspaceID, "host Workspace changes are not settled"},
+		{"task", "host_release_unsettled_operation", "task_id", "q1234567", "host has an unsettled task operation"},
+		{"invalid ID", "host_release_uncommitted_sync", "workspace_id", testWorkspaceID + "-secret", "conflict"},
+		{"unrelated reason", "unavailable", "workspace_id", testWorkspaceID, "conflict"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			services.hosts.err = &domain.Error{Code: domain.CodeConflict, Message: "private credential",
+				Details: map[string]any{"reason": test.reason, test.key: test.value, "secret": "private credential"}}
+			response := requestWithCookieBody(router, http.MethodPost, "/api/hosts/"+testHostID+"/release",
+				`{"confirm_process_termination":true}`, cookie, "https://portal.example.test")
+			assertError(t, response, http.StatusConflict, "conflict")
+			var body struct {
+				Error struct {
+					Message string         `json:"message"`
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error.Message != test.wantMessage || body.Error.Details["secret"] != nil ||
+				strings.Contains(response.Body.String(), "private credential") || strings.Contains(response.Body.String(), "-secret") {
+				t.Fatalf("unsafe Host release conflict response: %#v", body.Error)
+			}
+			var wantReason any = test.reason
+			if test.name == "invalid ID" {
+				wantReason = nil
+			}
+			if body.Error.Details["reason"] != wantReason {
+				t.Fatalf("Host release reason = %#v; want %#v", body.Error.Details["reason"], wantReason)
+			}
+			wantID := test.name == "workspace" || test.name == "task"
+			if got := body.Error.Details[test.key]; (got == test.value) != wantID {
+				t.Fatalf("Host release scope = %#v; want validated ID=%t", got, wantID)
+			}
+		})
+	}
+}
+
 func TestDomainErrorResponsesAreMappedAndSanitized(t *testing.T) {
 	tests := []struct {
 		code    domain.ErrorCode
@@ -759,7 +805,7 @@ func TestWorkspaceCRUDUsesNewContractAndIdempotencyKey(t *testing.T) {
 	}
 }
 
-func TestRetiredTaskRoutesAreNotRegistered(t *testing.T) {
+func TestRoutesWithoutServiceAreNotRegistered(t *testing.T) {
 	router := newRouter(t, newServices(), Options{})
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	for _, route := range []struct{ method, path string }{
@@ -1392,19 +1438,20 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 }
 
 type services struct {
-	hosts           *hostServiceStub
-	hostReplica     *hostReplicaServiceStub
-	tasks           TaskService
-	conversations   ConversationService
-	verifier        verifierStub
-	auth            *authServiceStub
-	workspaceOps    *workspaceServiceStub
-	sites           *siteServiceStub
-	templates       templateReaderStub
-	tokens          *tokenServiceStub
-	admin           *adminServiceStub
-	adminWorkspaces *adminWorkspaceServiceStub
-	readiness       readinessStub
+	hosts            *hostServiceStub
+	hostReplica      *hostReplicaServiceStub
+	executionControl ExecutionControlService
+	tasks            TaskService
+	conversations    ConversationService
+	verifier         verifierStub
+	auth             *authServiceStub
+	workspaceOps     *workspaceServiceStub
+	sites            *siteServiceStub
+	templates        templateReaderStub
+	tokens           *tokenServiceStub
+	admin            *adminServiceStub
+	adminWorkspaces  *adminWorkspaceServiceStub
+	readiness        readinessStub
 }
 
 func newServices() *services {
@@ -1477,8 +1524,9 @@ func newServices() *services {
 func (s *services) deps() Deps {
 	return Deps{
 		Hosts: s.hosts, TLSAuthorizer: s.hosts, Verifier: s.verifier, Auth: s.auth,
-		HostReplicas: s.hostReplica,
-		Tasks:        s.tasks, Conversations: s.conversations,
+		HostReplicas:     s.hostReplica,
+		ExecutionControl: s.executionControl,
+		Tasks:            s.tasks, Conversations: s.conversations,
 		WorkspaceOps: s.workspaceOps, Sites: s.sites, Templates: s.templates, Tokens: s.tokens,
 		Admin: s.admin, AdminWorkspaces: s.adminWorkspaces, Readiness: s.readiness,
 	}

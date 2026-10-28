@@ -4,9 +4,8 @@ import { errorDetails } from '../app/api';
 import { useToast } from '../app/toast';
 
 const primaryLinks = [
-  { to: '/', label: '工作台', icon: '⌂', end: true },
+  { to: '/hosts', label: '云端电脑', icon: '▣', end: true },
   { to: '/assistant', label: 'AI 助手', icon: '✧' },
-  { to: '/hosts', label: '云端电脑', icon: '▣' },
   { to: '/workspaces', label: '工作区', icon: '▱' },
 ];
 
@@ -17,7 +16,7 @@ const settingLinks = [
 ];
 
 const titles: Record<string, string> = {
-  '/': '工作台', '/assistant': 'AI 助手', '/hosts': '云端电脑',
+  '/assistant': 'AI 助手', '/hosts': '云端电脑',
   '/hosts/new': '创建电脑', '/workspaces': '工作区', '/connections': '模型连接',
   '/clients': '客户端', '/apikeys': 'API Key',
   '/notifications': '通知', '/download': '下载 Morde Desktop',

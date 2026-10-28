@@ -15,6 +15,8 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 )
 
@@ -44,6 +46,9 @@ func (s *Store) BeginMCPRuntimeOperation(ctx context.Context, request app.BeginM
 	var replayed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if _, err := requireOwnerExecutionEnabled(ctx, tx, request.Key.OwnerID, &request.ExpectedExecutionEpoch); err != nil {
+			return err
+		}
+		if err := requireCurrentMCPAuthorization(ctx, tx, request.Key); err != nil {
 			return err
 		}
 		if err := lockAndValidateMCPHost(ctx, tx, request.Key.OwnerID, request.Key.HostID, request.Fence); err != nil {
@@ -165,6 +170,9 @@ WHERE owner_id=$1 AND actor_user_id=$2 AND api_key_id=$3 AND session_id=$4 AND h
 		if _, err := requireOwnerExecutionEnabled(ctx, tx, key.OwnerID, &expectedEpoch); err != nil {
 			return err
 		}
+		if err := requireCurrentMCPAuthorization(ctx, tx, key); err != nil {
+			return err
+		}
 		if err := lockAndValidateMCPHost(ctx, tx, key.OwnerID, key.HostID, fence); err != nil {
 			return err
 		}
@@ -238,6 +246,9 @@ WHERE owner_id=$1 AND actor_user_id=$2 AND api_key_id=$3 AND session_id=$4 AND h
 			return mcpRuntimeFenceChangedError()
 		}
 		if _, err := requireOwnerExecutionEnabled(ctx, tx, key.OwnerID, &operationEpoch); err != nil {
+			return err
+		}
+		if err := requireCurrentMCPAuthorization(ctx, tx, key); err != nil {
 			return err
 		}
 		if err := lockAndValidateMCPHost(ctx, tx, key.OwnerID, key.HostID, fence); err != nil {
@@ -633,6 +644,131 @@ func mcpRuntimeActorID(key app.MCPRuntimeOperationKey) string {
 		return key.ActorUserID
 	}
 	return key.OwnerID
+}
+
+func requireCurrentMCPAuthorization(ctx context.Context, tx pgx.Tx, key app.MCPRuntimeOperationKey) error {
+	actorID := mcpRuntimeActorID(key)
+	userIDs := []string{key.OwnerID}
+	if actorID != key.OwnerID {
+		userIDs = append(userIDs, actorID)
+	}
+	for _, userID := range userIDs {
+		var approved bool
+		err := tx.QueryRow(ctx, `SELECT status='approved' FROM users WHERE id=$1 FOR SHARE`, userID).Scan(&approved)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && !approved {
+			return mcpAuthorizationUnavailable()
+		}
+		if err != nil {
+			return fmt.Errorf("check mcp runtime account authorization: %w", err)
+		}
+	}
+	var kind string
+	var expiresAt time.Time
+	var notRevoked bool
+	var hostIDs, scopes []string
+	err := tx.QueryRow(ctx, `SELECT kind, expires_at, revoked_at IS NULL, host_ids, scopes
+FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, key.APIKeyID, actorID).Scan(&kind, &expiresAt, &notRevoked, &hostIDs, &scopes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return mcpAuthorizationUnavailable()
+	}
+	if err != nil {
+		return fmt.Errorf("check mcp runtime api key authorization: %w", err)
+	}
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("read database time for mcp runtime authorization: %w", err)
+	}
+	if kind != string(identity.KindAPIKey) || !notRevoked || !expiresAt.After(now) {
+		return mcpAuthorizationUnavailable()
+	}
+	if len(hostIDs) > 0 {
+		allowed := false
+		for _, hostID := range hostIDs {
+			if hostID == key.HostID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return mcpAuthorizationUnavailable()
+		}
+	}
+	if len(scopes) > 0 {
+		allowed := false
+		for _, scope := range scopes {
+			if scope == string(identity.ScopeComputerOperate) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return mcpAuthorizationUnavailable()
+		}
+	}
+	if actorID != key.OwnerID {
+		var permissions []string
+		err := tx.QueryRow(ctx, `SELECT permissions FROM host_members
+WHERE host_id=$1 AND owner_id=$2 AND user_id=$3 AND revoked_at IS NULL FOR SHARE`,
+			key.HostID, key.OwnerID, actorID).Scan(&permissions)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return mcpAuthorizationUnavailable()
+		}
+		if err != nil {
+			return fmt.Errorf("check mcp runtime host membership: %w", err)
+		}
+		allowed := false
+		for _, permission := range permissions {
+			if permission == string(host.PermissionMCPControl) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return mcpAuthorizationUnavailable()
+		}
+	}
+	return nil
+}
+
+func mcpAuthorizationUnavailable() error {
+	return domain.NewError(domain.CodeUnauthenticated, "mcp runtime authorization is no longer valid")
+}
+
+func requestMCPRuntimeCancellationsForToken(ctx context.Context, tx pgx.Tx, actorID, tokenID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE mcp_runtime_operations o
+SET cancel_requested_at=COALESCE(o.cancel_requested_at, clock_timestamp()), updated_at=clock_timestamp()
+FROM mcp_runtime_sessions s
+WHERE s.owner_id=o.owner_id AND s.actor_user_id=o.actor_user_id AND s.api_key_id=o.api_key_id
+  AND s.session_id=o.session_id AND s.host_id=o.host_id AND s.active_operation_id=o.operation_id
+  AND o.actor_user_id=$1 AND o.api_key_id=$2 AND o.status IN ('prepared','dispatched','unknown')`, actorID, tokenID); err != nil {
+		return fmt.Errorf("persist mcp runtime token cancellation requests: %w", err)
+	}
+	return nil
+}
+
+func requestMCPRuntimeCancellationsForActor(ctx context.Context, tx pgx.Tx, actorID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE mcp_runtime_operations o
+SET cancel_requested_at=COALESCE(o.cancel_requested_at, clock_timestamp()), updated_at=clock_timestamp()
+FROM mcp_runtime_sessions s
+WHERE s.owner_id=o.owner_id AND s.actor_user_id=o.actor_user_id AND s.api_key_id=o.api_key_id
+  AND s.session_id=o.session_id AND s.host_id=o.host_id AND s.active_operation_id=o.operation_id
+  AND (o.actor_user_id=$1 OR o.owner_id=$1) AND o.status IN ('prepared','dispatched','unknown')`, actorID); err != nil {
+		return fmt.Errorf("persist mcp runtime account cancellation requests: %w", err)
+	}
+	return nil
+}
+
+func requestMCPRuntimeCancellationsForHostMember(ctx context.Context, tx pgx.Tx, ownerID, actorID, hostID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE mcp_runtime_operations o
+SET cancel_requested_at=COALESCE(o.cancel_requested_at, clock_timestamp()), updated_at=clock_timestamp()
+FROM mcp_runtime_sessions s
+WHERE s.owner_id=o.owner_id AND s.actor_user_id=o.actor_user_id AND s.api_key_id=o.api_key_id
+  AND s.session_id=o.session_id AND s.host_id=o.host_id AND s.active_operation_id=o.operation_id
+  AND o.owner_id=$1 AND o.actor_user_id=$2 AND o.host_id=$3 AND o.status IN ('prepared','dispatched','unknown')`,
+		ownerID, actorID, hostID); err != nil {
+		return fmt.Errorf("persist mcp runtime host membership cancellation requests: %w", err)
+	}
+	return nil
 }
 
 func validMCPRuntimeFence(fence app.AgentHostFence) bool {

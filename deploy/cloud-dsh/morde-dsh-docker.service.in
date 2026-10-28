@@ -1,0 +1,33 @@
+# TEMPLATE ONLY: install only after rendering the daemon config for the dedicated Portal group.
+[Unit]
+Description=Morde isolated Docker Engine for cloud DSH agents
+AssertPathExists=/etc/morde/dsh-docker/daemon.json
+Requires=morde-dsh-containerd.service
+After=morde-dsh-containerd.service
+After=network-online.target local-fs.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+User=root
+Group=root
+ExecStart=/usr/bin/dockerd --config-file=/etc/morde/dsh-docker/daemon.json
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=0
+TimeoutStopSec=1min
+LimitNOFILE=infinity
+LimitNPROC=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+UMask=0027
+RuntimeDirectory=morde-dsh-docker
+RuntimeDirectoryMode=0755
+StateDirectory=morde-dsh-docker
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

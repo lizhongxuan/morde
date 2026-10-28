@@ -1,9 +1,15 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,13 +136,17 @@ WHERE task_id=$1 AND agent_generation=1`, first.Fence.TaskID); err != nil {
 	}
 	digest := sha256.Sum256([]byte("checkpoint"))
 	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints
-(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
-VALUES ($1,$2,$3,1,$4,0,0,$5,'sealed',$6,$7,1,$8)`, first.Fence.TaskID, first.Fence.OwnerID,
+(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+VALUES ($1,$2,$3,1,$4,$4,0,0,$5,'sealed',$6,$7,1,$8)`, first.Fence.TaskID, first.Fence.OwnerID,
 		first.Fence.AgentInstanceID, first.Fence.AgentSessionID, digest[:], first.Fence.EngineVersion,
 		first.Fence.ProfileVersion, first.Fence.LeaseVersion); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET checkpoint_through_seq=0,checkpoint_digest=$2 WHERE id=$1`, first.Fence.TaskID, digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_through_seq=0,checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, first.Fence.TaskID, first.Fence.AgentSessionID, digest[:]); err != nil {
 		t.Fatal(err)
 	}
 	receipt := signAgentLifecycleReceipt(t, f.key, first.Fence, f.request.SupervisorNonce)
@@ -189,6 +199,203 @@ VALUES ($1,$2,$3,1,$4,0,0,$5,'sealed',$6,$7,1,$8)`, first.Fence.TaskID, first.Fe
 	defer closeProvider()
 	if _, err := provider.DownTo(ctx, 57); err == nil {
 		t.Fatal("rollback discarded agent lifecycle evidence")
+	}
+}
+
+func TestPostgresAccountRuntimeTaskStopProofIsBoundToBothFences(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	runtimeService, err := app.NewAccountAgentRuntimeService(f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeNonce := make([]byte, 32)
+	runtimeNonce[0] = 91
+	runtimeRequest := app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, RuntimeID: "runtime-task-proof",
+		LeaseOwner: "portal-runtime-task-proof", SupervisorNonce: runtimeNonce, MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second}
+	runtime, _, err := runtimeService.Start(ctx, runtimeRequest)
+	if err != nil {
+		t.Fatalf("start account Runtime: %v", err)
+	}
+	runtime, err = runtimeService.Ready(ctx, runtime.Fence)
+	if err != nil {
+		t.Fatalf("mark account Runtime ready: %v", err)
+	}
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := app.NewAgentStopAuthenticator("supervisor-1", f.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardian, err := app.NewAgentGuardianStopAuthenticator("supervisor-1", publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskGuardian, err := app.NewAccountAgentTaskGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := app.NewAgentInstanceServiceWithGuardianStops(f.store, supervisor, agentGuardian, taskGuardian)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.request.RuntimeFence = &runtime.Fence
+	lease, replayed, err := service.Start(ctx, f.request)
+	if err != nil || replayed || lease.RuntimeFence == nil || *lease.RuntimeFence != runtime.Fence {
+		t.Fatalf("start Runtime-bound Task Agent: lease=%+v replayed=%t err=%v", lease, replayed, err)
+	}
+	guardianLeaseExpiry := lease.ExpiresAt
+	if _, err := f.store.RenewTaskLease(ctx, lease.Fence.TaskID, lease.Fence.LeaseOwner, lease.Fence.LeaseVersion, app.MaxAgentLease); err != nil {
+		t.Fatalf("renew Task lease before Guardian renewal: %v", err)
+	}
+	// Simulate the Task Agent lease reaching PostgreSQL while Guardian renewal fails.
+	lease, err = service.Renew(ctx, lease.Fence, app.MaxAgentLease)
+	if err != nil || !lease.ExpiresAt.After(guardianLeaseExpiry) {
+		t.Fatalf("renew Task Agent in DB before failed Guardian renewal: lease=%+v err=%v", lease, err)
+	}
+	taskNonce := sha256.Sum256(f.request.SupervisorNonce)
+	attestation := app.AccountAgentTaskStopAttestation{RuntimeFence: runtime.Fence, TaskFence: lease.Fence,
+		RuntimeContainerID: strings.Repeat("a", 64), ContainerPID: 7, HostPID: 70, StartTimeTick: 1234,
+		CgroupPath: "/sys/fs/cgroup/morde/account-runtime/task-agent", NonceSHA256: hex.EncodeToString(taskNonce[:]),
+		ExpiresAt: guardianLeaseExpiry, DestroyedAt: time.Now().UTC(), ProofSHA256: strings.Repeat("b", 64), Destroyed: true}
+	payload, err := app.AccountAgentTaskStopAttestationSigningPayload(attestation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestation.Signature = ed25519.Sign(privateKey, payload)
+	if replayed, err := service.ConfirmTaskStopped(ctx, attestation); err != nil || replayed {
+		t.Fatalf("confirm account Task process stop: replayed=%t err=%v", replayed, err)
+	}
+	var state string
+	var encoded, digest []byte
+	var stoppedAt time.Time
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,guardian_stop_attestation,guardian_stop_attestation_digest,stopped_at
+FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`, lease.Fence.TaskID, lease.Fence.AgentGeneration).
+		Scan(&state, &encoded, &digest, &stoppedAt); err != nil {
+		t.Fatal(err)
+	}
+	wantProof, err := json.Marshal(attestation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := sha256.Sum256(wantProof)
+	if state != "stopped" || len(encoded) == 0 || !bytes.Equal(encoded, wantProof) || !bytes.Equal(digest, wantDigest[:]) || stoppedAt.IsZero() {
+		t.Fatalf("Task stop proof was not durably stored: state=%s proof=%d digest=%d stopped_at=%v", state, len(encoded), len(digest), stoppedAt)
+	}
+	if replayed, err := service.ConfirmTaskStopped(ctx, attestation); err != nil || !replayed {
+		t.Fatalf("replay account Task stop proof: replayed=%t err=%v", replayed, err)
+	}
+	pending, err := service.ListPendingAccountAgentTaskStopAttestations(ctx, 1)
+	if err != nil || len(pending) != 1 || pending[0].TaskFence != lease.Fence || pending[0].RuntimeFence != runtime.Fence {
+		t.Fatalf("list bounded Runtime-bound Task proof outbox: pending=%+v err=%v", pending, err)
+	}
+	wrongDigest := attestation
+	wrongDigest.ProofSHA256 = strings.Repeat("d", 64)
+	wrongPayload, err := app.AccountAgentTaskStopAttestationSigningPayload(wrongDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongDigest.Signature = ed25519.Sign(privateKey, wrongPayload)
+	if _, err := service.MarkAccountAgentTaskStopAttestationAcknowledged(ctx, wrongDigest); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("acknowledged a different signed Task proof digest: %v", err)
+	}
+	if replayed, err := service.MarkAccountAgentTaskStopAttestationAcknowledged(ctx, attestation); err != nil || replayed {
+		t.Fatalf("acknowledge Task stop proof: replayed=%t err=%v", replayed, err)
+	}
+	if replayed, err := service.MarkAccountAgentTaskStopAttestationAcknowledged(ctx, attestation); err != nil || !replayed {
+		t.Fatalf("replay Task stop acknowledgement: replayed=%t err=%v", replayed, err)
+	}
+	pending, err = service.ListPendingAccountAgentTaskStopAttestations(ctx, 1)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("acknowledged Task proof remained pending: pending=%+v err=%v", pending, err)
+	}
+
+	wrongRuntime := attestation
+	wrongRuntime.RuntimeFence.RuntimeGeneration++
+	wrongPayload, err = app.AccountAgentTaskStopAttestationSigningPayload(wrongRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongRuntime.Signature = ed25519.Sign(privateKey, wrongPayload)
+	if _, err := service.ConfirmTaskStopped(ctx, wrongRuntime); domain.CodeOf(err) == "" {
+		t.Fatal("accepted a Task stop proof for another Runtime generation")
+	}
+}
+
+func TestPostgresAccountRuntimeProofStopsUnconfirmedTaskAgents(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	runtimeService, err := app.NewAccountAgentRuntimeService(f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeNonce := make([]byte, 32)
+	runtimeNonce[0] = 92
+	runtime, _, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID,
+		RuntimeID: "runtime-parent-stop-proof", LeaseOwner: "portal-parent-stop-proof", SupervisorNonce: runtimeNonce,
+		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("start account Runtime: %v", err)
+	}
+	runtime, err = runtimeService.Ready(ctx, runtime.Fence)
+	if err != nil {
+		t.Fatalf("ready account Runtime: %v", err)
+	}
+	f.request.RuntimeFence = &runtime.Fence
+	lease, replayed, err := f.service.Start(ctx, f.request)
+	if err != nil || replayed || lease.RuntimeFence == nil {
+		t.Fatalf("start Runtime-bound Agent: lease=%+v replayed=%t err=%v", lease, replayed, err)
+	}
+	control, err := f.store.GetExecutionControl(ctx, f.request.Fence.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.StopAllExecution(ctx, executionControlIdempotency(f.request.Fence.OwnerID,
+		"execution.stop_all", "runtime-parent-stop-proof"), control.Epoch); err != nil {
+		t.Fatalf("request account Runtime stop: %v", err)
+	}
+	identity, err := runtimeService.StopIdentity(ctx, f.request.Fence.OwnerID)
+	if err != nil {
+		t.Fatalf("read account Runtime stop identity: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := signedAccountRuntimeStopProof(t, identity, privateKey)
+	runtimeGuardian, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed, err := runtimeService.ConfirmGuardianStopped(ctx, proof, runtimeGuardian); err != nil || replayed {
+		t.Fatalf("confirm account Runtime destruction with active Task Agent: replayed=%t err=%v", replayed, err)
+	}
+	var state string
+	var encoded, digest []byte
+	var stoppedAt time.Time
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,guardian_stop_attestation,guardian_stop_attestation_digest,stopped_at
+FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`, lease.Fence.TaskID, lease.Fence.AgentGeneration).
+		Scan(&state, &encoded, &digest, &stoppedAt); err != nil {
+		t.Fatal(err)
+	}
+	wantEncoded, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := sha256.Sum256(wantEncoded)
+	if state != "stopped" || !bytes.Equal(encoded, wantEncoded) || !bytes.Equal(digest, wantDigest[:]) || stoppedAt.IsZero() {
+		t.Fatalf("Runtime proof did not close unconfirmed Task Agent: state=%s proof=%d digest=%d stopped_at=%v", state, len(encoded), len(digest), stoppedAt)
+	}
+	taskProofs, err := f.store.ListPendingAccountAgentTaskStopAttestations(ctx, 10)
+	if err != nil || len(taskProofs) != 0 {
+		t.Fatalf("Runtime proof was incorrectly enqueued as a Task proof: pending=%+v err=%v", taskProofs, err)
+	}
+	runtimeProofs, err := runtimeService.ListPendingAccountAgentRuntimeStopAttestations(ctx, 10, runtimeGuardian)
+	if err != nil || len(runtimeProofs) != 1 || runtimeProofs[0].Fence != runtime.Fence {
+		t.Fatalf("Runtime proof was not isolated to the Runtime outbox: pending=%+v err=%v", runtimeProofs, err)
 	}
 }
 
@@ -291,4 +498,94 @@ agent_session_id='session-1',agent_engine_version='0.2.0-rc.2',agent_profile_ver
 			t.Fatalf("Host ID accepted as agent instance: %v", err)
 		}
 	})
+}
+
+func TestPostgresAgentGuardianStopAttestationRecoveryAndGenerationFence(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	first, replayed, err := f.service.Start(ctx, f.request)
+	if err != nil || replayed || first.Fence.AgentGeneration != 1 {
+		t.Fatalf("start first Agent: lease=%+v replayed=%t err=%v", first, replayed, err)
+	}
+	supervisor, err := app.NewAgentStopAuthenticator("supervisor-1", f.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guardianPrivate := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x72}, ed25519.SeedSize))
+	guardian, err := app.NewAgentGuardianStopAuthenticator("supervisor-1", guardianPrivate.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := app.NewAgentInstanceServiceWithGuardianStop(f.store, supervisor, guardian)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.GuardianStopIdentity(ctx, first.Fence.TaskID, first.Fence.OwnerID, first.Fence.AgentInstanceID, first.Fence.AgentGeneration)
+	nonceHash := sha256.Sum256(f.request.SupervisorNonce)
+	if err != nil || identity.Fence != first.Fence || identity.NonceSHA256 != hex.EncodeToString(nonceHash[:]) {
+		t.Fatalf("load exact active Guardian recovery identity: identity=%+v err=%v", identity, err)
+	}
+	if _, err := service.GuardianStopIdentity(ctx, first.Fence.TaskID, "u9999999", first.Fence.AgentInstanceID, first.Fence.AgentGeneration); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("mismatched owner returned an active recovery identity: %v", err)
+	}
+	if _, err := service.GuardianStopIdentity(ctx, first.Fence.TaskID, first.Fence.OwnerID, first.Fence.AgentInstanceID, first.Fence.AgentGeneration+1); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("stale generation returned an active recovery identity: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	attestation := app.AgentGuardianStopAttestation{
+		Fence: identity.Fence, ContainerID: string(bytes.Repeat([]byte("a"), 64)), ContainerName: "morde-dsh-" + string(bytes.Repeat([]byte("b"), 64)),
+		NonceSHA256: identity.NonceSHA256, ExpiresAt: now.Add(-time.Second), DestroyedAt: now,
+		ProofSHA256: string(bytes.Repeat([]byte("c"), 64)), Destroyed: true,
+	}
+	payload, err := app.AgentGuardianStopAttestationSigningPayload(attestation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestation.Signature = ed25519.Sign(guardianPrivate, payload)
+	if replayed, err := service.ConfirmGuardianStopped(ctx, attestation); err != nil || replayed {
+		t.Fatalf("record Guardian stop attestation: replayed=%t err=%v", replayed, err)
+	}
+	var state string
+	var stored, storedDigest []byte
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,guardian_stop_attestation,guardian_stop_attestation_digest
+FROM task_agent_instances WHERE task_id=$1 AND agent_generation=1`, first.Fence.TaskID).Scan(&state, &stored, &storedDigest); err != nil {
+		t.Fatal(err)
+	}
+	attestationDigest := sha256.Sum256(stored)
+	if state != "stopped" || len(stored) == 0 || !bytes.Equal(storedDigest, attestationDigest[:]) || bytes.Contains(stored, f.request.SupervisorNonce) {
+		t.Fatalf("Guardian proof storage is invalid: state=%q proof=%q digest=%x", state, stored, storedDigest)
+	}
+	pendingAccountTaskProofs, err := f.store.ListPendingAccountAgentTaskStopAttestations(ctx, 10)
+	if err != nil || len(pendingAccountTaskProofs) != 0 {
+		t.Fatalf("legacy non-Runtime Guardian proof entered the account Task acknowledgement outbox: pending=%+v err=%v", pendingAccountTaskProofs, err)
+	}
+	if replayed, err := service.ConfirmGuardianStopped(ctx, attestation); err != nil || !replayed {
+		t.Fatalf("exact Guardian stop replay: replayed=%t err=%v", replayed, err)
+	}
+	changed := attestation
+	changed.DestroyedAt = changed.DestroyedAt.Add(time.Second)
+	payload, err = app.AgentGuardianStopAttestationSigningPayload(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.Signature = ed25519.Sign(guardianPrivate, payload)
+	if _, err := service.ConfirmGuardianStopped(ctx, changed); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("different proof for the same Agent generation was accepted: %v", err)
+	}
+
+	next := f.request
+	next.Fence.AgentInstanceID = "agent-2"
+	next.SupervisorNonce = bytes.Repeat([]byte{0x24}, 32)
+	second, replayed, err := f.service.Start(ctx, next)
+	if err != nil || replayed || second.Fence.AgentGeneration != 2 {
+		t.Fatalf("Guardian proof did not authorize a fenced next generation: lease=%+v replayed=%t err=%v", second, replayed, err)
+	}
+	if _, err := service.GuardianStopIdentity(ctx, first.Fence.TaskID, first.Fence.OwnerID, first.Fence.AgentInstanceID, first.Fence.AgentGeneration); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("stale stopped generation remained a current recovery identity: %v", err)
+	}
+	current, err := service.GuardianStopIdentity(ctx, second.Fence.TaskID, second.Fence.OwnerID, second.Fence.AgentInstanceID, second.Fence.AgentGeneration)
+	if err != nil || current.Fence != second.Fence {
+		t.Fatalf("current generation recovery lookup: identity=%+v err=%v", current, err)
+	}
 }

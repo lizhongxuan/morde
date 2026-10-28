@@ -1,0 +1,35 @@
+# TEMPLATE ONLY: replace @PORTAL_GROUP@ after verifying the dedicated Portal group.
+[Unit]
+Description=Morde independent cloud DSH lease Guardian
+Requires=morde-dsh-docker.service
+After=morde-dsh-docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=@PORTAL_GROUP@
+ExecStart=/usr/local/sbin/dsh-guardian --socket=/run/morde/dsh-guardian.sock --socket-mode=0660 --state-dir=/var/lib/morde/dsh-guardian --docker-socket=/run/morde-dsh-docker/docker.sock --attestation-key-file=/etc/morde/dsh-guardian/attestation.key --sweep-interval=1s
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0077
+RuntimeDirectory=morde
+RuntimeDirectoryMode=0755
+StateDirectory=morde/dsh-guardian
+StateDirectoryMode=0700
+PrivateNetwork=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+ReadOnlyPaths=/etc/morde/dsh-guardian/attestation.key
+
+[Install]
+WantedBy=multi-user.target

@@ -35,6 +35,10 @@ type MCPRuntimeStopReconciler interface {
 	ReconcileMCPRuntimeCancellations(context.Context) error
 }
 
+type WorkspaceInputRevisionReconciler interface {
+	ReconcileStaleWorkspaceTasks(context.Context) error
+}
+
 // TaskStopOperationExecutor reconciles one already-dispatched runtime
 // operation. Nonterminal statuses leave the durable operation unsettled.
 type TaskStopOperationExecutor interface {
@@ -121,6 +125,14 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 	}
 	w.started = true
 	w.runMu.Unlock()
+	if reconciler, ok := w.store.(WorkspaceInputRevisionReconciler); ok {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			w.reconcileWorkspaceInputChanges(ctx, reconciler)
+		}()
+		defer func() { <-done }()
+	}
 
 	for ctx.Err() == nil {
 		if err := w.reconcileExecutionStops(ctx); err != nil {
@@ -166,6 +178,20 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 		}
 	}
 	return ctx.Err()
+}
+
+func (w *TaskStopWorker) reconcileWorkspaceInputChanges(ctx context.Context, reconciler WorkspaceInputRevisionReconciler) {
+	for ctx.Err() == nil {
+		callCtx, cancel := context.WithTimeout(ctx, w.operationTimeout)
+		err := reconciler.ReconcileStaleWorkspaceTasks(callCtx)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			w.logger.Warn("reconcile tasks with stale Workspace inputs failed", zap.String("error_type", fmt.Sprintf("%T", err)))
+		}
+		if !waitStopWorker(ctx, w.pollInterval) {
+			return
+		}
+	}
 }
 
 func (w *TaskStopWorker) reconcileExecutionStops(ctx context.Context) error {

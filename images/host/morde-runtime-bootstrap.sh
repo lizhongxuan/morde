@@ -20,6 +20,12 @@ morde_bootstrap_runtime_credential() {
     chmod 0700 /run/morde-runtime
     install -d -o root -g root -m 0700 /var/lib/morde-runtime
     chmod 0700 /var/lib/morde-runtime
+    [ ! -L /var/lib/morde-runtime/cache ] || { echo 'Morde sync cache path is unsafe' >&2; return 1; }
+    install -d -o root -g root -m 0700 /var/lib/morde-runtime/cache
+    [ "$(stat -c '%u:%g:%a' /var/lib/morde-runtime/cache)" = '0:0:700' ] || {
+        echo 'Morde sync cache permissions are unsafe' >&2
+        return 1
+    }
     temporary="$(mktemp /run/morde-runtime/.credential.XXXXXX)"
     if ! printf '%s' "$MORDE_RUNTIME_BOOTSTRAP_KEY" > "$temporary"; then
         rm -f "$temporary"

@@ -27,7 +27,7 @@ func TestRuntimeControlStopTaskOperationRequiresExactRuntimeFenceAndHandlesNotFo
 		t.Fatal(err)
 	}
 	arguments := json.RawMessage(`{}`)
-	_, _ = session.Execute(ctx, claimed.ID, "o1234567", 1, "missing.capability", "run", arguments, "", 0)
+	_, _ = session.Execute(ctx, claimed.ID, "o1234567", 1, "missing.capability", "run", arguments, "", 0, nil)
 	runtimeOperation, err := session.GetOperation(ctx, claimed.ID, "o1234567", 1)
 	if err != nil {
 		t.Fatal(err)

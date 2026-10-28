@@ -312,6 +312,7 @@ func TestDockerCloudDSHIsolationAttachAndVerifiedStop(t *testing.T) {
 		t.Fatal("stop receipt, guard confirmation, or renewal is invalid")
 	}
 	store := &cloudDSHTestInstanceStore{}
+	store.active, store.generation = launch.Fence, launch.Fence.AgentGeneration
 	auth, _ := app.NewAgentStopAuthenticator("supervisor-test", key)
 	service, _ := app.NewAgentInstanceService(store, auth)
 	if _, err := service.ConfirmStopped(context.Background(), receipt); err != nil || store.stopped != 1 {
@@ -401,12 +402,12 @@ func TestDockerCloudDSHRejectsUnsafeConfiguration(t *testing.T) {
 	if creates != 0 {
 		t.Fatal("unsafe image created a container")
 	}
-	if _, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{DockerHost: "tcp://127.0.0.1:2375", Image: fmt.Sprint("mutable"), Guardian: &dockerDSHFakeGuardian{}}); err == nil {
+	if _, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{DockerHost: "tcp://127.0.0.1:2375", Image: "mutable", Guardian: &dockerDSHFakeGuardian{}}); err == nil {
 		t.Fatal("non-Unix endpoint and mutable image accepted")
 	}
 }
 
-func TestDockerCloudDSHDoesNotStartBeforeGuardIsArmed(t *testing.T) {
+func TestDockerCloudDSHStartFailureBeforeRunIsSafelyStopped(t *testing.T) {
 	supervisor, engine, guardian, launch, _ := newDockerDSHFixture(t)
 	guardian.mu.Lock()
 	guardian.armError = true
@@ -420,8 +421,42 @@ func TestDockerCloudDSHDoesNotStartBeforeGuardIsArmed(t *testing.T) {
 	if running {
 		t.Fatal("container is running without a guard")
 	}
-	if receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce); err == nil || len(receipt.Signature) != 0 {
-		t.Fatal("unobserved process tree produced a stop receipt")
+	receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce)
+	if err != nil || !receipt.TreeStopped || len(receipt.Signature) != sha256.Size {
+		t.Fatalf("never-started process did not produce a verified stop receipt: %#v, %v", receipt, err)
+	}
+	guardian.mu.Lock()
+	confirmations := guardian.confirmations
+	guardian.mu.Unlock()
+	if confirmations != 0 {
+		t.Fatal("guardian was asked to prove a process that was never started")
+	}
+	supervisor.AgentStopConfirmed(launch.Fence, launch.Nonce)
+	supervisor.mu.Lock()
+	active := len(supervisor.active)
+	supervisor.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("confirmed failed startup state retained: %d", active)
+	}
+}
+
+func TestDockerCloudDSHImageValidationFailureHasNoProcessToStop(t *testing.T) {
+	supervisor, engine, _, launch, _ := newDockerDSHFixture(t)
+	engine.mu.Lock()
+	engine.unsafeImageEnv = true
+	engine.mu.Unlock()
+	if _, _, err := supervisor.Start(context.Background(), launch); err == nil {
+		t.Fatal("unsafe image passed validation")
+	}
+	receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce)
+	if err != nil || !receipt.TreeStopped || len(receipt.Signature) != sha256.Size {
+		t.Fatalf("failed pre-create startup was not safely stopped: %#v, %v", receipt, err)
+	}
+	engine.mu.Lock()
+	creates := engine.creates
+	engine.mu.Unlock()
+	if creates != 0 {
+		t.Fatalf("unsafe image created %d containers", creates)
 	}
 }
 

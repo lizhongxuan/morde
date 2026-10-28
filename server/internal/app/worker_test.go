@@ -593,7 +593,8 @@ func newWorkerAppTest(t *testing.T, service *hostService) *WorkerApp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{records: make(map[workerCleanupIdentity]bool)}, workerAppTestLocks{}, 30*time.Minute)
+	worker, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{records: make(map[workerCleanupIdentity]bool)},
+		workerAppTestLocks{}, &workerTestModelCallRecovery{}, 30*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,6 +603,53 @@ func newWorkerAppTest(t *testing.T, service *hostService) *WorkerApp {
 
 type workerAppTestLocks struct{}
 
+type workerTestModelCallRecovery struct {
+	count int
+	err   error
+	calls int
+}
+
+func (s *workerTestModelCallRecovery) MarkStaleModelCallsUnknown(context.Context) (int, error) {
+	s.calls++
+	return s.count, s.err
+}
+
 func (workerAppTestLocks) TryLeaderLock(context.Context) (LeaderLock, bool, error) {
 	return nil, false, nil
+}
+
+func TestWorkerAppReconcileReportsStaleModelCalls(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	runtime, err := NewRuntime(service.hosts, service.sandboxes, deps.sealer, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := &workerTestModelCallRecovery{count: 2}
+	worker, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{records: make(map[workerCleanupIdentity]bool)},
+		workerAppTestLocks{}, recovery, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := worker.Reconcile(context.Background())
+	if err != nil || recovery.calls != 1 || actions["model_call_unknown"] != 2 {
+		t.Fatalf("Reconcile() actions=%#v calls=%d err=%v", actions, recovery.calls, err)
+	}
+}
+
+func TestWorkerAppReconcileReportsStaleModelCallRecoveryError(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	runtime, err := NewRuntime(service.hosts, service.sandboxes, deps.sealer, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := &workerTestModelCallRecovery{err: errors.New("ledger unavailable")}
+	worker, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{records: make(map[workerCleanupIdentity]bool)},
+		workerAppTestLocks{}, recovery, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := worker.Reconcile(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "mark stale model calls unknown: ledger unavailable") || recovery.calls != 1 {
+		t.Fatalf("Reconcile() actions=%#v calls=%d err=%v", actions, recovery.calls, err)
+	}
 }

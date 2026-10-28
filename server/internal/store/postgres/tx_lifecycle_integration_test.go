@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -175,6 +176,25 @@ VALUES ($1,$2,$3,$4,'model-test','active work','queued','session',60,10,1000)`, 
 	if value, changed, err := store.BeginHostRelease(ctx, created.ID, false); err != nil || changed || value.State != host.StateRunning {
 		t.Fatalf("release with active task = %#v, %t, %v", value, changed, err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='paused' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO task_operations (id, task_id, operation_key, request_hash, host_id,
+                             runtime_generation, control_version, lease_version, status)
+VALUES ('o1234567',$1,'release-unknown',$2,$3,$4,$5,1,'unknown')`,
+		taskID, make([]byte, 32), created.ID, created.RuntimeGeneration, created.ControlVersion); err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err := store.BeginHostRelease(ctx, created.ID, false)
+	var operationConflict *domain.Error
+	if changed || domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &operationConflict) ||
+		operationConflict.Details["task_id"] != taskID {
+		t.Fatalf("release with paused task's unknown operation: changed=%t err=%v", changed, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE task_operations SET status='failed' WHERE task_id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='completed', finished_at=now() WHERE id=$1`, taskID); err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +219,143 @@ VALUES ($1,$2,$3,$4,'model-test','active work','queued','session',60,10,1000)`, 
 	}
 	if active, err := store.HasActiveHostActivityLease(ctx, created.ID, created.RuntimeGeneration); err != nil || active {
 		t.Fatalf("released session remained active: active=%t, err=%v", active, err)
+	}
+}
+
+func TestBeginHostReleaseBlocksUncommittedHostWorkspaceSync(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-uncommitted")
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+	if err := store.MarkCreateAttempt(ctx, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionHost(ctx, hostValue.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, 1,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := syncTestFile("pending.txt", []byte("Host has an unpublished change"))
+	session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "release-uncommitted:create", session.ID)); err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err := store.BeginHostRelease(ctx, hostValue.ID, true)
+	var scoped *domain.Error
+	if changed || domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &scoped) ||
+		scoped.Details["workspace_id"] != workspaceValue.ID {
+		t.Fatalf("release during Host upload: changed=%t err=%v", changed, err)
+	}
+	if current, getErr := store.GetHost(ctx, hostValue.ID); getErr != nil || current.State != host.StateRunning {
+		t.Fatalf("Host after rejected upload release = %#v, %v", current, getErr)
+	}
+	committed, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "release-uncommitted:commit", session.ID))
+	if err != nil || committed.State != workspace.SyncCompleted {
+		t.Fatalf("commit Host upload = %#v, %v", committed, err)
+	}
+	updatedWorkspace, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletion := newTestSyncSession(t, updatedWorkspace, owner.ID, nil, nil, []string{file.Path})
+	deletion.ReplicaID = session.ReplicaID
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, deletion, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "release-uncommitted:delete", deletion.ID)); err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err = store.BeginHostRelease(ctx, hostValue.ID, true)
+	if changed || domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &scoped) ||
+		scoped.Details["workspace_id"] != workspaceValue.ID {
+		t.Fatalf("release during Host deletion sync: changed=%t err=%v", changed, err)
+	}
+	if deleted, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, deletion.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "release-uncommitted:delete-commit", deletion.ID)); err != nil || deleted.State != workspace.SyncCompleted {
+		t.Fatalf("commit Host deletion = %#v, %v", deleted, err)
+	}
+	if _, err := store.SetWorkspaceBindingSyncStatus(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingSyncConflict, []string{file.Path}); err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err = store.BeginHostRelease(ctx, hostValue.ID, true)
+	if changed || domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &scoped) ||
+		scoped.Details["workspace_id"] != workspaceValue.ID {
+		t.Fatalf("release during Host sync conflict: changed=%t err=%v", changed, err)
+	}
+	if _, err := store.SetWorkspaceBindingSyncStatus(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingSyncHealthy, nil); err != nil {
+		t.Fatal(err)
+	}
+	stopping, changed, err := store.BeginHostRelease(ctx, hostValue.ID, true)
+	if err != nil || !changed || stopping.State != host.StateStopping {
+		t.Fatalf("release after Host upload and conflict settle = %#v, changed=%t, err=%v", stopping, changed, err)
+	}
+}
+
+func TestHostSyncSessionCreationSerializesWithRelease(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-sync-race")
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+	if err := store.MarkCreateAttempt(ctx, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionHost(ctx, hostValue.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, 1,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := syncTestFile("raced.txt", []byte("save before release"))
+	session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+	blocks := syncTestBlocks(session.UploadFiles)
+	if err := seedTestStoredWorkspaceBlockUsage(ctx, store, workspaceValue.ID, blocks[0].Chunk); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	var sessionErr, releaseErr error
+	var released host.Host
+	var changed bool
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		<-start
+		_, _, sessionErr = store.CreateWorkspaceSyncSession(ctx, session, blocks, nil, syncTestOwnerQuotaBytes,
+			syncTestIdempotency(owner.ID, "workspace.sync.create", "release-sync-race:create", session.ID))
+	}()
+	go func() {
+		defer wait.Done()
+		<-start
+		released, changed, releaseErr = store.BeginHostRelease(ctx, hostValue.ID, true)
+	}()
+	close(start)
+	wait.Wait()
+	switch {
+	case sessionErr == nil:
+		if changed || domain.CodeOf(releaseErr) != domain.CodeConflict {
+			t.Fatalf("Host released after upload session was created: Host=%#v changed=%t err=%v", released, changed, releaseErr)
+		}
+		current, err := store.GetHost(ctx, hostValue.ID)
+		if err != nil || current.State != host.StateRunning {
+			t.Fatalf("Host after upload won release race = %#v, %v", current, err)
+		}
+	case releaseErr == nil && changed:
+		if released.State != host.StateStopping || domain.CodeOf(sessionErr) != domain.CodeInvalidState {
+			t.Fatalf("upload session created after release: Host=%#v session err=%v", released, sessionErr)
+		}
+	default:
+		t.Fatalf("unexpected release/upload race: Host=%#v changed=%t release err=%v session err=%v", released, changed, releaseErr, sessionErr)
 	}
 }
 

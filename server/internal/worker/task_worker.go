@@ -17,6 +17,7 @@ import (
 
 type TaskLeaseStore interface {
 	ClaimNextTask(context.Context, string, time.Duration) (task.Task, bool, error)
+	ClaimNextTaskWithOwnerLimit(context.Context, string, time.Duration, int) (task.Task, bool, error)
 	RenewTaskLease(context.Context, string, string, int64, time.Duration) (task.Task, error)
 }
 
@@ -27,24 +28,30 @@ type TaskExecutor interface {
 var errTaskExecutorPanicked = errors.New("task executor panicked")
 
 type TaskWorkerOptions struct {
-	Store         TaskLeaseStore
-	Executor      TaskExecutor
-	WorkerID      string
-	LeaseDuration time.Duration
-	PollInterval  time.Duration
-	Logger        *zap.Logger
+	Store                      TaskLeaseStore
+	Executor                   TaskExecutor
+	Lifecycle                  func(context.Context) error
+	WorkerID                   string
+	LeaseDuration              time.Duration
+	PollInterval               time.Duration
+	MaxConcurrentTasks         int
+	MaxConcurrentTasksPerOwner int
+	Logger                     *zap.Logger
 }
 
 type TaskWorker struct {
-	store         TaskLeaseStore
-	executor      TaskExecutor
-	workerID      string
-	leaseDuration time.Duration
-	pollInterval  time.Duration
-	renewInterval time.Duration
-	logger        *zap.Logger
-	runMu         sync.Mutex
-	started       bool
+	store                      TaskLeaseStore
+	executor                   TaskExecutor
+	lifecycle                  func(context.Context) error
+	workerID                   string
+	leaseDuration              time.Duration
+	pollInterval               time.Duration
+	renewInterval              time.Duration
+	maxConcurrentTasks         int
+	maxConcurrentTasksPerOwner int
+	logger                     *zap.Logger
+	runMu                      sync.Mutex
+	started                    bool
 }
 
 func NewTaskWorker(options TaskWorkerOptions) (*TaskWorker, error) {
@@ -61,6 +68,15 @@ func NewTaskWorker(options TaskWorkerOptions) (*TaskWorker, error) {
 	if options.PollInterval <= 0 {
 		return nil, errors.New("task worker poll interval must be positive")
 	}
+	if options.MaxConcurrentTasks < 0 || options.MaxConcurrentTasksPerOwner < 0 {
+		return nil, errors.New("task worker concurrency limits cannot be negative")
+	}
+	if options.MaxConcurrentTasks == 0 {
+		options.MaxConcurrentTasks = 1
+	}
+	if options.MaxConcurrentTasksPerOwner == 0 {
+		options.MaxConcurrentTasksPerOwner = 1
+	}
 	logger := options.Logger
 	if logger == nil {
 		logger = zap.NewNop()
@@ -70,9 +86,10 @@ func NewTaskWorker(options TaskWorkerOptions) (*TaskWorker, error) {
 		renewInterval = time.Millisecond
 	}
 	return &TaskWorker{
-		store: options.Store, executor: options.Executor, workerID: options.WorkerID,
+		store: options.Store, executor: options.Executor, lifecycle: options.Lifecycle, workerID: options.WorkerID,
 		leaseDuration: options.LeaseDuration, pollInterval: options.PollInterval,
-		renewInterval: renewInterval, logger: logger,
+		renewInterval: renewInterval, maxConcurrentTasks: options.MaxConcurrentTasks,
+		maxConcurrentTasksPerOwner: options.MaxConcurrentTasksPerOwner, logger: logger,
 	}, nil
 }
 
@@ -89,8 +106,41 @@ func (w *TaskWorker) Run(ctx context.Context) error {
 	w.started = true
 	w.runMu.Unlock()
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var lifecycleDone chan error
+	if w.lifecycle != nil {
+		lifecycleDone = make(chan error, 1)
+		go func() {
+			defer cancel()
+			lifecycleDone <- w.lifecycle(runCtx)
+		}()
+	}
+	var workers sync.WaitGroup
+	workers.Add(w.maxConcurrentTasks)
+	for range w.maxConcurrentTasks {
+		go func() {
+			defer workers.Done()
+			w.runClaimLoop(runCtx)
+		}()
+	}
+	workers.Wait()
+	if lifecycleDone != nil {
+		lifecycleErr := <-lifecycleDone
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if lifecycleErr == nil {
+			return errors.New("task worker lifecycle stopped unexpectedly")
+		}
+		return fmt.Errorf("task worker lifecycle: %w", lifecycleErr)
+	}
+	return ctx.Err()
+}
+
+func (w *TaskWorker) runClaimLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		claimed, ok, err := w.store.ClaimNextTask(ctx, w.workerID, w.leaseDuration)
+		claimed, ok, err := w.store.ClaimNextTaskWithOwnerLimit(ctx, w.workerID, w.leaseDuration, w.maxConcurrentTasksPerOwner)
 		if ctx.Err() != nil {
 			break
 		}
@@ -123,7 +173,6 @@ func (w *TaskWorker) Run(ctx context.Context) error {
 			}
 		}
 	}
-	return ctx.Err()
 }
 
 func (w *TaskWorker) validClaim(value task.Task) bool {

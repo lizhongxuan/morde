@@ -14,7 +14,10 @@ import (
 
 func TestAgentFileWriteEvidenceRequiresSuccessfulMatchingCallOutputPair(t *testing.T) {
 	content := "hello, 世界"
-	output := fmt.Sprintf(`{"path":"notes/today.txt","bytes_written":%d}`, len([]byte(content)))
+	digest := sha256.Sum256([]byte(content))
+	output := fmt.Sprintf(`{"path":"notes/today.txt","bytes_written":%d,"sha256":"%x"}`, len([]byte(content)), digest[:])
+	wrongDigest := sha256.Sum256([]byte("different content"))
+	wrongOutput := fmt.Sprintf(`{"path":"notes/today.txt","bytes_written":%d,"sha256":"%x"}`, len([]byte(content)), wrongDigest[:])
 	inputs := []ModelInput{
 		{Type: "function_call", CallID: "write-1", Name: runtimeToolFileWrite, Arguments: `{"workspace_id":"w1234567","path":"notes/today.txt","content":"hello, 世界"}`},
 		{Type: "function_call_output", CallID: "write-1", Output: output},
@@ -23,7 +26,6 @@ func TestAgentFileWriteEvidenceRequiresSuccessfulMatchingCallOutputPair(t *testi
 	if err != nil || len(evidence) != 1 {
 		t.Fatalf("agentFileWriteEvidence() = %#v, %v; want one verified candidate", evidence, err)
 	}
-	digest := sha256.Sum256([]byte(content))
 	if evidence[0].Path != "notes/today.txt" || evidence[0].Size != int64(len([]byte(content))) || evidence[0].SHA256 != fmt.Sprintf("%x", digest[:]) ||
 		evidence[0].WorkspaceID != "w1234567" || evidence[0].OperationKey != agentOperationKey("write-1") || len(evidence[0].RequestHash) != sha256.Size {
 		t.Fatalf("evidence = %#v; want path, UTF-8 byte size, and SHA-256 from the file_write arguments", evidence[0])
@@ -44,6 +46,14 @@ func TestAgentFileWriteEvidenceRequiresSuccessfulMatchingCallOutputPair(t *testi
 				{Type: "function_call", CallID: "write-1", Name: runtimeToolFileWrite,
 					Arguments: `{"workspace_id":"w1234567","path":"notes/today.txt","content":"hello, 世界"}`},
 				{Type: "function_call_output", CallID: "write-1", Output: `{"path":"notes/today.txt","bytes_written":1}`},
+			},
+		},
+		{
+			name: "mismatched result digest",
+			inputs: []ModelInput{
+				{Type: "function_call", CallID: "write-1", Name: runtimeToolFileWrite,
+					Arguments: `{"workspace_id":"w1234567","path":"notes/today.txt","content":"hello, 世界"}`},
+				{Type: "function_call_output", CallID: "write-1", Output: wrongOutput},
 			},
 		},
 		{

@@ -43,6 +43,24 @@ func TestCapabilitiesArePublicAndOnlyAdvertiseAssembledServices(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesAdvertiseCloudTasksOnlyWithExecutionControl(t *testing.T) {
+	services := newServices()
+	deps := services.deps()
+	deps.Tasks = &taskServiceStub{}
+	deps.ExecutionControl = &executionControlServiceStub{}
+	options := validOptions()
+	options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	router, err := New(deps, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
+	var result capabilitiesResponse
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || !slices.Contains(result.SupportedFeatures, "cloud_tasks") {
+		t.Fatalf("enabled task capabilities = %d %s; want cloud_tasks", response.Code, response.Body)
+	}
+}
+
 func TestCapabilitiesFailClosedWithoutValidInstanceIdentity(t *testing.T) {
 	for _, id := range []string{"", "cloudhost", "00000000-0000-0000-0000-000000000000"} {
 		t.Run(id, func(t *testing.T) {

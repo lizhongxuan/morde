@@ -161,6 +161,8 @@ docker exec --env MORDE_RUNTIME_BOOTSTRAP_KEY= --env MORDE_HOST_REPLICA_KEY= "$c
   test "$(stat -c %u:%g:%a "$replica_file")" = 0:0:400
   test "$(cat "$replica_file")" = "$2"
   test "$(stat -c %u:%g:%a /var/lib/morde-runtime)" = 0:0:700
+  test "$(stat -c %u:%g:%a /var/lib/morde-runtime/cache)" = 0:0:700
+  printf persistent-sync-baseline > /var/lib/morde-runtime/cache/smoke-baseline
   printf persistent-runtime-data > /var/lib/morde-runtime/smoke-marker
   for process_env in /proc/[0-9]*/environ; do
     process_uid="$(stat -c %u "${process_env%/environ}" 2>/dev/null || true)"
@@ -179,6 +181,14 @@ docker exec --user 0:0 "$container" sh -c '
   test "$(stat -c %u:%g:%a /home/gem/workspace)" = 0:1000:2770
   printf runtime-created > /home/gem/workspace/runtime-created-by-root
   chmod 0660 /home/gem/workspace/runtime-created-by-root
+'
+docker exec "$container" sh -c '
+  for process_env in /proc/[0-9]*/environ; do
+    if tr "\000" "\n" 2>/dev/null <"$process_env" | grep -qx "XDG_CACHE_HOME=/var/lib/morde-runtime/cache" 2>/dev/null; then
+      exit 0
+    fi
+  done
+  exit 1
 '
 docker exec --user 1000:1000 "$container" sh -c '
   printf "%s" "-gem-edit" >> /home/gem/workspace/runtime-created-by-root
@@ -250,6 +260,7 @@ docker exec --user 1000:1000 "$container" sh -c '
 docker exec --env MORDE_RUNTIME_BOOTSTRAP_KEY= --env MORDE_HOST_REPLICA_KEY= "$container" sh -c '
   test "$(stat -c %u:%g:%a /var/lib/morde-runtime)" = 0:0:700
   test "$(cat /var/lib/morde-runtime/smoke-marker)" = persistent-runtime-data
+  test "$(cat /var/lib/morde-runtime/cache/smoke-baseline)" = persistent-sync-baseline
 '
 docker exec --env MORDE_RUNTIME_BOOTSTRAP_KEY= --env MORDE_HOST_REPLICA_KEY= "$container" sh -c '
   key_file=/run/morde-runtime/credential

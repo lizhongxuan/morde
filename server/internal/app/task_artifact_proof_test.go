@@ -103,6 +103,16 @@ func TestVerifyCommittedArtifactReadsPinnedRevision(t *testing.T) {
 	}
 }
 
+func TestVerifyLatestCommittedArtifactBindsCurrentRevision(t *testing.T) {
+	service, _, _, claim := proofFixture(t)
+	claim.Revision = 0
+	proof, err := service.VerifyLatestCommittedArtifact(context.Background(), claim.OwnerID, claim.WorkspaceID,
+		claim.Path, claim.SizeBytes, claim.SHA256)
+	if err != nil || proof.Revision != 4 || proof.Path != claim.Path || proof.SHA256 != claim.SHA256 {
+		t.Fatalf("latest committed artifact = %#v, err=%v; want revision 4", proof, err)
+	}
+}
+
 func TestVerifyCommittedArtifactRevisionZeroIsNotLatest(t *testing.T) {
 	service, store, _, claim := proofFixture(t)
 	old := syncServiceFile(claim.Path, nil)
@@ -274,7 +284,8 @@ func TestVerifyCommittedArtifactRejectsDeletedWorkspace(t *testing.T) {
 	if _, err := service.VerifyCommittedArtifact(context.Background(), claim); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("deleted workspace produced proof: %v", err)
 	}
-	if _, err := service.VerifyCommittedArtifact(nil, claim); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	var nilContext context.Context
+	if _, err := service.VerifyCommittedArtifact(nilContext, claim); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("nil context error = %v", err)
 	}
 }

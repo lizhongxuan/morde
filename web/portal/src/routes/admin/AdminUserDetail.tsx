@@ -11,7 +11,7 @@ type UnknownModelCall = Awaited<ReturnType<typeof portalApi.adminUnknownModelUsa
 type ModelAccountBudget = Awaited<ReturnType<typeof portalApi.adminModelAccountBudget>>;
 
 const modelUsageSourceLabel: Record<UnknownModelCall['source'], string> = {
-  client: '客户端', chat: '即时对话', task: '云端任务', probe: '连接检查',
+  client: '客户端', chat: '对话', task: '云端任务', probe: '连接检查',
 };
 
 function UserResourceEditor({ user }: { user: AdminUser }) {

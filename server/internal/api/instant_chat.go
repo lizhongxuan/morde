@@ -125,4 +125,4 @@ func (h *api) sendInstantChatMessage(c *gin.Context) {
 	})
 }
 
-var _ InstantChatService = (*app.InstantChatService)(nil)
+var _ InstantChatService = (*app.TaskChatCompatibilityService)(nil)

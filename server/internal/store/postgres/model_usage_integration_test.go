@@ -4,12 +4,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 
+	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -116,6 +123,80 @@ func TestPostgresModelProbeUnknownUsageIsNotMarkedChecked(t *testing.T) {
 	var state string
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM model_call_ledger WHERE owner_id=$1 AND source='probe'`, principal.UserID).Scan(&state); err != nil || state != "unknown" {
 		t.Fatalf("unknown probe ledger = %q, %v", state, err)
+	}
+}
+
+func TestPostgresModelGatewayHTTPSettlesUsage(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	portalLogin, err := credentials.Login(ctx, owner.Name, "client-password-123", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	portal, err := credentials.VerifySession(ctx, portalLogin.Credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &meteredProbeModel{usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}}
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := app.NewModelConnectionService(store, sealer, model, []string{"model.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := models.Create(ctx, portal, app.ModelConnectionCommand{
+		Name: "integration model", BaseURL: "https://model.example/v1", ModelName: "test-model", APIKey: "synthetic-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET capability_text=true,checked_at=now() WHERE id=$1`, connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent) VALUES ($1,50000,1)`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := app.NewModelGatewayService(store, models, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientLogin, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "model-http-login-01", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := api.New(api.Deps{
+		Hosts: unusedWorkspaceSyncHostService{}, TLSAuthorizer: unusedWorkspaceSyncTLSAuthorizer{},
+		Verifier: credentials, Auth: clientLoginHTTPAuth{credentials: credentials}, ClientLogin: clients,
+		ModelGateway: gateway, Admin: clientLoginHTTPAdmin{}, MCPDisabled: true,
+	}, api.Options{
+		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 1 << 20, MCPMaxBodyBytes: 1 << 20,
+		SessionTTL: 12 * time.Hour, HostScheme: "https", PortalDomain: "portal.example.test",
+		HostSuffix: "example-hosts.test", PreviewPortMin: 1024,
+		PortalFiles: fstest.MapFS{"admin/index.html": &fstest.MapFile{Data: []byte("<html>admin</html>")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"` + connection.ID + `","messages":[{"role":"user","content":"run metered model"}],"max_tokens":100}`
+	request := httptest.NewRequest(http.MethodPost, "/api/model/v1/chat/completions", strings.NewReader(body))
+	request.Host = "portal.example.test"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+clientLogin.ClientCredential)
+	request.Header.Set("Idempotency-Key", "model-gateway-http-001")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"content":"OK"`) ||
+		!strings.Contains(response.Body.String(), `"prompt_tokens":8`) || !strings.Contains(response.Body.String(), `"completion_tokens":4`) || model.calls != 1 {
+		t.Fatalf("model gateway response = %d %s, provider calls=%d", response.Code, response.Body, model.calls)
+	}
+	var state, providerModel string
+	var inputTokens, outputTokens int64
+	if err := store.pool.QueryRow(ctx, `SELECT state,provider_model,input_tokens,output_tokens FROM model_call_ledger
+ WHERE owner_id=$1 AND source='client' AND call_id=$2`, owner.ID, "model-gateway-http-001").Scan(&state, &providerModel, &inputTokens, &outputTokens); err != nil ||
+		state != "settled" || providerModel != "test-model" || inputTokens != 8 || outputTokens != 4 {
+		t.Fatalf("metered model call = %q %q %d/%d, %v", state, providerModel, inputTokens, outputTokens, err)
 	}
 }
 
@@ -287,9 +368,14 @@ func TestPostgresTaskModelReservationRequiresCurrentFenceAndCommittedCheckpoint(
  auth_client_installation_id,budget_active_seconds,budget_tool_calls,budget_model_tokens,usage_model_tokens,
  lease_owner,lease_version,lease_expires_at,execution_location,auth_version,auth_expires_at,agent_instance_id,
  agent_generation,agent_session_id,agent_engine_version,agent_profile_version,checkpoint_through_seq,checkpoint_digest)
- VALUES ('q1234567',$1,'c1234567','p1234567','test','running','client',$2,$3,600,10,500,0,
+ VALUES ('q1234567',$1,'c1234567','p1234567','test','running','client',$2,$3,600,10,125,0,
  'worker-1',3,clock_timestamp()+interval '1 hour','server',7,clock_timestamp()+interval '1 hour',
  'agent-1',2,'session-1','engine','profile',0,$4)`, principal.UserID, principal.TokenID, principal.ClientInstallationID, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.pool.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,checkpoint_through_seq,checkpoint_digest)
+VALUES ('q1234567',$1,'session-1',0,$2)`, principal.UserID, digest[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,9 +398,9 @@ VALUES ('q1234567',$1,'agent-1',2,'session-1','engine','profile','supervisor-1',
 	if err := store.ReserveModelCall(ctx, reservation); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("missing checkpoint = %v", err)
 	}
-	_, err = store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,
+	_, err = store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,
  from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
- VALUES ('q1234567',$1,'agent-1',2,'session-1',0,0,$2,decode('01','hex'),'engine','profile',7,3)`, principal.UserID, digest[:])
+ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',0,0,$2,decode('01','hex'),'engine','profile',7,3)`, principal.UserID, digest[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,6 +425,69 @@ VALUES ('q1234567',$1,'agent-1',2,'session-1','engine','profile','supervisor-1',
 	var used int64
 	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id='q1234567'`).Scan(&used); err != nil || used != 18 {
 		t.Fatalf("task charged %d tokens, %v", used, err)
+	}
+	childStepID := mustID(t, domain.NewStepID)
+	childSessionID := "child_" + childStepID
+	childDigest := sha256.Sum256([]byte("child checkpoint"))
+	requestHash := sha256.Sum256([]byte("child request"))
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_steps(id,task_id,sequence,kind,status,title,summary)
+VALUES ($1,'q1234567',1,'subagent','running','Child model work','Running')`, childStepID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_sessions
+(task_id,owner_id,session_id,parent_session_id,step_id,spawn_key,request_hash,checkpoint_through_seq,checkpoint_digest)
+VALUES ('q1234567',$1,$2,'session-1',$3,'spawn_child_1',$4,0,$5)`, principal.UserID, childSessionID, childStepID, requestHash[:], childDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,
+agent_session_id,agent_root_session_id,from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engine','profile',7,3)`,
+		principal.UserID, childSessionID, childDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	childFence := fence
+	childFence.AgentSessionID, childFence.AgentRootSessionID = childSessionID, "session-1"
+	childReservation := reservation
+	childReservation.Task = &childFence
+	childReservation.CallID, err = app.DSHModelCallID(childFence.TaskID, childFence.AgentSessionID, childFence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childReservation.ReservedTokens = 108
+	if err := store.ReserveModelCall(ctx, childReservation); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("child exceeded the Task budget remaining after the root call: %v", err)
+	}
+	childReservation.ReservedTokens = reservation.ReservedTokens
+	if err := store.ReserveModelCall(ctx, childReservation); err != nil {
+		t.Fatalf("reserve model call for committed child checkpoint: %v", err)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: childReservation.Source, OwnerID: principal.UserID,
+		CallID: childReservation.CallID, Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	wrongChildHead := childFence
+	wrongChildHead.ThroughSequence = 1
+	childReservation.Task = &wrongChildHead
+	childReservation.CallID, err = app.DSHModelCallID(wrongChildHead.TaskID, wrongChildHead.AgentSessionID, wrongChildHead.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveModelCall(ctx, childReservation); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("child model call used an uncommitted checkpoint head: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_steps SET status='succeeded' WHERE task_id='q1234567' AND id=$1`, childStepID); err != nil {
+		t.Fatal(err)
+	}
+	childReservation.Task = &childFence
+	childReservation.CallID, err = app.DSHModelCallID(childFence.TaskID, childFence.AgentSessionID, childFence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveModelCall(ctx, childReservation); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("settled child Session still authorized a model call: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_steps SET status='running' WHERE task_id='q1234567' AND id=$1`, childStepID); err != nil {
+		t.Fatal(err)
 	}
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	host := createTestHost(t, ctx, store, principal.UserID, capacity, nil)

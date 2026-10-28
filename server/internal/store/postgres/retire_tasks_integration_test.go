@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/execution"
 	"morde/server/internal/domain/host"
@@ -119,6 +120,41 @@ WHERE task_id=$1 AND action='cancel' AND status='pending') FROM tasks WHERE id=$
 	}
 	if !drained {
 		t.Fatal("retired tasks, stop requests, and owner gate did not drain")
+	}
+}
+
+func TestRetireTaskExecutionWaitsForAccountRuntimeGuardianProof(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	runtimeService, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, 32)
+	nonce[0] = 19
+	runtime, _, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID,
+		RuntimeID: "retire-runtime-proof", LeaseOwner: "retire-runtime-worker", SupervisorNonce: nonce,
+		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("start account Runtime: %v", err)
+	}
+	if _, err := runtimeService.Ready(ctx, runtime.Fence); err != nil {
+		t.Fatalf("ready account Runtime: %v", err)
+	}
+	if err := store.RetireTaskExecution(ctx); err != nil {
+		t.Fatalf("retire task execution: %v", err)
+	}
+	control, err := store.GetExecutionControl(ctx, owner.ID)
+	if err != nil || control.State != execution.StateStopping || control.Runtime.State != execution.RuntimeStateStopping {
+		t.Fatalf("retirement finalized before Runtime proof: control=%#v err=%v", control, err)
+	}
+	if err := store.ReconcileStoppingExecution(ctx); err != nil {
+		t.Fatal(err)
+	}
+	control, err = store.GetExecutionControl(ctx, owner.ID)
+	if err != nil || control.State != execution.StateStopping || control.Runtime.State != execution.RuntimeStateStopping {
+		t.Fatalf("reconcile disabled owner before Runtime proof: control=%#v err=%v", control, err)
 	}
 }
 

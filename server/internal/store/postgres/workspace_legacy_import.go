@@ -84,6 +84,15 @@ FOR UPDATE OF v, w`, value.WorkspaceID).Scan(
 		if active {
 			return domain.NewError(domain.CodeWorkspaceBusy, "workspace has an active sync session")
 		}
+		var activeTaskOperation bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')
+)`, value.WorkspaceID).Scan(&activeTaskOperation); err != nil {
+			return fmt.Errorf("check admitted task operations before legacy Workspace import: %w", err)
+		}
+		if activeTaskOperation {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an admitted task operation; retry import after it settles")
+		}
 		encodedFiles, err := json.Marshal(files)
 		if err != nil {
 			return fmt.Errorf("encode legacy workspace files for block usage check: %w", err)

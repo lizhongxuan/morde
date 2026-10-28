@@ -36,7 +36,7 @@ const (
 	maxSchemaBytes   = 64 << 10
 	maxModelIDBytes  = 256
 	maxAPIKeyBytes   = 4096
-	requestTimeout   = 45 * time.Second
+	requestTimeout   = app.ModelCallTimeout
 )
 
 var (

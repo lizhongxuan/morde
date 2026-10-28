@@ -39,11 +39,21 @@ VALUES ($1,$2,$3,'legacy-key',$4,$5,'old question','old answer')`, exchangeID, c
 	if _, err := provider.UpTo(ctx, 54); err != nil {
 		t.Fatalf("repeat migration: %v", err)
 	}
-	chat, exchange, err := store.GetInstantChatExchangeByKey(ctx, owner.ID, "legacy-key")
-	if err != nil || chat.ID != conversationID || exchange.ID != exchangeID || exchange.ModelID != "p1234567" ||
-		exchange.UserMessageID != userMessageID || exchange.AssistantMessageID != assistantMessageID ||
-		exchange.UserContent != "old question" || exchange.AssistantContent != "old answer" {
-		t.Fatalf("migrated exchange = %#v / %#v, err=%v", chat, exchange, err)
+	var archivedID, archivedConversationID, archivedOwnerID, archivedKey string
+	var archivedUserID, archivedAssistantID, archivedUserContent, archivedAssistantContent string
+	if err := pool.QueryRow(ctx, `SELECT id, conversation_id, owner_id, request_key, user_message_id,
+user_content, assistant_message_id, assistant_content FROM retired_instant_chat_exchanges WHERE owner_id=$1 AND request_key=$2`,
+		owner.ID, "legacy-key").Scan(&archivedID, &archivedConversationID, &archivedOwnerID, &archivedKey,
+		&archivedUserID, &archivedUserContent, &archivedAssistantID, &archivedAssistantContent); err != nil ||
+		archivedID != exchangeID || archivedConversationID != conversationID || archivedOwnerID != owner.ID ||
+		archivedKey != "legacy-key" || archivedUserID != userMessageID || archivedAssistantID != assistantMessageID ||
+		archivedUserContent != "old question" || archivedAssistantContent != "old answer" {
+		t.Fatalf("migrated legacy exchange = %q/%q/%q/%q %q/%q %q/%q, err=%v", archivedID, archivedConversationID,
+			archivedOwnerID, archivedKey, archivedUserID, archivedUserContent, archivedAssistantID, archivedAssistantContent, err)
+	}
+	chat, err := store.GetConversation(ctx, conversationID, owner.ID)
+	if err != nil || chat.ID != conversationID || chat.ModelID != "p1234567" || chat.Title != "old title" {
+		t.Fatalf("migrated canonical conversation = %#v, err=%v", chat, err)
 	}
 	firstPage, err := store.ListMessages(ctx, owner.ID, conversationID, app.PageRequest{Limit: 1})
 	if err != nil || len(firstPage.Items) != 1 || firstPage.Items[0].ID != assistantMessageID || firstPage.NextCursor == "" {

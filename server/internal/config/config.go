@@ -18,6 +18,8 @@ import (
 	templatedomain "morde/server/internal/domain/template"
 )
 
+const maxCloudDSHConcurrentPerOwner = 16
+
 type Config struct {
 	Instance         string           `yaml:"instance"`
 	Listen           Listen           `yaml:"listen"`
@@ -34,6 +36,7 @@ type Config struct {
 	WorkspaceStorage WorkspaceStorage `yaml:"workspace_storage"`
 	SiteStorage      SiteStorage      `yaml:"site_storage"`
 	Models           Models           `yaml:"models"`
+	CloudDSH         CloudDSH         `yaml:"cloud_dsh"`
 	Gateway          Gateway          `yaml:"gateway"`
 	MCP              MCP              `yaml:"mcp"`
 	PortalWeb        PortalWeb        `yaml:"portal_web"`
@@ -135,6 +138,20 @@ type Models struct {
 	AllowedHosts []string `yaml:"allowed_hosts"`
 }
 
+type CloudDSH struct {
+	Enabled               bool   `yaml:"enabled"`
+	MaxConcurrentTasks    int    `yaml:"max_concurrent_tasks"`
+	MaxConcurrentPerOwner int    `yaml:"max_concurrent_tasks_per_owner"`
+	DockerHost            string `yaml:"docker_host"`
+	Image                 string `yaml:"image"`
+	NodePath              string `yaml:"node_path"`
+	ScriptPath            string `yaml:"script_path"`
+	SupervisorID          string `yaml:"supervisor_id"`
+	SupervisorKeyFile     string `yaml:"supervisor_key_file"`
+	GuardianSocket        string `yaml:"guardian_socket"`
+	GuardianPublicKeyFile string `yaml:"guardian_public_key_file"`
+}
+
 type PortalWeb struct {
 	Dir string `yaml:"dir"`
 }
@@ -223,6 +240,8 @@ func convertDurations(node *yaml.Node, path string) error {
 }
 
 var rateLimitPattern = regexp.MustCompile(`^[1-9][0-9]*/min$`)
+var cloudDSHImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
+var cloudDSHSupervisorIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func (c Config) validate() error {
 	if strings.TrimSpace(c.Instance) == "" {
@@ -346,6 +365,36 @@ func (c Config) validate() error {
 			return fmt.Errorf("config.storage.min_free_bytes must be positive")
 		}
 	}
+	if c.CloudDSH.Enabled {
+		if c.CloudDSH.MaxConcurrentTasks < 1 || c.CloudDSH.MaxConcurrentTasks > 64 ||
+			c.CloudDSH.MaxConcurrentPerOwner < 1 || c.CloudDSH.MaxConcurrentPerOwner > c.CloudDSH.MaxConcurrentTasks ||
+			c.CloudDSH.MaxConcurrentPerOwner > maxCloudDSHConcurrentPerOwner {
+			return fmt.Errorf("config.cloud_dsh concurrency limits must be positive and per-owner may not exceed the global limit")
+		}
+		dshSocket, dshSocketOK := localDockerSocketPath(c.CloudDSH.DockerHost)
+		storageSocket, storageSocketOK := localDockerSocketPath(c.Storage.DockerHost)
+		if !dshSocketOK || !storageSocketOK || resolvePath(dshSocket) == resolvePath(storageSocket) {
+			return fmt.Errorf("config.cloud_dsh.docker_host must use a separate Docker endpoint")
+		}
+		if !cloudDSHImagePattern.MatchString(c.CloudDSH.Image) {
+			return fmt.Errorf("config.cloud_dsh.image must pin an image by sha256 digest")
+		}
+		for _, field := range []struct {
+			name  string
+			value string
+		}{
+			{"node_path", c.CloudDSH.NodePath}, {"script_path", c.CloudDSH.ScriptPath},
+			{"supervisor_key_file", c.CloudDSH.SupervisorKeyFile}, {"guardian_public_key_file", c.CloudDSH.GuardianPublicKeyFile},
+			{"guardian_socket", c.CloudDSH.GuardianSocket},
+		} {
+			if !filepath.IsAbs(field.value) || filepath.Clean(field.value) != field.value || field.value == string(filepath.Separator) {
+				return fmt.Errorf("config.cloud_dsh.%s must be an absolute clean path", field.name)
+			}
+		}
+		if !cloudDSHSupervisorIDPattern.MatchString(c.CloudDSH.SupervisorID) {
+			return fmt.Errorf("config.cloud_dsh.supervisor_id is invalid")
+		}
+	}
 	if strings.TrimSpace(c.WorkspaceStorage.RootDir) == "" || !filepath.IsAbs(c.WorkspaceStorage.RootDir) || filepath.Clean(c.WorkspaceStorage.RootDir) == string(filepath.Separator) {
 		return fmt.Errorf("config.workspace_storage.root_dir must be an absolute non-root path")
 	}
@@ -393,6 +442,15 @@ func (c Config) validate() error {
 		return fmt.Errorf("config.log.format must be json or console")
 	}
 	return nil
+}
+
+func localDockerSocketPath(endpoint string) (string, bool) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "unix" || parsed.Host != "" || parsed.User != nil || parsed.Opaque != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || !filepath.IsAbs(parsed.Path) || filepath.Clean(parsed.Path) != parsed.Path || parsed.Path == string(filepath.Separator) {
+		return "", false
+	}
+	return parsed.Path, true
 }
 
 func pathsOverlap(a, b string) bool {

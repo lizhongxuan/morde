@@ -12,7 +12,7 @@ import (
 )
 
 const getTask = `-- name: GetTask :one
-SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq FROM tasks WHERE id = $1 AND owner_id = $2
+SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent FROM tasks WHERE id = $1 AND owner_id = $2
 `
 
 type GetTaskParams struct {
@@ -67,12 +67,15 @@ func (q *Queries) GetTask(ctx context.Context, arg GetTaskParams) (Task, error) 
 		&i.AgentProfileVersion,
 		&i.CheckpointDigest,
 		&i.CheckpointThroughSeq,
+		&i.FileDeliveryIntent,
 	)
 	return i, err
 }
 
 const listTaskArtifacts = `-- name: ListTaskArtifacts :many
-SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt FROM task_artifacts WHERE task_id = $1 ORDER BY created_at, id
+SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt,
+       workspace_id, workspace_revision, size_bytes, sha256
+FROM task_artifacts WHERE task_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) ListTaskArtifacts(ctx context.Context, taskID string) ([]TaskArtifact, error) {
@@ -94,6 +97,10 @@ func (q *Queries) ListTaskArtifacts(ctx context.Context, taskID string) ([]TaskA
 			&i.CreatedAt,
 			&i.BatchItemID,
 			&i.BatchAttempt,
+			&i.WorkspaceID,
+			&i.WorkspaceRevision,
+			&i.SizeBytes,
+			&i.Sha256,
 		); err != nil {
 			return nil, err
 		}
@@ -213,7 +220,7 @@ func (q *Queries) ListTaskSteps(ctx context.Context, taskID string) ([]TaskStep,
 }
 
 const listTasks = `-- name: ListTasks :many
-SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq FROM tasks
+SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent FROM tasks
 WHERE owner_id = $1
   AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
   AND ($3 = '' OR status = $3)
@@ -291,6 +298,7 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]Task, e
 			&i.AgentProfileVersion,
 			&i.CheckpointDigest,
 			&i.CheckpointThroughSeq,
+			&i.FileDeliveryIntent,
 		); err != nil {
 			return nil, err
 		}

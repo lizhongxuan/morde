@@ -772,12 +772,24 @@ func createTestUser(t *testing.T, store *Store, quotaHosts, quotaCPU, quotaMemor
 func createPreRetirementTestUser(t *testing.T, store *Store, quotaHosts, quotaCPU, quotaMemory int) identity.User {
 	t.Helper()
 	user := createTestUser(t, store, quotaHosts, quotaCPU, quotaMemory)
+	expiresAt := time.Now().UTC().AddDate(20, 0, 0)
+	tokenID := testSessionTokenID(user.ID)
+	secretHash := sha256.Sum256([]byte("integration-session:" + tokenID))
+	if _, err := store.CreateToken(context.Background(), identity.Token{
+		ID: tokenID, OwnerID: user.ID, Kind: identity.KindSession, SecretHash: secretHash[:], ExpiresAt: expiresAt,
+	}); err != nil {
+		t.Fatalf("create test session token: %v", err)
+	}
 	// Historical execution tests need a gate that existed before migration 52.
 	result, err := store.pool.Exec(context.Background(), `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1 AND state='disabled'`, user.ID)
 	if err != nil || result.RowsAffected() != 1 {
 		t.Fatalf("enable historical execution for test: updated=%d err=%v", result.RowsAffected(), err)
 	}
 	return user
+}
+
+func testSessionTokenID(ownerID string) string {
+	return "t" + ownerID[1:]
 }
 
 func createTestHost(t *testing.T, ctx context.Context, store *Store, ownerID string, capacity app.Capacity, workspaceIDs []string) host.Host {

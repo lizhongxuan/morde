@@ -51,7 +51,7 @@ func RuntimeComputerTools() []RuntimeComputerToolDefinition {
 // Execute dispatches one already-persisted operation. It resolves an uncertain
 // response by querying the same ID and retries only when the exact runtime
 // instance reports that ID as not found.
-func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string, leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64) (runtimeclient.Operation, error) {
+func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string, leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64, inputRevision *int64) (runtimeclient.Operation, error) {
 	if err := validateRuntimeOperationCall(session, runtimeTaskID, operationID, leaseVersion, capability, action); err != nil {
 		return runtimeclient.Operation{}, err
 	}
@@ -59,9 +59,12 @@ func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSe
 	if !json.Valid(trimmed) || len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime operation arguments are invalid")
 	}
-	operation, err := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion)
+	operation, err := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, inputRevision)
 	if err == nil {
 		return operation, nil
+	}
+	if inputRevision != nil && domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+		return runtimeclient.Operation{}, err
 	}
 
 	operation, queryErr := r.queryAfterDispatchError(ctx, session, runtimeTaskID, operationID, leaseVersion)
@@ -72,9 +75,12 @@ func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSe
 		return runtimeclient.Operation{}, queryErr
 	}
 
-	operation, retryErr := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion)
+	operation, retryErr := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, inputRevision)
 	if retryErr == nil {
 		return operation, nil
+	}
+	if inputRevision != nil && domain.CodeOf(retryErr) == domain.CodeWorkspaceConflict {
+		return runtimeclient.Operation{}, retryErr
 	}
 	operation, queryErr = r.queryAfterDispatchError(ctx, session, runtimeTaskID, operationID, leaseVersion)
 	if queryErr == nil {

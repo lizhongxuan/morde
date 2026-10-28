@@ -165,6 +165,21 @@ type ModelConnectionManager interface {
 	Check(context.Context, identity.Principal, string) (app.ModelCapabilities, error)
 }
 
+type MCPConnectorManager interface {
+	List(context.Context, identity.Principal) ([]app.MCPConnectorView, error)
+	Get(context.Context, identity.Principal, string) (app.MCPConnectorView, error)
+	Create(context.Context, identity.Principal, app.CreateMCPConnectorCommand) (app.MCPConnectorView, error)
+	Update(context.Context, identity.Principal, string, app.UpdateMCPConnectorCommand) (app.MCPConnectorView, error)
+	RotateCredential(context.Context, identity.Principal, string, app.RotateMCPConnectorCredentialCommand) (app.MCPConnectorView, error)
+	SetEnabled(context.Context, identity.Principal, string, bool, app.MCPConnectorRevisionCommand) (app.MCPConnectorView, error)
+	Delete(context.Context, identity.Principal, string, app.MCPConnectorRevisionCommand) error
+}
+
+type MCPConnectorOAuthManager interface {
+	BeginOAuth(context.Context, identity.Principal, string, int64, string, string) (app.MCPConnectorOAuthStart, error)
+	CompleteOAuth(context.Context, string, string, string, string) error
+}
+
 type OnboardingManager interface {
 	Preferences(context.Context, identity.Principal) (app.UserPreferences, error)
 	SavePreferences(context.Context, identity.Principal, app.SaveUserPreferencesCommand) (app.UserPreferences, error)

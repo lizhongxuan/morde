@@ -164,9 +164,12 @@ func validateTask(value task.Task) error {
 		value.ModelID == "" || strings.TrimSpace(value.Objective) == "" || value.Status != task.StatusQueued ||
 		value.ExecutionLocation != "server" || value.Authorization.Version < 1 ||
 		(value.ApplicationID != "" && (value.HostID == "" || !app.ValidHostApplicationID(value.ApplicationID))) ||
+		!value.FileDeliveryIntent.Valid() ||
 		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
 		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
 		(value.InputRevision != nil && *value.InputRevision < 0) || (len(value.ContextDigest) != 0 && len(value.ContextDigest) != 32) ||
+		(value.WorkspaceID != "" && len(value.ContextDigest) != 32) ||
+		(value.WorkspaceID == "") != (len(value.ContextDigest) == 0) ||
 		value.AgentInstanceID != "" || value.AgentGeneration != 0 || value.AgentSessionID != "" ||
 		value.AgentEngineVersion != "" || value.AgentProfileVersion != "" || len(value.CheckpointDigest) != 0 {
 		return domain.InvalidArgument("task", "task fields are invalid")
@@ -190,6 +193,9 @@ func normalizeNewTask(value task.Task) task.Task {
 	}
 	if value.Authorization.Version == 0 {
 		value.Authorization.Version = 1
+	}
+	if !value.FileDeliveryIntent.Valid() {
+		value.FileDeliveryIntent = app.ClassifyFileDeliveryIntent(value.Objective, value.WorkspaceID != "")
 	}
 	return value
 }

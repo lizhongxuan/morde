@@ -238,7 +238,7 @@ func (e *MCPRuntimeToolExecutor) Execute(ctx context.Context, principal identity
 	}
 
 	runtimeOperation, err := e.operations.Execute(operationCtx, session, operation.RuntimeTaskID, operation.OperationID,
-		operation.LeaseVersion, mapping.capability, mapping.action, operation.Arguments, operation.WorkspaceID, operation.BindingVersion)
+		operation.LeaseVersion, mapping.capability, mapping.action, operation.Arguments, operation.WorkspaceID, operation.BindingVersion, nil)
 	if err == nil {
 		runtimeOperation, err = e.operations.Poll(operationCtx, session, operation.RuntimeTaskID, operation.OperationID, operation.LeaseVersion, runtimeOperation)
 	}

@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 type taskStoreStub struct {
@@ -53,6 +56,47 @@ type taskStoreStub struct {
 	events               []task.Event
 	eventPage            *TaskEventPage
 	storeErr             error
+	grantRevokeCalls     int
+	grantOwnerID         string
+	grantTaskID          string
+	grantConnectorID     string
+	grantVersion         int64
+	grantRevoked         TaskMCPConnectorGrant
+}
+
+type taskWorkspaceStoreStub struct {
+	*taskStoreStub
+	value workspace.Workspace
+	files []workspace.File
+}
+
+func (s *taskWorkspaceStoreStub) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
+	if id != s.value.ID {
+		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return s.value, nil
+}
+
+func (s *taskWorkspaceStoreStub) GetWorkspaceManifestPage(_ context.Context, id string, revision int64, _ string, after string, limit int32) (workspace.ManifestPage, error) {
+	if id != s.value.ID || revision > s.value.Revision || limit < 1 {
+		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace manifest not found")
+	}
+	start := 0
+	if after != "" {
+		for start < len(s.files) && s.files[start].Path <= after {
+			start++
+		}
+	}
+	end := start + 1
+	if end > len(s.files) {
+		end = len(s.files)
+	}
+	page := workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: append([]workspace.File(nil), s.files[start:end]...)}
+	if end < len(s.files) {
+		cursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: revision, After: s.files[end-1].Path})
+		page.NextCursor = &cursor
+	}
+	return page, nil
 }
 
 func (s *taskStoreStub) CreateConversation(_ context.Context, value conversation.Conversation, _ IdempotencyRecord) (conversation.Conversation, bool, error) {
@@ -98,6 +142,20 @@ func (s *taskStoreStub) AppendMessage(_ context.Context, submission TaskSubmissi
 
 func (s *taskStoreStub) GetTask(context.Context, string, string) (TaskDetails, error) {
 	return s.details, s.storeErr
+}
+
+func (s *taskStoreStub) RevokeTaskMCPConnectorGrant(_ context.Context, ownerID, taskID, connectorID string, expectedVersion int64) (TaskMCPConnectorGrant, error) {
+	s.grantRevokeCalls++
+	s.grantOwnerID, s.grantTaskID, s.grantConnectorID, s.grantVersion = ownerID, taskID, connectorID, expectedVersion
+	return s.grantRevoked, s.storeErr
+}
+
+func (s *taskStoreStub) ListTaskMCPConnectorGrants(context.Context, string, string) ([]TaskMCPConnectorGrant, error) {
+	return nil, s.storeErr
+}
+
+func (s *taskStoreStub) SetTaskMCPConnectorToolSchema(context.Context, string, string, string, int64, []byte, []byte) (TaskMCPConnectorGrant, error) {
+	return s.grantRevoked, s.storeErr
 }
 
 func (s *taskStoreStub) ListTasks(_ context.Context, _ string, filter TaskListRequest) (TaskPage, error) {
@@ -203,6 +261,171 @@ func TestTaskServiceSubmitCreatesHostBoundConversationAndIdempotencyHash(t *test
 	}
 	if a.Task.Authorization.Kind != string(identity.KindSession) || a.Task.Authorization.TokenID != principal.TokenID {
 		t.Fatalf("authorization snapshot = %#v", a.Task.Authorization)
+	}
+}
+
+func TestTaskServiceStoresFileDeliveryIntentFromTaskAndBatchText(t *testing.T) {
+	store := &taskStoreStub{}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		key       string
+		objective string
+		items     []BatchItemInput
+		want      task.FileDeliveryIntent
+	}{
+		{key: "intent-none-001", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
+		{key: "intent-required-01", objective: "Review each record.", items: []BatchItemInput{{Key: "row-a", Input: "Generate and save a PDF report."}}, want: task.FileDeliveryRequired},
+		{key: "intent-unclear-01", objective: "Write a report about this project.", want: task.FileDeliveryUnclear},
+	} {
+		if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+			ModelID: "model-a", Objective: test.objective, BatchItems: test.items, IdempotencyKey: test.key,
+		}); err != nil {
+			t.Fatalf("Submit(%q): %v", test.key, err)
+		}
+		got := store.submissions[len(store.submissions)-1].Task.FileDeliveryIntent
+		if got != test.want {
+			t.Fatalf("file delivery intent for %q = %q, want %q", test.key, got, test.want)
+		}
+	}
+}
+
+func TestTaskServiceNormalizesAndHashesMCPConnectorSelection(t *testing.T) {
+	store := &taskStoreStub{}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := SubmitTaskCommand{
+		HostID: "h1234567", ModelID: "model-a", Objective: "use an explicit connector",
+		MCPConnectorIDs: []string{"kzzzzzzz", "kaaaaaaa"}, IdempotencyKey: "connector-selection-01",
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	first := store.submissions[0]
+	if len(first.MCPConnectorIDs) != 2 || first.MCPConnectorIDs[0] != "kaaaaaaa" || first.MCPConnectorIDs[1] != "kzzzzzzz" {
+		t.Fatalf("connector IDs were not normalized: %#v", first.MCPConnectorIDs)
+	}
+	command.MCPConnectorIDs = []string{"kbbbbbbb"}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first.Idempotency.RequestHash, store.submissions[1].Idempotency.RequestHash) {
+		t.Fatal("different connector selections produced the same idempotency request hash")
+	}
+}
+
+func TestTaskServiceRevokeConnectorGrantAuthorizesSessionAndClient(t *testing.T) {
+	store := &taskStoreStub{
+		details:      TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}},
+		grantRevoked: TaskMCPConnectorGrant{TaskID: "q1234567", OwnerID: "u1234567", ConnectorID: "kaaaaaaa", GrantVersion: 2},
+	}
+	authorizer := &taskAuthorizerStub{}
+	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, principal := range []identity.Principal{
+		taskTestPrincipal(),
+		{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient, TokenID: "t7654321", ClientInstallationID: "i1234567"},
+	} {
+		grant, err := service.RevokeMCPConnectorGrant(context.Background(), principal, "q1234567", "kaaaaaaa", 1)
+		if err != nil || grant.GrantVersion != 2 {
+			t.Fatalf("RevokeMCPConnectorGrant(%s) = %#v, %v", principal.Kind, grant, err)
+		}
+	}
+	if store.grantRevokeCalls != 2 || store.grantOwnerID != "u1234567" || store.grantTaskID != "q1234567" ||
+		store.grantConnectorID != "kaaaaaaa" || store.grantVersion != 1 || authorizer.lastScope != taskControlScope {
+		t.Fatalf("grant revoke authorization/store call = %#v %#v", store, authorizer)
+	}
+	invalid := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: "t7654321"}
+	if _, err := service.RevokeMCPConnectorGrant(context.Background(), invalid, "q1234567", "kaaaaaaa", 1); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("device principal revoke error = %v", err)
+	}
+	if store.grantRevokeCalls != 2 {
+		t.Fatalf("invalid principal reached grant store: calls=%d", store.grantRevokeCalls)
+	}
+}
+
+func TestTaskServicePinsCommittedWorkspaceManifestAndHashesInputRevision(t *testing.T) {
+	emptyDigest := sha256.Sum256(nil)
+	files := []workspace.File{
+		{Path: "a.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0644, Chunks: []workspace.Chunk{}},
+		{Path: "b.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0644, Chunks: []workspace.Chunk{}},
+	}
+	store := &taskWorkspaceStoreStub{
+		taskStoreStub: &taskStoreStub{},
+		value:         workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 2},
+		files:         files,
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(1)
+	command := SubmitTaskCommand{
+		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		ModelID: "model-a", Objective: "edit the project", IdempotencyKey: "workspace-submit-001",
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	first := store.submissions[0]
+	expectedDigest, err := workspace.ManifestSHA256(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, _ := hex.DecodeString(expectedDigest)
+	if first.Task.WorkspaceID != store.value.ID || first.Task.InputRevision == nil || *first.Task.InputRevision != 1 || !bytes.Equal(first.Task.ContextDigest, wantDigest) {
+		t.Fatalf("task input snapshot = %#v, digest=%x want=%x", first.Task, first.Task.ContextDigest, wantDigest)
+	}
+
+	revision = 2
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first.Idempotency.RequestHash, store.submissions[1].Idempotency.RequestHash) {
+		t.Fatal("changing the pinned Workspace revision did not change the idempotency request hash")
+	}
+
+	revision = 3
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); domain.CodeOf(err) != domain.CodeWorkspaceConflict || len(store.submissions) != 2 {
+		t.Fatalf("uncommitted Workspace revision error=%v submissions=%d", err, len(store.submissions))
+	}
+	command.InputRevision = nil
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.submissions) != 2 {
+		t.Fatalf("missing Workspace revision error=%v submissions=%d", err, len(store.submissions))
+	}
+}
+
+func TestTaskServiceAppendPinsWorkspaceInputForNewTask(t *testing.T) {
+	emptyDigest := sha256.Sum256(nil)
+	files := []workspace.File{{Path: "notes.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0644, Chunks: []workspace.Chunk{}}}
+	store := &taskWorkspaceStoreStub{
+		taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+			"c1234567": {ID: "c1234567", OwnerID: "u1234567", HostID: "h1234567"},
+		}},
+		value: workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
+		files: files,
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(1)
+	_, err = service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", AppendMessageCommand{
+		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		ModelID: "model-a", Content: "use the uploaded notes", IdempotencyKey: "workspace-append-001",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.appends) != 1 || store.appends[0].Task.WorkspaceID != store.value.ID ||
+		store.appends[0].Task.InputRevision == nil || *store.appends[0].Task.InputRevision != revision || len(store.appends[0].Task.ContextDigest) != 32 {
+		t.Fatalf("append task Workspace input = %#v", store.appends)
 	}
 }
 

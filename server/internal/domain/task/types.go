@@ -19,6 +19,18 @@ const (
 	StatusCancelled   Status = "cancelled"
 )
 
+type FileDeliveryIntent string
+
+const (
+	FileDeliveryNone     FileDeliveryIntent = "none"
+	FileDeliveryRequired FileDeliveryIntent = "required"
+	FileDeliveryUnclear  FileDeliveryIntent = "unclear"
+)
+
+func (intent FileDeliveryIntent) Valid() bool {
+	return intent == FileDeliveryNone || intent == FileDeliveryRequired || intent == FileDeliveryUnclear
+}
+
 type OperationStatus string
 
 const (
@@ -132,6 +144,7 @@ type Task struct {
 	CheckpointThroughSequence int64
 	EventSequence             int64
 	Objective                 string
+	FileDeliveryIntent        FileDeliveryIntent
 	Status                    Status
 	Authorization             Authorization
 	Budget                    Budget
@@ -164,6 +177,7 @@ type Operation struct {
 	HostID            string
 	WorkspaceID       string
 	BindingVersion    int64
+	InputRevision     *int64
 	RuntimeGeneration int64
 	RuntimeInstanceID string
 	ControlVersion    int64
@@ -200,6 +214,10 @@ type Artifact struct {
 	StepID       string
 	BatchItemID  string
 	BatchAttempt int32
+	WorkspaceID  string
+	Revision     int64
+	SizeBytes    int64
+	SHA256       string
 	Label        string
 	Path         string
 	MediaType    string

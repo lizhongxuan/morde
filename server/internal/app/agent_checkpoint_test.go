@@ -65,6 +65,31 @@ func TestAgentCheckpointEncryptedAndBoundToTask(t *testing.T) {
 	}
 }
 
+func TestAgentCheckpointChildIsBoundToRootSession(t *testing.T) {
+	store := &checkpointStoreStub{}
+	sealer, err := NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := checkpointTestCommand(`{"header":{"id":"session_1"},"from_seq":0,"events":[{"seq":0}]}`)
+	command.Through = 0
+	command.Fence.AgentRootSessionID = "session_root"
+	digest := sha256.Sum256(command.Payload)
+	command.Digest = digest[:]
+	if _, err := service.Save(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	other := store.value
+	other.Fence.AgentRootSessionID = "session_other"
+	if _, err := service.Decode(other); err == nil {
+		t.Fatal("child checkpoint ciphertext accepted under another root session")
+	}
+}
+
 func TestAgentCheckpointRejectsBadDigestAndEventSequence(t *testing.T) {
 	store := &checkpointStoreStub{}
 	sealer, err := NewSealer(make([]byte, 32))

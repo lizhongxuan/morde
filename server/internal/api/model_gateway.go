@@ -359,11 +359,12 @@ func chatFinishReason(reason string) string {
 func modelGatewayErrorBody(err error) gin.H {
 	code := domain.CodeOf(err)
 	message := "model request failed"
-	if code == domain.CodeInvalidArgument || code == domain.CodeRequestTooLarge {
+	switch code {
+	case domain.CodeInvalidArgument, domain.CodeRequestTooLarge:
 		message = "invalid or unsupported model request"
-	} else if code == domain.CodeQuotaExceeded || code == domain.CodeRateLimited {
+	case domain.CodeQuotaExceeded, domain.CodeRateLimited:
 		message = "model budget or concurrency limit reached"
-	} else if code == domain.CodeIdempotencyConflict || code == domain.CodeConflict || code == domain.CodeInvalidState {
+	case domain.CodeIdempotencyConflict, domain.CodeConflict, domain.CodeInvalidState:
 		message = "model call requires reconciliation"
 	}
 	return gin.H{"message": message, "type": string(code), "code": string(code)}

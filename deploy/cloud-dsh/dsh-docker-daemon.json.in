@@ -1,0 +1,14 @@
+{
+  "data-root": "/var/lib/morde-dsh-docker",
+  "exec-root": "/run/morde-dsh-docker/exec",
+  "pidfile": "/run/morde-dsh-docker/docker.pid",
+  "containerd": "/run/morde-dsh-containerd/containerd.sock",
+  "hosts": ["unix:///run/morde-dsh-docker/docker.sock"],
+  "group": "@PORTAL_GROUP@",
+  "bridge": "none",
+  "iptables": false,
+  "ip-forward": false,
+  "ip-masq": false,
+  "userland-proxy": false,
+  "live-restore": true
+}

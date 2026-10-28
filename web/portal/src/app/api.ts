@@ -108,10 +108,23 @@ export const portalApi = {
   },
   clients: async () => unwrapApiResponse(await api.GET('/api/clients')),
   revokeClient: async (id: string) => unwrapApiResponse(await api.DELETE('/api/clients/{id}', { params: { path: { id } } })),
-  instantChatConversations: async () => unwrapApiResponse(await api.GET('/api/instant-chat/conversations')),
-  instantChatMessages: async (id: string) => unwrapApiResponse(await api.GET('/api/instant-chat/conversations/{id}/messages', { params: { path: { id } } })),
-  sendInstantChatMessage: async (body: components['schemas']['InstantChatSendRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/instant-chat/messages', {
+  capabilities: async () => unwrapApiResponse(await api.GET('/api/capabilities')),
+  conversations: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
+  conversationMessages: async (id: string, cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
+    params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } },
+  })),
+  task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  submitTask: async (body: components['schemas']['SubmitTaskRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  appendConversationMessage: async (id: string, body: components['schemas']['AppendConversationMessageRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/conversations/{id}/messages', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  answerTaskInput: async (id: string, body: components['schemas']['TaskInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/inputs', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  respondToTaskApproval: async (id: string, approvalID: string, body: components['schemas']['TaskApprovalResponseRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/approvals/{approval_id}/responses', {
+    params: { path: { id, approval_id: approvalID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
   notifications: async (cursor?: string, unreadOnly = false) => unwrapApiResponse(await api.GET('/api/notifications', { params: { query: { limit: 100, unread_only: unreadOnly, ...(cursor ? { cursor } : {}) } } })),
   markNotificationRead: async (id: string) => unwrapApiResponse(await api.POST('/api/notifications/{id}/read', { params: { path: { id } } })),

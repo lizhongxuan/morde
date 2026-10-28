@@ -79,11 +79,40 @@ func (s *Store) ReserveModelCall(ctx context.Context, request app.ModelCallReser
 			taskID = request.Task.TaskID
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO model_call_ledger
- (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched')`, request.OwnerID, string(request.Source), request.CallID,
+ (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,created_at)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched',clock_timestamp())`, request.OwnerID, string(request.Source), request.CallID,
 			request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens)
 		if err != nil {
 			return fmt.Errorf("reserve model call: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *Store) BeginModelCallDispatch(ctx context.Context, request app.ModelCallReservation) error {
+	if !domain.ValidUserID(request.OwnerID) || len(request.CallID) < 8 || len(request.CallID) > 128 {
+		return domain.InvalidArgument("model_call", "invalid model dispatch")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		var ownerID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, request.OwnerID).Scan(&ownerID); err != nil {
+			return storeError("lock model dispatch budget", "model budget", err)
+		}
+		if err := checkModelCaller(ctx, tx, request); err != nil {
+			return err
+		}
+		var state, modelID string
+		var priorDigest []byte
+		if err := tx.QueryRow(ctx, `SELECT state,model_id,request_digest FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`,
+			request.OwnerID, string(request.Source), request.CallID).Scan(&state, &modelID, &priorDigest); err != nil {
+			return storeError("find model dispatch", "model call", err)
+		}
+		if state != "dispatched" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
+			return domain.NewError(domain.CodeInvalidState, "model call is no longer awaiting dispatch")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()
+WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, request.OwnerID, string(request.Source), request.CallID); err != nil {
+			return fmt.Errorf("mark model dispatch start: %w", err)
 		}
 		return nil
 	})
@@ -152,6 +181,10 @@ func checkModelInstallation(ctx context.Context, tx pgx.Tx, id, ownerID string) 
 }
 
 func checkTaskModelFence(ctx context.Context, tx pgx.Tx, fence app.ModelTaskFence, modelID string) error {
+	rootSessionID := fence.AgentRootSessionID
+	if rootSessionID == "" {
+		rootSessionID = fence.AgentSessionID
+	}
 	var gateState string
 	var gateEpoch int64
 	if err := tx.QueryRow(ctx, `SELECT state,epoch FROM owner_execution_controls WHERE owner_id=$1 FOR SHARE`, fence.OwnerID).Scan(&gateState, &gateEpoch); err != nil || gateState != "enabled" {
@@ -178,24 +211,64 @@ func checkTaskModelFence(ctx context.Context, tx pgx.Tx, fence app.ModelTaskFenc
 	}
 	if status != "running" || location != "server" || !leaseValid || !authValid ||
 		leaseOwner != fence.LeaseOwner || leaseVersion != fence.LeaseVersion || agentID != fence.AgentInstanceID ||
-		generation != fence.AgentGeneration || sessionID != fence.AgentSessionID || authVersion != fence.AuthorizationVersion ||
-		engineVersion != fence.EngineVersion || profileVersion != fence.ProfileVersion || through != fence.ThroughSequence ||
+		generation != fence.AgentGeneration || sessionID != rootSessionID || authVersion != fence.AuthorizationVersion ||
+		engineVersion != fence.EngineVersion || profileVersion != fence.ProfileVersion ||
 		taskModel != modelID || len(checkpointDigest) != 32 || gateEpoch != executionEpoch {
 		return domain.NewError(domain.CodeUnauthenticated, "task model execution fence is unavailable")
 	}
 	if err := lockActiveAgentLease(ctx, tx, app.AgentInstanceFence{
 		TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
-		AgentGeneration: fence.AgentGeneration, AgentSessionID: fence.AgentSessionID,
+		AgentGeneration: fence.AgentGeneration, AgentSessionID: rootSessionID,
 		LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
 		AuthorizationVersion: fence.AuthorizationVersion, EngineVersion: fence.EngineVersion,
 		ProfileVersion: fence.ProfileVersion,
 	}); err != nil {
 		return err
 	}
+	var parentSessionID, stepID string
+	var sessionThrough int64
+	var sessionDigest []byte
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(parent_session_id,''),COALESCE(step_id,''),checkpoint_through_seq,checkpoint_digest
+FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`,
+		fence.TaskID, fence.OwnerID, fence.AgentSessionID).Scan(&parentSessionID, &stepID, &sessionThrough, &sessionDigest); errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeUnauthenticated, "task model Agent Session is unavailable")
+	} else if err != nil {
+		return fmt.Errorf("lock task model Agent Session: %w", err)
+	}
+	if fence.AgentSessionID == rootSessionID {
+		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) {
+			return domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
+		}
+	} else {
+		underRoot, err := agentSessionDescendsFrom(ctx, tx, fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID)
+		if err != nil {
+			return fmt.Errorf("verify task model Agent Session ancestry: %w", err)
+		}
+		if parentSessionID == "" || stepID == "" || !underRoot {
+			return domain.NewError(domain.CodeUnauthenticated, "task model Agent Session is outside the active tree")
+		}
+		var stepStatus string
+		if err := tx.QueryRow(ctx, `SELECT status FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, fence.TaskID, stepID).Scan(&stepStatus); err != nil {
+			return fmt.Errorf("lock task model child Agent TaskStep: %w", err)
+		}
+		if stepStatus != "running" {
+			return domain.NewError(domain.CodeUnauthenticated, "task model child Agent Session is not running")
+		}
+	}
+	if sessionThrough != fence.ThroughSequence || len(sessionDigest) != 32 {
+		return domain.NewError(domain.CodeInvalidState, "task model Agent Session checkpoint head is not committed")
+	}
 	var checkpoint bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints
- WHERE task_id=$1 AND owner_id=$2 AND agent_session_id=$3 AND through_seq=$4 AND digest=$5)`,
-		fence.TaskID, fence.OwnerID, fence.AgentSessionID, fence.ThroughSequence, checkpointDigest).Scan(&checkpoint)
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints c
+JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
+ AND i.agent_generation=c.agent_generation AND i.agent_instance_id=c.agent_instance_id
+ AND i.agent_session_id=c.agent_root_session_id AND i.engine_version=c.engine_version
+ AND i.profile_version=c.profile_version AND i.auth_version=c.auth_version AND i.lease_version=c.lease_version
+WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_session_id=$4
+ AND c.through_seq=$5 AND c.digest=$6 AND c.auth_version=$7 AND c.engine_version=$8 AND c.profile_version=$9
+ AND ((c.agent_generation=$10 AND i.state='active') OR (c.agent_generation<$10 AND i.state='stopped')))`,
+		fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
+		fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration).Scan(&checkpoint)
 	if err != nil || !checkpoint {
 		return domain.NewError(domain.CodeInvalidState, "task checkpoint is not committed")
 	}
@@ -264,6 +337,30 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 			return storeError("find model settlement", "model call", err)
 		}
 		if state != "dispatched" {
+			if state == "unknown" && !settlement.Unknown {
+				_, err = tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=clock_timestamp()
+ WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='unknown'`, settlement.OwnerID, string(settlement.Source), settlement.CallID,
+					settlement.Usage.InputTokens, settlement.Usage.OutputTokens)
+				if err != nil {
+					return fmt.Errorf("settle late model usage: %w", err)
+				}
+				if taskID != nil {
+					var unknown bool
+					if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND state='unknown')`, *taskID).Scan(&unknown); err != nil {
+						return fmt.Errorf("check unknown task model usage: %w", err)
+					}
+					if unknown {
+						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`, *taskID, settlement.OwnerID)
+					} else {
+						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=COALESCE((SELECT SUM(input_tokens::numeric+output_tokens::numeric)
+ FROM model_call_ledger WHERE task_id=$1 AND state='settled'),0),updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`, *taskID, settlement.OwnerID)
+					}
+					if err != nil {
+						return fmt.Errorf("rebuild late task model usage: %w", err)
+					}
+				}
+				return nil
+			}
 			if (state == "unknown" && settlement.Unknown) || (state == "settled" && !settlement.Unknown &&
 				input != nil && output != nil && *input == settlement.Usage.InputTokens && *output == settlement.Usage.OutputTokens) {
 				return nil
@@ -271,10 +368,10 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 			return domain.NewError(domain.CodeIdempotencyConflict, "model settlement was already recorded differently")
 		}
 		if settlement.Unknown {
-			_, err = tx.Exec(ctx, `UPDATE model_call_ledger SET state='unknown',settled_at=now()
+			_, err = tx.Exec(ctx, `UPDATE model_call_ledger SET state='unknown',settled_at=clock_timestamp()
  WHERE owner_id=$1 AND source=$2 AND call_id=$3`, settlement.OwnerID, string(settlement.Source), settlement.CallID)
 		} else {
-			_, err = tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=now()
+			_, err = tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=clock_timestamp()
  WHERE owner_id=$1 AND source=$2 AND call_id=$3`, settlement.OwnerID, string(settlement.Source), settlement.CallID,
 				settlement.Usage.InputTokens, settlement.Usage.OutputTokens)
 		}

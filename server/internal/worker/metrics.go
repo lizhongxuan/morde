@@ -25,7 +25,7 @@ func validHostState(state host.State) bool {
 
 func validReconcileAction(action string) bool {
 	switch action {
-	case "lost", "orphan_deleted", "renew", "release", "volume_deleted", "create_timeout":
+	case "lost", "orphan_deleted", "renew", "release", "volume_deleted", "create_timeout", "model_call_unknown":
 		return true
 	default:
 		return false

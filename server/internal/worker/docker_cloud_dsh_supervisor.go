@@ -38,6 +38,7 @@ const (
 
 var dockerDSHImageDigest = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
 var dockerDSHContainerID = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var errDockerObjectNotFound = errors.New("docker object not found")
 
 // DockerCloudDSHGuard identifies exactly one container and its independently
 // enforced deadline. The guardian does not receive the supervisor signing key.
@@ -80,9 +81,10 @@ type DockerCloudDSHSupervisor struct {
 }
 
 type dockerDSHState struct {
-	mu      sync.Mutex
-	guard   DockerCloudDSHGuard
-	removed bool
+	mu             sync.Mutex
+	guard          DockerCloudDSHGuard
+	startRequested bool
+	removed        bool
 }
 
 // NewDockerCloudDSHSupervisor is intentionally unavailable without a separately
@@ -163,6 +165,7 @@ func (s *DockerCloudDSHSupervisor) Start(ctx context.Context, launch CloudDSHLau
 	if !state.guard.ExpiresAt.After(time.Now()) {
 		return nil, nil, errors.New("dsh lease expired before container start")
 	}
+	state.startRequested = true
 	if err := s.requestJSON(ctx, http.MethodPost, "/containers/"+created.ID+"/start", nil, http.StatusNoContent, nil); err != nil {
 		return nil, nil, err
 	}
@@ -219,12 +222,47 @@ func (s *DockerCloudDSHSupervisor) Stop(ctx context.Context, fence app.AgentInst
 	state := s.active[fence]
 	s.mu.Unlock()
 	if state == nil {
-		state = &dockerDSHState{guard: guard}
+		state = &dockerDSHState{guard: guard, startRequested: true}
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.guard.ContainerName != guard.ContainerName || subtle.ConstantTimeCompare([]byte(state.guard.NonceSHA256), []byte(guard.NonceSHA256)) != 1 {
 		return app.AgentStopReceipt{}, errors.New("docker dsh stop identity does not match")
+	}
+	if !state.startRequested {
+		if !state.removed {
+			var inspected dockerDSHInspect
+			var err error
+			if state.guard.ContainerID == "" {
+				inspected, err = s.inspect(ctx, guard.ContainerName)
+				if errors.Is(err, errDockerObjectNotFound) {
+					state.removed = true
+				} else if err != nil || !dockerDSHContainerID.MatchString(inspected.ID) {
+					return app.AgentStopReceipt{}, errors.New("docker dsh container identity is unconfirmed")
+				} else {
+					state.guard.ContainerID = inspected.ID
+				}
+			} else {
+				inspected, err = s.inspect(ctx, state.guard.ContainerID)
+			}
+			if !state.removed {
+				if err != nil || s.validateContainer(inspected, state.guard, false) != nil || *inspected.State.Running || *inspected.State.PID != 0 {
+					return app.AgentStopReceipt{}, errors.New("dsh container was started without a recorded start request")
+				}
+				if err := s.requestJSON(ctx, http.MethodDelete, "/containers/"+state.guard.ContainerID+"?force=0&v=0", nil, http.StatusNoContent, nil); err != nil {
+					return app.AgentStopReceipt{}, err
+				}
+				state.removed = true
+			}
+		}
+		absentID := state.guard.ContainerID
+		if absentID == "" {
+			absentID = state.guard.ContainerName
+		}
+		if err := s.requireAbsent(ctx, absentID); err != nil {
+			return app.AgentStopReceipt{}, err
+		}
+		return s.signStopReceipt(fence, nonce)
 	}
 	if state.guard.ContainerID == "" {
 		inspected, err := s.inspect(ctx, guard.ContainerName)
@@ -274,6 +312,10 @@ func (s *DockerCloudDSHSupervisor) Stop(ctx context.Context, fence app.AgentInst
 	if ctx.Err() != nil {
 		return app.AgentStopReceipt{}, ctx.Err()
 	}
+	return s.signStopReceipt(fence, nonce)
+}
+
+func (s *DockerCloudDSHSupervisor) signStopReceipt(fence app.AgentInstanceFence, nonce []byte) (app.AgentStopReceipt, error) {
 	receipt := app.AgentStopReceipt{Fence: fence, SupervisorNonce: append([]byte(nil), nonce...), TreeStopped: true}
 	payload, err := app.AgentStopReceiptSigningPayload(receipt)
 	if err != nil {
@@ -298,7 +340,7 @@ func (s *DockerCloudDSHSupervisor) AgentStopConfirmed(fence app.AgentInstanceFen
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if !state.removed || state.guard.ContainerID == "" || state.guard.Fence != fence || subtle.ConstantTimeCompare([]byte(state.guard.NonceSHA256), []byte(hex.EncodeToString(nonceSum[:]))) != 1 {
+	if !state.removed || state.guard.Fence != fence || subtle.ConstantTimeCompare([]byte(state.guard.NonceSHA256), []byte(hex.EncodeToString(nonceSum[:]))) != 1 {
 		return
 	}
 	s.mu.Lock()
@@ -345,12 +387,16 @@ func (s *DockerCloudDSHSupervisor) validateImage(ctx context.Context) error {
 }
 
 func (s *DockerCloudDSHSupervisor) containerCreate(labels map[string]string) any {
+	return s.containerCreateForScript(labels, s.options.ScriptPath)
+}
+
+func (s *DockerCloudDSHSupervisor) containerCreateForScript(labels map[string]string, scriptPath string) any {
 	return map[string]any{
 		"Image":      s.options.Image,
 		"User":       dockerDSHUser,
 		"Env":        []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"},
 		"Entrypoint": []string{"/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production", s.options.NodePath},
-		"Cmd":        []string{s.options.ScriptPath},
+		"Cmd":        []string{scriptPath},
 		"Labels":     labels,
 		"OpenStdin":  true, "AttachStdin": true, "AttachStdout": true, "AttachStderr": false,
 		"StdinOnce": true, "Tty": false, "NetworkDisabled": true,
@@ -499,6 +545,9 @@ func (s *DockerCloudDSHSupervisor) requestJSON(ctx context.Context, method, path
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != status {
+		if response.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("docker request returned status %d: %w", response.StatusCode, errDockerObjectNotFound)
+		}
 		return fmt.Errorf("docker request returned status %d", response.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
@@ -560,6 +609,7 @@ func (s *DockerCloudDSHSupervisor) attach(ctx context.Context, id string) (io.Wr
 		_ = conn.Close()
 		return nil, nil, errors.New("docker attach handshake failed")
 	}
+	_ = response.Body.Close()
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
 		return nil, nil, errors.New("docker attach deadline reset failed")

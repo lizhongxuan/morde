@@ -317,6 +317,11 @@ func TestPostgresMCPRuntimePersistsActorSeparatelyFromHostOwner(t *testing.T) {
 	actor := createTestUser(t, store, 8, 20_000, 40_000)
 	ensureMCPTestAPIKey(t, ctx, store, actor.ID, "t1234567")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+	if _, err := store.UpsertHostMember(ctx, host.Member{
+		HostID: hostValue.ID, OwnerID: owner.ID, UserID: actor.ID, Permissions: []host.Permission{host.PermissionMCPControl},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	const runtimeInstanceID = "mcp-shared-actor-runtime"
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_generation=1, runtime_instance_id=$2 WHERE id=$1`, hostValue.ID, runtimeInstanceID); err != nil {
 		t.Fatal(err)

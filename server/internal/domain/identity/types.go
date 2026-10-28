@@ -72,6 +72,7 @@ const (
 	ScopeTaskControl     Scope = "task:control"
 	ScopeScheduleRead    Scope = "schedule:read"
 	ScopeScheduleManage  Scope = "schedule:manage"
+	ScopeMCPControl      Scope = "mcp:control"
 	ScopeWorkspaceSync   Scope = "workspace:sync"
 )
 
@@ -82,7 +83,7 @@ var apiKeyScopes = [...]Scope{
 }
 
 func ValidScope(scope Scope) bool {
-	if scope == ScopeWorkspaceSync {
+	if scope == ScopeWorkspaceSync || scope == ScopeMCPControl {
 		return true
 	}
 	for _, allowed := range apiKeyScopes {

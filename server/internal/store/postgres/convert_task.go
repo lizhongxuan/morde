@@ -38,7 +38,8 @@ func taskDomain(row sqlcgen.Task) task.Task {
 		AgentEngineVersion: row.AgentEngineVersion, AgentProfileVersion: row.AgentProfileVersion,
 		CheckpointDigest: append([]byte(nil), row.CheckpointDigest...), CheckpointThroughSequence: row.CheckpointThroughSeq,
 		EventSequence: row.EventSeq,
-		ApplicationID: row.ApplicationID, ModelID: row.ModelID, Objective: row.Objective, Status: task.Status(row.Status),
+		ApplicationID: row.ApplicationID, ModelID: row.ModelID, Objective: row.Objective,
+		FileDeliveryIntent: task.FileDeliveryIntent(row.FileDeliveryIntent), Status: task.Status(row.Status),
 		Authorization: task.Authorization{
 			Kind: row.AuthKind, TokenID: row.AuthTokenID,
 			ClientInstallationID: row.AuthClientInstallationID.String, Scopes: row.AuthScopes,
@@ -78,7 +79,9 @@ func taskArtifactDomain(row sqlcgen.TaskArtifact) task.Artifact {
 	}
 	return task.Artifact{
 		ID: row.ID, TaskID: row.TaskID, StepID: row.StepID, BatchItemID: batchItemID,
-		BatchAttempt: batchAttempt, Label: row.Label, Path: row.Path, MediaType: row.MediaType,
+		BatchAttempt: batchAttempt, WorkspaceID: row.WorkspaceID.String, Revision: row.WorkspaceRevision.Int64,
+		SizeBytes: row.SizeBytes.Int64, SHA256: row.Sha256.String,
+		Label: row.Label, Path: row.Path, MediaType: row.MediaType,
 		CreatedAt: row.CreatedAt.Time,
 	}
 }
@@ -93,7 +96,7 @@ func taskEventDomain(row sqlcgen.TaskEvent) task.Event {
 func taskOperationDomain(row sqlcgen.TaskOperation) task.Operation {
 	return task.Operation{
 		ID: row.ID, TaskID: row.TaskID, Key: row.OperationKey, RequestHash: row.RequestHash,
-		HostID: row.HostID, WorkspaceID: row.WorkspaceID, BindingVersion: row.BindingVersion,
+		HostID: row.HostID, WorkspaceID: row.WorkspaceID, BindingVersion: row.BindingVersion, InputRevision: int64Pointer(row.InputRevision),
 		RuntimeGeneration: row.RuntimeGeneration, RuntimeInstanceID: row.RuntimeInstanceID,
 		ControlVersion: row.ControlVersion, LeaseVersion: row.LeaseVersion,
 		RuntimeLeaseVersion: row.RuntimeLeaseVersion, Status: task.OperationStatus(row.Status),

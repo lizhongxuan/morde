@@ -226,6 +226,9 @@ func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip st
 	}
 	// Installation, its tokens and audit commit together so every credential is revoked at once.
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
+			return err
+		}
 		command, err := tx.Exec(ctx, `UPDATE client_installations SET revoked_at=COALESCE(revoked_at,now())
   WHERE id=$1 AND owner_id=$2 AND revoked_at IS NULL`, id, ownerID)
 		if err != nil {
@@ -233,6 +236,9 @@ func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip st
 		}
 		if command.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeNotFound, "client installation not found")
+		}
+		if _, err := stopTasksForAuthorization(ctx, tx, ownerID, "", id); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE tokens SET revoked_at=COALESCE(revoked_at,now())
   WHERE client_installation_id=$1 AND revoked_at IS NULL`, id); err != nil {

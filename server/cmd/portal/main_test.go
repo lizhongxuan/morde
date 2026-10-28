@@ -28,6 +28,37 @@ func TestRequireLoopbackMetrics(t *testing.T) {
 	}
 }
 
+func TestReadProtectedKeyRequiresPrivateRegularFile(t *testing.T) {
+	directory := t.TempDir()
+	keyPath := filepath.Join(directory, "supervisor.key")
+	key := bytes.Repeat([]byte{0x42}, 32)
+	if err := os.WriteFile(keyPath, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readProtectedKey(keyPath)
+	if err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("readProtectedKey() = %x, %v", got, err)
+	}
+
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readProtectedKey(keyPath); err == nil || !strings.Contains(err.Error(), "no group or other permissions") {
+		t.Fatalf("readProtectedKey(permissive file) error = %v", err)
+	}
+
+	if err := os.Chmod(keyPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(directory, "key-link")
+	if err := os.Symlink(keyPath, symlinkPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := readProtectedKey(symlinkPath); err == nil {
+		t.Fatal("readProtectedKey accepted a symlink")
+	}
+}
+
 func TestCheckNetworkPoliciesPropagatesGuardFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "network-policy.sh")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {

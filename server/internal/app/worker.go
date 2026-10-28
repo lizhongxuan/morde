@@ -21,14 +21,20 @@ type WorkerApp struct {
 	runtime     *Runtime
 	cleanups    OrphanHostVolumeCleanupStore
 	locks       LeaderLockStore
+	modelCalls  StaleModelCallStore
 	renewBefore time.Duration
 }
 
-func NewWorkerApp(service *hostService, runtime *Runtime, cleanups OrphanHostVolumeCleanupStore, locks LeaderLockStore, renewBefore time.Duration) (*WorkerApp, error) {
-	if service == nil || runtime == nil || cleanups == nil || locks == nil || renewBefore <= 0 {
+type StaleModelCallStore interface {
+	MarkStaleModelCallsUnknown(context.Context) (int, error)
+}
+
+func NewWorkerApp(service *hostService, runtime *Runtime, cleanups OrphanHostVolumeCleanupStore, locks LeaderLockStore,
+	modelCalls StaleModelCallStore, renewBefore time.Duration) (*WorkerApp, error) {
+	if service == nil || runtime == nil || cleanups == nil || locks == nil || modelCalls == nil || renewBefore <= 0 {
 		return nil, errors.New("worker app dependencies and positive renew window are required")
 	}
-	return &WorkerApp{service: service, runtime: runtime, cleanups: cleanups, locks: locks, renewBefore: renewBefore}, nil
+	return &WorkerApp{service: service, runtime: runtime, cleanups: cleanups, locks: locks, modelCalls: modelCalls, renewBefore: renewBefore}, nil
 }
 
 func (w *WorkerApp) ListCreatingHosts(ctx context.Context) ([]string, error) {
@@ -85,19 +91,25 @@ func (w *WorkerApp) TryReconcilerLock(ctx context.Context) (LeaderLock, bool, er
 
 func (w *WorkerApp) Reconcile(ctx context.Context) (map[string]int, error) {
 	actions := make(map[string]int)
+	var failures []error
+	unknownCalls, err := w.modelCalls.MarkStaleModelCallsUnknown(ctx)
+	if err != nil {
+		failures = append(failures, fmt.Errorf("mark stale model calls unknown: %w", err))
+	} else if unknownCalls > 0 {
+		actions["model_call_unknown"] = unknownCalls
+	}
 	values, err := w.service.hosts.ListHosts(ctx)
 	if err != nil {
-		return actions, err
+		return actions, errors.Join(errors.Join(failures...), err)
 	}
 	remotes, clients, err := w.listInstanceSandboxes(ctx)
 	if err != nil {
-		return actions, err
+		return actions, errors.Join(errors.Join(failures...), err)
 	}
 	byID := make(map[string]host.Host, len(values))
 	for _, value := range values {
 		byID[value.ID] = value
 	}
-	var failures []error
 	if err := w.reconcileOrphanHostVolumeCleanups(ctx, remotes, byID); err != nil {
 		failures = append(failures, err)
 	}

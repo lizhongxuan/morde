@@ -357,28 +357,33 @@ describe("portal mock admin workspaces", () => {
   });
 });
 
-describe("portal mock instant chat", () => {
-  it("saves a reply, replays a retry, and protects conversation ownership", async () => {
+describe("portal mock durable tasks", () => {
+  it("persists a queued Task, replays an exact retry, and protects conversation ownership", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const headers = { "content-type": "application/json", "Idempotency-Key": "chat-retry-001" };
-    const body = { model_id: "pmodel01", content: "你好" };
-    const first = await api("/api/instant-chat/messages", { ...json("POST", body), headers });
-    expect(first.status).toBe(200);
-    const saved = await first.json() as { conversation: { id: string }; message: { content: string }; reply: { content: string } };
-    expect(saved).toMatchObject({ message: { content: "你好" }, reply: { content: "已收到：你好" } });
-    const replay = await api("/api/instant-chat/messages", { ...json("POST", body), headers });
-    expect(await replay.json()).toMatchObject({ conversation: { id: saved.conversation.id } });
-    const history = await api(`/api/instant-chat/conversations/${saved.conversation.id}/messages`);
-    expect(await history.json()).toMatchObject({ items: [{ content: "你好", role: "user" }, { content: "已收到：你好", role: "assistant" }] });
+    const headers = { "content-type": "application/json", "Idempotency-Key": "task-submit-retry-001" };
+    const body = { model_id: "pmodel01", objective: "你好" };
+    const first = await api("/api/tasks", { ...json("POST", body), headers });
+    expect(first.status).toBe(202);
+    const saved = await first.json() as { id: string; conversation_id: string; status: string };
+    expect(saved).toMatchObject({ conversation_id: expect.any(String), status: "queued" });
+    const replay = await api("/api/tasks", { ...json("POST", body), headers });
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({ id: saved.id, conversation_id: saved.conversation_id });
+    const history = await api(`/api/conversations/${saved.conversation_id}/messages`);
+    expect(await history.json()).toMatchObject({ items: [{ content: "你好", role: "user", task_id: saved.id }] });
+    expect(await (await api(`/api/tasks/${saved.id}`)).json()).toMatchObject({ id: saved.id, status: "queued" });
+    expect(await (await api("/api/conversations")).json()).toMatchObject({ items: [{ id: saved.conversation_id, title: "你好" }] });
     const member = createApiClient();
     await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
-    expect((await member(`/api/instant-chat/conversations/${saved.conversation.id}/messages`)).status).toBe(404);
+    expect((await member(`/api/conversations/${saved.conversation_id}/messages`)).status).toBe(404);
+    expect((await member(`/api/tasks/${saved.id}`)).status).toBe(404);
 
     resetMockState({ restoreAssistantState: true });
     api = createApiClient();
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const restored = await api(`/api/instant-chat/conversations/${saved.conversation.id}/messages`);
-    expect((await restored.json()).items).toHaveLength(2);
+    const restored = await api(`/api/conversations/${saved.conversation_id}/messages`);
+    expect((await restored.json()).items).toHaveLength(1);
+    expect((await (await api(`/api/tasks/${saved.id}`)).json()).status).toBe("queued");
   });
 });
 

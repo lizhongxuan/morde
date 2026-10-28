@@ -13,6 +13,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/runtimeclient"
 )
@@ -321,15 +322,16 @@ func boundedRuntimeLeaseExpiry(now, taskExpiry time.Time) time.Time {
 	return taskExpiry
 }
 
-func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64) (runtimeclient.Operation, error) {
+func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64, inputRevision *int64) (runtimeclient.Operation, error) {
 	if s == nil || s.client == nil {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
 	}
 	if runtimeclient.WorkspaceScopedCapability(capability) {
-		if _, err := s.SyncWorkspaceBindings(ctx, workspaceID, bindingVersion); err != nil {
+		// shortcut: this point-in-time revision check cannot lock Workspace sync across the Runtime request; add an operation admission lease before promising snapshot isolation during concurrent sync.
+		if _, err := s.syncWorkspaceBindings(ctx, workspaceID, bindingVersion, inputRevision); err != nil {
 			return runtimeclient.Operation{}, err
 		}
-	} else if workspaceID != "" || bindingVersion != 0 {
+	} else if workspaceID != "" || bindingVersion != 0 || inputRevision != nil {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace binding is invalid")
 	}
 	return s.client.Execute(ctx, runtimeclient.ExecuteRequest{
@@ -343,6 +345,17 @@ func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string
 // the latest HostStore row. expectedVersion==0 captures the current active
 // version; a positive version enforces an operation's persisted binding fence.
 func (s *RuntimeSession) SyncWorkspaceBindings(ctx context.Context, workspaceID string, expectedVersion int64) (int64, error) {
+	return s.syncWorkspaceBindings(ctx, workspaceID, expectedVersion, nil)
+}
+
+func (s *RuntimeSession) SyncTaskWorkspaceBindings(ctx context.Context, current task.Task, workspaceID string, expectedVersion int64) (int64, error) {
+	if current.WorkspaceID != workspaceID || current.InputRevision == nil {
+		return 0, domain.NewError(domain.CodeWorkspaceConflict, "task has no matching pinned Workspace input")
+	}
+	return s.syncWorkspaceBindings(ctx, workspaceID, expectedVersion, current.InputRevision)
+}
+
+func (s *RuntimeSession) syncWorkspaceBindings(ctx context.Context, workspaceID string, expectedVersion int64, expectedRevision *int64) (int64, error) {
 	if s == nil || s.client == nil || s.hosts == nil || !domain.ValidWorkspaceID(workspaceID) || expectedVersion < 0 {
 		return 0, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace binding is invalid")
 	}
@@ -368,6 +381,10 @@ func (s *RuntimeSession) SyncWorkspaceBindings(ctx context.Context, workspaceID 
 		})
 		if binding.Workspace.ID == workspaceID {
 			selected = binding.BindingVersion
+			if expectedRevision != nil && (binding.SyncState != workspace.BindingSyncHealthy ||
+				binding.DesiredRevision != *expectedRevision || binding.AppliedRevision != *expectedRevision) {
+				return 0, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace no longer matches the task input revision")
+			}
 		}
 	}
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].WorkspaceID < bindings[j].WorkspaceID })

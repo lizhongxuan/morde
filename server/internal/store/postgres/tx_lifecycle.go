@@ -147,7 +147,7 @@ WHERE id = $1 AND state = $2
 }
 
 // BeginHostRelease closes admission under the Host row lock, then checks
-// active terminal sessions, tasks, and MCP work before changing state to stopping.
+// active terminal sessions, tasks, operations, and Workspace sync before stopping.
 func (s *Store) BeginHostRelease(ctx context.Context, hostID string, confirmProcessTermination bool) (host.Host, bool, error) {
 	if !domain.ValidHostID(hostID) {
 		return host.Host{}, false, domain.InvalidArgument("host.release", "host release request is invalid")
@@ -215,6 +215,21 @@ SELECT EXISTS (
 		if active {
 			return nil
 		}
+		var unsettledTaskID string
+		err = tx.QueryRow(ctx, `
+SELECT o.task_id FROM tasks t
+JOIN task_operations o ON o.task_id=t.id
+WHERE t.owner_id=$1 AND t.host_id=$2 AND o.status IN ('prepared','dispatched','unknown')
+LIMIT 1`, result.OwnerID, hostID).Scan(&unsettledTaskID)
+		if err == nil {
+			conflict := domain.NewError(domain.CodeConflict, "host has an unsettled task operation; resolve it before release")
+			conflict.Details["reason"] = "host_release_unsettled_operation"
+			conflict.Details["task_id"] = unsettledTaskID
+			return conflict
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("check task operations before host release: %w", err)
+		}
 		if err := tx.QueryRow(ctx, `
 SELECT EXISTS (
   SELECT 1 FROM mcp_runtime_operations
@@ -224,6 +239,37 @@ SELECT EXISTS (
 		}
 		if active {
 			return nil
+		}
+		var workspaceID string
+		err = tx.QueryRow(ctx, `
+SELECT workspace_id FROM workspace_bindings
+WHERE host_id=$1 AND state <> 'detached' AND sync_state='conflict'
+LIMIT 1`, hostID).Scan(&workspaceID)
+		if err == nil {
+			conflict := domain.NewError(domain.CodeConflict, "host Workspace has unresolved sync conflicts; resolve them before release")
+			conflict.Details["reason"] = "host_release_sync_conflict"
+			conflict.Details["workspace_id"] = workspaceID
+			return conflict
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("check workspace sync conflicts before host release: %w", err)
+		}
+		err = tx.QueryRow(ctx, `
+SELECT s.workspace_id FROM workspace_bindings b
+JOIN workspace_sync_sessions s ON s.workspace_id=b.workspace_id
+WHERE b.host_id=$1 AND b.state <> 'detached'
+  AND s.replica_id LIKE 'host:' || $1 || ':g' || $2::bigint::text || ':%'
+  AND s.state IN ('planned','transferring','verifying','applying')
+  AND (s.upload_files <> '[]'::jsonb OR cardinality(s.upload_deleted_paths) > 0)
+LIMIT 1`, hostID, result.RuntimeGeneration).Scan(&workspaceID)
+		if err == nil {
+			conflict := domain.NewError(domain.CodeConflict, "host Workspace has uncommitted sync changes; finish synchronization before release")
+			conflict.Details["reason"] = "host_release_uncommitted_sync"
+			conflict.Details["workspace_id"] = workspaceID
+			return conflict
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("check uncommitted workspace sync before host release: %w", err)
 		}
 		if err := beginHostSiteDrain(ctx, tx, hostID); err != nil {
 			return err

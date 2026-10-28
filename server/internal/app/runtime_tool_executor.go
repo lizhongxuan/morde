@@ -68,6 +68,14 @@ type runtimeToolMapping struct {
 	internal    bool
 }
 
+type runtimeToolRiskTier string
+
+const (
+	runtimeToolRiskSafe      runtimeToolRiskTier = "safe"
+	runtimeToolRiskModerate  runtimeToolRiskTier = "moderate"
+	runtimeToolRiskSensitive runtimeToolRiskTier = "sensitive"
+)
+
 var runtimeToolMappings = []runtimeToolMapping{
 	{
 		name: runtimeToolShellExec, capability: "shell.exec", action: "run", scope: identity.ScopeComputerOperate,
@@ -174,16 +182,17 @@ type RuntimeToolExecutor struct {
 	authorizer TaskAuthorizer
 	fences     AgentHostFenceReader
 	runtime    *RuntimeControl
+	workspaces *WorkspaceSyncService
 	operations *RuntimeOperationRunner
 	leaseEvery time.Duration
 }
 
-func NewRuntimeToolExecutor(store TaskStore, authorizer TaskAuthorizer, fences AgentHostFenceReader, runtime *RuntimeControl) (*RuntimeToolExecutor, error) {
-	if store == nil || authorizer == nil || fences == nil || runtime == nil {
+func NewRuntimeToolExecutor(store TaskStore, authorizer TaskAuthorizer, fences AgentHostFenceReader, runtime *RuntimeControl, workspaces *WorkspaceSyncService) (*RuntimeToolExecutor, error) {
+	if store == nil || authorizer == nil || fences == nil || runtime == nil || workspaces == nil {
 		return nil, errors.New("runtime tool executor dependencies are required")
 	}
 	return &RuntimeToolExecutor{
-		store: store, authorizer: authorizer, fences: fences, runtime: runtime,
+		store: store, authorizer: authorizer, fences: fences, runtime: runtime, workspaces: workspaces,
 		operations: NewRuntimeOperationRunner(0), leaseEvery: runtimeToolLeaseRefresh,
 	}, nil
 }
@@ -257,17 +266,96 @@ func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequ
 		if workspaceID == "" || (request.WorkspaceID != "" && request.WorkspaceID != workspaceID) {
 			return AgentToolPreparation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace binding is invalid")
 		}
-		bindingVersion, err = session.SyncWorkspaceBindings(ctx, workspaceID, 0)
+		bindingVersion, err = session.SyncTaskWorkspaceBindings(ctx, current, workspaceID, 0)
 		if err != nil {
 			return AgentToolPreparation{}, err
 		}
 	}
 	request.WorkspaceID = workspaceID
 	fence = agentFenceFromRuntime(session.Fence)
+	if runtimeToolRisk(mapping.name, request.Arguments) == runtimeToolRiskSensitive {
+		approved, approvalErr := e.hasCurrentRuntimeToolApproval(ctx, current, request, fence)
+		if approvalErr != nil {
+			return AgentToolPreparation{}, approvalErr
+		}
+		if !approved {
+			return AgentToolPreparation{
+				Status: AgentToolApprovalRequired, Approval: runtimeToolApprovalRequest(mapping),
+				Fence: fence, WorkspaceID: workspaceID, BindingVersion: bindingVersion,
+			}, nil
+		}
+	}
 	return AgentToolPreparation{
 		Status: AgentToolReady, Fence: fence, WorkspaceID: workspaceID, BindingVersion: bindingVersion,
 		Token: runtimeToolPreparationToken(request, fence, bindingVersion),
 	}, nil
+}
+
+func (e *RuntimeToolExecutor) hasCurrentRuntimeToolApproval(ctx context.Context, current task.Task, request AgentToolRequest, fence AgentHostFence) (bool, error) {
+	decision := request.Approval
+	if decision == nil {
+		return false, nil
+	}
+	hash, err := agentOperationHash(request.Call.Name, request.Arguments)
+	if err != nil {
+		return false, domain.NewError(domain.CodeInvalidArgument, "runtime tool approval request is invalid")
+	}
+	details, err := e.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return false, err
+	}
+	pending := details.PendingRequest
+	if pending == nil || pending.TaskID != current.ID || pending.Kind != "approval" || pending.ID != decision.PendingID ||
+		pending.Version != decision.Version || pending.CallID != request.Call.CallID || pending.ToolName != request.Call.Name ||
+		!bytes.Equal(pending.RequestHash, hash[:]) || !bytes.Equal(decision.RequestHash, hash[:]) {
+		return false, domain.NewError(domain.CodeForbidden, "Host action approval does not match this exact tool call")
+	}
+	if pending.Status == task.PendingRequestRejected || decision.Decision != task.PendingDecisionApprove {
+		return false, domain.NewError(domain.CodeForbidden, "Host action approval was rejected")
+	}
+	if pending.Status != task.PendingRequestApproved || pending.Decision != task.PendingDecisionApprove ||
+		!samePendingApprovalFence(pending, fence) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func runtimeToolRisk(name string, arguments json.RawMessage) runtimeToolRiskTier {
+	switch name {
+	case runtimeToolFileRead, runtimeToolFileList, runtimeToolFileFind, runtimeToolBrowserSnapshot,
+		runtimeToolBrowserScreenshot, runtimeToolDesktopScreenshot, runtimeToolWindowList, runtimeToolBrowserObserveField:
+		return runtimeToolRiskSafe
+	case runtimeToolFileWrite, runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserClick,
+		runtimeToolBrowserPressKey, runtimeToolWindowActivate:
+		return runtimeToolRiskModerate
+	case runtimeToolDesktopPressKey:
+		var input struct {
+			Key string `json:"key"`
+		}
+		if json.Unmarshal(arguments, &input) == nil && input.Key != "Enter" && input.Key != "BackSpace" && input.Key != "Delete" {
+			return runtimeToolRiskModerate
+		}
+		return runtimeToolRiskSensitive
+	default:
+		return runtimeToolRiskSensitive
+	}
+}
+
+func runtimeToolApprovalRequest(mapping runtimeToolMapping) AgentApprovalRequest {
+	switch mapping.name {
+	case runtimeToolShellExec:
+		return AgentApprovalRequest{Object: "Host Workspace command", Content: "Run a command in the Host Workspace?", Impact: "The command can change files or send data from the authorized Workspace."}
+	case runtimeToolBrowserType:
+		return AgentApprovalRequest{Object: "Browser input", Content: "Type text into the selected browser field?", Impact: "The website may receive and store the text."}
+	case runtimeToolDesktopClick:
+		return AgentApprovalRequest{Object: "Host desktop input", Content: "Click a point on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
+	case runtimeToolDesktopType:
+		return AgentApprovalRequest{Object: "Host desktop input", Content: "Type text into the current Host desktop window?", Impact: "The text may change app data or be submitted externally."}
+	case runtimeToolDesktopPressKey:
+		return AgentApprovalRequest{Object: "Host desktop input", Content: "Press a potentially submitting or destructive key on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
+	default:
+		return AgentApprovalRequest{Object: "Host tool action", Content: "Run this sensitive Host action?", Impact: "The action may have effects that cannot be assessed from the available tool context."}
+	}
 }
 
 func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequest, preparation AgentToolPreparation) (AgentToolResult, error) {
@@ -285,9 +373,6 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	if err := checkRuntimeToolBudget(current); err != nil {
-		return AgentToolResult{}, err
-	}
 	if err := e.authorize(ctx, current, mapping.scope); err != nil {
 		return AgentToolResult{}, err
 	}
@@ -303,8 +388,20 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	if !session.Supports(mapping.capability) {
 		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "Host runtime does not support this tool")
 	}
+	if runtimeToolRisk(mapping.name, request.Arguments) == runtimeToolRiskSensitive {
+		approved, approvalErr := e.hasCurrentRuntimeToolApproval(ctx, current, request, fence)
+		if approvalErr != nil {
+			return AgentToolResult{}, approvalErr
+		}
+		if !approved {
+			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "sensitive Host action has no current approval")
+		}
+	}
 	if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
-		if _, err := session.SyncWorkspaceBindings(ctx, preparation.WorkspaceID, preparation.BindingVersion); err != nil {
+		if _, err := session.SyncTaskWorkspaceBindings(ctx, current, preparation.WorkspaceID, preparation.BindingVersion); err != nil {
+			if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+				return workspaceInputChangedResult(), nil
+			}
 			return AgentToolResult{Status: AgentToolFailed}, err
 		}
 	}
@@ -314,12 +411,20 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	if current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "task lease is no longer active")
 	}
+	runtimeArguments, err := runtimeToolExecutionArguments(mapping, request.Arguments)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
 
 	// The runtime lease mirrors the task's durable worker lease. The operation
 	// is sent only after the current Host fence, authorization, and persisted
 	// operation row have all been checked again.
 	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
 		return AgentToolResult{}, err
+	}
+	var inputRevision *int64
+	if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
+		inputRevision = current.InputRevision
 	}
 	operationCtx, cancelOperation := context.WithCancel(ctx)
 	leaseKeeperDone := make(chan struct{})
@@ -332,8 +437,11 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 		<-leaseKeeperDone
 	}()
 	operation, err := e.operations.Execute(operationCtx, session, current.ID, request.OperationID, current.Lease.Version,
-		mapping.capability, mapping.action, request.Arguments, preparation.WorkspaceID, preparation.BindingVersion)
+		mapping.capability, mapping.action, runtimeArguments, preparation.WorkspaceID, preparation.BindingVersion, inputRevision)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			return workspaceInputChangedResult(), nil
+		}
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	operation, err = e.operations.Poll(operationCtx, session, current.ID, request.OperationID, current.Lease.Version, operation)
@@ -342,9 +450,16 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	}
 	result, err := mapRuntimeToolResult(mapping, operation, request.Arguments)
 	if err == nil && desktopFocusChanged(mapping, operation) {
-		result.Status = AgentToolNeedsUser
+		result.Status, result.WaitingReason = AgentToolNeedsUser, "desktop_focus_changed"
 	}
 	return result, err
+}
+
+func workspaceInputChangedResult() AgentToolResult {
+	return AgentToolResult{
+		Status: AgentToolNeedsUser, WaitingReason: "workspace_input_changed",
+		Output: "The Workspace changed after this task was submitted. Submit a new task to use the updated files.",
+	}
 }
 
 // ReconcileOperation reads an operation by its durable runtime operation ID.
@@ -352,20 +467,25 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 // query fence was not captured or no longer matches the returned journal row.
 func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request AgentToolRequest, persisted task.Operation) (AgentToolResult, error) {
 	mapping, ok := runtimeToolMappingByName(request.Call.Name)
+	requestHash, hashErr := agentOperationHash(request.Call.Name, request.Arguments)
+	terminal := persisted.Status == task.OperationSucceeded || persisted.Status == task.OperationFailed
+	leaseMatches := persisted.LeaseVersion == request.Task.Lease.Version
+	if terminal {
+		leaseMatches = persisted.LeaseVersion > 0 && persisted.LeaseVersion <= request.Task.Lease.Version
+	}
 	if !ok || mapping.scope != request.RequiredScope || !validRuntimeToolArguments(mapping, request.Arguments) ||
-		!domain.ValidOperationID(persisted.ID) || persisted.RuntimeLeaseVersion < 1 || persisted.RuntimeInstanceID == "" ||
+		hashErr != nil || !bytes.Equal(persisted.RequestHash, requestHash[:]) ||
+		!domain.ValidOperationID(persisted.ID) || request.OperationID != "" && request.OperationID != persisted.ID ||
+		persisted.RuntimeLeaseVersion < 1 || persisted.RuntimeInstanceID == "" ||
 		persisted.TaskID != request.Task.ID || persisted.Key != request.OperationKey || persisted.HostID != request.Task.HostID ||
 		persisted.WorkspaceID != runtimeToolWorkspaceID(mapping, request.Arguments) ||
 		(runtimeclient.WorkspaceScopedCapability(mapping.capability) && persisted.BindingVersion < 1) ||
 		(!runtimeclient.WorkspaceScopedCapability(mapping.capability) && persisted.BindingVersion != 0) ||
-		persisted.LeaseVersion != request.Task.Lease.Version || persisted.Status != task.OperationUnknown {
+		!leaseMatches || (persisted.Status != task.OperationUnknown && !terminal) {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
-	current, err := e.currentTask(ctx, request.Task)
+	current, err := e.currentTaskForOperationReconciliation(ctx, request.Task)
 	if err != nil {
-		return AgentToolResult{}, err
-	}
-	if err := checkRuntimeToolBudget(current); err != nil {
 		return AgentToolResult{}, err
 	}
 	if err := e.authorize(ctx, current, mapping.scope); err != nil {
@@ -387,13 +507,24 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 	if !session.Supports(mapping.capability) || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
-	if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
-		if _, err := session.SyncWorkspaceBindings(ctx, persisted.WorkspaceID, persisted.BindingVersion); err != nil {
+	if runtimeclient.WorkspaceScopedCapability(mapping.capability) && !terminal {
+		if _, err := session.SyncTaskWorkspaceBindings(ctx, current, persisted.WorkspaceID, persisted.BindingVersion); err != nil {
 			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
 	}
 	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
+	}
+	if terminal {
+		status := AgentToolSucceeded
+		if persisted.Status == task.OperationFailed {
+			status = AgentToolFailed
+			if desktopFocusChanged(mapping, runtimeclient.Operation{Status: runtimeclient.OperationFailed, Result: []byte(persisted.Result)}) {
+				status = AgentToolNeedsUser
+				return AgentToolResult{Status: status, WaitingReason: "desktop_focus_changed", ExternalID: persisted.ExternalID, Output: persisted.Result}, nil
+			}
+		}
+		return AgentToolResult{Status: status, ExternalID: persisted.ExternalID, Output: persisted.Result}, nil
 	}
 	operation, err := e.operations.Get(ctx, session, current.ID, persisted.ID, persisted.RuntimeLeaseVersion)
 	if err != nil {
@@ -418,7 +549,7 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 	}
 	result, err := mapRuntimeToolResult(mapping, operation, request.Arguments)
 	if err == nil && desktopFocusChanged(mapping, operation) {
-		result.Status = AgentToolNeedsUser
+		result.Status, result.WaitingReason = AgentToolNeedsUser, "desktop_focus_changed"
 	}
 	return result, err
 }
@@ -573,6 +704,9 @@ func (e *RuntimeToolExecutor) groupFileEvidence(ctx context.Context, current tas
 		if operation.Status != task.OperationSucceeded {
 			return nil, unknownAgentVerification("A file_write candidate is not durably recorded as successful.")
 		}
+		if operation.Result != item.Result {
+			return nil, unknownAgentVerification("A file_write candidate result does not match its durable operation.")
+		}
 		if workspaceID, exists := pathWorkspace[item.Path]; exists && workspaceID != item.WorkspaceID {
 			return nil, AgentVerificationResult{
 				Status: AgentNotVerified,
@@ -640,7 +774,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 				persisted.ControlVersion != fence.ControlVersion {
 				return unknownAgentVerification("The verification result belongs to a different Host control fence.")
 			}
-			return mapFileVerificationOperation(persisted, group.files)
+			return e.verifyWorkspaceArtifacts(ctx, current, mapFileVerificationOperation(persisted, group.files))
 		}
 		if persisted.Status == task.OperationDispatched {
 			persisted, err = e.store.UpdateOperation(ctx, OperationUpdate{
@@ -704,7 +838,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 		<-leaseKeeperDone
 	}()
 	operation, err := session.Execute(operationCtx, current.ID, persisted.ID, current.Lease.Version,
-		runtimeFileVerifyCapability, runtimeFileVerifyAction, arguments, group.workspaceID, group.bindingVersion)
+		runtimeFileVerifyCapability, runtimeFileVerifyAction, arguments, group.workspaceID, group.bindingVersion, nil)
 	if err == nil && runtimeOperationMatchesTaskOperation(operation, current, persisted) {
 		operation, err = e.operations.Poll(operationCtx, session, current.ID, persisted.ID, current.Lease.Version, operation)
 	} else if err == nil {
@@ -736,7 +870,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 		persisted.Status = task.OperationSucceeded
 		persisted.ExternalID = operation.OperationID
 		persisted.Result = string(operation.Result)
-		return mapFileVerificationOperation(persisted, group.files)
+		return e.verifyWorkspaceArtifacts(ctx, current, mapFileVerificationOperation(persisted, group.files))
 	case runtimeclient.OperationFailed:
 		if _, err := e.store.UpdateOperation(ctx, OperationUpdate{
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
@@ -960,7 +1094,7 @@ func (e *RuntimeToolExecutor) reconcileFileVerificationOperation(ctx context.Con
 		persisted.Status = task.OperationSucceeded
 		persisted.ExternalID = operation.OperationID
 		persisted.Result = string(operation.Result)
-		return mapFileVerificationOperation(persisted, evidence)
+		return e.verifyWorkspaceArtifacts(ctx, current, mapFileVerificationOperation(persisted, evidence))
 	case runtimeclient.OperationFailed:
 		if _, err := e.store.UpdateOperation(ctx, OperationUpdate{
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
@@ -1056,7 +1190,10 @@ func mapFileVerificationOperation(operation task.Operation, expected []AgentFile
 		if mediaType == "" {
 			mediaType = "application/octet-stream"
 		}
-		artifacts = append(artifacts, AgentVerifiedArtifact{Label: path.Base(actual.Path), Path: actual.Path, MediaType: mediaType})
+		artifacts = append(artifacts, AgentVerifiedArtifact{
+			Label: path.Base(actual.Path), Path: actual.Path, MediaType: mediaType,
+			WorkspaceID: candidate.WorkspaceID, SizeBytes: actual.Size, SHA256: actual.SHA256,
+		})
 	}
 	return AgentVerificationResult{
 		Status: AgentVerified, Summary: fmt.Sprintf("The runtime independently matched %d Workspace file(s) by size and SHA-256.", len(artifacts)),
@@ -1064,11 +1201,37 @@ func mapFileVerificationOperation(operation task.Operation, expected []AgentFile
 	}
 }
 
+func (e *RuntimeToolExecutor) verifyWorkspaceArtifacts(ctx context.Context, current task.Task, result AgentVerificationResult) AgentVerificationResult {
+	if result.Status != AgentVerified || len(result.Artifacts) == 0 {
+		return result
+	}
+	for index := range result.Artifacts {
+		artifact := &result.Artifacts[index]
+		if artifact.WorkspaceID != current.WorkspaceID {
+			return AgentVerificationResult{Status: AgentNotVerified, Summary: "The verified file is outside the Task Workspace."}
+		}
+		proof, err := e.workspaces.VerifyLatestCommittedArtifact(ctx, current.OwnerID, artifact.WorkspaceID, artifact.Path, artifact.SizeBytes, artifact.SHA256)
+		if err != nil {
+			return unknownAgentVerification("The Morde Workspace revision or stored file blocks could not be verified.")
+		}
+		artifact.Revision = proof.Revision
+	}
+	return result
+}
+
 func validRuntimeJSONObject(raw []byte, limit int) bool {
 	return validAgentJSONObject(raw, limit)
 }
 
 func (e *RuntimeToolExecutor) currentTask(ctx context.Context, claimed task.Task) (task.Task, error) {
+	return e.loadCurrentTask(ctx, claimed, true)
+}
+
+func (e *RuntimeToolExecutor) currentTaskForOperationReconciliation(ctx context.Context, claimed task.Task) (task.Task, error) {
+	return e.loadCurrentTask(ctx, claimed, false)
+}
+
+func (e *RuntimeToolExecutor) loadCurrentTask(ctx context.Context, claimed task.Task, checkToolBudget bool) (task.Task, error) {
 	if ctx == nil || !domain.ValidTaskID(claimed.ID) || !domain.ValidUserID(claimed.OwnerID) || !domain.ValidHostID(claimed.HostID) {
 		return task.Task{}, domain.NewError(domain.CodeInvalidArgument, "runtime task is invalid")
 	}
@@ -1083,15 +1246,27 @@ func (e *RuntimeToolExecutor) currentTask(ctx context.Context, claimed task.Task
 		current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 		return task.Task{}, domain.NewError(domain.CodeInvalidState, "task lease or Host binding changed")
 	}
-	if err := checkRuntimeToolBudget(current); err != nil {
+	if err := checkRuntimeNonToolBudget(current); err != nil {
 		return task.Task{}, err
+	}
+	if current.Usage.ToolCalls < 0 || (checkToolBudget && current.Usage.ToolCalls > current.Budget.ToolCalls) {
+		return task.Task{}, domain.NewError(domain.CodeQuotaExceeded, "task execution budget is exhausted")
 	}
 	return current, nil
 }
 
 func checkRuntimeToolBudget(current task.Task) error {
-	if current.Budget.Validate() != nil || current.Usage.ToolCalls < 0 || current.Usage.ToolCalls > current.Budget.ToolCalls ||
-		current.Usage.ActiveSeconds < 0 || current.Usage.ActiveSeconds >= current.Budget.ActiveSeconds ||
+	if err := checkRuntimeNonToolBudget(current); err != nil {
+		return err
+	}
+	if current.Usage.ToolCalls < 0 || current.Usage.ToolCalls > current.Budget.ToolCalls {
+		return domain.NewError(domain.CodeQuotaExceeded, "task execution budget is exhausted")
+	}
+	return nil
+}
+
+func checkRuntimeNonToolBudget(current task.Task) error {
+	if current.Budget.Validate() != nil || current.Usage.ActiveSeconds < 0 || current.Usage.ActiveSeconds >= current.Budget.ActiveSeconds ||
 		(current.Usage.ModelTokens != nil && (*current.Usage.ModelTokens < 0 || *current.Usage.ModelTokens > current.Budget.ModelTokens)) {
 		return domain.NewError(domain.CodeQuotaExceeded, "task execution budget is exhausted")
 	}
@@ -1557,25 +1732,26 @@ func runtimeToolPreparationToken(request AgentToolRequest, fence AgentHostFence,
 		version = bindingVersion[0]
 	}
 	value := struct {
-		TaskID         string         `json:"task_id"`
-		OwnerID        string         `json:"owner_id"`
-		HostID         string         `json:"host_id"`
-		LeaseOwner     string         `json:"lease_owner"`
-		LeaseVersion   int64          `json:"lease_version"`
-		OperationKey   string         `json:"operation_key"`
-		CallID         string         `json:"call_id"`
-		Tool           string         `json:"tool"`
-		ArgumentsHash  string         `json:"arguments_hash"`
-		Scope          identity.Scope `json:"scope"`
-		Fence          AgentHostFence `json:"fence"`
-		WorkspaceID    string         `json:"workspace_id"`
-		BindingVersion int64          `json:"binding_version"`
+		TaskID         string                     `json:"task_id"`
+		OwnerID        string                     `json:"owner_id"`
+		HostID         string                     `json:"host_id"`
+		LeaseOwner     string                     `json:"lease_owner"`
+		LeaseVersion   int64                      `json:"lease_version"`
+		OperationKey   string                     `json:"operation_key"`
+		CallID         string                     `json:"call_id"`
+		Tool           string                     `json:"tool"`
+		ArgumentsHash  string                     `json:"arguments_hash"`
+		Scope          identity.Scope             `json:"scope"`
+		Fence          AgentHostFence             `json:"fence"`
+		WorkspaceID    string                     `json:"workspace_id"`
+		BindingVersion int64                      `json:"binding_version"`
+		Approval       *AgentToolApprovalDecision `json:"approval,omitempty"`
 	}{
 		TaskID: request.Task.ID, OwnerID: request.Task.OwnerID, HostID: request.Task.HostID,
 		LeaseOwner: request.Task.Lease.Owner, LeaseVersion: request.Task.Lease.Version,
 		OperationKey: request.OperationKey, CallID: request.Call.CallID,
 		Tool: request.Call.Name, ArgumentsHash: hex.EncodeToString(argumentsHash[:]),
-		Scope: request.RequiredScope, Fence: fence, WorkspaceID: request.WorkspaceID, BindingVersion: version,
+		Scope: request.RequiredScope, Fence: fence, WorkspaceID: request.WorkspaceID, BindingVersion: version, Approval: request.Approval,
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
@@ -1781,6 +1957,22 @@ func runtimeToolWorkspaceID(mapping runtimeToolMapping, raw json.RawMessage) str
 		return ""
 	}
 	return args.WorkspaceID
+}
+
+func runtimeToolExecutionArguments(mapping runtimeToolMapping, raw json.RawMessage) (json.RawMessage, error) {
+	if !runtimeclient.WorkspaceScopedCapability(mapping.capability) {
+		return append(json.RawMessage(nil), raw...), nil
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil || fields["workspace_id"] == nil {
+		return nil, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace argument is invalid")
+	}
+	delete(fields, "workspace_id")
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace argument is invalid")
+	}
+	return encoded, nil
 }
 
 func validRuntimeWorkspaceID(value string) bool { return domain.ValidWorkspaceID(value) }

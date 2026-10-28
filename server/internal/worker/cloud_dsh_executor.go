@@ -13,6 +13,7 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,10 +27,19 @@ const cloudDSHMaxFrame = 4 << 20
 const cloudDSHMaxText = 256 << 10
 const cloudDSHEngineVersion = "0.2.0-rc.2"
 const cloudDSHProfileVersion = "v1"
+const cloudDSHDelegateToolName = "dsh_delegate"
+const cloudDSHJobListToolName = "dsh_job_list"
+const cloudDSHJobGetToolName = "dsh_job_get"
+const cloudDSHJobOutputToolName = "dsh_job_output"
+const cloudDSHJobCancelToolName = "dsh_job_cancel"
 
 // ErrCloudDSHCompletionPending means dsh finished, but output and Task completion
 // have not been independently verified and committed.
 var ErrCloudDSHCompletionPending = errors.New("dsh completion requires output verification")
+
+// ErrCloudDSHWaitingForUser means the broker durably paused the task before
+// returning a tool result, so the dsh process must stop without failing it.
+var ErrCloudDSHWaitingForUser = errors.New("dsh task is waiting for user input")
 
 var cloudDSHID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
@@ -66,20 +76,47 @@ type CloudDSHInstances interface {
 
 type CloudDSHCheckpoints interface {
 	Save(context.Context, app.AgentCheckpointCommand) (bool, error)
+	ReadPage(context.Context, app.AgentCheckpointPageRequest) (app.AgentCheckpointPage, error)
 }
 
 type CloudDSHModels interface {
 	Complete(context.Context, app.ModelCall) (app.ModelResponse, error)
 }
 
+type CloudDSHTools interface {
+	Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error)
+	Execute(context.Context, task.Task, app.ModelToolCall) (app.AgentToolResult, error)
+}
+
+type CloudDSHChildSessions interface {
+	Create(context.Context, app.AgentChildSessionCommand) (app.AgentChildSession, bool, error)
+	List(context.Context, app.AgentInstanceFence, string) ([]app.AgentChildSession, error)
+	Get(context.Context, app.AgentInstanceFence, string, string) (app.AgentChildSession, error)
+	RequestCancel(context.Context, app.AgentChildSessionCancelCommand) (app.AgentChildSession, bool, error)
+	Settle(context.Context, app.AgentChildSessionSettleCommand) (app.AgentChildSession, bool, error)
+}
+
+type CloudDSHRecoveryTools interface {
+	Reconcile(context.Context, task.Task, app.ModelToolCall, *string) (app.AgentToolResult, error)
+	PauseRecovery(context.Context, task.Task) error
+}
+
+type CloudDSHCompleter interface {
+	Complete(context.Context, task.Task, app.CloudDSHTaskCompletion) error
+}
+
 type CloudDSHExecutorOptions struct {
-	NodePath     string
-	ScriptPath   string
-	SupervisorID string
-	Supervisor   CloudDSHSupervisor
-	Instances    CloudDSHInstances
-	Checkpoints  CloudDSHCheckpoints
-	Models       CloudDSHModels
+	NodePath        string
+	ScriptPath      string
+	SupervisorID    string
+	Supervisor      CloudDSHSupervisor
+	AccountRuntimes *CloudDSHAccountRuntimeManager
+	Instances       CloudDSHInstances
+	Checkpoints     CloudDSHCheckpoints
+	Models          CloudDSHModels
+	Tools           CloudDSHTools
+	Children        CloudDSHChildSessions
+	Completion      CloudDSHCompleter
 }
 
 type CloudDSHExecutor struct{ options CloudDSHExecutorOptions }
@@ -93,15 +130,107 @@ func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, er
 	return &CloudDSHExecutor{options: options}, nil
 }
 
-// ExecuteTask deliberately does not complete or resume a Task. A durable
-// supervisor and a separate artifact/completion transaction remain mandatory.
+func cloudDSHDelegateTool(available []app.AgentToolDefinition) app.AgentToolDefinition {
+	toolNames := make([]string, 0, len(available))
+	for _, tool := range available {
+		if tool.Name != cloudDSHDelegateToolName && tool.Name != "ask_user" {
+			toolNames = append(toolNames, tool.Name)
+		}
+	}
+	sort.Strings(toolNames)
+	parameters, _ := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"title":             map[string]any{"type": "string", "minLength": 1, "maxLength": 120},
+			"objective":         map[string]any{"type": "string", "minLength": 1, "maxLength": 32768},
+			"run_in_background": map[string]any{"type": "boolean"},
+			"tool_names": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": toolNames},
+				"maxItems": 64, "uniqueItems": true},
+		},
+		"required":             []string{"title", "objective", "tool_names"},
+		"additionalProperties": false,
+	})
+	return app.AgentToolDefinition{ModelTool: app.ModelTool{Name: cloudDSHDelegateToolName, Description: "Delegate a bounded task to a resumable child Agent with a selected subset of the current Task tools.",
+		Parameters: parameters}}
+}
+
+func cloudDSHJobTools() []app.AgentToolDefinition {
+	list, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}, "additionalProperties": false})
+	output, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{
+		"job_id":    map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+		"after_seq": map[string]any{"type": "integer", "minimum": -1},
+	}, "required": []string{"job_id", "after_seq"}, "additionalProperties": false})
+	job, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{
+		"job_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+	}, "required": []string{"job_id"}, "additionalProperties": false})
+	cancel := job
+	return []app.AgentToolDefinition{
+		{ModelTool: app.ModelTool{Name: cloudDSHJobListToolName, Description: "List this task's delegated background jobs and their status.", Parameters: list}},
+		{ModelTool: app.ModelTool{Name: cloudDSHJobGetToolName, Description: "Get the status of one delegated background job.", Parameters: job}},
+		{ModelTool: app.ModelTool{Name: cloudDSHJobOutputToolName, Description: "Read new delegated job output after a durable event cursor.", Parameters: output}},
+		{ModelTool: app.ModelTool{Name: cloudDSHJobCancelToolName, Description: "Cancel one delegated background job and wait for safe stop confirmation.", Parameters: cancel}},
+	}
+}
+
+func cloudDSHJobTool(name string) bool {
+	return name == cloudDSHJobListToolName || name == cloudDSHJobGetToolName || name == cloudDSHJobOutputToolName || name == cloudDSHJobCancelToolName
+}
+
+type cloudDSHDelegateArguments struct {
+	Title           string   `json:"title"`
+	Objective       string   `json:"objective"`
+	ToolNames       []string `json:"tool_names"`
+	RunInBackground bool     `json:"run_in_background"`
+}
+
+func validateCloudDSHDelegateArguments(raw []byte, parentDefinitions []app.AgentToolDefinition) (cloudDSHDelegateArguments, []app.AgentToolDefinition, error) {
+	var arguments cloudDSHDelegateArguments
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if len(raw) == 0 || len(raw) > 64<<10 || !uniqueCloudDSHJSON(raw) || decoder.Decode(&arguments) != nil || decoder.Decode(new(any)) != io.EOF ||
+		strings.TrimSpace(arguments.Title) == "" || len(arguments.Title) > 120 || !utf8.ValidString(arguments.Title) ||
+		strings.TrimSpace(arguments.Objective) == "" || len(arguments.Objective) > 32<<10 || !utf8.ValidString(arguments.Objective) ||
+		arguments.ToolNames == nil || len(arguments.ToolNames) > 64 {
+		return cloudDSHDelegateArguments{}, nil, errors.New("child Agent request is invalid")
+	}
+	selected := make(map[string]struct{}, len(arguments.ToolNames))
+	for _, name := range arguments.ToolNames {
+		if !cloudDSHID.MatchString(name) || name == cloudDSHDelegateToolName || name == "ask_user" {
+			return cloudDSHDelegateArguments{}, nil, errors.New("child Agent tool selection is invalid")
+		}
+		if _, exists := selected[name]; exists {
+			return cloudDSHDelegateArguments{}, nil, errors.New("child Agent tool selection is duplicated")
+		}
+		selected[name] = struct{}{}
+	}
+	definitions := make([]app.AgentToolDefinition, 0, len(selected))
+	for _, definition := range parentDefinitions {
+		if _, allowed := selected[definition.Name]; allowed {
+			definitions = append(definitions, definition)
+			delete(selected, definition.Name)
+		}
+	}
+	if len(selected) != 0 {
+		return cloudDSHDelegateArguments{}, nil, errors.New("child Agent requested a tool outside the parent authorization")
+	}
+	sort.Slice(definitions, func(i, j int) bool { return definitions[i].Name < definitions[j].Name })
+	return arguments, definitions, nil
+}
+
+// ExecuteTask leaves completion pending unless the stop receipt and the
+// separately injected completion service both confirm the result.
 func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (retErr error) {
+	freshAgent := value.AgentInstanceID == "" && value.AgentGeneration == 0 && value.AgentSessionID == "" &&
+		value.AgentEngineVersion == "" && value.AgentProfileVersion == "" && value.CheckpointThroughSequence == -1 && len(value.CheckpointDigest) == 0
+	recoveringAgent := cloudDSHID.MatchString(value.AgentInstanceID) && value.AgentGeneration >= 1 &&
+		cloudDSHID.MatchString(value.AgentSessionID) && value.AgentEngineVersion == cloudDSHEngineVersion &&
+		value.AgentProfileVersion == cloudDSHProfileVersion &&
+		((value.CheckpointThroughSequence == -1 && len(value.CheckpointDigest) == 0) ||
+			(value.CheckpointThroughSequence >= 0 && value.CheckpointThroughSequence <= 1<<53-1 && len(value.CheckpointDigest) == sha256.Size))
 	if ctx == nil || !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
 		!domain.ValidModelConnectionID(value.ModelID) || value.Status != task.StatusRunning || value.ExecutionLocation != "server" ||
 		value.Lease.Owner == "" || value.Lease.Version < 1 || value.Lease.ExpiresAt == nil || !value.Lease.ExpiresAt.After(time.Now()) ||
-		value.Authorization.Version < 1 || value.Budget.Validate() != nil ||
-		value.AgentInstanceID != "" || value.AgentGeneration != 0 || value.AgentSessionID != "" ||
-		value.CheckpointThroughSequence != -1 || len(value.CheckpointDigest) != 0 ||
+		value.Authorization.Version < 1 || value.Budget.Validate() != nil || (!freshAgent && !recoveringAgent) ||
 		!utf8.ValidString(value.Objective) || strings.TrimSpace(value.Objective) == "" || len(value.Objective) > cloudDSHMaxText {
 		return errors.New("dsh task is invalid or requires unsupported recovery")
 	}
@@ -112,57 +241,99 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	if err != nil {
 		return err
 	}
-	sessionID, err := randomCloudDSHID("session_")
-	if err != nil {
-		return err
+	sessionID := value.AgentSessionID
+	if freshAgent {
+		sessionID, err = randomCloudDSHID("session_")
+		if err != nil {
+			return err
+		}
 	}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
+	var accountRuntime *cloudDSHAccountRuntimeSession
+	var runtimeFence *app.AccountAgentRuntimeFence
+	if e.options.AccountRuntimes != nil {
+		accountRuntime, err = e.options.AccountRuntimes.Acquire(ctx, value.OwnerID)
+		if err != nil {
+			return err
+		}
+		fence := accountRuntime.runtime.Fence
+		runtimeFence = &fence
+	}
 	fence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, AgentInstanceID: instanceID,
 		AgentSessionID: sessionID, SupervisorID: e.options.SupervisorID, LeaseOwner: value.Lease.Owner,
 		LeaseVersion: value.Lease.Version, AuthorizationVersion: value.Authorization.Version,
 		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
-	lease, replayed, err := e.options.Instances.Start(ctx, app.AgentInstanceStart{Fence: fence, SupervisorNonce: nonce, LeaseDuration: app.MaxAgentLease})
+	lease, replayed, err := e.options.Instances.Start(ctx, app.AgentInstanceStart{Fence: fence, RuntimeFence: runtimeFence,
+		SupervisorNonce: nonce, LeaseDuration: app.MaxAgentLease})
 	if err != nil {
 		return err
 	}
 	fence.AgentGeneration = lease.Fence.AgentGeneration
-	if replayed || fence.AgentGeneration < 1 || lease.Fence != fence || !validCloudDSHLease(lease.ExpiresAt) {
+	if replayed || fence.AgentGeneration < 1 || lease.Fence != fence || !validCloudDSHLease(lease.ExpiresAt) ||
+		(accountRuntime != nil && (lease.RuntimeFence == nil || *lease.RuntimeFence != accountRuntime.runtime.Fence || lease.RuntimeSequence < 1)) {
 		return errors.New("dsh instance lease was not confirmed")
 	}
+	var completion app.CloudDSHTaskCompletion
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		receipt, err := e.options.Supervisor.Stop(stopCtx, fence, nonce)
-		if err == nil && (receipt.Fence != fence || subtle.ConstantTimeCompare(receipt.SupervisorNonce, nonce) != 1 || !receipt.TreeStopped) {
-			err = errors.New("supervisor returned an invalid process-tree stop receipt")
-		}
-		if err == nil {
-			_, err = e.options.Instances.ConfirmStopped(stopCtx, receipt)
-			if err == nil {
-				if finalizer, ok := e.options.Supervisor.(CloudDSHStopFinalizer); ok {
-					finalizer.AgentStopConfirmed(fence, nonce)
+		var stopErr error
+		if accountRuntime != nil {
+			stopErr = e.options.AccountRuntimes.StopTask(stopCtx, accountRuntime, fence)
+		} else {
+			receipt, err := e.options.Supervisor.Stop(stopCtx, fence, nonce)
+			stopErr = err
+			if stopErr == nil && (receipt.Fence != fence || subtle.ConstantTimeCompare(receipt.SupervisorNonce, nonce) != 1 || !receipt.TreeStopped) {
+				stopErr = errors.New("supervisor returned an invalid process-tree stop receipt")
+			}
+			if stopErr == nil {
+				_, stopErr = e.options.Instances.ConfirmStopped(stopCtx, receipt)
+				if stopErr == nil {
+					if finalizer, ok := e.options.Supervisor.(CloudDSHStopFinalizer); ok {
+						finalizer.AgentStopConfirmed(fence, nonce)
+					}
 				}
 			}
 		}
-		if err != nil {
+		if stopErr != nil {
 			if errors.Is(retErr, ErrCloudDSHCompletionPending) {
 				retErr = nil
 			}
 			retErr = errors.Join(retErr, errors.New("dsh process-tree stop is unconfirmed"))
+			return
+		}
+		if errors.Is(retErr, ErrCloudDSHCompletionPending) && e.options.Completion != nil {
+			if ctx.Err() != nil {
+				retErr = ctx.Err()
+				return
+			}
+			completeCtx, cancelComplete := context.WithTimeout(ctx, 30*time.Second)
+			defer cancelComplete()
+			if err := e.options.Completion.Complete(completeCtx, value, completion); err != nil {
+				retErr = err
+				return
+			}
+			retErr = nil
 		}
 	}()
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(value.Budget.ActiveSeconds)*time.Second)
 	defer cancel()
 	runCtx, cancelCause := context.WithCancelCause(runCtx)
 	defer cancelCause(nil)
-	input, output, err := e.options.Supervisor.Start(runCtx, CloudDSHLaunch{
-		NodePath: e.options.NodePath, ScriptPath: e.options.ScriptPath,
-		Environment: []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"},
-		Fence:       fence, Nonce: append([]byte(nil), nonce...), ExpiresAt: lease.ExpiresAt,
-	})
+	var input io.WriteCloser
+	var output io.ReadCloser
+	if accountRuntime != nil {
+		input, output, err = accountRuntime.StartTask(runCtx, fence, nonce, lease)
+	} else {
+		input, output, err = e.options.Supervisor.Start(runCtx, CloudDSHLaunch{
+			NodePath: e.options.NodePath, ScriptPath: e.options.ScriptPath,
+			Environment: []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"},
+			Fence:       fence, Nonce: append([]byte(nil), nonce...), ExpiresAt: lease.ExpiresAt,
+		})
+	}
 	if err != nil {
 		return errors.New("dsh supervisor could not start the process")
 	}
@@ -181,11 +352,18 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	renewDone := make(chan struct{})
 	go func() {
 		defer close(renewDone)
-		e.renewCloudDSHLease(runCtx, cancelCause, fence, lease.ExpiresAt)
+		e.renewCloudDSHLease(runCtx, cancelCause, fence, lease.ExpiresAt, accountRuntime)
 	}()
-	err = e.runCloudDSH(runCtx, value, fence, input, output)
+	err = e.runCloudDSH(runCtx, value, fence, input, output, recoveringAgent && value.CheckpointThroughSequence >= 0, &completion)
 	cancelCause(context.Canceled)
 	<-renewDone
+	if err != nil && !errors.Is(err, ErrCloudDSHCompletionPending) && recoveringAgent && ctx.Err() == nil {
+		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
+			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			err = errors.Join(err, recoveryTools.PauseRecovery(pauseCtx, value))
+			cancelPause()
+		}
+	}
 	if errors.Is(err, ErrCloudDSHCompletionPending) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -194,10 +372,14 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			return cause
 		}
 	}
+	if errors.Is(err, ErrCloudDSHWaitingForUser) {
+		return nil
+	}
 	return err
 }
 
-func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel context.CancelCauseFunc, fence app.AgentInstanceFence, expires time.Time) {
+func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel context.CancelCauseFunc, fence app.AgentInstanceFence, expires time.Time,
+	accountRuntime *cloudDSHAccountRuntimeSession) {
 	for {
 		delay := time.Until(expires) / 3
 		if delay <= 0 {
@@ -219,7 +401,9 @@ func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel contex
 		if err == nil && (lease.Fence != fence || !validCloudDSHLease(lease.ExpiresAt)) {
 			err = errors.New("invalid dsh instance renewal")
 		}
-		if err == nil {
+		if err == nil && accountRuntime != nil {
+			err = e.options.AccountRuntimes.RenewTask(renewCtx, accountRuntime, fence, lease.ExpiresAt)
+		} else if err == nil {
 			err = e.options.Supervisor.Renew(renewCtx, fence, lease.ExpiresAt)
 		}
 		cancelRenew()
@@ -265,8 +449,14 @@ type cloudDSHFrame struct {
 	Payload   string          `json:"payload,omitempty"`
 	SHA256    string          `json:"sha256,omitempty"`
 	Request   json.RawMessage `json:"request,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
 	State     string          `json:"state,omitempty"`
+	Status    string          `json:"status,omitempty"`
 	Code      string          `json:"code,omitempty"`
+	Summary   string          `json:"summary,omitempty"`
+	JobID     string          `json:"job_id,omitempty"`
 }
 
 type cloudDSHRead struct {
@@ -274,112 +464,11 @@ type cloudDSHRead struct {
 	err   error
 }
 
-func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence, input io.WriteCloser, output io.ReadCloser) error {
-	identity := cloudDSHIdentity{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentID: fence.AgentInstanceID,
-		SessionID: fence.AgentSessionID, Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion}
-	frames := make(chan cloudDSHRead, 1)
-	go readCloudDSHFrames(ctx, output, frames)
-	ready := false
-	through, lastModel := int64(-1), int64(-1)
-	checkpointIDs := make(map[string]struct{})
-	for {
-		var item cloudDSHRead
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case item = <-frames:
-		}
-		if item.err != nil {
-			return errors.New("dsh connection ended before a verified result")
-		}
-		frame, err := decodeCloudDSHFrame(item.frame)
-		if err != nil {
-			return err
-		}
-		if !ready {
-			if frame.Type != "ready" || frame.Version != 1 || frame.Engine != "dsh" || frame.EngineVer != cloudDSHEngineVersion {
-				return errors.New("dsh startup handshake is invalid")
-			}
-			maxTokens := value.Budget.ModelTokens
-			if maxTokens > 2048 {
-				maxTokens = 2048
-			}
-			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "start", "version": 1,
-				"task_id": identity.TaskID, "owner_id": identity.OwnerID, "agent_id": identity.AgentID,
-				"session_id": identity.SessionID, "generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
-				"model": value.ModelID, "prompt": value.Objective, "max_tokens": maxTokens}); err != nil {
-				return err
-			}
-			ready = true
-			continue
-		}
-		if frame.Type == "failed" {
-			return errors.New("dsh reported an unavailable runtime")
-		}
-		if frame.cloudDSHIdentity != identity {
-			return errors.New("dsh frame identity is invalid")
-		}
-		switch frame.Type {
-		case "checkpoint":
-			if !cloudDSHID.MatchString(frame.ID) || frame.From == nil || frame.Through == nil ||
-				*frame.From != through+1 || *frame.Through < *frame.From || *frame.Through > 1<<53-1 ||
-				len(frame.Payload) == 0 || len(frame.Payload) > 1<<20 || !utf8.ValidString(frame.Payload) ||
-				!uniqueCloudDSHJSON([]byte(frame.Payload)) || !cloudDSHDigest([]byte(frame.Payload), frame.SHA256) {
-				return errors.New("dsh checkpoint is invalid")
-			}
-			if _, exists := checkpointIDs[frame.ID]; exists || len(checkpointIDs) >= 4096 {
-				return errors.New("dsh checkpoint identity is repeated or exceeds the limit")
-			}
-			checkpointIDs[frame.ID] = struct{}{}
-			digest, _ := hex.DecodeString(frame.SHA256)
-			_, err := e.options.Checkpoints.Save(ctx, app.AgentCheckpointCommand{Fence: app.AgentCheckpointFence{
-				TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
-				AgentGeneration: fence.AgentGeneration, AgentSessionID: fence.AgentSessionID, AuthorizationVersion: fence.AuthorizationVersion,
-				LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion,
-			}, From: *frame.From, Through: *frame.Through, Digest: digest, Payload: []byte(frame.Payload)})
-			if err != nil {
-				return errors.New("dsh checkpoint was not durably confirmed")
-			}
-			through = *frame.Through
-			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "checkpoint_ack", "id": frame.ID,
-				"ok": true, "through_seq": through, "sha256": frame.SHA256}); err != nil {
-				return err
-			}
-		case "model":
-			if frame.Through == nil || *frame.Through != through || through <= lastModel || !cloudDSHDigest(frame.Request, frame.SHA256) ||
-				!validCloudDSHModelRequest(frame.Request, value.ModelID) {
-				return errors.New("dsh model request is invalid")
-			}
-			callID, err := app.DSHModelCallID(value.ID, identity.SessionID, through)
-			if err != nil || frame.ID != callID {
-				return errors.New("dsh model identity is invalid")
-			}
-			lastModel = through
-			response, err := e.options.Models.Complete(ctx, app.ModelCall{Source: app.ModelCallTask,
-				Task: &app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, LeaseOwner: fence.LeaseOwner,
-					LeaseVersion: fence.LeaseVersion, AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
-					AgentSessionID: fence.AgentSessionID, AuthorizationVersion: fence.AuthorizationVersion, ThroughSequence: through,
-					EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion},
-				ModelID: value.ModelID, CallID: frame.ID, RawRequest: append(json.RawMessage(nil), frame.Request...)})
-			if ctx.Err() != nil {
-				return context.Cause(ctx)
-			}
-			if err != nil || !response.Usage.Known || len(response.ToolCalls) != 0 || response.StopReason != "stop" ||
-				!utf8.ValidString(response.Text) || strings.TrimSpace(response.Text) == "" || len(response.Text) > cloudDSHMaxText {
-				return errors.New("dsh model result is unavailable or requires an unsupported tool")
-			}
-			if err := writeCloudDSHModel(ctx, input, frame.ID, response); err != nil {
-				return err
-			}
-		case "settled":
-			if frame.Through == nil || *frame.Through != through || through < 0 || lastModel < 0 || frame.State != "completed_candidate" {
-				return errors.New("dsh did not produce a completed candidate")
-			}
-			return ErrCloudDSHCompletionPending
-		default:
-			return errors.New("unsupported dsh frame")
-		}
-	}
+func checkpointFence(fence app.AgentInstanceFence) app.AgentCheckpointFence {
+	return app.AgentCheckpointFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
+		AgentGeneration: fence.AgentGeneration, AgentSessionID: fence.AgentSessionID, AgentRootSessionID: fence.AgentSessionID,
+		AuthorizationVersion: fence.AuthorizationVersion,
+		LeaseOwner:           fence.LeaseOwner, LeaseVersion: fence.LeaseVersion, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion}
 }
 
 func readCloudDSHFrames(ctx context.Context, source io.Reader, out chan<- cloudDSHRead) {
@@ -431,12 +520,17 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		return cloudDSHFrame{}, errors.New("invalid dsh frame fields")
 	}
 	fields := map[string][]string{
-		"ready":        {"type", "version", "engine", "engine_version"},
-		"checkpoint":   {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
-		"model":        {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
-		"model_cancel": {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
-		"settled":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "state", "through_seq"},
-		"failed":       {"type", "code"},
+		"ready":             {"type", "version", "engine", "engine_version"},
+		"checkpoint":        {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
+		"checkpoint_read":   {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
+		"model":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
+		"tool_call":         {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "name", "arguments"},
+		"child_create":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "arguments"},
+		"child_settle":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "status", "sha256", "summary"},
+		"job_cancel_result": {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "job_id", "status"},
+		"model_cancel":      {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
+		"settled":           {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "state", "through_seq"},
+		"failed":            {"type", "code"},
 	}
 	required, ok := fields[frame.Type]
 	if !ok || len(keys) != len(required) {
@@ -510,33 +604,229 @@ func cloudDSHDigest(data []byte, encoded string) bool {
 	return subtle.ConstantTimeCompare(sum[:], want) == 1
 }
 
-func validCloudDSHModelRequest(raw []byte, modelID string) bool {
-	var request struct {
-		Provider string            `json:"provider"`
-		Model    string            `json:"model"`
-		Tools    []json.RawMessage `json:"tools"`
-		Messages []struct {
-			Role    string `json:"role"`
-			Content []struct {
-				Type string `json:"type"`
-			} `json:"content"`
-		} `json:"messages"`
+func cloudDSHToolPayload(definitions []app.AgentToolDefinition) []map[string]any {
+	tools := make([]map[string]any, 0, len(definitions))
+	for _, definition := range definitions {
+		tools = append(tools, map[string]any{
+			"name": definition.Name, "description": definition.Description, "parameters": definition.Parameters,
+		})
 	}
-	if !uniqueCloudDSHJSON(raw) || json.Unmarshal(raw, &request) != nil || request.Provider != "morde" ||
-		request.Model != modelID || request.Tools == nil || len(request.Tools) != 0 || len(request.Messages) == 0 {
+	return tools
+}
+
+func validCloudDSHToolDefinitions(definitions []app.AgentToolDefinition) bool {
+	if len(definitions) > 64 {
 		return false
 	}
+	seen := make(map[string]struct{}, len(definitions))
+	for _, definition := range definitions {
+		if !cloudDSHID.MatchString(definition.Name) || !utf8.ValidString(definition.Description) ||
+			strings.TrimSpace(definition.Description) == "" || len(definition.Description) > 2048 ||
+			len(definition.Parameters) == 0 || len(definition.Parameters) > 64<<10 || !uniqueCloudDSHJSON(definition.Parameters) {
+			return false
+		}
+		var schema struct {
+			Type                 string          `json:"type"`
+			Properties           json.RawMessage `json:"properties"`
+			AdditionalProperties *bool           `json:"additionalProperties"`
+		}
+		if json.Unmarshal(definition.Parameters, &schema) != nil || schema.Type != "object" ||
+			len(schema.Properties) == 0 || string(schema.Properties) == "null" ||
+			schema.AdditionalProperties == nil || *schema.AdditionalProperties {
+			return false
+		}
+		if _, exists := seen[definition.Name]; exists {
+			return false
+		}
+		seen[definition.Name] = struct{}{}
+	}
+	return true
+}
+
+func validCloudDSHModelRequest(raw []byte, modelID string, definitions []app.AgentToolDefinition) bool {
+	type modelTool struct {
+		Name         string          `json:"name"`
+		Description  string          `json:"description"`
+		Parameters   json.RawMessage `json:"parameters"`
+		DeferLoading bool            `json:"deferLoading"`
+	}
+	type modelBlock struct {
+		Type       string          `json:"type"`
+		Text       string          `json:"text"`
+		ID         string          `json:"id"`
+		Name       string          `json:"name"`
+		Arguments  string          `json:"arguments"`
+		Attachment json.RawMessage `json:"attachment"`
+	}
+	type modelMessage struct {
+		ID         string          `json:"id"`
+		Role       string          `json:"role"`
+		Source     json.RawMessage `json:"source"`
+		Content    []modelBlock    `json:"content"`
+		ToolCallID string          `json:"toolCallId"`
+		IsError    bool            `json:"isError"`
+	}
+	var request struct {
+		Provider    string            `json:"provider"`
+		Model       string            `json:"model"`
+		Tools       []json.RawMessage `json:"tools"`
+		Messages    []modelMessage    `json:"messages"`
+		MaxTokens   *int              `json:"max_tokens"`
+		Temperature *float64          `json:"temperature"`
+	}
+	if !validCloudDSHToolDefinitions(definitions) || !uniqueCloudDSHJSON(raw) {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF || request.Provider != "morde" ||
+		request.Model != modelID || request.Tools == nil || len(request.Tools) != len(definitions) || len(request.Messages) == 0 {
+		return false
+	}
+	expectedTools := make(map[string]app.AgentToolDefinition, len(definitions))
+	for _, definition := range definitions {
+		expectedTools[definition.Name] = definition
+	}
+	allowed := make(map[string]struct{}, len(definitions))
+	imageCount, imageBytes := 0, 0
+	for _, rawTool := range request.Tools {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(rawTool, &fields) != nil || (len(fields) != 3 && len(fields) != 4) {
+			return false
+		}
+		for key := range fields {
+			if key != "name" && key != "description" && key != "parameters" && key != "deferLoading" {
+				return false
+			}
+		}
+		for _, key := range []string{"name", "description", "parameters"} {
+			if _, ok := fields[key]; !ok {
+				return false
+			}
+		}
+		if _, ok := fields["deferLoading"]; ok {
+			var deferred bool
+			if json.Unmarshal(fields["deferLoading"], &deferred) != nil || deferred {
+				return false
+			}
+		}
+		var offered modelTool
+		if json.Unmarshal(rawTool, &offered) != nil || offered.DeferLoading {
+			return false
+		}
+		definition, ok := expectedTools[offered.Name]
+		if !ok || offered.Description != definition.Description {
+			return false
+		}
+		if _, duplicate := allowed[offered.Name]; duplicate {
+			return false
+		}
+		parameters, ok := canonicalCloudDSHJSON(offered.Parameters)
+		if !ok {
+			return false
+		}
+		want, ok := canonicalCloudDSHJSON(definition.Parameters)
+		if !ok || !bytes.Equal(parameters, want) {
+			return false
+		}
+		allowed[offered.Name] = struct{}{}
+	}
 	for _, message := range request.Messages {
-		if message.Role != "system" && message.Role != "developer" && message.Role != "user" && message.Role != "assistant" {
+		if message.Role != "system" && message.Role != "developer" && message.Role != "user" && message.Role != "assistant" && message.Role != "tool" {
+			return false
+		}
+		if message.Role == "tool" {
+			if message.ToolCallID == "" || !cloudDSHID.MatchString(message.ToolCallID) {
+				return false
+			}
+		} else if message.ToolCallID != "" || message.IsError {
 			return false
 		}
 		for _, block := range message.Content {
-			if block.Type != "text" {
+			switch block.Type {
+			case "text":
+			case "tool-call":
+				if message.Role != "assistant" || !cloudDSHID.MatchString(block.ID) {
+					return false
+				}
+				if _, ok := allowed[block.Name]; !ok || !validCloudDSHJSONObject([]byte(block.Arguments)) {
+					return false
+				}
+			case "image":
+				if message.Role != "tool" || message.ToolCallID == "" || len(block.Attachment) == 0 {
+					return false
+				}
+				_, data, err := decodeCloudDSHImageAttachment(block.Attachment)
+				if err != nil {
+					return false
+				}
+				imageCount++
+				imageBytes += len(data)
+				if imageCount > cloudDSHMaxModelImageCount || imageBytes > cloudDSHMaxModelImageBytes {
+					return false
+				}
+			default:
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func canonicalCloudDSHJSON(raw []byte) ([]byte, bool) {
+	if !uniqueCloudDSHJSON(raw) {
+		return nil, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil || decoder.Decode(new(any)) != io.EOF {
+		return nil, false
+	}
+	encoded, err := json.Marshal(value)
+	return encoded, err == nil
+}
+
+func validCloudDSHJSONObject(raw []byte) bool {
+	if len(raw) == 0 || len(raw) > 64<<10 || !uniqueCloudDSHJSON(raw) {
+		return false
+	}
+	var value map[string]json.RawMessage
+	return json.Unmarshal(raw, &value) == nil && value != nil
+}
+
+func validCloudDSHModelResponse(response app.ModelResponse, definitions []app.AgentToolDefinition) bool {
+	if !response.Usage.Known || response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
+		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 ||
+		!utf8.ValidString(response.Text) || len(response.Text) > cloudDSHMaxText || len(response.ToolCalls) > 64 {
+		return false
+	}
+	if len(response.ToolCalls) == 0 {
+		return response.StopReason == "stop" && strings.TrimSpace(response.Text) != ""
+	}
+	if response.StopReason != "tool_calls" || len(definitions) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(response.ToolCalls))
+	for _, call := range response.ToolCalls {
+		if !cloudDSHID.MatchString(call.CallID) || !cloudDSHToolAllowed(definitions, call.Name) || !validCloudDSHJSONObject([]byte(call.Arguments)) {
+			return false
+		}
+		if _, exists := seen[call.CallID]; exists {
+			return false
+		}
+		seen[call.CallID] = struct{}{}
+	}
+	return true
+}
+
+func cloudDSHToolAllowed(definitions []app.AgentToolDefinition, name string) bool {
+	for _, definition := range definitions {
+		if definition.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func writeCloudDSHFrame(ctx context.Context, target io.WriteCloser, frame any) error {
@@ -577,16 +867,30 @@ func writeCloudDSHFrame(ctx context.Context, target io.WriteCloser, frame any) e
 
 func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, response app.ModelResponse) error {
 	if response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
-		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 {
+		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 ||
+		(len(response.ToolCalls) == 0 && response.StopReason != "stop") || (len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") {
 		return errors.New("dsh model usage is invalid")
 	}
-	chunks := []any{
-		map[string]any{"type": "block-start", "index": 0, "blockType": "text"},
-		map[string]any{"type": "text-delta", "index": 0, "text": response.Text},
-		map[string]any{"type": "block-end", "index": 0, "block": map[string]any{"type": "text", "text": response.Text}},
-		map[string]any{"type": "usage", "usage": map[string]any{"inputTokens": response.Usage.InputTokens, "outputTokens": response.Usage.OutputTokens}},
-		map[string]any{"type": "finish", "reason": map[string]any{"kind": "stop"}},
+	chunks := make([]any, 0, 4+len(response.ToolCalls))
+	if response.Text != "" {
+		chunks = append(chunks,
+			map[string]any{"type": "block-start", "index": 0, "blockType": "text"},
+			map[string]any{"type": "text-delta", "index": 0, "text": response.Text},
+			map[string]any{"type": "block-end", "index": 0, "block": map[string]any{"type": "text", "text": response.Text}},
+		)
 	}
+	for index, call := range response.ToolCalls {
+		chunks = append(chunks, map[string]any{"type": "tool-call-delta", "index": index,
+			"id": call.CallID, "name": call.Name, "argumentsDelta": call.Arguments})
+	}
+	finishReason := "stop"
+	if len(response.ToolCalls) > 0 {
+		finishReason = "tool-calls"
+	}
+	chunks = append(chunks,
+		map[string]any{"type": "usage", "usage": map[string]any{"inputTokens": response.Usage.InputTokens, "outputTokens": response.Usage.OutputTokens}},
+		map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}},
+	)
 	for index, chunk := range chunks {
 		if err := writeCloudDSHFrame(ctx, target, map[string]any{"type": "model_chunk", "id": id, "index": index, "chunk": chunk}); err != nil {
 			return err

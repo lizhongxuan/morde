@@ -2,7 +2,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -44,14 +47,30 @@ func (s *Store) ListHostMembers(ctx context.Context, hostID, ownerID string) ([]
 }
 
 func (s *Store) RevokeHostMember(ctx context.Context, hostID, ownerID, userID string) error {
-	rows, err := s.q.RevokeHostMember(ctx, sqlcgen.RevokeHostMemberParams{HostID: hostID, OwnerID: ownerID, UserID: userID})
-	if err != nil {
-		return fmt.Errorf("revoke host member: %w", err)
-	}
-	if rows == 0 {
-		return domain.NewError(domain.CodeNotFound, "host member not found")
-	}
-	return nil
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
+			return err
+		}
+		var hostOwnerID string
+		err := tx.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, hostID, ownerID).Scan(&hostOwnerID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "host member not found")
+		}
+		if err != nil {
+			return fmt.Errorf("lock host for member revocation: %w", err)
+		}
+		if err := requestMCPRuntimeCancellationsForHostMember(ctx, tx, hostOwnerID, userID, hostID); err != nil {
+			return err
+		}
+		rows, err := sqlcgen.New(tx).RevokeHostMember(ctx, sqlcgen.RevokeHostMemberParams{HostID: hostID, OwnerID: ownerID, UserID: userID})
+		if err != nil {
+			return fmt.Errorf("revoke host member: %w", err)
+		}
+		if rows == 0 {
+			return domain.NewError(domain.CodeNotFound, "host member not found")
+		}
+		return nil
+	})
 }
 
 func (s *Store) ListSharedHosts(ctx context.Context, userID string) ([]host.SharedHost, error) {

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -11,13 +12,14 @@ import (
 )
 
 type taskLeaseStoreStub struct {
-	claim      func(context.Context, string, time.Duration) (task.Task, bool, error)
-	renew      func(context.Context, string, string, int64, time.Duration) (task.Task, error)
-	mu         sync.Mutex
-	claims     int
-	renews     int
-	claimCalls chan struct{}
-	renewCalls chan struct{}
+	claim               func(context.Context, string, time.Duration) (task.Task, bool, error)
+	claimWithOwnerLimit func(context.Context, string, time.Duration, int) (task.Task, bool, error)
+	renew               func(context.Context, string, string, int64, time.Duration) (task.Task, error)
+	mu                  sync.Mutex
+	claims              int
+	renews              int
+	claimCalls          chan struct{}
+	renewCalls          chan struct{}
 }
 
 func (s *taskLeaseStoreStub) ClaimNextTask(ctx context.Context, workerID string, lease time.Duration) (task.Task, bool, error) {
@@ -29,6 +31,25 @@ func (s *taskLeaseStoreStub) ClaimNextTask(ctx context.Context, workerID string,
 		case s.claimCalls <- struct{}{}:
 		default:
 		}
+	}
+	if s.claim != nil {
+		return s.claim(ctx, workerID, lease)
+	}
+	return task.Task{}, false, nil
+}
+
+func (s *taskLeaseStoreStub) ClaimNextTaskWithOwnerLimit(ctx context.Context, workerID string, lease time.Duration, limit int) (task.Task, bool, error) {
+	s.mu.Lock()
+	s.claims++
+	s.mu.Unlock()
+	if s.claimCalls != nil {
+		select {
+		case s.claimCalls <- struct{}{}:
+		default:
+		}
+	}
+	if s.claimWithOwnerLimit != nil {
+		return s.claimWithOwnerLimit(ctx, workerID, lease, limit)
 	}
 	if s.claim != nil {
 		return s.claim(ctx, workerID, lease)
@@ -362,5 +383,102 @@ func TestNewTaskWorkerUsesNonZeroRenewIntervalForShortLease(t *testing.T) {
 	}), time.Millisecond, time.Second)
 	if worker.renewInterval < time.Millisecond {
 		t.Fatalf("renew interval = %s, want at least 1ms", worker.renewInterval)
+	}
+}
+
+func TestTaskWorkerRunsTasksConcurrentlyWithinConfiguredLimit(t *testing.T) {
+	store := &taskLeaseStoreStub{}
+	var next int
+	store.claimWithOwnerLimit = func(_ context.Context, workerID string, _ time.Duration, ownerLimit int) (task.Task, bool, error) {
+		if ownerLimit != 2 {
+			t.Errorf("per-owner task limit = %d, want 2", ownerLimit)
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		next++
+		if next > 2 {
+			return task.Task{}, false, nil
+		}
+		claim := validTaskClaim(workerID)
+		claim.ID = fmt.Sprintf("task-%d", next)
+		return claim, true, nil
+	}
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	worker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: store, Executor: taskExecutorFunc(func(ctx context.Context, value task.Task) error {
+			started <- value.ID
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}), WorkerID: "worker-test", LeaseDuration: time.Second, PollInterval: time.Millisecond,
+		MaxConcurrentTasks: 2, MaxConcurrentTasksPerOwner: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewTaskWorker() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTaskWorker(ctx, worker)
+	first := receiveTaskWorkerStart(t, started)
+	second := receiveTaskWorkerStart(t, started)
+	if first == second {
+		t.Fatalf("worker started duplicate Task %q", first)
+	}
+	close(release)
+	cancel()
+	if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+func receiveTaskWorkerStart(t *testing.T, started <-chan string) string {
+	t.Helper()
+	select {
+	case taskID := <-started:
+		return taskID
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not execute tasks concurrently")
+		return ""
+	}
+}
+
+func TestNewTaskWorkerRejectsNegativeConcurrencyLimits(t *testing.T) {
+	store := &taskLeaseStoreStub{}
+	executor := taskExecutorFunc(func(context.Context, task.Task) error { return nil })
+	for _, options := range []TaskWorkerOptions{
+		{Store: store, Executor: executor, WorkerID: "worker", LeaseDuration: time.Second, PollInterval: time.Second, MaxConcurrentTasks: -1},
+		{Store: store, Executor: executor, WorkerID: "worker", LeaseDuration: time.Second, PollInterval: time.Second, MaxConcurrentTasksPerOwner: -1},
+	} {
+		if _, err := NewTaskWorker(options); err == nil {
+			t.Fatalf("NewTaskWorker(%#v) succeeded, want validation error", options)
+		}
+	}
+}
+
+func TestTaskWorkerLifecycleFailureCancelsClaimLoops(t *testing.T) {
+	started := make(chan struct{})
+	var once sync.Once
+	store := &taskLeaseStoreStub{claimWithOwnerLimit: func(ctx context.Context, _ string, _ time.Duration, _ int) (task.Task, bool, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		return task.Task{}, false, ctx.Err()
+	}}
+	lifecycleErr := errors.New("runtime reaper failed")
+	worker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: store, Executor: taskExecutorFunc(func(context.Context, task.Task) error { return nil }),
+		WorkerID: "worker-test", LeaseDuration: time.Second, PollInterval: time.Millisecond,
+		Lifecycle: func(context.Context) error {
+			<-started
+			return lifecycleErr
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Run(context.Background()); !errors.Is(err, lifecycleErr) {
+		t.Fatalf("Run() error = %v, want lifecycle failure", err)
 	}
 }

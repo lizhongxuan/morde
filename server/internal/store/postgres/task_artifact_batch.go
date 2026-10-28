@@ -50,7 +50,7 @@ func (s *Store) ListUnknownOperations(ctx context.Context, ownerID, taskID strin
 		if !exists {
 			return missingTaskError()
 		}
-		rows, err := tx.Query(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version,
+		rows, err := tx.Query(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision,
 o.runtime_generation, o.runtime_instance_id, o.control_version, o.lease_version, o.runtime_lease_version, o.status, o.external_id, o.result, o.created_at, o.updated_at
 FROM task_operations o JOIN tasks t ON t.id=o.task_id
 WHERE o.task_id=$1 AND t.owner_id=$2 AND o.status='unknown'
@@ -62,7 +62,7 @@ ORDER BY o.created_at, o.operation_key`, taskID, ownerID)
 		for rows.Next() {
 			var row sqlcgen.TaskOperation
 			if err := rows.Scan(&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID,
-				&row.WorkspaceID, &row.BindingVersion, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion,
+				&row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion,
 				&row.RuntimeLeaseVersion, &row.Status, &row.ExternalID,
 				&row.Result, &row.CreatedAt, &row.UpdatedAt); err != nil {
 				return fmt.Errorf("read unknown task operation: %w", err)
@@ -232,6 +232,9 @@ FROM task_batch_items WHERE task_id=$1`, taskID).Scan(&totalItems, &nonTerminalI
 		if totalItems == 0 || nonTerminalItems != 0 {
 			return domain.NewError(domain.CodeInvalidState, "all other batch items must be terminal before retry")
 		}
+		if _, err := tx.Exec(ctx, `DELETE FROM task_artifacts WHERE task_id=$1 AND batch_item_id=$2`, taskID, batchItemID); err != nil {
+			return fmt.Errorf("discard artifacts from failed batch attempt: %w", err)
+		}
 		var unresolvedOperations bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM task_operations WHERE task_id=$1 AND status IN ('dispatched','unknown')
@@ -290,11 +293,13 @@ WHERE id=$1`, taskID); err != nil {
 	return nil
 }
 
-// RecordValidatedArtifact persists metadata only. The caller must first validate
-// that Path is Workspace-relative and that the runtime created it.
+// RecordValidatedArtifact persists a batch artifact with a proof of its
+// committed Workspace revision. Runtime and block readback occur in the app;
+// this transaction rechecks the immutable manifest before accepting the row.
 func (s *Store) RecordValidatedArtifact(ctx context.Context, ownerID string, artifact task.Artifact, leaseOwner string, leaseVersion int64) (task.Artifact, error) {
 	if !domain.ValidUserID(ownerID) || !domain.ValidArtifactID(artifact.ID) || !domain.ValidTaskID(artifact.TaskID) || !domain.ValidStepID(artifact.StepID) ||
 		strings.TrimSpace(artifact.Label) == "" || !validWorkspaceRelativeArtifactPath(artifact.Path) || leaseOwner == "" || leaseVersion < 1 ||
+		!validTaskArtifactProof(artifact) ||
 		(artifact.BatchItemID == "" && artifact.BatchAttempt != 0) ||
 		(artifact.BatchItemID != "" && (!domain.ValidBatchItemID(artifact.BatchItemID) || artifact.BatchAttempt < 1)) {
 		return task.Artifact{}, domain.InvalidArgument("artifact", "validated artifact metadata is invalid")
@@ -331,94 +336,177 @@ func (s *Store) RecordValidatedArtifact(ctx context.Context, ownerID string, art
 				return domain.NewError(domain.CodeInvalidState, "artifact batch attempt does not match the current item attempt")
 			}
 		}
-
-		var current sqlcgen.TaskArtifact
-		current, err = loadTaskArtifactByPath(ctx, tx, artifact)
-		if err == nil {
-			if !sameArtifact(current, artifact) {
-				return domain.NewError(domain.CodeInvalidState, "artifact path already has different metadata")
-			}
-			result = taskArtifactDomain(current)
-			return nil
+		if err := validateTaskArtifactWorkspaceProof(ctx, tx, ownerID, artifact); err != nil {
+			return err
 		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("check existing artifact path: %w", err)
-		}
-		err = scanTaskArtifact(tx.QueryRow(ctx, `SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt
-FROM task_artifacts WHERE id=$1 FOR UPDATE`, artifact.ID), &current)
-		if err == nil {
-			if !sameArtifact(current, artifact) {
-				return domain.NewError(domain.CodeInvalidState, "artifact identity cannot be changed")
-			}
-			result = taskArtifactDomain(current)
-			return nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("check existing artifact metadata: %w", err)
-		}
-		inserted, err := tx.Exec(ctx, `INSERT INTO task_artifacts (id, task_id, step_id, label, path, media_type, batch_item_id, batch_attempt)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
-			artifact.ID, artifact.TaskID, artifact.StepID, artifact.Label, artifact.Path, artifact.MediaType,
-			nullableBatchItemID(artifact.BatchItemID), nullableBatchAttempt(artifact.BatchItemID, artifact.BatchAttempt))
-		if err != nil {
-			return fmt.Errorf("record validated artifact metadata: %w", err)
-		}
-		if inserted.RowsAffected() == 0 {
-			// A concurrent insert may have won the scoped path identity or the
-			// globally unique artifact ID. Only replay the former when its metadata
-			// exactly matches; never disclose a row reached by artifact ID alone.
-			current, err = loadTaskArtifactByPath(ctx, tx, artifact)
-			if err == nil {
-				if !sameArtifact(current, artifact) {
-					return domain.NewError(domain.CodeInvalidState, "artifact path already has different metadata")
-				}
-				result = taskArtifactDomain(current)
-				return nil
-			}
-			if !errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("read artifact path after conflict: %w", err)
-			}
-			return domain.NewError(domain.CodeInvalidState, "artifact identity is already in use")
-		}
-		if err := scanTaskArtifact(tx.QueryRow(ctx, `SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt
-FROM task_artifacts WHERE id=$1`, artifact.ID), &current); err != nil {
-			return fmt.Errorf("read recorded artifact metadata: %w", err)
-		}
-		payloadFields := map[string]any{
-			"artifact_id": artifact.ID,
-			"step_id":     artifact.StepID,
-			"label":       artifact.Label,
-			"media_type":  artifact.MediaType,
-			"path":        artifact.Path,
-		}
-		if artifact.BatchItemID != "" {
-			payloadFields["batch_item_id"] = artifact.BatchItemID
-			payloadFields["batch_attempt"] = artifact.BatchAttempt
-		}
-		payload, err := json.Marshal(payloadFields)
-		if err != nil {
-			return fmt.Errorf("encode artifact event: %w", err)
-		}
-		sequence, err := incrementTaskEventSequence(ctx, tx, artifact.TaskID)
+		result, err = recordTaskArtifactTx(ctx, tx, artifact)
 		if err != nil {
 			return err
 		}
-		if err := insertTaskEvent(ctx, tx, task.Event{TaskID: artifact.TaskID, Sequence: sequence, Type: "task.artifact", Payload: payload}); err != nil {
-			return err
-		}
-		result = taskArtifactDomain(current)
 		return nil
 	})
 	return result, err
 }
 
+func validTaskArtifactProof(artifact task.Artifact) bool {
+	return domain.ValidWorkspaceID(artifact.WorkspaceID) && artifact.Revision >= 0 && artifact.SizeBytes >= 0 && validPostgresSHA256(artifact.SHA256)
+}
+
+func validateTaskArtifactWorkspaceProof(ctx context.Context, tx pgx.Tx, ownerID string, artifact task.Artifact) error {
+	if !validTaskArtifactProof(artifact) {
+		return domain.InvalidArgument("artifact.proof", "workspace artifact proof fields are invalid")
+	}
+	var matches bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1
+  FROM tasks t
+  JOIN workspaces w ON w.id=$3 AND w.owner_id=t.owner_id AND w.deleted_at IS NULL
+  JOIN workspace_revision_files f ON f.workspace_id=$3 AND f.file_path=$4
+    AND f.valid_from_revision <= $5 AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $5)
+    AND f.size_bytes=$6 AND f.sha256=$7
+  WHERE t.id=$1 AND t.owner_id=$2 AND t.workspace_id=$3
+)`, artifact.TaskID, ownerID, artifact.WorkspaceID, artifact.Path, artifact.Revision, artifact.SizeBytes, artifact.SHA256).Scan(&matches)
+	if err != nil {
+		return fmt.Errorf("verify task artifact workspace manifest proof: %w", err)
+	}
+	if !matches {
+		return domain.NewError(domain.CodeInvalidState, "artifact proof does not match a committed Task Workspace revision")
+	}
+	return nil
+}
+
+func recordTaskArtifactTx(ctx context.Context, tx pgx.Tx, artifact task.Artifact) (task.Artifact, error) {
+	var current sqlcgen.TaskArtifact
+	current, err := loadTaskArtifactByPath(ctx, tx, artifact)
+	if err == nil {
+		if !sameArtifact(current, artifact) {
+			return task.Artifact{}, domain.NewError(domain.CodeInvalidState, "artifact path already has different metadata")
+		}
+		return taskArtifactDomain(current), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return task.Artifact{}, fmt.Errorf("check existing artifact path: %w", err)
+	}
+	err = scanTaskArtifact(tx.QueryRow(ctx, `SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt,
+workspace_id, workspace_revision, size_bytes, sha256
+FROM task_artifacts WHERE id=$1 FOR UPDATE`, artifact.ID), &current)
+	if err == nil {
+		if !sameArtifact(current, artifact) {
+			return task.Artifact{}, domain.NewError(domain.CodeInvalidState, "artifact identity cannot be changed")
+		}
+		return taskArtifactDomain(current), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return task.Artifact{}, fmt.Errorf("check existing artifact metadata: %w", err)
+	}
+	inserted, err := tx.Exec(ctx, `INSERT INTO task_artifacts
+(id, task_id, step_id, label, path, media_type, batch_item_id, batch_attempt, workspace_id, workspace_revision, size_bytes, sha256)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`,
+		artifact.ID, artifact.TaskID, artifact.StepID, artifact.Label, artifact.Path, artifact.MediaType,
+		nullableBatchItemID(artifact.BatchItemID), nullableBatchAttempt(artifact.BatchItemID, artifact.BatchAttempt),
+		artifact.WorkspaceID, artifact.Revision, artifact.SizeBytes, artifact.SHA256)
+	if err != nil {
+		return task.Artifact{}, fmt.Errorf("record validated artifact proof: %w", err)
+	}
+	if inserted.RowsAffected() == 0 {
+		current, err = loadTaskArtifactByPath(ctx, tx, artifact)
+		if err == nil && sameArtifact(current, artifact) {
+			return taskArtifactDomain(current), nil
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return task.Artifact{}, fmt.Errorf("read artifact path after conflict: %w", err)
+		}
+		return task.Artifact{}, domain.NewError(domain.CodeInvalidState, "artifact identity is already in use")
+	}
+	if err := scanTaskArtifact(tx.QueryRow(ctx, `SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt,
+workspace_id, workspace_revision, size_bytes, sha256
+FROM task_artifacts WHERE id=$1`, artifact.ID), &current); err != nil {
+		return task.Artifact{}, fmt.Errorf("read recorded artifact proof: %w", err)
+	}
+	payloadFields := map[string]any{
+		"artifact_id": artifact.ID, "step_id": artifact.StepID, "label": artifact.Label,
+		"media_type": artifact.MediaType, "path": artifact.Path, "workspace_id": artifact.WorkspaceID,
+		"revision": artifact.Revision, "size_bytes": artifact.SizeBytes, "sha256": artifact.SHA256,
+	}
+	if artifact.BatchItemID != "" {
+		payloadFields["batch_item_id"] = artifact.BatchItemID
+		payloadFields["batch_attempt"] = artifact.BatchAttempt
+	}
+	payload, err := json.Marshal(payloadFields)
+	if err != nil {
+		return task.Artifact{}, fmt.Errorf("encode artifact event: %w", err)
+	}
+	sequence, err := incrementTaskEventSequence(ctx, tx, artifact.TaskID)
+	if err != nil {
+		return task.Artifact{}, err
+	}
+	if err := insertTaskEvent(ctx, tx, task.Event{TaskID: artifact.TaskID, Sequence: sequence, Type: "task.artifact", Payload: payload}); err != nil {
+		return task.Artifact{}, err
+	}
+	return taskArtifactDomain(current), nil
+}
+
+func persistTaskProgressArtifacts(ctx context.Context, tx pgx.Tx, ownerID, taskID string, artifacts []task.Artifact) error {
+	if len(artifacts) > 64 {
+		return domain.InvalidArgument("artifacts", "task artifact count exceeds the limit")
+	}
+	seen := make(map[string]struct{}, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact.TaskID != taskID || !domain.ValidArtifactID(artifact.ID) || !domain.ValidStepID(artifact.StepID) ||
+			strings.TrimSpace(artifact.Label) == "" || !validWorkspaceRelativeArtifactPath(artifact.Path) || !validTaskArtifactProof(artifact) ||
+			(artifact.BatchItemID == "" && artifact.BatchAttempt != 0) ||
+			(artifact.BatchItemID != "" && (!domain.ValidBatchItemID(artifact.BatchItemID) || artifact.BatchAttempt < 1)) {
+			return domain.InvalidArgument("artifacts", "task artifact fields are invalid")
+		}
+		key := artifact.BatchItemID + "\x00" + fmt.Sprint(artifact.BatchAttempt) + "\x00" + artifact.Path
+		if _, duplicate := seen[key]; duplicate {
+			return domain.InvalidArgument("artifacts", "task artifact paths must be unique")
+		}
+		seen[key] = struct{}{}
+		if err := validateTaskArtifactWorkspaceProof(ctx, tx, ownerID, artifact); err != nil {
+			return err
+		}
+		if _, err := recordTaskArtifactTx(ctx, tx, artifact); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCompletedTaskArtifacts(ctx context.Context, tx pgx.Tx, ownerID, taskID string) error {
+	var invalid bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1
+  FROM task_artifacts a
+  JOIN tasks t ON t.id=a.task_id AND t.owner_id=$2
+  LEFT JOIN workspaces w ON w.id=a.workspace_id AND w.owner_id=t.owner_id AND w.deleted_at IS NULL
+  LEFT JOIN workspace_revision_files f ON f.workspace_id=a.workspace_id AND f.file_path=a.path
+    AND f.valid_from_revision <= a.workspace_revision
+    AND (f.valid_to_revision IS NULL OR f.valid_to_revision > a.workspace_revision)
+    AND f.size_bytes=a.size_bytes AND f.sha256=a.sha256
+  LEFT JOIN task_batch_items bi ON bi.task_id=a.task_id AND bi.id=a.batch_item_id
+  WHERE a.task_id=$1 AND (
+    a.workspace_id IS NULL OR a.workspace_revision IS NULL OR a.size_bytes IS NULL OR a.sha256 IS NULL
+    OR t.workspace_id IS NULL OR a.workspace_id <> t.workspace_id OR w.id IS NULL OR f.file_path IS NULL
+    OR (a.batch_item_id IS NOT NULL AND (bi.id IS NULL OR bi.attempt <> a.batch_attempt OR bi.status <> 'succeeded'))
+  )
+)`, taskID, ownerID).Scan(&invalid)
+	if err != nil {
+		return fmt.Errorf("verify completed task artifact proofs: %w", err)
+	}
+	if invalid {
+		return domain.NewError(domain.CodeInvalidState, "task cannot complete with an unproved or stale Workspace artifact")
+	}
+	return nil
+}
+
 func loadOwnedOperationByKey(ctx context.Context, tx pgx.Tx, ownerID, taskID, key string) (task.Operation, error) {
 	var row sqlcgen.TaskOperation
-	err := tx.QueryRow(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version,
+	err := tx.QueryRow(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision,
 o.runtime_generation, o.runtime_instance_id, o.control_version, o.lease_version, o.runtime_lease_version, o.status, o.external_id, o.result, o.created_at, o.updated_at
 FROM task_operations o JOIN tasks t ON t.id=o.task_id
 WHERE t.owner_id=$1 AND o.task_id=$2 AND o.operation_key=$3`, ownerID, taskID, key).Scan(
-		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion, &row.RuntimeGeneration,
+		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.RuntimeGeneration,
 		&row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status,
 		&row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
@@ -482,17 +570,21 @@ func sameArtifact(current sqlcgen.TaskArtifact, candidate task.Artifact) bool {
 	}
 	return current.TaskID == candidate.TaskID && current.StepID == candidate.StepID && current.Label == candidate.Label &&
 		current.Path == candidate.Path && current.MediaType == candidate.MediaType && batchItemID == candidate.BatchItemID &&
-		batchAttempt == candidate.BatchAttempt
+		batchAttempt == candidate.BatchAttempt && current.WorkspaceID.Valid && current.WorkspaceID.String == candidate.WorkspaceID &&
+		current.WorkspaceRevision.Valid && current.WorkspaceRevision.Int64 == candidate.Revision &&
+		current.SizeBytes.Valid && current.SizeBytes.Int64 == candidate.SizeBytes && current.Sha256.Valid && current.Sha256.String == candidate.SHA256
 }
 
 func scanTaskArtifact(row pgx.Row, result *sqlcgen.TaskArtifact) error {
 	return row.Scan(&result.ID, &result.TaskID, &result.StepID, &result.Label, &result.Path,
-		&result.MediaType, &result.CreatedAt, &result.BatchItemID, &result.BatchAttempt)
+		&result.MediaType, &result.CreatedAt, &result.BatchItemID, &result.BatchAttempt, &result.WorkspaceID,
+		&result.WorkspaceRevision, &result.SizeBytes, &result.Sha256)
 }
 
 func loadTaskArtifactByPath(ctx context.Context, tx pgx.Tx, candidate task.Artifact) (sqlcgen.TaskArtifact, error) {
 	var result sqlcgen.TaskArtifact
-	err := scanTaskArtifact(tx.QueryRow(ctx, `SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt
+	err := scanTaskArtifact(tx.QueryRow(ctx, `SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt,
+workspace_id, workspace_revision, size_bytes, sha256
 FROM task_artifacts
 WHERE task_id=$1 AND path=$2 AND batch_item_id IS NOT DISTINCT FROM $3 AND batch_attempt IS NOT DISTINCT FROM $4
 FOR UPDATE`, candidate.TaskID, candidate.Path, nullableBatchItemID(candidate.BatchItemID),

@@ -10,6 +10,8 @@ func TestActionValid(t *testing.T) {
 		ActionHostApplicationLaunch, ActionHostApplicationStop,
 		ActionAPIKeyCreate, ActionAPIKeyDelete,
 		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionMCPCall,
+		ActionMCPConnectorCreate, ActionMCPConnectorUpdate, ActionMCPConnectorEnable,
+		ActionMCPConnectorDisable, ActionMCPConnectorCredentialRotate, ActionMCPConnectorDelete,
 		ActionSystemLost, ActionOrphanDeleted, ActionSystemRenew,
 	} {
 		if !action.Valid() {

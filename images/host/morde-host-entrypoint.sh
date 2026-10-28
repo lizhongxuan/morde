@@ -91,7 +91,8 @@ if [ -n "${DISPLAY:-}" ] && [ -x /usr/bin/xdpyinfo ]; then
     done
 fi
 
-/usr/local/bin/morde-runtime &
+# Keep live sync checkpoints on the Host runtime volume across container recreation.
+XDG_CACHE_HOME=/var/lib/morde-runtime/cache /usr/local/bin/morde-runtime &
 runtime_pid=$!
 runtime_started=$SECONDS
 
@@ -125,7 +126,7 @@ while true; do
     if [ "$restart_delay" -gt 30 ]; then
         restart_delay=30
     fi
-    /usr/local/bin/morde-runtime &
+    XDG_CACHE_HOME=/var/lib/morde-runtime/cache /usr/local/bin/morde-runtime &
     runtime_pid=$!
     runtime_started=$SECONDS
 done

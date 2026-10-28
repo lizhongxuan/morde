@@ -34,6 +34,7 @@ type ModelTaskFence struct {
 	AgentInstanceID      string
 	AgentGeneration      int64
 	AgentSessionID       string
+	AgentRootSessionID   string
 	AuthorizationVersion int64
 	ThroughSequence      int64
 	EngineVersion        string
@@ -76,6 +77,7 @@ type ModelCallSettlement struct {
 
 type ModelCallStore interface {
 	ReserveModelCall(context.Context, ModelCallReservation) error
+	BeginModelCallDispatch(context.Context, ModelCallReservation) error
 	SettleModelCall(context.Context, ModelCallSettlement) error
 }
 
@@ -151,16 +153,22 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
-	if err := s.store.ReserveModelCall(ctx, ModelCallReservation{
+	reservation := ModelCallReservation{
 		Source: call.Source, Principal: call.Principal, Task: call.Task, OwnerID: ownerID,
 		ModelID: call.ModelID, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
 		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
-	}); err != nil {
+	}
+	if err := s.store.ReserveModelCall(ctx, reservation); err != nil {
 		return ModelResponse{}, err
 	}
 	request := call.Request
 	request.Endpoint = endpoint.Endpoint
-	response, callErr := s.client.Complete(ctx, request)
+	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, ModelCallTimeout)
+	defer cancelDispatch()
+	if err := s.store.BeginModelCallDispatch(dispatchCtx, reservation); err != nil {
+		return ModelResponse{}, err
+	}
+	response, callErr := s.client.Complete(dispatchCtx, request)
 	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage, Unknown: callErr != nil || !response.Usage.Known}
 	if response.Usage.Known && (response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 || response.Usage.InputTokens > math.MaxInt64-response.Usage.OutputTokens) {
 		settlement.Unknown = true
@@ -202,8 +210,12 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			return "", empty, 0, domain.NewError(domain.CodeForbidden, "portal session required to check model")
 		}
 	case ModelCallTask:
+		if call.Task != nil && call.Task.AgentRootSessionID == "" {
+			call.Task.AgentRootSessionID = call.Task.AgentSessionID
+		}
 		if call.Task == nil || !domain.ValidUserID(call.Task.OwnerID) || call.Task.LeaseOwner == "" || call.Task.LeaseVersion < 1 ||
 			call.Task.AgentInstanceID == "" || call.Task.AgentGeneration < 1 || call.Task.AuthorizationVersion < 1 ||
+			!dshModelIdentityPattern.MatchString(call.Task.AgentRootSessionID) ||
 			invalidCheckpointLabel(call.Task.EngineVersion, 128) || invalidCheckpointLabel(call.Task.ProfileVersion, 128) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task execution fence")
 		}

@@ -253,6 +253,9 @@ func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus i
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('morde:admin-user-update', 0))`); err != nil {
 			return fmt.Errorf("lock admin user updates: %w", err)
 		}
+		if _, err := lockOwnerExecutionControl(ctx, tx, value.ID, true); err != nil {
+			return err
+		}
 		var currentName, currentPasswordHash, currentRole, currentStatus string
 		var currentMustChangePassword bool
 		var currentQuotaHosts, currentQuotaCPUMilli, currentQuotaMemMiB, currentDefaultCPU, currentDefaultMem int
@@ -298,6 +301,8 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 		if value.PasswordHash != current.PasswordHash && actorID != value.ID {
 			return domain.NewError(domain.CodeForbidden, "users must change their own password")
 		}
+		identityChanged := current.Name != value.Name || current.PasswordHash != value.PasswordHash || current.Role != value.Role ||
+			current.Status != value.Status || current.MustChangePassword != value.MustChangePassword
 		row, err := sqlcgen.New(tx).UpdateUser(ctx, sqlcgen.UpdateUserParams{
 			ID: value.ID, Name: value.Name, PasswordHash: value.PasswordHash, Role: string(value.Role),
 			Status: string(value.Status), MustChangePassword: value.MustChangePassword,
@@ -311,8 +316,13 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 			return storeError("update user", "user", err)
 		}
 		updated = userDomain(row)
-		if current.Name != value.Name || current.PasswordHash != value.PasswordHash || current.Role != value.Role ||
-			current.Status != value.Status || current.MustChangePassword != value.MustChangePassword {
+		if identityChanged {
+			if err := stopAllOwnerTasks(ctx, tx, value.ID); err != nil {
+				return err
+			}
+			if err := requestMCPRuntimeCancellationsForActor(ctx, tx, value.ID); err != nil {
+				return err
+			}
 			if _, err := tx.Exec(ctx, `UPDATE tokens SET revoked_at=COALESCE(revoked_at, now()) WHERE owner_id=$1 AND revoked_at IS NULL`, value.ID); err != nil {
 				return fmt.Errorf("revoke account credentials: %w", err)
 			}
@@ -415,14 +425,31 @@ func createToken(ctx context.Context, q *sqlcgen.Queries, value identity.Token) 
 }
 
 func (s *Store) RevokeToken(ctx context.Context, id, ownerID string) error {
-	rowsAffected, err := s.q.RevokeToken(ctx, sqlcgen.RevokeTokenParams{ID: id, OwnerID: ownerID})
-	if err != nil {
-		return fmt.Errorf("revoke token: %w", err)
-	}
-	if rowsAffected == 0 {
-		return domain.NewError(domain.CodeNotFound, "token not found")
-	}
-	return nil
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
+			return err
+		}
+		var tokenKind string
+		err := tx.QueryRow(ctx, `SELECT kind FROM tokens WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&tokenKind)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "token not found")
+		}
+		if err != nil {
+			return fmt.Errorf("lock token for revocation: %w", err)
+		}
+		if _, err := stopTasksForAuthorization(ctx, tx, ownerID, id, ""); err != nil {
+			return err
+		}
+		if tokenKind == string(identity.KindAPIKey) {
+			if err := requestMCPRuntimeCancellationsForToken(ctx, tx, ownerID, id); err != nil {
+				return err
+			}
+		}
+		if _, err := sqlcgen.New(tx).RevokeToken(ctx, sqlcgen.RevokeTokenParams{ID: id, OwnerID: ownerID}); err != nil {
+			return fmt.Errorf("revoke token: %w", err)
+		}
+		return nil
+	})
 }
 
 func (s *Store) WriteAudit(ctx context.Context, entry audit.Entry) error {

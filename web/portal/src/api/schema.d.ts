@@ -1319,7 +1319,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List the current user's instant chat conversations */
+        /**
+         * List conversations through the legacy instant chat route
+         * @description Returns the same durable Task-backed conversations as the canonical conversation API.
+         */
         get: operations["listInstantChatConversations"];
         put?: never;
         post?: never;
@@ -1338,7 +1341,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List messages in an instant chat conversation */
+        /**
+         * List conversation messages through the legacy instant chat route
+         * @description Returns the same persisted messages as the canonical conversation API.
+         */
         get: operations["listInstantChatMessages"];
         put?: never;
         post?: never;
@@ -1358,10 +1364,70 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Send a message and receive an immediate AI reply
-         * @description Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
+         * Submit a durable Task through the legacy reply shape
+         * @description Submits to the canonical Task and Conversation services, then waits for the Task's terminal result to preserve the legacy response shape. Disconnecting while waiting does not cancel the durable Task. Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
          */
         post: operations["sendInstantChatMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/execution": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the current user's cloud task execution control
+         * @description Requires a Portal Session. Client credentials and API keys cannot change or inspect the owner execution gate.
+         */
+        get: operations["getExecutionControl"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/execution/stop-all": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop all cloud task execution for the current user
+         * @description The expected epoch prevents stale control requests. The same Idempotency-Key may only retry this exact action and epoch. HTTP 202 means tasks are still stopping; poll GET /api/execution until the state is disabled.
+         */
+        post: operations["stopAllExecution"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/execution/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Enable cloud task execution for the current user
+         * @description Requires a Portal Session and the current execution epoch. Reuse the Idempotency-Key only for an exact retry of this action and epoch.
+         */
+        post: operations["enableExecution"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1466,6 +1532,29 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/mcp-connectors/{connector_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                connector_id: components["schemas"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one connector grant for a task
+         * @description Revocation uses a grant-version compare-and-set. It blocks new connector dispatch; already dispatched operations are settled by the task operation lifecycle.
+         */
+        delete: operations["revokeTaskMCPConnectorGrant"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1722,6 +1811,146 @@ export interface paths {
          * @description Portal sessions only. Requires a configured account model budget and an Idempotency-Key. The selected probe is reserved and settled in the same ledger as model requests. An omitted capability means all; text, tools and vision can also be checked independently, using a new key for each. False means not yet verified or unsupported. Verified capabilities are combined only while the connection version is unchanged. Unknown usage remains pending for reconciliation and cannot be silently retried; the API key is never returned.
          */
         post: operations["checkModelConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/connectors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the current user's MCP connectors
+         * @description Portal sessions only. Connectors are private to the account. Responses never contain credential values.
+         */
+        get: operations["listMCPConnectors"];
+        put?: never;
+        /**
+         * Create a private MCP connector
+         * @description Portal sessions only. New connectors are disabled until explicitly enabled. Optional credential JSON is encrypted at rest and never returned; URL credentials, query strings, fragments, non-HTTPS schemes, literal IPs and ports other than 443 are rejected.
+         */
+        post: operations["createMCPConnector"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/connectors/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a private MCP connector
+         * @description Portal sessions only. Another user's connector is reported as not found.
+         */
+        get: operations["getMCPConnector"];
+        /**
+         * Update connector metadata
+         * @description Portal sessions only. Requires the current revision. Credential rotation uses its separate endpoint.
+         */
+        put: operations["updateMCPConnector"];
+        post?: never;
+        /**
+         * Delete a private MCP connector
+         * @description Portal sessions only. Requires the current revision; the deletion and audit event commit together.
+         */
+        delete: operations["deleteMCPConnector"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/connectors/{id}/credential": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replace a connector credential
+         * @description Portal sessions only. Credentials are write-only, encrypted with owner, connector and credential-version AAD, and never returned. The request and audit event commit with the new version.
+         */
+        put: operations["rotateMCPConnectorCredential"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/connectors/{id}/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Enable or disable a connector
+         * @description Portal sessions only. Requires the current revision. The change and audit event commit together.
+         */
+        put: operations["setMCPConnectorEnabled"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/connectors/{id}/oauth/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Begin server-side OAuth authorization for a connector
+         * @description Portal sessions only. Discovers the MCP protected resource and authorization server, reuses or dynamically registers an OAuth client, and returns a PKCE authorization URL. If dynamic registration is unavailable, returns the issuer and callback URI so the user can provide an OAuth client ID and optional secret. Client secrets are accepted only in this request and are never returned.
+         */
+        post: operations["beginMCPConnectorOAuth"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/oauth/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Complete the one-time OAuth authorization callback
+         * @description Public provider callback protected by a one-time, expiring state hash. The authorization code is exchanged server-side with PKCE and encrypted credentials are stored for the account that initiated the flow. OAuth callback errors are not reflected to the browser.
+         */
+        get: operations["completeMCPConnectorOAuth"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2000,6 +2229,18 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ExecutionControlMutationRequest: {
+            expected_epoch: number;
+        };
+        ExecutionControl: {
+            owner_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            state: "enabled" | "stopping" | "disabled";
+            epoch: number;
+            pending_task_count: number;
+            /** Format: date-time */
+            updated_at: string;
+        };
         ModelGatewayToolCall: {
             id: string;
             /** @constant */
@@ -2060,6 +2301,7 @@ export interface components {
         ConversationId: string;
         TaskId: string;
         ModelConnectionId: string;
+        MCPConnectorId: string;
         MessageId: string;
         StepId: string;
         OperationId: string;
@@ -2118,6 +2360,69 @@ export interface components {
         };
         ModelConnectionList: {
             items: components["schemas"]["ModelConnection"][];
+        };
+        CreateMCPConnectorRequest: {
+            name: string;
+            /**
+             * Format: uri
+             * @description HTTPS endpoint using DNS and port 443, without URL credentials, query or fragment. Actual DNS/IP authorization is performed by the server at connection time.
+             */
+            endpoint_url: string;
+            /** @description Optional provider credential bundle. The serialized object is limited to 32 KiB, encrypted at rest and never returned. */
+            credential?: {
+                [key: string]: unknown;
+            };
+        };
+        BeginMCPConnectorOAuthRequest: {
+            expected_revision: number;
+            client_id?: string;
+            client_secret?: string;
+        };
+        BeginMCPConnectorOAuthResponse: {
+            /** @constant */
+            kind: "authorize";
+            /** Format: uri */
+            authorization_url: string;
+            /** Format: uri */
+            redirect_uri: string;
+        } | {
+            /** @constant */
+            kind: "client_required";
+            /** Format: uri */
+            developer_url: string;
+            /** Format: uri */
+            redirect_uri: string;
+        };
+        UpdateMCPConnectorRequest: {
+            name: string;
+            /** Format: uri */
+            endpoint_url: string;
+            expected_revision: number;
+        };
+        RotateMCPConnectorCredentialRequest: {
+            /** @description Serialized JSON object is limited to 32 KiB and encrypted with owner, connector and credential-version AAD. */
+            credential: {
+                [key: string]: unknown;
+            };
+            expected_revision: number;
+        };
+        /** @description Private connector metadata. Credential values and ciphertext are never present. */
+        MCPConnector: {
+            id: components["schemas"]["MCPConnectorId"];
+            name: string;
+            /** Format: uri */
+            endpoint_url: string;
+            enabled: boolean;
+            has_credential: boolean;
+            credential_version: number;
+            revision: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        MCPConnectorList: {
+            items: components["schemas"]["MCPConnector"][];
         };
         Quota: {
             hosts: number;
@@ -2834,9 +3139,13 @@ export interface components {
         };
         AppendConversationMessageRequest: {
             host_id?: components["schemas"]["HostId"];
+            workspace_id?: components["schemas"]["WorkspaceId"];
+            /** @description Immutable committed Workspace revision used by this task. Required with workspace_id. */
+            input_revision?: number;
             application_id?: string;
             model_id: string;
             content: string;
+            mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
         };
         AppendConversationMessageResponse: {
@@ -2868,6 +3177,8 @@ export interface components {
             /** @enum {string} */
             execution_location: "server" | "legacy";
             workspace_id?: components["schemas"]["WorkspaceId"];
+            /** @description Immutable committed Workspace revision this task started from. */
+            input_revision?: number;
             application_id?: string;
             conversation_id: components["schemas"]["ConversationId"];
             model_id: string;
@@ -2885,7 +3196,7 @@ export interface components {
             id: components["schemas"]["StepId"];
             sequence: number;
             /** @enum {string} */
-            kind: "plan" | "tool" | "wait" | "result";
+            kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "result";
             /** @enum {string} */
             status: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
             title: string;
@@ -2957,10 +3268,14 @@ export interface components {
         };
         SubmitTaskRequest: {
             host_id?: components["schemas"]["HostId"];
+            workspace_id?: components["schemas"]["WorkspaceId"];
+            /** @description Immutable committed Workspace revision to pin for this task. Required with workspace_id. */
+            input_revision?: number;
             application_id?: string;
             model_id: string;
             conversation_id?: components["schemas"]["ConversationId"] | null;
             objective: string;
+            mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
             batch_items?: components["schemas"]["TaskBatchItemInput"][];
         };
@@ -3207,6 +3522,7 @@ export interface components {
         SiteId: components["schemas"]["SiteId"];
         SiteReleaseId: components["schemas"]["SiteReleaseId"];
         ModelConnectionId: components["schemas"]["ModelConnectionId"];
+        MCPConnectorId: components["schemas"]["MCPConnectorId"];
         NotificationId: components["schemas"]["NotificationId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
@@ -5412,6 +5728,99 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getExecutionControl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current execution gate and epoch */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionControl"];
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    stopAllExecution: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionControlMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Execution is already disabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionControl"];
+                };
+            };
+            /** @description Stop requests are still being confirmed */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionControl"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    enableExecution: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionControlMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Execution gate is enabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionControl"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     listConversations: {
         parameters: {
             query?: {
@@ -5636,6 +6045,33 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeTaskMCPConnectorGrant: {
+        parameters: {
+            query: {
+                expected_grant_version: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                connector_id: components["schemas"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Connector grant revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -6083,6 +6519,293 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
             504: components["responses"]["GatewayTimeout"];
             default: components["responses"]["Error"];
+        };
+    };
+    listMCPConnectors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Connectors without credential values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MCPConnectorList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateMCPConnectorRequest"];
+            };
+        };
+        responses: {
+            /** @description Created connector without credential values */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Connector metadata and credential presence, without credential values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateMCPConnectorRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated connector metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteMCPConnector: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Connector deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rotateMCPConnectorCredential: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RotateMCPConnectorCredentialRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated connector metadata without credential values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setMCPConnectorEnabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    enabled: boolean;
+                    expected_revision: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Updated connector state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    beginMCPConnectorOAuth: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["MCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BeginMCPConnectorOAuthRequest"];
+            };
+        };
+        responses: {
+            /** @description Authorization URL or a request for user-provided OAuth client details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BeginMCPConnectorOAuthResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    completeMCPConnectorOAuth: {
+        parameters: {
+            query: {
+                state: string;
+                code?: string;
+                error?: string;
+                iss?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authorization completed. Returns a simple no-store page for the user. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authorization was not completed or the one-time state was invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description OAuth service unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listAllHosts: {

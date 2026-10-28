@@ -18,11 +18,15 @@ import (
 
 	"morde/server/internal/api"
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/template"
 	"morde/server/internal/storage"
 	"morde/server/internal/storage/workspacefs"
+	"morde/server/internal/worker"
 )
 
 // Opt-in native smoke test: a loopback Portal backed by a disposable PostgreSQL database.
@@ -91,6 +95,7 @@ func TestNativeDesktopAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	enableTaskExecutionForTest(t, store, principal)
 	checked, err := models.Create(ctx, principal, app.ModelConnectionCommand{
 		Name: "本地验收模型", BaseURL: "https://example.invalid/v1", ModelName: "morde-local-qa", APIKey: "synthetic-test-key",
 	})
@@ -107,10 +112,34 @@ func TestNativeDesktopAcceptance(t *testing.T) {
 	if _, err := modelGateway.CheckModelCapability(ctx, principal, checked.ID, "native-model-probe-0001", "all"); err != nil {
 		t.Fatal(err)
 	}
-	chats, err := app.NewInstantChatService(store, modelGateway)
+	tasks, err := app.NewTaskService(store, credentials, models)
 	if err != nil {
 		t.Fatal(err)
 	}
+	conversations, err := app.NewConversationService(store, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chats, err := app.NewTaskChatCompatibilityService(tasks, conversations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
+		Store: store, Executor: taskChatCompatTestExecutor{store: store}, WorkerID: "native-acceptance-task",
+		LeaseDuration: time.Minute, PollInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- taskWorker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		if err := <-workerDone; !errors.Is(err, context.Canceled) {
+			t.Errorf("stop native acceptance task worker: %v", err)
+		}
+	})
 	hosts := nativeAcceptanceHosts{}
 	onboarding, err := app.NewOnboardingService(store, hosts, models, "small")
 	if err != nil {
@@ -157,7 +186,8 @@ func TestNativeDesktopAcceptance(t *testing.T) {
 		Hosts: hosts, HostSharing: nativeAcceptanceSharing{}, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients,
 		WorkspaceOps: workspaces, WorkspaceSync: syncService, Tokens: nativeAcceptanceTokens{tokens},
-		Notifications: notifications, ModelConnections: models, ModelGateway: modelGateway, InstantChat: chats, Onboarding: onboarding,
+		Notifications: notifications, ModelConnections: models, ModelGateway: modelGateway,
+		Tasks: tasks, Conversations: conversations, InstantChat: chats, Onboarding: onboarding,
 		Templates: nativeAcceptanceTemplates{}, MCPDisabled: true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,
@@ -208,9 +238,9 @@ verify:
 		min   int
 		max   int
 	}{
-		{"instant chat replies", `SELECT count(*) FROM conversation_messages WHERE owner_id=$1 AND role='assistant' AND task_id IS NULL`, 1, 1 << 30},
+		{"Task-backed chat replies", `SELECT count(*) FROM conversation_messages WHERE owner_id=$1 AND role='assistant' AND task_id IS NOT NULL`, 1, 1 << 30},
 		{"user workspaces", `SELECT count(*) FROM workspaces WHERE owner_id=$1`, 1, 1 << 30},
-		{"retired task records", `SELECT count(*) FROM tasks WHERE owner_id=$1`, 0, 0},
+		{"persistent chat tasks", `SELECT count(*) FROM tasks WHERE owner_id=$1 AND status='completed'`, 1, 1 << 30},
 	} {
 		var count int
 		if err := store.pool.QueryRow(ctx, check.query, owner.ID).Scan(&count); err != nil {
@@ -220,6 +250,45 @@ verify:
 			t.Errorf("%s = %d, want %d..%d", check.name, count, check.min, check.max)
 		}
 	}
+}
+
+type taskChatCompatTestExecutor struct{ store *Store }
+
+func (e taskChatCompatTestExecutor) ExecuteTask(ctx context.Context, current task.Task) error {
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		return err
+	}
+	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded,
+		Title: "本地验收执行器", Summary: "返回固定的验收回复。"}
+	message := conversation.Message{ID: messageID, ConversationID: current.ConversationID, OwnerID: current.OwnerID,
+		Role: conversation.RoleAssistant, Content: "本地验收回复", TaskID: current.ID, ModelID: current.ModelID}
+	stepPayload, err := json.Marshal(map[string]string{"step_id": stepID, "status": string(task.StepSucceeded)})
+	if err != nil {
+		return err
+	}
+	if _, err := e.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: stepID, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.step", Payload: stepPayload}, AssistantMessage: &message,
+	}); err != nil {
+		return err
+	}
+	result := "本地验收回复"
+	resultPayload, err := json.Marshal(map[string]string{"status": string(task.StatusCompleted), "result": result})
+	if err != nil {
+		return err
+	}
+	_, err = e.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: stepID, Result: result, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.result", Payload: resultPayload},
+	})
+	return err
 }
 
 type nativeAcceptanceModel struct{}

@@ -13,6 +13,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
@@ -71,7 +72,9 @@ type AgentToolApprovalDecision struct {
 
 type AgentToolDefinition struct {
 	ModelTool
-	RequiredScope identity.Scope
+	RequiredScope     identity.Scope
+	MCPConnectorID    string
+	MCPRemoteToolName string
 }
 
 type AgentToolPreparationStatus string
@@ -110,10 +113,11 @@ const (
 )
 
 type AgentToolResult struct {
-	Status     AgentToolResultStatus
-	ExternalID string
-	Output     string
-	Images     []ModelImage
+	Status        AgentToolResultStatus
+	WaitingReason string
+	ExternalID    string
+	Output        string
+	Images        []ModelImage
 }
 
 type AgentVerificationRequest struct {
@@ -135,6 +139,7 @@ type AgentFileEvidence struct {
 	WorkspaceID  string `json:"-"`
 	OperationKey string `json:"-"`
 	RequestHash  []byte `json:"-"`
+	Result       string `json:"-"`
 }
 
 const (
@@ -170,9 +175,13 @@ func validAgentObservationFingerprint(value string) bool {
 // AgentVerifiedArtifact is metadata independently observed by ToolExecutor.Verify.
 // It must never be populated from the model's completion claim.
 type AgentVerifiedArtifact struct {
-	Label     string
-	Path      string
-	MediaType string
+	Label       string
+	Path        string
+	MediaType   string
+	WorkspaceID string
+	Revision    int64
+	SizeBytes   int64
+	SHA256      string
 }
 
 const maxAgentVerifiedArtifacts = 64
@@ -184,6 +193,7 @@ func validateAgentVerificationArtifacts(result AgentVerificationResult) error {
 	seen := make(map[string]struct{}, len(result.Artifacts))
 	for _, artifact := range result.Artifacts {
 		if !validBoundedText(artifact.Label, 256) || len(artifact.Path) > 4096 || len(artifact.MediaType) > 256 ||
+			!domain.ValidWorkspaceID(artifact.WorkspaceID) || artifact.Revision < 0 || artifact.SizeBytes < 0 || !validAgentObservationFingerprint(artifact.SHA256) ||
 			strings.ContainsRune(artifact.Path, '\x00') || strings.Contains(artifact.Path, "\\") || path.IsAbs(artifact.Path) ||
 			artifact.Path == "." || artifact.Path == ".." || strings.HasPrefix(path.Clean(artifact.Path), "../") || path.Clean(artifact.Path) != artifact.Path {
 			return errors.New("verification artifact metadata is invalid")
@@ -202,7 +212,7 @@ func validateAgentVerificationArtifacts(result AgentVerificationResult) error {
 
 // agentFileWriteEvidence accepts only a unique, ordered function_call and
 // function_call_output pair whose successful runtime output agrees with the
-// original path and byte count. Model completion text is deliberately ignored.
+// original path, byte count, and any returned digest. Model text is ignored.
 func agentFileWriteEvidence(inputs []ModelInput, batchScope *agentBatchScope) ([]AgentFileEvidence, error) {
 	type indexedInput struct {
 		index int
@@ -245,14 +255,16 @@ func agentFileWriteEvidence(inputs []ModelInput, batchScope *agentBatchScope) ([
 		var output struct {
 			Path         string `json:"path"`
 			BytesWritten int    `json:"bytes_written"`
+			SHA256       string `json:"sha256"`
 		}
 		outputBytes := []byte(outputItems[0].item.Output)
+		content := []byte(args.Content)
+		digest := sha256.Sum256(content)
 		if !validAgentJSONObject(outputBytes, maxAgentToolOutputBytes) || decodeStrictRuntimeResult(outputBytes, &output) != nil ||
-			output.Path != args.Path || output.BytesWritten != len([]byte(args.Content)) {
+			output.Path != args.Path || output.BytesWritten != len(content) || (output.SHA256 != "" && output.SHA256 != fmt.Sprintf("%x", digest[:])) {
 			continue
 		}
 
-		content := []byte(args.Content)
 		operationKey := agentOperationKeyForBatch(outputItem.CallID, batchScope)
 		requestHash, err := agentOperationHash(runtimeToolFileWrite, argumentBytes)
 		if err != nil || operationKey == "" || len(operationKey) > 255 {
@@ -266,14 +278,13 @@ func agentFileWriteEvidence(inputs []ModelInput, batchScope *agentBatchScope) ([
 			delete(latest, evidenceKey)
 			continue
 		}
-		digest := sha256.Sum256(content)
 		if _, exists := orderedPaths[evidenceKey]; !exists {
 			order = append(order, evidenceKey)
 			orderedPaths[evidenceKey] = struct{}{}
 		}
 		latest[evidenceKey] = AgentFileEvidence{
 			Path: args.Path, Size: int64(len(content)), SHA256: fmt.Sprintf("%x", digest[:]),
-			WorkspaceID: args.WorkspaceID, OperationKey: operationKey, RequestHash: append([]byte(nil), requestHash[:]...),
+			WorkspaceID: args.WorkspaceID, OperationKey: operationKey, RequestHash: append([]byte(nil), requestHash[:]...), Result: outputItem.Output,
 		}
 	}
 
@@ -336,9 +347,20 @@ func validateAgentTools(tools []AgentToolDefinition) (map[string]AgentToolDefini
 	byName := make(map[string]AgentToolDefinition, len(tools))
 	for _, tool := range tools {
 		if !agentToolNamePattern.MatchString(tool.Name) || len(tool.Description) > 4096 || len(tool.Parameters) > maxAgentToolSchemaBytes ||
-			!validAgentJSONObject(tool.Parameters, maxAgentToolSchemaBytes) ||
-			(tool.RequiredScope != identity.ScopeComputerObserve && tool.RequiredScope != identity.ScopeComputerOperate &&
-				tool.RequiredScope != identity.ScopeScheduleRead && tool.RequiredScope != identity.ScopeScheduleManage) {
+			!validAgentJSONObject(tool.Parameters, maxAgentToolSchemaBytes) {
+			return nil, errors.New("invalid tool definition")
+		}
+		switch tool.RequiredScope {
+		case identity.ScopeMCPControl:
+			if !domain.ValidMCPConnectorID(tool.MCPConnectorID) || tool.MCPRemoteToolName == "" || len(tool.MCPRemoteToolName) > 128 ||
+				!utf8.ValidString(tool.MCPRemoteToolName) || strings.IndexFunc(tool.MCPRemoteToolName, unicode.IsControl) >= 0 {
+				return nil, errors.New("invalid MCP connector tool definition")
+			}
+		case identity.ScopeTaskRead, identity.ScopeComputerObserve, identity.ScopeComputerOperate, identity.ScopeScheduleRead, identity.ScopeScheduleManage:
+			if tool.MCPConnectorID != "" || tool.MCPRemoteToolName != "" {
+				return nil, errors.New("non-MCP tool contains connector identity")
+			}
+		default:
 			return nil, errors.New("invalid tool definition")
 		}
 		if _, exists := byName[tool.Name]; exists {

@@ -70,6 +70,141 @@ func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 	}
 }
 
+func TestPostgresTaskStopRecoversDispatchedMCPConnectorOperation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	fixture := newMCPConnectorOperationFixture(t, ctx, store, owner.ID, "stop-recover-mcp-operation")
+	prepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, fixture.operation("stop-recover-dispatched", "update"), fixture.leaseOwner)
+	if err != nil || replayed {
+		t.Fatalf("prepare MCP operation = %#v replay=%t err=%v", prepared, replayed, err)
+	}
+	dispatched, err := store.MarkMCPConnectorOperationDispatched(ctx, prepared, fixture.leaseOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopID := mustID(t, domain.NewTaskActionID)
+	stopRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "stop-recover-mcp-action", fixture.running.ID, task.StatusRunning, stopID)
+	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionCancel, task.StatusRunning, stopID)
+	if err != nil || requested.Task.Status != task.StatusCancelling || len(requested.UnsettledOperationIDs) != 1 {
+		t.Fatalf("stop request = %#v err=%v", requested, err)
+	}
+	stopFenced, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, dispatched.Key)
+	if err != nil || stopFenced.Status != task.OperationDispatched || !stopFenced.CancelRequested {
+		t.Fatalf("dispatched operation after stop request = %#v err=%v", stopFenced, err)
+	}
+	if _, err := store.CompleteMCPConnectorOperation(ctx, dispatched, fixture.leaseOwner, task.OperationSucceeded, `{"late":true}`); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("late MCP result after stop request was accepted: %v", err)
+	}
+
+	claim, found, err := store.ClaimNextTaskStop(ctx, "stop-worker", time.Minute)
+	if err != nil || !found || claim.Request.ID != stopID {
+		t.Fatalf("claim stop = %#v found=%t err=%v", claim, found, err)
+	}
+	stillDispatched, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, dispatched.Key)
+	if err != nil || stillDispatched.Status != task.OperationDispatched || !stillDispatched.CancelRequested {
+		t.Fatalf("dispatched operation before safe-after recovery = %#v err=%v", stillDispatched, err)
+	}
+	if _, err := store.CompleteTaskStop(ctx, fixture.running.ID, stopID, "stop-worker", claim.Request.LeaseVersion); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("stop completed before the safe-after barrier: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE id=$1`, stopID); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.CompleteTaskStop(ctx, fixture.running.ID, stopID, "stop-worker", claim.Request.LeaseVersion)
+	if err != nil || cancelled.Status != task.StatusCancelled {
+		t.Fatalf("complete stop with unknown MCP operation = %#v err=%v", cancelled, err)
+	}
+	unknownAfterStop, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, dispatched.Key)
+	if err != nil || unknownAfterStop.Status != task.OperationUnknown || !unknownAfterStop.CancelRequested || unknownAfterStop.Result == "" {
+		t.Fatalf("unknown operation audit record after stop = %#v err=%v", unknownAfterStop, err)
+	}
+}
+
+func TestPostgresTaskStopRecoversRevokedDispatchedMCPConnectorOperation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	fixture := newMCPConnectorOperationFixture(t, ctx, store, owner.ID, "stop-recover-revoked-mcp")
+	prepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, fixture.operation("stop-recover-revoked", "update"), fixture.leaseOwner)
+	if err != nil || replayed {
+		t.Fatalf("prepare MCP operation = %#v replay=%t err=%v", prepared, replayed, err)
+	}
+	dispatched, err := store.MarkMCPConnectorOperationDispatched(ctx, prepared, fixture.leaseOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevokeTaskMCPConnectorGrant(ctx, owner.ID, fixture.running.ID, fixture.connectorID, 1); err != nil {
+		t.Fatalf("revoke MCP connector grant: %v", err)
+	}
+	revoked, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, dispatched.Key)
+	if err != nil || revoked.Status != task.OperationDispatched || !revoked.CancelRequested || revoked.Result == "" {
+		t.Fatalf("dispatched operation after grant revocation = %#v err=%v", revoked, err)
+	}
+
+	stopID := mustID(t, domain.NewTaskActionID)
+	stopRecord := taskActionIdempotency(owner.ID, task.ActionPause, "stop-recover-revoked-action", fixture.running.ID, task.StatusRunning, stopID)
+	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionPause, task.StatusRunning, stopID)
+	if err != nil || requested.Task.Status != task.StatusPausing || len(requested.UnsettledOperationIDs) != 1 {
+		t.Fatalf("pause request = %#v err=%v", requested, err)
+	}
+	claim, found, err := store.ClaimNextTaskStop(ctx, "stop-worker", time.Minute)
+	if err != nil || !found || claim.Request.ID != stopID {
+		t.Fatalf("claim stop = %#v found=%t err=%v", claim, found, err)
+	}
+	stillDispatched, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, dispatched.Key)
+	if err != nil || stillDispatched.Status != task.OperationDispatched || !stillDispatched.CancelRequested || stillDispatched.Result != revoked.Result {
+		t.Fatalf("revoked dispatched operation before safe-after recovery = %#v err=%v", stillDispatched, err)
+	}
+	if _, err := store.CompleteTaskStop(ctx, fixture.running.ID, stopID, "stop-worker", claim.Request.LeaseVersion); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("stop completed before the safe-after barrier: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE id=$1`, stopID); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := store.CompleteTaskStop(ctx, fixture.running.ID, stopID, "stop-worker", claim.Request.LeaseVersion)
+	if err != nil || paused.Status != task.StatusPaused {
+		t.Fatalf("complete pause with revoked MCP operation outcome unknown = %#v err=%v", paused, err)
+	}
+	unknown, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, dispatched.Key)
+	if err != nil || unknown.Status != task.OperationUnknown || !unknown.CancelRequested || unknown.Result != revoked.Result {
+		t.Fatalf("revoked unknown operation after stop finalization = %#v err=%v", unknown, err)
+	}
+}
+
+func TestPostgresTaskStopWaitsForAgentStopReceipt(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	lease, replayed, err := f.service.Start(ctx, f.request)
+	if err != nil || replayed {
+		t.Fatalf("start active agent: lease=%#v replayed=%t err=%v", lease, replayed, err)
+	}
+	cancelID := mustID(t, domain.NewTaskActionID)
+	stopRecord := taskActionIdempotency(f.request.Fence.OwnerID, task.ActionCancel, "cancel-agent-key", f.request.Fence.TaskID, task.StatusRunning, cancelID)
+	if _, err := f.store.RequestTaskAction(ctx, stopRecord, f.request.Fence.TaskID, task.ActionCancel, task.StatusRunning, cancelID); err != nil {
+		t.Fatalf("request task cancellation: %v", err)
+	}
+	claim, found, err := f.store.ClaimNextTaskStop(ctx, "stop-worker", time.Minute)
+	if err != nil || !found || claim.Request.ID != cancelID {
+		t.Fatalf("claim task stop: claim=%#v found=%t err=%v", claim, found, err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE id=$1`, cancelID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CompleteTaskStop(ctx, claim.Task.ID, cancelID, "stop-worker", claim.Request.LeaseVersion); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("task stop completed without an Agent receipt: %v", err)
+	}
+	receipt := signAgentLifecycleReceipt(t, f.key, lease.Fence, f.request.SupervisorNonce)
+	if _, err := f.service.ConfirmStopped(ctx, receipt); err != nil {
+		t.Fatalf("confirm Agent stop: %v", err)
+	}
+	cancelled, err := f.store.CompleteTaskStop(ctx, claim.Task.ID, cancelID, "stop-worker", claim.Request.LeaseVersion)
+	if err != nil || cancelled.Status != task.StatusCancelled {
+		t.Fatalf("complete confirmed stop: task=%#v err=%v", cancelled, err)
+	}
+}
+
 func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

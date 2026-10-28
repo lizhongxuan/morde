@@ -53,11 +53,14 @@ type messagePageResponse struct {
 }
 
 type appendMessageRequest struct {
-	HostID        string             `json:"host_id"`
-	ApplicationID string             `json:"application_id"`
-	ModelID       string             `json:"model_id"`
-	Content       string             `json:"content"`
-	Budget        *taskBudgetRequest `json:"budget"`
+	HostID          string             `json:"host_id"`
+	WorkspaceID     string             `json:"workspace_id"`
+	InputRevision   *int64             `json:"input_revision"`
+	MCPConnectorIDs []string           `json:"mcp_connector_ids"`
+	ApplicationID   string             `json:"application_id"`
+	ModelID         string             `json:"model_id"`
+	Content         string             `json:"content"`
+	Budget          *taskBudgetRequest `json:"budget"`
 }
 
 type appendMessageResponse struct {
@@ -215,7 +218,9 @@ func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
 			return
 		}
 		result, err := service.AppendMessage(c.Request.Context(), principal, id, app.AppendMessageCommand{
-			HostID: request.HostID, ApplicationID: request.ApplicationID, ModelID: request.ModelID, Content: request.Content,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
+			MCPConnectorIDs: request.MCPConnectorIDs,
+			ApplicationID:   request.ApplicationID, ModelID: request.ModelID, Content: request.Content,
 			Budget: budget, IdempotencyKey: c.GetHeader("Idempotency-Key"),
 		})
 		if err != nil {

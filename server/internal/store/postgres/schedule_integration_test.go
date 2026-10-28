@@ -351,7 +351,7 @@ func createPostgresSchedule(t *testing.T, ctx context.Context, store *Store, own
 		ID: id, OwnerID: ownerID, Version: 1, Status: schedule.StatusEnabled, ExecutionEpoch: 1,
 		HostID: hostID, ModelID: "model-test", Objective: "scheduled objective", Timing: timing,
 		Budget:        task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
-		Authorization: task.Authorization{Kind: string(identity.KindSession)}, MisfirePolicy: policy,
+		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: testSessionTokenID(ownerID)}, MisfirePolicy: policy,
 		NotificationEvents: events, NextOccurrenceKey: occurrence.Key, NextRunAt: occurrence.ScheduledAt,
 		NextCheckAt: &occurrence.CheckAt,
 	}

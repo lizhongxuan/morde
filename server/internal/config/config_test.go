@@ -21,12 +21,73 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second ||
+	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.CloudDSH.Enabled ||
 		cfg.SiteStorage.RootDir == "" || cfg.SiteStorage.MaxReleaseBytes != 10737418240 || cfg.SiteStorage.MaxOwnerBytes != 53687091200 || cfg.SiteStorage.MinFreeBytes != 10737418240 {
 		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.SiteStorage)
 	}
 	if cfg.MCP != (MCP{Enabled: true, MaxOutputBytes: 65536, ScreenshotMaxWidth: 1280}) {
 		t.Fatalf("MCP defaults = %+v", cfg.MCP)
+	}
+}
+
+func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.CloudDSH = CloudDSH{
+		Enabled: true, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 2,
+		DockerHost: "unix:///run/morde-dsh/docker.sock", Image: "morde-dsh@sha256:" + strings.Repeat("a", 64),
+		NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", SupervisorID: "dsh-supervisor-1",
+		SupervisorKeyFile: "/etc/morde/dsh-supervisor.key", GuardianSocket: "/run/morde/dsh-guardian.sock",
+		GuardianPublicKeyFile: "/etc/morde/dsh-guardian.pub",
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("valid enabled cloud dsh config: %v", err)
+	}
+	atOwnerCap := cfg
+	atOwnerCap.CloudDSH.MaxConcurrentTasks = 64
+	atOwnerCap.CloudDSH.MaxConcurrentPerOwner = maxCloudDSHConcurrentPerOwner
+	if err := atOwnerCap.validate(); err != nil {
+		t.Fatalf("valid account runtime task cap: %v", err)
+	}
+	root := t.TempDir()
+	realDir, aliasDir := filepath.Join(root, "docker"), filepath.Join(root, "docker-alias")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	aliased := cfg
+	aliased.Storage.DockerHost = "unix://" + filepath.Join(realDir, "docker.sock")
+	aliased.CloudDSH.DockerHost = "unix://" + filepath.Join(aliasDir, "docker.sock")
+	if err := aliased.validate(); err == nil || !strings.Contains(err.Error(), "separate Docker endpoint") {
+		t.Fatalf("validate() error = %v, want aliased Docker socket rejected", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*CloudDSH)
+		want   string
+	}{
+		{name: "shared docker endpoint", mutate: func(value *CloudDSH) { value.DockerHost = "unix:///var/run/docker.sock" }, want: "separate Docker endpoint"},
+		{name: "unpinned image", mutate: func(value *CloudDSH) { value.Image = "morde-dsh:latest" }, want: "pin an image by sha256 digest"},
+		{name: "relative runtime path", mutate: func(value *CloudDSH) { value.NodePath = "node" }, want: "node_path must be an absolute clean path"},
+		{name: "invalid supervisor id", mutate: func(value *CloudDSH) { value.SupervisorID = "bad id" }, want: "supervisor_id is invalid"},
+		{name: "missing guardian key", mutate: func(value *CloudDSH) { value.GuardianPublicKeyFile = "" }, want: "guardian_public_key_file must be an absolute clean path"},
+		{name: "missing task concurrency limit", mutate: func(value *CloudDSH) { value.MaxConcurrentTasks = 0 }, want: "concurrency limits must be positive"},
+		{name: "owner exceeds global task limit", mutate: func(value *CloudDSH) { value.MaxConcurrentPerOwner = 5 }, want: "concurrency limits must be positive"},
+		{name: "owner exceeds account runtime capacity", mutate: func(value *CloudDSH) {
+			value.MaxConcurrentTasks = 64
+			value.MaxConcurrentPerOwner = maxCloudDSHConcurrentPerOwner + 1
+		}, want: "concurrency limits must be positive"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := cfg
+			test.mutate(&value.CloudDSH)
+			if err := value.validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validate() error = %v, want substring %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -384,6 +445,7 @@ func validConfigYAML(workbenchDir string) string {
 		"capacity:\n  cpu_milli: 4000\n  mem_mib: 8192\n"+
 		"reconciler:\n  interval: 1m\n  renew_before: 5m\n  activity_flush_interval: 10s\n"+
 		"storage:\n  driver: docker\n  docker_host: unix:///var/run/docker.sock\n  docker_data_dir: /var/lib/docker\n  min_free_bytes: 10737418240\n"+
+		"cloud_dsh:\n  enabled: false\n"+
 		"workspace_storage:\n  root_dir: /var/lib/morde/workspaces\n  max_workspace_bytes: 10737418240\n  max_owner_bytes: 53687091200\n  min_free_bytes: 10737418240\n"+
 		"site_storage:\n  root_dir: %q\n  max_release_bytes: 10737418240\n  max_owner_bytes: 53687091200\n  min_free_bytes: 10737418240\n"+
 		"gateway:\n  workbench_dir: %q\n  upstream_cache_ttl: 1m\n  credential_cache_ttl: 1m\n  preview_port_min: 1024\n  max_body_bytes: 1048576\n"+

@@ -28,6 +28,7 @@ func NewArtifactID() (string, error)           { return newID('a') }
 func NewPendingRequestID() (string, error)     { return newID('r') }
 func NewTaskActionID() (string, error)         { return newID('x') }
 func NewModelConnectionID() (string, error)    { return newID('p') }
+func NewMCPConnectorID() (string, error)       { return newID('k') }
 
 func newID(prefix byte) (string, error) {
 	var id [8]byte
@@ -58,6 +59,7 @@ func ValidArtifactID(id string) bool           { return validID(id, 'a') }
 func ValidPendingRequestID(id string) bool     { return validID(id, 'r') }
 func ValidTaskActionID(id string) bool         { return validID(id, 'x') }
 func ValidModelConnectionID(id string) bool    { return validID(id, 'p') }
+func ValidMCPConnectorID(id string) bool       { return validID(id, 'k') }
 
 func validID(id string, prefix byte) bool {
 	if len(id) != 8 || id[0] != prefix {

@@ -481,6 +481,41 @@ func TestAgentWaitsForUserWhenDesktopTargetLosesFocus(t *testing.T) {
 	}
 }
 
+func TestAgentPausesAndRequiresResubmissionWhenWorkspaceInputChanges(t *testing.T) {
+	fixture := newAgentFixture(t, ModelResponse{
+		ToolCalls: []ModelToolCall{{CallID: "call-workspace-change", Name: "inspect", Arguments: `{}`}},
+		Usage:     ModelUsage{Known: true, InputTokens: 5, OutputTokens: 2},
+	})
+	fixture.tools.prepareError = domain.NewError(domain.CodeWorkspaceConflict, "stale Workspace revision")
+
+	result, err := fixture.agent.Run(context.Background(), fixture.claimed)
+	if err != nil || result.Status != task.StatusWaitingUser || result.WaitingReason != "workspace_input_changed" ||
+		fixture.store.details.Task.Status != task.StatusWaitingUser || len(fixture.store.operations) != 0 || fixture.tools.executeCalls != 0 {
+		t.Fatalf("Run() = %+v, %v; task=%#v operations=%d executes=%d; want a resubmission pause before dispatch",
+			result, err, fixture.store.details.Task, len(fixture.store.operations), fixture.tools.executeCalls)
+	}
+}
+
+func TestAgentPausesOnWorkspaceConflictReportedBeforeRuntimeDispatch(t *testing.T) {
+	fixture := newAgentFixture(t, ModelResponse{
+		ToolCalls: []ModelToolCall{{CallID: "call-workspace-dispatch-change", Name: "inspect", Arguments: `{}`}},
+		Usage:     ModelUsage{Known: true, InputTokens: 5, OutputTokens: 2},
+	})
+	fixture.tools.result = AgentToolResult{
+		Status: AgentToolNeedsUser, WaitingReason: "workspace_input_changed",
+		Output: "Workspace changed after this task was submitted.",
+	}
+
+	result, err := fixture.agent.Run(context.Background(), fixture.claimed)
+	operation := fixture.store.operations[agentOperationKey("call-workspace-dispatch-change")]
+	if err != nil || result.Status != task.StatusWaitingUser || result.WaitingReason != "workspace_input_changed" ||
+		operation.Status != task.OperationFailed || operation.Result != `{"error":"workspace_input_changed"}` ||
+		fixture.tools.executeCalls != 1 || len(fixture.client.requests) != 1 {
+		t.Fatalf("Run() = %+v, %v; task=%#v operation=%#v executes=%d models=%d; want a durable resubmission pause",
+			result, err, fixture.store.details.Task, operation, fixture.tools.executeCalls, len(fixture.client.requests))
+	}
+}
+
 func TestAgentRearmsSamePersistedOperationAfterExactRuntimeNotFound(t *testing.T) {
 	fixture := newAgentFixture(t,
 		ModelResponse{ToolCalls: []ModelToolCall{{CallID: "call-reconcile", Name: "inspect", Arguments: `{}`}}, Usage: ModelUsage{Known: true, InputTokens: 5, OutputTokens: 2}},
@@ -704,9 +739,10 @@ func TestAgentStoresOnlyIndependentlyVerifiedBatchArtifacts(t *testing.T) {
 	fixture.store.details.BatchItems = []task.BatchItem{{
 		ID: "b1234567", TaskID: fixture.claimed.ID, Key: "report", Input: "create report", Status: task.BatchItemQueued, Attempt: 2,
 	}}
+	setAgentFixtureWorkspace(fixture)
 	fixture.tools.verification = AgentVerificationResult{
 		Status: AgentVerified, Summary: "The report exists in the workspace.",
-		Artifacts: []AgentVerifiedArtifact{{Label: "Report", Path: "reports/summary.txt", MediaType: "text/plain"}},
+		Artifacts: []AgentVerifiedArtifact{verifiedReportArtifact()},
 	}
 	result, err := fixture.agent.Run(context.Background(), fixture.claimed)
 	if err != nil || result.Status != task.StatusCompleted || len(fixture.store.details.Artifacts) != 1 {
@@ -716,6 +752,26 @@ func TestAgentStoresOnlyIndependentlyVerifiedBatchArtifacts(t *testing.T) {
 	if artifact.TaskID != fixture.claimed.ID || artifact.BatchItemID != "b1234567" || artifact.BatchAttempt != 2 ||
 		artifact.Path != "reports/summary.txt" || artifact.Label != "Report" || !domain.ValidStepID(artifact.StepID) {
 		t.Fatalf("artifact association = %#v", artifact)
+	}
+}
+
+func TestAgentCommitsVerifiedArtifactWithTaskCompletion(t *testing.T) {
+	fixture := newAgentFixture(t, ModelResponse{Text: "The report is complete.", Usage: ModelUsage{Known: true, InputTokens: 5, OutputTokens: 2}})
+	setAgentFixtureWorkspace(fixture)
+	fixture.tools.verification = AgentVerificationResult{
+		Status: AgentVerified, Summary: "The report exists in the workspace.",
+		Artifacts: []AgentVerifiedArtifact{verifiedReportArtifact()},
+	}
+	result, err := fixture.agent.Run(context.Background(), fixture.claimed)
+	if err != nil || result.Status != task.StatusCompleted || len(fixture.store.details.Artifacts) != 1 ||
+		len(fixture.store.lastProgress.Artifacts) != 1 || fixture.store.recordValidatedArtifactCalls != 0 {
+		t.Fatalf("Run() = %+v, %v; stored=%#v progress=%#v separate writes=%d", result, err,
+			fixture.store.details.Artifacts, fixture.store.lastProgress.Artifacts, fixture.store.recordValidatedArtifactCalls)
+	}
+	artifact := fixture.store.lastProgress.Artifacts[0]
+	if artifact.WorkspaceID != "w1234567" || artifact.Revision != 4 || artifact.SizeBytes != 5 ||
+		artifact.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+		t.Fatalf("completion artifact proof = %#v", artifact)
 	}
 }
 
@@ -755,9 +811,10 @@ func TestAgentArtifactWriteIsIdempotentAcrossVerificationRecovery(t *testing.T) 
 	fixture.store.details.BatchItems = []task.BatchItem{{
 		ID: "b1234567", TaskID: fixture.claimed.ID, Key: "report", Input: "create report", Status: task.BatchItemQueued, Attempt: 1,
 	}}
+	setAgentFixtureWorkspace(fixture)
 	fixture.tools.verification = AgentVerificationResult{
 		Status: AgentVerified, Summary: "The report exists in the workspace.",
-		Artifacts: []AgentVerifiedArtifact{{Label: "Report", Path: "reports/summary.txt", MediaType: "text/plain"}},
+		Artifacts: []AgentVerifiedArtifact{verifiedReportArtifact()},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.store.onArtifactRecorded = func(task.Artifact) { cancel() }
@@ -1036,6 +1093,19 @@ func newAgentFixture(t *testing.T, responses ...ModelResponse) *agentFixture {
 	return &agentFixture{agent: agent, claimed: claimed, store: store, client: client, tools: tools, fences: fences, auth: auth}
 }
 
+func setAgentFixtureWorkspace(fixture *agentFixture) {
+	fixture.claimed.WorkspaceID = "w1234567"
+	fixture.store.details.Task.WorkspaceID = "w1234567"
+}
+
+func verifiedReportArtifact() AgentVerifiedArtifact {
+	return AgentVerifiedArtifact{
+		Label: "Report", Path: "reports/summary.txt", MediaType: "text/plain",
+		WorkspaceID: "w1234567", Revision: 4, SizeBytes: 5,
+		SHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+	}
+}
+
 type agentModelResolverFake struct{}
 
 func (*agentModelResolverFake) ResolveEndpoint(context.Context, string, string) (ModelEndpoint, error) {
@@ -1162,16 +1232,18 @@ func (f *agentToolExecutorFake) ReconcileOperation(ctx context.Context, _ AgentT
 
 type agentTaskStoreFake struct {
 	TaskStore
-	mu                 sync.Mutex
-	details            TaskDetails
-	operations         map[string]task.Operation
-	events             []task.Event
-	sequence           int64
-	assistantMessages  []conversation.Message
-	deltaErr           error
-	onCreateOperation  func()
-	onBatchItemUpdated func(task.BatchItem)
-	onArtifactRecorded func(task.Artifact)
+	mu                           sync.Mutex
+	details                      TaskDetails
+	operations                   map[string]task.Operation
+	events                       []task.Event
+	sequence                     int64
+	lastProgress                 TaskProgress
+	recordValidatedArtifactCalls int
+	assistantMessages            []conversation.Message
+	deltaErr                     error
+	onCreateOperation            func()
+	onBatchItemUpdated           func(task.BatchItem)
+	onArtifactRecorded           func(task.Artifact)
 }
 
 func (f *agentTaskStoreFake) GetTask(ctx context.Context, id, ownerID string) (TaskDetails, error) {
@@ -1212,6 +1284,18 @@ func (f *agentTaskStoreFake) CommitTaskProgress(ctx context.Context, progress Ta
 		if !updated {
 			f.details.Steps = append(f.details.Steps, next)
 		}
+	}
+	f.lastProgress = progress
+	for _, artifact := range progress.Artifacts {
+		f.details.Artifacts = append(f.details.Artifacts, artifact)
+		f.sequence++
+		payloadFields := map[string]any{
+			"artifact_id": artifact.ID, "step_id": artifact.StepID, "label": artifact.Label,
+			"media_type": artifact.MediaType, "path": artifact.Path, "workspace_id": artifact.WorkspaceID,
+			"revision": artifact.Revision, "size_bytes": artifact.SizeBytes, "sha256": artifact.SHA256,
+		}
+		payload, _ := json.Marshal(payloadFields)
+		f.events = append(f.events, task.Event{TaskID: artifact.TaskID, Sequence: f.sequence, Type: "task.artifact", Payload: payload})
 	}
 	f.details.Task.Status = progress.Status
 	f.details.Task.CurrentStep = progress.CurrentStep
@@ -1360,6 +1444,7 @@ func (f *agentTaskStoreFake) UpdateBatchItem(ctx context.Context, ownerID string
 func (f *agentTaskStoreFake) RecordValidatedArtifact(ctx context.Context, ownerID string, artifact task.Artifact, leaseOwner string, leaseVersion int64) (task.Artifact, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.recordValidatedArtifactCalls++
 	if err := ctx.Err(); err != nil {
 		return task.Artifact{}, err
 	}
@@ -1387,7 +1472,8 @@ func (f *agentTaskStoreFake) RecordValidatedArtifact(ctx context.Context, ownerI
 	for _, existing := range f.details.Artifacts {
 		if existing.TaskID == artifact.TaskID && existing.BatchItemID == artifact.BatchItemID &&
 			existing.BatchAttempt == artifact.BatchAttempt && existing.Path == artifact.Path {
-			if existing.Label != artifact.Label || existing.MediaType != artifact.MediaType {
+			if existing.Label != artifact.Label || existing.MediaType != artifact.MediaType || existing.WorkspaceID != artifact.WorkspaceID ||
+				existing.Revision != artifact.Revision || existing.SizeBytes != artifact.SizeBytes || existing.SHA256 != artifact.SHA256 {
 				return task.Artifact{}, fmt.Errorf("artifact metadata changed")
 			}
 			return existing, nil
@@ -1395,7 +1481,8 @@ func (f *agentTaskStoreFake) RecordValidatedArtifact(ctx context.Context, ownerI
 	}
 	f.details.Artifacts = append(f.details.Artifacts, artifact)
 	f.sequence++
-	payloadFields := map[string]any{"artifact_id": artifact.ID, "step_id": artifact.StepID, "label": artifact.Label, "media_type": artifact.MediaType, "path": artifact.Path}
+	payloadFields := map[string]any{"artifact_id": artifact.ID, "step_id": artifact.StepID, "label": artifact.Label, "media_type": artifact.MediaType,
+		"path": artifact.Path, "workspace_id": artifact.WorkspaceID, "revision": artifact.Revision, "size_bytes": artifact.SizeBytes, "sha256": artifact.SHA256}
 	if artifact.BatchItemID != "" {
 		payloadFields["batch_item_id"] = artifact.BatchItemID
 		payloadFields["batch_attempt"] = artifact.BatchAttempt

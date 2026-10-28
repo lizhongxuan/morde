@@ -53,6 +53,11 @@ storage:
   docker_host: ${CH_DOCKER_HOST}
   docker_data_dir: ${CH_DOCKER_DATA_DIR}
   min_free_bytes: ${CH_DOCKER_MIN_FREE_BYTES}
+# Enable only after installing the independent dsh Guardian and isolated Docker daemon.
+cloud_dsh:
+  enabled: false
+  max_concurrent_tasks: 4
+  max_concurrent_tasks_per_owner: 2
 workspace_storage:
   root_dir: ${CH_WORKSPACE_STORAGE_ROOT_DIR}
   max_workspace_bytes: ${CH_WORKSPACE_MAX_BYTES}

@@ -141,6 +141,91 @@ func TestRuntimeDesktopToolArgumentsAreBounded(t *testing.T) {
 	}
 }
 
+func TestRuntimeToolRiskTiers(t *testing.T) {
+	cases := []struct {
+		name      string
+		arguments string
+		want      runtimeToolRiskTier
+	}{
+		{runtimeToolFileRead, `{}`, runtimeToolRiskSafe},
+		{runtimeToolFileList, `{}`, runtimeToolRiskSafe},
+		{runtimeToolFileFind, `{}`, runtimeToolRiskSafe},
+		{runtimeToolFileWrite, `{}`, runtimeToolRiskModerate},
+		{runtimeToolBrowserOpenTab, `{}`, runtimeToolRiskModerate},
+		{runtimeToolBrowserNavigate, `{}`, runtimeToolRiskModerate},
+		{runtimeToolBrowserClick, `{}`, runtimeToolRiskModerate},
+		{runtimeToolBrowserType, `{}`, runtimeToolRiskSensitive},
+		{runtimeToolBrowserPressKey, `{"key":"Enter"}`, runtimeToolRiskModerate},
+		{runtimeToolDesktopClick, `{}`, runtimeToolRiskSensitive},
+		{runtimeToolDesktopType, `{}`, runtimeToolRiskSensitive},
+		{runtimeToolDesktopPressKey, `{"key":"Enter"}`, runtimeToolRiskSensitive},
+		{runtimeToolDesktopPressKey, `{"key":"BackSpace"}`, runtimeToolRiskSensitive},
+		{runtimeToolDesktopPressKey, `{"key":"Delete"}`, runtimeToolRiskSensitive},
+		{runtimeToolDesktopPressKey, `{"key":"Tab"}`, runtimeToolRiskModerate},
+		{runtimeToolDesktopPressKey, `{"key":"ArrowLeft"}`, runtimeToolRiskModerate},
+		{runtimeToolDesktopScreenshot, `{}`, runtimeToolRiskSafe},
+		{runtimeToolWindowList, `{}`, runtimeToolRiskSafe},
+		{runtimeToolWindowActivate, `{}`, runtimeToolRiskModerate},
+		{"unknown", `{}`, runtimeToolRiskSensitive},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+tc.arguments, func(t *testing.T) {
+			if got := runtimeToolRisk(tc.name, json.RawMessage(tc.arguments)); got != tc.want {
+				t.Fatalf("runtimeToolRisk(%q) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeToolExecutorPrepareRequiresSensitiveApprovalWithoutPersistingArguments(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run",
+		result: `{"exit_code":0,"stdout":"ok","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	request := fixture.request(runtimeToolShellExec, `{"command":"echo private-value"}`, identity.ScopeComputerOperate)
+	preparation, err := fixture.executor.Prepare(context.Background(), request)
+	if err != nil || preparation.Status != AgentToolApprovalRequired {
+		t.Fatalf("Prepare() = %#v, %v; want approval required", preparation, err)
+	}
+	if preparation.Token != "" || preparation.Approval.Object == "" || preparation.Approval.Content == "" || preparation.Approval.Impact == "" {
+		t.Fatalf("sensitive preparation = %#v; want a non-executable approval request", preparation)
+	}
+	if strings.Contains(preparation.Approval.Object+preparation.Approval.Content+preparation.Approval.Impact, "private-value") ||
+		fixture.handlers["shell.exec"].calls.Load() != 0 || len(fixture.store.operations) != 0 {
+		t.Fatalf("approval exposed arguments or executed work: approval=%#v calls=%d operations=%d", preparation.Approval,
+			fixture.handlers["shell.exec"].calls.Load(), len(fixture.store.operations))
+	}
+}
+
+func TestRuntimeToolExecutionArgumentsKeepWorkspaceIDOutOfToolPayload(t *testing.T) {
+	mapping, ok := runtimeToolMappingByName(runtimeToolFileWrite)
+	if !ok {
+		t.Fatal("file_write mapping is missing")
+	}
+	raw := json.RawMessage(`{"workspace_id":"w1234567","path":"task-note.txt","content":"saved"}`)
+	got, err := runtimeToolExecutionArguments(mapping, raw)
+	if err != nil {
+		t.Fatalf("runtimeToolExecutionArguments() error = %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(got, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields["workspace_id"]; exists || string(fields["path"]) != `"task-note.txt"` || string(fields["content"]) != `"saved"` {
+		t.Fatalf("Host tool arguments = %s, want path/content without workspace_id", got)
+	}
+
+	other, _ := runtimeToolMappingByName(runtimeToolBrowserOpenTab)
+	unchanged := json.RawMessage(`{"url":"https://example.test"}`)
+	got, err = runtimeToolExecutionArguments(other, unchanged)
+	if err != nil || !bytes.Equal(got, unchanged) {
+		t.Fatalf("non-Workspace runtime arguments = %s, %v; want unchanged %s", got, err, unchanged)
+	}
+	if _, err := runtimeToolExecutionArguments(mapping, json.RawMessage(`{"path":"task-note.txt","content":"saved"}`)); err == nil {
+		t.Fatal("Workspace-scoped tool payload without workspace_id was accepted")
+	}
+}
+
 func TestRuntimeDesktopScreenshotMapsValidatedJPEGWithoutBase64InOutput(t *testing.T) {
 	imageBuffer := new(bytes.Buffer)
 	frame := image.NewRGBA(image.Rect(0, 0, 2, 3))
@@ -826,6 +911,56 @@ func TestRuntimeToolExecutorPrepareRechecksAuthorizationFenceAndCapability(t *te
 	})
 }
 
+func TestRuntimeToolExecutorRejectsWorkspaceRevisionChangedAfterTaskSubmission(t *testing.T) {
+	t.Run("before preparation", func(t *testing.T) {
+		fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+			capability: "file.read", action: "read", result: `{"path":"README.md","text":"hello"}`,
+		}})
+		setRuntimeToolWorkspaceRevision(t, fixture, 1)
+		_, err := fixture.executor.Prepare(context.Background(), fixture.request(runtimeToolFileRead,
+			`{"path":"README.md"}`, identity.ScopeComputerObserve))
+		if domain.CodeOf(err) != domain.CodeWorkspaceConflict || fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("Prepare() error/calls = %v/%d, want Workspace conflict and no dispatch", err, fixture.handlers["file.read"].calls.Load())
+		}
+	})
+
+	t.Run("after preparation before dispatch", func(t *testing.T) {
+		fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+			capability: "file.read", action: "read", result: `{"path":"README.md","text":"hello"}`,
+		}})
+		request, preparation := fixture.prepared(runtimeToolFileRead, `{"path":"README.md"}`, identity.ScopeComputerObserve)
+		fixture.persistOperation(request)
+		setRuntimeToolWorkspaceRevision(t, fixture, 1)
+
+		result, err := fixture.executor.Execute(context.Background(), request, preparation)
+		if err != nil || result.Status != AgentToolNeedsUser || result.WaitingReason != "workspace_input_changed" ||
+			!strings.Contains(result.Output, "Submit a new task") || fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("Execute() = %#v, %v; calls=%d, want a resubmission pause and no dispatch", result, err, fixture.handlers["file.read"].calls.Load())
+		}
+	})
+
+	t.Run("at runtime dispatch", func(t *testing.T) {
+		fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+			capability: "file.read", action: "read", result: `{"path":"README.md","text":"hello"}`,
+		}})
+		setRuntimeToolWorkspaceRevision(t, fixture, 1)
+		current := fixture.store.details.Task
+		session, err := fixture.executor.runtime.Connect(context.Background(), current.HostID, &fixture.fence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		if err := session.SetTaskLease(context.Background(), current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
+			t.Fatal(err)
+		}
+		_, err = fixture.executor.operations.Execute(context.Background(), session, current.ID, "o1234567", current.Lease.Version,
+			"file.read", "read", json.RawMessage(`{"path":"README.md"}`), current.WorkspaceID, 1, current.InputRevision)
+		if domain.CodeOf(err) != domain.CodeWorkspaceConflict || fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("RuntimeOperationRunner.Execute() error/calls = %v/%d, want Workspace conflict and no dispatch", err, fixture.handlers["file.read"].calls.Load())
+		}
+	})
+}
+
 func TestRuntimeToolExecutorExecuteRechecksAuthorizationAndFence(t *testing.T) {
 	t.Run("authorization revoked after prepare", func(t *testing.T) {
 		fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
@@ -900,6 +1035,10 @@ func TestRuntimeToolExecutorReconcilesUsingOriginalRuntimeLeaseAfterMordeReclaim
 	newExpiry := time.Now().Add(time.Minute).UTC()
 	fixture.store.mu.Lock()
 	fixture.store.details.Task.Lease = task.Lease{Owner: "worker-two", Version: 2, ExpiresAt: &newExpiry}
+	// The recovered journal query is not a new tool call and must still run
+	// after the original task has exhausted its tool-call budget.
+	fixture.store.details.Task.Budget.ToolCalls = 1
+	fixture.store.details.Task.Usage.ToolCalls = 1
 	fixture.store.operation.Status = task.OperationUnknown
 	fixture.store.operation.LeaseVersion = 2
 	fixture.store.mu.Unlock()
@@ -912,6 +1051,22 @@ func TestRuntimeToolExecutorReconcilesUsingOriginalRuntimeLeaseAfterMordeReclaim
 	}
 	if fixture.handlers["file.read"].calls.Load() != 1 {
 		t.Fatalf("reconciliation replayed the runtime action: handler calls = %d", fixture.handlers["file.read"].calls.Load())
+	}
+}
+
+func TestRuntimeToolExecutorReadsTerminalOperationAfterWorkspaceRevisionChanges(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "file.read", action: "read", result: `{"path":"README.md","text":"from pinned revision"}`,
+	}})
+	request, _ := fixture.prepared(runtimeToolFileRead, `{"path":"README.md"}`, identity.ScopeComputerObserve)
+	fixture.persistOperation(request)
+	fixture.store.operation.Status = task.OperationSucceeded
+	fixture.store.operation.Result = `{"path":"README.md","text":"from pinned revision"}`
+	setRuntimeToolWorkspaceRevision(t, fixture, 1)
+
+	result, err := fixture.executor.ReconcileOperation(context.Background(), request, fixture.store.operation)
+	if err != nil || result.Status != AgentToolSucceeded || result.Output != fixture.store.operation.Result || fixture.handlers["file.read"].calls.Load() != 0 {
+		t.Fatalf("ReconcileOperation() = %#v, %v; calls=%d, want stored terminal result without runtime dispatch", result, err, fixture.handlers["file.read"].calls.Load())
 	}
 }
 
@@ -1133,7 +1288,9 @@ func TestRuntimeToolExecutorVerifyRequiresRuntimeFileMatchAndPersistsIdempotentO
 		t.Fatalf("Verify() = %#v, %v; want verified matching file", result, err)
 	}
 	artifact := result.Artifacts[0]
-	if artifact.Path != "notes/hello.txt" || artifact.Label != "hello.txt" || !strings.HasPrefix(artifact.MediaType, "text/plain") {
+	if artifact.Path != "notes/hello.txt" || artifact.Label != "hello.txt" || !strings.HasPrefix(artifact.MediaType, "text/plain") ||
+		artifact.WorkspaceID != "w1234567" || artifact.Revision != 4 || artifact.SizeBytes != 5 ||
+		artifact.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("artifact = %#v; want basename label, Workspace path, and extension-derived MIME", artifact)
 	}
 	operationKey := runtimeVerificationOperationKey(request.StepID, "w1234567", 1)
@@ -1158,6 +1315,42 @@ func TestRuntimeToolExecutorVerifyRequiresRuntimeFileMatchAndPersistsIdempotentO
 	conflict, err := fixture.executor.Verify(context.Background(), request)
 	if err != nil || conflict.Status != AgentVerifyUnknown || fixture.handlers[runtimeFileVerifyCapability].calls.Load() != 1 {
 		t.Fatalf("same-step changed evidence Verify() = %#v, %v; runtime calls = %d; want fail-closed idempotency conflict", conflict, err, fixture.handlers[runtimeFileVerifyCapability].calls.Load())
+	}
+}
+
+func TestRuntimeToolExecutorVerifyRejectsFileWriteOutputNotInLedger(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: runtimeFileVerifyCapability, action: runtimeFileVerifyAction,
+		result: `{"files":[{"path":"notes/hello.txt","size":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","matches":true}]}`,
+	}})
+	evidence := seedSuccessfulFileWrite(t, fixture, "w1234567", "notes/hello.txt", "hello")
+	fixture.store.mu.Lock()
+	operation := fixture.store.operations[evidence.OperationKey]
+	operation.Result = `{"path":"notes/other.txt","bytes_written":5}`
+	fixture.store.operations[evidence.OperationKey] = operation
+	fixture.store.mu.Unlock()
+
+	result, err := fixture.executor.Verify(context.Background(), AgentVerificationRequest{
+		Task: fixture.store.details.Task, StepID: "s1234567", Evidence: []AgentFileEvidence{evidence}, Fence: fixture.fence,
+	})
+	if err != nil || result.Status != AgentVerifyUnknown || fixture.handlers[runtimeFileVerifyCapability].calls.Load() != 0 {
+		t.Fatalf("Verify() = %#v, %v; runtime calls = %d; want ledger mismatch rejected before verification",
+			result, err, fixture.handlers[runtimeFileVerifyCapability].calls.Load())
+	}
+}
+
+func TestRuntimeToolExecutorVerifyRequiresCommittedWorkspaceBlockReadback(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: runtimeFileVerifyCapability, action: runtimeFileVerifyAction,
+		result: `{"files":[{"path":"notes/hello.txt","size":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","matches":true}]}`,
+	}})
+	fixture.workspaceBlocks.data["2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"] = []byte("jello")
+	evidence := []AgentFileEvidence{seedSuccessfulFileWrite(t, fixture, "w1234567", "notes/hello.txt", "hello")}
+	result, err := fixture.executor.Verify(context.Background(), AgentVerificationRequest{
+		Task: fixture.store.details.Task, StepID: "s1234567", Evidence: evidence, Fence: fixture.fence,
+	})
+	if err != nil || result.Status != AgentVerifyUnknown || len(result.Artifacts) != 0 {
+		t.Fatalf("Verify() with corrupt Morde block = %#v, %v; want unknown without artifact", result, err)
 	}
 }
 
@@ -1431,7 +1624,7 @@ func seedSuccessfulFileWrite(t *testing.T, fixture *runtimeToolExecutorFixture, 
 	operation := task.Operation{
 		ID: operationID, TaskID: fixture.store.details.Task.ID, Key: evidence[0].OperationKey,
 		RequestHash: append([]byte(nil), evidence[0].RequestHash...), HostID: fixture.store.details.Task.HostID,
-		WorkspaceID: workspaceID, BindingVersion: 1, Status: task.OperationSucceeded,
+		WorkspaceID: workspaceID, BindingVersion: 1, Status: task.OperationSucceeded, Result: string(output),
 	}
 	fixture.store.mu.Lock()
 	fixture.store.operations[operation.Key] = operation
@@ -1440,15 +1633,16 @@ func seedSuccessfulFileWrite(t *testing.T, fixture *runtimeToolExecutorFixture, 
 }
 
 type runtimeToolExecutorFixture struct {
-	executor   *RuntimeToolExecutor
-	store      *runtimeToolTaskStore
-	authorizer *runtimeToolAuthorizer
-	fence      AgentHostFence
-	fences     *runtimeToolFenceReader
-	handlers   map[string]*runtimeToolTestHandler
-	wrap       func(http.Handler) http.Handler
-	manager    *runtimecore.Manager
-	server     *httptest.Server
+	executor        *RuntimeToolExecutor
+	store           *runtimeToolTaskStore
+	authorizer      *runtimeToolAuthorizer
+	fence           AgentHostFence
+	fences          *runtimeToolFenceReader
+	handlers        map[string]*runtimeToolTestHandler
+	wrap            func(http.Handler) http.Handler
+	manager         *runtimecore.Manager
+	server          *httptest.Server
+	workspaceBlocks *proofBlocks
 }
 
 type runtimeToolHandlerSpec struct {
@@ -1665,8 +1859,10 @@ func newRuntimeToolExecutorFixture(t *testing.T, specs []runtimeToolHandlerSpec)
 	fixture := &runtimeToolExecutorFixture{handlers: make(map[string]*runtimeToolTestHandler)}
 
 	expires := time.Now().Add(time.Minute).UTC()
+	inputRevision := int64(0)
 	value := task.Task{
-		ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", ModelID: "p1234567",
+		ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", ModelID: "p1234567", WorkspaceID: "w1234567",
+		InputRevision: &inputRevision, ContextDigest: make([]byte, 32),
 		Status: task.StatusRunning, Authorization: task.Authorization{Kind: string(identity.KindSession)},
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		Lease:  task.Lease{Owner: "worker-1", Version: 1, ExpiresAt: &expires},
@@ -1760,11 +1956,33 @@ func newRuntimeToolExecutorFixture(t *testing.T, specs []runtimeToolHandlerSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.executor, err = NewRuntimeToolExecutor(fixture.store, fixture.authorizer, fixture.fences, runtime)
+	workspaceService, manifestStore, workspaceBlocks, _ := proofFixture(t)
+	const helloSHA256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	manifestStore.snapshots[4] = []workspace.File{{
+		Path: "notes/hello.txt", SizeBytes: 5, SHA256: helloSHA256, Mode: 0o644,
+		Chunks: []workspace.Chunk{{SHA256: helloSHA256, SizeBytes: 5}},
+	}}
+	workspaceBlocks.data[helloSHA256] = []byte("hello")
+	fixture.workspaceBlocks = workspaceBlocks
+	fixture.executor, err = NewRuntimeToolExecutor(fixture.store, fixture.authorizer, fixture.fences, runtime, workspaceService)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return fixture
+}
+
+func setRuntimeToolWorkspaceRevision(t *testing.T, fixture *runtimeToolExecutorFixture, revision int64) {
+	t.Helper()
+	hosts := fixture.executor.runtime.hosts.(*hostServiceTestHostStore)
+	value, err := hosts.GetHost(context.Background(), fixture.store.details.Task.HostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.Workspaces[0].DesiredRevision = revision
+	value.Workspaces[0].AppliedRevision = revision
+	value.Workspaces[0].Workspace.Revision = revision
+	value.Workspaces[0].SyncState = workspace.BindingSyncHealthy
+	hosts.addHost(value)
 }
 
 func (f *runtimeToolExecutorFixture) request(name string, arguments string, scope identity.Scope) AgentToolRequest {
@@ -1795,7 +2013,28 @@ func (f *runtimeToolExecutorFixture) prepared(name, arguments string, scope iden
 	if err != nil {
 		panic(fmt.Sprintf("Prepare(%s) failed: %v", name, err))
 	}
+	if preparation.Status == AgentToolApprovalRequired {
+		hash, hashErr := agentOperationHash(request.Call.Name, request.Arguments)
+		if hashErr != nil {
+			panic(hashErr)
+		}
+		pending, pendingErr := newPendingApproval(request.Task, request.Call, hash[:], preparation.Approval, preparation.Fence, 1)
+		if pendingErr != nil {
+			panic(pendingErr)
+		}
+		pending.Status, pending.Decision = task.PendingRequestApproved, task.PendingDecisionApprove
+		f.store.details.PendingRequest = pending
+		f.fences.fence = preparation.Fence
+		request.Fence = preparation.Fence
+		request.Approval = &AgentToolApprovalDecision{PendingID: pending.ID, Version: pending.Version,
+			Decision: task.PendingDecisionApprove, RequestHash: append([]byte(nil), hash[:]...)}
+		preparation, err = f.executor.Prepare(context.Background(), request)
+		if err != nil {
+			panic(fmt.Sprintf("Prepare(%s) with approved action failed: %v", name, err))
+		}
+	}
 	request.Fence = preparation.Fence
+	request.WorkspaceID = preparation.WorkspaceID
 	f.fence = preparation.Fence
 	f.fences.fence = preparation.Fence
 	request.OperationID = "o1234567"

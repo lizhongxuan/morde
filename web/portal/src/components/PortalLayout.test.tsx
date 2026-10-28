@@ -9,11 +9,13 @@ vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: '
 describe('PortalLayout', () => {
   afterEach(cleanup);
 
-  it('links the PC portal to the same-origin mobile app', () => {
-    render(<ToastProvider><MemoryRouter><PortalLayout /></MemoryRouter></ToastProvider>);
+  it('opens the cloud computer page first and links to the same-origin mobile app', () => {
+    render(<ToastProvider><MemoryRouter initialEntries={['/hosts']}><PortalLayout /></MemoryRouter></ToastProvider>);
 
     expect(screen.getByRole('link', { name: '打开手机端' })).toHaveAttribute('href', '/app/');
-    expect(screen.getByRole('heading', { level: 1, name: '工作台' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: '云端电脑' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '工作台' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 });

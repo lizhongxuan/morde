@@ -3,7 +3,9 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -118,6 +121,489 @@ func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
 	result, err := store.AppendMessage(ctx, newTask)
 	if err != nil || result.Task.ID != newTask.Task.ID || result.Task.ID == created.Task.ID {
 		t.Fatalf("append after completion should create a new task: %#v, err=%v", result, err)
+	}
+}
+
+func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	for _, test := range []struct {
+		key       string
+		objective string
+		want      task.FileDeliveryIntent
+	}{
+		{key: "persist-intent-none", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
+		{key: "persist-intent-file", objective: "Generate and save a PDF report.", want: task.FileDeliveryRequired},
+		{key: "persist-intent-unclear", objective: "Write a report about the project.", want: task.FileDeliveryUnclear},
+	} {
+		submission := newTestTaskSubmission(t, owner.ID, "", test.key, test.objective)
+		created, err := store.SubmitTask(ctx, submission)
+		if err != nil {
+			t.Fatalf("submit %s task: %v", test.want, err)
+		}
+		loaded, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+		if err != nil {
+			t.Fatalf("load %s task: %v", test.want, err)
+		}
+		if created.Task.FileDeliveryIntent != test.want || loaded.Task.FileDeliveryIntent != test.want {
+			t.Fatalf("file delivery intent create/read = %q/%q, want %q", created.Task.FileDeliveryIntent, loaded.Task.FileDeliveryIntent, test.want)
+		}
+	}
+}
+
+func TestPostgresTaskAppendOnlyRaisesFileDeliveryIntent(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	submission := newTestTaskSubmission(t, owner.ID, "", "append-intent-start", "Explain what caused the error.")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit task: %v", err)
+	}
+
+	appendMessage := func(key, content string, intent task.FileDeliveryIntent) app.TaskSubmissionResult {
+		t.Helper()
+		result, appendErr := store.AppendMessage(ctx, app.TaskSubmission{
+			Task: task.Task{
+				OwnerID: owner.ID, ConversationID: created.Conversation.ID, ModelID: created.Task.ModelID,
+				FileDeliveryIntent: intent,
+			},
+			Message: conversation.Message{
+				ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
+				OwnerID: owner.ID, Role: conversation.RoleUser, Content: content,
+			},
+			Idempotency: testIdempotency(owner.ID, "append-intent", key),
+		})
+		if appendErr != nil {
+			t.Fatalf("append %q: %v", key, appendErr)
+		}
+		return result
+	}
+
+	required := appendMessage("append-intent-required", "Generate and save a PDF report.", task.FileDeliveryRequired)
+	if required.Task.FileDeliveryIntent != task.FileDeliveryRequired {
+		t.Fatalf("appended required intent = %q", required.Task.FileDeliveryIntent)
+	}
+	stillRequired := appendMessage("append-intent-neutral", "Continue the explanation.", task.FileDeliveryNone)
+	if stillRequired.Task.FileDeliveryIntent != task.FileDeliveryRequired {
+		t.Fatalf("later neutral message downgraded intent to %q", stillRequired.Task.FileDeliveryIntent)
+	}
+}
+
+func TestPostgresTaskSubmissionFencesWorkspaceRevisionAndHostBinding(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-input")
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := workspaceValue.Revision
+	newWorkspaceTask := func(key string, inputRevision int64) app.TaskSubmission {
+		submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, key, "work from pinned files")
+		submission.Task.WorkspaceID = workspaceValue.ID
+		submission.Task.InputRevision = &inputRevision
+		submission.Task.ContextDigest = hashBytes("workspace input manifest")
+		return submission
+	}
+	if _, err := store.SubmitTask(ctx, newWorkspaceTask("task-before-sync", revision)); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("task using a preparing Workspace binding error = %v", err)
+	}
+
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := store.SubmitTask(ctx, newWorkspaceTask("task-current-input", revision))
+	if err != nil || accepted.Task.WorkspaceID != workspaceValue.ID || accepted.Task.InputRevision == nil || *accepted.Task.InputRevision != revision {
+		t.Fatalf("task with current active Workspace binding = %#v, err=%v", accepted, err)
+	}
+	appendValue := app.TaskSubmission{
+		Task: task.Task{OwnerID: owner.ID, ConversationID: accepted.Conversation.ID, HostID: hostValue.ID, ModelID: accepted.Task.ModelID},
+		Message: conversation.Message{
+			ID: mustID(t, domain.NewMessageID), ConversationID: accepted.Conversation.ID,
+			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue this task",
+		},
+		Idempotency: testIdempotency(owner.ID, "conversation.append_message", "task-workspace-context-append"),
+	}
+	appended, err := store.AppendMessage(ctx, appendValue)
+	if err != nil || appended.Task.WorkspaceID != workspaceValue.ID || appended.Task.InputRevision == nil || *appended.Task.InputRevision != revision {
+		t.Fatalf("append did not preserve active task Workspace input: %#v, err=%v", appended, err)
+	}
+	mismatchedAppend := appendValue
+	mismatchedAppend.Task.WorkspaceID = workspaceValue.ID
+	wrongRevision := revision + 1
+	mismatchedAppend.Task.InputRevision = &wrongRevision
+	mismatchedAppend.Task.ContextDigest = hashBytes("workspace input manifest")
+	mismatchedAppend.Message.ID = mustID(t, domain.NewMessageID)
+	mismatchedAppend.Message.Content = "must not change the pinned input"
+	mismatchedAppend.Idempotency = testIdempotency(owner.ID, "conversation.append_message", "task-workspace-context-mismatch")
+	if _, err := store.AppendMessage(ctx, mismatchedAppend); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("append with a different Workspace snapshot error = %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, newWorkspaceTask("task-stale-input", revision+1)); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("task with uncommitted Workspace revision error = %v", err)
+	}
+	if _, err := store.SetWorkspaceBindingSyncStatus(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingSyncConflict, []string{"input.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SubmitTask(ctx, newWorkspaceTask("task-conflicted-binding", revision)); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("task with conflicted Host replica error = %v", err)
+	}
+}
+
+func TestPostgresWorkspaceSyncCommitSerializesWithTaskSubmission(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+
+	prepare := func(t *testing.T, name, key string) (app.TaskSubmission, workspace.Workspace, workspace.SyncSession) {
+		t.Helper()
+		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, name)
+		hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+			SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+		})
+		if err != nil {
+			t.Fatalf("create Workspace binding: %v", err)
+		}
+		if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+			t.Fatalf("activate Workspace binding: %v", err)
+		}
+		revision := workspaceValue.Revision
+		submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, key, "work from the pinned Workspace")
+		submission.Task.WorkspaceID = workspaceValue.ID
+		submission.Task.InputRevision = &revision
+		submission.Task.ContextDigest = hashBytes("workspace input manifest")
+
+		file := syncTestFile(name+".txt", []byte("committed after the task snapshot"))
+		session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+		if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks([]workspace.File{file}),
+			syncTestIdempotency(owner.ID, "workspace.sync.create", "create:"+key, session.ID)); err != nil {
+			t.Fatalf("create Workspace sync session: %v", err)
+		}
+		return submission, workspaceValue, session
+	}
+
+	t.Run("sync commit wins and stale task is rejected", func(t *testing.T) {
+		submission, workspaceValue, session := prepare(t, "sync-first", "task-sync-first")
+		committed, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
+			syncTestIdempotency(owner.ID, "workspace.sync.commit", "commit:task-sync-first", session.ID))
+		if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
+			t.Fatalf("commit Workspace sync first = %#v, err=%v", committed, err)
+		}
+		if _, err := store.SubmitTask(ctx, submission); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+			t.Fatalf("submit Task with stale input after sync commit error = %v, want workspace conflict", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE workspace_id=$1`, workspaceValue.ID).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("stale Task rows after rejected submission = %d, err=%v", count, err)
+		}
+	})
+
+	t.Run("task submission wins then sync commit advances revision", func(t *testing.T) {
+		submission, workspaceValue, session := prepare(t, "task-first", "task-task-first")
+		const advisoryLockKey int64 = 824726194
+		if _, err := pool.Exec(ctx, `CREATE FUNCTION wait_for_task_submission_test_release() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(824726194);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql`); err != nil {
+			t.Fatalf("create Task insert test barrier: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `CREATE TRIGGER wait_for_task_submission_test_release
+BEFORE INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION wait_for_task_submission_test_release()`); err != nil {
+			t.Fatalf("install Task insert test barrier: %v", err)
+		}
+		advisoryConn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("acquire PostgreSQL advisory lock connection: %v", err)
+		}
+		defer func() {
+			_, _ = advisoryConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, advisoryLockKey)
+			advisoryConn.Release()
+		}()
+		if _, err := advisoryConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {
+			t.Fatalf("hold Task insert advisory lock: %v", err)
+		}
+
+		type submissionResult struct {
+			value app.TaskSubmissionResult
+			err   error
+		}
+		type commitResult struct {
+			value workspace.SyncSession
+			err   error
+		}
+		submitted := make(chan submissionResult, 1)
+		committed := make(chan commitResult, 1)
+		go func() {
+			value, err := store.SubmitTask(ctx, submission)
+			submitted <- submissionResult{value: value, err: err}
+		}()
+
+		waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer waitCancel()
+		// The INSERT trigger runs only after SubmitTask holds the Workspace row lock.
+		waitForPostgresLockWait(t, waitCtx, pool, "%INSERT INTO tasks%", 1)
+		go func() {
+			value, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
+				syncTestIdempotency(owner.ID, "workspace.sync.commit", "commit:task-task-first", session.ID))
+			committed <- commitResult{value: value, err: err}
+		}()
+		waitForPostgresLockWait(t, waitCtx, pool, "%FOR UPDATE OF w%", 1)
+		var unlocked bool
+		if err := advisoryConn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+			t.Fatalf("release Task insert advisory lock: unlocked=%t err=%v", unlocked, err)
+		}
+
+		var accepted app.TaskSubmissionResult
+		select {
+		case result := <-submitted:
+			if result.err != nil {
+				t.Fatalf("Task submission queued before sync commit: %v", result.err)
+			}
+			accepted = result.value
+		case <-waitCtx.Done():
+			t.Fatalf("Task submission did not finish before sync commit: %v", waitCtx.Err())
+		}
+		if accepted.Task.WorkspaceID != workspaceValue.ID || accepted.Task.InputRevision == nil || *accepted.Task.InputRevision != workspaceValue.Revision {
+			t.Fatalf("Task input after first lock grant = %#v", accepted.Task)
+		}
+		select {
+		case result := <-committed:
+			if result.err != nil || result.value.State != workspace.SyncCompleted || result.value.TargetRevision != workspaceValue.Revision+1 {
+				t.Fatalf("Workspace sync commit after Task submission = %#v, err=%v", result.value, result.err)
+			}
+		case <-waitCtx.Done():
+			t.Fatalf("Workspace sync commit did not finish after Task submission: %v", waitCtx.Err())
+		}
+		stored, err := store.GetTask(ctx, accepted.Task.ID, owner.ID)
+		if err != nil || stored.Task.InputRevision == nil || *stored.Task.InputRevision != workspaceValue.Revision {
+			t.Fatalf("stored Task input after later Workspace commit = %#v, err=%v", stored.Task, err)
+		}
+		currentWorkspace, err := store.GetWorkspace(ctx, workspaceValue.ID)
+		if err != nil || currentWorkspace.Revision != workspaceValue.Revision+1 {
+			t.Fatalf("Workspace after serialized commit = %#v, err=%v", currentWorkspace, err)
+		}
+	})
+}
+
+func TestPostgresWorkspaceSyncCommitSerializesWithTaskOperationAdmission(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "operation-admission")
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_workspace_admission' WHERE id=$1`, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	revision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "workspace-operation-admission", "read the pinned Workspace")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("workspace operation admission manifest")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Workspace task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "workspace-admission-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Workspace task: %#v, found=%t, err=%v", claimed, found, err)
+	}
+	file := syncTestFile("external-update.txt", []byte("external Workspace update"))
+	writerSubmission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "workspace-file-writer", "write a file")
+	writerSubmission.Task.WorkspaceID = workspaceValue.ID
+	writerSubmission.Task.InputRevision = &revision
+	writerSubmission.Task.ContextDigest = hashBytes("writer Workspace manifest")
+	writerCreated, err := store.SubmitTask(ctx, writerSubmission)
+	if err != nil {
+		t.Fatalf("submit Workspace writer task: %v", err)
+	}
+	writer, found, err := store.ClaimNextTask(ctx, "workspace-writer-worker", time.Minute)
+	if err != nil || !found || writer.ID != writerCreated.Task.ID {
+		t.Fatalf("claim Workspace writer task: %#v, found=%t, err=%v", writer, found, err)
+	}
+	operation, replayed, err := store.CreateOperation(ctx, task.Operation{
+		ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "file.read:input",
+		RequestHash: hashBytes("read pinned input"), HostID: hostValue.ID, WorkspaceID: workspaceValue.ID,
+		BindingVersion: binding.BindingVersion, InputRevision: &revision,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_workspace_admission",
+		ControlVersion: hostValue.ControlVersion, LeaseVersion: claimed.Lease.Version,
+		RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared,
+	}, claimed.Lease.Owner)
+	if err != nil || replayed || operation.Status != task.OperationPrepared || operation.InputRevision == nil || *operation.InputRevision != revision {
+		t.Fatalf("create revision-bound task operation: %#v, replayed=%t, err=%v", operation, replayed, err)
+	}
+	loadedOperation, err := store.GetOperation(ctx, owner.ID, claimed.ID, operation.Key)
+	if err != nil || loadedOperation.InputRevision == nil || *loadedOperation.InputRevision != revision {
+		t.Fatalf("load revision-bound task operation: %#v, err=%v", loadedOperation, err)
+	}
+	writeKey := "file-write-output"
+	writerOperation, replayed, err := store.CreateOperation(ctx, task.Operation{
+		ID: mustID(t, domain.NewOperationID), TaskID: writer.ID, Key: writeKey,
+		RequestHash: hashBytes("write pinned output"), HostID: hostValue.ID, WorkspaceID: workspaceValue.ID,
+		BindingVersion: binding.BindingVersion, InputRevision: &revision,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_workspace_admission",
+		ControlVersion: hostValue.ControlVersion, LeaseVersion: writer.Lease.Version,
+		RuntimeLeaseVersion: writer.Lease.Version, Status: task.OperationPrepared,
+	}, writer.Lease.Owner)
+	if err != nil || replayed {
+		t.Fatalf("create writer operation: %#v replay=%t err=%v", writerOperation, replayed, err)
+	}
+
+	session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks([]workspace.File{file}),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "admission-session", session.ID)); err != nil {
+		t.Fatalf("create external sync session: %v", err)
+	}
+	commit := func() (workspace.SyncSession, error) {
+		value, _, commitErr := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
+			syncTestIdempotency(owner.ID, "workspace.sync.commit", "admission-commit", session.ID))
+		return value, commitErr
+	}
+	if _, err := commit(); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("Workspace commit during admitted task operation error = %v, want workspace busy", err)
+	}
+	if _, err := store.UpdateOperation(ctx, app.OperationUpdate{
+		TaskID: claimed.ID, OperationKey: operation.Key, LeaseOwner: claimed.Lease.Owner,
+		LeaseVersion: claimed.Lease.Version, Status: task.OperationFailed, Result: `{"error":"test_settled"}`,
+	}); err != nil {
+		t.Fatalf("settle admitted operation: %v", err)
+	}
+	writeOutput, err := json.Marshal(map[string]any{"path": file.Path, "bytes_written": file.SizeBytes, "sha256": file.SHA256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateOperation(ctx, app.OperationUpdate{
+		TaskID: writer.ID, OperationKey: writeKey, LeaseOwner: writer.Lease.Owner,
+		LeaseVersion: writer.Lease.Version, Status: task.OperationDispatched, ExternalID: "file-write-dispatch",
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_workspace_admission",
+		ControlVersion: hostValue.ControlVersion, RuntimeLeaseVersion: writer.Lease.Version,
+	}); err != nil {
+		t.Fatalf("dispatch writer operation: %v", err)
+	}
+	if _, err := store.UpdateOperation(ctx, app.OperationUpdate{
+		TaskID: writer.ID, OperationKey: writeKey, LeaseOwner: writer.Lease.Owner,
+		LeaseVersion: writer.Lease.Version, Status: task.OperationSucceeded, Result: string(writeOutput),
+	}); err != nil {
+		t.Fatalf("settle writer operation: %v", err)
+	}
+	committed, err := commit()
+	if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != revision+1 {
+		t.Fatalf("Workspace commit after operation settlement = %#v, err=%v", committed, err)
+	}
+	staleOperation := task.Operation{
+		ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "file.read:stale-input",
+		RequestHash: hashBytes("read stale input"), HostID: hostValue.ID, WorkspaceID: workspaceValue.ID,
+		BindingVersion: binding.BindingVersion, InputRevision: &revision,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_workspace_admission",
+		ControlVersion: hostValue.ControlVersion, LeaseVersion: claimed.Lease.Version,
+		RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared,
+	}
+	if _, _, err := store.CreateOperation(ctx, staleOperation, claimed.Lease.Owner); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("operation admitted after input revision changed error = %v, want workspace conflict", err)
+	}
+	completionStepID := mustID(t, domain.NewStepID)
+	completionStep := task.Step{ID: completionStepID, TaskID: claimed.ID, Sequence: 1, Kind: "result", Status: task.StepSucceeded,
+		Title: "Complete task", Summary: "The task finished."}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: completionStep.ID, Result: "done", Steps: []task.Step{completionStep},
+		Event: task.Event{TaskID: claimed.ID, Type: "task.result", Payload: []byte(`{"result":"done"}`)},
+	}); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("completion against stale Workspace revision error = %v, want workspace conflict", err)
+	}
+	if err := store.ReconcileStaleWorkspaceTasks(ctx); err != nil {
+		t.Fatalf("reconcile stale Workspace tasks: %v", err)
+	}
+	readerAfter, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || readerAfter.Task.Status != task.StatusPausing || readerAfter.Task.WaitingReason != "workspace_input_changed" {
+		t.Fatalf("stale Workspace reader task = %#v, err=%v", readerAfter.Task, err)
+	}
+	writerAfter, err := store.GetTask(ctx, writer.ID, owner.ID)
+	if err != nil || writerAfter.Task.Status != task.StatusRunning {
+		t.Fatalf("task's own verified file write was treated as external drift: %#v, err=%v", writerAfter.Task, err)
+	}
+	stopClaim, found, err := store.ClaimNextTaskStop(ctx, "workspace-revision-stop", time.Minute)
+	if err != nil || !found || stopClaim.Task.ID != claimed.ID {
+		t.Fatalf("claim stale Workspace task stop: %#v, found=%t, err=%v", stopClaim, found, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE id=$1`, stopClaim.Request.ID); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := store.CompleteTaskStop(ctx, claimed.ID, stopClaim.Request.ID, "workspace-revision-stop", stopClaim.Request.LeaseVersion)
+	if err != nil || paused.Status != task.StatusPaused || paused.WaitingReason != "workspace_input_changed" {
+		t.Fatalf("finalize stale Workspace task stop: %#v, err=%v", paused, err)
+	}
+	resumeID := mustID(t, domain.NewTaskActionID)
+	resumeRecord := taskActionIdempotency(owner.ID, task.ActionResume, "stale-workspace-resume", claimed.ID, task.StatusPaused, resumeID)
+	if _, err := store.RequestTaskAction(ctx, resumeRecord, claimed.ID, task.ActionResume, task.StatusPaused, resumeID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("resume against a stale Workspace input error = %v, want workspace conflict", err)
+	}
+	notifications, err := store.ListUnprocessedNotificationEvents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var staleNotice bool
+	for _, event := range notifications {
+		var payload struct {
+			Reason string `json:"reason"`
+		}
+		if event.TaskID == claimed.ID && event.Type == "task.waiting_user" && json.Unmarshal(event.Payload, &payload) == nil &&
+			payload.Reason == "workspace_input_changed" {
+			staleNotice = true
+		}
+	}
+	if !staleNotice {
+		t.Fatalf("stale Workspace task notification event missing: %#v", notifications)
+	}
+	notificationService, err := app.NewNotificationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := notificationService.ProcessPending(ctx, 10); err != nil || processed == 0 {
+		t.Fatalf("process stale Workspace task notification: processed=%d err=%v", processed, err)
+	}
+	page, err := store.ListNotifications(ctx, owner.ID, false, app.PageRequest{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attentionNotice bool
+	for _, notification := range page.Items {
+		if notification.TaskID == claimed.ID && string(notification.Kind) == "attention_required" && !notification.Actionable {
+			attentionNotice = true
+		}
+	}
+	if !attentionNotice {
+		t.Fatalf("stale Workspace task attention notification missing: %#v", page.Items)
 	}
 }
 
@@ -610,6 +1096,118 @@ func TestPostgresPendingApprovalResponseIsVersionedAndAtomic(t *testing.T) {
 	}
 }
 
+func TestPostgresConcurrentApprovalByTwoAuthorizedClientsIsAppliedOnce(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "two-client-approval", "approve a shared operation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "two-client-approval-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("ClaimNextTask() = %#v, found=%t, err=%v", claimed, found, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	pendingID := mustID(t, domain.NewPendingRequestID)
+	request := &task.PendingRequest{
+		ID: pendingID, TaskID: claimed.ID, Version: 1, Kind: "approval", Title: "Approve export",
+		Object: "report.txt", Content: "Export this file?", Impact: "The file will leave this Host.",
+		CallID: "call-two-client-approval", ToolName: "file_export", RequestHash: hashBytes("two-client-export"),
+		RuntimeGeneration: 1, RuntimeInstanceID: "two-client-runtime", ControlVersion: 1, Status: task.PendingRequestPending,
+	}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusWaitingUser, CurrentStep: stepID, WaitingReason: "approval_required",
+		Usage: task.Usage{ActiveSeconds: 1, ToolCalls: 1},
+		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "tool", Status: task.StepWaitingUser,
+			Title: request.Title, Summary: request.Content}},
+		Event:          task.Event{TaskID: claimed.ID, Type: "task.waiting_user", Payload: []byte(`{"reason":"approval_required"}`)},
+		PendingRequest: request,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
+	}, credentialDefaultHostNoop{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := app.NewTaskService(store, credentials, taskChatConfiguredModelCatalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principals := make([]identity.Principal, 2)
+	for i := range principals {
+		installationID := createTestClientInstallation(t, store.pool, owner.ID, nil)
+		token := clientTestToken(t, owner.ID, installationID, identity.KindClient, nil)
+		if _, err := store.CreateToken(ctx, token); err != nil {
+			t.Fatalf("create client %d token: %v", i+1, err)
+		}
+		principals[i] = identity.Principal{
+			UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindClient,
+			TokenID: token.ID, ClientInstallationID: installationID,
+		}
+		if err := credentials.AuthorizeTaskAction(ctx, owner.ID, identity.KindClient, token.ID, hostValue.ID, nil, identity.ScopeTaskControl); err != nil {
+			t.Fatalf("authorize client %d for task control: %v", i+1, err)
+		}
+	}
+
+	start := make(chan struct{})
+	type outcome struct {
+		client int
+		err    error
+	}
+	results := make(chan outcome, len(principals))
+	for i, principal := range principals {
+		go func(client int, principal identity.Principal) {
+			<-start
+			key := fmt.Sprintf("approval-client-%d-key", client+1)
+			err := tasks.RespondToPendingRequest(ctx, principal, claimed.ID, pendingID, 1, task.PendingDecisionApprove, key)
+			results <- outcome{client: client + 1, err: err}
+		}(i, principal)
+	}
+	close(start)
+	successes, conflicts := 0, 0
+	for range principals {
+		result := <-results
+		if result.err == nil {
+			successes++
+		} else if domain.CodeOf(result.err) == domain.CodeConflict {
+			conflicts++
+		} else {
+			t.Fatalf("client %d approval error = %v, want one success and one conflict", result.client, result.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent approvals: successes=%d conflicts=%d, want one each", successes, conflicts)
+	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusQueued || details.PendingRequest == nil ||
+		details.PendingRequest.Status != task.PendingRequestApproved || details.PendingRequest.Decision != task.PendingDecisionApprove {
+		t.Fatalf("task after concurrent approval = status %q pending %#v err=%v", details.Task.Status, details.PendingRequest, err)
+	}
+	events, err := store.ListTaskEvents(ctx, owner.ID, claimed.ID, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseEvents := 0
+	for _, event := range events {
+		if event.Type == "task.response" {
+			responseEvents++
+		}
+	}
+	if responseEvents != 1 {
+		t.Fatalf("concurrent approval emitted %d task.response events, want exactly one: %#v", responseEvents, events)
+	}
+}
+
 func TestPostgresClarificationAnswerIsVersionedIdempotentAndRestorable(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -742,6 +1340,9 @@ func TestPostgresTaskWritesDuringUserTakeoverAndPreserveReplays(t *testing.T) {
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	if err := store.SetRuntimeInstanceID(ctx, hostValue.ID, hostValue.RuntimeGeneration, hostValue.ControlVersion, "", "runtime-during-takeover"); err != nil {
+		t.Fatal(err)
+	}
 
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "fenced-submit", "initial work")
 	created, err := store.SubmitTask(ctx, submission)
@@ -797,7 +1398,7 @@ func TestPostgresTaskWritesDuringUserTakeoverAndPreserveReplays(t *testing.T) {
 	}
 	operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimedTask.ID, Key: "takeover-operation",
 		RequestHash: hashBytes("takeover-operation"), HostID: hostValue.ID, RuntimeGeneration: hostValue.RuntimeGeneration,
-		RuntimeInstanceID: "runtime-during-takeover", ControlVersion: hostValue.ControlVersion,
+		RuntimeInstanceID: "runtime-during-takeover", ControlVersion: transition.BlockedControlVersion,
 		LeaseVersion: claimedTask.Lease.Version, RuntimeLeaseVersion: claimedTask.Lease.Version, Status: task.OperationPrepared}
 	if _, _, err := store.CreateOperation(ctx, operation, "worker-fenced"); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("Host operation during takeover error = %v", err)
@@ -815,7 +1416,7 @@ func TestPostgresTaskProgressWithoutRunningHost(t *testing.T) {
 			ctx := context.Background()
 			owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 			hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
-			if _, err := pool.Exec(ctx, `UPDATE hosts SET state=$2 WHERE id=$1`, hostValue.ID, state); err != nil {
+			if _, err := pool.Exec(ctx, `UPDATE hosts SET state=$2, runtime_instance_id='unready-runtime' WHERE id=$1`, hostValue.ID, state); err != nil {
 				t.Fatal(err)
 			}
 			created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "non-running-host", "server work"))
@@ -844,6 +1445,10 @@ func TestPostgresTaskProgressWithoutRunningHost(t *testing.T) {
 			})
 			if err != nil || event.Type != "task.step" {
 				t.Fatalf("commit server progress with Host %s = %#v, err=%v", state, event, err)
+			}
+			details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+			if err != nil || details.Task.CurrentStep != stepID || len(details.Steps) != 1 || details.Steps[0].Status != task.StepSucceeded {
+				t.Fatalf("load server progress with Host %s = %#v, err=%v", state, details, err)
 			}
 			operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, Key: "unready-host-operation",
 				RequestHash: hashBytes("unready-host-operation"), HostID: hostValue.ID, RuntimeGeneration: hostValue.RuntimeGeneration,
@@ -1332,6 +1937,26 @@ func TestPostgresTaskBatchItemAndValidatedArtifactPersistence(t *testing.T) {
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "durable-primitives", "generate a report")
+	artifactWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "artifact proof")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: artifactWorkspace, Directory: artifactWorkspace.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: artifactWorkspace.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, artifactWorkspace.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, artifactWorkspace.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(0)
+	submission.Task.WorkspaceID = artifactWorkspace.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("workspace input manifest")
+	proofs := seedTaskArtifactManifest(t, store, artifactWorkspace.ID, 0, map[string][]byte{
+		"artifacts/report.pdf": []byte("report"), "artifacts/summary.txt": []byte("summary"),
+	})
 	itemID := mustID(t, domain.NewBatchItemID)
 	submission.BatchItems = []task.BatchItem{{ID: itemID, Key: "report", Input: "write report"}}
 	created, err := store.SubmitTask(ctx, submission)
@@ -1384,6 +2009,7 @@ func TestPostgresTaskBatchItemAndValidatedArtifactPersistence(t *testing.T) {
 		BatchItemID: batchItem.ID, BatchAttempt: batchItem.Attempt,
 		Label: "Report", Path: "artifacts/report.pdf", MediaType: "application/pdf",
 	}
+	artifact = addArtifactProof(artifact, proofs[artifact.Path])
 	if _, err := store.RecordValidatedArtifact(ctx, otherOwner.ID, artifact, "worker-one", claimed.Lease.Version); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("cross-owner artifact record error = %v", err)
 	}
@@ -1410,6 +2036,7 @@ func TestPostgresTaskBatchItemAndValidatedArtifactPersistence(t *testing.T) {
 		ID: mustID(t, domain.NewArtifactID), TaskID: created.Task.ID, StepID: stepID,
 		Label: "Summary", Path: "artifacts/summary.txt", MediaType: "text/plain",
 	}
+	ordinaryArtifact = addArtifactProof(ordinaryArtifact, proofs[ordinaryArtifact.Path])
 	ordinaryStored, err := store.RecordValidatedArtifact(ctx, owner.ID, ordinaryArtifact, "worker-one", claimed.Lease.Version)
 	if err != nil {
 		t.Fatalf("record ordinary task artifact: %v", err)
@@ -1463,6 +2090,275 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, mustID(t, domain.NewArtifactID), created.Task
 	var payload map[string]any
 	if err := json.Unmarshal(events[4].Payload, &payload); err != nil || payload["artifact_id"] != artifact.ID || payload["step_id"] != stepID || payload["path"] != artifact.Path || payload["media_type"] != artifact.MediaType || payload["batch_item_id"] != batchItem.ID || payload["batch_attempt"] != float64(1) {
 		t.Fatalf("artifact event payload = %#v err=%v", payload, err)
+	}
+}
+
+func TestPostgresTaskCompletionAcceptsPreviouslyRecordedArtifactAtCurrentWorkspaceRevision(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "batch artifact completion")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	proofs := seedTaskArtifactManifest(t, store, workspaceValue.ID, 0, map[string][]byte{"output/report.txt": []byte("saved")})
+	revision := int64(0)
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "persisted-artifact-completion", "generate and save a report")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("workspace input manifest")
+	submission.Task.FileDeliveryIntent = task.FileDeliveryRequired
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "worker-persisted-artifact", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim task: claimed=%t task=%s err=%v", found, claimed.ID, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	step := task.Step{ID: stepID, TaskID: created.Task.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded, Title: "Save report"}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: stepID, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.step", Payload: []byte(`{"step_id":"` + stepID + `"}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := addArtifactProof(task.Artifact{
+		ID: mustID(t, domain.NewArtifactID), TaskID: created.Task.ID, StepID: stepID,
+		Label: "Report", Path: "output/report.txt", MediaType: "text/plain",
+	}, proofs["output/report.txt"])
+	if _, err := store.RecordValidatedArtifact(ctx, owner.ID, artifact, claimed.Lease.Owner, claimed.Lease.Version); err != nil {
+		t.Fatalf("persist batch artifact before completion: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revisions (workspace_id, revision, file_count, total_bytes)
+VALUES ($1, 1, 0, 0)`, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_revision_files SET valid_to_revision=1
+WHERE workspace_id=$1 AND file_path=$2`, workspaceValue.ID, artifact.Path); err != nil {
+		t.Fatal(err)
+	}
+	seedTaskArtifactManifest(t, store, workspaceValue.ID, 1, map[string][]byte{artifact.Path: []byte("saved")})
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET revision=1 WHERE id=$1`, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, Result: "report saved", Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"saved"}`)},
+	}); err != nil {
+		t.Fatalf("complete with previously recorded artifact present at current Workspace revision: %v", err)
+	}
+	result, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || result.Task.Status != task.StatusCompleted || len(result.Artifacts) != 1 {
+		t.Fatalf("task with persisted artifact = status %q artifacts %#v err=%v", result.Task.Status, result.Artifacts, err)
+	}
+}
+
+func TestPostgresTaskCompletionCommitsOnlyProvedArtifactsAtomically(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "completion artifact")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	proofs := seedTaskArtifactManifest(t, store, workspaceValue.ID, 0, map[string][]byte{"output/result.txt": []byte("saved")})
+	revision := int64(0)
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "artifact-completion", "save result")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("workspace input manifest")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "worker-artifact", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim artifact task: claimed=%t task=%s err=%v", found, claimed.ID, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	step := task.Step{ID: stepID, TaskID: created.Task.ID, Sequence: 1, Kind: "verify", Status: task.StepSucceeded, Title: "Verify output"}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: "worker-artifact", LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: stepID, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.step", Payload: []byte(`{"step_id":"` + stepID + `"}`)},
+	}); err != nil {
+		t.Fatalf("persist artifact source step: %v", err)
+	}
+
+	artifact := addArtifactProof(task.Artifact{
+		ID: mustID(t, domain.NewArtifactID), TaskID: created.Task.ID, StepID: stepID,
+		Label: "Result", Path: "output/result.txt", MediaType: "text/plain",
+	}, proofs["output/result.txt"])
+	completed := app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: "worker-artifact", LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: stepID, Result: "saved", Steps: []task.Step{step},
+		Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"saved"}`)},
+	}
+	for _, mutate := range []struct {
+		name string
+		edit func(*task.Artifact)
+	}{
+		{name: "digest", edit: func(value *task.Artifact) {
+			value.SHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		}},
+		{name: "size", edit: func(value *task.Artifact) { value.SizeBytes++ }},
+		{name: "path", edit: func(value *task.Artifact) { value.Path = "output/other.txt" }},
+	} {
+		bad := artifact
+		bad.ID = mustID(t, domain.NewArtifactID)
+		mutate.edit(&bad)
+		attempt := completed
+		attempt.Artifacts = []task.Artifact{bad}
+		if _, err := store.CommitTaskProgress(ctx, attempt); domain.CodeOf(err) != domain.CodeInvalidState {
+			t.Fatalf("tampered artifact %s completion error = %v, want invalid_state", mutate.name, err)
+		}
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusRunning || len(details.Artifacts) != 0 {
+		t.Fatalf("failed proof partially committed: status=%q artifacts=%#v err=%v", details.Task.Status, details.Artifacts, err)
+	}
+
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_artifacts (id, task_id, step_id, label, path, media_type, batch_item_id, batch_attempt)
+VALUES ($1,$2,$3,'Legacy','output/legacy.txt','text/plain',NULL,NULL)`, mustID(t, domain.NewArtifactID), created.Task.ID, stepID); err != nil {
+		t.Fatalf("seed legacy artifact without proof: %v", err)
+	}
+	completed.Artifacts = nil
+	if _, err := store.CommitTaskProgress(ctx, completed); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("completion with an unproved artifact row error = %v, want invalid_state", err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM task_artifacts WHERE task_id=$1 AND path='output/legacy.txt'`, created.Task.ID); err != nil {
+		t.Fatalf("remove legacy artifact fixture: %v", err)
+	}
+	completed.Artifacts = []task.Artifact{artifact}
+	event, err := store.CommitTaskProgress(ctx, completed)
+	if err != nil || event.Type != "task.result" {
+		t.Fatalf("complete with committed Workspace proof: event=%#v err=%v", event, err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusCompleted || len(details.Artifacts) != 1 ||
+		details.Artifacts[0].WorkspaceID != workspaceValue.ID || details.Artifacts[0].Revision != 0 ||
+		details.Artifacts[0].SizeBytes != 5 || details.Artifacts[0].SHA256 != proofs["output/result.txt"].SHA256 {
+		t.Fatalf("completed task proof state = task:%q artifacts:%#v err=%v", details.Task.Status, details.Artifacts, err)
+	}
+	events, err := store.ListTaskEvents(ctx, owner.ID, created.Task.ID, 0, 10)
+	if err != nil || len(events) != 5 || events[3].Type != "task.artifact" || events[4].Type != "task.result" {
+		t.Fatalf("artifact and completion event sequence = %#v err=%v", events, err)
+	}
+
+	noFileSubmission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "no-file-completion", "answer question")
+	noFile, err := store.SubmitTask(ctx, noFileSubmission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noFileClaim, found, err := store.ClaimNextTask(ctx, "worker-no-file", time.Minute)
+	if err != nil || !found || noFileClaim.ID != noFile.Task.ID {
+		t.Fatalf("claim no-file task: claimed=%t task=%s err=%v", found, noFileClaim.ID, err)
+	}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: noFile.Task.ID, LeaseOwner: "worker-no-file", LeaseVersion: noFileClaim.Lease.Version,
+		Status: task.StatusCompleted, Result: "answer", Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"answer"}`)},
+	}); err != nil {
+		t.Fatalf("complete no-file task: %v", err)
+	}
+}
+
+func TestPostgresTaskCompletionRejectsFailedBatchAttemptArtifacts(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "batch artifact proof")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	proofs := seedTaskArtifactManifest(t, store, workspaceValue.ID, 0, map[string][]byte{"output/item.txt": []byte("item")})
+	revision := int64(0)
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "failed-batch-proof", "process items")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("workspace input manifest")
+	itemID := mustID(t, domain.NewBatchItemID)
+	submission.BatchItems = []task.BatchItem{{ID: itemID, Key: "item", Input: "make file"}}
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "worker-batch-artifact", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim batch artifact task: claimed=%t task=%s err=%v", found, claimed.ID, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: "worker-batch-artifact", LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: stepID,
+		Steps: []task.Step{{ID: stepID, TaskID: created.Task.ID, Sequence: 1, Kind: "verify", Status: task.StepSucceeded, Title: "Verify item"}},
+		Event: task.Event{Type: "task.step", Payload: []byte(`{"step_id":"` + stepID + `"}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || len(details.BatchItems) != 1 {
+		t.Fatalf("read batch item: %#v err=%v", details.BatchItems, err)
+	}
+	item := details.BatchItems[0]
+	item.Status = task.BatchItemRunning
+	item, err = store.UpdateBatchItem(ctx, owner.ID, item, "worker-batch-artifact", claimed.Lease.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Status = task.BatchItemFailed
+	item.Error = "failed after file write"
+	if _, err := store.UpdateBatchItem(ctx, owner.ID, item, "worker-batch-artifact", claimed.Lease.Version); err != nil {
+		t.Fatal(err)
+	}
+	artifact := addArtifactProof(task.Artifact{
+		ID: mustID(t, domain.NewArtifactID), TaskID: created.Task.ID, StepID: stepID,
+		BatchItemID: item.ID, BatchAttempt: item.Attempt, Label: "Item", Path: "output/item.txt", MediaType: "text/plain",
+	}, proofs["output/item.txt"])
+	if _, err := store.RecordValidatedArtifact(ctx, owner.ID, artifact, "worker-batch-artifact", claimed.Lease.Version); err != nil {
+		t.Fatalf("persist failed attempt artifact evidence: %v", err)
+	}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: "worker-batch-artifact", LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, Result: "completed", Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"completed"}`)},
+	}); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("complete with failed batch artifact error = %v, want invalid_state", err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusRunning {
+		t.Fatalf("failed batch artifact completed Task: status=%q err=%v", details.Task.Status, err)
 	}
 }
 
@@ -1674,10 +2570,13 @@ func newTestTaskSubmission(t *testing.T, ownerID, hostID, idemKey, objective str
 	t.Helper()
 	taskID := mustID(t, domain.NewTaskID)
 	messageID := mustID(t, domain.NewMessageID)
+	authorizationExpiresAt := time.Now().UTC().AddDate(1, 0, 0)
 	return app.TaskSubmission{
 		Task: task.Task{
 			ID: taskID, OwnerID: ownerID, HostID: hostID, ModelID: "model-test", Objective: objective,
-			Status: task.StatusQueued, Authorization: task.Authorization{Kind: "session"},
+			Status: task.StatusQueued, Authorization: task.Authorization{
+				Kind: "session", TokenID: testSessionTokenID(ownerID), Version: 1, ExpiresAt: &authorizationExpiresAt,
+			},
 			Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		},
 		Message:      conversation.Message{ID: messageID, OwnerID: ownerID, Role: conversation.RoleUser, Content: objective},
@@ -1688,6 +2587,40 @@ func newTestTaskSubmission(t *testing.T, ownerID, hostID, idemKey, objective str
 
 func testIdempotency(ownerID, operation, key string) app.IdempotencyRecord {
 	return app.IdempotencyRecord{OwnerID: ownerID, Operation: operation, Key: key, RequestHash: hashBytes(operation + ":" + key)}
+}
+
+func seedTaskArtifactManifest(t *testing.T, store *Store, workspaceID string, revision int64, files map[string][]byte) map[string]task.Artifact {
+	t.Helper()
+	proofs := make(map[string]task.Artifact, len(files))
+	var totalBytes int64
+	for filePath, content := range files {
+		digestBytes := sha256.Sum256(content)
+		digest := hex.EncodeToString(digestBytes[:])
+		chunks, err := json.Marshal([]workspace.Chunk{{SHA256: digest, SizeBytes: int64(len(content))}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.pool.Exec(context.Background(), `INSERT INTO workspace_revision_files
+(workspace_id, valid_from_revision, file_path, folded_path, size_bytes, sha256, mode, chunks)
+VALUES ($1,$2,$3,lower($3),$4,$5,420,$6::jsonb)`, workspaceID, revision, filePath, len(content), digest, chunks); err != nil {
+			t.Fatalf("insert artifact test manifest file: %v", err)
+		}
+		proofs[filePath] = task.Artifact{WorkspaceID: workspaceID, Revision: revision, SizeBytes: int64(len(content)), SHA256: digest}
+		totalBytes += int64(len(content))
+	}
+	if _, err := store.pool.Exec(context.Background(), `UPDATE workspace_revisions SET file_count=$3,total_bytes=$4 WHERE workspace_id=$1 AND revision=$2`,
+		workspaceID, revision, len(files), totalBytes); err != nil {
+		t.Fatalf("update artifact test manifest revision: %v", err)
+	}
+	return proofs
+}
+
+func addArtifactProof(artifact, proof task.Artifact) task.Artifact {
+	artifact.WorkspaceID = proof.WorkspaceID
+	artifact.Revision = proof.Revision
+	artifact.SizeBytes = proof.SizeBytes
+	artifact.SHA256 = proof.SHA256
+	return artifact
 }
 
 func hashBytes(value string) []byte {

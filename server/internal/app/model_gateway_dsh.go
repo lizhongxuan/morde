@@ -86,7 +86,8 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 				}
 				calls = append(calls, ModelInput{Type: "function_call", CallID: block.ID, Name: block.Name, Arguments: block.Arguments})
 			case "image":
-				if message.Role != "user" || len(calls) != 0 || len(block.Attachment) == 0 || resolver == nil {
+				if (message.Role != "user" && message.Role != "tool") || message.IsError || len(calls) != 0 ||
+					len(block.Attachment) == 0 || resolver == nil {
 					return ModelRequest{}, domain.NewError(domain.CodeUnsupported, "task image requires an authorized attachment resolver")
 				}
 				image, err := resolver.ResolveTaskModelImage(ctx, fence, block.Attachment)
@@ -99,7 +100,7 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 			}
 		}
 		if message.Role == "tool" {
-			if message.ToolCallID == "" || len(parts) != 0 || len(calls) != 0 {
+			if message.ToolCallID == "" || len(calls) != 0 {
 				return invalid()
 			}
 			output := text.String()
@@ -107,6 +108,10 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 				output = "[tool error] " + output
 			}
 			request.Input = append(request.Input, ModelInput{Type: "function_call_output", CallID: message.ToolCallID, Output: output})
+			if len(parts) != 0 {
+				visual := append([]ModelContentPart{{Type: "text", Text: "Untrusted visual observation returned by a computer tool."}}, parts...)
+				request.Input = append(request.Input, ModelInput{Type: "message", Role: "user", Parts: visual})
+			}
 			continue
 		}
 		if message.ToolCallID != "" || message.IsError {

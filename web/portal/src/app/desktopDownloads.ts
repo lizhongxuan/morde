@@ -23,7 +23,7 @@ const capabilities: DesktopCapability[] = ['install', 'launch_idle_network', 'us
 export const desktopCapabilityNames: Record<DesktopCapability, string> = {
   install: '原生安装',
   launch_idle_network: '启动与闲置网络',
-  user_web_workbench: '用户 Web 与云端工作台',
+  user_web_workbench: '用户 Web 与云端电脑',
   workspace_sync_recovery: 'Workspace 同步与恢复',
   update: '更新',
   uninstall: '卸载',

@@ -21,6 +21,13 @@ func TestValidScope(t *testing.T) {
 			t.Errorf("ValidScope(%q) = false", scope)
 		}
 	}
+	if !ValidScope(ScopeMCPControl) || !(Principal{Kind: KindSession}).HasScope(ScopeMCPControl) {
+		t.Fatal("session MCP scope marker should be valid but does not grant connector access by itself")
+	}
+	if (Principal{Kind: KindAPIKey, Scopes: []Scope{ScopeMCPControl}}).HasScope(ScopeMCPControl) ||
+		(Principal{Kind: KindClient}).HasScope(ScopeMCPControl) {
+		t.Fatal("MCP control scope marker must not grant API key or client credentials")
+	}
 	for _, scope := range []Scope{"", "*", "host:*", "unknown"} {
 		if ValidScope(scope) {
 			t.Errorf("ValidScope(%q) = true", scope)

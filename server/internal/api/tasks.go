@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,6 +28,10 @@ type TaskService interface {
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
+type TaskMCPConnectorGrantService interface {
+	RevokeMCPConnectorGrant(context.Context, identity.Principal, string, string, int64) (app.TaskMCPConnectorGrant, error)
+}
+
 type taskPageResponse struct {
 	Items      []taskSummaryResponse `json:"items"`
 	NextCursor *string               `json:"next_cursor"`
@@ -38,6 +43,7 @@ type taskSummaryResponse struct {
 	HostID            string             `json:"host_id,omitempty"`
 	ExecutionLocation string             `json:"execution_location"`
 	WorkspaceID       string             `json:"workspace_id,omitempty"`
+	InputRevision     *int64             `json:"input_revision,omitempty"`
 	ApplicationID     string             `json:"application_id,omitempty"`
 	ConversationID    string             `json:"conversation_id"`
 	ModelID           string             `json:"model_id"`
@@ -154,13 +160,16 @@ type taskArtifactResponse struct {
 }
 
 type submitTaskRequest struct {
-	HostID         string             `json:"host_id"`
-	ApplicationID  string             `json:"application_id"`
-	ModelID        string             `json:"model_id"`
-	ConversationID *string            `json:"conversation_id"`
-	Objective      string             `json:"objective"`
-	Budget         *taskBudgetRequest `json:"budget"`
-	BatchItems     []batchItemRequest `json:"batch_items"`
+	HostID          string             `json:"host_id"`
+	WorkspaceID     string             `json:"workspace_id"`
+	InputRevision   *int64             `json:"input_revision"`
+	MCPConnectorIDs []string           `json:"mcp_connector_ids"`
+	ApplicationID   string             `json:"application_id"`
+	ModelID         string             `json:"model_id"`
+	ConversationID  *string            `json:"conversation_id"`
+	Objective       string             `json:"objective"`
+	Budget          *taskBudgetRequest `json:"budget"`
+	BatchItems      []batchItemRequest `json:"batch_items"`
 }
 
 type taskBudgetRequest struct {
@@ -197,11 +206,50 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	}
 	group.GET("/tasks", h.listTasks(service))
 	group.POST("/tasks", h.submitTask(service))
+	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
 	group.POST("/tasks/:id/actions", h.taskAction(service))
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+func (h *api) revokeTaskMCPConnectorGrant(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		connectorID, ok := safeIDParam(c, "connector_id", "connector_id", domain.ValidMCPConnectorID)
+		if !ok {
+			return
+		}
+		versions := c.QueryArray("expected_grant_version")
+		if len(versions) != 1 {
+			writeError(c, domain.InvalidArgument("expected_grant_version", "a single positive grant version is required"))
+			return
+		}
+		expectedVersion, err := strconv.ParseInt(versions[0], 10, 64)
+		if err != nil || expectedVersion < 1 {
+			writeError(c, domain.InvalidArgument("expected_grant_version", "a single positive grant version is required"))
+			return
+		}
+		grantService, ok := service.(TaskMCPConnectorGrantService)
+		if !ok {
+			writeError(c, domain.NewError(domain.CodeUnsupported, "task MCP connector grants are unavailable"))
+			return
+		}
+		if _, err := grantService.RevokeMCPConnectorGrant(c.Request.Context(), principal, taskID, connectorID, expectedVersion); err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	}
 }
 
 func (h *api) taskAction(service TaskService) gin.HandlerFunc {
@@ -343,7 +391,9 @@ func (h *api) submitTask(service TaskService) gin.HandlerFunc {
 			conversationID = *request.ConversationID
 		}
 		result, err := service.Submit(c.Request.Context(), principal, app.SubmitTaskCommand{
-			HostID: request.HostID, ApplicationID: request.ApplicationID, ModelID: request.ModelID, ConversationID: conversationID,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
+			MCPConnectorIDs: request.MCPConnectorIDs,
+			ApplicationID:   request.ApplicationID, ModelID: request.ModelID, ConversationID: conversationID,
 			Objective: request.Objective, Budget: budget, BatchItems: batchItems,
 			IdempotencyKey: c.GetHeader("Idempotency-Key"),
 		})
@@ -422,6 +472,7 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
 		(value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
 		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
+		(value.WorkspaceID == "") != (value.InputRevision == nil) || (value.InputRevision != nil && *value.InputRevision < 0) ||
 		(value.ExecutionLocation != "server" && value.ExecutionLocation != "legacy") ||
 		!domain.ValidConversationID(value.ConversationID) || strings.TrimSpace(value.ModelID) == "" ||
 		(value.ApplicationID != "" && !app.ValidHostApplicationID(value.ApplicationID)) || !validTaskStatusResponse(value.Status) ||
@@ -430,7 +481,8 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 		return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return taskSummaryResponse{
-		ID: value.ID, OwnerID: value.OwnerID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation, WorkspaceID: value.WorkspaceID,
+		ID: value.ID, OwnerID: value.OwnerID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
+		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
 		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, CurrentStep: stringPointer(value.CurrentStep),
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
@@ -580,7 +632,7 @@ func validStepStatus(value task.StepStatus) bool {
 
 func validStepKind(value string) bool {
 	switch value {
-	case "plan", "tool", "wait", "result":
+	case "plan", "model", "tool", "wait", "clarification", "budget", "verification", "verify", "batch_item", "batch_result", "subagent", "result":
 		return true
 	default:
 		return false

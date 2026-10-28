@@ -130,6 +130,19 @@ func (f mcpRuntimeStopReconcilerFunc) ReconcileMCPRuntimeCancellations(ctx conte
 	return f(ctx)
 }
 
+type workspaceInputRevisionStopStore struct {
+	*taskStopStoreStub
+	reconciled chan struct{}
+}
+
+func (s *workspaceInputRevisionStopStore) ReconcileStaleWorkspaceTasks(context.Context) error {
+	select {
+	case s.reconciled <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func newTestTaskStopWorker(t *testing.T, store TaskStopStore, executor TaskStopOperationExecutor, lease, poll, timeout time.Duration) *TaskStopWorker {
 	t.Helper()
 	worker, err := NewTaskStopWorker(TaskStopWorkerOptions{
@@ -180,6 +193,22 @@ func startTaskStopWorker(ctx context.Context, worker *TaskStopWorker) <-chan err
 	done := make(chan error, 1)
 	go func() { done <- worker.Run(ctx) }()
 	return done
+}
+
+func TestTaskStopWorkerReconcilesWorkspaceInputWhileRecoveringStops(t *testing.T) {
+	store := &workspaceInputRevisionStopStore{
+		taskStopStoreStub: &taskStopStoreStub{}, reconciled: make(chan struct{}, 1),
+	}
+	worker := newTestTaskStopWorker(t, store, taskStopExecutorFunc(func(context.Context, task.Task, task.Operation) (task.OperationStatus, string, bool, error) {
+		return "", "", false, errors.New("no stop operation expected")
+	}), time.Second, 5*time.Millisecond, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTaskStopWorker(ctx, worker)
+	waitTaskStopSignal(t, store.reconciled)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
 }
 
 func TestTaskStopWorkerSettlesPreparedOperationAndCompletes(t *testing.T) {

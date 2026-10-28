@@ -24,6 +24,7 @@ func TestIDs(t *testing.T) {
 		{NewArtifactID, ValidArtifactID},
 		{NewPendingRequestID, ValidPendingRequestID},
 		{NewModelConnectionID, ValidModelConnectionID},
+		{NewMCPConnectorID, ValidMCPConnectorID},
 	} {
 		id, err := tc.newID()
 		if err != nil || !tc.valid(id) {

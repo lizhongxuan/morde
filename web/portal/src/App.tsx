@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { BrowserRouter, Link, Route, Routes } from 'react-router';
+import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router';
 import { AuthProvider } from './app/auth';
 import { AdminGuard, RouteGuard } from './app/RouteGuard';
 import { ToastProvider } from './app/toast';
@@ -16,7 +16,6 @@ import { Register } from './routes/Register';
 import { ChangePassword } from './routes/ChangePassword';
 import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
-import { Dashboard } from './routes/Dashboard';
 import { Workspaces } from './routes/Workspaces';
 import { AdminAudit } from './routes/admin/AdminAudit';
 import { AdminCapacity } from './routes/admin/AdminCapacity';
@@ -46,7 +45,7 @@ function UserRoutes() {
     <Route element={<RouteGuard />}>
       <Route path="host-entry/:id" element={<HostEntry />} />
       <Route element={<PortalLayout />}>
-        <Route index element={<Dashboard />} />
+        <Route index element={<Navigate to="/hosts" replace />} />
         <Route path="assistant" element={<Assistant />} />
         <Route path="hosts" element={<Hosts />} />
         <Route path="hosts/new" element={<NewHost />} />

@@ -1,7 +1,11 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -37,7 +41,10 @@ func (s *Store) GetExecutionControl(ctx context.Context, ownerID string) (execut
 		if !result.State.Valid() || result.Epoch < 1 {
 			return missingExecutionGateError()
 		}
-		return readPendingExecutionTaskCount(ctx, tx, ownerID, &result.PendingTaskCount)
+		if err := readPendingExecutionTaskCount(ctx, tx, ownerID, &result.PendingTaskCount); err != nil {
+			return err
+		}
+		return readExecutionRuntimeSummary(ctx, tx, ownerID, &result.Runtime)
 	})
 	return result, err
 }
@@ -77,6 +84,9 @@ func (s *Store) setExecutionControl(ctx context.Context, record app.IdempotencyR
 				return missingExecutionGateError()
 			}
 			result.UpdatedAt = updatedAt
+			if !result.Runtime.Valid() {
+				return readExecutionRuntimeSummary(ctx, tx, record.OwnerID, &result.Runtime)
+			}
 			return nil
 		}
 		if gate.epoch != expectedEpoch {
@@ -86,13 +96,36 @@ func (s *Store) setExecutionControl(ctx context.Context, record app.IdempotencyR
 			return conflict
 		}
 		if stopAll {
-			if gate.state == execution.StateEnabled {
+			switch gate.state {
+			case execution.StateEnabled:
 				gate, err = transitionOwnerExecutionControl(ctx, tx, record.OwnerID, gate, execution.StateStopping)
 				if err != nil {
 					return err
 				}
+			case execution.StateDisabled:
+				var pending int64
+				if err := readActiveExecutionTaskCount(ctx, tx, record.OwnerID, &pending); err != nil {
+					return err
+				}
+				var pendingStops int64
+				if err := readPendingTaskStopRequestCount(ctx, tx, record.OwnerID, &pendingStops); err != nil {
+					return err
+				}
+				runtimeStopped, err := accountAgentRuntimeStopConfirmed(ctx, tx, record.OwnerID)
+				if err != nil {
+					return err
+				}
+				if pending > 0 || pendingStops > 0 || !runtimeStopped {
+					gate, err = transitionOwnerExecutionControl(ctx, tx, record.OwnerID, gate, execution.StateStopping)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			if gate.state == execution.StateStopping {
+				if err := requestOwnerAccountAgentRuntimeStop(ctx, tx, record.OwnerID); err != nil {
+					return err
+				}
 				if err := disableOwnerSchedules(ctx, tx, record.OwnerID); err != nil {
 					return err
 				}
@@ -106,7 +139,15 @@ func (s *Store) setExecutionControl(ctx context.Context, record app.IdempotencyR
 				if err := readActiveExecutionTaskCount(ctx, tx, record.OwnerID, &pending); err != nil {
 					return err
 				}
-				if pending == 0 {
+				var pendingStops int64
+				if err := readPendingTaskStopRequestCount(ctx, tx, record.OwnerID, &pendingStops); err != nil {
+					return err
+				}
+				runtimeStopped, err := accountAgentRuntimeStopConfirmed(ctx, tx, record.OwnerID)
+				if err != nil {
+					return err
+				}
+				if pending == 0 && pendingStops == 0 && runtimeStopped {
 					gate, err = transitionOwnerExecutionControl(ctx, tx, record.OwnerID, gate, execution.StateDisabled)
 					if err != nil {
 						return err
@@ -118,6 +159,13 @@ func (s *Store) setExecutionControl(ctx context.Context, record app.IdempotencyR
 				return domain.NewError(domain.CodeConflict, "owner execution is still stopping")
 			}
 			if gate.state == execution.StateDisabled {
+				runtimeStopped, err := accountAgentRuntimeStopConfirmed(ctx, tx, record.OwnerID)
+				if err != nil {
+					return err
+				}
+				if !runtimeStopped {
+					return domain.NewError(domain.CodeConflict, "account Runtime stop is unconfirmed")
+				}
 				gate, err = transitionOwnerExecutionControl(ctx, tx, record.OwnerID, gate, execution.StateEnabled)
 				if err != nil {
 					return err
@@ -130,6 +178,9 @@ func (s *Store) setExecutionControl(ctx context.Context, record app.IdempotencyR
 		}
 		if err := tx.QueryRow(ctx, `SELECT updated_at FROM owner_execution_controls WHERE owner_id=$1`, record.OwnerID).Scan(&result.UpdatedAt); err != nil {
 			return missingExecutionGateError()
+		}
+		if err := readExecutionRuntimeSummary(ctx, tx, record.OwnerID, &result.Runtime); err != nil {
+			return err
 		}
 		encoded := encodeExecutionSnapshot(result)
 		if _, _, err := reserveIdempotency(ctx, tx, record, record.OwnerID, encoded); err != nil {
@@ -181,11 +232,14 @@ func (s *Store) ReconcileStoppingExecution(ctx context.Context) error {
 				return err
 			}
 			var pendingStops int64
-			if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests sr JOIN tasks t ON t.id=sr.task_id
-WHERE t.owner_id=$1 AND sr.status='pending'`, item.owner).Scan(&pendingStops); err != nil {
-				return fmt.Errorf("count pending owner stop requests: %w", err)
+			if err := readPendingTaskStopRequestCount(ctx, tx, item.owner, &pendingStops); err != nil {
+				return err
 			}
-			if pending == 0 && pendingStops == 0 {
+			runtimeStopped, err := accountAgentRuntimeStopConfirmed(ctx, tx, item.owner)
+			if err != nil {
+				return err
+			}
+			if pending == 0 && pendingStops == 0 && runtimeStopped {
 				if item.epoch == math.MaxInt64 {
 					return domain.NewError(domain.CodeInvalidState, "owner execution epoch is exhausted")
 				}
@@ -201,6 +255,72 @@ WHERE owner_id=$1 AND state='stopping' AND epoch=$2`, item.owner, item.epoch)
 		}
 		return nil
 	})
+}
+
+func readExecutionRuntimeSummary(ctx context.Context, tx pgx.Tx, ownerID string, target *execution.Runtime) error {
+	serviceInstanceID, err := serviceInstanceIDInTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	runtime, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, false)
+	if errors.Is(err, pgx.ErrNoRows) {
+		*target = execution.Runtime{State: execution.RuntimeStateNotStarted}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read execution account Runtime summary: %w", err)
+	}
+	state := execution.RuntimeState(runtime.State)
+	if state != execution.RuntimeStateStarting && state != execution.RuntimeStateRunning && state != execution.RuntimeStateStopping &&
+		state != execution.RuntimeStateStopped && state != execution.RuntimeStateFailed {
+		return domain.NewError(domain.CodeInternal, "account Runtime state is unavailable")
+	}
+	var activeTaskCount int64
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_agent_instances
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND account_runtime_id=$3 AND account_runtime_generation=$4 AND state='active'`,
+		runtime.Fence.ServiceInstanceID, ownerID, runtime.Fence.RuntimeID, runtime.Fence.RuntimeGeneration).Scan(&activeTaskCount); err != nil {
+		return fmt.Errorf("count active account Runtime tasks: %w", err)
+	}
+	*target = execution.Runtime{State: state, RuntimeID: runtime.Fence.RuntimeID,
+		RuntimeGeneration: runtime.Fence.RuntimeGeneration, MaxConcurrentTasks: runtime.MaxConcurrentTasks,
+		ActiveTaskCount: activeTaskCount}
+	return nil
+}
+
+func accountAgentRuntimeStopConfirmed(ctx context.Context, tx pgx.Tx, ownerID string) (bool, error) {
+	serviceInstanceID, err := serviceInstanceIDInTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	runtime, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, true)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock account Runtime stop proof: %w", err)
+	}
+	if runtime.State != app.AccountAgentRuntimeStopped || !isLowerHexRuntimeNonce(runtime.NonceSHA256) {
+		return false, nil
+	}
+	var attestation, digest []byte
+	if err := tx.QueryRow(ctx, `SELECT guardian_stop_attestation,guardian_stop_attestation_digest
+FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`, serviceInstanceID, ownerID).
+		Scan(&attestation, &digest); err != nil {
+		return false, fmt.Errorf("read Guardian Runtime stop proof: %w", err)
+	}
+	if len(attestation) == 0 || len(attestation) > 16384 || len(digest) != sha256.Size {
+		return false, nil
+	}
+	actualDigest := sha256.Sum256(attestation)
+	return bytes.Equal(actualDigest[:], digest), nil
+}
+
+func readPendingTaskStopRequestCount(ctx context.Context, tx pgx.Tx, ownerID string, target *int64) error {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests sr JOIN tasks t ON t.id=sr.task_id
+WHERE t.owner_id=$1 AND sr.status='pending'`, ownerID).Scan(target); err != nil {
+		return fmt.Errorf("count pending owner Task stop requests: %w", err)
+	}
+	return nil
 }
 
 func lockOwnerExecutionControl(ctx context.Context, tx pgx.Tx, ownerID string, exclusive bool) (executionGate, error) {
@@ -357,10 +477,37 @@ SELECT
 }
 
 func encodeExecutionSnapshot(value execution.Control) string {
-	return strings.Join([]string{string(value.State), strconv.FormatInt(value.Epoch, 10), strconv.FormatInt(value.PendingTaskCount, 10)}, ":")
+	encoded, _ := json.Marshal(struct {
+		State            execution.State   `json:"state"`
+		Epoch            int64             `json:"epoch"`
+		PendingTaskCount int64             `json:"pending_task_count"`
+		Runtime          execution.Runtime `json:"runtime"`
+	}{State: value.State, Epoch: value.Epoch, PendingTaskCount: value.PendingTaskCount, Runtime: value.Runtime})
+	return "v2:" + base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 func executionSnapshotFromIdempotency(ownerID, encoded string) (execution.Control, error) {
+	if strings.HasPrefix(encoded, "v2:") {
+		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encoded, "v2:"))
+		if err != nil {
+			return execution.Control{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		var value struct {
+			State            execution.State   `json:"state"`
+			Epoch            int64             `json:"epoch"`
+			PendingTaskCount int64             `json:"pending_task_count"`
+			Runtime          execution.Runtime `json:"runtime"`
+		}
+		if err := json.Unmarshal(payload, &value); err != nil {
+			return execution.Control{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		result := execution.Control{OwnerID: ownerID, State: value.State, Epoch: value.Epoch,
+			PendingTaskCount: value.PendingTaskCount, Runtime: value.Runtime}
+		if !result.State.Valid() || result.Epoch < 1 || result.PendingTaskCount < 0 || !result.Runtime.Valid() {
+			return execution.Control{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		return result, nil
+	}
 	parts := strings.Split(encoded, ":")
 	if len(parts) != 3 {
 		return execution.Control{}, domain.NewError(domain.CodeInternal, "internal error")

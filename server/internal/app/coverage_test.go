@@ -535,10 +535,13 @@ func TestCoverageConstructorsRejectInvalidDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewWorkerApp(nil, runtime, &workerTestOrphanCleanupStore{}, workerAppTestLocks{}, time.Minute); err == nil {
+	if _, err := NewWorkerApp(nil, runtime, &workerTestOrphanCleanupStore{}, workerAppTestLocks{}, &workerTestModelCallRecovery{}, time.Minute); err == nil {
 		t.Fatal("NewWorkerApp() accepted a missing host service")
 	}
-	if _, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{}, workerAppTestLocks{}, 0); err == nil {
+	if _, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{}, workerAppTestLocks{}, nil, time.Minute); err == nil {
+		t.Fatal("NewWorkerApp() accepted a missing model call recovery store")
+	}
+	if _, err := NewWorkerApp(service, runtime, &workerTestOrphanCleanupStore{}, workerAppTestLocks{}, &workerTestModelCallRecovery{}, 0); err == nil {
 		t.Fatal("NewWorkerApp() accepted a non-positive renewal window")
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
@@ -172,8 +173,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err := app.EnsureInitialAdmin(ctx, store); err != nil {
 		return fmt.Errorf("initialize administrator: %w", err)
 	}
-	if err := store.RetireTaskExecution(ctx); err != nil {
-		return fmt.Errorf("retire task execution before serving: %w", err)
+	if !cfg.CloudDSH.Enabled {
+		if err := store.RetireTaskExecution(ctx); err != nil {
+			return fmt.Errorf("retire task execution before serving: %w", err)
+		}
 	}
 	workspaceBlocks, err := workspacefs.Open(cfg.WorkspaceStorage.RootDir)
 	if err != nil {
@@ -233,6 +236,11 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model connections: %w", err)
 	}
+	mcpConnectors, err := app.NewMCPConnectorService(store, sealer,
+		cfg.Domains.Scheme+"://"+cfg.Domains.Portal+"/api/mcp/oauth/callback")
+	if err != nil {
+		return fmt.Errorf("initialize MCP connectors: %w", err)
+	}
 	modelGateway, err := app.NewModelGatewayService(store, modelConnections, modelClient)
 	if err != nil {
 		return fmt.Errorf("initialize model gateway: %w", err)
@@ -240,10 +248,6 @@ func serve(ctx context.Context, configPath string) error {
 	modelUsageAdmin, err := app.NewModelUsageAdminService(store)
 	if err != nil {
 		return fmt.Errorf("initialize model usage admin: %w", err)
-	}
-	instantChat, err := app.NewInstantChatService(store, modelGateway)
-	if err != nil {
-		return fmt.Errorf("initialize instant chat: %w", err)
 	}
 	aioClient := aio.New(nil)
 	volumes, err := newVolumeDeleter(cfg.Storage)
@@ -319,6 +323,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize conversation service: %w", err)
 	}
+	instantChat, err := app.NewTaskChatCompatibilityService(tasks, conversations)
+	if err != nil {
+		return fmt.Errorf("initialize task chat compatibility: %w", err)
+	}
 	users, err := app.NewUserService(store, store)
 	if err != nil {
 		return err
@@ -366,13 +374,26 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	mcpRuntimeTools, err := app.NewMCPRuntimeToolExecutor(store, mcpHosts, credentials, store, runtimeControl)
-	if err != nil {
-		return err
-	}
 	workerSuffix, err := domain.NewOperationID()
 	if err != nil {
 		return fmt.Errorf("generate task worker identity: %w", err)
+	}
+	var executionControlService *app.ExecutionControlService
+	var taskWorker *worker.TaskWorker
+	if cfg.CloudDSH.Enabled {
+		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
+		if err != nil {
+			return err
+		}
+		taskWorker, err = newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
+			modelGateway, sealer, mcpConnectors, workerSuffix, logger)
+		if err != nil {
+			return fmt.Errorf("initialize cloud dsh task worker: %w", err)
+		}
+	}
+	mcpRuntimeTools, err := app.NewMCPRuntimeToolExecutor(store, mcpHosts, credentials, store, runtimeControl)
+	if err != nil {
+		return err
 	}
 	taskStopWorker, err := worker.NewTaskStopWorker(worker.TaskStopWorkerOptions{
 		Store: store, Executor: runtimeControl, WorkerID: workerSuffix + "-stop",
@@ -405,8 +426,8 @@ func serve(ctx context.Context, configPath string) error {
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
-		Control:       controlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
-		ModelConnections: modelConnections, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin, Onboarding: onboardingService, Admin: admin, AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
+		Control:       controlService, ExecutionControl: executionControlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
+		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin, Onboarding: onboardingService, Admin: admin, AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
 		Readiness: readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
 	}, api.Options{
@@ -420,7 +441,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	workerApp, err := app.NewWorkerApp(hosts, runtime, store, store, cfg.Reconciler.RenewBefore)
+	workerApp, err := app.NewWorkerApp(hosts, runtime, store, store, store, cfg.Reconciler.RenewBefore)
 	if err != nil {
 		return err
 	}
@@ -445,7 +466,101 @@ func serve(ctx context.Context, configPath string) error {
 	gatewayServer := httpserver.NewServer(cfg.Listen.Gateway, gatewayHandler, cfg.HTTP)
 	metricsServer := httpserver.NewServer(cfg.Listen.Metrics, metricsHandler(registry), cfg.HTTP)
 	logger.Info("portal starting", zap.String("instance", cfg.Instance), zap.Int64("migration_version", migrationVersion), zap.String("api", cfg.Listen.API), zap.String("gateway", cfg.Listen.Gateway), zap.String("metrics", cfg.Listen.Metrics))
-	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+}
+
+func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
+	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
+	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
+	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
+	}
+	guardianPublicKey, err := readKey(cfg.GuardianPublicKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read cloud_dsh.guardian_public_key_file: %w", err)
+	}
+	supervisorAuth, err := app.NewAgentStopAuthenticator(cfg.SupervisorID, supervisorKey)
+	if err != nil {
+		return nil, err
+	}
+	guardianKey := ed25519.PublicKey(guardianPublicKey)
+	guardianAuth, err := app.NewAgentGuardianStopAuthenticator(cfg.SupervisorID, guardianKey)
+	if err != nil {
+		return nil, err
+	}
+	taskGuardianAuth, err := app.NewAccountAgentTaskGuardianStopAuthenticator(guardianKey)
+	if err != nil {
+		return nil, err
+	}
+	instances, err := app.NewAgentInstanceServiceWithGuardianStops(store, supervisorAuth, guardianAuth, taskGuardianAuth)
+	if err != nil {
+		return nil, err
+	}
+	runtimeControlService, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		return nil, err
+	}
+	runtimeStopAuth, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(guardianKey)
+	if err != nil {
+		return nil, err
+	}
+	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		return nil, err
+	}
+	toolRuntime, err := app.NewRuntimeToolExecutor(store, authorizer, runtimeControl, runtimeControl, workspaceSync)
+	if err != nil {
+		return nil, err
+	}
+	tools, err := app.NewCloudDSHToolBroker(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient())
+	if err != nil {
+		return nil, err
+	}
+	childSessions, err := app.NewAgentChildSessionService(store)
+	if err != nil {
+		return nil, err
+	}
+	guardian, err := worker.NewUnixSocketDockerCloudDSHGuardian(cfg.GuardianSocket)
+	if err != nil {
+		return nil, err
+	}
+	supervisor, err := worker.NewDockerCloudDSHSupervisor(worker.DockerCloudDSHSupervisorOptions{
+		DockerHost: cfg.DockerHost, Image: cfg.Image, NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath,
+		SupervisorID: cfg.SupervisorID, SigningKey: supervisorKey, Guardian: guardian,
+	})
+	if err != nil {
+		return nil, err
+	}
+	accountRuntimeSupervisor, err := worker.NewDockerCloudDSHAccountRuntimeSupervisor(supervisor)
+	if err != nil {
+		return nil, err
+	}
+	accountTaskGuardian, ok := guardian.(worker.CloudDSHAccountRuntimeTaskGuardian)
+	if !ok {
+		return nil, errors.New("account Agent Runtime Guardian operations are unavailable")
+	}
+	accountRuntimes, err := worker.NewCloudDSHAccountRuntimeManager(worker.CloudDSHAccountRuntimeManagerOptions{
+		Control: runtimeControlService, Supervisor: accountRuntimeSupervisor, Guardian: accountTaskGuardian,
+		StopVerifier: runtimeStopAuth, TaskStopper: instances, LeaseOwner: workerID + "-runtime",
+		MaxTasks: cfg.MaxConcurrentPerOwner,
+	})
+	if err != nil {
+		return nil, err
+	}
+	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
+		NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath, SupervisorID: cfg.SupervisorID,
+		Supervisor: supervisor, AccountRuntimes: accountRuntimes, Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools,
+		Children: childSessions, Completion: tools,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return worker.NewTaskWorker(worker.TaskWorkerOptions{
+		Store: store, Executor: executor, Lifecycle: accountRuntimes.Run, WorkerID: workerID + "-task",
+		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond,
+		MaxConcurrentTasks: cfg.MaxConcurrentTasks, MaxConcurrentTasksPerOwner: cfg.MaxConcurrentPerOwner, Logger: logger,
+	})
 }
 
 func migrate(ctx context.Context, configPath, action string, stdout io.Writer) error {
@@ -725,6 +840,36 @@ func readKey(path string) ([]byte, error) {
 	return key, nil
 }
 
+func readProtectedKey(path string) ([]byte, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !pathInfo.Mode().IsRegular() || pathInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("key file must be a regular file with no group or other permissions")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fileInfo.Mode().IsRegular() || !os.SameFile(pathInfo, fileInfo) {
+		return nil, fmt.Errorf("key file changed while opening")
+	}
+	key, err := io.ReadAll(io.LimitReader(file, 33))
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("key file must contain exactly 32 bytes")
+	}
+	return key, nil
+}
+
 func loginLimit(value string) int {
 	count, err := strconv.Atoi(strings.TrimSuffix(value, "/min"))
 	if err != nil {
@@ -791,7 +936,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -803,6 +948,12 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		}
 		listeners = append(listeners, listener)
 	}
+	if err := ctx.Err(); err != nil {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+		return err
+	}
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- background.Run(workerCtx) }()
@@ -810,6 +961,14 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	go func() { taskStopWorkerDone <- taskStopWorker.Run(workerCtx) }()
 	notificationWorkerDone := make(chan error, 1)
 	go func() { notificationWorkerDone <- notificationWorker.Run(workerCtx) }()
+	var taskWorkerDone chan error
+	var cancelTaskWorker context.CancelFunc
+	if taskWorker != nil {
+		taskWorkerCtx, cancel := context.WithCancel(context.Background())
+		cancelTaskWorker = cancel
+		taskWorkerDone = make(chan error, 1)
+		go func() { taskWorkerDone <- taskWorker.Run(taskWorkerCtx) }()
+	}
 	serverErrors := make(chan error, len(servers))
 	var serverWG sync.WaitGroup
 	for index, server := range servers {
@@ -825,9 +984,17 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		}()
 	}
 	var runErr error
+	taskWorkerExited := false
 	select {
 	case <-ctx.Done():
 	case runErr = <-serverErrors:
+	case err := <-taskWorkerDone:
+		taskWorkerExited = true
+		if err == nil {
+			runErr = errors.New("cloud task worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("cloud task worker stopped unexpectedly: %w", err)
+		}
 	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancelShutdown()
@@ -843,6 +1010,23 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		closer.CloseConnections()
 	}
 	serverWG.Wait()
+	if cancelTaskWorker != nil {
+		cancelTaskWorker()
+		if !taskWorkerExited {
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownTimeout)
+			select {
+			case err := <-taskWorkerDone:
+				if err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+					runErr = fmt.Errorf("stop cloud task worker: %w", err)
+				}
+			case <-drainCtx.Done():
+				if runErr == nil {
+					runErr = fmt.Errorf("cloud task worker did not stop before shutdown timeout; Guardian lease expiry remains the final stop boundary")
+				}
+			}
+			cancelDrain()
+		}
+	}
 	cancelWorker()
 	if err := <-workerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop worker: %w", err)

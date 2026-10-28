@@ -41,6 +41,9 @@ func (h *api) capabilities(c *gin.Context) {
 	if h.deps.ModelGateway != nil && clientVerifier {
 		features = append(features, "model_gateway")
 	}
+	if h.deps.ExecutionControl != nil && h.deps.Tasks != nil {
+		features = append(features, "cloud_tasks")
+	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, capabilitiesResponse{
 		ServiceInstanceID: h.options.ServiceInstanceID,

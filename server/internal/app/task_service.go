@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 const (
@@ -28,24 +31,35 @@ type TaskExecutionAuthorizer interface {
 	AuthorizeTaskExecution(context.Context, identity.Principal, string, identity.Scope) (task.Authorization, error)
 }
 
+type taskWorkspaceSnapshotReader interface {
+	GetWorkspace(context.Context, string) (workspace.Workspace, error)
+	GetWorkspaceManifestPage(context.Context, string, int64, string, string, int32) (workspace.ManifestPage, error)
+}
+
 type SubmitTaskCommand struct {
-	HostID         string
-	ApplicationID  string
-	ModelID        string
-	ConversationID string
-	Objective      string
-	Budget         task.Budget
-	BatchItems     []BatchItemInput
-	IdempotencyKey string
+	HostID          string
+	WorkspaceID     string
+	InputRevision   *int64
+	ApplicationID   string
+	ModelID         string
+	ConversationID  string
+	Objective       string
+	Budget          task.Budget
+	BatchItems      []BatchItemInput
+	MCPConnectorIDs []string
+	IdempotencyKey  string
 }
 
 type AppendMessageCommand struct {
-	HostID         string
-	ApplicationID  string
-	ModelID        string
-	Content        string
-	Budget         task.Budget
-	IdempotencyKey string
+	HostID          string
+	WorkspaceID     string
+	InputRevision   *int64
+	ApplicationID   string
+	ModelID         string
+	Content         string
+	Budget          task.Budget
+	MCPConnectorIDs []string
+	IdempotencyKey  string
 }
 
 type BatchItemInput struct {
@@ -68,6 +82,66 @@ func NewTaskService(store TaskStore, authorizer TaskAuthorizer, models Configure
 	}
 	actions, _ := store.(TaskActionRequester)
 	return &TaskService{store: store, authorizer: authorizer, executionAuthorizer: executionAuthorizer, models: models, actions: actions}, nil
+}
+
+func (s *TaskService) workspaceInputSnapshot(ctx context.Context, ownerID, hostID, workspaceID string, requestedRevision *int64) (*int64, []byte, error) {
+	if workspaceID == "" {
+		if requestedRevision != nil {
+			return nil, nil, domain.InvalidArgument("input_revision", "input_revision requires workspace_id")
+		}
+		return nil, nil, nil
+	}
+	if !domain.ValidWorkspaceID(workspaceID) || !domain.ValidHostID(hostID) || requestedRevision == nil || *requestedRevision < 0 {
+		return nil, nil, domain.InvalidArgument("workspace_id", "workspace, Host, and input revision are required together")
+	}
+	reader, ok := s.store.(taskWorkspaceSnapshotReader)
+	if !ok {
+		return nil, nil, domain.NewError(domain.CodeInternal, "workspace task storage is unavailable")
+	}
+	value, err := reader.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if value.OwnerID != ownerID || value.State != workspace.StateReady || value.DeletedAt != nil {
+		return nil, nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	if *requestedRevision > value.Revision {
+		return nil, nil, domain.NewError(domain.CodeWorkspaceConflict, "workspace input revision is not committed")
+	}
+	manifestDigest, err := workspace.ManifestSHA256Stream(func(yield func(workspace.File) error) error {
+		afterPath := ""
+		for {
+			page, err := reader.GetWorkspaceManifestPage(ctx, workspaceID, *requestedRevision, "", afterPath, manifestPageLimit)
+			if err != nil {
+				return err
+			}
+			if page.WorkspaceID != workspaceID || page.Revision != *requestedRevision {
+				return errors.New("workspace manifest snapshot does not match the requested revision")
+			}
+			for _, file := range page.Files {
+				if err := yield(file); err != nil {
+					return err
+				}
+			}
+			if page.NextCursor == nil {
+				return nil
+			}
+			cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
+			if err != nil || cursor.Revision != *requestedRevision || cursor.Prefix != "" || cursor.After == afterPath || len(page.Files) == 0 {
+				return errors.New("workspace manifest cursor is invalid")
+			}
+			afterPath = cursor.After
+		}
+	})
+	if err != nil {
+		return nil, nil, domain.NewError(domain.CodeWorkspaceConflict, "workspace input manifest is unavailable")
+	}
+	digest, err := hex.DecodeString(manifestDigest)
+	if err != nil || len(digest) != 32 {
+		return nil, nil, domain.NewError(domain.CodeInternal, "workspace input manifest digest is invalid")
+	}
+	revision := *requestedRevision
+	return &revision, digest, nil
 }
 
 func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, command SubmitTaskCommand) (TaskSubmissionResult, error) {
@@ -93,6 +167,11 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
 		return TaskSubmissionResult{}, err
 	}
+	connectorIDs, err := normalizeTaskMCPConnectorIDs(command.MCPConnectorIDs)
+	if err != nil {
+		return TaskSubmissionResult{}, err
+	}
+	command.MCPConnectorIDs = connectorIDs
 	budget, err := normalizedBudget(command.Budget)
 	if err != nil {
 		return TaskSubmissionResult{}, err
@@ -102,11 +181,22 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
+	fileDeliveryIntent := ClassifyFileDeliveryIntent(command.Objective, command.WorkspaceID != "")
+	for _, item := range batchItems {
+		itemIntent := ClassifyFileDeliveryIntent(item.Input, command.WorkspaceID != "")
+		if itemIntent == task.FileDeliveryRequired || (itemIntent == task.FileDeliveryUnclear && fileDeliveryIntent == task.FileDeliveryNone) {
+			fileDeliveryIntent = itemIntent
+		}
+	}
 	authorization, err := s.authorizeTask(ctx, principal, command.HostID, taskSubmitScope)
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
 	if err := s.validateModel(ctx, principal.UserID, command.ModelID); err != nil {
+		return TaskSubmissionResult{}, err
+	}
+	inputRevision, contextDigest, err := s.workspaceInputSnapshot(ctx, principal.UserID, command.HostID, command.WorkspaceID, command.InputRevision)
+	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
 
@@ -137,14 +227,19 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		return TaskSubmissionResult{}, fmt.Errorf("generate task message id: %w", err)
 	}
 	requestHash, err := hashIdempotencyRequest(struct {
-		HostID         string           `json:"host_id"`
-		ApplicationID  string           `json:"application_id,omitempty"`
-		ModelID        string           `json:"model_id"`
-		ConversationID string           `json:"conversation_id,omitempty"`
-		Objective      string           `json:"objective"`
-		Budget         task.Budget      `json:"budget"`
-		BatchItems     []BatchItemInput `json:"batch_items"`
-	}{command.HostID, command.ApplicationID, command.ModelID, command.ConversationID, command.Objective, command.Budget, normalizedBatchInputs(command.BatchItems)})
+		HostID          string           `json:"host_id"`
+		ApplicationID   string           `json:"application_id,omitempty"`
+		ModelID         string           `json:"model_id"`
+		ConversationID  string           `json:"conversation_id,omitempty"`
+		WorkspaceID     string           `json:"workspace_id,omitempty"`
+		InputRevision   *int64           `json:"input_revision,omitempty"`
+		ContextDigest   []byte           `json:"context_digest,omitempty"`
+		Objective       string           `json:"objective"`
+		Budget          task.Budget      `json:"budget"`
+		BatchItems      []BatchItemInput `json:"batch_items"`
+		MCPConnectorIDs []string         `json:"mcp_connector_ids"`
+	}{command.HostID, command.ApplicationID, command.ModelID, command.ConversationID, command.WorkspaceID, inputRevision, contextDigest,
+		command.Objective, command.Budget, normalizedBatchInputs(command.BatchItems), command.MCPConnectorIDs})
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
@@ -156,15 +251,18 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		Conversation: newConversation,
 		Task: task.Task{
 			ID: taskID, OwnerID: principal.UserID, ConversationID: conversationID,
-			HostID: command.HostID, ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Objective,
-			ExecutionLocation: "server", Status: task.StatusQueued, Authorization: authorization, Budget: command.Budget,
+			HostID: command.HostID, WorkspaceID: command.WorkspaceID, InputRevision: inputRevision, ContextDigest: contextDigest,
+			ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Objective,
+			FileDeliveryIntent: fileDeliveryIntent,
+			ExecutionLocation:  "server", Status: task.StatusQueued, Authorization: authorization, Budget: command.Budget,
 		},
 		Message: conversation.Message{
 			ID: messageID, ConversationID: conversationID, OwnerID: principal.UserID,
 			Role: conversation.RoleUser, Content: command.Objective,
 		},
-		InitialEvent: task.Event{TaskID: taskID, Type: "task.status", Payload: initialEvent},
-		BatchItems:   batchItems,
+		InitialEvent:    task.Event{TaskID: taskID, Type: "task.status", Payload: initialEvent},
+		BatchItems:      batchItems,
+		MCPConnectorIDs: command.MCPConnectorIDs,
 		Idempotency: IdempotencyRecord{
 			OwnerID: principal.UserID, Operation: "task.submit", Key: command.IdempotencyKey,
 			RequestHash: requestHash, ResourceID: taskID, RelatedID: messageID,
@@ -199,6 +297,11 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 	if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
 		return TaskSubmissionResult{}, err
 	}
+	connectorIDs, err := normalizeTaskMCPConnectorIDs(command.MCPConnectorIDs)
+	if err != nil {
+		return TaskSubmissionResult{}, err
+	}
+	command.MCPConnectorIDs = connectorIDs
 	budget, err := normalizedBudget(command.Budget)
 	if err != nil {
 		return TaskSubmissionResult{}, err
@@ -214,6 +317,10 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 	if err := s.validateModel(ctx, principal.UserID, command.ModelID); err != nil {
 		return TaskSubmissionResult{}, err
 	}
+	inputRevision, contextDigest, err := s.workspaceInputSnapshot(ctx, principal.UserID, command.HostID, command.WorkspaceID, command.InputRevision)
+	if err != nil {
+		return TaskSubmissionResult{}, err
+	}
 	taskID, err := domain.NewTaskID()
 	if err != nil {
 		return TaskSubmissionResult{}, fmt.Errorf("generate task id: %w", err)
@@ -223,13 +330,17 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 		return TaskSubmissionResult{}, fmt.Errorf("generate task message id: %w", err)
 	}
 	requestHash, err := hashIdempotencyRequest(struct {
-		ConversationID string      `json:"conversation_id"`
-		HostID         string      `json:"host_id"`
-		ApplicationID  string      `json:"application_id,omitempty"`
-		ModelID        string      `json:"model_id"`
-		Content        string      `json:"content"`
-		Budget         task.Budget `json:"budget"`
-	}{conversationID, command.HostID, command.ApplicationID, command.ModelID, command.Content, command.Budget})
+		ConversationID  string      `json:"conversation_id"`
+		HostID          string      `json:"host_id"`
+		WorkspaceID     string      `json:"workspace_id,omitempty"`
+		InputRevision   *int64      `json:"input_revision,omitempty"`
+		ContextDigest   []byte      `json:"context_digest,omitempty"`
+		ApplicationID   string      `json:"application_id,omitempty"`
+		ModelID         string      `json:"model_id"`
+		Content         string      `json:"content"`
+		Budget          task.Budget `json:"budget"`
+		MCPConnectorIDs []string    `json:"mcp_connector_ids"`
+	}{conversationID, command.HostID, command.WorkspaceID, inputRevision, contextDigest, command.ApplicationID, command.ModelID, command.Content, command.Budget, command.MCPConnectorIDs})
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
@@ -240,14 +351,17 @@ func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Prin
 	return s.store.AppendMessage(ctx, TaskSubmission{
 		Task: task.Task{
 			ID: taskID, OwnerID: principal.UserID, ConversationID: conversationID,
-			HostID: command.HostID, ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Content,
-			ExecutionLocation: "server", Status: task.StatusQueued, Authorization: authorization, Budget: command.Budget,
+			HostID: command.HostID, WorkspaceID: command.WorkspaceID, InputRevision: inputRevision, ContextDigest: contextDigest,
+			ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Content,
+			FileDeliveryIntent: ClassifyFileDeliveryIntent(command.Content, command.WorkspaceID != ""),
+			ExecutionLocation:  "server", Status: task.StatusQueued, Authorization: authorization, Budget: command.Budget,
 		},
 		Message: conversation.Message{
 			ID: messageID, ConversationID: conversationID, OwnerID: principal.UserID,
 			Role: conversation.RoleUser, Content: command.Content,
 		},
-		InitialEvent: task.Event{TaskID: taskID, Type: "task.status", Payload: initialEvent},
+		InitialEvent:    task.Event{TaskID: taskID, Type: "task.status", Payload: initialEvent},
+		MCPConnectorIDs: command.MCPConnectorIDs,
 		Idempotency: IdempotencyRecord{
 			OwnerID: principal.UserID, Operation: "conversation.append_message", Key: command.IdempotencyKey,
 			RequestHash: requestHash, ResourceID: taskID, RelatedID: messageID,

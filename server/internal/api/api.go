@@ -45,10 +45,12 @@ type Deps struct {
 	ClientLogin        ClientLoginService
 	Notifications      NotificationService
 	Control            ControlService
+	ExecutionControl   ExecutionControlService
 	Tasks              TaskService
 	Conversations      ConversationService
 	InstantChat        InstantChatService
 	ModelConnections   ModelConnectionManager
+	MCPConnectors      MCPConnectorManager
 	ModelGateway       ModelGateway
 	ModelUsageAdmin    ModelUsageAdmin
 	Onboarding         OnboardingManager
@@ -122,6 +124,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	engine.GET("/healthz", h.healthz)
 	engine.GET("/readyz", h.readyz)
 	engine.GET("/api/capabilities", h.capabilities)
+	engine.GET("/api/mcp/oauth/callback", h.mcpConnectorOAuthCallback)
 	engine.GET("/__ch/cert-authorize", h.authorizeTLS)
 	h.registerHostReplicaRoutes(engine)
 	if deps.MCPDisabled {
@@ -136,6 +139,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerOnboarding(group)
 	h.registerHosts(group)
 	h.registerControl(group, deps.Control)
+	h.registerExecutionControl(group, deps.ExecutionControl)
 	h.registerConversations(group, deps.Conversations, deps.Tasks)
 	h.registerTasks(group, deps.Tasks)
 	h.registerResources(group)
@@ -145,6 +149,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerInstantChat(group)
 	h.registerNotifications(group, deps.Notifications)
 	h.registerModelConnections(group)
+	h.registerMCPConnectors(group)
 	h.registerModelGateway(group)
 	h.registerAdmin(group)
 	h.registerAdminModelUsage(group)
@@ -487,6 +492,22 @@ func writeError(c *gin.Context, err error) {
 	}
 	if reason, ok := appError.Details["reason"].(string); ok && validSafeErrorReason(reason) {
 		safe.Details["reason"] = reason
+	}
+	if appError.Code == domain.CodeConflict {
+		switch appError.Details["reason"] {
+		case "host_release_unsettled_operation":
+			if id, ok := appError.Details["task_id"].(string); ok && domain.ValidTaskID(id) {
+				safe.Details["reason"] = "host_release_unsettled_operation"
+				safe.Details["task_id"] = id
+				safe.Message = "host has an unsettled task operation"
+			}
+		case "host_release_uncommitted_sync", "host_release_sync_conflict":
+			if id, ok := appError.Details["workspace_id"].(string); ok && domain.ValidWorkspaceID(id) {
+				safe.Details["reason"] = appError.Details["reason"]
+				safe.Details["workspace_id"] = id
+				safe.Message = "host Workspace changes are not settled"
+			}
+		}
 	}
 	httpserver.WriteError(c, safe)
 }

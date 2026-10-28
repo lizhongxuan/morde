@@ -66,6 +66,21 @@ FROM owner_execution_controls ORDER BY owner_id FOR UPDATE`)
 					return err
 				}
 			}
+			runtimeStopped, err := accountAgentRuntimeStopConfirmed(ctx, tx, item.ownerID)
+			if err != nil {
+				return err
+			}
+			if !runtimeStopped && gate.state == execution.StateDisabled {
+				gate, err = transitionOwnerExecutionControl(ctx, tx, item.ownerID, gate, execution.StateStopping)
+				if err != nil {
+					return err
+				}
+			}
+			if gate.state == execution.StateStopping {
+				if err := requestOwnerAccountAgentRuntimeStop(ctx, tx, item.ownerID); err != nil {
+					return err
+				}
+			}
 			if err := disableOwnerSchedules(ctx, tx, item.ownerID); err != nil {
 				return err
 			}
@@ -79,16 +94,11 @@ FROM owner_execution_controls ORDER BY owner_id FOR UPDATE`)
 			if err := readActiveExecutionTaskCount(ctx, tx, item.ownerID, &active); err != nil {
 				return err
 			}
-			if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests AS sr
-JOIN tasks AS t ON t.id=sr.task_id
-WHERE t.owner_id=$1 AND sr.status='pending'`, item.ownerID).Scan(&pendingStops); err != nil {
-				return fmt.Errorf("count pending task stops for retirement: %w", err)
+			if err := readPendingTaskStopRequestCount(ctx, tx, item.ownerID, &pendingStops); err != nil {
+				return err
 			}
-			if active != 0 || pendingStops != 0 {
+			if active != 0 || pendingStops != 0 || !runtimeStopped {
 				if gate.state == execution.StateDisabled {
-					if gate.epoch == math.MaxInt64 {
-						return domain.NewError(domain.CodeInvalidState, "owner execution control cannot be safely retired")
-					}
 					if _, err := transitionOwnerExecutionControl(ctx, tx, item.ownerID, gate, execution.StateStopping); err != nil {
 						return err
 					}

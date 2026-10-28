@@ -2,6 +2,12 @@ package postgres
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,7 +32,7 @@ func TestPostgresExecutionControlStopsTasksAndReenablesWithoutRevival(t *testing
 		schedule.MisfireSkip, []schedule.NotificationEvent{schedule.NotifyCompleted})
 
 	initial, err := store.GetExecutionControl(ctx, owner.ID)
-	if err != nil || initial.State != execution.StateEnabled || initial.Epoch != 1 {
+	if err != nil || initial.State != execution.StateEnabled || initial.Epoch != 1 || initial.Runtime.State != execution.RuntimeStateNotStarted {
 		t.Fatalf("initial owner execution control = %#v, err=%v", initial, err)
 	}
 
@@ -130,6 +136,139 @@ WHERE id=$1`, runningTask.Task.ID); err != nil {
 	}
 	if _, err := store.StopAllExecution(ctx, executionControlIdempotency(owner.ID, "execution.stop_all", "stale-execution-stop"), initial.Epoch); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("stale expected epoch error = %v", err)
+	}
+}
+
+func TestPostgresExecutionStopWaitsForGuardianConfirmedAccountRuntime(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	runtimeService, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeNonce := make([]byte, 32)
+	runtimeNonce[0] = 7
+	start := app.AccountAgentRuntimeStart{OwnerID: owner.ID, RuntimeID: "account-runtime-stop-proof", LeaseOwner: "portal-runtime-stop-proof",
+		SupervisorNonce: runtimeNonce, MaxConcurrentTasks: 3, LeaseDuration: 30 * time.Second}
+	runtime, replayed, err := runtimeService.Start(ctx, start)
+	if err != nil || replayed || runtime.State != app.AccountAgentRuntimeStarting {
+		t.Fatalf("start account Runtime: runtime=%+v replayed=%t err=%v", runtime, replayed, err)
+	}
+	runtime, err = runtimeService.Ready(ctx, runtime.Fence)
+	if err != nil {
+		t.Fatalf("ready account Runtime: %v", err)
+	}
+	guardianLeaseExpiry := runtime.LeaseExpiresAt
+	// Simulate a DB lease renewal whose matching Guardian renewal was lost.
+	runtime, err = runtimeService.Renew(ctx, runtime.Fence, app.MaxAgentLease)
+	if err != nil || !runtime.LeaseExpiresAt.After(guardianLeaseExpiry) {
+		t.Fatalf("renew account Runtime in DB before failed Guardian renewal: runtime=%+v err=%v", runtime, err)
+	}
+	initial, err := store.GetExecutionControl(ctx, owner.ID)
+	if err != nil || initial.Runtime.State != execution.RuntimeStateRunning || initial.Runtime.MaxConcurrentTasks != 3 || initial.Runtime.ActiveTaskCount != 0 {
+		t.Fatalf("running Runtime status = %#v err=%v", initial.Runtime, err)
+	}
+
+	stopRecord := executionControlIdempotency(owner.ID, "execution.stop_all", "account-runtime-stop-proof")
+	stopping, err := store.StopAllExecution(ctx, stopRecord, initial.Epoch)
+	if err != nil || stopping.State != execution.StateStopping || stopping.Runtime.State != execution.RuntimeStateStopping || stopping.PendingTaskCount != 0 {
+		t.Fatalf("stop-all without Runtime proof = %#v, err=%v", stopping, err)
+	}
+	if err := store.ReconcileStoppingExecution(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stillStopping, err := store.GetExecutionControl(ctx, owner.ID)
+	if err != nil || stillStopping.State != execution.StateStopping || stillStopping.Runtime.State != execution.RuntimeStateStopping {
+		t.Fatalf("owner gate closed before Runtime proof: %#v, err=%v", stillStopping, err)
+	}
+	if _, err := store.EnableExecution(ctx, executionControlIdempotency(owner.ID, "execution.enable", "runtime-before-proof"), stillStopping.Epoch); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("enabled with unconfirmed Runtime stop: %v", err)
+	}
+
+	identity, err := runtimeService.StopIdentity(ctx, owner.ID)
+	if err != nil || identity.Fence != runtime.Fence || identity.NonceSHA256 != runtime.NonceSHA256 || !identity.ExpiresAt.Equal(runtime.LeaseExpiresAt) {
+		t.Fatalf("Runtime stop identity = %+v err=%v", identity, err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := signedAccountRuntimeStopProof(t, identity, privateKey)
+	proof.ExpiresAt = guardianLeaseExpiry
+	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof.Signature = ed25519.Sign(privateKey, payload)
+	authenticator, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed, err := runtimeService.ConfirmGuardianStopped(ctx, proof, authenticator); err != nil || replayed {
+		t.Fatalf("confirm Runtime destruction: replayed=%t err=%v", replayed, err)
+	}
+	if replayed, err := runtimeService.ConfirmGuardianStopped(ctx, proof, authenticator); err != nil || !replayed {
+		t.Fatalf("replay Runtime destruction proof: replayed=%t err=%v", replayed, err)
+	}
+	pendingRuntimeProofs, err := runtimeService.ListPendingAccountAgentRuntimeStopAttestations(ctx, 1, authenticator)
+	if err != nil || len(pendingRuntimeProofs) != 1 || pendingRuntimeProofs[0].Fence != runtime.Fence {
+		t.Fatalf("list Runtime stop proof awaiting Guardian acknowledgement: proofs=%+v err=%v", pendingRuntimeProofs, err)
+	}
+	if replayed, err := runtimeService.MarkAccountAgentRuntimeStopAttestationAcknowledged(ctx, proof, authenticator); err != nil || replayed {
+		t.Fatalf("acknowledge durable Runtime stop proof: replayed=%t err=%v", replayed, err)
+	}
+	if err := store.ReconcileStoppingExecution(ctx); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := store.GetExecutionControl(ctx, owner.ID)
+	if err != nil || disabled.State != execution.StateDisabled || disabled.Runtime.State != execution.RuntimeStateStopped || disabled.Epoch != 3 {
+		t.Fatalf("owner gate after confirmed Runtime stop = %#v, err=%v", disabled, err)
+	}
+	if _, err := store.EnableExecution(ctx, executionControlIdempotency(owner.ID, "execution.enable", "runtime-after-proof"), disabled.Epoch); err != nil {
+		t.Fatalf("enable after Runtime proof: %v", err)
+	}
+	start.RuntimeID, start.LeaseOwner = "account-runtime-stop-proof-next", "portal-runtime-stop-proof-next"
+	start.SupervisorNonce = make([]byte, 32)
+	start.SupervisorNonce[0] = 8
+	next, replayed, err := runtimeService.Start(ctx, start)
+	if err != nil || replayed || next.Fence.RuntimeGeneration != 2 || next.State != app.AccountAgentRuntimeStarting {
+		t.Fatalf("start next Runtime generation: runtime=%+v replayed=%t err=%v", next, replayed, err)
+	}
+}
+
+func accountRuntimeContainerNameForTest(fence app.AccountAgentRuntimeFence, nonceSHA256 string) string {
+	encoded, _ := json.Marshal(fence)
+	nonce, _ := hex.DecodeString(nonceSHA256)
+	digest := sha256.Sum256(append(append(encoded, 0), nonce...))
+	return "morde-account-runtime-" + hex.EncodeToString(digest[:])
+}
+
+func signedAccountRuntimeStopProof(t *testing.T, identity app.AccountAgentRuntimeStopIdentity, privateKey ed25519.PrivateKey) app.AccountAgentRuntimeStopAttestation {
+	t.Helper()
+	proof := app.AccountAgentRuntimeStopAttestation{Fence: identity.Fence, ContainerID: strings.Repeat("a", 64),
+		ContainerName: accountRuntimeContainerNameForTest(identity.Fence, identity.NonceSHA256), NonceSHA256: identity.NonceSHA256,
+		ExpiresAt: identity.ExpiresAt, DestroyedAt: time.Now().UTC(), ProofSHA256: strings.Repeat("b", 64), Destroyed: true}
+	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof.Signature = ed25519.Sign(privateKey, payload)
+	return proof
+}
+
+func TestExecutionSnapshotStoresRuntimeAndReadsLegacyRecords(t *testing.T) {
+	original := execution.Control{OwnerID: "u1234567", State: execution.StateStopping, Epoch: 2, PendingTaskCount: 1,
+		Runtime: execution.Runtime{State: execution.RuntimeStateRunning, RuntimeID: "runtime-1", RuntimeGeneration: 3,
+			MaxConcurrentTasks: 4, ActiveTaskCount: 1}}
+	decoded, err := executionSnapshotFromIdempotency(original.OwnerID, encodeExecutionSnapshot(original))
+	if err != nil || decoded.State != original.State || decoded.Epoch != original.Epoch || decoded.PendingTaskCount != original.PendingTaskCount ||
+		decoded.Runtime != original.Runtime {
+		t.Fatalf("round-trip execution snapshot: decoded=%#v err=%v", decoded, err)
+	}
+	legacy, err := executionSnapshotFromIdempotency(original.OwnerID, "stopping:2:1")
+	if err != nil || legacy.State != original.State || legacy.Runtime.Valid() {
+		t.Fatalf("legacy execution snapshot = %#v err=%v", legacy, err)
 	}
 }
 

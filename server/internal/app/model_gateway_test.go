@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -16,6 +17,8 @@ type modelGatewayStoreTest struct {
 	reservation ModelCallReservation
 	settlement  ModelCallSettlement
 	reserveErr  error
+	dispatchErr error
+	dispatch    bool
 	settleErr   error
 	settledCtx  error
 }
@@ -23,6 +26,11 @@ type modelGatewayStoreTest struct {
 func (s *modelGatewayStoreTest) ReserveModelCall(_ context.Context, value ModelCallReservation) error {
 	s.reservation = value
 	return s.reserveErr
+}
+
+func (s *modelGatewayStoreTest) BeginModelCallDispatch(_ context.Context, value ModelCallReservation) error {
+	s.reservation, s.dispatch = value, true
+	return s.dispatchErr
 }
 
 func (s *modelGatewayStoreTest) SettleModelCall(ctx context.Context, value ModelCallSettlement) error {
@@ -46,6 +54,12 @@ func (r *modelGatewayResolverTest) ResolveProbeEndpoint(_ context.Context, princ
 
 func (*modelGatewayResolverTest) SaveProbeCapabilities(_ context.Context, _ identity.Principal, _ string, _ time.Time, value ModelCapabilities) (ModelCapabilities, error) {
 	return value, nil
+}
+
+type modelTaskImageResolverTest struct{}
+
+func (modelTaskImageResolverTest) ResolveTaskModelImage(context.Context, ModelTaskFence, json.RawMessage) (ModelImage, error) {
+	return ModelImage{MediaType: "image/jpeg", Data: []byte("jpeg")}, nil
 }
 
 type modelGatewayClientTest struct {
@@ -89,7 +103,7 @@ func TestModelGatewayReservesSettlesAndReturnsToolCalls(t *testing.T) {
 		t.Fatalf("response = %#v, stream = %q, error = %v", response, text, err)
 	}
 	digest := sha256.Sum256(call.RawRequest)
-	if store.reservation.OwnerID != call.Principal.UserID || store.reservation.ProviderModel != "test-model" ||
+	if !store.dispatch || store.reservation.OwnerID != call.Principal.UserID || store.reservation.ProviderModel != "test-model" ||
 		hex.EncodeToString(store.reservation.RequestDigest) != hex.EncodeToString(digest[:]) || !resolver.tools || resolver.image ||
 		store.settlement.Unknown || store.settlement.Usage.InputTokens != 3 || store.settlement.Usage.OutputTokens != 4 ||
 		client.request.Endpoint.APIKey != "platform-key" || client.calls != 1 {
@@ -110,11 +124,16 @@ func TestModelGatewayRejectsBeforeProviderAndRecordsUnknownOnCancellation(t *tes
 		t.Fatalf("budget denial reached provider: %v, calls %d", err, client.calls)
 	}
 	store.reserveErr = nil
+	store.dispatchErr = nil
 	client.err = context.Canceled
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := service.Complete(ctx, call); !errors.Is(err, context.Canceled) || !store.settlement.Unknown || store.settledCtx != nil {
 		t.Fatalf("cancel settlement = %#v, context error=%v, call error=%v", store.settlement, store.settledCtx, err)
+	}
+	store.dispatchErr = domain.NewError(domain.CodeInvalidState, "model call expired before dispatch")
+	if _, err := service.Complete(context.Background(), call); domain.CodeOf(err) != domain.CodeInvalidState || client.calls != 1 {
+		t.Fatalf("stale model call reached provider: %v, calls %d", err, client.calls)
 	}
 	call.Request.Endpoint.APIKey = "device-secret"
 	if _, err := service.Complete(context.Background(), call); domain.CodeOf(err) != domain.CodeInvalidArgument || client.calls != 1 {
@@ -183,5 +202,22 @@ func TestTaskModelRequestUsesTheCheckpointedDSHFrame(t *testing.T) {
 	call.RawRequest = []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"image","attachment":{"id":"untrusted"}}]}],"tools":[]}`)
 	if _, err := service.Complete(context.Background(), call); domain.CodeOf(err) != domain.CodeUnsupported || client.calls != 1 {
 		t.Fatalf("unresolved image was not rejected before provider: %v", err)
+	}
+}
+
+func TestDSHToolImageBecomesAuthorizedModelObservation(t *testing.T) {
+	raw := json.RawMessage(`{"provider":"morde","model":"p1234567","messages":[{"role":"assistant","content":[{"type":"tool-call","id":"call-1","name":"desktop_screenshot","arguments":"{}"}]},{"role":"tool","toolCallId":"call-1","content":[{"type":"text","text":"screenshot captured"},{"type":"image","attachment":{"id":"registered"}}]}],"tools":[]}`)
+	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 1,
+		EngineVersion: "dsh-1", ProfileVersion: "v1"}
+	request, err := parseDSHModelRequest(context.Background(), fence, "p1234567", raw, modelTaskImageResolverTest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Input) != 3 || request.Input[0].Type != "function_call" || request.Input[1].Type != "function_call_output" ||
+		request.Input[1].Output != "screenshot captured" || request.Input[2].Type != "message" || request.Input[2].Role != "user" ||
+		len(request.Input[2].Parts) != 2 || request.Input[2].Parts[0].Type != "text" ||
+		request.Input[2].Parts[1].Image == nil || string(request.Input[2].Parts[1].Image.Data) != "jpeg" {
+		t.Fatalf("DSH tool image was not converted into a visual observation: %#v", request.Input)
 	}
 }

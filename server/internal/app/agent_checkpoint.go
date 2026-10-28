@@ -22,6 +22,7 @@ type AgentCheckpointFence struct {
 	AgentInstanceID      string
 	AgentGeneration      int64
 	AgentSessionID       string
+	AgentRootSessionID   string
 	AuthorizationVersion int64
 	LeaseOwner           string
 	LeaseVersion         int64
@@ -39,6 +40,7 @@ type AgentCheckpointCommand struct {
 
 type AgentCheckpointPageRequest struct {
 	Fence         AgentInstanceFence
+	SessionID     string
 	From          int64
 	Through       int64
 	ThroughDigest []byte
@@ -78,6 +80,9 @@ func NewAgentCheckpointService(store AgentCheckpointStore, sealer *Sealer) (*Age
 
 // Save confirms a checkpoint only after the fenced store commits it.
 func (s *AgentCheckpointService) Save(ctx context.Context, command AgentCheckpointCommand) (bool, error) {
+	if command.Fence.AgentRootSessionID == "" {
+		command.Fence.AgentRootSessionID = command.Fence.AgentSessionID
+	}
 	if err := validateAgentCheckpoint(command.Fence, command.From, command.Through, command.Digest, command.Payload); err != nil {
 		return false, err
 	}
@@ -113,15 +118,22 @@ func (s *AgentCheckpointService) Decode(stored StoredAgentCheckpoint) ([]byte, e
 
 // ReadPage only exposes prior checkpoint data to the current, fenced agent lease.
 func (s *AgentCheckpointService) ReadPage(ctx context.Context, request AgentCheckpointPageRequest) (AgentCheckpointPage, error) {
+	if request.SessionID == "" {
+		request.SessionID = request.Fence.AgentSessionID
+	}
 	if err := request.Fence.Validate(); err != nil || request.From < 0 || request.Through < request.From ||
-		len(request.ThroughDigest) != sha256.Size {
+		len(request.ThroughDigest) != sha256.Size || !agentCheckpointIDPattern.MatchString(request.SessionID) {
 		return AgentCheckpointPage{}, domain.InvalidArgument("checkpoint_page", "checkpoint page request is invalid")
 	}
 	stored, err := s.store.ReadAgentCheckpointPage(ctx, request)
 	if err != nil {
 		return AgentCheckpointPage{}, err
 	}
-	if stored.From != request.From || stored.Through > request.Through {
+	if stored.Fence.AgentRootSessionID == "" && stored.Fence.AgentSessionID == request.Fence.AgentSessionID {
+		stored.Fence.AgentRootSessionID = stored.Fence.AgentSessionID
+	}
+	if stored.Fence.AgentSessionID != request.SessionID || stored.Fence.AgentRootSessionID != request.Fence.AgentSessionID ||
+		stored.From != request.From || stored.Through > request.Through {
 		return AgentCheckpointPage{}, domain.NewError(domain.CodeInvalidState, "checkpoint page is outside the pinned history")
 	}
 	payload, err := s.Decode(stored)
@@ -142,6 +154,7 @@ func subtleCompareCheckpointDigest(left, right []byte) bool {
 func validateAgentCheckpoint(fence AgentCheckpointFence, from, through int64, digest, payload []byte) error {
 	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) ||
 		!agentCheckpointIDPattern.MatchString(fence.AgentInstanceID) || !agentCheckpointIDPattern.MatchString(fence.AgentSessionID) ||
+		(fence.AgentRootSessionID != "" && !agentCheckpointIDPattern.MatchString(fence.AgentRootSessionID)) ||
 		fence.AgentGeneration < 1 || fence.AuthorizationVersion < 1 || fence.LeaseVersion < 1 ||
 		invalidCheckpointLabel(fence.LeaseOwner, 255) || invalidCheckpointLabel(fence.EngineVersion, 128) ||
 		invalidCheckpointLabel(fence.ProfileVersion, 128) || from < 0 || through < from ||
@@ -178,13 +191,19 @@ func invalidCheckpointLabel(value string, max int) bool {
 }
 
 func checkpointAAD(fence AgentCheckpointFence, from, through int64) ([]byte, error) {
+	rootSessionID := fence.AgentRootSessionID
+	if rootSessionID == fence.AgentSessionID {
+		rootSessionID = ""
+	}
 	value, err := json.Marshal(struct {
-		TaskID    string `json:"task_id"`
-		OwnerID   string `json:"owner_id"`
-		SessionID string `json:"session_id"`
-		From      int64  `json:"from"`
-		Through   int64  `json:"through"`
-	}{TaskID: fence.TaskID, OwnerID: fence.OwnerID, SessionID: fence.AgentSessionID, From: from, Through: through})
+		TaskID        string `json:"task_id"`
+		OwnerID       string `json:"owner_id"`
+		SessionID     string `json:"session_id"`
+		RootSessionID string `json:"root_session_id,omitempty"`
+		From          int64  `json:"from"`
+		Through       int64  `json:"through"`
+	}{TaskID: fence.TaskID, OwnerID: fence.OwnerID, SessionID: fence.AgentSessionID,
+		RootSessionID: rootSessionID, From: from, Through: through})
 	if err != nil {
 		return nil, fmt.Errorf("encode checkpoint identity: %w", err)
 	}

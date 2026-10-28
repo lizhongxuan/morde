@@ -32,14 +32,14 @@ tags:
     description: Desktop and mobile client installations authorized by account login.
   - name: Models
     description: Session-managed model connections and capability checks.
-  - name: Instant Chat
-    description: Immediate text conversations without background tasks.
+  - name: Instant Chat compatibility
+    description: Temporary legacy routes backed by the canonical durable Task and Conversation services.
   - name: Notifications
     description: In-app notifications for Portal sessions and native client credentials.
   - name: Admin
     description: Administrative operations.
   - name: MCP
-    description: Streamable HTTP endpoint for platform MCP clients.
+    description: Platform MCP endpoint and account-owned third-party connector management.
   - name: Health
     description: Process and dependency health checks.
 security:
@@ -545,7 +545,7 @@ paths:
       tags: [Hosts]
       operationId: releaseHost
       summary: Release host compute while retaining data
-      description: API keys require current account ownership of this host. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks are active or user control is enabled. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
+      description: API keys require current account ownership of this host. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks or tool operations are active, a Host Workspace upload is uncommitted, a Host Workspace sync conflict remains, or user control is enabled. For these release conflicts, 409 details contain reason=host_release_uncommitted_sync, host_release_sync_conflict, or host_release_unsettled_operation and the validated workspace_id or task_id. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
       requestBody:
         required: false
         content:
@@ -1971,9 +1971,10 @@ paths:
         default: { $ref: '#/components/responses/Error' }
   /api/instant-chat/conversations:
     get:
-      tags: [Instant Chat]
+      tags: [Instant Chat compatibility]
       operationId: listInstantChatConversations
-      summary: List the current user's instant chat conversations
+      summary: List conversations through the legacy instant chat route
+      description: Returns the same durable Task-backed conversations as the canonical conversation API.
       security: [{ portalSession: [] }]
       responses:
         '200':
@@ -1993,9 +1994,10 @@ paths:
         required: true
         schema: { $ref: '#/components/schemas/ConversationId' }
     get:
-      tags: [Instant Chat]
+      tags: [Instant Chat compatibility]
       operationId: listInstantChatMessages
-      summary: List messages in an instant chat conversation
+      summary: List conversation messages through the legacy instant chat route
+      description: Returns the same persisted messages as the canonical conversation API.
       security: [{ portalSession: [] }]
       responses:
         '200':
@@ -2011,10 +2013,10 @@ paths:
         default: { $ref: '#/components/responses/Error' }
   /api/instant-chat/messages:
     post:
-      tags: [Instant Chat]
+      tags: [Instant Chat compatibility]
       operationId: sendInstantChatMessage
-      summary: Send a message and receive an immediate AI reply
-      description: Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
+      summary: Submit a durable Task through the legacy reply shape
+      description: Submits to the canonical Task and Conversation services, then waits for the Task's terminal result to preserve the legacy response shape. Disconnecting while waiting does not cancel the durable Task. Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
       security: [{ portalSession: [] }]
       parameters:
         - name: Idempotency-Key
@@ -2034,6 +2036,74 @@ paths:
               schema: { $ref: '#/components/schemas/InstantChatSendResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/execution:
+    get:
+      tags: [Tasks]
+      operationId: getExecutionControl
+      summary: Get the current user's cloud task execution control
+      description: Requires a Portal Session. Returns the owner-scoped execution gate, account Runtime generation and quota, and active Task summary. Client credentials and API keys cannot change or inspect this state.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Current execution gate, account Runtime, quota, and Task summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionControl' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/execution/stop-all:
+    post:
+      tags: [Tasks]
+      operationId: stopAllExecution
+      summary: Stop all cloud task execution for the current user
+      description: The expected epoch prevents stale control requests. The same Idempotency-Key may only retry this exact action and epoch. HTTP 202 means Task processes or the account Runtime lack stop confirmation; poll GET /api/execution until the state is disabled.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutionControlMutationRequest' }
+      responses:
+        '200':
+          description: Execution is already disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionControl' }
+        '202':
+          description: Task or account Runtime stop proof is still pending
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionControl' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/execution/enable:
+    post:
+      tags: [Tasks]
+      operationId: enableExecution
+      summary: Enable cloud task execution for the current user
+      description: Requires a Portal Session and the current execution epoch. Reuse the Idempotency-Key only for an exact retry of this action and epoch. The request conflicts while an account Runtime stop is unconfirmed.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutionControlMutationRequest' }
+      responses:
+        '200':
+          description: Execution gate is enabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionControl' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/conversations:
     get:
@@ -2199,6 +2269,33 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
         '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/mcp-connectors/{connector_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: connector_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MCPConnectorId' }
+    delete:
+      tags: [Tasks]
+      operationId: revokeTaskMCPConnectorGrant
+      summary: Revoke one connector grant for a task
+      description: Revocation uses a grant-version compare-and-set. It blocks new connector dispatch; already dispatched operations are settled by the task operation lifecycle.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: expected_grant_version
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '204': { description: Connector grant revoked }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/actions:
     parameters:
@@ -2561,6 +2658,226 @@ paths:
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
         '504': { $ref: '#/components/responses/GatewayTimeout' }
         default: { $ref: '#/components/responses/Error' }
+  /api/mcp/connectors:
+    get:
+      tags: [MCP]
+      operationId: listMCPConnectors
+      summary: List the current user's MCP connectors
+      description: Portal sessions only. Connectors are private to the account. Responses never contain credential values.
+      security:
+        - portalSession: []
+      responses:
+        '200':
+          description: Connectors without credential values
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MCPConnectorList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [MCP]
+      operationId: createMCPConnector
+      summary: Create a private MCP connector
+      description: Portal sessions only. New connectors are disabled until explicitly enabled. Optional credential JSON is encrypted at rest and never returned; URL credentials, query strings, fragments, non-HTTPS schemes, literal IPs and ports other than 443 are rejected.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMCPConnectorRequest' }
+      responses:
+        '201':
+          description: Created connector without credential values
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/mcp/connectors/{id}:
+    parameters:
+      - $ref: '#/components/parameters/MCPConnectorId'
+    get:
+      tags: [MCP]
+      operationId: getMCPConnector
+      summary: Get a private MCP connector
+      description: Portal sessions only. Another user's connector is reported as not found.
+      security:
+        - portalSession: []
+      responses:
+        '200':
+          description: Connector metadata and credential presence, without credential values
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      tags: [MCP]
+      operationId: updateMCPConnector
+      summary: Update connector metadata
+      description: Portal sessions only. Requires the current revision. Credential rotation uses its separate endpoint.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMCPConnectorRequest' }
+      responses:
+        '200':
+          description: Updated connector metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [MCP]
+      operationId: deleteMCPConnector
+      summary: Delete a private MCP connector
+      description: Portal sessions only. Requires the current revision; the deletion and audit event commit together.
+      security:
+        - portalSession: []
+      parameters:
+        - name: expected_revision
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '204': { description: Connector deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/mcp/connectors/{id}/credential:
+    parameters:
+      - $ref: '#/components/parameters/MCPConnectorId'
+    put:
+      tags: [MCP]
+      operationId: rotateMCPConnectorCredential
+      summary: Replace a connector credential
+      description: Portal sessions only. Credentials are write-only, encrypted with owner, connector and credential-version AAD, and never returned. The request and audit event commit with the new version.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RotateMCPConnectorCredentialRequest' }
+      responses:
+        '200':
+          description: Updated connector metadata without credential values
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/mcp/connectors/{id}/enabled:
+    parameters:
+      - $ref: '#/components/parameters/MCPConnectorId'
+    put:
+      tags: [MCP]
+      operationId: setMCPConnectorEnabled
+      summary: Enable or disable a connector
+      description: Portal sessions only. Requires the current revision. The change and audit event commit together.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled, expected_revision]
+              properties:
+                enabled: { type: boolean }
+                expected_revision: { type: integer, minimum: 1 }
+              additionalProperties: false
+      responses:
+        '200':
+          description: Updated connector state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/mcp/connectors/{id}/oauth/authorize:
+    parameters:
+      - $ref: '#/components/parameters/MCPConnectorId'
+    post:
+      tags: [MCP]
+      operationId: beginMCPConnectorOAuth
+      summary: Begin server-side OAuth authorization for a connector
+      description: Portal sessions only. Discovers the MCP protected resource and authorization server, reuses or dynamically registers an OAuth client, and returns a PKCE authorization URL. If dynamic registration is unavailable, returns the issuer and callback URI so the user can provide an OAuth client ID and optional secret. Client secrets are accepted only in this request and are never returned.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BeginMCPConnectorOAuthRequest' }
+      responses:
+        '200':
+          description: Authorization URL or a request for user-provided OAuth client details
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BeginMCPConnectorOAuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/mcp/oauth/callback:
+    get:
+      tags: [MCP]
+      operationId: completeMCPConnectorOAuth
+      summary: Complete the one-time OAuth authorization callback
+      description: Public provider callback protected by a one-time, expiring state hash. The authorization code is exchanged server-side with PKCE and encrypted credentials are stored for the account that initiated the flow. OAuth callback errors are not reflected to the browser.
+      security: []
+      parameters:
+        - { name: state, in: query, required: true, schema: { type: string, minLength: 43, maxLength: 128 } }
+        - { name: code, in: query, required: false, schema: { type: string, maxLength: 8192 } }
+        - { name: error, in: query, required: false, schema: { type: string, maxLength: 128 } }
+        - { name: iss, in: query, required: false, schema: { type: string, format: uri, maxLength: 4096 } }
+      responses:
+        '200': { description: Authorization completed. Returns a simple no-store page for the user. }
+        '400': { description: Authorization was not completed or the one-time state was invalid. }
+        '503': { description: OAuth service unavailable. }
   /api/admin/hosts:
     get:
       tags: [Admin]
@@ -3036,6 +3353,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/ModelConnectionId' }
+    MCPConnectorId:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/MCPConnectorId' }
     NotificationId:
       name: id
       in: path
@@ -3116,6 +3438,33 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
   schemas:
+    ExecutionControlMutationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_epoch]
+      properties:
+        expected_epoch: { type: integer, minimum: 1 }
+    ExecutionControl:
+      type: object
+      additionalProperties: false
+      required: [owner_id, state, epoch, pending_task_count, runtime, updated_at]
+      properties:
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        state: { type: string, enum: [enabled, stopping, disabled] }
+        epoch: { type: integer, minimum: 1 }
+        pending_task_count: { type: integer, minimum: 0 }
+        runtime: { $ref: '#/components/schemas/ExecutionRuntime' }
+        updated_at: { type: string, format: date-time }
+    ExecutionRuntime:
+      type: object
+      additionalProperties: false
+      required: [state, runtime_generation, max_concurrent_tasks, active_task_count]
+      properties:
+        state: { type: string, enum: [not_started, starting, running, stopping, stopped, failed] }
+        runtime_id: { type: string }
+        runtime_generation: { type: integer, minimum: 0 }
+        max_concurrent_tasks: { type: integer, minimum: 0, maximum: 16 }
+        active_task_count: { type: integer, minimum: 0 }
     ModelGatewayToolCall:
       type: object
       additionalProperties: false
@@ -3202,6 +3551,7 @@ components:
     ConversationId: { type: string, pattern: '^c[a-z0-9]{7}$' }
     TaskId: { type: string, pattern: '^q[a-z0-9]{7}$' }
     ModelConnectionId: { type: string, pattern: '^p[a-z0-9]{7}$' }
+    MCPConnectorId: { type: string, pattern: '^k[a-z0-9]{7}$' }
     MessageId: { type: string, pattern: '^m[a-z0-9]{7}$' }
     StepId: { type: string, pattern: '^s[a-z0-9]{7}$' }
     OperationId: { type: string, pattern: '^o[a-z0-9]{7}$' }
@@ -3275,6 +3625,95 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/ModelConnection' }
+      additionalProperties: false
+    CreateMCPConnectorRequest:
+      type: object
+      required: [name, endpoint_url]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        endpoint_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https://'
+          description: HTTPS endpoint using DNS and port 443, without URL credentials, query or fragment. Actual DNS/IP authorization is performed by the server at connection time.
+        credential:
+          type: object
+          maxProperties: 128
+          writeOnly: true
+          description: Optional provider credential bundle. The serialized object is limited to 32 KiB, encrypted at rest and never returned.
+          additionalProperties: true
+      additionalProperties: false
+    BeginMCPConnectorOAuthRequest:
+      type: object
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, minimum: 1 }
+        client_id: { type: string, maxLength: 2048, writeOnly: true }
+        client_secret: { type: string, maxLength: 4096, writeOnly: true }
+      additionalProperties: false
+    BeginMCPConnectorOAuthResponse:
+      oneOf:
+        - type: object
+          required: [kind, authorization_url, redirect_uri]
+          properties:
+            kind: { const: authorize }
+            authorization_url: { type: string, format: uri }
+            redirect_uri: { type: string, format: uri }
+          additionalProperties: false
+        - type: object
+          required: [kind, developer_url, redirect_uri]
+          properties:
+            kind: { const: client_required }
+            developer_url: { type: string, format: uri }
+            redirect_uri: { type: string, format: uri }
+          additionalProperties: false
+    UpdateMCPConnectorRequest:
+      type: object
+      required: [name, endpoint_url, expected_revision]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        endpoint_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https://'
+        expected_revision: { type: integer, minimum: 1 }
+      additionalProperties: false
+    RotateMCPConnectorCredentialRequest:
+      type: object
+      required: [credential, expected_revision]
+      properties:
+        credential:
+          type: object
+          maxProperties: 128
+          writeOnly: true
+          description: Serialized JSON object is limited to 32 KiB and encrypted with owner, connector and credential-version AAD.
+          additionalProperties: true
+        expected_revision: { type: integer, minimum: 1 }
+      additionalProperties: false
+    MCPConnector:
+      type: object
+      required: [id, name, endpoint_url, enabled, has_credential, credential_version, revision, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/MCPConnectorId' }
+        name: { type: string }
+        endpoint_url: { type: string, format: uri }
+        enabled: { type: boolean }
+        has_credential: { type: boolean }
+        credential_version: { type: integer, minimum: 0 }
+        revision: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      description: Private connector metadata. Credential values and ciphertext are never present.
+      additionalProperties: false
+    MCPConnectorList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/MCPConnector' }
       additionalProperties: false
     Quota:
       type: object
@@ -4100,9 +4539,16 @@ components:
       required: [model_id, content]
       properties:
         host_id: { $ref: '#/components/schemas/HostId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision used by this task. Required with workspace_id. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
         content: { type: string, minLength: 1, maxLength: 32768 }
+        mcp_connector_ids:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/MCPConnectorId' }
         budget:
           oneOf:
             - { $ref: '#/components/schemas/TaskBudgetRequest' }
@@ -4147,6 +4593,7 @@ components:
         host_id: { $ref: '#/components/schemas/HostId', description: Optional target Host for computer operations; the dsh Agent runs independently on the server. }
         execution_location: { type: string, enum: [server, legacy] }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision this task started from. }
         application_id: { type: string }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
         model_id: { type: string }
@@ -4163,7 +4610,7 @@ components:
       properties:
         id: { $ref: '#/components/schemas/StepId' }
         sequence: { type: integer, minimum: 1 }
-        kind: { type: string, enum: [plan, tool, wait, result] }
+        kind: { type: string, enum: [plan, model, tool, wait, clarification, budget, verification, verify, batch_item, batch_result, subagent, result] }
         status: { type: string, enum: [queued, running, waiting_user, succeeded, failed, unknown] }
         title: { type: string }
         summary: { type: string }
@@ -4244,10 +4691,17 @@ components:
       required: [model_id, objective]
       properties:
         host_id: { $ref: '#/components/schemas/HostId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision to pin for this task. Required with workspace_id. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
         conversation_id: { oneOf: [{ $ref: '#/components/schemas/ConversationId' }, { type: 'null' }] }
         objective: { type: string, minLength: 1, maxLength: 32768 }
+        mcp_connector_ids:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/MCPConnectorId' }
         budget:
           oneOf:
             - { $ref: '#/components/schemas/TaskBudgetRequest' }

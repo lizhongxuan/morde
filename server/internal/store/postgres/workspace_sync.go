@@ -758,6 +758,17 @@ WHERE w.id=$1 FOR UPDATE OF w`, workspaceID).Scan(&workspaceOwner, &workspaceSta
 		if err := ensureWorkspaceMutationsBlockUsageStored(ctx, tx, workspaceID, mutations); err != nil {
 			return err
 		}
+		if len(mutations) > 0 {
+			var activeTaskOperation bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')
+)`, workspaceID).Scan(&activeTaskOperation); err != nil {
+				return fmt.Errorf("check admitted task operations before Workspace revision commit: %w", err)
+			}
+			if activeTaskOperation {
+				return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an admitted task operation; retry synchronization after it settles")
+			}
+		}
 		if err := applyWorkspaceSyncMutations(ctx, tx, workspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, mutations); err != nil {
 			return err
 		}

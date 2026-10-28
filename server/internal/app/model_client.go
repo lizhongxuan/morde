@@ -3,7 +3,11 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"time"
 )
+
+// ModelCallTimeout bounds both dispatch authorization and the provider request.
+const ModelCallTimeout = 45 * time.Second
 
 type ModelEndpoint struct {
 	BaseURL string

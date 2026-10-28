@@ -17,7 +17,9 @@ SELECT * FROM task_steps WHERE task_id = $1 ORDER BY sequence;
 SELECT * FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id;
 
 -- name: ListTaskArtifacts :many
-SELECT * FROM task_artifacts WHERE task_id = $1 ORDER BY created_at, id;
+SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt,
+       workspace_id, workspace_revision, size_bytes, sha256
+FROM task_artifacts WHERE task_id = $1 ORDER BY created_at, id;
 
 -- name: ListTaskEvents :many
 SELECT * FROM task_events

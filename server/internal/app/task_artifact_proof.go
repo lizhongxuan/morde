@@ -21,6 +21,25 @@ type TaskArtifactProof struct {
 	SHA256      string
 }
 
+// VerifyLatestCommittedArtifact resolves the Workspace's current revision, then
+// verifies the requested file against that immutable manifest and its blocks.
+func (s *WorkspaceSyncService) VerifyLatestCommittedArtifact(ctx context.Context, ownerID, workspaceID, filePath string, sizeBytes int64, sha256 string) (TaskArtifactProof, error) {
+	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return TaskArtifactProof{}, domain.InvalidArgument("artifact", "workspace artifact proof is invalid")
+	}
+	value, err := s.store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return TaskArtifactProof{}, err
+	}
+	if value.OwnerID != ownerID || value.State != workspace.StateReady || value.DeletedAt != nil {
+		return TaskArtifactProof{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return s.VerifyCommittedArtifact(ctx, TaskArtifactProof{
+		OwnerID: ownerID, WorkspaceID: workspaceID, Revision: value.Revision,
+		Path: filePath, SizeBytes: sizeBytes, SHA256: sha256,
+	})
+}
+
 // VerifyCommittedArtifact checks expected metadata against an immutable manifest
 // and actually reads all referenced blocks. The caller must independently bind
 // these facts to the authorized Task and step in its completion transaction.

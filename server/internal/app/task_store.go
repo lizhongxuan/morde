@@ -71,12 +71,13 @@ type IdempotencyRecord struct {
 }
 
 type TaskSubmission struct {
-	Conversation *conversation.Conversation
-	Task         task.Task
-	Message      conversation.Message
-	InitialEvent task.Event
-	BatchItems   []task.BatchItem
-	Idempotency  IdempotencyRecord
+	Conversation    *conversation.Conversation
+	Task            task.Task
+	Message         conversation.Message
+	InitialEvent    task.Event
+	BatchItems      []task.BatchItem
+	MCPConnectorIDs []string
+	Idempotency     IdempotencyRecord
 }
 
 type TaskSubmissionResult struct {
@@ -97,10 +98,29 @@ type TaskProgress struct {
 	Usage                  task.Usage
 	ObservationFingerprint string
 	Steps                  []task.Step
+	Artifacts              []task.Artifact
 	Event                  task.Event
 	PendingRequest         *task.PendingRequest
 	ClarificationRequest   *task.ClarificationRequest
 	AssistantMessage       *conversation.Message
+	CloudDSHSkillRead      *CloudDSHSkillReadCommit
+}
+
+// CloudDSHSkillReadCommit binds a fixed skill response to one durable dsh call.
+// The Task event stores source metadata and hashes; the skill text stays in the encrypted dsh checkpoint.
+type CloudDSHSkillReadCommit struct {
+	TaskID               string
+	OwnerID              string
+	AgentSessionID       string
+	AuthorizationVersion int64
+	CallID               string
+	SkillID              string
+	SkillVersion         string
+	BundleVersion        string
+	SourceRef            string
+	ContentSHA256        string
+	OutputSHA256         string
+	FingerprintSHA256    string
 }
 
 type AssistantTextDelta struct {
@@ -162,7 +182,7 @@ type TaskStore interface {
 	RetryFailedBatchItem(context.Context, IdempotencyRecord, string, string) error
 	RespondToPendingRequest(context.Context, IdempotencyRecord, string, string, int64, task.PendingDecision) error
 	AnswerClarificationRequest(context.Context, IdempotencyRecord, string, string, int64, string) error
-	// RecordValidatedArtifact persists metadata after the caller validates the runtime-created Workspace-relative path and source step.
+	// RecordValidatedArtifact persists batch artifact proof after the caller reads it back from a committed Workspace revision.
 	RecordValidatedArtifact(context.Context, string, task.Artifact, string, int64) (task.Artifact, error)
 }
 

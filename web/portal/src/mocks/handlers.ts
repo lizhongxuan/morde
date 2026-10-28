@@ -10,8 +10,9 @@ type WorkspaceBinding = components["schemas"]["WorkspaceBinding"];
 type Host = Omit<components["schemas"]["Host"], "workspaces"> & { sandbox_id?: string | null; workspaces: WorkspaceBinding[] };
 type HostMember = { user_id: string; permissions: HostMemberPermission[]; created_at: string };
 type ModelConnection = components["schemas"]["ModelConnection"];
-type InstantChatConversation = components["schemas"]["InstantChatConversation"];
-type InstantChatMessage = components["schemas"]["InstantChatMessage"];
+type Conversation = components["schemas"]["Conversation"];
+type ConversationMessage = components["schemas"]["ConversationMessage"];
+type Task = components["schemas"]["Task"];
 type UserPreferences = components["schemas"]["UserPreferences"];
 type Notification = components["schemas"]["Notification"];
 type ClientInstallation = components["schemas"]["ClientInstallation"];
@@ -34,10 +35,12 @@ let hostMembers = new Map<string, HostMember[]>();
 const hostResourceVersions = new Map<string, number>();
 let apiKeys: Array<Record<string, unknown>> = [];
 let modelConnections: ModelConnection[] = [];
-let instantChatConversations: InstantChatConversation[] = [];
-let instantChatMessages: InstantChatMessage[] = [];
-let instantChatOwners = new Map<string, string>();
-const instantChatReplays = new Map<string, { request: string; response: { conversation: InstantChatConversation; message: InstantChatMessage; reply: InstantChatMessage } }>();
+let conversations: Conversation[] = [];
+let conversationMessages: ConversationMessage[] = [];
+let conversationOwners = new Map<string, string>();
+let tasks = new Map<string, Task>();
+const taskSubmitReplays = new Map<string, { request: string; response: Task }>();
+const taskMessageReplays = new Map<string, { request: string; response: { message: ConversationMessage; task: Task } }>();
 let userPreferences = new Map<string, UserPreferences>();
 let notifications: Notification[] = [];
 let clients: ClientInstallation[] = [];
@@ -53,7 +56,7 @@ const passwords = new Map<string, string>();
 const loginAccounts = new Map<string, { user: User; password: string }>();
 const sessions = new Map<string, { userId: string; name: string }>();
 const sessionStoragePrefix = "cloudhost:portal-mock-session:";
-const assistantMockStorageKey = "cloudhost:portal-mock-assistant-state-v2";
+const assistantMockStorageKey = "cloudhost:portal-mock-assistant-state-v3";
 let auditLogs: AuditLog[] = [];
 const hostDeletionStartedAt = new Map<string, number>();
 const hostReleaseStartedAt = new Map<string, number>();
@@ -143,9 +146,10 @@ type PersistedAssistantState = {
   workspaces: Workspace[];
   workspaceOwners: Array<[string, string]>;
   userPreferences: Array<[string, UserPreferences]>;
-  instantChatConversations?: InstantChatConversation[];
-  instantChatMessages?: InstantChatMessage[];
-  instantChatOwners?: Array<[string, string]>;
+  conversations?: Conversation[];
+  conversationMessages?: ConversationMessage[];
+  conversationOwners?: Array<[string, string]>;
+  tasks?: Task[];
   notifications?: Notification[];
   notificationOwners?: Array<[string, string]>;
   hostMembers?: Array<[string, HostMember[]]>;
@@ -164,9 +168,10 @@ function persistAssistantState() {
     workspaces,
     workspaceOwners: Array.from(workspaceOwners.entries()),
     userPreferences: Array.from(userPreferences.entries()),
-    instantChatConversations,
-    instantChatMessages,
-    instantChatOwners: Array.from(instantChatOwners.entries()),
+    conversations,
+    conversationMessages,
+    conversationOwners: Array.from(conversationOwners.entries()),
+    tasks: Array.from(tasks.values()),
     notifications,
     notificationOwners: Array.from(notificationOwners.entries()),
     hostMembers: Array.from(hostMembers.entries()),
@@ -206,10 +211,12 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaceOwners.clear();
   apiKeys = [];
   modelConnections = [{ id: "pmodel01", name: "团队示例模型", base_url: "https://models.example.invalid/v1", model_name: "morde-demo", shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false }, checked_at: now(), created_at: now(), updated_at: now() }];
-  instantChatConversations = [];
-  instantChatMessages = [];
-  instantChatOwners = new Map();
-  instantChatReplays.clear();
+  conversations = [];
+  conversationMessages = [];
+  conversationOwners = new Map();
+  tasks = new Map();
+  taskSubmitReplays.clear();
+  taskMessageReplays.clear();
   userPreferences = new Map();
   notifications = [];
   clients = [{ id: "cli_demo01", platform: "desktop", display_name: "Morde 演示电脑", expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(), revoked: false, created_at: now(), last_used_at: null } as ClientInstallation];
@@ -247,10 +254,11 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
     workspaces = persisted.workspaces;
     for (const [workspaceId, ownerId] of persisted.workspaceOwners) workspaceOwners.set(workspaceId, ownerId);
     userPreferences = new Map(persisted.userPreferences);
-    if (Array.isArray(persisted.instantChatConversations) && Array.isArray(persisted.instantChatMessages) && Array.isArray(persisted.instantChatOwners)) {
-      instantChatConversations = persisted.instantChatConversations;
-      instantChatMessages = persisted.instantChatMessages;
-      instantChatOwners = new Map(persisted.instantChatOwners);
+    if (Array.isArray(persisted.conversations) && Array.isArray(persisted.conversationMessages) && Array.isArray(persisted.conversationOwners)) {
+      conversations = persisted.conversations;
+      conversationMessages = persisted.conversationMessages;
+      conversationOwners = new Map(persisted.conversationOwners);
+      tasks = new Map((persisted.tasks ?? []).map((task) => [task.id, task]));
     }
     if (Array.isArray(persisted.hostMembers)) hostMembers = new Map(persisted.hostMembers);
     if (Array.isArray(persisted.hostResourceVersions)) for (const [hostID, version] of persisted.hostResourceVersions) hostResourceVersions.set(hostID, version);
@@ -364,6 +372,33 @@ function sessionUser(cookies: Record<string, string>): User | null {
   return session.name === user.name ? user : { ...user, name: session.name };
 }
 
+function createTaskMessage(user: User, conversation: Conversation, modelID: string, content: string, request: Record<string, unknown>) {
+  const timestamp = now();
+  const budget = request.budget as { active_seconds: number; tool_calls: number; model_tokens: number } | undefined;
+  const task: Task = {
+    id: id("q"), owner_id: user.id, host_id: typeof request.host_id === "string" ? request.host_id : undefined,
+    execution_location: "server", conversation_id: conversation.id, model_id: modelID, objective: content,
+    status: "queued", current_step: null,
+    budget: budget ?? { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
+    usage: { active_seconds: 0, tool_calls: 0, model_tokens: null }, created_at: timestamp, updated_at: timestamp,
+    result: null, waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null,
+    clarification_request: null, stop_request: null, finished_at: null,
+  };
+  const message: ConversationMessage = {
+    id: id("m"), conversation_id: conversation.id, role: "user", content, task_id: task.id, created_at: timestamp,
+  };
+  conversation.updated_at = timestamp;
+  tasks.set(task.id, task);
+  conversationMessages.push(message);
+  persistAssistantState();
+  return { task, message };
+}
+
+function activeConversationTask(conversationID: string) {
+  return Array.from(tasks.values()).find((task) => task.conversation_id === conversationID
+    && !["completed", "failed", "cancelled"].includes(task.status));
+}
+
 const isAdmin = (user: User) => user.role === "admin" || user.role === "super_admin";
 const validAccountStatus = (status: string): status is User["status"] => ["pending", "rejected", "approved", "disabled"].includes(status);
 const nextAccountStatuses: Record<User["status"], User["status"][]> = {
@@ -381,7 +416,7 @@ const unauthenticated = () => failure("unauthenticated", "请先登录", 401);
 // Keep this first so protected handlers cannot run before the session check.
 const sessionGuard = http.all("/api/*", ({ request, cookies }) => {
   const path = new URL(request.url).pathname;
-  if (path === "/api/auth/login" || path === "/api/auth/register" || path === "/api/auth/logout") return;
+  if (path === "/api/capabilities" || path === "/api/auth/login" || path === "/api/auth/register" || path === "/api/auth/logout") return;
   const user = sessionUser(cookies);
   if (!user) return unauthenticated();
   if (user.must_change_password && !(path === "/api/me" || path === "/api/me/password")) {
@@ -848,50 +883,84 @@ export const handlers = [
     scheduleDeletionCompletion();
     return json(item, 202);
   }),
-  http.get("/api/instant-chat/conversations", ({ cookies }) => {
+  http.get("/api/capabilities", () => json({ service_instance_id: "00000000-0000-4000-8000-000000000001", api_version: "1",
+    hub_version: null, event_version: null, minimum_client_version: null, supported_features: ["password_login"], default_max_request_bytes: 1048576 })),
+  http.get("/api/conversations", ({ cookies }) => {
     const user = sessionUser(cookies)!;
-    return json({ items: instantChatConversations.filter((item) => instantChatOwners.get(item.id) === user.id)
-      .sort((left, right) => right.updated_at.localeCompare(left.updated_at)) });
+    return json({ items: conversations.filter((item) => conversationOwners.get(item.id) === user.id)
+      .sort((left, right) => right.updated_at.localeCompare(left.updated_at)), next_cursor: null });
   }),
-  http.get("/api/instant-chat/conversations/:conversationID/messages", ({ params, cookies }) => {
+  http.get("/api/conversations/:conversationID/messages", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
     const conversationID = String(params.conversationID);
-    if (instantChatOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
-    return json({ items: instantChatMessages.filter((item) => item.conversation_id === conversationID) });
+    if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
+    return json({ items: conversationMessages.filter((item) => item.conversation_id === conversationID), next_cursor: null });
   }),
-  http.post("/api/instant-chat/messages", async ({ request, cookies }) => {
+  http.post("/api/tasks", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
     const key = request.headers.get("Idempotency-Key") ?? "";
     if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
-    const body = await request.json().catch(() => null) as { conversation_id?: string; model_id?: string; content?: string } | null;
-    if (!body || Object.keys(body).some((field) => !["conversation_id", "model_id", "content"].includes(field))
-      || typeof body.model_id !== "string" || typeof body.content !== "string" || !body.content.trim()
-      || Array.from(body.content).length > 32768 || (body.conversation_id !== undefined && typeof body.conversation_id !== "string")) {
+    const body = await request.json().catch(() => null) as {
+      host_id?: string; workspace_id?: string; input_revision?: number; application_id?: string; model_id?: string;
+      conversation_id?: string | null; objective?: string; budget?: { active_seconds: number; tool_calls: number; model_tokens: number };
+    } | null;
+    const allowed = ["host_id", "workspace_id", "input_revision", "application_id", "model_id", "conversation_id", "objective", "budget"];
+    if (!body || Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.model_id !== "string"
+      || typeof body.objective !== "string" || !body.objective.trim() || Array.from(body.objective).length > 32768
+      || (body.conversation_id !== undefined && body.conversation_id !== null && typeof body.conversation_id !== "string")) {
+      return failure("invalid_argument", "任务内容无效", 400);
+    }
+    const requestText = JSON.stringify({ ...body, objective: body.objective.trim() });
+    const replayKey = `${user.id}:${key}`;
+    const replay = taskSubmitReplays.get(replayKey);
+    if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    if (!modelConnections.some((item) => item.id === body.model_id && item.checked_at && item.capabilities.text)) return failure("not_found", "模型不存在", 404);
+    let conversation = body.conversation_id ? conversations.find((item) => item.id === body.conversation_id && conversationOwners.get(item.id) === user.id) : undefined;
+    if (body.conversation_id && !conversation) return failure("not_found", "对话不存在", 404);
+    if (conversation && activeConversationTask(conversation.id)) return failure("task_busy", "对话中已有任务正在运行", 409);
+    if (!conversation) {
+      const timestamp = now();
+      conversation = { id: id("c"), title: Array.from(body.objective.trim()).slice(0, 120).join(""), created_at: timestamp, updated_at: timestamp };
+      conversations.push(conversation);
+      conversationOwners.set(conversation.id, user.id);
+    }
+    const { task } = createTaskMessage(user, conversation, body.model_id, body.objective.trim(), body);
+    taskSubmitReplays.set(replayKey, { request: requestText, response: task });
+    persistAssistantState();
+    return json(task, 202);
+  }),
+  http.post("/api/conversations/:conversationID/messages", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    const conversation = conversations.find((item) => item.id === conversationID && conversationOwners.get(item.id) === user.id);
+    if (!conversation) return failure("not_found", "对话不存在", 404);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
+    const body = await request.json().catch(() => null) as {
+      host_id?: string; workspace_id?: string; input_revision?: number; application_id?: string; model_id?: string;
+      content?: string; budget?: { active_seconds: number; tool_calls: number; model_tokens: number };
+    } | null;
+    const allowed = ["host_id", "workspace_id", "input_revision", "application_id", "model_id", "content", "budget"];
+    if (!body || Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.model_id !== "string"
+      || typeof body.content !== "string" || !body.content.trim() || Array.from(body.content).length > 32768) {
       return failure("invalid_argument", "对话内容无效", 400);
     }
-    const requestText = JSON.stringify({ conversation_id: body.conversation_id ?? "", model_id: body.model_id, content: body.content.trim() });
+    const requestText = JSON.stringify({ conversation_id: conversationID, ...body, content: body.content.trim() });
     const replayKey = `${user.id}:${key}`;
-    const replay = instantChatReplays.get(replayKey);
-    if (replay) return replay.request === requestText ? json(replay.response) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
-    const model = modelConnections.find((item) => item.id === body.model_id && item.checked_at && item.capabilities.text);
-    if (!model) return failure("not_found", "模型不存在", 404);
-    let conversation = body.conversation_id ? instantChatConversations.find((item) => item.id === body.conversation_id && instantChatOwners.get(item.id) === user.id) : undefined;
-    if (body.conversation_id && !conversation) return failure("not_found", "对话不存在", 404);
-    if (conversation && conversation.model_id !== body.model_id) return failure("invalid_argument", "对话模型不能更换", 400);
-    const timestamp = now();
-    if (!conversation) {
-      conversation = { id: id("c"), title: Array.from(body.content.trim()).slice(0, 40).join(""), model_id: body.model_id, created_at: timestamp, updated_at: timestamp };
-      instantChatConversations.push(conversation);
-      instantChatOwners.set(conversation.id, user.id);
-    }
-    conversation.updated_at = timestamp;
-    const message: InstantChatMessage = { id: id("m"), conversation_id: conversation.id, role: "user", content: body.content.trim(), created_at: timestamp };
-    const reply: InstantChatMessage = { id: id("m"), conversation_id: conversation.id, role: "assistant", content: `已收到：${body.content.trim()}`, created_at: timestamp };
-    instantChatMessages.push(message, reply);
-    const response = { conversation, message, reply };
-    instantChatReplays.set(replayKey, { request: requestText, response });
+    const replay = taskMessageReplays.get(replayKey);
+    if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    if (!modelConnections.some((item) => item.id === body.model_id && item.checked_at && item.capabilities.text)) return failure("not_found", "模型不存在", 404);
+    if (activeConversationTask(conversationID)) return failure("task_busy", "对话中已有任务正在运行", 409);
+    const result = createTaskMessage(user, conversation, body.model_id, body.content.trim(), body);
+    taskMessageReplays.set(replayKey, { request: requestText, response: result });
     persistAssistantState();
-    return json(response);
+    return json(result, 202);
+  }),
+  http.get("/api/tasks/:taskID", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const task = tasks.get(String(params.taskID));
+    if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
+    return json(task);
   }),
   http.get("/api/model-connections", () => json({ items: modelConnections })),
   http.post("/api/model-connections", async ({ request }) => {

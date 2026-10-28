@@ -175,9 +175,6 @@ func TestStoreQueriesAndConversions(t *testing.T) {
 	if _, err := s.CreateToken(ctx, identity.Token{ID: "t1234567", OwnerID: "u1234567"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeToken(ctx, "t1234567", "u1234567"); err != nil {
-		t.Fatal(err)
-	}
 	if err := s.WriteAudit(ctx, audit.Entry{Action: audit.ActionHostCreate}); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +228,6 @@ func TestStoreDatabaseErrors(t *testing.T) {
 		{"get token", func() error { _, err := s.GetTokenByID(ctx, "t1234567"); return err }},
 		{"list tokens", func() error { _, err := s.ListTokensByOwner(ctx, "u1234567"); return err }},
 		{"create token", func() error { _, err := s.CreateToken(ctx, identity.Token{}); return err }},
-		{"revoke token", func() error { return s.RevokeToken(ctx, "t1234567", "u1234567") }},
 		{"write audit", func() error { return s.WriteAudit(ctx, audit.Entry{}) }},
 		{"list audit", func() error { _, err := s.ListAuditLogs(ctx, app.AuditFilter{Limit: 10}); return err }},
 	}
@@ -243,7 +239,4 @@ func TestStoreDatabaseErrors(t *testing.T) {
 		})
 	}
 
-	if err := (&Store{q: sqlcgen.New(fakeDBTX{rowsAffected: 0})}).RevokeToken(ctx, "t1234567", "u1234567"); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("missing token error = %v", err)
-	}
 }

@@ -175,20 +175,39 @@ describe('typed Portal API client', () => {
     expect(await request!.json()).toEqual({ confirm_process_termination: false });
   });
 
-  it('uses caller-provided and generated keys for instant chat', async () => {
+  it('uses the durable conversation and Task endpoints with stable retry keys', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       requests.push(new Request(input, init));
       return Response.json({});
     }));
 
-    await portalApi.sendInstantChatMessage({ model_id: 'p1234567', content: '你好' }, 'chat-retry-key-001');
-    await portalApi.sendInstantChatMessage({ conversation_id: 'c1234567', model_id: 'p1234567', content: '继续' });
+    await portalApi.capabilities();
+    await portalApi.conversations();
+    await portalApi.conversationMessages('c1234567');
+    await portalApi.submitTask({ model_id: 'p1234567', objective: '你好' }, 'task-submit-key-001');
+    await portalApi.appendConversationMessage('c1234567', { model_id: 'p1234567', content: '继续' }, 'task-message-key-001');
+    await portalApi.task('q1234567');
+    await portalApi.answerTaskInput('q1234567', { clarification_id: 'k1234567', clarification_version: 2, answer: '使用默认目录' }, 'task-input-key-001');
+    await portalApi.respondToTaskApproval('q1234567', 'k7654321', { version: 3, decision: 'approve' }, 'task-approval-key-001');
 
-    const keys = requests.map((request) => request.headers.get('Idempotency-Key'));
-    expect(keys[0]).toBe('chat-retry-key-001');
-    expect(keys[1]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    expect(requests.map((request) => new URL(request.url).pathname)).toEqual(['/api/instant-chat/messages', '/api/instant-chat/messages']);
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname, new URL(request.url).search])).toEqual([
+      ['GET', '/api/capabilities', ''],
+      ['GET', '/api/conversations', '?limit=100'],
+      ['GET', '/api/conversations/c1234567/messages', '?limit=100'],
+      ['POST', '/api/tasks', ''],
+      ['POST', '/api/conversations/c1234567/messages', ''],
+      ['GET', '/api/tasks/q1234567', ''],
+      ['POST', '/api/tasks/q1234567/inputs', ''],
+      ['POST', '/api/tasks/q1234567/approvals/k7654321/responses', ''],
+    ]);
+    expect(requests[3]?.headers.get('Idempotency-Key')).toBe('task-submit-key-001');
+    expect(requests[4]?.headers.get('Idempotency-Key')).toBe('task-message-key-001');
+    expect(requests[6]?.headers.get('Idempotency-Key')).toBe('task-input-key-001');
+    expect(requests[7]?.headers.get('Idempotency-Key')).toBe('task-approval-key-001');
+    expect(await requests[3]?.json()).toEqual({ model_id: 'p1234567', objective: '你好' });
+    expect(await requests[4]?.json()).toEqual({ model_id: 'p1234567', content: '继续' });
+    expect(requests.every((request) => request.credentials === 'include')).toBe(true);
   });
 
   it('creates a standalone workspace with an idempotency key and deletes hosts without legacy query flags', async () => {
