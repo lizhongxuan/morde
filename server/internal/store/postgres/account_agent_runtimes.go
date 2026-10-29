@@ -380,13 +380,19 @@ func (s *Store) ConfirmAccountAgentRuntimeStopped(ctx context.Context, proof app
 			return domain.NewError(domain.CodeUnauthenticated, "Guardian Runtime stop proof does not match the current nonce")
 		}
 		if current.State == app.AccountAgentRuntimeStopped {
-			var storedDigest []byte
-			if err := tx.QueryRow(ctx, `SELECT guardian_stop_attestation_digest FROM account_agent_runtimes
-WHERE service_instance_id=$1::uuid AND owner_id=$2`, attestation.Fence.ServiceInstanceID, attestation.Fence.OwnerID).Scan(&storedDigest); err != nil {
+			var storedProof, storedDigest []byte
+			if err := tx.QueryRow(ctx, `SELECT guardian_stop_attestation,guardian_stop_attestation_digest FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND owner_id=$2`, attestation.Fence.ServiceInstanceID, attestation.Fence.OwnerID).Scan(&storedProof, &storedDigest); err != nil {
 				return fmt.Errorf("read stored Guardian Runtime proof: %w", err)
 			}
 			if !bytes.Equal(storedDigest, attestationHash[:]) {
-				return domain.NewError(domain.CodeIdempotencyConflict, "Guardian Runtime stop proof was already recorded differently")
+				var previous app.AccountAgentRuntimeStopAttestation
+				previousDigest := sha256.Sum256(storedProof)
+				if !attestation.StartAborted || !bytes.Equal(storedDigest, previousDigest[:]) || json.Unmarshal(storedProof, &previous) != nil ||
+					!previous.StartAborted || previous.Fence != attestation.Fence || previous.NonceSHA256 != attestation.NonceSHA256 ||
+					previous.ContainerName != attestation.ContainerName {
+					return domain.NewError(domain.CodeIdempotencyConflict, "Guardian Runtime stop proof was already recorded differently")
+				}
 			}
 			replayed = true
 			return nil
@@ -412,6 +418,10 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 		if current.State != app.AccountAgentRuntimeStarting && current.State != app.AccountAgentRuntimeRunning &&
 			current.State != app.AccountAgentRuntimeStopping && current.State != app.AccountAgentRuntimeFailed {
 			return domain.NewError(domain.CodeConflict, "account Runtime is not awaiting Guardian stop proof")
+		}
+		if attestation.StartAborted && (current.State != app.AccountAgentRuntimeStarting && current.State != app.AccountAgentRuntimeStopping ||
+			current.RuntimeSequence != 0) {
+			return domain.NewError(domain.CodeConflict, "aborted account Runtime start has already admitted work")
 		}
 		if current.ControlVersion == math.MaxInt64 {
 			return domain.NewError(domain.CodeInvalidState, "account Runtime control version is exhausted")
@@ -442,6 +452,9 @@ lease_version,auth_version,engine_version,profile_version`,
 			return fmt.Errorf("iterate Task Agents settled by Runtime proof: %w", err)
 		}
 		rows.Close()
+		if attestation.StartAborted && len(stoppedAgents) != 0 {
+			return domain.NewError(domain.CodeConflict, "aborted account Runtime start has active Task Agents")
+		}
 		for _, fence := range stoppedAgents {
 			if err := settleStoppedAgentChildSessions(ctx, tx, fence); err != nil {
 				return err
@@ -449,13 +462,13 @@ lease_version,auth_version,engine_version,profile_version`,
 		}
 		command, err := tx.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopped',lease_expires_at=NULL,
 guardian_stop_attestation=$3,guardian_stop_attestation_digest=$4,stopped_at=clock_timestamp(),
-	control_version=control_version+1,guardian_stop_acknowledged_at=NULL,updated_at=clock_timestamp()
+	control_version=control_version+1,guardian_stop_acknowledged_at=CASE WHEN $11 THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp()
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$5 AND runtime_generation=$6
  AND lease_owner=$7 AND lease_version=$8 AND execution_epoch=$9 AND supervisor_nonce_sha256=$10
  AND state IN ('starting','running','stopping','failed') AND control_version<9223372036854775807`,
 			attestation.Fence.ServiceInstanceID, attestation.Fence.OwnerID, encoded, attestationHash[:],
 			attestation.Fence.RuntimeID, attestation.Fence.RuntimeGeneration, attestation.Fence.LeaseOwner,
-			attestation.Fence.LeaseVersion, attestation.Fence.ExecutionEpoch, attestation.NonceSHA256)
+			attestation.Fence.LeaseVersion, attestation.Fence.ExecutionEpoch, attestation.NonceSHA256, attestation.StartAborted)
 		if err != nil {
 			return fmt.Errorf("persist verified Guardian Runtime stop proof: %w", err)
 		}
@@ -606,10 +619,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 }
 
 func validateRuntimeStopProofForStore(attestation app.AccountAgentRuntimeStopAttestation, encoded []byte) error {
-	if attestation.Fence.Validate() != nil || !attestation.Destroyed || len(attestation.ContainerID) != sha256.Size*2 ||
-		!isLowerHexRuntimeNonce(attestation.ContainerID) || attestation.ContainerName == "" ||
+	validContainerID := attestation.StartAborted && attestation.ContainerID == "" || isLowerHexRuntimeNonce(attestation.ContainerID)
+	validExpiry := attestation.StartAborted && attestation.ExpiresAt.IsZero() || !attestation.StartAborted && !attestation.ExpiresAt.IsZero()
+	if attestation.Fence.Validate() != nil || !attestation.Destroyed || !validContainerID || attestation.ContainerName == "" || !validExpiry ||
 		!isLowerHexRuntimeNonce(attestation.NonceSHA256) || !isLowerHexRuntimeNonce(attestation.ProofSHA256) ||
-		attestation.ExpiresAt.IsZero() || attestation.DestroyedAt.IsZero() || len(attestation.Signature) != ed25519.SignatureSize ||
+		attestation.DestroyedAt.IsZero() || len(attestation.Signature) != ed25519.SignatureSize ||
 		len(encoded) == 0 || len(encoded) > 16384 {
 		return domain.InvalidArgument("attestation", "verified Guardian Runtime stop attestation is required")
 	}

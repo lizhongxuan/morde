@@ -595,7 +595,7 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 	model.enableBackgroundChild()
 	backgroundRequest, err := json.Marshal(map[string]any{
 		"host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(1),
-		"model_id": "p1234567", "objective": "Read the existing Workspace note in a background job, then write a completion note.",
+		"model_id": "p1234567", "objective": "Read the existing Workspace note in a background job, then create and save a completion note in the Workspace.",
 		"budget": map[string]int64{"active_seconds": 120, "tool_calls": 20, "model_tokens": 1000},
 	})
 	if err != nil {

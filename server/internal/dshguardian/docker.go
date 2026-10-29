@@ -11,9 +11,9 @@ import (
 	"net/url"
 	"path/filepath"
 	"time"
-)
 
-const dockerAPIVersion = "/v1.43"
+	"morde/server/internal/dockerapi"
+)
 
 var (
 	errContainerNotFound = errors.New("docker container was not found")
@@ -41,6 +41,7 @@ type containerInspect struct {
 
 type dockerEngine struct {
 	client *http.Client
+	api    *dockerapi.EndpointResolver
 }
 
 func newDockerEngine(socket string) (*dockerEngine, error) {
@@ -54,7 +55,8 @@ func newDockerEngine(socket string) (*dockerEngine, error) {
 		},
 		DisableCompression: true,
 	}
-	return &dockerEngine{client: &http.Client{Transport: transport, Timeout: 8 * time.Second}}, nil
+	client := &http.Client{Transport: transport, Timeout: 8 * time.Second}
+	return &dockerEngine{client: client, api: dockerapi.NewEndpointResolver(client)}, nil
 }
 
 func (d *dockerEngine) inspect(ctx context.Context, id string) (containerInspect, error) {
@@ -121,7 +123,11 @@ func (d *dockerEngine) remove(ctx context.Context, id string) error {
 }
 
 func (d *dockerEngine) request(ctx context.Context, method, path string, result any) (int, error) {
-	request, err := http.NewRequestWithContext(ctx, method, "http://docker"+dockerAPIVersion+path, nil)
+	endpoint, err := d.api.Endpoint(ctx, path)
+	if err != nil {
+		return 0, errors.New("resolve Docker Engine API endpoint")
+	}
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
 		return 0, errors.New("build docker request")
 	}

@@ -166,11 +166,11 @@ func (s *Service) renewAccountRuntimeLocked(ctx context.Context, guard AccountRu
 }
 
 func (s *Service) StopAccountRuntime(ctx context.Context, fence app.AccountAgentRuntimeFence, nonceSHA256 string) (app.AccountAgentRuntimeStopAttestation, error) {
-	return s.accountRuntimeStopAttestation(ctx, fence, nonceSHA256)
+	return s.accountRuntimeStopAttestation(ctx, fence, nonceSHA256, false)
 }
 
 func (s *Service) RecoverAccountRuntimeStopped(ctx context.Context, fence app.AccountAgentRuntimeFence, nonceSHA256 string) (app.AccountAgentRuntimeStopAttestation, error) {
-	return s.accountRuntimeStopAttestation(ctx, fence, nonceSHA256)
+	return s.accountRuntimeStopAttestation(ctx, fence, nonceSHA256, true)
 }
 
 func (s *Service) AcknowledgeAccountRuntimeStopped(ctx context.Context, runtimeFence app.AccountAgentRuntimeFence,
@@ -184,14 +184,20 @@ func (s *Service) AcknowledgeAccountRuntimeStopped(ctx context.Context, runtimeF
 	return s.store.acknowledgeAccountRuntimeProof(runtimeFence, nonceSHA256, proofSHA256)
 }
 
-func (s *Service) accountRuntimeStopAttestation(ctx context.Context, fence app.AccountAgentRuntimeFence, nonceSHA256 string) (app.AccountAgentRuntimeStopAttestation, error) {
+func (s *Service) accountRuntimeStopAttestation(ctx context.Context, fence app.AccountAgentRuntimeFence, nonceSHA256 string, allowAbortedStart bool) (app.AccountAgentRuntimeStopAttestation, error) {
 	if ctx == nil || ctx.Err() != nil || fence.Validate() != nil || !nonceHashRE.MatchString(nonceSHA256) {
 		return app.AccountAgentRuntimeStopAttestation{}, errors.New("account Runtime stop identity is invalid")
 	}
 	s.operationM.Lock()
 	defer s.operationM.Unlock()
 	value, ok, err := s.store.findRuntime(fence, nonceSHA256)
-	if err != nil || !ok {
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("guardian lease for the exact account Runtime fence is unavailable")
+	}
+	if !ok && allowAbortedStart {
+		return s.attestAbortedAccountRuntimeStart(ctx, fence, nonceSHA256)
+	}
+	if !ok {
 		return app.AccountAgentRuntimeStopAttestation{}, errors.New("guardian lease for the exact account Runtime fence is unknown")
 	}
 	// A whole-container proof remains valid if one Task proof cannot be
@@ -214,6 +220,66 @@ func (s *Service) accountRuntimeStopAttestation(ctx context.Context, fence app.A
 		NonceSHA256: current.Guard.NonceSHA256, ExpiresAt: current.Guard.ExpiresAt, DestroyedAt: current.DestroyedAt,
 		ProofSHA256: hex.EncodeToString(proofDigest[:]), Destroyed: true,
 	}
+	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(attestation)
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	attestation.Signature = ed25519.Sign(s.signingKey, payload)
+	return attestation, nil
+}
+
+func (s *Service) attestAbortedAccountRuntimeStart(ctx context.Context, fence app.AccountAgentRuntimeFence, nonceSHA256 string) (app.AccountAgentRuntimeStopAttestation, error) {
+	if err := s.processes.Ready(); err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, fmt.Errorf("independent process-tree verification is unavailable: %w", err)
+	}
+	for _, existing := range s.store.allRuntimes() {
+		if existing.Guard.Fence == fence {
+			return app.AccountAgentRuntimeStopAttestation{}, errors.New("account Runtime fence has a different Guardian lease")
+		}
+	}
+	for _, existing := range s.store.allTasks() {
+		if existing.Guard.RuntimeFence == fence {
+			return app.AccountAgentRuntimeStopAttestation{}, errors.New("account Runtime fence still has a Guardian Task process lease")
+		}
+	}
+	name := expectedAccountRuntimeContainerName(fence, nonceSHA256)
+	containerID := ""
+	inspected, err := s.docker.inspect(ctx, name)
+	if err == nil {
+		guard := AccountRuntimeGuard{ContainerID: inspected.ID, ContainerName: name, Fence: fence, NonceSHA256: nonceSHA256}
+		if guard.validateIdentity() != nil || validateAccountRuntimeContainer(inspected, guard) != nil ||
+			inspected.State.Running == nil || inspected.State.PID == nil || *inspected.State.Running || *inspected.State.PID != 0 {
+			return app.AccountAgentRuntimeStopAttestation{}, errors.New("unregistered account Runtime container cannot be proven unstarted")
+		}
+		containerID = inspected.ID
+		if err := s.docker.remove(ctx, containerID); err != nil && !errors.Is(err, errContainerNotFound) {
+			return app.AccountAgentRuntimeStopAttestation{}, errors.New("unregistered account Runtime container removal is unconfirmed")
+		}
+	} else if !errors.Is(err, errContainerNotFound) {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("unregistered account Runtime container state is unavailable")
+	}
+	if _, err := s.docker.inspect(ctx, name); !errors.Is(err, errContainerNotFound) {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("unregistered account Runtime container absence is unconfirmed")
+	}
+	if containerID != "" {
+		if _, err := s.docker.inspect(ctx, containerID); !errors.Is(err, errContainerNotFound) {
+			return app.AccountAgentRuntimeStopAttestation{}, errors.New("unregistered account Runtime container ID absence is unconfirmed")
+		}
+	}
+	observedAt := s.now().UTC()
+	observation, err := json.Marshal(struct {
+		Fence         app.AccountAgentRuntimeFence `json:"fence"`
+		ContainerID   string                       `json:"container_id"`
+		ContainerName string                       `json:"container_name"`
+		NonceSHA256   string                       `json:"nonce_sha256"`
+		ObservedAt    time.Time                    `json:"observed_at"`
+	}{fence, containerID, name, nonceSHA256, observedAt})
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	digest := sha256.Sum256(observation)
+	attestation := app.AccountAgentRuntimeStopAttestation{Fence: fence, ContainerID: containerID, ContainerName: name,
+		NonceSHA256: nonceSHA256, DestroyedAt: observedAt, ProofSHA256: hex.EncodeToString(digest[:]), Destroyed: true, StartAborted: true}
 	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(attestation)
 	if err != nil {
 		return app.AccountAgentRuntimeStopAttestation{}, err

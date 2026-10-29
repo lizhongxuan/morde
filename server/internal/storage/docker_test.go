@@ -57,8 +57,8 @@ func TestDeleteVolumeUsesDockerUnixSocketAPI(t *testing.T) {
 				t.Fatalf("DeleteVolume() error = %v, want nil", err)
 			}
 			request := <-observed
-			if request.method != http.MethodDelete || request.path != "/v1.43/volumes/ws-w8f2k1q0" || request.query != "" {
-				t.Fatalf("Docker request = %s %s?%s, want DELETE /v1.43/volumes/ws-w8f2k1q0", request.method, request.path, request.query)
+			if request.method != http.MethodDelete || request.path != "/v1.44/volumes/ws-w8f2k1q0" || request.query != "" {
+				t.Fatalf("Docker request = %s %s?%s, want DELETE /v1.44/volumes/ws-w8f2k1q0", request.method, request.path, request.query)
 			}
 		})
 	}
@@ -103,7 +103,7 @@ func TestNewDockerValidatesUnixSocketURL(t *testing.T) {
 func TestCheckCapacityVerifiesDockerRootAndFreeSpace(t *testing.T) {
 	dockerRoot := t.TempDir()
 	client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1.43/info" {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1.44/info" {
 			http.NotFound(w, r)
 			return
 		}
@@ -297,21 +297,21 @@ func newLegacyVolumeDockerWithResponses(t *testing.T, dockerRoot, name, mountpoi
 	}
 	client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1.43/info":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.44/info":
 			_ = json.NewEncoder(w).Encode(map[string]string{"DockerRootDir": dockerRoot})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1.43/volumes/ws-w8f2k1q0":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.44/volumes/ws-w8f2k1q0":
 			if volumeStatus != http.StatusOK {
 				http.Error(w, "missing", volumeStatus)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{"Name": name, "Driver": driver, "Mountpoint": mountpoint})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1.43/containers/json":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.44/containers/json":
 			if r.URL.Query().Get("all") != "1" {
 				http.Error(w, "all containers must be requested", http.StatusBadRequest)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(ids)
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.43/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.44/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
 			if inspections == nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{})
 				return
@@ -338,7 +338,13 @@ func newUnixDockerForTest(t *testing.T, handler http.Handler) *Docker {
 		_ = os.RemoveAll(shortDir)
 		t.Fatalf("listen on Unix socket: %v", err)
 	}
-	server := &http.Server{Handler: handler}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/version" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"ApiVersion": "1.52", "MinAPIVersion": "1.44"})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})}
 	go func() {
 		_ = server.Serve(listener)
 	}()

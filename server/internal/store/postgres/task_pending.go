@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -106,9 +107,12 @@ RETURNING event_seq`, taskID, record.OwnerID).Scan(&sequence)
 
 // AnswerClarificationRequest stores a free-form answer and requeues only the
 // task waiting for the exact active clarification version.
-func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.IdempotencyRecord, taskID, clarificationID string, version int64, answer string) error {
+func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.IdempotencyRecord, taskID, clarificationID string, version int64, answer string, fileIntent task.FileDeliveryIntent, objective string) error {
 	if !domain.ValidTaskID(taskID) || !domain.ValidPendingRequestID(clarificationID) || version < 1 || !validClarificationText(answer) {
 		return domain.InvalidArgument("clarification", "clarification response fields are invalid")
+	}
+	if (fileIntent == "") != (objective == "") || (fileIntent != "" && (!fileIntent.Valid() || fileIntent == task.FileDeliveryUnclear || strings.TrimSpace(objective) == "")) {
+		return domain.InvalidArgument("clarification", "file delivery clarification resolution is invalid")
 	}
 	if err := validateIdempotency(record); err != nil {
 		return err
@@ -126,10 +130,10 @@ func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.Idemp
 		if err != nil {
 			return err
 		}
-		var status, waitingReason string
+		var status, waitingReason, storedFileIntent, workspaceID string
 		var leaseVersion, taskEpoch int64
-		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, execution_epoch FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
-			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, execution_epoch, file_delivery_intent, COALESCE(workspace_id, '') FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
+			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch, &storedFileIntent, &workspaceID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("lock task for clarification answer: %w", err)
@@ -146,9 +150,9 @@ func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.Idemp
 			return domain.NewError(domain.CodeConflict, "task is no longer waiting for this clarification")
 		}
 		var storedVersion int64
-		var requestStatus string
-		if err := tx.QueryRow(ctx, `SELECT version, status FROM task_clarification_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, clarificationID, taskID).
-			Scan(&storedVersion, &requestStatus); errors.Is(err, pgx.ErrNoRows) {
+		var requestStatus, callID string
+		if err := tx.QueryRow(ctx, `SELECT version, status, call_id FROM task_clarification_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, clarificationID, taskID).
+			Scan(&storedVersion, &requestStatus, &callID); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "clarification request is no longer active")
 		} else if err != nil {
 			return fmt.Errorf("lock task clarification request: %w", err)
@@ -156,21 +160,37 @@ func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.Idemp
 		if storedVersion != version || requestStatus != string(task.ClarificationPending) {
 			return domain.NewError(domain.CodeConflict, "clarification version is stale or already answered")
 		}
+		if callID == app.FileDeliveryIntentClarificationCallID {
+			if fileIntent == "" || storedFileIntent != string(task.FileDeliveryUnclear) {
+				return domain.NewError(domain.CodeConflict, "file delivery clarification resolution is missing or stale")
+			}
+			if fileIntent == task.FileDeliveryRequired && workspaceID == "" {
+				return domain.InvalidArgument("workspace_id", "file delivery requires a Workspace")
+			}
+		} else if fileIntent != "" {
+			return domain.InvalidArgument("clarification", "only file delivery clarifications may change file delivery intent")
+		}
 		if _, err := tx.Exec(ctx, `UPDATE task_clarification_requests SET status='answered', answer=$3, responded_at=clock_timestamp()
 WHERE id=$1 AND task_id=$2`, clarificationID, taskID, answer); err != nil {
 			return fmt.Errorf("persist task clarification answer: %w", err)
 		}
-		payload, err := json.Marshal(map[string]any{
+		payloadValues := map[string]any{
 			"clarification_id": clarificationID, "clarification_version": version, "answer": answer,
 			"idempotency_replayed": false, "status": string(task.StatusQueued), "lease_version": leaseVersion + 1,
-		})
+		}
+		if fileIntent != "" {
+			payloadValues["file_delivery_intent"] = fileIntent
+		}
+		payload, err := json.Marshal(payloadValues)
 		if err != nil {
 			return fmt.Errorf("encode clarification answer event: %w", err)
 		}
 		var sequence int64
-		err = tx.QueryRow(ctx, `UPDATE tasks SET status='queued', lease_version=lease_version+1, waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
+		err = tx.QueryRow(ctx, `UPDATE tasks SET objective=CASE WHEN $3='' THEN objective ELSE $3 END,
+file_delivery_intent=CASE WHEN $4='' THEN file_delivery_intent ELSE $4 END,
+status='queued', lease_version=lease_version+1, waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND status='waiting_user' AND waiting_reason='clarification_required' AND lease_owner='' AND lease_expires_at IS NULL
-RETURNING event_seq`, taskID, record.OwnerID).Scan(&sequence)
+RETURNING event_seq`, taskID, record.OwnerID, objective, string(fileIntent)).Scan(&sequence)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "task state changed while applying the clarification")
 		}

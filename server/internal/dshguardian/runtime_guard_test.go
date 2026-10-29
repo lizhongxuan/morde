@@ -842,6 +842,68 @@ func TestAccountRuntimeAndTaskGuardsRejectFenceMismatch(t *testing.T) {
 	}
 }
 
+func TestRecoverAbortedAccountRuntimeStartRequiresAbsentContainer(t *testing.T) {
+	now := time.Now().UTC()
+	guard := testAccountRuntimeGuard(now)
+	for _, test := range []struct {
+		name        string
+		absent      bool
+		running     bool
+		wrongLabel  bool
+		taskLease   bool
+		wantRemoved bool
+		wantError   bool
+	}{
+		{name: "already absent", absent: true},
+		{name: "unstarted container removed", wantRemoved: true},
+		{name: "running container refused", running: true, wantError: true},
+		{name: "tampered container refused", wrongLabel: true, wantError: true},
+		{name: "orphaned Task lease refused", absent: true, taskLease: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := openLeaseStore(filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.taskLease {
+				taskGuard := testTaskProcessGuard(guard, now)
+				if err := store.createTask(taskProcessLease{Guard: taskGuard, Key: taskProcessKey(taskGuard)}); err != nil {
+					t.Fatal(err)
+				}
+				store, err = openLeaseStore(store.dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			pid := 0
+			if test.running {
+				pid = 321
+			}
+			docker := newFakeAccountRuntimeDocker(guard, test.running, pid)
+			docker.exists = !test.absent
+			if test.wrongLabel {
+				docker.value.Config.Labels["morde.account-agent-runtime.nonce-sha256"] = testNonceHash("another-runtime")
+			}
+			service := newService(store, docker, &fakeProcessInspector{}, func() time.Time { return now })
+			if _, err := service.StopAccountRuntime(context.Background(), guard.Fence, guard.NonceSHA256); err == nil {
+				t.Fatal("ordinary stop accepted an unknown Guardian lease")
+			}
+			proof, err := service.RecoverAccountRuntimeStopped(context.Background(), guard.Fence, guard.NonceSHA256)
+			if test.wantError {
+				if err == nil || docker.removeCalls != 0 {
+					t.Fatalf("untrusted unregistered container was accepted: proof=%+v err=%v removed=%d", proof, err, docker.removeCalls)
+				}
+				return
+			}
+			if err != nil || !proof.StartAborted || !proof.ExpiresAt.IsZero() || proof.ContainerName != guard.ContainerName ||
+				proof.Fence != guard.Fence || proof.NonceSHA256 != guard.NonceSHA256 || (docker.removeCalls == 1) != test.wantRemoved || docker.removeCalls > 1 {
+				t.Fatalf("aborted Runtime proof=%+v err=%v removed=%d", proof, err, docker.removeCalls)
+			}
+			verifyRuntimeAttestation(t, proof)
+		})
+	}
+}
+
 func testAccountRuntimeGuard(now time.Time) AccountRuntimeGuard {
 	fence := app.AccountAgentRuntimeFence{
 		ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", OwnerID: "u1234567", RuntimeID: "runtime-1",

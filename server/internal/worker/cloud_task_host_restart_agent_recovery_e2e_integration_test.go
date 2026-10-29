@@ -186,6 +186,37 @@ func TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint(t *testing.T)
 	if err != nil || operation.Status != task.OperationSucceeded || operation.RuntimeGeneration != 1 {
 		t.Fatalf("settle old-generation operation: operation=%#v err=%v", operation, err)
 	}
+	unknownCallID := callID + "-unknown"
+	unknownKey := f01OperationKey(unknownCallID)
+	unknownID, err := domain.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownOperation, replayed, err := store.CreateOperation(ctx, task.Operation{
+		ID: unknownID, TaskID: firstTask.ID, Key: unknownKey, RequestHash: operationHash[:], HostID: hostValue.ID,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: oldRuntimeInstanceID,
+		ControlVersion: hostValue.ControlVersion, LeaseVersion: firstTask.Lease.Version,
+		RuntimeLeaseVersion: firstTask.Lease.Version, Status: task.OperationPrepared,
+	}, firstTask.Lease.Owner)
+	if err != nil || replayed || unknownOperation.Status != task.OperationPrepared {
+		t.Fatalf("create uncertain old-generation operation: operation=%#v replayed=%t err=%v", unknownOperation, replayed, err)
+	}
+	unknownOperation, err = store.UpdateOperation(ctx, app.OperationUpdate{
+		TaskID: firstTask.ID, OperationKey: unknownKey, LeaseOwner: firstTask.Lease.Owner,
+		LeaseVersion: firstTask.Lease.Version, RuntimeGeneration: hostValue.RuntimeGeneration,
+		RuntimeInstanceID: oldRuntimeInstanceID, ControlVersion: hostValue.ControlVersion,
+		RuntimeLeaseVersion: firstTask.Lease.Version, Status: task.OperationDispatched,
+	})
+	if err != nil || unknownOperation.Status != task.OperationDispatched {
+		t.Fatalf("dispatch uncertain old-generation operation: operation=%#v err=%v", unknownOperation, err)
+	}
+	unknownOperation, err = store.UpdateOperation(ctx, app.OperationUpdate{
+		TaskID: firstTask.ID, OperationKey: unknownKey, LeaseOwner: firstTask.Lease.Owner,
+		LeaseVersion: firstTask.Lease.Version, Status: task.OperationUnknown,
+	})
+	if err != nil || unknownOperation.Status != task.OperationUnknown {
+		t.Fatalf("mark uncertain old-generation operation unknown: operation=%#v err=%v", unknownOperation, err)
+	}
 
 	stopAgent := func(lease app.AgentInstanceLease, nonceByte byte) {
 		t.Helper()
@@ -212,6 +243,44 @@ runtime_instance_id=$2, updated_at=clock_timestamp() WHERE id=$1 AND runtime_gen
 		hostValue.ID, newRuntimeInstanceID, hostValue.RuntimeGeneration)
 	if err != nil || result.RowsAffected() != 1 {
 		t.Fatalf("advance simulated Host generation fence: rows=%d err=%v", result.RowsAffected(), err)
+	}
+	blocks, err := workspacefs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close Workspace blocks: %v", err)
+		}
+	}()
+	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := &hostGenerationFenceTestRouter{}
+	runtimeControl, err := app.NewRuntimeControl(store, router, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeTools, err := app.NewRuntimeToolExecutor(store, credentials, runtimeControl, runtimeControl, syncService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentDetails, err := store.GetTask(ctx, firstTask.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownReconciliation, err := runtimeTools.ReconcileOperation(ctx, app.AgentToolRequest{
+		Task:      currentDetails.Task,
+		Call:      app.ModelToolCall{CallID: unknownCallID, Name: "browser_open_tab", Arguments: string(arguments)},
+		Arguments: arguments, OperationKey: unknownKey, OperationID: unknownOperation.ID,
+		RequiredScope: identity.ScopeComputerOperate,
+	}, unknownOperation)
+	if err != nil || unknownReconciliation.Status != app.AgentToolUnknown {
+		t.Fatalf("unknown old-generation operation was accepted after Host generation change: result=%#v err=%v", unknownReconciliation, err)
+	}
+	if router.endpointLookups.Load() != 0 {
+		t.Fatalf("unknown stale Host operation tried to resolve a runtime endpoint %d times", router.endpointLookups.Load())
 	}
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1 AND lease_owner=$2 AND lease_version=$3`,
 		firstTask.ID, firstTask.Lease.Owner, firstTask.Lease.Version); err != nil {
@@ -240,29 +309,7 @@ runtime_instance_id=$2, updated_at=clock_timestamp() WHERE id=$1 AND runtime_gen
 		t.Fatalf("child checkpoint after Host generation change: page=%#v err=%v", checkpointPage, err)
 	}
 
-	blocks, err := workspacefs.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := blocks.Close(); err != nil {
-			t.Errorf("close Workspace blocks: %v", err)
-		}
-	}()
-	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<40)
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := &hostGenerationFenceTestRouter{}
-	runtimeControl, err := app.NewRuntimeControl(store, router, sealer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtimeTools, err := app.NewRuntimeToolExecutor(store, credentials, runtimeControl, runtimeControl, syncService)
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentDetails, err := store.GetTask(ctx, secondTask.ID, owner.ID)
+	currentDetails, err = store.GetTask(ctx, secondTask.ID, owner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +334,13 @@ runtime_instance_id=$2, updated_at=clock_timestamp() WHERE id=$1 AND runtime_gen
 	if err != nil || unchangedOperation.ID != operation.ID || unchangedOperation.RuntimeGeneration != hostValue.RuntimeGeneration ||
 		unchangedOperation.RuntimeInstanceID != oldRuntimeInstanceID || unchangedOperation.Status != task.OperationSucceeded {
 		t.Fatalf("old operation changed during fenced reconciliation: operation=%#v err=%v", unchangedOperation, err)
+	}
+
+	unchangedUnknownOperation, err := store.GetOperation(ctx, owner.ID, secondTask.ID, unknownKey)
+	if err != nil || unchangedUnknownOperation.ID != unknownOperation.ID ||
+		unchangedUnknownOperation.RuntimeGeneration != hostValue.RuntimeGeneration ||
+		unchangedUnknownOperation.RuntimeInstanceID != oldRuntimeInstanceID || unchangedUnknownOperation.Status != task.OperationUnknown {
+		t.Fatalf("unknown old-generation operation changed during fenced reconciliation: operation=%#v err=%v", unchangedUnknownOperation, err)
 	}
 }
 

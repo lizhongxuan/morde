@@ -102,6 +102,22 @@ func TestAccountAgentRuntimeGuardianProofScopesAndSigning(t *testing.T) {
 	if stored.Fence != fence || len(encoded) == 0 || len(stored.Signature) != ed25519.SignatureSize {
 		t.Fatalf("verified Runtime proof lost signed fields: %+v", stored)
 	}
+	aborted := attestation
+	aborted.ContainerID = ""
+	aborted.ExpiresAt = time.Time{}
+	aborted.StartAborted = true
+	payload, err = AccountAgentRuntimeStopAttestationSigningPayload(aborted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aborted.Signature = ed25519.Sign(privateKey, payload)
+	if _, err := authenticator.VerifyAccountAgentRuntimeStop(context.Background(), aborted); err != nil {
+		t.Fatalf("verify aborted account Runtime start proof: %v", err)
+	}
+	aborted.StartAborted = false
+	if _, err := authenticator.VerifyAccountAgentRuntimeStop(context.Background(), aborted); err == nil {
+		t.Fatal("aborted account Runtime start proof was accepted as a container stop proof")
+	}
 
 	taskFence := AgentInstanceFence{TaskID: "q1234567", OwnerID: fence.OwnerID, AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1", LeaseVersion: 1,

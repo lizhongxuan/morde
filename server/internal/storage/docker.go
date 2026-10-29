@@ -17,17 +17,16 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/dockerapi"
 	"morde/server/internal/domain"
 )
-
-const dockerAPIVersion = "v1.43"
 
 var volumeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 
 // Docker deletes named volumes through the Docker Engine API over its Unix socket.
 type Docker struct {
 	client       *http.Client
-	endpoint     string
+	api          *dockerapi.EndpointResolver
 	dataDir      string
 	minFreeBytes int64
 }
@@ -35,7 +34,7 @@ type Docker struct {
 var _ app.VolumeDeleter = (*Docker)(nil)
 
 // NewDocker constructs a Docker volume deleter for a unix:// socket URL, such as
-// unix:///var/run/docker.sock. API v1.43 is the minimum supported by Docker 24.
+// unix:///var/run/docker.sock. It negotiates between Docker API v1.43 and v1.44.
 func NewDocker(dockerHost, dataDir string, minFreeBytes int64) (*Docker, error) {
 	if !filepath.IsAbs(dataDir) || minFreeBytes <= 0 {
 		return nil, fmt.Errorf("docker data directory and minimum free bytes are required")
@@ -59,16 +58,21 @@ func NewDocker(dockerHost, dataDir string, minFreeBytes int64) (*Docker, error) 
 		IdleConnTimeout:       30 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
+	client := &http.Client{Transport: transport, Timeout: 35 * time.Second}
 	return &Docker{
-		client:       &http.Client{Transport: transport, Timeout: 35 * time.Second},
-		endpoint:     "http://docker/" + dockerAPIVersion,
+		client:       client,
+		api:          dockerapi.NewEndpointResolver(client),
 		dataDir:      filepath.Clean(dataDir),
 		minFreeBytes: minFreeBytes,
 	}, nil
 }
 
 func (d *Docker) CheckCapacity(ctx context.Context) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, d.endpoint+"/info", nil)
+	endpoint, err := d.api.Endpoint(ctx, "/info")
+	if err != nil {
+		return fmt.Errorf("read Docker Engine API version: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("create docker info request: %w", err)
 	}
@@ -121,7 +125,10 @@ func (d *Docker) DeleteVolume(ctx context.Context, name string) error {
 	if !volumeNamePattern.MatchString(name) {
 		return fmt.Errorf("delete docker volume: invalid volume name")
 	}
-	requestURL := d.endpoint + "/volumes/" + url.PathEscape(name)
+	requestURL, err := d.api.Endpoint(ctx, "/volumes/"+url.PathEscape(name))
+	if err != nil {
+		return fmt.Errorf("delete docker volume: %w", err)
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
 	if err != nil {
 		return fmt.Errorf("create docker volume delete request: %w", err)
@@ -259,7 +266,11 @@ func (d *Docker) rejectAttachedVolume(ctx context.Context, name string) error {
 }
 
 func (d *Docker) getJSON(ctx context.Context, path string, destination any, operation string) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, d.endpoint+path, nil)
+	endpoint, err := d.api.Endpoint(ctx, path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("create docker %s request: %w", operation, err)
 	}

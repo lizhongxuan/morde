@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"regexp"
@@ -266,6 +267,16 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		AgentSessionID: sessionID, SupervisorID: e.options.SupervisorID, LeaseOwner: value.Lease.Owner,
 		LeaseVersion: value.Lease.Version, AuthorizationVersion: value.Authorization.Version,
 		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	var unlockRuntimeTaskStart func()
+	if accountRuntime != nil {
+		accountRuntime.startMu.Lock()
+		unlockRuntimeTaskStart = accountRuntime.startMu.Unlock
+		defer func() {
+			if unlockRuntimeTaskStart != nil {
+				unlockRuntimeTaskStart()
+			}
+		}()
+	}
 	lease, replayed, err := e.options.Instances.Start(ctx, app.AgentInstanceStart{Fence: fence, RuntimeFence: runtimeFence,
 		SupervisorNonce: nonce, LeaseDuration: app.MaxAgentLease})
 	if err != nil {
@@ -354,7 +365,15 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		defer close(renewDone)
 		e.renewCloudDSHLease(runCtx, cancelCause, fence, lease.ExpiresAt, accountRuntime)
 	}()
-	err = e.runCloudDSH(runCtx, value, fence, input, output, recoveringAgent && value.CheckpointThroughSequence >= 0, &completion)
+	releaseRuntimeTaskStart := func() {
+		if unlockRuntimeTaskStart != nil {
+			unlockRuntimeTaskStart()
+			unlockRuntimeTaskStart = nil
+		}
+	}
+	err = e.runCloudDSH(runCtx, value, fence, input, output,
+		recoveringAgent && value.CheckpointThroughSequence >= 0, &completion, releaseRuntimeTaskStart)
+	releaseRuntimeTaskStart()
 	cancelCause(context.Canceled)
 	<-renewDone
 	if err != nil && !errors.Is(err, ErrCloudDSHCompletionPending) && recoveringAgent && ctx.Err() == nil {
@@ -859,13 +878,13 @@ func writeCloudDSHFrame(ctx context.Context, target io.WriteCloser, frame any) e
 		return context.Cause(ctx)
 	case err := <-done:
 		if err != nil {
-			return errors.New("dsh output connection failed")
+			return fmt.Errorf("dsh output connection failed: %w", err)
 		}
 		return nil
 	}
 }
 
-func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, response app.ModelResponse) error {
+func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity, response app.ModelResponse) error {
 	if response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
 		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 ||
 		(len(response.ToolCalls) == 0 && response.StopReason != "stop") || (len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") {
@@ -891,12 +910,22 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, r
 		map[string]any{"type": "usage", "usage": map[string]any{"inputTokens": response.Usage.InputTokens, "outputTokens": response.Usage.OutputTokens}},
 		map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}},
 	)
+	frame := func(kind string) map[string]any {
+		return map[string]any{"type": kind, "task_id": identity.TaskID, "owner_id": identity.OwnerID,
+			"agent_id": identity.AgentID, "session_id": identity.SessionID, "generation": identity.Generation,
+			"authorization_version": identity.AuthorizationVersion, "id": id}
+	}
 	for index, chunk := range chunks {
-		if err := writeCloudDSHFrame(ctx, target, map[string]any{"type": "model_chunk", "id": id, "index": index, "chunk": chunk}); err != nil {
+		message := frame("model_chunk")
+		message["index"] = index
+		message["chunk"] = chunk
+		if err := writeCloudDSHFrame(ctx, target, message); err != nil {
 			return err
 		}
 	}
-	return writeCloudDSHFrame(ctx, target, map[string]any{"type": "model_end", "id": id, "ok": true})
+	message := frame("model_end")
+	message["ok"] = true
+	return writeCloudDSHFrame(ctx, target, message)
 }
 
 var _ TaskExecutor = (*CloudDSHExecutor)(nil)

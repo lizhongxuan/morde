@@ -327,7 +327,6 @@ func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
 	}
 	if runtimeclient.WorkspaceScopedCapability(capability) {
-		// shortcut: this point-in-time revision check cannot lock Workspace sync across the Runtime request; add an operation admission lease before promising snapshot isolation during concurrent sync.
 		if _, err := s.syncWorkspaceBindings(ctx, workspaceID, bindingVersion, inputRevision); err != nil {
 			return runtimeclient.Operation{}, err
 		}

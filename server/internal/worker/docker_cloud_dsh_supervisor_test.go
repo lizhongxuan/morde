@@ -89,6 +89,7 @@ type dockerDSHFakeEngine struct {
 	waitHang        bool
 	unsafeImageEnv  bool
 	badLabel        bool
+	badAccountLabel bool
 	missingPID      bool
 	kills, creates  int
 	input           chan string
@@ -96,7 +97,11 @@ type dockerDSHFakeEngine struct {
 }
 
 func (f *dockerDSHFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, dockerDSHAPIVersion)
+	if r.Method == http.MethodGet && r.URL.Path == "/version" {
+		_ = json.NewEncoder(w).Encode(map[string]string{"ApiVersion": "1.52", "MinAPIVersion": "1.44"})
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/v1.44")
 	f.mu.Lock()
 	switch {
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json"):
@@ -138,6 +143,9 @@ func (f *dockerDSHFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		_ = json.Unmarshal(encoded, &config)
 		if f.badLabel {
 			config["Labels"].(map[string]any)[dockerDSHNonceLabel] = strings.Repeat("0", 64)
+		}
+		if f.badAccountLabel {
+			config["Labels"].(map[string]any)[dockerAccountRuntimeNonceLabel] = strings.Repeat("0", 64)
 		}
 		pid := 0
 		if f.running {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"morde/server/internal/app"
@@ -611,8 +612,25 @@ func unixListener(path string, socketMode os.FileMode) (*net.UnixListener, func(
 	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || parent.Mode().Perm()&0o022 != 0 {
 		return nil, nil, errors.New("guardian socket parent must be a trusted non-writable directory")
 	}
-	if _, err := os.Lstat(path); err == nil {
-		return nil, nil, errors.New("guardian socket path already exists; inspect it before removing it")
+	if existing, err := os.Lstat(path); err == nil {
+		if existing.Mode()&os.ModeSocket == 0 {
+			return nil, nil, errors.New("guardian socket path contains a non-socket file")
+		}
+		connection, dialErr := net.DialTimeout("unix", path, 200*time.Millisecond)
+		if dialErr == nil {
+			_ = connection.Close()
+			return nil, nil, errors.New("guardian socket path already has a live listener")
+		}
+		if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+			return nil, nil, fmt.Errorf("guardian socket state is unavailable: %w", dialErr)
+		}
+		current, statErr := os.Lstat(path)
+		if statErr != nil || !os.SameFile(existing, current) {
+			return nil, nil, errors.New("guardian socket changed while checking stale state")
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, nil, fmt.Errorf("remove stale guardian socket: %w", err)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, nil, fmt.Errorf("inspect guardian socket path: %w", err)
 	}

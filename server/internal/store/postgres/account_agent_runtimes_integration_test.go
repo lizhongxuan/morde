@@ -232,6 +232,100 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 	}
 }
 
+func TestPostgresAbortedAccountRuntimeStartRequiresExpiredLeaseAndNoWork(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	service, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, 32)
+	nonce[0] = 81
+	request := app.AccountAgentRuntimeStart{OwnerID: owner.ID, RuntimeID: "runtime-aborted-start",
+		LeaseOwner: "portal-aborted-start", SupervisorNonce: nonce, MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second}
+	runtime, replayed, err := service.Start(ctx, request)
+	if err != nil || replayed {
+		t.Fatalf("start Runtime: runtime=%+v replayed=%t err=%v", runtime, replayed, err)
+	}
+	identity, err := service.StopIdentity(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := signedAbortedAccountRuntimeStartProof(t, identity, privateKey)
+	if _, err := service.ConfirmGuardianStopped(ctx, proof, verifier); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("accepted aborted start proof before lease expired: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.Fence.ServiceInstanceID, owner.ID, runtime.Fence.RuntimeID); err != nil {
+		t.Fatal(err)
+	}
+	if replayed, err := service.ConfirmGuardianStopped(ctx, proof, verifier); err != nil || replayed {
+		t.Fatalf("confirm aborted start: replayed=%t err=%v", replayed, err)
+	}
+	loaded, found, err := service.Get(ctx, owner.ID)
+	if err != nil || !found || loaded.State != app.AccountAgentRuntimeStopped {
+		t.Fatalf("aborted start did not stop Runtime: runtime=%+v found=%t err=%v", loaded, found, err)
+	}
+	pending, err := service.ListPendingAccountAgentRuntimeStopAttestations(ctx, 1, verifier)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("no-Guardian-lease proof incorrectly needs acknowledgement: pending=%+v err=%v", pending, err)
+	}
+	laterProof := signedAbortedAccountRuntimeStartProof(t, identity, privateKey)
+	if replayed, err := service.ConfirmGuardianStopped(ctx, laterProof, verifier); err != nil || !replayed {
+		t.Fatalf("second signed aborted-start observation was not idempotent: replayed=%t err=%v", replayed, err)
+	}
+	request.RuntimeID = "runtime-after-abort"
+	request.SupervisorNonce = make([]byte, 32)
+	request.SupervisorNonce[0] = 82
+	replacement, replayed, err := service.Start(ctx, request)
+	if err != nil || replayed || replacement.Fence.RuntimeGeneration != runtime.Fence.RuntimeGeneration+1 {
+		t.Fatalf("start replacement Runtime: runtime=%+v replayed=%t err=%v", replacement, replayed, err)
+	}
+	if _, err := service.Ready(ctx, replacement.Fence); err != nil {
+		t.Fatalf("mark replacement Runtime running: %v", err)
+	}
+	runningIdentity, err := service.StopIdentity(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningProof := signedAbortedAccountRuntimeStartProof(t, runningIdentity, privateKey)
+	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, replacement.Fence.ServiceInstanceID, owner.ID, replacement.Fence.RuntimeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ConfirmGuardianStopped(ctx, runningProof, verifier); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("accepted aborted-start proof for a running Runtime: %v", err)
+	}
+	stillRunning, found, err := service.Get(ctx, owner.ID)
+	if err != nil || !found || stillRunning.State != app.AccountAgentRuntimeRunning {
+		t.Fatalf("rejected aborted-start proof changed running Runtime: runtime=%+v found=%t err=%v", stillRunning, found, err)
+	}
+}
+
+func signedAbortedAccountRuntimeStartProof(t *testing.T, identity app.AccountAgentRuntimeStopIdentity,
+	privateKey ed25519.PrivateKey) app.AccountAgentRuntimeStopAttestation {
+	t.Helper()
+	proof := app.AccountAgentRuntimeStopAttestation{Fence: identity.Fence,
+		ContainerName: accountRuntimeContainerNameForTest(identity.Fence, identity.NonceSHA256),
+		NonceSHA256:   identity.NonceSHA256, DestroyedAt: time.Now().UTC(), ProofSHA256: strings.Repeat("e", 64),
+		Destroyed: true, StartAborted: true}
+	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof.Signature = ed25519.Sign(privateKey, payload)
+	return proof
+}
+
 func TestPostgresListsBoundedAccountRuntimeStopCandidates(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

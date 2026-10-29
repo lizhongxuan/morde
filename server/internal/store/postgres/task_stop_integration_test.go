@@ -421,7 +421,7 @@ func TestPostgresCancelSettlesPendingClarification(t *testing.T) {
 		OwnerID: owner.ID, Operation: "task.clarification.answer", Key: "answer-cancelled-clarification",
 		RequestHash: hashBytes("answer-cancelled"), ResourceID: claimed.ID, RelatedID: requestID,
 	}
-	if err := store.AnswerClarificationRequest(ctx, answerRecord, claimed.ID, requestID, 1, "staging"); domain.CodeOf(err) != domain.CodeConflict {
+	if err := store.AnswerClarificationRequest(ctx, answerRecord, claimed.ID, requestID, 1, "staging", "", ""); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("answer cancelled clarification error = %v", err)
 	}
 }

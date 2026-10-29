@@ -119,7 +119,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return domain.NewError(domain.CodeInvalidState, "hostless dsh task contains computer tool history")
 		}
 		if fileIntent != task.FileDeliveryNone {
-			return b.pauseForFileDelivery(ctx, current, details.Steps, fileIntent, false)
+			return b.pauseForFileDelivery(ctx, current, details, fileIntent, false)
 		}
 		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
 			"Complete cloud task", "The cloud dsh session completed and its process tree stopped.")
@@ -134,7 +134,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs, nil)
 	if evidenceErr == nil && !cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) && len(evidence) == 0 {
 		if fileIntent != task.FileDeliveryNone {
-			return b.pauseForFileDelivery(ctx, current, details.Steps, fileIntent, current.WorkspaceID != "")
+			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
 		}
 		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
 			"Complete cloud task", "The cloud dsh session completed without producing a Workspace file.")
@@ -189,14 +189,27 @@ func ClassifyFileDeliveryIntent(objective string, hasWorkspace bool) task.FileDe
 		return task.FileDeliveryUnclear
 	}
 	noFileRequested := false
-	for _, phrase := range []string{"不要生成文件", "不要创建文件", "不需要生成文件", "无需生成文件", "不用生成文件", "do not create a file", "don't create a file", "do not generate a file", "don't generate a file"} {
+	for _, phrase := range []string{
+		"不要生成文件", "不要创建文件", "不要写文件", "不要写入文件", "不要保存文件", "不要输出文件",
+		"不要在工作区写文件", "不要在工作区保存文件",
+		"不需要生成文件", "无需生成文件", "不用生成文件", "不需要写文件", "无需写文件", "不用写文件",
+		"不需要保存文件", "无需保存文件", "不用保存文件",
+		"do not create a file", "don't create a file", "do not create the file", "don't create the file",
+		"do not create any file", "don't create any file",
+		"do not generate a file", "don't generate a file", "do not generate the file", "don't generate the file",
+		"do not generate any file", "don't generate any file",
+		"do not write a file", "don't write a file", "do not write the file", "don't write the file",
+		"do not write to a file", "don't write to a file", "do not save a file", "don't save a file",
+		"do not save the file", "don't save the file", "do not save to a file", "don't save to a file",
+		"do not output a file", "don't output a file",
+	} {
 		if strings.Contains(text, phrase) {
 			noFileRequested = true
 			text = strings.ReplaceAll(text, phrase, " ")
 		}
 	}
 	noFileRequested = noFileRequested || containsAny(text, "不需要文件", "无需文件", "不用文件", "不要文件", "无需附件", "只要文字", "只需要文字", "直接回答", "直接回复文字", "在聊天里回答", "no file needed", "no need for a file", "no attachment", "no file", "without a file", "text only", "text-only", "just answer", "answer in chat", "reply in chat")
-	outputAction := containsAny(text, "生成", "创建", "新建", "制作", "导出", "下载", "保存", "另存", "交付", "提供", "输出", "上传", "写", "撰写", "整理成", "draft", "generate", "create", "make", "produce", "export", "download", "save", "deliver", "attach", "provide", "output", "write", "prepare")
+	outputAction := containsAny(text, "生成", "创建", "新建", "制作", "做一份", "做个", "做一个", "导出", "下载", "保存", "另存", "交付", "提供", "输出", "上传", "写", "撰写", "整理成", "draft", "generate", "create", "make", "produce", "export", "download", "save", "deliver", "attach", "provide", "output", "write", "prepare")
 	fileTarget := containsAny(text, "文件", "文档", "附件", "下载", "file", "document", "attachment", "download", ".pdf", ".csv", ".xlsx", ".docx", ".pptx", " pdf", " csv", " xlsx", " docx", " pptx", "excel", "word", "powerpoint", "ppt", "spreadsheet", "workbook", "presentation", "slide deck")
 	workspaceDestination := containsAny(text, "在工作区", "到工作区", "写入工作区", "保存到工作区", "保存至工作区", "in the workspace", "in the attached workspace", "in the cloud workspace", "to the workspace", "to the attached workspace", "to the cloud workspace", "into the workspace", "into the attached workspace", "into the cloud workspace")
 	if outputAction && workspaceDestination {
@@ -245,22 +258,46 @@ func containsAny(text string, values ...string) bool {
 	return false
 }
 
-func (b *CloudDSHToolBroker) pauseForFileDelivery(ctx context.Context, current task.Task, steps []task.Step, intent task.FileDeliveryIntent, hasWorkspace bool) error {
-	step, err := newAgentStep(current.ID, maxStepSequence(steps)+1, "verification", task.StepRunning,
+func (b *CloudDSHToolBroker) pauseForFileDelivery(ctx context.Context, current task.Task, details TaskDetails, intent task.FileDeliveryIntent, hasWorkspace bool) error {
+	if intent == task.FileDeliveryUnclear {
+		version := nextClarificationVersion(details.ClarificationRequests)
+		if version < 1 {
+			return domain.NewError(domain.CodeInvalidState, "clarification version is exhausted")
+		}
+		initialSteps, request, err := newFileDeliveryIntentClarification(current.ID, hasWorkspace, maxStepSequence(details.Steps), version)
+		if err != nil {
+			return err
+		}
+		clarificationStep := initialSteps[1]
+		usage := cloneTaskUsage(current.Usage)
+		payload, err := agentStepEvent(clarificationStep, usage, map[string]any{
+			"clarification_id": request.ID, "clarification_version": request.Version,
+			"call_id": request.CallID, "source": "cloud_dsh",
+		})
+		if err != nil {
+			return err
+		}
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+		defer cancel()
+		_, err = b.store.CommitTaskProgress(persistCtx, TaskProgress{
+			TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+			Status: task.StatusWaitingUser, CurrentStep: clarificationStep.ID, Result: current.Result,
+			WaitingReason: "clarification_required", Usage: usage, Steps: initialSteps,
+			Event:                task.Event{TaskID: current.ID, Type: "task.waiting_user", Payload: payload},
+			ClarificationRequest: request,
+		})
+		return err
+	}
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepRunning,
 		"Check requested file delivery", "")
 	if err != nil {
 		return err
 	}
-	summary := "The task text does not clearly say whether a file is required; confirm before completion."
-	reason := "file_delivery_unclear"
-	if intent == task.FileDeliveryRequired {
-		summary = "The task requests a file deliverable, but no verified Workspace file was produced."
-		reason = "file_delivery_required"
-		if !hasWorkspace {
-			summary = "The task requests a file deliverable, but no Host Workspace is available to store it."
-		}
+	summary := "The task requests a file deliverable, but no verified Workspace file was produced."
+	if !hasWorkspace {
+		summary = "The task requests a file deliverable, but no Host Workspace is available to store it."
 	}
-	return b.pauseCompletion(ctx, current, step, reason, summary)
+	return b.pauseCompletion(ctx, current, step, "file_delivery_required", summary)
 }
 
 func cloudDSHHasUnverifiedFileWrite(inputs []ModelInput, evidence []AgentFileEvidence) bool {

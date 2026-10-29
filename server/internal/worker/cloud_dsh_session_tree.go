@@ -88,7 +88,7 @@ func sameWorkerToolNames(left, right []string) bool {
 }
 
 func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
-	input io.WriteCloser, output io.ReadCloser, resume bool, completion *app.CloudDSHTaskCompletion) error {
+	input io.WriteCloser, output io.ReadCloser, resume bool, completion *app.CloudDSHTaskCompletion, onStart func()) error {
 	rootIdentity := cloudDSHIdentity{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentID: fence.AgentInstanceID,
 		SessionID: fence.AgentSessionID, Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion}
 	baseDefinitions := []app.AgentToolDefinition{}
@@ -194,7 +194,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		case item = <-frames:
 		}
 		if item.err != nil {
-			return errors.New("dsh connection ended before a verified result")
+			return errors.New("dsh connection ended before a verified result: " + item.err.Error())
 		}
 		frame, err := decodeCloudDSHFrame(item.frame)
 		if err != nil {
@@ -224,6 +224,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			if err := writeCloudDSHFrame(ctx, input, start); err != nil {
 				return err
+			}
+			if onStart != nil {
+				onStart()
 			}
 			ready = true
 			continue
@@ -332,7 +335,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil || !validCloudDSHModelResponse(response, state.definitions) {
 				return errors.New("dsh model result is unavailable or contains an unauthorized tool")
 			}
-			if err := writeCloudDSHModel(ctx, input, frame.ID, response); err != nil {
+			if err := writeCloudDSHModel(ctx, input, frame.ID, state.identity, response); err != nil {
 				return err
 			}
 		case "model_cancel":

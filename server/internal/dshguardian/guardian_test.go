@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -720,6 +721,9 @@ func TestUnixListenerUsesPrivatePermissionsAndRemovesOwnedSocket(t *testing.T) {
 	if _, _, err := unixListener(path, 0o600); err == nil {
 		t.Fatal("opened an existing socket path")
 	}
+	if current, err := os.Lstat(path); err != nil || !os.SameFile(info, current) {
+		t.Fatalf("live guardian socket changed after duplicate listen: %v", err)
+	}
 	cleanup()
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("owned socket was not removed on cleanup: %v", err)
@@ -739,6 +743,42 @@ func TestUnixListenerUsesPrivatePermissionsAndRemovesOwnedSocket(t *testing.T) {
 		t.Fatal("accepted an unsafe guardian socket mode")
 	}
 	_ = listener
+}
+
+func TestUnixListenerReclaimsOnlyStaleSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "dg-stale-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	stalePath := filepath.Join(dir, "stale.sock")
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: stalePath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listener, cleanup, err := unixListener(stalePath, 0o600)
+	if err != nil {
+		t.Fatalf("reopen stale guardian socket: %v", err)
+	}
+	defer cleanup()
+	if info, err := os.Lstat(stalePath); err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o600 {
+		t.Fatalf("reclaimed guardian socket is unsafe: info=%v err=%v", info, err)
+	}
+	_ = listener
+	regularPath := filepath.Join(dir, "regular.sock")
+	if err := os.WriteFile(regularPath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := unixListener(regularPath, 0o600); err == nil {
+		t.Fatal("replaced a non-socket guardian path")
+	}
+	if data, err := os.ReadFile(regularPath); err != nil || string(data) != "keep" {
+		t.Fatalf("non-socket guardian path changed: %q, %v", data, err)
+	}
 }
 
 func TestDockerEngineFailsClosedOnUnexpectedStatuses(t *testing.T) {
@@ -935,7 +975,7 @@ func TestDockerEngineUsesOnlyExpectedContainerEndpoints(t *testing.T) {
 	guard := testGuard(time.Now())
 	state := newFakeDocker(guard, true, 654)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/v1.43/containers/"+guard.ContainerID) {
+		if !strings.HasPrefix(r.URL.Path, "/v1.44/containers/"+guard.ContainerID) {
 			t.Errorf("unexpected Docker API path: %s", r.URL.Path)
 			http.NotFound(w, r)
 			return
@@ -1004,7 +1044,13 @@ func startUnixHTTPServer(t *testing.T, handler http.Handler) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &http.Server{Handler: handler}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/version" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"ApiVersion": "1.52", "MinAPIVersion": "1.44"})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
 		_ = server.Close()
@@ -1058,7 +1104,7 @@ type fakeDocker struct {
 }
 
 func (d *fakeDocker) inspect(_ context.Context, id string) (containerInspect, error) {
-	if !d.exists || id != d.value.ID {
+	if !d.exists || id != d.value.ID && id != strings.TrimPrefix(d.value.Name, "/") {
 		return containerInspect{}, errContainerNotFound
 	}
 	return d.value, nil

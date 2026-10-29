@@ -89,9 +89,9 @@ type AccountAgentRuntimeStopIdentity struct {
 	ExpiresAt   time.Time
 }
 
-// AccountAgentRuntimeStopAttestation is a Guardian-signed proof that the
-// exact account Runtime container was destroyed. The raw start nonce is never
-// included; only its digest is carried across the Guardian boundary.
+// AccountAgentRuntimeStopAttestation proves the exact Runtime container is
+// absent. StartAborted identifies a start with no registered Guardian lease.
+// The raw start nonce is never included; only its digest crosses the boundary.
 type AccountAgentRuntimeStopAttestation struct {
 	Fence         AccountAgentRuntimeFence `json:"fence"`
 	ContainerID   string                   `json:"container_id"`
@@ -101,6 +101,7 @@ type AccountAgentRuntimeStopAttestation struct {
 	DestroyedAt   time.Time                `json:"destroyed_at"`
 	ProofSHA256   string                   `json:"proof_sha256"`
 	Destroyed     bool                     `json:"destroyed"`
+	StartAborted  bool                     `json:"start_aborted,omitempty"`
 	Signature     []byte                   `json:"signature"`
 }
 
@@ -378,11 +379,13 @@ func AccountAgentRuntimeStopAttestationSigningPayload(attestation AccountAgentRu
 		DestroyedAt   time.Time                `json:"destroyed_at"`
 		ProofSHA256   string                   `json:"proof_sha256"`
 		Destroyed     bool                     `json:"destroyed"`
+		StartAborted  bool                     `json:"start_aborted,omitempty"`
 	}{
 		Purpose: "morde.account-agent-runtime-guardian-stop.v1", Fence: attestation.Fence,
 		ContainerID: attestation.ContainerID, ContainerName: attestation.ContainerName,
 		NonceSHA256: attestation.NonceSHA256, ExpiresAt: attestation.ExpiresAt,
 		DestroyedAt: attestation.DestroyedAt, ProofSHA256: attestation.ProofSHA256, Destroyed: attestation.Destroyed,
+		StartAborted: attestation.StartAborted,
 	})
 }
 
@@ -411,11 +414,14 @@ func AccountAgentTaskStopAttestationSigningPayload(attestation AccountAgentTaskS
 }
 
 func validateAccountAgentRuntimeStopAttestation(attestation AccountAgentRuntimeStopAttestation) error {
-	if err := attestation.Fence.Validate(); err != nil || !attestation.Destroyed || !isLowerHex(attestation.ContainerID) ||
-		len(attestation.ContainerID) != sha256.Size*2 || !isLowerHex(attestation.NonceSHA256) ||
+	validContainerID := attestation.ContainerID == "" && attestation.StartAborted ||
+		isLowerHex(attestation.ContainerID) && len(attestation.ContainerID) == sha256.Size*2
+	validExpiry := attestation.StartAborted && attestation.ExpiresAt.IsZero() ||
+		!attestation.StartAborted && !attestation.ExpiresAt.IsZero()
+	if err := attestation.Fence.Validate(); err != nil || !attestation.Destroyed || !validContainerID || !validExpiry || !isLowerHex(attestation.NonceSHA256) ||
 		len(attestation.NonceSHA256) != sha256.Size*2 || !isLowerHex(attestation.ProofSHA256) ||
 		len(attestation.ProofSHA256) != sha256.Size*2 || attestation.ContainerName != expectedAccountAgentRuntimeContainerName(attestation.Fence, attestation.NonceSHA256) ||
-		attestation.ExpiresAt.IsZero() || attestation.DestroyedAt.IsZero() || len(attestation.Signature) != ed25519.SignatureSize {
+		attestation.DestroyedAt.IsZero() || len(attestation.Signature) != ed25519.SignatureSize {
 		return domain.InvalidArgument("attestation", "account Runtime stop attestation is invalid")
 	}
 	return nil

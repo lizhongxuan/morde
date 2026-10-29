@@ -1,12 +1,16 @@
 package orchestrator
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -22,6 +26,8 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/config"
+	"morde/server/internal/dockerapi"
+	"morde/server/internal/storage"
 )
 
 func TestCreateRequestMatchesGolden(t *testing.T) {
@@ -386,6 +392,456 @@ func TestOpenSandboxIntegrationList(t *testing.T) {
 	if _, err := client.List(context.Background(), nil); err != nil {
 		t.Fatalf("list sandboxes from OpenSandbox: %v", err)
 	}
+}
+
+func TestOpenSandboxLocalVolumeSurvivesSandboxDeleteAndRecreate(t *testing.T) {
+	// The explicit opt-in also attests that this loopback OpenSandbox instance
+	// uses the supplied local Docker socket directly; do not use a forwarded or
+	// tunneled service here.
+	if os.Getenv("CH_OSB_LOCAL_VOLUME_LIFECYCLE_TEST") != "1" {
+		t.Skip("set CH_OSB_LOCAL_VOLUME_LIFECYCLE_TEST=1 and the required CH_OSB_LOCAL_* variables to run this local lifecycle check")
+	}
+	baseURL := os.Getenv("CH_OSB_LOCAL_URL")
+	apiKey := os.Getenv("CH_OSB_LOCAL_API_KEY")
+	dockerSocket := os.Getenv("CH_OSB_LOCAL_DOCKER_SOCKET")
+	testImage := os.Getenv("CH_OSB_LOCAL_TEST_IMAGE")
+	if baseURL == "" || apiKey == "" || dockerSocket == "" || testImage == "" {
+		t.Fatal("CH_OSB_LOCAL_URL, CH_OSB_LOCAL_API_KEY, CH_OSB_LOCAL_DOCKER_SOCKET, and CH_OSB_LOCAL_TEST_IMAGE are required when the lifecycle opt-in is set")
+	}
+	if _, err := requireLocalLoopbackURL(baseURL); err != nil {
+		t.Fatalf("CH_OSB_LOCAL_URL must be an HTTP(S) URL with a literal loopback IP and explicit port: %v", err)
+	}
+	if !filepath.IsAbs(dockerSocket) {
+		t.Fatal("CH_OSB_LOCAL_DOCKER_SOCKET must be an absolute local Unix socket path")
+	}
+	socketInfo, err := os.Lstat(dockerSocket)
+	if err != nil || socketInfo.Mode()&os.ModeSocket == 0 || socketInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("CH_OSB_LOCAL_DOCKER_SOCKET must name an existing Unix socket, not a symlink or Docker context")
+	}
+	testImage = strings.TrimSpace(testImage)
+	if testImage == "" {
+		t.Fatal("CH_OSB_LOCAL_TEST_IMAGE must name an image already cached in the Docker engine at CH_OSB_LOCAL_DOCKER_SOCKET")
+	}
+
+	dockerHTTP := newLocalDockerHTTPClient(dockerSocket)
+	imagePresent, err := localDockerResourceExists(t.Context(), dockerHTTP,
+		"/images/"+url.PathEscape(testImage)+"/json")
+	if err != nil {
+		t.Fatalf("inspect explicitly cached local test image: %v", err)
+	}
+	if !imagePresent {
+		t.Skip("configured local test image is not cached in the explicitly supplied Docker engine; image pulls are not permitted by this check")
+	}
+
+	volumeDeleter, err := storage.NewDocker((&url.URL{Scheme: "unix", Path: dockerSocket}).String(), os.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("configure explicit local Docker socket: %v", err)
+	}
+	runID, err := randomLocalTestID()
+	if err != nil {
+		t.Fatalf("generate unique local test identity: %v", err)
+	}
+	claimName := "morde-osb-local-test-" + runID
+	claimExists, err := localDockerResourceExists(t.Context(), dockerHTTP,
+		"/volumes/"+url.PathEscape(claimName))
+	if err != nil {
+		t.Fatalf("check unique local test volume: %v", err)
+	}
+	if claimExists {
+		t.Skip("generated test claim already exists; refusing to inspect, use, or delete it")
+	}
+
+	profile := config.Profile{Name: "local-volume-lifecycle", BaseURL: baseURL, APIKey: apiKey, RequestTimeout: 30 * time.Second}
+	loopbackHTTP := newStrictLoopbackHTTPClient()
+	client := NewClient(profile, loopbackHTTP, prometheus.NewRegistry())
+	client.checkNetworkPolicy = func(_ context.Context, _, target string) error {
+		if _, err := requireLocalLoopbackURL(target); err != nil {
+			return fmt.Errorf("local OpenSandbox target is not loopback")
+		}
+		return nil
+	}
+	metadata := map[string]string{"ch-env": "morde-local-volume-lifecycle-test", "morde-test-run": runID}
+	execdToken, err := randomLocalTestID()
+	if err != nil {
+		t.Fatalf("generate ephemeral local Execd token: %v", err)
+	}
+
+	createdIDs := make(map[string]struct{}, 2)
+	cleanupSafe := true
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		listed, listErr := client.List(cleanupCtx, map[string]string{"morde-test-run": runID})
+		if listErr != nil {
+			t.Errorf("list only this test run's sandboxes during cleanup: %v", listErr)
+		}
+		ids := make(map[string]struct{}, len(createdIDs)+len(listed))
+		for id := range createdIDs {
+			ids[id] = struct{}{}
+		}
+		cleanupOK := listErr == nil && cleanupSafe
+		if !cleanupSafe {
+			t.Errorf("a sandbox create could not be ownership-verified; refusing to delete the named volume")
+		}
+		for _, sandbox := range listed {
+			if sandbox.ID == "" || sandbox.Metadata["morde-test-run"] != runID {
+				t.Errorf("OpenSandbox cleanup listing returned a sandbox outside this test run; refusing to delete it")
+				cleanupOK = false
+				continue
+			}
+			ids[sandbox.ID] = struct{}{}
+		}
+		for id := range ids {
+			if err := deleteAndConfirmLocalSandbox(cleanupCtx, client, id, runID); err != nil {
+				cleanupOK = false
+				t.Errorf("delete test sandbox and confirm termination: %v", err)
+			}
+		}
+		if !cleanupOK {
+			return
+		}
+		if err := volumeDeleter.DeleteVolume(cleanupCtx, claimName); err != nil {
+			t.Errorf("delete only this test run's named volume through the explicit local Docker socket: %v", err)
+			return
+		}
+		stillExists, err := localDockerResourceExists(cleanupCtx, dockerHTTP,
+			"/volumes/"+url.PathEscape(claimName))
+		if err != nil || stillExists {
+			t.Errorf("verify cleanup of the unique local test volume: exists=%t err=%v", stillExists, err)
+		}
+	})
+
+	create := func() app.Sandbox {
+		t.Helper()
+		created, err := client.Create(t.Context(), app.SandboxCreateRequest{
+			Image:      testImage,
+			Entrypoint: []string{"/bin/sh", "-c", "sleep 600"},
+			Timeout:    10 * time.Minute,
+			Requests:   app.SandboxResources{CPU: "100m", Memory: "128Mi"},
+			Limits:     app.SandboxResources{CPU: "1", Memory: "512Mi"},
+			Env:        map[string]string{"EXECD_ACCESS_TOKEN": execdToken},
+			Metadata:   metadata,
+			Volumes: []app.SandboxVolume{{
+				Name: "workspace", MountPath: "/workspace", ClaimName: claimName, Storage: "64Mi",
+			}},
+		})
+		if err != nil {
+			cleanupSafe = false
+			t.Fatalf("create local OpenSandbox test sandbox: %v", err)
+		}
+		if created.ID == "" {
+			cleanupSafe = false
+			t.Fatal("OpenSandbox Create response omitted the sandbox ID")
+		}
+		verified, err := waitForLocalSandboxState(t.Context(), client, created.ID, runID, app.SandboxRunning, 90*time.Second)
+		if verified {
+			createdIDs[created.ID] = struct{}{}
+		} else {
+			cleanupSafe = false
+		}
+		if err != nil {
+			t.Fatalf("wait for local OpenSandbox test sandbox: %v", err)
+		}
+		return created
+	}
+
+	first := create()
+	claimExists, err = localDockerResourceExists(t.Context(), dockerHTTP,
+		"/volumes/"+url.PathEscape(claimName))
+	if err != nil || !claimExists {
+		t.Fatalf("OpenSandbox did not create the unique claim in the explicitly supplied local Docker engine: exists=%t err=%v", claimExists, err)
+	}
+	firstURL, firstHeaders, err := localExecdEndpoint(t.Context(), client, first.ID)
+	if err != nil {
+		t.Fatalf("resolve safe local Execd endpoint: %v", err)
+	}
+	marker := "morde-volume-" + runID
+	writeAndRead := "printf '%s' '" + marker + "' > /workspace/morde-persistent-marker && cat /workspace/morde-persistent-marker"
+	firstOutput, err := runLocalExecdCommand(t.Context(), loopbackHTTP, firstURL, firstHeaders, execdToken, writeAndRead)
+	if err != nil || firstOutput != marker {
+		t.Fatalf("write marker through local Execd endpoint %s: output matched=%t err=%v", firstURL, firstOutput == marker, err)
+	}
+
+	if err := deleteAndConfirmLocalSandbox(t.Context(), client, first.ID, runID); err != nil {
+		t.Fatalf("delete first sandbox and confirm runtime termination: %v", err)
+	}
+	claimExists, err = localDockerResourceExists(t.Context(), dockerHTTP,
+		"/volumes/"+url.PathEscape(claimName))
+	if err != nil || !claimExists {
+		t.Fatalf("persistent claim disappeared after deleting first sandbox: exists=%t err=%v", claimExists, err)
+	}
+
+	second := create()
+	secondURL, secondHeaders, err := localExecdEndpoint(t.Context(), client, second.ID)
+	if err != nil {
+		t.Fatalf("resolve safe restored Execd endpoint: %v", err)
+	}
+	readback, err := runLocalExecdCommand(t.Context(), loopbackHTTP, secondURL, secondHeaders, execdToken,
+		"cat /workspace/morde-persistent-marker")
+	if err != nil || readback != marker {
+		t.Fatalf("read marker from restored Execd endpoint %s: matched=%t err=%v", secondURL, readback == marker, err)
+	}
+}
+
+func requireLocalLoopbackURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil ||
+		parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("expected an HTTP(S) URL without credentials, query, or fragment")
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	port, portErr := strconv.Atoi(parsed.Port())
+	if ip == nil || !ip.IsLoopback() || portErr != nil || port < 1 || port > 65535 {
+		return nil, errors.New("URL must use a literal loopback IP and explicit valid port")
+	}
+	return parsed, nil
+}
+
+func TestLocalOpenSandboxEndpointValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		endpoint    string
+		execd       bool
+		wantAllowed bool
+	}{
+		{name: "ipv4 loopback", endpoint: "http://127.0.0.1:18080", wantAllowed: true},
+		{name: "ipv6 loopback", endpoint: "https://[::1]:18080", wantAllowed: true},
+		{name: "execd proxy", endpoint: "http://127.0.0.1:18080/proxy/44772", execd: true, wantAllowed: true},
+		{name: "hostname", endpoint: "http://localhost:18080"},
+		{name: "non-loopback ip", endpoint: "http://192.0.2.1:18080"},
+		{name: "missing port", endpoint: "http://127.0.0.1"},
+		{name: "credentials", endpoint: "http://user@127.0.0.1:18080"},
+		{name: "query", endpoint: "http://127.0.0.1:18080?token=value"},
+		{name: "unexpected execd path", endpoint: "http://127.0.0.1:18080/admin", execd: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var err error
+			if test.execd {
+				_, err = requireLocalExecdEndpoint(test.endpoint)
+			} else {
+				_, err = requireLocalLoopbackURL(test.endpoint)
+			}
+			if allowed := err == nil; allowed != test.wantAllowed {
+				t.Fatalf("endpoint allowed=%t, want %t (err=%v)", allowed, test.wantAllowed, err)
+			}
+		})
+	}
+}
+
+func requireLocalExecdEndpoint(raw string) (*url.URL, error) {
+	parsed, err := requireLocalLoopbackURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Path != "" && parsed.Path != "/proxy/44772" {
+		return nil, errors.New("expected a direct Execd endpoint or the OpenSandbox /proxy/44772 route")
+	}
+	return parsed, nil
+}
+
+func localExecdEndpoint(ctx context.Context, client *Client, sandboxID string) (*url.URL, map[string]string, error) {
+	endpoint, err := client.Endpoint(ctx, sandboxID, 44772)
+	if err != nil {
+		return nil, nil, err
+	}
+	parsed, err := requireLocalExecdEndpoint(endpoint.BaseURL)
+	return parsed, endpoint.Headers, err
+}
+
+func newStrictLoopbackHTTPClient() *http.Client {
+	transport := &http.Transport{Proxy: nil}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   45 * time.Second,
+		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+			if _, err := requireLocalLoopbackURL(request.URL.String()); err != nil {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+}
+
+func newLocalDockerHTTPClient(socketPath string) *http.Client {
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	return &http.Client{Transport: transport, Timeout: 10 * time.Second}
+}
+
+func localDockerResourceExists(ctx context.Context, client *http.Client, path string) (bool, error) {
+	endpoint, err := dockerapi.NewEndpointResolver(client).Endpoint(ctx, path)
+	if err != nil {
+		return false, errors.New("resolve explicit local Docker Engine API version")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, errors.New("build explicit local Docker inspection request")
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return false, errors.New("connect to the explicitly supplied local Docker socket")
+	}
+	defer func() { _ = response.Body.Close() }()
+	switch response.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("explicit local Docker inspection returned HTTP %d", response.StatusCode)
+	}
+}
+
+func randomLocalTestID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func waitForLocalSandboxState(ctx context.Context, client *Client, sandboxID, runID string, target app.SandboxState, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
+	verified := false
+	for {
+		value, err := client.Get(ctx, sandboxID)
+		if errors.Is(err, app.ErrSandboxNotFound) && target == app.SandboxTerminated {
+			return true, nil
+		}
+		if err == nil {
+			if value.Metadata["morde-test-run"] != runID {
+				return false, errors.New("sandbox metadata does not match this test run; refusing to use or delete it")
+			}
+			verified = true
+			if value.State == target {
+				return true, nil
+			}
+			if target == app.SandboxRunning && (value.State == app.SandboxFailed || value.State == app.SandboxTerminated) {
+				return true, fmt.Errorf("sandbox entered terminal state %q", value.State)
+			}
+		} else if !errors.Is(err, app.ErrSandboxUnavailable) && !errors.Is(err, app.ErrSandboxNotFound) {
+			return verified, errors.New("read local OpenSandbox state")
+		}
+		if time.Now().After(deadline) {
+			return verified, errors.New("timed out waiting for local OpenSandbox sandbox")
+		}
+		if err := waitLocalTestPoll(ctx); err != nil {
+			return verified, err
+		}
+	}
+}
+
+func deleteAndConfirmLocalSandbox(ctx context.Context, client *Client, sandboxID, runID string) error {
+	if err := client.Delete(ctx, sandboxID); err != nil && !errors.Is(err, app.ErrSandboxNotFound) {
+		return errors.New("request local OpenSandbox sandbox deletion")
+	}
+	if _, err := waitForLocalSandboxState(ctx, client, sandboxID, runID, app.SandboxTerminated, 30*time.Second); err != nil {
+		return fmt.Errorf("confirm local OpenSandbox sandbox deletion: %w", err)
+	}
+	return nil
+}
+
+func waitLocalTestPoll(ctx context.Context) error {
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func runLocalExecdCommand(ctx context.Context, client *http.Client, endpoint *url.URL, extraHeaders map[string]string, token, command string) (string, error) {
+	if endpoint == nil || token == "" || command == "" {
+		return "", errors.New("local Execd command configuration is incomplete")
+	}
+	target := *endpoint
+	target.Path = strings.TrimRight(target.Path, "/") + "/command"
+	target.RawPath = ""
+	body, err := json.Marshal(struct {
+		Command    string `json:"command"`
+		Cwd        string `json:"cwd"`
+		Background bool   `json:"background"`
+		Timeout    int64  `json:"timeout"`
+	}{Command: command, Cwd: "/workspace", Timeout: int64(30 * time.Second / time.Millisecond)})
+	if err != nil {
+		return "", errors.New("encode local Execd command")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(body))
+	if err != nil {
+		return "", errors.New("build local Execd command request")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	request.Header.Set("X-EXECD-ACCESS-TOKEN", token)
+	for key, value := range extraHeaders {
+		if strings.EqualFold(key, "Host") || strings.HasPrefix(strings.ToLower(key), "proxy-") {
+			return "", errors.New("OpenSandbox returned an unsafe Execd routing header")
+		}
+		if strings.EqualFold(key, "X-EXECD-ACCESS-TOKEN") {
+			if value != token {
+				return "", errors.New("OpenSandbox returned a conflicting Execd access token")
+			}
+			continue
+		}
+		request.Header.Set(key, value)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", errors.New("connect to loopback Execd endpoint")
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("local Execd command returned HTTP %d", response.StatusCode)
+	}
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	var stdout strings.Builder
+	var completed bool
+	var exitCode *int
+	for scanner.Scan() {
+		payload := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(payload, "data:") {
+			payload = strings.TrimSpace(strings.TrimPrefix(payload, "data:"))
+		} else if !strings.HasPrefix(payload, "{") {
+			continue
+		}
+		var event struct {
+			Type          string `json:"type"`
+			Text          string `json:"text"`
+			ExitCode      *int   `json:"exit_code"`
+			ExitCodeCamel *int   `json:"exitCode"`
+		}
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			return "", errors.New("decode local Execd stream event")
+		}
+		if event.Type == "execution_complete" {
+			if event.ExitCode == nil {
+				event.ExitCode = event.ExitCodeCamel
+			}
+		}
+		switch event.Type {
+		case "stdout":
+			stdout.WriteString(event.Text)
+		case "error":
+			return "", errors.New("local Execd command failed")
+		case "execution_complete":
+			completed, exitCode = true, event.ExitCode
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", errors.New("read local Execd stream")
+	}
+	if !completed || (exitCode != nil && *exitCode != 0) {
+		return "", errors.New("local Execd command did not report a successful exit")
+	}
+	return stdout.String(), nil
 }
 
 func newTestClient(baseURL string, registry prometheus.Registerer) *Client {

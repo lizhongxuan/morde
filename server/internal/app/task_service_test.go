@@ -20,48 +20,50 @@ import (
 
 type taskStoreStub struct {
 	TaskStore
-	conversations        map[string]conversation.Conversation
-	submissions          []TaskSubmission
-	appends              []TaskSubmission
-	created              []conversation.Conversation
-	listHostIDs          []string
-	listTasksPage        TaskPage
-	listConvPage         ConversationPage
-	messagePage          MessagePage
-	details              TaskDetails
-	retryRecord          IdempotencyRecord
-	retryTaskID          string
-	retryItemID          string
-	retryCalls           int
-	retryRecords         []IdempotencyRecord
-	pendingRecord        IdempotencyRecord
-	pendingTaskID        string
-	pendingID            string
-	pendingVersion       int64
-	pendingDecision      task.PendingDecision
-	pendingCalls         int
-	clarificationRecord  IdempotencyRecord
-	clarificationTaskID  string
-	clarificationID      string
-	clarificationVersion int64
-	clarificationAnswer  string
-	clarificationCalls   int
-	actionResult         TaskActionResult
-	actionRecord         IdempotencyRecord
-	actionTaskID         string
-	action               task.Action
-	actionExpected       task.Status
-	actionRequestID      string
-	actionCalls          int
-	events               []task.Event
-	eventPage            *TaskEventPage
-	storeErr             error
-	grantRevokeCalls     int
-	grantOwnerID         string
-	grantTaskID          string
-	grantConnectorID     string
-	grantVersion         int64
-	grantRevoked         TaskMCPConnectorGrant
+	conversations          map[string]conversation.Conversation
+	submissions            []TaskSubmission
+	appends                []TaskSubmission
+	created                []conversation.Conversation
+	listHostIDs            []string
+	listTasksPage          TaskPage
+	listConvPage           ConversationPage
+	messagePage            MessagePage
+	details                TaskDetails
+	retryRecord            IdempotencyRecord
+	retryTaskID            string
+	retryItemID            string
+	retryCalls             int
+	retryRecords           []IdempotencyRecord
+	pendingRecord          IdempotencyRecord
+	pendingTaskID          string
+	pendingID              string
+	pendingVersion         int64
+	pendingDecision        task.PendingDecision
+	pendingCalls           int
+	clarificationRecord    IdempotencyRecord
+	clarificationTaskID    string
+	clarificationID        string
+	clarificationVersion   int64
+	clarificationAnswer    string
+	clarificationIntent    task.FileDeliveryIntent
+	clarificationObjective string
+	clarificationCalls     int
+	actionResult           TaskActionResult
+	actionRecord           IdempotencyRecord
+	actionTaskID           string
+	action                 task.Action
+	actionExpected         task.Status
+	actionRequestID        string
+	actionCalls            int
+	events                 []task.Event
+	eventPage              *TaskEventPage
+	storeErr               error
+	grantRevokeCalls       int
+	grantOwnerID           string
+	grantTaskID            string
+	grantConnectorID       string
+	grantVersion           int64
+	grantRevoked           TaskMCPConnectorGrant
 }
 
 type taskWorkspaceStoreStub struct {
@@ -195,9 +197,10 @@ func (s *taskStoreStub) RespondToPendingRequest(_ context.Context, record Idempo
 	return s.storeErr
 }
 
-func (s *taskStoreStub) AnswerClarificationRequest(_ context.Context, record IdempotencyRecord, taskID, clarificationID string, version int64, answer string) error {
+func (s *taskStoreStub) AnswerClarificationRequest(_ context.Context, record IdempotencyRecord, taskID, clarificationID string, version int64, answer string, intent task.FileDeliveryIntent, objective string) error {
 	s.clarificationCalls++
 	s.clarificationRecord, s.clarificationTaskID, s.clarificationID, s.clarificationVersion, s.clarificationAnswer = record, taskID, clarificationID, version, answer
+	s.clarificationIntent, s.clarificationObjective = intent, objective
 	return s.storeErr
 }
 
@@ -289,6 +292,73 @@ func TestTaskServiceStoresFileDeliveryIntentFromTaskAndBatchText(t *testing.T) {
 		if got != test.want {
 			t.Fatalf("file delivery intent for %q = %q, want %q", test.key, got, test.want)
 		}
+	}
+}
+
+func TestTaskServiceSubmitsUnclearFileIntentAsAnswerableClarification(t *testing.T) {
+	store := &taskStoreStub{}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		ModelID: "model-a", Objective: "Write a report about the project.", IdempotencyKey: "intent-clarify-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := store.submissions[0]
+	if submission.Task.Status != task.StatusWaitingUser || submission.Task.WaitingReason != "clarification_required" ||
+		submission.Task.FileDeliveryIntent != task.FileDeliveryUnclear || len(submission.InitialSteps) != 2 ||
+		submission.InitialClarificationRequest == nil || submission.InitialClarificationRequest.Status != task.ClarificationPending ||
+		submission.InitialClarificationRequest.CallID != FileDeliveryIntentClarificationCallID ||
+		submission.Task.CurrentStep != submission.InitialSteps[1].ID || submission.InitialEvent.Type != "task.waiting_user" {
+		t.Fatalf("unclear file intent did not create an answerable initial state: %#v", submission)
+	}
+}
+
+func TestTaskServiceResolvesFileDeliveryClarificationFromAnswer(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		answer    string
+		want      task.FileDeliveryIntent
+		wantErr   domain.ErrorCode
+		workspace string
+	}{
+		{name: "required", answer: "需要生成并交付 PDF 文件", want: task.FileDeliveryRequired, workspace: "w1234567"},
+		{name: "chat only", answer: "不需要文件，只要聊天答复", want: task.FileDeliveryNone, workspace: "w1234567"},
+		{name: "English chat only", answer: "I don't need a file, just answer in chat", want: task.FileDeliveryNone, workspace: "w1234567"},
+		{name: "Chinese no delivery", answer: "无需交付文件，直接在聊天回答", want: task.FileDeliveryNone, workspace: "w1234567"},
+		{name: "unclear", answer: "看着办", wantErr: domain.CodeInvalidArgument, workspace: "w1234567"},
+		{name: "contradictory", answer: "不需要文件，但请交付 PDF", wantErr: domain.CodeInvalidArgument, workspace: "w1234567"},
+		{name: "required without workspace", answer: "需要交付文件", wantErr: domain.CodeInvalidArgument},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &taskStoreStub{details: TaskDetails{
+				Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", WorkspaceID: test.workspace,
+					Objective: "Write a report about the project.", FileDeliveryIntent: task.FileDeliveryUnclear},
+				ClarificationRequests: []task.ClarificationRequest{{
+					ID: "r1234567", TaskID: "q1234567", Version: 1, CallID: FileDeliveryIntentClarificationCallID,
+					Status: task.ClarificationPending,
+				}},
+			}}
+			service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 1, test.answer, "file-answer-001")
+			if test.wantErr != "" {
+				if domain.CodeOf(err) != test.wantErr || store.clarificationCalls != 0 {
+					t.Fatalf("answer error=%v writes=%d, want %s and no write", err, store.clarificationCalls, test.wantErr)
+				}
+				return
+			}
+			if err != nil || store.clarificationCalls != 1 || store.clarificationIntent != test.want ||
+				!strings.Contains(store.clarificationObjective, "Write a report about the project.") ||
+				!strings.Contains(store.clarificationObjective, test.answer) {
+				t.Fatalf("resolved answer error=%v intent=%q objective=%q", err, store.clarificationIntent, store.clarificationObjective)
+			}
+		})
 	}
 }
 

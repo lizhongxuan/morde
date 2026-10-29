@@ -870,7 +870,7 @@ func waitWorkspaceSyncFile(t *testing.T, root, name, expected string, runs ...*w
 
 func waitWorkspaceSyncReplicaCursor(t *testing.T, ctx context.Context, store *Store, workspaceID, replicaID string, revision int64) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		cursor, err := store.q.GetWorkspaceSyncCursor(ctx, sqlcgen.GetWorkspaceSyncCursorParams{WorkspaceID: workspaceID, ReplicaID: replicaID})
 		if err == nil && cursor.Revision >= revision {

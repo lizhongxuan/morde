@@ -159,9 +159,12 @@ func validateMessage(value conversation.Message) error {
 }
 
 func validateTask(value task.Task) error {
+	validInitialStatus := value.Status == task.StatusQueued && value.WaitingReason == "" && value.CurrentStep == ""
+	validInitialClarification := value.Status == task.StatusWaitingUser && value.WaitingReason == "clarification_required" &&
+		value.FileDeliveryIntent == task.FileDeliveryUnclear && domain.ValidStepID(value.CurrentStep)
 	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
 		!domain.ValidConversationID(value.ConversationID) || (value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
-		value.ModelID == "" || strings.TrimSpace(value.Objective) == "" || value.Status != task.StatusQueued ||
+		value.ModelID == "" || strings.TrimSpace(value.Objective) == "" || (!validInitialStatus && !validInitialClarification) ||
 		value.ExecutionLocation != "server" || value.Authorization.Version < 1 ||
 		(value.ApplicationID != "" && (value.HostID == "" || !app.ValidHostApplicationID(value.ApplicationID))) ||
 		!value.FileDeliveryIntent.Valid() ||

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -80,7 +81,9 @@ func (s *accountRuntimeControlStub) ConfirmGuardianStopped(_ context.Context, at
 	_ app.AccountAgentRuntimeStopVerifier) (bool, error) {
 	s.stopProofs++
 	s.runtime.State = app.AccountAgentRuntimeStopped
-	s.pendingStopProofs = append(s.pendingStopProofs, attestation)
+	if !attestation.StartAborted {
+		s.pendingStopProofs = append(s.pendingStopProofs, attestation)
+	}
 	return false, nil
 }
 
@@ -136,15 +139,20 @@ func (s *accountRuntimeTaskStopperStub) MarkAccountAgentTaskStopAttestationAckno
 }
 
 type accountRuntimeSupervisorStub struct {
-	mu         sync.Mutex
-	admitted   bool
-	recoverErr error
-	stopCalls  int
-	renewCalls int
+	mu             sync.Mutex
+	admitted       bool
+	recoverErr     error
+	recoverAborted bool
+	incomplete     bool
+	stopCalls      int
+	renewCalls     int
 }
 
 func (s *accountRuntimeSupervisorStub) StartAccountRuntime(_ context.Context, fence app.AccountAgentRuntimeFence, _ []byte,
 	_ time.Time) (CloudDSHAccountRuntimeProcess, error) {
+	if s.incomplete {
+		return CloudDSHAccountRuntimeProcess{}, nil
+	}
 	runtimeInput, portalInput := io.Pipe()
 	portalOutput, runtimeOutput := io.Pipe()
 	go func() {
@@ -185,6 +193,20 @@ func (s *accountRuntimeSupervisorStub) StartAccountRuntime(_ context.Context, fe
 	}()
 	return CloudDSHAccountRuntimeProcess{ContainerID: strings.Repeat("a", 64), ContainerName: "account-test",
 		Input: portalInput, Output: portalOutput}, nil
+}
+
+func TestAccountAgentRuntimeRejectsIncompleteSupervisorProcess(t *testing.T) {
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: &accountRuntimeControlStub{}, Supervisor: &accountRuntimeSupervisorStub{incomplete: true},
+		Guardian: &accountRuntimeGuardianStub{}, StopVerifier: accountRuntimeStopVerifierStub{},
+		TaskStopper: &accountRuntimeTaskStopperStub{}, LeaseOwner: "worker-runtime", MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Acquire(context.Background(), "u1234567"); err == nil || !strings.Contains(err.Error(), "incomplete pipes") {
+		t.Fatalf("incomplete supervisor process error = %v", err)
+	}
 }
 
 func (s *accountRuntimeSupervisorStub) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
@@ -245,12 +267,13 @@ func (s *accountRuntimeSupervisorStub) RecoverAccountRuntimeStopped(_ context.Co
 	nonceSHA256 string) (app.AccountAgentRuntimeStopAttestation, error) {
 	s.mu.Lock()
 	err := s.recoverErr
+	aborted := s.recoverAborted
 	s.mu.Unlock()
 	if err != nil {
 		return app.AccountAgentRuntimeStopAttestation{}, err
 	}
 	return app.AccountAgentRuntimeStopAttestation{Fence: fence, NonceSHA256: nonceSHA256,
-		ProofSHA256: strings.Repeat("d", 64), Destroyed: true, DestroyedAt: time.Now()}, nil
+		ProofSHA256: strings.Repeat("d", 64), Destroyed: true, StartAborted: aborted, DestroyedAt: time.Now()}, nil
 }
 
 type accountRuntimeGuardianStub struct {
@@ -329,17 +352,20 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := manager.Acquire(context.Background(), "u1234567")
+	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelAcquire()
+	session, err := manager.Acquire(acquireCtx, "u1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
 	nonce := []byte(strings.Repeat("n", 32))
 	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
 	lease := app.AgentInstanceLease{Fence: fence, RuntimeFence: &session.runtime.Fence, RuntimeSequence: 1,
 		ExpiresAt: time.Now().Add(app.MaxAgentLease)}
-	input, output, err := session.StartTask(context.Background(), fence, nonce, lease)
+	input, output, err := session.StartTask(acquireCtx, fence, nonce, lease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +381,7 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	start := map[string]any{"type": "start", "version": 1, "task_id": fence.TaskID, "owner_id": fence.OwnerID,
 		"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
 		"authorization_version": fence.AuthorizationVersion, "model": "test-model", "tools": []any{}, "prompt": "do work"}
-	if err := writeCloudDSHFrame(context.Background(), input, start); err != nil {
+	if err := writeCloudDSHFrame(acquireCtx, input, start); err != nil {
 		t.Fatal(err)
 	}
 	guardian.mu.Lock()
@@ -367,12 +393,98 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	if !armed || !started || !admitted {
 		t.Fatalf("guardian armed=%t started=%t runtime admitted=%t", armed, started, admitted)
 	}
-	if err := manager.StopTask(context.Background(), session, fence); err != nil {
+	if err := manager.StopTask(acquireCtx, session, fence); err != nil {
 		t.Fatal(err)
 	}
+	cancelAcquire()
 	if len(taskStopper.confirmed) != 1 || len(taskStopper.acknowledged) != 1 || len(guardian.acked) != 1 {
 		t.Fatalf("Task proof confirm=%d DB ack=%d Guardian ack=%d, want 1/1/1", len(taskStopper.confirmed),
 			len(taskStopper.acknowledged), len(guardian.acked))
+	}
+	routeTaskFrame := func(kind string, target app.AgentInstanceFence) error {
+		raw, err := json.Marshal(map[string]any{"type": kind, "server_instance_id": session.runtime.Fence.ServiceInstanceID,
+			"runtime_id": session.runtime.Fence.RuntimeID, "runtime_generation": session.runtime.Fence.RuntimeGeneration,
+			"task_id": target.TaskID, "owner_id": target.OwnerID, "agent_id": target.AgentInstanceID,
+			"session_id": target.AgentSessionID, "generation": target.AgentGeneration,
+			"authorization_version": target.AuthorizationVersion})
+		if err != nil {
+			return err
+		}
+		return session.routeFrame(raw)
+	}
+	wrongSession := fence
+	wrongSession.AgentSessionID = "other-session"
+	if err := routeTaskFrame("task_terminated", wrongSession); err == nil {
+		t.Fatal("stopped Task frame with a different session was accepted")
+	}
+	if err := routeTaskFrame("task_terminated", fence); err != nil || session.closed() {
+		t.Fatalf("late stopped Task frame ended sibling Runtime: err=%v closed=%t", err, session.closed())
+	}
+	unknown := fence
+	unknown.TaskID = "q9999999"
+	if err := routeTaskFrame("task_terminated", unknown); err == nil {
+		t.Fatal("unknown Task frame was accepted without a stop proof")
+	}
+	if err := session.routeFrame([]byte(`{"type":"failed","code":"runtime_unavailable"}`)); err == nil {
+		t.Fatal("unfenced Runtime failure was accepted as a Task failure")
+	}
+	for sequence := int64(2); sequence <= 8; sequence++ {
+		taskCtx, cancelTask := context.WithTimeout(context.Background(), 2*time.Second)
+		nextFence := fence
+		nextFence.TaskID = fmt.Sprintf("q%07d", sequence)
+		nextFence.AgentInstanceID = fmt.Sprintf("agent-%d", sequence)
+		nextFence.AgentSessionID = fmt.Sprintf("session-%d", sequence)
+		nextLease := lease
+		nextLease.Fence, nextLease.RuntimeSequence = nextFence, sequence
+		input, output, err := session.StartTask(taskCtx, nextFence, nonce, nextLease)
+		if err != nil {
+			cancelTask()
+			t.Fatal(err)
+		}
+		if _, err := bufio.NewReader(output).ReadBytes('\n'); err != nil {
+			cancelTask()
+			t.Fatalf("read Task %d ready frame: %v", sequence, err)
+		}
+		start["task_id"], start["agent_id"], start["session_id"] = nextFence.TaskID, nextFence.AgentInstanceID, nextFence.AgentSessionID
+		if err := writeCloudDSHFrame(taskCtx, input, start); err != nil {
+			cancelTask()
+			t.Fatalf("start Task %d after initial Task stopped: %v", sequence, err)
+		}
+		if sequence == 2 {
+			if err := routeTaskFrame("failed", nextFence); err != nil || session.closed() {
+				cancelTask()
+				t.Fatalf("Task failure ended sibling Runtime: err=%v closed=%t", err, session.closed())
+			}
+			var failed cloudDSHFrame
+			if err := json.NewDecoder(output).Decode(&failed); err != nil || failed.Type != "failed" {
+				cancelTask()
+				t.Fatalf("Task failure was not routed to its Task: type=%q err=%v", failed.Type, err)
+			}
+		}
+		stopCtx := taskCtx
+		if sequence == 3 {
+			session.mu.Lock()
+			active := session.tasks[nextFence]
+			session.mu.Unlock()
+			for len(active.events) < cap(active.events) {
+				active.events <- cloudDSHRead{frame: []byte(`{}`)}
+			}
+			cancelTask()
+			if err := routeTaskFrame("checkpoint", nextFence); err != nil || session.closed() {
+				t.Fatalf("canceled Task frame ended sibling Runtime: err=%v closed=%t", err, session.closed())
+			}
+			stopCtx = context.Background()
+		}
+		if err := manager.StopTask(stopCtx, session, nextFence); err != nil {
+			cancelTask()
+			t.Fatalf("stop Task %d: %v", sequence, err)
+		}
+		_ = input.Close()
+		_ = output.Close()
+		cancelTask()
+	}
+	if session.closed() || len(taskStopper.confirmed) != 8 {
+		t.Fatalf("account Runtime ended after a Task context was canceled: closed=%t stop proofs=%d", session.closed(), len(taskStopper.confirmed))
 	}
 }
 
@@ -405,6 +517,33 @@ func TestAccountAgentRuntimeLifecycleReapsIdleStoppingRuntime(t *testing.T) {
 	}
 	if manager.sessions[session.runtime.Fence.OwnerID] != nil {
 		t.Fatal("reaped Runtime session remains cached")
+	}
+}
+
+func TestAbortedAccountRuntimeStartDoesNotAcknowledgeMissingGuardianLease(t *testing.T) {
+	control := &accountRuntimeControlStub{}
+	supervisor := &accountRuntimeSupervisorStub{recoverAborted: true}
+	guardian := &accountRuntimeGuardianStub{}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{Control: control,
+		Supervisor: supervisor, Guardian: guardian, StopVerifier: accountRuntimeStopVerifierStub{},
+		TaskStopper: &accountRuntimeTaskStopperStub{}, LeaseOwner: "worker-runtime", MaxTasks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = control.Start(context.Background(), app.AccountAgentRuntimeStart{OwnerID: "u1234567",
+		RuntimeID: "aborted-runtime", LeaseOwner: "worker-runtime", SupervisorNonce: []byte(strings.Repeat("n", 32)),
+		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	control.runtime.LeaseExpiresAt = time.Now().Add(-time.Second)
+	if err := manager.stopUnattachedRuntime(context.Background(), control.runtime.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if control.runtime.State != app.AccountAgentRuntimeStopped || control.stopProofs != 1 ||
+		len(control.pendingStopProofs) != 0 || len(control.acknowledgedStopProofs) != 0 || len(guardian.runtimeProofAcks) != 0 {
+		t.Fatalf("aborted start recovery state=%q proofs=%d pending=%d DB ACK=%d Guardian ACK=%d",
+			control.runtime.State, control.stopProofs, len(control.pendingStopProofs), len(control.acknowledgedStopProofs), len(guardian.runtimeProofAcks))
 	}
 }
 

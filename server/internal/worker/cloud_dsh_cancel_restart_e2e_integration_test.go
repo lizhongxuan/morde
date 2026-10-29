@@ -3,6 +3,8 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,7 +48,7 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 		t.Fatal(err)
 	}
 	submitted, err := tasks.Submit(ctx, principal, app.SubmitTaskCommand{
-		ModelID: "p1234567", Objective: "Create a child job, then continue after it is cancelled.",
+		ModelID: "p1234567", Objective: "Answer in chat after a background child task is cancelled.",
 		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 8, ModelTokens: 1000}, IdempotencyKey: "f01-child-cancel-restart-001",
 	})
 	if err != nil {
@@ -62,7 +64,27 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 		t.Fatal(err)
 	}
 	stopKey := bytes.Repeat([]byte{0x64}, 32)
-	instances, err := newF01AgentInstances(store, stopKey)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeStopVerifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisorAuth, err := app.NewAgentStopAuthenticator("f01-child-cancel-supervisor", stopKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardianAuth, err := app.NewAgentGuardianStopAuthenticator("f01-child-cancel-supervisor", publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskGuardianAuth, err := app.NewAccountAgentTaskGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceServiceWithGuardianStops(store, supervisorAuth, agentGuardianAuth, taskGuardianAuth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,12 +97,42 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 		t.Fatal(err)
 	}
 	node, script := f01NodeRuntimePaths(t)
-	model := &cancelRestartModel{childCheckpointed: make(chan struct{}), parentRecovered: make(chan struct{})}
+	accountScript := filepath.Join(filepath.Dir(script), "bin-account.mjs")
+	model := &cancelRestartModel{childCheckpointed: make(chan struct{}), parentRecovered: make(chan struct{}), interrupted: make(chan struct{})}
 	tools := &cancelRestartTools{definition: cloudDSHWriteTool()}
-	firstSupervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
+	guardian := &f01SignedNodeTaskGuardian{key: privateKey}
+	control, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeSupervisor := func() *f01RecoveringNodeAccountSupervisor {
+		return &f01RecoveringNodeAccountSupervisor{
+			f01NodeAccountSupervisor: &f01NodeAccountSupervisor{node: node, script: accountScript},
+			recovery:                 &signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: privateKey},
+		}
+	}
+	makeRuntimeManager := func(supervisor CloudDSHAccountRuntimeSupervisor, leaseOwner string) *CloudDSHAccountRuntimeManager {
+		t.Helper()
+		manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+			Control: control, Supervisor: supervisor, Guardian: guardian, StopVerifier: runtimeStopVerifier,
+			TaskStopper: instances, LeaseOwner: leaseOwner, MaxTasks: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return manager
+	}
+	firstRuntimeSupervisor := makeSupervisor()
+	firstRuntimeManager := makeRuntimeManager(firstRuntimeSupervisor, "f01-child-cancel-runtime-old")
+	defer func() {
+		if command := firstRuntimeSupervisor.cmd; command != nil && command.Process != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
 	firstExecutor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-child-cancel-supervisor", Supervisor: firstSupervisor,
-		Instances: instances, Checkpoints: checkpoints, Children: children, Models: model, Tools: tools,
+		NodePath: node, ScriptPath: script, SupervisorID: "f01-child-cancel-supervisor", Supervisor: &cloudDSHTestSupervisor{key: stopKey},
+		AccountRuntimes: firstRuntimeManager, Instances: instances, Checkpoints: checkpoints, Children: children, Models: model, Tools: tools,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -94,14 +146,35 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 	case <-model.childCheckpointed:
 	case <-ctx.Done():
 		t.Fatalf("background child did not reach its persisted checkpoint: %v; root_calls=%d child_calls=%d writes=%d",
-			ctx.Err(), model.callCount(fenceGeneration(firstSupervisor)), model.childCallCount(fenceGeneration(firstSupervisor)), tools.writes.Load())
+			ctx.Err(), model.callCount(1), model.childCallCount(1), tools.writes.Load())
 	case err := <-firstDone:
-		t.Fatalf("first Agent stopped before background child checkpoint: %v; writes=%d child_calls=%d",
-			err, tools.writes.Load(), model.childCallCount(1))
+		firstRuntimeManager.mu.Lock()
+		runtimeSession := firstRuntimeManager.sessions[owner.ID]
+		firstRuntimeManager.mu.Unlock()
+		var runtimeFailure string
+		if runtimeSession != nil {
+			runtimeSession.mu.Lock()
+			if runtimeSession.failed != nil {
+				runtimeFailure = runtimeSession.failed.Error()
+			}
+			runtimeSession.mu.Unlock()
+		}
+		t.Fatalf("first Agent stopped before background child checkpoint: %v; runtime=%s root_calls=%d child_calls=%d writes=%d",
+			err, runtimeFailure, model.callCount(1), model.childCallCount(1), tools.writes.Load())
 	}
-	firstSupervisor.child.mu.Lock()
-	fence := firstSupervisor.child.launch.Fence
-	firstSupervisor.child.mu.Unlock()
+	rootBeforeRestart, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("read root recovery checkpoint: %v", err)
+	}
+	fence := app.AgentInstanceFence{TaskID: submitted.Task.ID, OwnerID: owner.ID,
+		AgentInstanceID: rootBeforeRestart.Task.AgentInstanceID, AgentGeneration: rootBeforeRestart.Task.AgentGeneration,
+		AgentSessionID: rootBeforeRestart.Task.AgentSessionID, SupervisorID: "f01-child-cancel-supervisor",
+		LeaseOwner: rootBeforeRestart.Task.Lease.Owner, LeaseVersion: rootBeforeRestart.Task.Lease.Version,
+		AuthorizationVersion: rootBeforeRestart.Task.Authorization.Version,
+		EngineVersion:        cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	if fence.AgentGeneration != 1 || fence.AgentSessionID == "" {
+		t.Fatalf("initial Agent fence was not persisted: %#v", fence)
+	}
 	jobs, err := children.List(ctx, fence, fence.AgentSessionID)
 	if err != nil || len(jobs) != 1 || !jobs[0].Background || jobs[0].Step.Status != task.StepRunning ||
 		jobs[0].CheckpointThrough < 0 || len(jobs[0].CheckpointDigest) != 32 {
@@ -116,26 +189,20 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 	}
 	oldChildCheckpoint := append([]byte(nil), jobs[0].CheckpointDigest...)
 	oldChildThrough := jobs[0].CheckpointThrough
-	rootBeforeRestart, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
-	if err != nil {
-		t.Fatalf("read root recovery checkpoint: %v", err)
-	}
 	oldRootCheckpointThrough := rootBeforeRestart.Task.CheckpointThroughSequence
 	oldRootCheckpointDigest := append([]byte(nil), rootBeforeRestart.Task.CheckpointDigest...)
 	if oldRootCheckpointThrough < 0 || len(oldRootCheckpointDigest) != 32 {
 		t.Fatalf("parent checkpoint was not durable before interruption: through=%d digest=%d", oldRootCheckpointThrough, len(oldRootCheckpointDigest))
 	}
 
-	firstSupervisor.child.mu.Lock()
-	oldProcess := firstSupervisor.child.cmd
-	firstSupervisor.child.mu.Unlock()
+	oldProcess := firstRuntimeSupervisor.cmd
 	if oldProcess == nil || oldProcess.Process == nil {
-		t.Fatal("real Node process was not available for restart simulation")
+		t.Fatal("real Node account Runtime was not available for restart simulation")
 	}
 	if err := oldProcess.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("stop old Node process: %v", err)
 	}
-	cancelFirst()
+	model.interrupt()
 	select {
 	case runErr := <-firstDone:
 		if runErr == nil || errors.Is(runErr, ErrCloudDSHCompletionPending) {
@@ -144,10 +211,47 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 	case <-ctx.Done():
 		t.Fatalf("old Agent did not stop and persist its receipt: %v", ctx.Err())
 	}
+	waitOldRuntime := make(chan error, 1)
+	go func() { waitOldRuntime <- oldProcess.Wait() }()
+	select {
+	case waitErr := <-waitOldRuntime:
+		if waitErr == nil || oldProcess.ProcessState == nil || oldProcess.ProcessState.ExitCode() != -1 {
+			t.Fatalf("wait for old account Runtime: %v", waitErr)
+		}
+		firstRuntimeSupervisor.cmd = nil
+	case <-ctx.Done():
+		t.Fatalf("old account Runtime did not exit: %v", ctx.Err())
+	}
 	var oldState string
 	if err := pool.QueryRow(ctx, `SELECT state FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`,
 		submitted.Task.ID, fence.AgentGeneration).Scan(&oldState); err != nil || oldState != "stopped" {
 		t.Fatalf("old Agent stop proof state=%q err=%v", oldState, err)
+	}
+	var parentStatus, parentLeaseOwner string
+	var pendingStopRequests int
+	if err := pool.QueryRow(ctx, `SELECT status,lease_owner FROM tasks WHERE id=$1`, submitted.Task.ID).
+		Scan(&parentStatus, &parentLeaseOwner); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests WHERE task_id=$1 AND status='pending'`, submitted.Task.ID).
+		Scan(&pendingStopRequests); err != nil {
+		t.Fatal(err)
+	}
+	if parentStatus != string(task.StatusRunning) || parentLeaseOwner == "" || pendingStopRequests != 0 {
+		t.Fatalf("Runtime crash cancelled its Task: status=%s lease_owner_empty=%t pending_stops=%d",
+			parentStatus, parentLeaseOwner == "", pendingStopRequests)
+	}
+	firstRuntimeManager.mu.Lock()
+	oldRuntimeSession := firstRuntimeManager.sessions[owner.ID]
+	firstRuntimeManager.mu.Unlock()
+	if oldRuntimeSession == nil {
+		t.Fatal("old account Runtime session is missing")
+	}
+	oldRuntimeFence := oldRuntimeSession.runtime.Fence
+	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime_generation=$4`,
+		oldRuntimeFence.ServiceInstanceID, owner.ID, oldRuntimeFence.RuntimeID, oldRuntimeFence.RuntimeGeneration); err != nil {
+		t.Fatal(err)
 	}
 
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, submitted.Task.ID); err != nil {
@@ -158,10 +262,17 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 		recovered.CheckpointThroughSequence != oldRootCheckpointThrough || !bytes.Equal(recovered.CheckpointDigest, oldRootCheckpointDigest) {
 		t.Fatalf("claim recoverable parent session: task=%#v found=%t err=%v", recovered, found, err)
 	}
-	secondSupervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
+	secondRuntimeSupervisor := makeSupervisor()
+	secondRuntimeManager := makeRuntimeManager(secondRuntimeSupervisor, "f01-child-cancel-runtime-new")
+	defer func() {
+		if command := secondRuntimeSupervisor.cmd; command != nil && command.Process != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
 	secondExecutor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-child-cancel-supervisor", Supervisor: secondSupervisor,
-		Instances: instances, Checkpoints: checkpoints, Children: children, Models: model, Tools: tools,
+		NodePath: node, ScriptPath: script, SupervisorID: "f01-child-cancel-supervisor", Supervisor: &cloudDSHTestSupervisor{key: stopKey},
+		AccountRuntimes: secondRuntimeManager, Instances: instances, Checkpoints: checkpoints, Children: children, Models: model, Tools: tools,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -203,14 +314,6 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3`, submitted.Task.ID, ow
 	}
 }
 
-func newF01AgentInstances(store app.AgentInstanceStore, key []byte) (*app.AgentInstanceService, error) {
-	auth, err := app.NewAgentStopAuthenticator("f01-child-cancel-supervisor", key)
-	if err != nil {
-		return nil, err
-	}
-	return app.NewAgentInstanceService(store, auth)
-}
-
 func f01NodeRuntimePaths(t *testing.T) (string, string) {
 	t.Helper()
 	node, err := exec.LookPath("node")
@@ -237,8 +340,10 @@ type cancelRestartModel struct {
 	childCalls        map[int64]int
 	childCheckpointed chan struct{}
 	parentRecovered   chan struct{}
+	interrupted       chan struct{}
 	childOnce         sync.Once
 	parentOnce        sync.Once
+	interruptOnce     sync.Once
 }
 
 func (m *cancelRestartModel) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
@@ -304,9 +409,15 @@ func (m *cancelRestartModel) Complete(ctx context.Context, call app.ModelCall) (
 			StopReason: "tool_calls", Usage: usage}, nil
 	}
 	m.childOnce.Do(func() { close(m.childCheckpointed) })
-	<-ctx.Done()
-	return app.ModelResponse{}, ctx.Err()
+	select {
+	case <-ctx.Done():
+		return app.ModelResponse{}, ctx.Err()
+	case <-m.interrupted:
+		return app.ModelResponse{}, errors.New("test Runtime stopped during the model request")
+	}
 }
+
+func (m *cancelRestartModel) interrupt() { m.interruptOnce.Do(func() { close(m.interrupted) }) }
 
 func (m *cancelRestartModel) childCallCount(generation int64) int {
 	m.mu.Lock()
@@ -318,12 +429,6 @@ func (m *cancelRestartModel) callCount(generation int64) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.rootCalls[generation]
-}
-
-func fenceGeneration(supervisor *f01CapturingSupervisor) int64 {
-	supervisor.child.mu.Lock()
-	defer supervisor.child.mu.Unlock()
-	return supervisor.child.launch.Fence.AgentGeneration
 }
 
 type cancelRestartTools struct {

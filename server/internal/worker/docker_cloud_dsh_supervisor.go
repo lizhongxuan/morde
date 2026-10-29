@@ -24,10 +24,10 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/dockerapi"
 )
 
 const (
-	dockerDSHAPIVersion = "/v1.43"
 	dockerDSHUser       = "65532:65532"
 	dockerDSHMemory     = int64(512 << 20)
 	dockerDSHNanoCPUs   = int64(1_000_000_000)
@@ -76,6 +76,7 @@ type DockerCloudDSHSupervisor struct {
 	options DockerCloudDSHSupervisorOptions
 	socket  string
 	client  *http.Client
+	api     *dockerapi.EndpointResolver
 	mu      sync.Mutex
 	active  map[app.AgentInstanceFence]*dockerDSHState
 }
@@ -101,7 +102,9 @@ func NewDockerCloudDSHSupervisor(options DockerCloudDSHSupervisorOptions) (*Dock
 	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", endpoint.Path)
 	}, DisableCompression: true}
-	return &DockerCloudDSHSupervisor{options: options, socket: endpoint.Path, client: &http.Client{Transport: transport}, active: make(map[app.AgentInstanceFence]*dockerDSHState)}, nil
+	client := &http.Client{Transport: transport}
+	return &DockerCloudDSHSupervisor{options: options, socket: endpoint.Path, client: client,
+		api: dockerapi.NewEndpointResolver(client), active: make(map[app.AgentInstanceFence]*dockerDSHState)}, nil
 }
 
 func cleanDockerDSHPath(path string) bool {
@@ -482,13 +485,21 @@ func (s *DockerCloudDSHSupervisor) validateContainer(value dockerDSHInspect, gua
 	if err != nil {
 		return err
 	}
+	if !s.validContainerIsolation(value, s.options.ScriptPath, running) ||
+		value.ID != guard.ContainerID || value.Name != "/"+guard.ContainerName ||
+		value.Config.Labels[dockerDSHFenceLabel] != string(encoded) || value.Config.Labels[dockerDSHNonceLabel] != guard.NonceSHA256 {
+		return errors.New("docker dsh isolation contract mismatch")
+	}
+	return nil
+}
+
+func (s *DockerCloudDSHSupervisor) validContainerIsolation(value dockerDSHInspect, scriptPath string, running bool) bool {
 	config, host := value.Config, value.HostConfig
 	wantEnv := []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}
 	wantEntrypoint := []string{"/usr/bin/env", "-i", wantEnv[0], wantEnv[1], wantEnv[2], s.options.NodePath}
 	if value.State == nil || value.State.Running == nil || value.State.Restarting == nil || value.State.Paused == nil || value.State.PID == nil ||
-		value.ID != guard.ContainerID || value.Name != "/"+guard.ContainerName || config.Labels[dockerDSHFenceLabel] != string(encoded) ||
-		config.Labels[dockerDSHNonceLabel] != guard.NonceSHA256 || config.Image != s.options.Image || config.User != dockerDSHUser ||
-		!equalDockerDSHEnv(config.Env, wantEnv) || !slices.Equal(config.Entrypoint, wantEntrypoint) || !slices.Equal(config.Cmd, []string{s.options.ScriptPath}) ||
+		config.Image != s.options.Image || config.User != dockerDSHUser ||
+		!equalDockerDSHEnv(config.Env, wantEnv) || !slices.Equal(config.Entrypoint, wantEntrypoint) || !slices.Equal(config.Cmd, []string{scriptPath}) ||
 		len(config.Volumes) != 0 || !config.OpenStdin || !config.AttachStdin || !config.AttachStdout || config.AttachStderr || !config.StdinOnce || config.Tty || !config.NetworkDisabled ||
 		config.Healthcheck == nil || !slices.Equal(config.Healthcheck.Test, []string{"NONE"}) ||
 		host.NetworkMode != "none" || !host.ReadonlyRootfs || host.Privileged || !slices.Contains(host.CapDrop, "ALL") || len(host.CapAdd) != 0 ||
@@ -498,9 +509,9 @@ func (s *DockerCloudDSHSupervisor) validateContainer(value dockerDSHInspect, gua
 		(host.PidMode != "" && host.PidMode != "private") || host.Init == nil || !*host.Init || host.AutoRemove ||
 		len(host.Binds) != 0 || len(host.Mounts) != 0 || len(host.Devices) != 0 || len(host.DeviceRequests) != 0 || len(host.VolumesFrom) != 0 || len(value.Mounts) != 0 ||
 		host.LogConfig.Type != "none" || host.RestartPolicy.Name != "no" || *value.State.Restarting || *value.State.Paused || (running && !*value.State.Running) {
-		return errors.New("docker dsh isolation contract mismatch")
+		return false
 	}
-	return nil
+	return true
 }
 
 func equalDockerDSHEnv(got, expected []string) bool {
@@ -532,7 +543,11 @@ func (s *DockerCloudDSHSupervisor) requestJSON(ctx context.Context, method, path
 		}
 		reader = bytes.NewReader(encoded)
 	}
-	request, err := http.NewRequestWithContext(requestCtx, method, "http://docker"+dockerDSHAPIVersion+path, reader)
+	endpoint, err := s.api.Endpoint(requestCtx, path)
+	if err != nil {
+		return errors.New("docker Engine API version is unsupported")
+	}
+	request, err := http.NewRequestWithContext(requestCtx, method, endpoint, reader)
 	if err != nil {
 		return errors.New("invalid docker request")
 	}
@@ -563,7 +578,11 @@ func (s *DockerCloudDSHSupervisor) requestJSON(ctx context.Context, method, path
 func (s *DockerCloudDSHSupervisor) requireAbsent(ctx context.Context, id string) error {
 	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "http://docker"+dockerDSHAPIVersion+"/containers/"+url.PathEscape(id)+"/json", nil)
+	endpoint, err := s.api.Endpoint(requestCtx, "/containers/"+url.PathEscape(id)+"/json")
+	if err != nil {
+		return errors.New("docker Engine API version is unsupported")
+	}
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return errors.New("invalid docker inspection")
 	}
@@ -592,7 +611,12 @@ func (s *DockerCloudDSHSupervisor) attach(ctx context.Context, id string) (io.Wr
 		_ = conn.Close()
 		return nil, nil, errors.New("docker attach deadline failed")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker"+dockerDSHAPIVersion+"/containers/"+id+"/attach?stream=1&stdin=1&stdout=1&stderr=0&logs=0", nil)
+	endpoint, err := s.api.Endpoint(ctx, "/containers/"+id+"/attach?stream=1&stdin=1&stdout=1&stderr=0&logs=0")
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, errors.New("docker Engine API version is unsupported")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
 		_ = conn.Close()
 		return nil, nil, errors.New("docker attach request is invalid")

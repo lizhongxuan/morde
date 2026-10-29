@@ -16,7 +16,8 @@ LimitNOFILE=infinity
 TasksMax=infinity
 Delegate=yes
 KillMode=process
-UMask=0027
+# Preserve image layer permissions so non-root containers can traverse their root filesystem.
+UMask=0022
 RuntimeDirectory=morde-dsh-containerd
 RuntimeDirectoryMode=0755
 StateDirectory=morde-dsh-containerd

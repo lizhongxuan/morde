@@ -64,7 +64,7 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime fence cannot be encoded")
 	}
 	identity := sha256.Sum256(append(append(encodedFence, 0), nonceDigest[:]...))
-	name := "morde-account-agent-" + hex.EncodeToString(identity[:])
+	name := "morde-account-runtime-" + hex.EncodeToString(identity[:])
 	labels := map[string]string{dockerAccountRuntimeFenceLabel: string(encodedFence), dockerAccountRuntimeNonceLabel: nonceHash}
 	guard := dshguardian.AccountRuntimeGuard{ContainerName: name, Fence: fence, NonceSHA256: nonceHash, ExpiresAt: expires}
 	if err := s.docker.validateImage(ctx); err != nil {
@@ -79,13 +79,20 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 	}
 	guard.ContainerID = created.ID
 	preflight, err := s.docker.inspect(ctx, created.ID)
-	if err != nil || validateDockerAccountRuntime(preflight, guard, false) != nil || *preflight.State.Running || *preflight.State.PID != 0 {
+	if err != nil || s.validateAccountRuntime(preflight, guard, false) != nil || *preflight.State.Running || *preflight.State.PID != 0 {
+		if s.cleanupUnstartedContainer(ctx, created.ID, name) != nil {
+			return CloudDSHAccountRuntimeProcess{}, errors.New("unverified account Agent Runtime container cleanup is unconfirmed")
+		}
 		return CloudDSHAccountRuntimeProcess{}, errors.New("created account Agent Runtime container does not match its identity")
 	}
 	if err := s.guardian.ArmAccountRuntime(ctx, guard); err != nil {
+		if s.cleanupUnstartedContainer(ctx, created.ID, name) != nil {
+			return CloudDSHAccountRuntimeProcess{}, errors.New("unguarded account Agent Runtime container cleanup is unconfirmed")
+		}
 		return CloudDSHAccountRuntimeProcess{}, errors.New("guardian could not arm the account Agent Runtime")
 	}
-	input, output, err := s.docker.attach(ctx, created.ID)
+	// The attach stream belongs to the account Runtime, not the Task that started it.
+	input, output, err := s.docker.attach(context.WithoutCancel(ctx), created.ID)
 	if err != nil {
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
 		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime pipes could not be attached")
@@ -97,7 +104,7 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime container could not be started")
 	}
 	started, err := s.docker.inspect(ctx, created.ID)
-	if err != nil || validateDockerAccountRuntime(started, guard, true) != nil || !*started.State.Running || *started.State.PID < 2 {
+	if err != nil || s.validateAccountRuntime(started, guard, true) != nil || !*started.State.Running || *started.State.PID < 2 {
 		_ = input.Close()
 		_ = output.Close()
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
@@ -118,13 +125,26 @@ func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context
 	return CloudDSHAccountRuntimeProcess{ContainerID: created.ID, ContainerName: name, Input: input, Output: output}, nil
 }
 
-func validateDockerAccountRuntime(value dockerDSHInspect, guard dshguardian.AccountRuntimeGuard, running bool) error {
+func (s *dockerCloudDSHAccountRuntimeSupervisor) cleanupUnstartedContainer(ctx context.Context, id, name string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	removeErr := s.docker.requestJSON(cleanupCtx, http.MethodDelete, "/containers/"+id+"?force=0&v=0", nil, http.StatusNoContent, nil)
+	if removeErr != nil && !errors.Is(removeErr, errDockerObjectNotFound) {
+		return removeErr
+	}
+	if err := s.docker.requireAbsent(cleanupCtx, id); err != nil {
+		return err
+	}
+	return s.docker.requireAbsent(cleanupCtx, name)
+}
+
+func (s *dockerCloudDSHAccountRuntimeSupervisor) validateAccountRuntime(value dockerDSHInspect, guard dshguardian.AccountRuntimeGuard, running bool) error {
 	encodedFence, err := json.Marshal(guard.Fence)
-	if err != nil || value.State == nil || value.State.Running == nil || value.State.Restarting == nil || value.State.Paused == nil || value.State.PID == nil ||
+	scriptPath := filepath.Join(filepath.Dir(s.docker.options.ScriptPath), "bin-account.mjs")
+	if err != nil || !s.docker.validContainerIsolation(value, scriptPath, running) ||
 		value.ID != guard.ContainerID || value.Name != "/"+guard.ContainerName ||
 		value.Config.Labels[dockerAccountRuntimeFenceLabel] != string(encodedFence) ||
-		value.Config.Labels[dockerAccountRuntimeNonceLabel] != guard.NonceSHA256 || *value.State.Restarting || *value.State.Paused ||
-		(running && !*value.State.Running) {
+		value.Config.Labels[dockerAccountRuntimeNonceLabel] != guard.NonceSHA256 {
 		return errors.New("account Agent Runtime container identity mismatch")
 	}
 	return nil

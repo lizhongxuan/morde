@@ -1249,10 +1249,10 @@ func TestPostgresClarificationAnswerIsVersionedIdempotentAndRestorable(t *testin
 		OwnerID: owner.ID, Operation: "task.clarification.answer", Key: "clarification-answer-key",
 		RequestHash: hashBytes("answer:" + answer), ResourceID: claimed.ID, RelatedID: requestID,
 	}
-	if err := store.AnswerClarificationRequest(ctx, record, claimed.ID, requestID, 1, answer); err != nil {
+	if err := store.AnswerClarificationRequest(ctx, record, claimed.ID, requestID, 1, answer, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AnswerClarificationRequest(ctx, record, claimed.ID, requestID, 1, answer); err != nil {
+	if err := store.AnswerClarificationRequest(ctx, record, claimed.ID, requestID, 1, answer, "", ""); err != nil {
 		t.Fatalf("idempotent answer replay: %v", err)
 	}
 	details, err = store.GetTask(ctx, claimed.ID, owner.ID)
@@ -1271,8 +1271,75 @@ func TestPostgresClarificationAnswerIsVersionedIdempotentAndRestorable(t *testin
 	stale := record
 	stale.Key = "clarification-answer-stale"
 	stale.RequestHash = hashBytes("stale")
-	if err := store.AnswerClarificationRequest(ctx, stale, claimed.ID, requestID, 2, "other answer"); domain.CodeOf(err) != domain.CodeConflict {
+	if err := store.AnswerClarificationRequest(ctx, stale, claimed.ID, requestID, 2, "other answer", "", ""); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("stale clarification version error = %v", err)
+	}
+}
+
+func TestPostgresInitialFileDeliveryClarificationIsDurableAndAtomic(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "file-intent-task", "Write a report about the project.")
+	classificationStepID := mustID(t, domain.NewStepID)
+	clarificationStepID := mustID(t, domain.NewStepID)
+	requestID := mustID(t, domain.NewPendingRequestID)
+	question := "Do you need a file saved in this Workspace, or is a chat answer enough?"
+	submission.Task.FileDeliveryIntent = task.FileDeliveryUnclear
+	submission.Task.Status = task.StatusWaitingUser
+	submission.Task.WaitingReason = "clarification_required"
+	submission.Task.CurrentStep = clarificationStepID
+	submission.InitialEvent = task.Event{Type: "task.waiting_user", Payload: []byte(`{"status":"waiting_user","reason":"clarification_required"}`)}
+	submission.InitialSteps = []task.Step{
+		{ID: classificationStepID, TaskID: submission.Task.ID, Sequence: 1, Kind: "verification", Status: task.StepSucceeded,
+			Title: "Check file delivery intent", Summary: "The server could not determine whether a file is required."},
+		{ID: clarificationStepID, TaskID: submission.Task.ID, Sequence: 2, Kind: "clarification", Status: task.StepWaitingUser,
+			Title: "Confirm file delivery", Summary: question},
+	}
+	submission.InitialClarificationRequest = &task.ClarificationRequest{
+		ID: requestID, TaskID: submission.Task.ID, Version: 1, ModelStepID: classificationStepID,
+		CallID: app.FileDeliveryIntentClarificationCallID, Question: question, Status: task.ClarificationPending,
+	}
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusWaitingUser || details.Task.FileDeliveryIntent != task.FileDeliveryUnclear ||
+		len(details.Steps) != 2 || len(details.ClarificationRequests) != 1 || details.ClarificationRequests[0].ID != requestID {
+		t.Fatalf("submitted file clarification = %#v, err=%v", details, err)
+	}
+
+	append := newTestTaskSubmission(t, owner.ID, hostValue.ID, "append-before-file-answer", "continue")
+	append.Task.ConversationID = created.Task.ConversationID
+	append.Message.ConversationID = created.Task.ConversationID
+	append.Idempotency.Operation = "conversation.append_message"
+	if _, err := store.AppendMessage(ctx, append); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("append bypassed pending file clarification: %v", err)
+	}
+
+	answer := "不需要文件，只要聊天答复"
+	objective := submission.Task.Objective + "\n\nUser clarification about file delivery: " + answer
+	requiredRecord := testIdempotency(owner.ID, "task.clarification.answer", "file-intent-required")
+	requiredRecord.ResourceID, requiredRecord.RelatedID = created.Task.ID, requestID
+	if err := store.AnswerClarificationRequest(ctx, requiredRecord, created.Task.ID, requestID, 1, "需要交付文件", task.FileDeliveryRequired, submission.Task.Objective+"\n\nUser clarification about file delivery: 需要交付文件"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("file delivery without Workspace error = %v", err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusWaitingUser || details.ClarificationRequests[0].Status != task.ClarificationPending {
+		t.Fatalf("rejected answer changed pending task state: %#v, err=%v", details, err)
+	}
+	answerRecord := testIdempotency(owner.ID, "task.clarification.answer", "file-intent-chat-only")
+	answerRecord.ResourceID, answerRecord.RelatedID = created.Task.ID, requestID
+	if err := store.AnswerClarificationRequest(ctx, answerRecord, created.Task.ID, requestID, 1, answer, task.FileDeliveryNone, objective); err != nil {
+		t.Fatal(err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusQueued || details.Task.FileDeliveryIntent != task.FileDeliveryNone ||
+		details.Task.Objective != objective || details.Task.Lease.Version != created.Task.Lease.Version+1 ||
+		details.ClarificationRequests[0].Status != task.ClarificationAnswered || details.ClarificationRequests[0].Answer != answer {
+		t.Fatalf("resolved file clarification = %#v, err=%v", details, err)
 	}
 }
 

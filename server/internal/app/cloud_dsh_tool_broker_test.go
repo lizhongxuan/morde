@@ -841,12 +841,20 @@ func TestCloudDSHFileDeliveryIntentUsesTaskTextConservatively(t *testing.T) {
 		{name: "ambiguous report", objective: "Write a report about the project.", want: task.FileDeliveryUnclear},
 		{name: "ambiguous note about Workspace", objective: "Write a note about the Workspace.", hasWorkspace: true, want: task.FileDeliveryUnclear},
 		{name: "ambiguous Chinese report", objective: "写一份项目报告。", want: task.FileDeliveryUnclear},
+		{name: "colloquial Chinese report", objective: "帮我做一份项目报告。", want: task.FileDeliveryUnclear},
+		{name: "colloquial Chinese spreadsheet", objective: "做个 Excel 表格。", want: task.FileDeliveryRequired},
 		{name: "ordinary explanation", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
 		{name: "ordinary Chinese explanation", objective: "解释一下错误原因。", want: task.FileDeliveryNone},
 		{name: "explicit Chinese chat only", objective: "不要生成文件，直接用文字回答。", want: task.FileDeliveryNone},
+		{name: "Chinese no file write", objective: "不要写文件，只要在聊天里回答。", want: task.FileDeliveryNone},
+		{name: "Chinese no Workspace write", objective: "不要在工作区写文件，只在聊天说明。", hasWorkspace: true, want: task.FileDeliveryNone},
+		{name: "Chinese no file save", objective: "不需要保存文件，解释结论即可。", want: task.FileDeliveryNone},
+		{name: "English no file create", objective: "Don't create any files; just answer in chat.", want: task.FileDeliveryNone},
+		{name: "English no Workspace write", objective: "Do not write the file to the Workspace; answer in chat.", hasWorkspace: true, want: task.FileDeliveryNone},
 		{name: "explicit chat only", objective: "Create a PDF report, but no file is needed; explain it in chat.", want: task.FileDeliveryUnclear},
 		{name: "conflicting Chinese code edit", objective: "不要生成文件，直接修改工作区代码。", hasWorkspace: true, want: task.FileDeliveryUnclear},
 		{name: "conflicting file delivery", objective: "Do not create a file, but save a PDF report in the Workspace.", hasWorkspace: true, want: task.FileDeliveryUnclear},
+		{name: "conflicting file write", objective: "Do not write a file, but save the PDF report in the Workspace.", hasWorkspace: true, want: task.FileDeliveryUnclear},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := ClassifyFileDeliveryIntent(test.objective, test.hasWorkspace); got != test.want {
@@ -858,13 +866,14 @@ func TestCloudDSHFileDeliveryIntentUsesTaskTextConservatively(t *testing.T) {
 
 func TestCloudDSHToolBrokerPausesWhenTaskTextRequiresMissingFile(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		objective string
-		hostless  bool
-		reason    string
+		name              string
+		objective         string
+		hostless          bool
+		reason            string
+		wantClarification bool
 	}{
 		{name: "required file", objective: "Create and save a PDF report.", reason: "file_delivery_required"},
-		{name: "unclear report", objective: "Write a report about the project.", reason: "file_delivery_unclear"},
+		{name: "unclear report", objective: "Write a report about the project.", reason: "clarification_required", wantClarification: true},
 		{name: "hostless file", objective: "Create and save a PDF report.", hostless: true, reason: "file_delivery_required"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -875,6 +884,12 @@ func TestCloudDSHToolBrokerPausesWhenTaskTextRequiresMissingFile(t *testing.T) {
 			if test.hostless {
 				store.details.Task.HostID = ""
 			}
+			if test.wantClarification {
+				store.details.ClarificationRequests = []task.ClarificationRequest{{
+					ID: "r1234567", TaskID: store.details.Task.ID, Version: 1, CallID: "call-previous",
+					Question: "Which environment?", Answer: "staging", Status: task.ClarificationAnswered,
+				}}
+			}
 			setCloudDSHCompletionFence(&store.details.Task)
 			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
 			if err != nil {
@@ -884,9 +899,18 @@ func TestCloudDSHToolBrokerPausesWhenTaskTextRequiresMissingFile(t *testing.T) {
 			if err := broker.Complete(context.Background(), claimed, cloudDSHCompletionFor(claimed, "Done.", nil)); err != nil {
 				t.Fatalf("Complete() error = %v", err)
 			}
-			if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != test.reason ||
-				store.details.Task.Result != "" || len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown {
+			if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != test.reason || store.details.Task.Result != "" {
 				t.Fatalf("missing file did not pause task: task=%#v steps=%#v", store.details.Task, store.details.Steps)
+			}
+			if test.wantClarification {
+				if len(store.details.Steps) != 2 || len(store.details.ClarificationRequests) != 2 ||
+					store.details.ClarificationRequests[1].CallID != FileDeliveryIntentClarificationCallID ||
+					store.details.ClarificationRequests[1].Version != 2 ||
+					store.details.ClarificationRequests[1].Status != task.ClarificationPending {
+					t.Fatalf("unclear file intent did not create an answerable request: %#v", store.details)
+				}
+			} else if len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown {
+				t.Fatalf("required file pause did not preserve its verification step: %#v", store.details.Steps)
 			}
 		})
 	}

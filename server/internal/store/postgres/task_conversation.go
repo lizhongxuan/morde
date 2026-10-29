@@ -224,6 +224,9 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 	if err := validateTask(submission.Task); err != nil {
 		return app.TaskSubmissionResult{}, err
 	}
+	if err := validateInitialFileDeliveryClarification(submission); err != nil {
+		return app.TaskSubmissionResult{}, err
+	}
 	message := submission.Message
 	message.TaskID = submission.Task.ID
 	if message.Role != conversation.RoleUser {
@@ -309,6 +312,9 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		if err := insertTask(ctx, tx, submission.Task, 1, gate.epoch); err != nil {
 			return err
 		}
+		if err := insertInitialFileDeliveryClarification(ctx, tx, submission); err != nil {
+			return err
+		}
 		if err := insertTaskMCPConnectorGrants(ctx, tx, submission.Task.OwnerID, submission.Task.ID, submission.MCPConnectorIDs); err != nil {
 			return err
 		}
@@ -376,18 +382,20 @@ func (s *Store) AppendMessage(ctx context.Context, submission app.TaskSubmission
 			return err
 		}
 		var active sqlcgen.Task
+		var fileIntentClarificationPending bool
 		err = tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens,
 lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, application_id,
-workspace_id, input_revision, context_digest, file_delivery_intent
+workspace_id, input_revision, context_digest, file_delivery_intent,
+EXISTS (SELECT 1 FROM task_clarification_requests r WHERE r.task_id=tasks.id AND r.call_id=$3 AND r.status='pending')
 FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','running','waiting_user','pausing','cancelling') FOR UPDATE`,
-			message.ConversationID, message.OwnerID).Scan(
+			message.ConversationID, message.OwnerID, app.FileDeliveryIntentClarificationCallID).Scan(
 			&active.ID, &active.OwnerID, &active.ConversationID, &active.HostID, &active.ModelID, &active.Objective, &active.Status,
 			&active.AuthKind, &active.AuthTokenID, &active.AuthScopes, &active.AuthClientInstallationID, &active.BudgetActiveSeconds, &active.BudgetToolCalls,
 			&active.BudgetModelTokens, &active.UsageActiveSeconds, &active.UsageToolCalls, &active.UsageModelTokens,
 			&active.LeaseOwner, &active.LeaseVersion, &active.LeaseExpiresAt, &active.EventSeq, &active.CurrentStep,
 			&active.Result, &active.WaitingReason, &active.CreatedAt, &active.UpdatedAt, &active.FinishedAt, &active.ApplicationID,
-			&active.WorkspaceID, &active.InputRevision, &active.ContextDigest, &active.FileDeliveryIntent)
+			&active.WorkspaceID, &active.InputRevision, &active.ContextDigest, &active.FileDeliveryIntent, &fileIntentClarificationPending)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("find active conversation task: %w", err)
 		}
@@ -457,7 +465,13 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 			}
 			return err
 		}
+		if !newTask && fileIntentClarificationPending {
+			return domain.NewError(domain.CodeInvalidState, "answer the file delivery clarification before appending another message")
+		}
 		if newTask {
+			if err := validateInitialFileDeliveryClarification(submission); err != nil {
+				return err
+			}
 			payload, err := validateInitialTaskEvent(submission.InitialEvent.Type, submission.InitialEvent.Payload)
 			if err != nil {
 				return err
@@ -466,6 +480,9 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 				return err
 			}
 			if err := insertTask(ctx, tx, targetTask, 1, gate.epoch); err != nil {
+				return err
+			}
+			if err := insertInitialFileDeliveryClarification(ctx, tx, submission); err != nil {
 				return err
 			}
 			if err := insertTaskMCPConnectorGrants(ctx, tx, targetTask.OwnerID, targetTask.ID, submission.MCPConnectorIDs); err != nil {
@@ -517,6 +534,52 @@ WHERE id=$1 RETURNING event_seq`, targetTask.ID, status, string(submission.Task.
 		return err
 	})
 	return result, err
+}
+
+func validateInitialFileDeliveryClarification(submission app.TaskSubmission) error {
+	request := submission.InitialClarificationRequest
+	if request == nil {
+		if len(submission.InitialSteps) != 0 || submission.Task.Status != task.StatusQueued {
+			return domain.InvalidArgument("clarification", "initial file delivery clarification is incomplete")
+		}
+		return nil
+	}
+	if len(submission.InitialSteps) != 2 || submission.Task.Status != task.StatusWaitingUser ||
+		submission.Task.WaitingReason != "clarification_required" || submission.Task.FileDeliveryIntent != task.FileDeliveryUnclear ||
+		request.TaskID != submission.Task.ID || request.Version != 1 || request.CallID != app.FileDeliveryIntentClarificationCallID ||
+		request.Status != task.ClarificationPending || !domain.ValidPendingRequestID(request.ID) ||
+		!validClarificationQuestion(request.Question) || request.Answer != "" || request.RespondedAt != nil {
+		return domain.InvalidArgument("clarification", "initial file delivery clarification is invalid")
+	}
+	classification, clarification := submission.InitialSteps[0], submission.InitialSteps[1]
+	if !domain.ValidStepID(classification.ID) || !domain.ValidStepID(clarification.ID) ||
+		classification.ID == clarification.ID || classification.TaskID != submission.Task.ID || clarification.TaskID != submission.Task.ID ||
+		classification.Sequence != 1 || clarification.Sequence != 2 || classification.Kind != "verification" ||
+		classification.Status != task.StepSucceeded || clarification.Kind != "clarification" ||
+		clarification.Status != task.StepWaitingUser || submission.Task.CurrentStep != clarification.ID ||
+		request.ModelStepID != classification.ID || clarification.Summary != request.Question ||
+		submission.InitialEvent.Type != "task.waiting_user" {
+		return domain.InvalidArgument("clarification", "initial file delivery clarification steps do not match the task")
+	}
+	return nil
+}
+
+func insertInitialFileDeliveryClarification(ctx context.Context, tx pgx.Tx, submission app.TaskSubmission) error {
+	if submission.InitialClarificationRequest == nil {
+		return nil
+	}
+	for _, step := range submission.InitialSteps {
+		if _, err := tx.Exec(ctx, `INSERT INTO task_steps (id, task_id, sequence, kind, status, title, summary) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			step.ID, step.TaskID, step.Sequence, step.Kind, string(step.Status), step.Title, step.Summary); err != nil {
+			return fmt.Errorf("persist initial task step: %w", err)
+		}
+	}
+	request := submission.InitialClarificationRequest
+	if _, err := tx.Exec(ctx, `INSERT INTO task_clarification_requests (id, task_id, version, model_step_id, call_id, question, status)
+VALUES ($1,$2,$3,$4,$5,$6,'pending')`, request.ID, request.TaskID, request.Version, request.ModelStepID, request.CallID, request.Question); err != nil {
+		return fmt.Errorf("persist initial task clarification: %w", err)
+	}
+	return nil
 }
 
 // Hold the Host lock so deletion cannot race a task target check.

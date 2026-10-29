@@ -77,6 +77,7 @@ docker run --rm --platform "$platform" --network none \
   chown -R 1000:1000 /home/gem/.bashrc /home/gem/.config
 '
 # GUI readiness and Chromium sandboxing are verified separately on isolated Linux.
+# shortcut: Docker Desktop's emulated Jupyter prewarm blocks AIO, remove this override after native Linux Jupyter verification.
 container="$(docker run -d --platform "$platform" --network none \
   --mount "type=volume,src=$profile_volume,dst=/home/gem" \
   --mount "type=volume,src=$workspace_volume,dst=/home/gem/workspace" \
@@ -87,6 +88,7 @@ container="$(docker run -d --platform "$platform" --network none \
   --env MORDE_HOST_ID=h1234567 \
   --env MORDE_RUNTIME_GENERATION=1 \
   --env SANDBOX_API_KEY=synthetic-aio-key \
+  --env JUPYTER_POOL_SIZE=0 \
   --env DISABLE_BROWSER=true "$image")"
 
 ready=false
@@ -229,6 +231,7 @@ container="$(docker run -d --platform "$platform" --network none \
   --env MORDE_HOST_ID=h1234567 \
   --env MORDE_RUNTIME_GENERATION=1 \
   --env SANDBOX_API_KEY=synthetic-aio-key \
+  --env JUPYTER_POOL_SIZE=0 \
   --env DISABLE_BROWSER=true "$image")"
 ready=false
 deadline=$((SECONDS + 90))

@@ -71,13 +71,15 @@ type IdempotencyRecord struct {
 }
 
 type TaskSubmission struct {
-	Conversation    *conversation.Conversation
-	Task            task.Task
-	Message         conversation.Message
-	InitialEvent    task.Event
-	BatchItems      []task.BatchItem
-	MCPConnectorIDs []string
-	Idempotency     IdempotencyRecord
+	Conversation                *conversation.Conversation
+	Task                        task.Task
+	Message                     conversation.Message
+	InitialEvent                task.Event
+	InitialSteps                []task.Step
+	InitialClarificationRequest *task.ClarificationRequest
+	BatchItems                  []task.BatchItem
+	MCPConnectorIDs             []string
+	Idempotency                 IdempotencyRecord
 }
 
 type TaskSubmissionResult struct {
@@ -181,7 +183,7 @@ type TaskStore interface {
 	UpdateBatchItem(context.Context, string, task.BatchItem, string, int64) (task.BatchItem, error)
 	RetryFailedBatchItem(context.Context, IdempotencyRecord, string, string) error
 	RespondToPendingRequest(context.Context, IdempotencyRecord, string, string, int64, task.PendingDecision) error
-	AnswerClarificationRequest(context.Context, IdempotencyRecord, string, string, int64, string) error
+	AnswerClarificationRequest(context.Context, IdempotencyRecord, string, string, int64, string, task.FileDeliveryIntent, string) error
 	// RecordValidatedArtifact persists batch artifact proof after the caller reads it back from a committed Workspace revision.
 	RecordValidatedArtifact(context.Context, string, task.Artifact, string, int64) (task.Artifact, error)
 }

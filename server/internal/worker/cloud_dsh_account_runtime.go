@@ -132,12 +132,17 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID str
 		return nil, errors.New("account Agent Runtime container could not start")
 	}
 	if process.Input == nil || process.Output == nil || process.ContainerID == "" || process.ContainerName == "" {
-		_ = process.Input.Close()
-		_ = process.Output.Close()
+		if process.Input != nil {
+			_ = process.Input.Close()
+		}
+		if process.Output != nil {
+			_ = process.Output.Close()
+		}
 		return nil, errors.New("account Agent Runtime supervisor returned incomplete pipes")
 	}
 	frames := make(chan cloudDSHRead, 32)
-	go readCloudDSHFrames(ctx, process.Output, frames)
+	// The account Runtime outlives the Task that first acquires it.
+	go readCloudDSHFrames(context.Background(), process.Output, frames)
 	start := map[string]any{"type": "runtime_start", "version": 1, "server_instance_id": runtime.Fence.ServiceInstanceID,
 		"owner_id": runtime.Fence.OwnerID, "runtime_id": runtime.Fence.RuntimeID,
 		"runtime_generation": runtime.Fence.RuntimeGeneration, "max_concurrent_tasks": runtime.MaxConcurrentTasks}
@@ -166,7 +171,8 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID str
 	}
 	session := &cloudDSHAccountRuntimeSession{manager: m, runtime: ready, process: process, frames: frames,
 		leaseExpiresAt: ready.LeaseExpiresAt, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask),
-		input: &cloudDSHRuntimeInput{target: process.Input}}
+		stopped: make(map[cloudDSHIdentity]struct{}),
+		input:   &cloudDSHRuntimeInput{target: process.Input}}
 	go session.route()
 	m.sessions[ownerID] = session
 	return session, nil
@@ -362,6 +368,9 @@ func (m *CloudDSHAccountRuntimeManager) reapAccountRuntimeStopProofAcknowledgeme
 
 func (m *CloudDSHAccountRuntimeManager) acknowledgeAccountRuntimeStopProof(ctx context.Context,
 	attestation app.AccountAgentRuntimeStopAttestation) error {
+	if attestation.StartAborted {
+		return nil
+	}
 	if err := m.options.Guardian.AcknowledgeAccountRuntimeStopped(ctx, attestation.Fence,
 		attestation.NonceSHA256, attestation.ProofSHA256); err != nil {
 		return fmt.Errorf("acknowledge Guardian account Runtime proof for owner %s: %w", attestation.Fence.OwnerID, err)
@@ -395,8 +404,10 @@ type cloudDSHAccountRuntimeSession struct {
 	frames         <-chan cloudDSHRead
 	input          *cloudDSHRuntimeInput
 	mu             sync.Mutex
+	startMu        sync.Mutex
 	renewMu        sync.Mutex
 	tasks          map[app.AgentInstanceFence]*cloudDSHAccountTask
+	stopped        map[cloudDSHIdentity]struct{}
 	failed         error
 }
 
@@ -447,7 +458,14 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 	if json.Unmarshal(frame["type"], &kind) != nil {
 		return errors.New("account Agent Runtime frame type is missing")
 	}
-	if kind == "runtime_stopped" || kind == "failed" || kind == "protocol_error" {
+	if kind == "runtime_stopped" || kind == "protocol_error" {
+		var code string
+		if len(frame["code"]) <= 64 {
+			_ = json.Unmarshal(frame["code"], &code)
+		}
+		if code != "" {
+			return fmt.Errorf("account Agent Runtime stopped: %s (%s)", kind, code)
+		}
 		return fmt.Errorf("account Agent Runtime stopped: %s", kind)
 	}
 	if err := s.validateRuntimeIdentity(frame); err != nil {
@@ -465,9 +483,30 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 			break
 		}
 	}
+	if task == nil {
+		for stopped := range s.stopped {
+			if stopped.TaskID == identity.TaskID && stopped.OwnerID == identity.OwnerID && stopped.AgentID == identity.AgentID &&
+				stopped.SessionID == identity.SessionID && stopped.Generation == identity.Generation &&
+				stopped.AuthorizationVersion == identity.AuthorizationVersion {
+				if kind == "settled" || kind == "failed" || kind == "task_terminated" {
+					delete(s.stopped, stopped)
+				}
+				s.mu.Unlock()
+				return nil
+			}
+		}
+	} else if task.fence.OwnerID != identity.OwnerID || task.fence.AgentInstanceID != identity.AgentID ||
+		task.fence.AgentGeneration != identity.Generation || task.fence.AuthorizationVersion != identity.AuthorizationVersion ||
+		((kind == "task_process_ready" || kind == "task_started" || kind == "task_terminated" || kind == "settled" || kind == "failed") &&
+			task.fence.AgentSessionID != identity.SessionID) {
+		s.mu.Unlock()
+		return errors.New("account Agent Runtime frame names an unknown Task")
+	}
+	if task != nil && (kind == "settled" || kind == "failed" || kind == "task_terminated") {
+		task.terminal = true
+	}
 	s.mu.Unlock()
-	if task == nil || task.fence.OwnerID != identity.OwnerID || task.fence.AgentInstanceID != identity.AgentID ||
-		task.fence.AgentGeneration != identity.Generation || task.fence.AuthorizationVersion != identity.AuthorizationVersion {
+	if task == nil {
 		return errors.New("account Agent Runtime frame names an unknown Task")
 	}
 	switch kind {
@@ -480,7 +519,15 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 		}
 		return nil
 	case "task_terminated":
-		task.fail(errors.New("account Agent Runtime Task process exited without a result"))
+		var reason string
+		if len(frame["reason"]) <= 128 {
+			_ = json.Unmarshal(frame["reason"], &reason)
+		}
+		if reason != "" {
+			task.fail(errors.New("account Agent Runtime Task process exited without a result: " + reason))
+		} else {
+			task.fail(errors.New("account Agent Runtime Task process exited without a result"))
+		}
 		return nil
 	}
 	for _, key := range []string{"server_instance_id", "runtime_id", "runtime_generation", "runtime_sequence"} {
@@ -494,7 +541,8 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 	case task.events <- cloudDSHRead{frame: encoded}:
 		return nil
 	case <-task.ctx.Done():
-		return task.ctx.Err()
+		task.fail(task.ctx.Err())
+		return nil
 	}
 }
 
@@ -622,17 +670,17 @@ func (s *cloudDSHAccountRuntimeSession) stopTask(ctx context.Context, task *clou
 	}
 	s.mu.Lock()
 	delete(s.tasks, task.fence)
+	if !task.terminal {
+		s.stopped[cloudDSHIdentity{TaskID: task.fence.TaskID, OwnerID: task.fence.OwnerID,
+			AgentID: task.fence.AgentInstanceID, SessionID: task.fence.AgentSessionID,
+			Generation: task.fence.AgentGeneration, AuthorizationVersion: task.fence.AuthorizationVersion}] = struct{}{}
+	}
 	stopRequested := len(s.tasks) == 0
 	s.mu.Unlock()
 	if stopRequested || s.closed() {
+		// A crashed shared Runtime recovers after lease expiry; RequestStop would cancel every owner Task.
 		current, found, getErr := s.manager.options.Control.Get(ctx, s.runtime.Fence.OwnerID)
 		if getErr == nil && found && current.State != app.AccountAgentRuntimeStopped && current.State == app.AccountAgentRuntimeStopping {
-			return s.manager.stopUnattachedRuntime(ctx, s.runtime.Fence)
-		}
-		if getErr == nil && found && s.closed() && current.State != app.AccountAgentRuntimeStopped {
-			if _, err := s.manager.options.Control.RequestStop(ctx, s.runtime.Fence); err != nil {
-				return errors.New("failed account Agent Runtime stop intent was not persisted")
-			}
 			return s.manager.stopUnattachedRuntime(ctx, s.runtime.Fence)
 		}
 	}
@@ -649,6 +697,7 @@ type cloudDSHAccountTask struct {
 	guard       *dshguardian.TaskProcessGuard
 	events      chan cloudDSHRead
 	started     chan error
+	terminal    bool // Protected by the account Runtime session mutex.
 	failure     error
 }
 
