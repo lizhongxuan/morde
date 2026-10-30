@@ -492,50 +492,51 @@ type SiteRelease struct {
 }
 
 type Task struct {
-	ID                       string             `json:"id"`
-	OwnerID                  string             `json:"owner_id"`
-	ConversationID           string             `json:"conversation_id"`
-	HostID                   pgtype.Text        `json:"host_id"`
-	ModelID                  string             `json:"model_id"`
-	Objective                string             `json:"objective"`
-	Status                   string             `json:"status"`
-	AuthKind                 string             `json:"auth_kind"`
-	AuthTokenID              string             `json:"auth_token_id"`
-	AuthScopes               []string           `json:"auth_scopes"`
-	BudgetActiveSeconds      int32              `json:"budget_active_seconds"`
-	BudgetToolCalls          int32              `json:"budget_tool_calls"`
-	BudgetModelTokens        int32              `json:"budget_model_tokens"`
-	UsageActiveSeconds       int64              `json:"usage_active_seconds"`
-	UsageToolCalls           int64              `json:"usage_tool_calls"`
-	UsageModelTokens         pgtype.Int8        `json:"usage_model_tokens"`
-	LeaseOwner               string             `json:"lease_owner"`
-	LeaseVersion             int64              `json:"lease_version"`
-	LeaseExpiresAt           pgtype.Timestamptz `json:"lease_expires_at"`
-	EventSeq                 int64              `json:"event_seq"`
-	CurrentStep              string             `json:"current_step"`
-	Result                   string             `json:"result"`
-	WaitingReason            string             `json:"waiting_reason"`
-	CreatedAt                pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
-	FinishedAt               pgtype.Timestamptz `json:"finished_at"`
-	RuntimeLeaseSafeAfter    pgtype.Timestamptz `json:"runtime_lease_safe_after"`
-	ExecutionEpoch           int64              `json:"execution_epoch"`
-	ApplicationID            string             `json:"application_id"`
-	AuthClientInstallationID pgtype.Text        `json:"auth_client_installation_id"`
-	ExecutionLocation        string             `json:"execution_location"`
-	WorkspaceID              pgtype.Text        `json:"workspace_id"`
-	InputRevision            pgtype.Int8        `json:"input_revision"`
-	ContextDigest            []byte             `json:"context_digest"`
-	AuthVersion              int64              `json:"auth_version"`
-	AuthExpiresAt            pgtype.Timestamptz `json:"auth_expires_at"`
-	AgentInstanceID          string             `json:"agent_instance_id"`
-	AgentGeneration          int64              `json:"agent_generation"`
-	AgentSessionID           string             `json:"agent_session_id"`
-	AgentEngineVersion       string             `json:"agent_engine_version"`
-	AgentProfileVersion      string             `json:"agent_profile_version"`
-	CheckpointDigest         []byte             `json:"checkpoint_digest"`
-	CheckpointThroughSeq     int64              `json:"checkpoint_through_seq"`
-	FileDeliveryIntent       string             `json:"file_delivery_intent"`
+	ID                          string             `json:"id"`
+	OwnerID                     string             `json:"owner_id"`
+	ConversationID              string             `json:"conversation_id"`
+	HostID                      pgtype.Text        `json:"host_id"`
+	ModelID                     string             `json:"model_id"`
+	Objective                   string             `json:"objective"`
+	Status                      string             `json:"status"`
+	AuthKind                    string             `json:"auth_kind"`
+	AuthTokenID                 string             `json:"auth_token_id"`
+	AuthScopes                  []string           `json:"auth_scopes"`
+	BudgetActiveSeconds         int32              `json:"budget_active_seconds"`
+	BudgetToolCalls             int32              `json:"budget_tool_calls"`
+	BudgetModelTokens           int32              `json:"budget_model_tokens"`
+	UsageActiveSeconds          int64              `json:"usage_active_seconds"`
+	UsageToolCalls              int64              `json:"usage_tool_calls"`
+	UsageModelTokens            pgtype.Int8        `json:"usage_model_tokens"`
+	LeaseOwner                  string             `json:"lease_owner"`
+	LeaseVersion                int64              `json:"lease_version"`
+	LeaseExpiresAt              pgtype.Timestamptz `json:"lease_expires_at"`
+	EventSeq                    int64              `json:"event_seq"`
+	CurrentStep                 string             `json:"current_step"`
+	Result                      string             `json:"result"`
+	WaitingReason               string             `json:"waiting_reason"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	FinishedAt                  pgtype.Timestamptz `json:"finished_at"`
+	RuntimeLeaseSafeAfter       pgtype.Timestamptz `json:"runtime_lease_safe_after"`
+	ExecutionEpoch              int64              `json:"execution_epoch"`
+	ApplicationID               string             `json:"application_id"`
+	AuthClientInstallationID    pgtype.Text        `json:"auth_client_installation_id"`
+	ExecutionLocation           string             `json:"execution_location"`
+	WorkspaceID                 pgtype.Text        `json:"workspace_id"`
+	InputRevision               pgtype.Int8        `json:"input_revision"`
+	ContextDigest               []byte             `json:"context_digest"`
+	AuthVersion                 int64              `json:"auth_version"`
+	AuthExpiresAt               pgtype.Timestamptz `json:"auth_expires_at"`
+	AgentInstanceID             string             `json:"agent_instance_id"`
+	AgentGeneration             int64              `json:"agent_generation"`
+	AgentSessionID              string             `json:"agent_session_id"`
+	AgentEngineVersion          string             `json:"agent_engine_version"`
+	AgentProfileVersion         string             `json:"agent_profile_version"`
+	CheckpointDigest            []byte             `json:"checkpoint_digest"`
+	CheckpointThroughSeq        int64              `json:"checkpoint_through_seq"`
+	FileDeliveryIntent          string             `json:"file_delivery_intent"`
+	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
 }
 
 type TaskAgentCheckpoint struct {
@@ -668,43 +669,49 @@ type TaskMcpConnectorGrant struct {
 }
 
 type TaskMcpConnectorOperation struct {
-	ID                string             `json:"id"`
-	TaskID            string             `json:"task_id"`
-	OwnerID           string             `json:"owner_id"`
-	ConnectorID       string             `json:"connector_id"`
-	ConnectorRevision int64              `json:"connector_revision"`
-	CredentialVersion int64              `json:"credential_version"`
-	GrantVersion      int64              `json:"grant_version"`
-	LeaseVersion      int64              `json:"lease_version"`
-	OperationKey      string             `json:"operation_key"`
-	ToolName          string             `json:"tool_name"`
-	RequestHash       []byte             `json:"request_hash"`
-	Status            string             `json:"status"`
-	CancelRequested   bool               `json:"cancel_requested"`
-	Result            string             `json:"result"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ID                          string             `json:"id"`
+	TaskID                      string             `json:"task_id"`
+	OwnerID                     string             `json:"owner_id"`
+	ConnectorID                 string             `json:"connector_id"`
+	ConnectorRevision           int64              `json:"connector_revision"`
+	CredentialVersion           int64              `json:"credential_version"`
+	GrantVersion                int64              `json:"grant_version"`
+	LeaseVersion                int64              `json:"lease_version"`
+	OperationKey                string             `json:"operation_key"`
+	ToolName                    string             `json:"tool_name"`
+	RequestHash                 []byte             `json:"request_hash"`
+	Status                      string             `json:"status"`
+	CancelRequested             bool               `json:"cancel_requested"`
+	Result                      string             `json:"result"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	HostID                      string             `json:"host_id"`
+	WorkspaceID                 string             `json:"workspace_id"`
+	BindingVersion              int64              `json:"binding_version"`
+	InputRevision               pgtype.Int8        `json:"input_revision"`
+	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
 }
 
 type TaskOperation struct {
-	ID                  string             `json:"id"`
-	TaskID              string             `json:"task_id"`
-	OperationKey        string             `json:"operation_key"`
-	RequestHash         []byte             `json:"request_hash"`
-	HostID              string             `json:"host_id"`
-	RuntimeGeneration   int64              `json:"runtime_generation"`
-	ControlVersion      int64              `json:"control_version"`
-	LeaseVersion        int64              `json:"lease_version"`
-	Status              string             `json:"status"`
-	ExternalID          string             `json:"external_id"`
-	Result              string             `json:"result"`
-	CreatedAt           pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
-	RuntimeInstanceID   string             `json:"runtime_instance_id"`
-	RuntimeLeaseVersion int64              `json:"runtime_lease_version"`
-	WorkspaceID         string             `json:"workspace_id"`
-	BindingVersion      int64              `json:"binding_version"`
-	InputRevision       pgtype.Int8        `json:"input_revision"`
+	ID                          string             `json:"id"`
+	TaskID                      string             `json:"task_id"`
+	OperationKey                string             `json:"operation_key"`
+	RequestHash                 []byte             `json:"request_hash"`
+	HostID                      string             `json:"host_id"`
+	RuntimeGeneration           int64              `json:"runtime_generation"`
+	ControlVersion              int64              `json:"control_version"`
+	LeaseVersion                int64              `json:"lease_version"`
+	Status                      string             `json:"status"`
+	ExternalID                  string             `json:"external_id"`
+	Result                      string             `json:"result"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	RuntimeInstanceID           string             `json:"runtime_instance_id"`
+	RuntimeLeaseVersion         int64              `json:"runtime_lease_version"`
+	WorkspaceID                 string             `json:"workspace_id"`
+	BindingVersion              int64              `json:"binding_version"`
+	InputRevision               pgtype.Int8        `json:"input_revision"`
+	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
 }
 
 type TaskPendingRequest struct {
@@ -882,6 +889,18 @@ type WorkspaceRevisionFile struct {
 	Sha256            string      `json:"sha256"`
 	Mode              int32       `json:"mode"`
 	Chunks            []byte      `json:"chunks"`
+}
+
+type WorkspaceSyncCommitReceipt struct {
+	OwnerID     string             `json:"owner_id"`
+	Operation   string             `json:"operation"`
+	Key         string             `json:"key"`
+	RequestHash []byte             `json:"request_hash"`
+	WorkspaceID string             `json:"workspace_id"`
+	SessionID   string             `json:"session_id"`
+	State       string             `json:"state"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WorkspaceSyncCursor struct {

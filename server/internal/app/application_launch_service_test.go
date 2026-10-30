@@ -302,7 +302,7 @@ func (r *applicationLaunchRuntime) ServeHTTP(w http.ResponseWriter, request *htt
 		writeLaunchTestJSON(w, runtimeclient.CapabilitiesResponse{
 			ProtocolVersion: runtimeclient.ProtocolVersion, HostID: fence.HostID, RuntimeGeneration: fence.RuntimeGeneration,
 			RuntimeInstanceID: fence.RuntimeInstanceID, ControlVersion: fence.ControlVersion, Mode: runtimeclient.ModeAI, OperationStoreReady: true,
-			Capabilities: []string{"operation.execute", "operation.query", "operation.cancel", "control.fence", "control.quiesce", "task_lease.fence"},
+			Capabilities: []string{"operation.execute", "operation.query", "operation.cancel", "control.fence", "control.quiesce", "task_lease.fence", "workspace.task_view"},
 		})
 	case request.Method == http.MethodPost && request.URL.Path == "/runtime/v1/applications/wechat/launch":
 		r.launchCalls.Add(1)

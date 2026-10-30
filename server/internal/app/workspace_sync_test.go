@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,9 @@ type syncServiceStore struct {
 	binding                                  workspace.Binding
 	snapshots                                map[int64][]workspace.File
 	sessions                                 map[string]workspace.SyncSession
+	commitReceipts                           map[string]WorkspaceSyncCommitReceipt
+	taskWorkspacePublishReceipts             map[string]TaskWorkspacePublishReceipt
+	taskWorkspacePublishCommands             map[string]TaskWorkspacePublishCommand
 	blocks                                   map[string][]workspace.TransferBlock
 	changes                                  []workspace.Change
 	progress                                 []workspace.DeviceSyncProgress
@@ -32,6 +36,7 @@ type syncServiceStore struct {
 	blockLockHeld                            bool
 	blockReadLocksHeld                       int
 	onCreate                                 func()
+	syncDeviceRevoked                        bool
 	usageFinalizeCalls                       int
 }
 
@@ -54,9 +59,93 @@ func (lock syncServiceBlockLock) Release(context.Context) error {
 func newSyncServiceStore() *syncServiceStore {
 	return &syncServiceStore{
 		workspace: workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", Name: "test", State: workspace.StateReady, QuotaBytes: 1 << 30},
-		snapshots: map[int64][]workspace.File{0: {}}, sessions: map[string]workspace.SyncSession{},
+		snapshots: map[int64][]workspace.File{0: {}}, sessions: map[string]workspace.SyncSession{}, commitReceipts: map[string]WorkspaceSyncCommitReceipt{},
 		blocks: map[string][]workspace.TransferBlock{}, changes: []workspace.Change{},
+		taskWorkspacePublishReceipts: map[string]TaskWorkspacePublishReceipt{}, taskWorkspacePublishCommands: map[string]TaskWorkspacePublishCommand{},
 	}
+}
+
+func taskWorkspacePublishReceiptKey(taskID, operationKey string) string {
+	return taskID + "/" + operationKey
+}
+
+func (s *syncServiceStore) ReserveTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error) {
+	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
+	if receipt, exists := s.taskWorkspacePublishReceipts[key]; exists {
+		command := s.taskWorkspacePublishCommands[key]
+		if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) {
+			return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "Task Workspace publish key was reused")
+		}
+		return receipt, nil
+	}
+	receipt := TaskWorkspacePublishReceipt{State: TaskWorkspacePublishPending, WorkspaceID: value.WorkspaceID, BaseRevision: value.BaseRevision}
+	s.taskWorkspacePublishReceipts[key], s.taskWorkspacePublishCommands[key] = receipt, value
+	return receipt, nil
+}
+
+func (s *syncServiceStore) GetTaskWorkspacePublishReceipt(_ context.Context, value TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error) {
+	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
+	receipt, exists := s.taskWorkspacePublishReceipts[key]
+	if !exists {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
+	}
+	command := s.taskWorkspacePublishCommands[key]
+	if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "Task Workspace publish key was reused")
+	}
+	return receipt, nil
+}
+
+func (s *syncServiceStore) FindTaskWorkspacePublishReceipt(_ context.Context, ownerID, taskID, workspaceID, operationKey string) (TaskWorkspacePublishReceipt, error) {
+	key := taskWorkspacePublishReceiptKey(taskID, operationKey)
+	receipt, exists := s.taskWorkspacePublishReceipts[key]
+	command := s.taskWorkspacePublishCommands[key]
+	if !exists || command.OwnerID != ownerID || command.WorkspaceID != workspaceID {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
+	}
+	return receipt, nil
+}
+
+func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand, files []workspace.File, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
+	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
+	receipt, exists := s.taskWorkspacePublishReceipts[key]
+	if !exists || receipt.State != TaskWorkspacePublishPending {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "pending Task Workspace publish receipt not found")
+	}
+	if current := s.workspace.Revision; current != value.BaseRevision {
+		receipt.State = TaskWorkspacePublishConflict
+		s.taskWorkspacePublishReceipts[key] = receipt
+		return receipt, nil
+	}
+	revision := value.BaseRevision
+	if !reflect.DeepEqual(s.snapshots[value.BaseRevision], files) {
+		revision++
+	}
+	receipt.State, receipt.ManifestSHA256, receipt.PublishedRevision = TaskWorkspacePublishSucceeded, manifestSHA, revision
+	s.taskWorkspacePublishReceipts[key] = receipt
+	s.workspace.Revision, s.snapshots[revision] = revision, append([]workspace.File(nil), files...)
+	return receipt, nil
+}
+
+func (s *syncServiceStore) RejectTaskWorkspacePublishQuota(_ context.Context, value TaskWorkspacePublishCommand) error {
+	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
+	receipt, exists := s.taskWorkspacePublishReceipts[key]
+	if !exists {
+		return domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
+	}
+	if receipt.State == TaskWorkspacePublishPending {
+		receipt.State = TaskWorkspacePublishQuotaRejected
+		s.taskWorkspacePublishReceipts[key] = receipt
+	}
+	return nil
+}
+
+func (s *syncServiceStore) ReserveTaskWorkspaceBlockUsage(context.Context, string, []WorkspaceBlockReservation, int64) error {
+	return nil
+}
+
+func syncCommitReceiptKey(record IdempotencyRecord) string {
+	return record.OwnerID + "/" + record.Operation + "/" + record.Key
 }
 
 func (s *syncServiceStore) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
@@ -71,6 +160,13 @@ func (s *syncServiceStore) GetWorkspaceBinding(_ context.Context, hostID, worksp
 		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
 	}
 	return s.binding, nil
+}
+
+func (s *syncServiceStore) CheckWorkspaceSyncDeviceAccess(_ context.Context, _ identity.Principal, _ string) error {
+	if s.syncDeviceRevoked {
+		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return nil
 }
 
 func (s *syncServiceStore) TryWorkspaceBlockStoreLock(ctx context.Context, _ string) (LeaderLock, bool, error) {
@@ -139,6 +235,13 @@ func (s *syncServiceStore) GetWorkspaceChangePage(_ context.Context, _ string, r
 }
 
 func (s *syncServiceStore) CreateWorkspaceSyncSession(_ context.Context, session workspace.SyncSession, transfers []workspace.TransferBlock, _ []WorkspaceBlockReservation, _ int64, _ IdempotencyRecord) (workspace.SyncSession, bool, error) {
+	var manifestBytes int64
+	for _, file := range session.Files {
+		manifestBytes += file.SizeBytes
+	}
+	if manifestBytes > s.workspace.QuotaBytes {
+		return workspace.SyncSession{}, false, domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
+	}
 	if s.onCreate != nil {
 		s.onCreate()
 	}
@@ -166,6 +269,33 @@ func (s *syncServiceStore) ListDeviceWorkspaceSyncProgress(_ context.Context, ow
 
 func (s *syncServiceStore) ListWorkspaceSyncTransferBlocks(_ context.Context, _, sessionID string) ([]workspace.TransferBlock, error) {
 	return append([]workspace.TransferBlock(nil), s.blocks[sessionID]...), nil
+}
+
+func (s *syncServiceStore) ReserveWorkspaceSyncCommit(_ context.Context, workspaceID, sessionID string, record IdempotencyRecord) (WorkspaceSyncCommitReceipt, error) {
+	key := syncCommitReceiptKey(record)
+	if receipt, ok := s.commitReceipts[key]; ok {
+		if record.ResourceID != sessionID || record.Operation != "workspace.sync.commit" {
+			return WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different request")
+		}
+		return receipt, nil
+	}
+	if workspaceID != s.workspace.ID || record.ResourceID != sessionID || record.Operation != "workspace.sync.commit" {
+		return WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeNotFound, "workspace sync commit receipt not found")
+	}
+	receipt := WorkspaceSyncCommitReceipt{State: WorkspaceSyncCommitPending}
+	s.commitReceipts[key] = receipt
+	return receipt, nil
+}
+
+func (s *syncServiceStore) InspectWorkspaceSyncCommit(_ context.Context, workspaceID, sessionID string, record IdempotencyRecord) (WorkspaceSyncCommitReceipt, error) {
+	if workspaceID != s.workspace.ID || record.ResourceID != sessionID || record.Operation != "workspace.sync.commit" {
+		return WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeNotFound, "workspace sync commit receipt not found")
+	}
+	receipt, ok := s.commitReceipts[syncCommitReceiptKey(record)]
+	if !ok {
+		return WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeNotFound, "workspace sync commit receipt not found")
+	}
+	return receipt, nil
 }
 
 func (s *syncServiceStore) FinalizeWorkspaceBlockUsage(context.Context, string, string, int64, int64) error {
@@ -265,7 +395,7 @@ func (s *syncServiceStore) AckWorkspaceSyncDownloadAction(_ context.Context, _, 
 	return domain.NewError(domain.CodeNotFound, "workspace download action not found")
 }
 
-func (s *syncServiceStore) CommitWorkspaceSyncSession(_ context.Context, workspaceID, sessionID string, _ IdempotencyRecord) (workspace.SyncSession, bool, error) {
+func (s *syncServiceStore) CommitWorkspaceSyncSession(_ context.Context, workspaceID, sessionID string, record IdempotencyRecord) (workspace.SyncSession, bool, error) {
 	session, ok := s.sessions[sessionID]
 	if !ok || session.WorkspaceID != workspaceID {
 		return workspace.SyncSession{}, false, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
@@ -286,6 +416,7 @@ func (s *syncServiceStore) CommitWorkspaceSyncSession(_ context.Context, workspa
 	s.sessions[sessionID] = session
 	s.workspace.Revision = 1
 	s.snapshots[1] = append([]workspace.File(nil), session.UploadFiles...)
+	s.commitReceipts[syncCommitReceiptKey(record)] = WorkspaceSyncCommitReceipt{State: WorkspaceSyncCommitSucceeded, Result: session}
 	return session, false, nil
 }
 
@@ -418,6 +549,25 @@ func TestWorkspaceSyncServiceUploadIsResumableAndWorkspaceScoped(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncServiceCreateReportsQuotaExceeded(t *testing.T) {
+	store := newSyncServiceStore()
+	store.workspace.QuotaBytes = 2
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	_, err = service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, Files: []workspace.File{syncServiceFile("too-large.txt", []byte("abc"))},
+	}, "quota-create")
+	if domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("over-quota create error = %v, want quota_exceeded", err)
+	}
+	if len(store.sessions) != 0 {
+		t.Fatalf("over-quota create persisted %d sessions", len(store.sessions))
+	}
+}
+
 func TestWorkspaceSyncServiceBlockStoreLockContention(t *testing.T) {
 	store := newSyncServiceStore()
 	blocks := newSyncBlockMemory()
@@ -456,6 +606,44 @@ func TestWorkspaceSyncServiceBlockStoreLockContention(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncCommitReturnsRetryableBusyWhileReceiptIsPending(t *testing.T) {
+	store, blocks, service, principal, session, _ := uploadedSyncFixture(t)
+	const idempotencyKey = "commit-pending-verify"
+	record, err := idempotencyRecord(session.OwnerID, "workspace.sync.commit", idempotencyKey, struct {
+		WorkspaceID string `json:"workspace_id"`
+		SessionID   string `json:"session_id"`
+	}{store.workspace.ID, session.ID}, session.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := store.ReserveWorkspaceSyncCommit(context.Background(), store.workspace.ID, session.ID, record)
+	if err != nil || receipt.State != WorkspaceSyncCommitPending {
+		t.Fatalf("reserved commit receipt = %#v, err=%v; want pending", receipt, err)
+	}
+
+	blocks.openError = errors.New("temporary block read failure")
+	if _, err := service.CommitSyncSession(context.Background(), principal, store.workspace.ID, session.ID, idempotencyKey); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("commit while block verification is temporarily unavailable = %v, want retryable workspace busy", err)
+	}
+	receipt, err = store.InspectWorkspaceSyncCommit(context.Background(), store.workspace.ID, session.ID, record)
+	if err != nil || receipt.State != WorkspaceSyncCommitPending {
+		t.Fatalf("receipt after retryable verification failure = %#v, err=%v; want pending", receipt, err)
+	}
+	if store.workspace.Revision != 0 || store.sessions[session.ID].State == workspace.SyncCompleted {
+		t.Fatalf("temporary block verification failure committed state: revision=%d session=%s", store.workspace.Revision, store.sessions[session.ID].State)
+	}
+
+	blocks.openError = nil
+	committed, err := service.CommitSyncSession(context.Background(), principal, store.workspace.ID, session.ID, idempotencyKey)
+	if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
+		t.Fatalf("same-key retry after block storage recovers = %#v, err=%v", committed, err)
+	}
+	receipt, err = store.InspectWorkspaceSyncCommit(context.Background(), store.workspace.ID, session.ID, record)
+	if err != nil || receipt.State != WorkspaceSyncCommitSucceeded {
+		t.Fatalf("receipt after successful retry = %#v, err=%v; want succeeded", receipt, err)
+	}
+}
+
 func TestWorkspaceSyncServiceAuthorizesDeviceWorkspaceDynamically(t *testing.T) {
 	store := newSyncServiceStore()
 	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
@@ -470,9 +658,53 @@ func TestWorkspaceSyncServiceAuthorizesDeviceWorkspaceDynamically(t *testing.T) 
 	if _, err := service.GetManifest(context.Background(), device, store.workspace.ID, 0, "", "", 100); err != nil {
 		t.Fatalf("owned device manifest error = %v", err)
 	}
+	store.syncDeviceRevoked = true
+	if _, err := service.GetManifest(context.Background(), device, store.workspace.ID, 0, "", "", 100); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked device manifest error = %v", err)
+	}
+	store.syncDeviceRevoked = false
 	device.Scopes = nil
 	if _, err := service.GetManifest(context.Background(), device, store.workspace.ID, 0, "", "", 100); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("device without sync scope error = %v", err)
+	}
+}
+
+func TestWorkspaceSyncDeviceDownloadStopsAfterRevocation(t *testing.T) {
+	store := newSyncServiceStore()
+	blocks := newSyncBlockMemory()
+	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("workspace file content")
+	file := syncServiceFile("notes.txt", content)
+	if _, err := blocks.PutBlock(store.workspace.ID, file.SHA256, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	store.workspace.Revision = 1
+	store.snapshots[1] = []workspace.File{file}
+	device := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: "t1234567", ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	session, err := service.CreateSyncSession(context.Background(), device, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
+	}, "device-download-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := service.GetSyncBlock(context.Background(), device, store.workspace.ID, session.ID, file.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	buffer := make([]byte, 2)
+	if n, err := reader.Read(buffer); err != nil || n != len(buffer) {
+		t.Fatalf("first block read = %d, %v", n, err)
+	}
+	store.syncDeviceRevoked = true
+	if n, err := reader.Read(buffer); n != 0 || domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("block read after device revocation = %d, %v; want no more bytes and not found", n, err)
 	}
 }
 

@@ -9,8 +9,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -346,6 +348,35 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	var workspaceSyncNodeEnsurer app.WorkspaceSyncNodeEnsurer
+	var workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
+	if cfg.WorkspaceSyncNode.Enabled {
+		dockerSocket, err := workspaceSyncDockerSocketPath(cfg.Storage.DockerHost)
+		if err != nil {
+			return err
+		}
+		nodeSupervisor, err := worker.NewDockerWorkspaceSyncNodeSupervisor(worker.DockerWorkspaceSyncNodeSupervisorOptions{
+			ImageDigest: cfg.WorkspaceSyncNode.ImageDigest, RelayImageDigest: cfg.WorkspaceSyncNode.RelayImageDigest,
+			RelayPublicAddress: cfg.WorkspaceSyncNode.RelayPublicAddress, RelayToken: cfg.WorkspaceSyncNode.RelayToken,
+			DockerSocket: dockerSocket, RelayStateRoot: cfg.WorkspaceSyncNode.RelayStateRoot, StateRoot: cfg.WorkspaceSyncNode.StateRoot,
+			WorkspaceRoot: cfg.WorkspaceSyncNode.WorkspaceRoot, RelayContainerName: cfg.WorkspaceSyncNode.RelayContainerName,
+			Resources: worker.DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Workspace sync node supervisor: %w", err)
+		}
+		workspaceSyncNodeProvisioner, err = worker.NewWorkspaceSyncNodeProvisioner(worker.WorkspaceSyncNodeProvisionerOptions{
+			Supervisor: nodeSupervisor, Store: store, DataKey: dataKey,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Workspace sync node provisioner: %w", err)
+		}
+		workspaceSyncNodeEnsurer = workspaceSyncNodeProvisioner
+	}
+	workspaceSyncDevices, err := app.NewWorkspaceSyncDeviceService(store, workspaceSyncNodeEnsurer)
+	if err != nil {
+		return err
+	}
 	siteService, err := app.NewSiteService(store, store, workspaceBlocks, siteArtifacts, cfg.SiteStorage.MaxReleaseBytes, cfg.SiteStorage.MaxOwnerBytes)
 	if err != nil {
 		return fmt.Errorf("initialize Site service: %w", err)
@@ -423,7 +454,8 @@ func serve(ctx context.Context, configPath string) error {
 	admin := adminAdapter{users: users, audit: auditService, capacity: hosts}
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
-		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, Sites: siteService, Templates: templateAdapter{values: templates},
+		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices,
+		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
@@ -450,7 +482,8 @@ func serve(ctx context.Context, configPath string) error {
 		return fmt.Errorf("initialize workspace block garbage collection: %w", err)
 	}
 	background, err := worker.New(worker.Options{
-		Application: workerApplicationAdapter{WorkerApp: workerApp, workspaceBlockGC: workspaceBlockGC, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
+		Application: workerApplicationAdapter{WorkerApp: workerApp, workspaceBlockGC: workspaceBlockGC,
+			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
 		ActivityFlushInterval: cfg.Reconciler.ActivityFlushInterval, Logger: logger, Registerer: registry,
 	})
 	if err != nil {
@@ -1047,4 +1080,13 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	cancelFlush()
 	logger.Info("portal stopped")
 	return runErr
+}
+
+func workspaceSyncDockerSocketPath(endpoint string) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "unix" || parsed.Host != "" || parsed.User != nil || parsed.Opaque != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || !filepath.IsAbs(parsed.Path) || filepath.Clean(parsed.Path) != parsed.Path || parsed.Path == string(filepath.Separator) {
+		return "", errors.New("workspace sync node requires a local Unix Docker socket")
+	}
+	return parsed.Path, nil
 }

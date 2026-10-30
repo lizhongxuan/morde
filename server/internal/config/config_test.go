@@ -91,6 +91,73 @@ func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
+	cfg := validConfig(t)
+	root := t.TempDir()
+	cfg.WorkspaceSyncNode = WorkspaceSyncNode{
+		Enabled: true, ImageDigest: "morde-syncthing@sha256:" + strings.Repeat("a", 64),
+		RelayImageDigest:   "morde-syncthing-relay@sha256:" + strings.Repeat("b", 64),
+		RelayPublicAddress: "127.0.0.1:22067",
+		RelayToken:         strings.Repeat("c", 64),
+		RelayStateRoot:     filepath.Join(root, "relay"), StateRoot: filepath.Join(root, "state"),
+		WorkspaceRoot: filepath.Join(root, "files"), RelayContainerName: "morde-sync-relay",
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("valid Workspace sync node config: %v", err)
+	}
+	localImageIDs := cfg
+	localImageIDs.WorkspaceSyncNode.ImageDigest = "sha256:" + strings.Repeat("c", 64)
+	localImageIDs.WorkspaceSyncNode.RelayImageDigest = "sha256:" + strings.Repeat("d", 64)
+	if err := localImageIDs.validate(); err != nil {
+		t.Fatalf("local content-pinned Workspace sync images: %v", err)
+	}
+	tests := []struct {
+		name   string
+		want   string
+		mutate func(*WorkspaceSyncNode)
+	}{
+		{name: "unpinned image", want: "image_digest must pin an image by sha256 digest", mutate: func(value *WorkspaceSyncNode) { value.ImageDigest = "morde-syncthing:latest" }},
+		{name: "unpinned relay image", want: "relay_image_digest must pin an image by sha256 digest", mutate: func(value *WorkspaceSyncNode) { value.RelayImageDigest = "morde-relay:latest" }},
+		{name: "invalid relay public address", want: "relay_public_address must be a host and port", mutate: func(value *WorkspaceSyncNode) { value.RelayPublicAddress = "https://relay.example.test:22067/path" }},
+		{name: "missing relay token", want: "relay_token must be a 32 to 128 character URL-safe secret", mutate: func(value *WorkspaceSyncNode) { value.RelayToken = "" }},
+		{name: "missing relay state root", want: "relay_state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = "" }},
+		{name: "missing state root", want: "state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.StateRoot = "" }},
+		{name: "relative workspace root", want: "workspace_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.WorkspaceRoot = "relative/files" }},
+		{name: "overlapping node roots", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.WorkspaceRoot = filepath.Join(value.StateRoot, "files") }},
+		{name: "overlapping relay root", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = filepath.Join(value.StateRoot, "relay") }},
+		{name: "unsafe relay name", want: "relay_container_name is invalid", mutate: func(value *WorkspaceSyncNode) { value.RelayContainerName = "../relay" }},
+	}
+	for _, address := range []string{"relay.example.test:22067", "[2001:db8::1]:22067"} {
+		if !validWorkspaceSyncRelayAddress(address) {
+			t.Fatalf("valid relay public address %q rejected", address)
+		}
+	}
+	for _, address := range []string{"", "relay.example.test", "relay.example.test:0", "relay.example.test:65536", "relay.example.test:22067/path"} {
+		if validWorkspaceSyncRelayAddress(address) {
+			t.Fatalf("invalid relay public address %q accepted", address)
+		}
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := cfg
+			test.mutate(&value.WorkspaceSyncNode)
+			if err := value.validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validate() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+	blockStoreOverlap := cfg
+	blockStoreOverlap.WorkspaceSyncNode.WorkspaceRoot = filepath.Join(cfg.WorkspaceStorage.RootDir, "current")
+	if err := blockStoreOverlap.validate(); err == nil || !strings.Contains(err.Error(), "separate from config.workspace_storage.root_dir") {
+		t.Fatalf("block-store overlap error = %v", err)
+	}
+	remoteDocker := cfg
+	remoteDocker.Storage.DockerHost = "tcp://docker.example:2375"
+	if err := remoteDocker.validate(); err == nil || !strings.Contains(err.Error(), "requires config.storage.docker_host to use a Unix socket") {
+		t.Fatalf("remote Docker error = %v", err)
+	}
+}
+
 func TestLoadReportsReadParseDurationAndUnknownFieldErrors(t *testing.T) {
 	t.Setenv("T02_TEST_INSTANCE", "test-instance")
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.yaml")); err == nil || !strings.Contains(err.Error(), "read config") {

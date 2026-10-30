@@ -1644,6 +1644,101 @@ func TestClientCredentialPositiveRouteContract(t *testing.T) {
 	}
 }
 
+type workspaceSyncDeviceHTTPStub struct {
+	WorkspaceSyncDeviceService
+	principal      identity.Principal
+	workspaceID    string
+	deviceID       string
+	certificateDER []byte
+	challengeCalls int
+	registerCalls  int
+	listCalls      int
+	revokeCalls    int
+}
+
+func (s *workspaceSyncDeviceHTTPStub) CreateChallenge(_ context.Context, principal identity.Principal, workspaceID, deviceID string, certificateDER []byte) (app.WorkspaceSyncDeviceChallengeResult, error) {
+	s.principal, s.workspaceID, s.deviceID, s.certificateDER = principal, workspaceID, deviceID, certificateDER
+	s.challengeCalls++
+	return app.WorkspaceSyncDeviceChallengeResult{ID: "n1234567", DeviceID: deviceID, Nonce: []byte("nonce"), SigningPayload: []byte("sign this"), ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
+func (s *workspaceSyncDeviceHTTPStub) Register(_ context.Context, principal identity.Principal, workspaceID, challengeID, idempotencyKey string, signature []byte) (app.WorkspaceSyncDeviceRegistration, error) {
+	s.principal, s.workspaceID = principal, workspaceID
+	s.registerCalls++
+	if challengeID != "n1234567" || idempotencyKey != "sync-device-key-001" || string(signature) != "signature" {
+		return app.WorkspaceSyncDeviceRegistration{}, domain.InvalidArgument("request", "unexpected test request")
+	}
+	return app.WorkspaceSyncDeviceRegistration{Binding: workspace.SyncDeviceBinding{ID: "d1234567", WorkspaceID: workspaceID, ClientInstallationID: principal.ClientInstallationID,
+		DeviceID: "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA", FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		State: workspace.SyncDeviceBindingActive, CreatedAt: time.Now().UTC()}, Node: workspace.SyncNodeConnection{
+		DeviceID:     "BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB",
+		RelayAddress: "relay://relay.example.test:22067/?id=CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC"}}, nil
+}
+
+func (s *workspaceSyncDeviceHTTPStub) Revoke(_ context.Context, principal identity.Principal, workspaceID, bindingID string) error {
+	s.principal, s.workspaceID = principal, workspaceID
+	if bindingID != "d1234567" {
+		return domain.NewError(domain.CodeNotFound, "workspace sync device binding not found")
+	}
+	s.revokeCalls++
+	return nil
+}
+
+func (s *workspaceSyncDeviceHTTPStub) List(_ context.Context, principal identity.Principal, workspaceID string) ([]workspace.SyncDeviceBinding, error) {
+	s.principal, s.workspaceID = principal, workspaceID
+	s.listCalls++
+	return []workspace.SyncDeviceBinding{{ID: "d1234567", WorkspaceID: workspaceID,
+		ClientInstallationID: principal.ClientInstallationID, DeviceID: "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA",
+		FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: workspace.SyncDeviceBindingPendingNode,
+		CreatedAt: time.Date(2026, time.October, 30, 0, 0, 0, 0, time.UTC)}}, nil
+}
+
+func TestWorkspaceSyncDeviceHTTPContractUsesClientProofAndPortalRevocation(t *testing.T) {
+	services := newServices()
+	deviceService := &workspaceSyncDeviceHTTPStub{}
+	deps := services.deps()
+	deps.WorkspaceSyncDevices = deviceService
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCredential, _, err := identity.NewCredential(identity.KindClient, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientAuthorization := "Bearer " + clientCredential
+	challengeResponse := request(router, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/sync-device-challenges",
+		`{"device_id":"device-id","certificate_der":"Y2VydA=="}`, clientAuthorization, "")
+	if challengeResponse.Code != http.StatusCreated || deviceService.challengeCalls != 1 ||
+		deviceService.principal.Kind != identity.KindClient || deviceService.principal.ClientInstallationID != "i1234567" ||
+		string(deviceService.certificateDER) != "cert" {
+		t.Fatalf("create device challenge = %d %s, calls=%d principal=%#v cert=%q", challengeResponse.Code, challengeResponse.Body,
+			deviceService.challengeCalls, deviceService.principal, deviceService.certificateDER)
+	}
+	registerResponse := requestWithHeader(router, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/sync-devices",
+		`{"challenge_id":"n1234567","signature":"c2lnbmF0dXJl"}`, clientAuthorization, "", "Idempotency-Key", "sync-device-key-001")
+	if registerResponse.Code != http.StatusOK || deviceService.registerCalls != 1 || deviceService.principal.Kind != identity.KindClient ||
+		!strings.Contains(registerResponse.Body.String(), `"server_device_id":"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB"`) ||
+		!strings.Contains(registerResponse.Body.String(), `"relay_address":"relay://relay.example.test:22067/?id=CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC"`) {
+		t.Fatalf("register sync device = %d %s, calls=%d principal=%#v", registerResponse.Code, registerResponse.Body, deviceService.registerCalls, deviceService.principal)
+	}
+	portalCredential, _, err := identity.NewCredential(identity.KindSession, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listResponse := requestWithCookie(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/sync-devices",
+		&http.Cookie{Name: portalCookieName, Value: portalCredential}, "https://portal.example.test")
+	if listResponse.Code != http.StatusOK || deviceService.listCalls != 1 || deviceService.principal.Kind != identity.KindSession ||
+		!strings.Contains(listResponse.Body.String(), `"state":"pending_node"`) {
+		t.Fatalf("list sync devices = %d %s, calls=%d principal=%#v", listResponse.Code, listResponse.Body, deviceService.listCalls, deviceService.principal)
+	}
+	revokeResponse := requestWithCookie(router, http.MethodDelete, "/api/workspaces/"+testWorkspaceID+"/sync-devices/d1234567",
+		&http.Cookie{Name: portalCookieName, Value: portalCredential}, "https://portal.example.test")
+	if revokeResponse.Code != http.StatusNoContent || deviceService.revokeCalls != 1 || deviceService.principal.Kind != identity.KindSession {
+		t.Fatalf("revoke sync device = %d %s, calls=%d principal=%#v", revokeResponse.Code, revokeResponse.Body, deviceService.revokeCalls, deviceService.principal)
+	}
+}
+
 func TestClientCredentialRouteFence(t *testing.T) {
 	services := newServices()
 	services.verifier = verifierStub{role: identity.RoleAdmin}
@@ -1663,6 +1758,8 @@ func TestClientCredentialRouteFence(t *testing.T) {
 		{http.MethodGet, "/api/model-connections", ""},
 		{http.MethodGet, "/api/device/workspaces", ""},
 		{http.MethodPost, "/api/workspaces", `{}`},
+		{http.MethodDelete, "/api/workspaces/" + testWorkspaceID + "/sync-devices/d1234567", ""},
+		{http.MethodGet, "/api/workspaces/" + testWorkspaceID + "/sync-devices", ""},
 		{http.MethodDelete, "/api/hosts/" + testHostID, ""},
 	} {
 		response := request(router, tc.method, tc.path, tc.body, auth, "")

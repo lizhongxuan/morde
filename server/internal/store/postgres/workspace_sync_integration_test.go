@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -65,6 +66,395 @@ func TestWorkspaceSyncPersistsPlanAndCommitsImmutableRevision(t *testing.T) {
 	changes, err := store.GetWorkspaceChangePage(ctx, value.ID, 0, "", 100)
 	if err != nil || len(changes.Items) != 1 || changes.Items[0].Action != workspace.ChangeUpsert || changes.Items[0].File == nil {
 		t.Fatalf("workspace change page = %#v err=%v", changes, err)
+	}
+}
+
+func TestWorkspaceSyncQuotaCommitReceiptStaysRejectedAfterSpaceIsFreed(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-quota-receipt")
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=6 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	file := syncTestFile("over-limit.txt", []byte("sixsix"))
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.PlannedBytes = 0 // The test fixture marks its upload block as already received.
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "quota-receipt:create", session.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=5 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	legacy := syncTestIdempotency(owner.ID, "workspace.sync.commit", "quota-receipt:legacy", session.ID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO idempotency_keys(owner_id, operation, key, request_hash, resource_id)
+VALUES ($1, $2, $3, $4, $5)`, legacy.OwnerID, legacy.Operation, legacy.Key, legacy.RequestHash, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	otherSessionID, err := workspace.NewSyncSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherLegacyRequest := syncTestIdempotency(owner.ID, "workspace.sync.commit", legacy.Key, otherSessionID)
+	if _, err := store.ReserveWorkspaceSyncCommit(ctx, value.ID, otherSessionID, otherLegacyRequest); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("legacy commit key reused for another session = %v, want idempotency conflict", err)
+	}
+	oldKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "quota-receipt:old", session.ID)
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, session.ID, oldKey); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("first over-quota commit error = %v, want quota exceeded", err)
+	}
+	receipt, err := store.ReserveWorkspaceSyncCommit(ctx, value.ID, session.ID, oldKey)
+	if err != nil || receipt.State != app.WorkspaceSyncCommitQuotaRejected {
+		t.Fatalf("durable quota receipt = %#v, err=%v", receipt, err)
+	}
+	var revision int64
+	if err := store.pool.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1`, value.ID).Scan(&revision); err != nil || revision != 0 {
+		t.Fatalf("revision after quota rejection = %d, err=%v; want unchanged revision 0", revision, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=6 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, session.ID, oldKey); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("replayed rejected key after freeing quota = %v, want quota exceeded", err)
+	}
+	newKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "quota-receipt:new", session.ID)
+	committed, replayed, err := commitWorkspaceSyncSession(ctx, store, value.ID, session.ID, newKey)
+	if err != nil || replayed || committed.State != workspace.SyncCompleted {
+		t.Fatalf("new-key commit = %#v replayed=%t err=%v", committed, replayed, err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, session.ID, oldKey); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("old rejected key after new-key success = %v, want quota exceeded", err)
+	}
+	value, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil || value.Revision != 1 || value.UsedBytes != file.SizeBytes {
+		t.Fatalf("workspace after fresh-key recovery = %#v, err=%v", value, err)
+	}
+}
+
+func TestWorkspaceSyncCreateQuotaRejectionStaysRejectedAfterQuotaChanges(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-create-quota-receipt")
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=2 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	file := syncTestFile("over-limit.txt", []byte("abc"))
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.PlannedBytes = file.SizeBytes
+	transfers := syncTestBlocks(session.UploadFiles)
+	for i := range transfers {
+		transfers[i].Received = false
+	}
+	key := syncTestIdempotency(owner.ID, "workspace.sync.create", "create-quota:old", session.ID)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, transfers, key); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("over-quota create error = %v, want quota exceeded", err)
+	}
+	var resourceID, relatedID string
+	if err := store.pool.QueryRow(ctx, `SELECT resource_id, related_id FROM idempotency_keys WHERE owner_id=$1 AND operation=$2 AND key=$3`,
+		key.OwnerID, key.Operation, key.Key).Scan(&resourceID, &relatedID); err != nil {
+		t.Fatalf("read durable create rejection: %v", err)
+	}
+	if resourceID != workspaceSyncCreateQuotaRejectedResource || relatedID != session.ReplicaID {
+		t.Fatalf("durable create rejection = (%q,%q), want quota marker bound to replica %q", resourceID, relatedID, session.ReplicaID)
+	}
+	var sessionCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, value.ID, session.ID).Scan(&sessionCount); err != nil || sessionCount != 0 {
+		t.Fatalf("sessions after quota rejection = %d, err=%v; want no session", sessionCount, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=3 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, transfers, key); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("replayed rejected create after raising quota = %v, want quota exceeded", err)
+	}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, transfers,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "create-quota:new", session.ID)); err != nil {
+		t.Fatalf("fresh-key create after raising quota: %v", err)
+	}
+}
+
+func TestWorkspaceSyncCreatePhysicalQuotaRejectionRollsBackReservations(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-create-physical-quota")
+	file := syncTestFile("too-large.txt", []byte("abc"))
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.PlannedBytes = file.SizeBytes
+	transfers := syncTestBlocks(session.UploadFiles)
+	for i := range transfers {
+		transfers[i].Received = false
+	}
+	key := syncTestIdempotency(owner.ID, "workspace.sync.create", "create-physical-quota:old", session.ID)
+	if _, _, err := createTestWorkspaceSyncSessionWithQuota(ctx, store, session, transfers, 2, key); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("over-quota physical reservation error = %v, want quota exceeded", err)
+	}
+	var resourceID string
+	if err := store.pool.QueryRow(ctx, `SELECT resource_id FROM idempotency_keys WHERE owner_id=$1 AND operation=$2 AND key=$3`,
+		key.OwnerID, key.Operation, key.Key).Scan(&resourceID); err != nil || resourceID != workspaceSyncCreateQuotaRejectedResource {
+		t.Fatalf("physical quota rejection marker = %q, err=%v", resourceID, err)
+	}
+	var reservationCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM workspace_block_usage WHERE workspace_id=$1`, value.ID).Scan(&reservationCount); err != nil || reservationCount != 0 {
+		t.Fatalf("partial block reservations after rejection = %d, err=%v", reservationCount, err)
+	}
+	var reservedBytes int64
+	if err := store.pool.QueryRow(ctx, `SELECT COALESCE(reserved_bytes, 0) FROM workspace_owner_block_usage WHERE owner_id=$1`, owner.ID).Scan(&reservedBytes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatal(err)
+	}
+	if reservedBytes != 0 {
+		t.Fatalf("owner reserved bytes after rejection = %d, want 0", reservedBytes)
+	}
+}
+
+func TestWorkspaceSyncConcurrentQuotaCommitsPersistSingleWinner(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-quota-concurrent")
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=10 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	files := []workspace.File{
+		syncTestFile("first.txt", []byte("123456")),
+		syncTestFile("second.txt", []byte("abcdef")),
+	}
+	sessions := make([]workspace.SyncSession, len(files))
+	keys := make([]app.IdempotencyRecord, len(files))
+	for i, file := range files {
+		sessions[i] = newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+		if _, _, err := createTestWorkspaceSyncSession(ctx, store, sessions[i], syncTestBlocks(sessions[i].UploadFiles),
+			syncTestIdempotency(owner.ID, "workspace.sync.create", fmt.Sprintf("quota-concurrent:create:%d", i), sessions[i].ID)); err != nil {
+			t.Fatal(err)
+		}
+		keys[i] = syncTestIdempotency(owner.ID, "workspace.sync.commit", fmt.Sprintf("quota-concurrent:commit:%d", i), sessions[i].ID)
+	}
+	type outcome struct {
+		index int
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, len(sessions))
+	for i := range sessions {
+		go func(index int) {
+			<-start
+			_, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, sessions[index].ID, keys[index])
+			results <- outcome{index: index, err: err}
+		}(i)
+	}
+	close(start)
+	winner, loser := -1, -1
+	for range sessions {
+		result := <-results
+		if result.err == nil {
+			if winner != -1 {
+				t.Fatal("both concurrent Workspace commits succeeded")
+			}
+			winner = result.index
+		} else if domain.CodeOf(result.err) == domain.CodeQuotaExceeded {
+			if loser != -1 {
+				t.Fatal("both concurrent Workspace commits were rejected")
+			}
+			loser = result.index
+		} else {
+			t.Fatalf("concurrent commit %d error = %v", result.index, result.err)
+		}
+	}
+	if winner == -1 || loser == -1 {
+		t.Fatalf("concurrent winner/loser = %d/%d", winner, loser)
+	}
+	winningReceipt, err := store.ReserveWorkspaceSyncCommit(ctx, value.ID, sessions[winner].ID, keys[winner])
+	if err != nil || winningReceipt.State != app.WorkspaceSyncCommitSucceeded || winningReceipt.Result.State != workspace.SyncCompleted {
+		t.Fatalf("winner receipt = %#v, err=%v", winningReceipt, err)
+	}
+	losingReceipt, err := store.ReserveWorkspaceSyncCommit(ctx, value.ID, sessions[loser].ID, keys[loser])
+	if err != nil || losingReceipt.State != app.WorkspaceSyncCommitQuotaRejected {
+		t.Fatalf("loser receipt = %#v, err=%v", losingReceipt, err)
+	}
+	updated, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil || updated.Revision != 1 || updated.UsedBytes != 6 {
+		t.Fatalf("Workspace after competing commits = %#v, err=%v", updated, err)
+	}
+}
+
+func TestWorkspaceSyncCommitReceiptEnforcesExactWorkspaceQuota(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-exact-workspace-quota")
+	const quotaBytes = int64(5 << 30)
+	const fileBytes = int64(256 << 20)
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=$2 WHERE id=$1`, value.ID, quotaBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	files := make([]workspace.File, 20)
+	for i := range files {
+		files[i] = syncTestRepeatedZeroFile(fmt.Sprintf("large-%02d.bin", i), fileBytes)
+	}
+	initial := newTestSyncSession(t, value, owner.ID, files, files, nil)
+	initial.PlannedBytes = 0 // All manifests reference the same already-received zero block.
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, initial, syncTestBlocks(initial.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "exact-quota:create", initial.ID)); err != nil {
+		t.Fatal(err)
+	}
+	committed, replayed, err := commitWorkspaceSyncSession(ctx, store, value.ID, initial.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "exact-quota:initial", initial.ID))
+	if err != nil || replayed || committed.State != workspace.SyncCompleted {
+		t.Fatalf("exact 5 GiB commit = %#v replayed=%t err=%v", committed, replayed, err)
+	}
+	value, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil || value.Revision != 1 || value.UsedBytes != quotaBytes {
+		t.Fatalf("workspace at exact quota = %#v, err=%v", value, err)
+	}
+
+	extra := syncTestFile("over-quota.txt", []byte("x"))
+	overQuotaFiles := append(append([]workspace.File(nil), files...), extra)
+	overQuota := newTestSyncSession(t, value, owner.ID, overQuotaFiles, []workspace.File{extra}, nil)
+	overQuota.PlannedBytes = 0
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=$2 WHERE id=$1`, value.ID, quotaBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, overQuota, syncTestBlocks(overQuota.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "exact-quota:over:create", overQuota.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=$2 WHERE id=$1`, value.ID, quotaBytes); err != nil {
+		t.Fatal(err)
+	}
+	rejectedKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "exact-quota:over:commit", overQuota.ID)
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, overQuota.ID, rejectedKey); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("5 GiB + 1 byte commit error = %v, want quota exceeded", err)
+	}
+	value, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil || value.Revision != 1 || value.UsedBytes != quotaBytes {
+		t.Fatalf("workspace after over-quota rejection = %#v, err=%v", value, err)
+	}
+
+	remaining := append([]workspace.File(nil), files[1:]...)
+	shrink := newTestSyncSession(t, value, owner.ID, remaining, nil, []string{files[0].Path})
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, shrink, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "exact-quota:shrink:create", shrink.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, shrink.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "exact-quota:shrink:commit", shrink.ID)); err != nil {
+		t.Fatalf("shrink after quota rejection: %v", err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, overQuota.ID, rejectedKey); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("replay of rejected key after space is freed = %v, want quota exceeded", err)
+	}
+	newKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "exact-quota:over:retry", overQuota.ID)
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, overQuota.ID, newKey); err != nil {
+		t.Fatalf("new key after freeing 256 MiB = %v", err)
+	}
+	value, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil || value.Revision != 3 || value.UsedBytes != quotaBytes-fileBytes+extra.SizeBytes {
+		t.Fatalf("workspace after fresh-key recovery = %#v, err=%v", value, err)
+	}
+}
+
+func TestWorkspaceSyncCommitReceiptFailureRollsBackWorkspaceMutation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-commit-receipt-rollback")
+	file := syncTestFile("receipt.txt", []byte("atomic commit"))
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.PlannedBytes = 0
+	created, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "receipt-rollback:create", session.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := syncTestIdempotency(owner.ID, "workspace.sync.commit", "receipt-rollback:commit", session.ID)
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE workspace_sync_commit_receipts
+ADD CONSTRAINT f02_test_reject_succeeded_receipt CHECK (state <> 'succeeded')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, created.ID, key); err == nil {
+		t.Fatal("commit succeeded despite injected receipt update failure")
+	}
+	var receiptState string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_sync_commit_receipts WHERE owner_id=$1 AND operation=$2 AND key=$3`,
+		key.OwnerID, key.Operation, key.Key).Scan(&receiptState); err != nil || receiptState != "pending" {
+		t.Fatalf("receipt after failed transaction = %q, err=%v; want pending", receiptState, err)
+	}
+	unchanged, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil || unchanged.Revision != 0 || unchanged.UsedBytes != 0 {
+		t.Fatalf("workspace after failed receipt transaction = %#v, err=%v", unchanged, err)
+	}
+	page, err := store.GetWorkspaceManifestPage(ctx, value.ID, 0, "", "", 10)
+	if err != nil || len(page.Files) != 0 {
+		t.Fatalf("manifest after failed receipt transaction = %#v, err=%v", page, err)
+	}
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE workspace_sync_commit_receipts
+DROP CONSTRAINT f02_test_reject_succeeded_receipt`); err != nil {
+		t.Fatal(err)
+	}
+	committed, replayed, err := commitWorkspaceSyncSession(ctx, store, value.ID, created.ID, key)
+	if err != nil || replayed || committed.State != workspace.SyncCompleted {
+		t.Fatalf("retry with pending receipt after rollback = %#v replayed=%t err=%v", committed, replayed, err)
+	}
+	updated, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil || updated.Revision != 1 || updated.UsedBytes != file.SizeBytes {
+		t.Fatalf("workspace after successful retry = %#v, err=%v", updated, err)
+	}
+}
+
+func TestWorkspaceSyncConcurrentSameKeyCommitReplaysSingleMutation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-commit-same-key")
+	file := syncTestFile("same-key.txt", []byte("one revision"))
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.PlannedBytes = 0
+	created, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "same-key:create", session.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := syncTestIdempotency(owner.ID, "workspace.sync.commit", "same-key:commit", created.ID)
+	const callers = 8
+	start := make(chan struct{})
+	type result struct {
+		replayed bool
+		err      error
+	}
+	results := make(chan result, callers)
+	var workers sync.WaitGroup
+	for range callers {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, replayed, err := commitWorkspaceSyncSession(ctx, store, value.ID, created.ID, key)
+			results <- result{replayed: replayed, err: err}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	successes, replays := 0, 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("same-key commit error = %v", result.err)
+		}
+		if result.replayed {
+			replays++
+		} else {
+			successes++
+		}
+	}
+	if successes != 1 || replays != callers-1 {
+		t.Fatalf("same-key commit results = successes:%d replays:%d; want 1 and %d", successes, replays, callers-1)
+	}
+	updated, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil || updated.Revision != 1 || updated.UsedBytes != file.SizeBytes {
+		t.Fatalf("workspace after same-key commits = %#v, err=%v", updated, err)
 	}
 }
 
@@ -488,7 +878,7 @@ func TestListDeviceWorkspaceSyncProgressRespectsActiveInstallationAndHidesDetail
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "device-progress")
-	makeDevice := func(name string) identity.Token {
+	makeDevice := func(name string, deviceIDChar byte) identity.Token {
 		t.Helper()
 		installationID := createTestClientInstallation(t, pool, owner.ID, nil)
 		id, err := domain.NewTokenID()
@@ -507,10 +897,11 @@ func TestListDeviceWorkspaceSyncProgressRespectsActiveInstallationAndHidesDetail
 		if err != nil {
 			t.Fatal(err)
 		}
+		activateTestWorkspaceSyncDeviceBinding(t, store, owner.ID, value.ID, installationID, id, deviceIDChar)
 		return token
 	}
-	device := makeDevice("active")
-	revoked := makeDevice("revoked")
+	device := makeDevice("active", 'E')
+	revoked := makeDevice("revoked", 'F')
 	file := syncTestFile("private/path.txt", []byte("private"))
 	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{}, nil)
 	session.ReplicaID = "device:" + device.ID
@@ -1292,6 +1683,19 @@ func syncTestFile(path string, body []byte) workspace.File {
 	return workspace.File{Path: path, SizeBytes: int64(len(body)), SHA256: sha, Mode: 0644, Chunks: chunks}
 }
 
+func syncTestRepeatedZeroFile(path string, size int64) workspace.File {
+	zeroBlock := make([]byte, workspace.MaxSyncBlockBytes)
+	chunkDigest := sha256.Sum256(zeroBlock)
+	chunkSHA := hex.EncodeToString(chunkDigest[:])
+	fileHash := sha256.New()
+	chunks := make([]workspace.Chunk, 0, size/workspace.MaxSyncBlockBytes)
+	for offset := int64(0); offset < size; offset += workspace.MaxSyncBlockBytes {
+		_, _ = fileHash.Write(zeroBlock)
+		chunks = append(chunks, workspace.Chunk{SHA256: chunkSHA, SizeBytes: workspace.MaxSyncBlockBytes})
+	}
+	return workspace.File{Path: path, SizeBytes: size, SHA256: hex.EncodeToString(fileHash.Sum(nil)), Mode: 0644, Chunks: chunks}
+}
+
 func newTestSyncSession(t *testing.T, value workspace.Workspace, ownerID string, files, upload []workspace.File, deletes []string) workspace.SyncSession {
 	t.Helper()
 	id, err := workspace.NewSyncSessionID()
@@ -1377,5 +1781,8 @@ func syncTestIdempotency(ownerID, operation, key, resourceID string) app.Idempot
 }
 
 func commitWorkspaceSyncSession(ctx context.Context, store *Store, workspaceID, sessionID string, idempotency app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
+	if _, err := store.ReserveWorkspaceSyncCommit(ctx, workspaceID, sessionID, idempotency); err != nil {
+		return workspace.SyncSession{}, false, err
+	}
 	return store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, idempotency)
 }

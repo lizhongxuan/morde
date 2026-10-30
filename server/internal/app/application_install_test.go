@@ -100,7 +100,7 @@ func TestControlServiceInstallApplicationIsOwnerOnlyAndFenced(t *testing.T) {
 			writeApplicationTestJSON(t, w, runtimeclient.CapabilitiesResponse{
 				ProtocolVersion: runtimeclient.ProtocolVersion, HostID: "h1234567", RuntimeGeneration: 1,
 				RuntimeInstanceID: "ri_install", ControlVersion: 0, Mode: runtimeclient.ModeAI, OperationStoreReady: true,
-				Capabilities: []string{"operation.execute", "operation.query", "operation.cancel", "control.fence", "control.quiesce", "task_lease.fence"},
+				Capabilities: []string{"operation.execute", "operation.query", "operation.cancel", "control.fence", "control.quiesce", "task_lease.fence", "workspace.task_view"},
 			})
 		case "/runtime/v1/applications/wechat/install":
 			installCalls++

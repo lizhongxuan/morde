@@ -486,10 +486,16 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 			if len(verification.Summary) > maxAgentResponseBytes || !utf8.ValidString(verification.Summary) ||
 				len(verification.Observation) > maxAgentResponseBytes || !utf8.ValidString(verification.Observation) ||
 				(verification.ObservationFingerprint != "" && (details.ScheduleObservation == nil || verification.Status != AgentVerified || !validAgentObservationFingerprint(verification.ObservationFingerprint))) ||
-				validateAgentVerificationArtifacts(verification) != nil {
+				validateAgentVerificationArtifacts(verification) != nil ||
+				(verification.WaitingReason != "" && (verification.WaitingReason != "workspace_input_changed" || verification.Status != AgentVerifyUnknown)) {
 				verifyStep.Status = task.StepFailed
 				verifyStep.Summary = "Independent verification returned an invalid response."
 				return a.fail(ctx, current, verifyStep, usage, AgentErrorVerification, nil)
+			}
+			if verification.WaitingReason == "workspace_input_changed" {
+				verifyStep.Status = task.StepWaitingUser
+				verifyStep.Summary = "Workspace changed after this task was submitted. Submit a new task to use the updated files."
+				return a.wait(ctx, current, verifyStep, usage, verification.WaitingReason, nil)
 			}
 			if verification.Status == AgentVerified {
 				verifyStep.Status = task.StepSucceeded
@@ -777,7 +783,7 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 				return a.wait(ctx, current, toolStep, usage, "host_fence_changed", nil)
 			}
 			fence = preparation.Fence
-			request.Fence = fence
+			request.Fence, request.WorkspaceID = fence, preparation.WorkspaceID
 			if activeUsage(baseActiveSeconds, started) >= current.Budget.ActiveSeconds {
 				toolStep.Status = task.StepWaitingUser
 				toolStep.Summary = "The task reached the active time limit before tool dispatch."
@@ -797,7 +803,7 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 			operation, replayed, err := a.store.CreateOperation(ctx, task.Operation{
 				ID: operationID, TaskID: current.ID, Key: operationKey, RequestHash: hash[:], HostID: current.HostID,
 				WorkspaceID: preparation.WorkspaceID, BindingVersion: preparation.BindingVersion,
-				InputRevision:     inputRevision,
+				InputRevision: inputRevision, WorkspaceCheckpointRevision: current.WorkspaceCheckpointRevision,
 				RuntimeGeneration: fence.RuntimeGeneration, RuntimeInstanceID: fence.RuntimeInstanceID,
 				ControlVersion: fence.ControlVersion, LeaseVersion: current.Lease.Version, RuntimeLeaseVersion: current.Lease.Version,
 				Status: task.OperationPrepared,
@@ -812,7 +818,9 @@ func (a *Agent) Run(ctx context.Context, claimed task.Task) (AgentRunResult, err
 				toolStep.Summary = "The tool operation could not be registered."
 				return a.fail(ctx, current, toolStep, usage, AgentErrorTool, nil)
 			}
-			if operation.WorkspaceID != preparation.WorkspaceID || operation.BindingVersion != preparation.BindingVersion {
+			if operation.WorkspaceID != preparation.WorkspaceID || operation.BindingVersion != preparation.BindingVersion ||
+				!sameTaskInputRevision(operation.InputRevision, inputRevision) ||
+				!sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) {
 				toolStep.Status = task.StepWaitingUser
 				toolStep.Summary = "The stored operation belongs to a different Workspace binding version."
 				return a.wait(ctx, current, toolStep, usage, "workspace_binding_changed", nil)

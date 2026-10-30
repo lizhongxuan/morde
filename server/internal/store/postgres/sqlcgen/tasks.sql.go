@@ -12,7 +12,7 @@ import (
 )
 
 const getTask = `-- name: GetTask :one
-SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent FROM tasks WHERE id = $1 AND owner_id = $2
+SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent, workspace_checkpoint_revision FROM tasks WHERE id = $1 AND owner_id = $2
 `
 
 type GetTaskParams struct {
@@ -68,6 +68,7 @@ func (q *Queries) GetTask(ctx context.Context, arg GetTaskParams) (Task, error) 
 		&i.CheckpointDigest,
 		&i.CheckpointThroughSeq,
 		&i.FileDeliveryIntent,
+		&i.WorkspaceCheckpointRevision,
 	)
 	return i, err
 }
@@ -220,7 +221,7 @@ func (q *Queries) ListTaskSteps(ctx context.Context, taskID string) ([]TaskStep,
 }
 
 const listTasks = `-- name: ListTasks :many
-SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent FROM tasks
+SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent, workspace_checkpoint_revision FROM tasks
 WHERE owner_id = $1
   AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
   AND ($3 = '' OR status = $3)
@@ -299,6 +300,7 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]Task, e
 			&i.CheckpointDigest,
 			&i.CheckpointThroughSeq,
 			&i.FileDeliveryIntent,
+			&i.WorkspaceCheckpointRevision,
 		); err != nil {
 			return nil, err
 		}

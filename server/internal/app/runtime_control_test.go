@@ -18,6 +18,8 @@ import (
 
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/runtimeclient"
 )
 
@@ -99,6 +101,38 @@ func TestRuntimeControlReadTaskFenceRequiresOwnedRunningHost(t *testing.T) {
 	fence, err = service.ReadTaskFence(context.Background(), value.OwnerID, value.ID)
 	if err != nil || fence.AIAllowed || fence.ControlVersion != 4 {
 		t.Fatalf("ReadTaskFence() during takeover = %+v, %v; want AI denied at current fence", fence, err)
+	}
+}
+
+func TestRuntimeControlTaskPrivateViewCanAdvanceAheadOfHostReplica(t *testing.T) {
+	ctx := context.Background()
+	service, hosts, manager, server := newRuntimeControlTest(t, 0, 0, runtimeclient.ModeBlocked, host.ControlAI, "")
+	defer func() { _ = manager.Close() }()
+	defer server.Close()
+
+	value, err := hosts.GetHost(ctx, "h1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := testWorkspaceBinding(value.ID, value.OwnerID, "w1234567", workspace.BindingActive)
+	binding.DesiredRevision = 1
+	binding.Workspace.Revision = 1
+	value.Workspaces = []workspace.Binding{binding}
+	hosts.addHost(value)
+
+	session, err := service.Connect(ctx, value.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	inputRevision, checkpointRevision := int64(0), int64(1)
+	current := task.Task{
+		ID: "q1234567", HostID: value.ID, WorkspaceID: binding.Workspace.ID,
+		InputRevision: &inputRevision, WorkspaceCheckpointRevision: &checkpointRevision,
+	}
+	if version, err := session.SyncTaskWorkspaceBindings(ctx, current, binding.Workspace.ID, binding.BindingVersion); err != nil || version != binding.BindingVersion {
+		t.Fatalf("SyncTaskWorkspaceBindings() = version %d, err=%v; want existing binding despite Host applied revision 0", version, err)
 	}
 }
 

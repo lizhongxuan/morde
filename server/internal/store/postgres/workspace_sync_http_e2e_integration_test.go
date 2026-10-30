@@ -71,6 +71,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+		activateTestWorkspaceSyncDeviceBinding(t, store, owner.ID, value.ID, installationID, tokenID, byte('A'+i))
 	}
 	auditService, err := app.NewAuditService(store)
 	if err != nil {
@@ -311,6 +312,154 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	}
 }
 
+// This integration test exercises the client, Portal API, PostgreSQL receipts,
+// and block store using a small logical quota.
+func TestWorkspaceSyncClientRetriesQuotaRejectionWithNewCommitKey(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "http-sync-quota-retry")
+	if _, err := pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=7 WHERE id=$1`, value.ID); err != nil {
+		t.Fatalf("set small Workspace quota: %v", err)
+	}
+	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "blocks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blocks.Close() })
+
+	installationID := createTestClientInstallation(t, pool, owner.ID, []string{value.ID})
+	tokenID, err := domain.NewTokenID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, secretHash, err := identity.NewCredential(identity.KindDevice, tokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateToken(ctx, identity.Token{
+		ID: tokenID, OwnerID: owner.ID, ClientInstallationID: installationID, Kind: identity.KindDevice, Name: "quota retry test device",
+		Scopes: []identity.Scope{identity.ScopeWorkspaceSync}, SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activateTestWorkspaceSyncDeviceBinding(t, store, owner.ID, value.ID, installationID, tokenID, 'C')
+	auditService, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialService, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
+	}, credentialDefaultHostNoop{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncService, err := app.NewWorkspaceSyncService(store, blocks, 0, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := api.New(api.Deps{
+		Hosts: unusedWorkspaceSyncHostService{}, TLSAuthorizer: unusedWorkspaceSyncTLSAuthorizer{},
+		Verifier: credentialService, Auth: unusedWorkspaceSyncAuth{}, WorkspaceSync: syncService, MCPDisabled: true,
+	}, api.Options{
+		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,
+		MCPMaxBodyBytes: 16 << 20, SessionTTL: time.Hour, HostScheme: "https",
+		PortalDomain: "portal.example.test", HostSuffix: "example-hosts.test", PreviewPortMin: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitReached := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePendingCommit := func() { releaseOnce.Do(func() { close(releaseCommit) }) }
+	defer releasePendingCommit()
+	var commitGateMu sync.Mutex
+	firstCommitBlocked := false
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/commit") {
+			commitGateMu.Lock()
+			block := !firstCommitBlocked
+			firstCommitBlocked = true
+			commitGateMu.Unlock()
+			if block {
+				close(commitReached)
+				<-releaseCommit
+			}
+		}
+		router.ServeHTTP(w, r)
+	}))
+	t.Cleanup(httpServer.Close)
+	syncClient, err := client.New(httpServer.URL, credential, httpServer.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskSource := t.TempDir()
+	writeWorkspaceSyncE2EFile(t, taskSource, "task.txt", []byte("same"))
+	zeroRevision := int64(0)
+	type syncOutcome struct {
+		result client.Result
+		err    error
+	}
+	pendingDone := make(chan syncOutcome, 1)
+	go func() {
+		result, err := syncClient.Sync(ctx, client.SyncOptions{
+			WorkspaceID: value.ID, Directory: taskSource, Direction: "upload", BaseRevision: &zeroRevision,
+		})
+		pendingDone <- syncOutcome{result: result, err: err}
+	}()
+	select {
+	case <-commitReached:
+	case <-time.After(15 * time.Second):
+		t.Fatal("first sync did not reach its commit request")
+	}
+
+	baseSource := t.TempDir()
+	writeWorkspaceSyncE2EFile(t, baseSource, "base.txt", []byte("same"))
+	base, err := syncClient.Sync(ctx, client.SyncOptions{
+		WorkspaceID: value.ID, Directory: baseSource, Direction: "upload", BaseRevision: &zeroRevision,
+	})
+	if err != nil || base.Session.State != "completed" || base.Session.TargetRevision != 1 {
+		t.Fatalf("concurrent base upload = %#v, %v", base.Session, err)
+	}
+	releasePendingCommit()
+	pending := <-pendingDone
+	var quotaError *client.HTTPError
+	if !errors.As(pending.err, &quotaError) || quotaError.Status != http.StatusConflict || quotaError.Code != "quota_exceeded" || pending.result.Session.ID == "" {
+		t.Fatalf("quota-limited concurrent upload = %#v, %v", pending.result.Session, pending.err)
+	}
+
+	writeWorkspaceSyncE2EFile(t, baseSource, "base.txt", []byte("sam"))
+	revisionOne := int64(1)
+	shrink, err := syncClient.Sync(ctx, client.SyncOptions{
+		WorkspaceID: value.ID, Directory: baseSource, Direction: "upload", Policy: "compare_merge", BaseRevision: &revisionOne,
+	})
+	if err != nil || shrink.Session.State != "completed" || shrink.Session.TargetRevision != 2 {
+		t.Fatalf("shrink upload to free Workspace quota = %#v, %v", shrink.Session, err)
+	}
+	sticky, err := syncClient.Sync(ctx, client.SyncOptions{
+		WorkspaceID: value.ID, Directory: taskSource, SessionID: pending.result.Session.ID,
+	})
+	if !errors.As(err, &quotaError) || quotaError.Status != http.StatusConflict || quotaError.Code != "quota_exceeded" {
+		t.Fatalf("same-key retry after quota restoration = %#v, %v; want sticky quota rejection", sticky.Session, err)
+	}
+	completed, err := syncClient.Sync(ctx, client.SyncOptions{
+		WorkspaceID: value.ID, Directory: taskSource, SessionID: pending.result.Session.ID, RetryCommitAfterQuota: true,
+	})
+	if err != nil || completed.Session.State != "completed" || completed.Session.TargetRevision != 3 {
+		t.Fatalf("new-key retry after quota restoration = %#v, %v", completed.Session, err)
+	}
+	manifest, err := store.GetWorkspaceManifestPage(ctx, value.ID, 3, "", "", 100)
+	totalBytes := int64(0)
+	for _, file := range manifest.Files {
+		totalBytes += file.SizeBytes
+	}
+	if err != nil || len(manifest.Files) != 2 || totalBytes != 7 {
+		t.Fatalf("manifest after explicit quota retry = %#v, %v", manifest, err)
+	}
+}
+
 // TestWorkspaceSyncClientThroughHTTPAndPostgresENOSPCRetryAfterRecovery is an
 // opt-in end-to-end check against a dedicated, small ext4 mount. It exercises
 // the actual block store, HTTP API, and PostgreSQL acknowledgement state.
@@ -416,6 +565,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgresENOSPCRetryAfterRecovery(t *te
 	}); err != nil {
 		t.Fatal(err)
 	}
+	activateTestWorkspaceSyncDeviceBinding(t, store, owner.ID, value.ID, installationID, tokenID, 'D')
 	auditService, err := app.NewAuditService(store)
 	if err != nil {
 		t.Fatal(err)

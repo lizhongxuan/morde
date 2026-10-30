@@ -47,10 +47,9 @@ import (
 	storepostgres "morde/server/internal/store/postgres"
 )
 
-// TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact exercises
-// task acceptance, durable worker execution, the real Node dsh runtime, Host
-// runtime file operations, Host replica sync commits, and artifact readback.
-func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *testing.T) {
+// TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView exercises
+// durable execution and publication from the Task-private Workspace view.
+func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
@@ -76,15 +75,15 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 	if err := os.MkdirAll(workspaceDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	files, err := runtimefiles.OpenWorkspace(hostRoot)
+	taskWorkspace, err := runtimefiles.OpenTaskWorkspace(hostRoot, filepath.Join(hostRoot, ".morde-task-views"), uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	approvalDesktop := &f01ApprovalDesktopHandler{}
-	runtimeHandlers := append(files.Handlers(), approvalDesktop)
+	runtimeHandlers := append(taskWorkspace.Handlers(), approvalDesktop)
 	defer func() {
-		if err := files.Close(); err != nil {
-			t.Errorf("close Host runtime workspace: %v", err)
+		if err := taskWorkspace.Close(); err != nil {
+			t.Errorf("close Host Task Workspace views: %v", err)
 		}
 	}()
 	runtimeStore := filepath.Join(t.TempDir(), "runtime-state")
@@ -94,7 +93,7 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 	runtimeManager, err := runtimecore.Open(runtimecore.Options{
 		StoreDir: runtimeStore, ExpectedOwnerUID: uint32(os.Geteuid()),
 		HostID: hostValue.ID, Generation: hostValue.RuntimeGeneration, ProtocolVersion: contract.ProtocolVersion,
-		Handlers: runtimeHandlers,
+		Handlers: runtimeHandlers, TaskWorkspaceViews: taskWorkspace,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +245,7 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	model := &f01CloudTaskModel{store: store, hostID: hostValue.ID, workspaceID: workspaceValue.ID, approvalFirst: true,
+	model := &f01CloudTaskModel{workspaceID: workspaceValue.ID, approvalFirst: true,
 		secondStarted: make(chan struct{}), content: "Morde kept the cloud task running after the client disconnected.\n"}
 	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
@@ -333,7 +332,14 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 		liveDone <- liveClient.LiveSync(liveCtx, mordesync.LiveSyncOptions{
 			WorkspaceID: workspaceValue.ID, Directory: workspaceDirectory, RescanInterval: 5 * time.Second,
 			OnResult: func(result mordesync.Result) {
-				if result.Session.State != "completed" || len(result.Conflicts) != 0 || len(result.Session.Conflicts) != 0 {
+				if result.Session.State == "failed" || result.Session.State == "cancelled" || len(result.Conflicts) != 0 || len(result.Session.Conflicts) != 0 {
+					select {
+					case liveErrors <- fmt.Errorf("Host replica sync %s ended in %s with conflicts %v", result.Session.ID, result.Session.State, result.Conflicts):
+					default:
+					}
+					return
+				}
+				if result.Session.State != "completed" {
 					return
 				}
 				if err := f01RecordApplied(httpClient, portal.URL, hostValue, replicaCredential, workspaceValue.ID,
@@ -471,7 +477,9 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 		case <-model.secondStarted:
 			secondTurnReached = true
 		case executionErr := <-executionErrors:
-			t.Fatalf("real CloudDSHExecutor stopped before its second model call: %v", executionErr)
+			current, taskErr := store.GetTask(ctx, accepted.ID, owner.ID)
+			t.Fatalf("real CloudDSHExecutor stopped before its second model call: %v; task=%#v task_error=%v",
+				executionErr, current.Task, taskErr)
 		case <-secondTurn.C:
 			current, getErr := store.GetTask(ctx, accepted.ID, owner.ID)
 			t.Logf("waiting for dsh second model turn: err=%v status=%s agent=%s/%d checkpoint=%d reason=%s model_calls=%d steps=%d",
@@ -482,22 +490,17 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 		}
 	}
 	details, err := store.GetTask(ctx, accepted.ID, owner.ID)
-	if err != nil || details.Task.Status != task.StatusRunning {
-		t.Fatalf("task after client stream disconnect = %s, %v; want running", details.Task.Status, err)
+	if err != nil || details.Task.Status != task.StatusRunning && details.Task.Status != task.StatusCompleted {
+		t.Fatalf("task after client stream disconnect = %s, %v; want running or completed", details.Task.Status, err)
 	}
 	if approvalDesktop.calls.Load() != 1 {
 		t.Fatalf("approved Host desktop operation ran %d times, want exactly once", approvalDesktop.calls.Load())
 	}
-	fileOnHost, err := os.ReadFile(filepath.Join(workspaceDirectory, "task-note.txt"))
-	if err != nil || string(fileOnHost) != model.content {
-		current, taskErr := store.GetTask(ctx, accepted.ID, owner.ID)
-		operation, operationErr := store.GetOperation(ctx, owner.ID, accepted.ID, f01OperationKey("f01-write-note-001"))
-		var stepSummary []string
-		for _, step := range current.Steps {
-			stepSummary = append(stepSummary, fmt.Sprintf("%s:%s:%s", step.Kind, step.Status, step.Summary))
-		}
-		t.Fatalf("real Host runtime file after dsh write: read_error=%v bytes=%d task_error=%v task_status=%s tool_calls=%d steps=%v operation_status=%s operation_error=%v model_calls=%d",
-			err, len(fileOnHost), taskErr, current.Task.Status, current.Task.Usage.ToolCalls, stepSummary, operation.Status, operationErr, model.callCount())
+	if err := waitF01(t, ctx, func() (bool, error) {
+		current, err := store.GetTask(ctx, accepted.ID, owner.ID)
+		return err == nil && current.Task.Status == task.StatusCompleted, err
+	}, executionErrors, nil); err != nil {
+		t.Fatalf("Cloud Task did not complete after publishing its private view: %v", err)
 	}
 
 	if err := waitF01(t, ctx, func() (bool, error) {
@@ -507,16 +510,6 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 		}
 		return binding.Workspace.Revision == 1 && binding.DesiredRevision == 1 && binding.AppliedRevision == 1, nil
 	}, liveErrors, liveReceipts); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := waitF01(t, ctx, func() (bool, error) {
-		current, err := store.GetTask(ctx, accepted.ID, owner.ID)
-		if err != nil {
-			return false, err
-		}
-		return current.Task.Status == task.StatusCompleted, nil
-	}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	details, err = store.GetTask(ctx, accepted.ID, owner.ID)
@@ -532,20 +525,22 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 	}
 	digest := sha256.Sum256([]byte(model.content))
 	wantDigest := hex.EncodeToString(digest[:])
-	if details.Task.Status != task.StatusCompleted || details.Task.WorkspaceID != workspaceValue.ID ||
-		details.Task.InputRevision == nil || *details.Task.InputRevision != 0 || len(details.Artifacts) != 1 {
-		t.Fatalf("completed Task or artifact count = status %s, Workspace %s, input revision %#v, artifacts %#v",
-			details.Task.Status, details.Task.WorkspaceID, details.Task.InputRevision, details.Artifacts)
+	if details.Task.Status != task.StatusCompleted || details.Task.WaitingReason != "" ||
+		details.Task.WorkspaceID != workspaceValue.ID || details.Task.InputRevision == nil || *details.Task.InputRevision != 0 ||
+		details.Task.WorkspaceCheckpointRevision == nil || *details.Task.WorkspaceCheckpointRevision != 1 || len(details.Artifacts) != 1 ||
+		details.Artifacts[0].Path != "task-note.txt" || details.Artifacts[0].Revision != 1 {
+		t.Fatalf("published Task = status %s reason %s Workspace %s input revision %#v checkpoint %#v artifacts %#v",
+			details.Task.Status, details.Task.WaitingReason, details.Task.WorkspaceID, details.Task.InputRevision,
+			details.Task.WorkspaceCheckpointRevision, details.Artifacts)
 	}
-	artifact := details.Artifacts[0]
-	if artifact.WorkspaceID != workspaceValue.ID || artifact.Revision != 1 || artifact.Path != "task-note.txt" ||
-		artifact.SizeBytes != int64(len(model.content)) || artifact.SHA256 != wantDigest || artifact.MediaType != "text/plain; charset=utf-8" {
-		t.Fatalf("persisted artifact metadata = %#v", artifact)
-	}
-	manifest, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, artifact.Revision, "", "", 10)
-	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Path != artifact.Path ||
-		manifest.Files[0].SizeBytes != artifact.SizeBytes || manifest.Files[0].SHA256 != artifact.SHA256 {
+	manifest, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, 1, "", "", 10)
+	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Path != "task-note.txt" ||
+		manifest.Files[0].SizeBytes != int64(len(model.content)) || manifest.Files[0].SHA256 != wantDigest {
 		t.Fatalf("committed Workspace manifest = %#v, %v", manifest, err)
+	}
+	fileOnHost, err := os.ReadFile(filepath.Join(workspaceDirectory, "task-note.txt"))
+	if err != nil || string(fileOnHost) != model.content {
+		t.Fatalf("Host replica file after Task publish = %q, %v", fileOnHost, err)
 	}
 
 	readCredential, readBinding := f01BindingCredential(t, httpClient, portal.URL, hostValue, replicaCredential, workspaceValue.ID)
@@ -563,7 +558,7 @@ func TestCloudTaskSurvivesClientDisconnectAndCommitsHostWorkspaceArtifact(t *tes
 	if err != nil || readback.Session.State != "completed" || readback.Session.TargetRevision != readBinding.DesiredRevision {
 		t.Fatalf("read committed Workspace through Host replica blocks = %#v, %v", readback.Session, err)
 	}
-	readbackBytes, err := os.ReadFile(filepath.Join(readbackDirectory, artifact.Path))
+	readbackBytes, err := os.ReadFile(filepath.Join(readbackDirectory, "task-note.txt"))
 	if err != nil || string(readbackBytes) != model.content {
 		t.Fatalf("downloaded Workspace artifact = %q, %v", readbackBytes, err)
 	}
@@ -629,7 +624,16 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 		current, err := store.GetTask(ctx, backgroundAccepted.ID, owner.ID)
 		return err == nil && current.Task.Status == task.StatusCompleted, err
 	}, executionErrors, nil); err != nil {
-		t.Fatalf("background child Task did not complete: %v", err)
+		t.Fatalf("background child Task did not finish with its private-view output: %v", err)
+	}
+	if err := waitF01(t, ctx, func() (bool, error) {
+		binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if err != nil {
+			return false, err
+		}
+		return binding.Workspace.Revision == 2 && binding.DesiredRevision == 2 && binding.AppliedRevision == 2, nil
+	}, liveErrors, liveReceipts); err != nil {
+		t.Fatalf("Host did not apply the background Task's published Workspace revision: %v", err)
 	}
 	backgroundDetails, err := store.GetTask(ctx, backgroundAccepted.ID, owner.ID)
 	if err != nil {
@@ -652,9 +656,12 @@ WHERE task_id=$1 AND owner_id=$2 AND parent_session_id IS NOT NULL AND is_backgr
 			childSucceeded = true
 		}
 	}
-	if !childSucceeded || !model.backgroundOutputWasVerified() {
-		t.Fatalf("background job result was not durably read and completed: child_succeeded=%t output_verified=%t steps=%#v",
-			childSucceeded, model.backgroundOutputWasVerified(), backgroundDetails.Steps)
+	if !childSucceeded || !model.backgroundOutputWasVerified() || len(backgroundDetails.Artifacts) != 1 ||
+		backgroundDetails.Artifacts[0].Path != "background-result.txt" || backgroundDetails.Task.WorkspaceCheckpointRevision == nil ||
+		*backgroundDetails.Task.WorkspaceCheckpointRevision != 2 {
+		t.Fatalf("background job result was not durably read and published: child_succeeded=%t output_verified=%t checkpoint=%#v artifacts=%#v steps=%#v",
+			childSucceeded, model.backgroundOutputWasVerified(), backgroundDetails.Task.WorkspaceCheckpointRevision,
+			backgroundDetails.Artifacts, backgroundDetails.Steps)
 	}
 	backgroundReadCall := cloudDSHNamespacedToolCallID(backgroundAccepted.ID, childSessionID, "f01-background-read-001")
 	backgroundReadOperation, backgroundReadErr := store.GetOperation(ctx, owner.ID, backgroundAccepted.ID, f01OperationKey(backgroundReadCall))
@@ -678,8 +685,6 @@ type f01CloudTaskModel struct {
 	secondStarted            chan struct{}
 	startOnce                sync.Once
 	approvalFirst            bool
-	store                    *storepostgres.Store
-	hostID                   string
 	workspaceID              string
 	content                  string
 	backgroundChild          bool
@@ -939,19 +944,7 @@ func (m *f01CloudTaskModel) Complete(ctx context.Context, call app.ModelCall) (a
 		return app.ModelResponse{}, fmt.Errorf("unexpected model call %d", callNumber)
 	}
 	m.startOnce.Do(func() { close(m.secondStarted) })
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		binding, err := m.store.GetWorkspaceBinding(ctx, m.hostID, m.workspaceID)
-		if err == nil && binding.Workspace.Revision >= 1 && binding.AppliedRevision >= 1 {
-			return app.ModelResponse{Text: "The Workspace file was committed.", StopReason: "stop", Usage: usage}, nil
-		}
-		select {
-		case <-ctx.Done():
-			return app.ModelResponse{}, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return app.ModelResponse{Text: "The Workspace file was committed.", StopReason: "stop", Usage: usage}, nil
 }
 
 func (m *f01CloudTaskModel) enableBackgroundChild() {
@@ -1005,7 +998,7 @@ func (m *f01CloudTaskModel) completeBackground(ctx context.Context, call app.Mod
 			m.backgroundOutputCallID, m.backgroundOutputVerified
 		m.mu.Unlock()
 		if outputVerified {
-			return m.waitForBackgroundWorkspaceCommit(ctx, usage)
+			return app.ModelResponse{Text: "The background job completed and its Workspace output was committed.", StopReason: "stop", Usage: usage}, nil
 		}
 		if getCallID != "" {
 			output, ok := f01ToolResult(call.RawRequest, getCallID)
@@ -1051,22 +1044,6 @@ func (m *f01CloudTaskModel) completeBackground(ctx context.Context, call app.Mod
 				"Background job completed after reading task-note.txt.\n"))
 		}
 		return app.ModelResponse{}, fmt.Errorf("unexpected background model call %d", callNumber)
-	}
-}
-
-func (m *f01CloudTaskModel) waitForBackgroundWorkspaceCommit(ctx context.Context, usage app.ModelUsage) (app.ModelResponse, error) {
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		binding, err := m.store.GetWorkspaceBinding(ctx, m.hostID, m.workspaceID)
-		if err == nil && binding.Workspace.Revision >= 2 && binding.AppliedRevision >= 2 {
-			return app.ModelResponse{Text: "The background job completed and its Workspace output was committed.", StopReason: "stop", Usage: usage}, nil
-		}
-		select {
-		case <-ctx.Done():
-			return app.ModelResponse{}, ctx.Err()
-		case <-ticker.C:
-		}
 	}
 }
 

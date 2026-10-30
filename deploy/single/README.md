@@ -2,7 +2,17 @@
 
 > 唯一网络方案：runsc + 专用 Docker 网桥 + 宿主 nftables。固定 OSB 不发送 networkPolicy、不部署 egress sidecar。规则检查失败时 Portal 启动、readiness 和创建均失败。
 
-目标环境为 Linux：Docker 已注册 runsc，安装 nftables、Python 3.11+（tomllib）、coreutils 和 util-linux（flock）。当前测试机只有一块系统盘，因此 Docker、PostgreSQL 和系统日志仍共享物理盘；Portal 在 Docker 数据根目录剩余空间低于 10 GiB 时拒绝新建 Host，但不提供每个 Workspace 硬配额或数据库独立保护。只对外开放 Caddy，Portal/数据库/OpenSandbox/主机端口保持回环监听。执行前先跑 `m0/02-gvisor.sh`，证明固定 AIO 的核心接口和浏览器可用。
+目标环境为 Linux：Docker 已注册 runsc，安装 nftables、Python 3.11+（tomllib）、coreutils 和 util-linux（flock）。当前测试机只有一块系统盘，因此 Docker、PostgreSQL 和系统日志仍共享物理盘；Portal 在 Docker 数据根目录剩余空间低于 10 GiB 时拒绝新建 Host，但不提供每个 Workspace 硬配额或数据库独立保护。默认只对外开放 Caddy，Portal/数据库/OpenSandbox/Host 端口保持回环监听。F02 私有 Syncthing relay 使用独立 Compose profile，默认不启动且只绑定回环；relay 使用 IP masquerading 关闭的专用 bridge，外部启用前仍须在 Linux 目标主机验证 nftables 入站与出站规则。公网入口仅开放 TCP 22067，不开放 relay status 端口。中继会连接各账号隔离网络并可访问节点内部 GUI/API，必须作为受信 Morde 服务运行。执行前先跑 `m0/02-gvisor.sh`，证明固定 AIO 的核心接口和浏览器可用。
+
+F02 中继已选择由 Morde 自行托管，作为 Syncthing 加密节点连接的转发点，不加入公共 relay pool。Compose 使用独立的 `CH_WORKSPACE_SYNC_RELAY_TOKEN` 限制只有持有共享 token 的节点能加入；生成 32 字节随机 token（例如 `openssl rand -hex 32`），只保存在 root 持有、权限 `0600` 的 `/etc/cloudhost/cloudhost.env`，不要提交到仓库。授权桌面端通过设备登记响应取得带 relay 证书 ID 与 token 的静态 URI。当前 Compose profile 仅是部署配置；设备/Workspace folder 接线和撤权屏障通过验收前不要启动 `workspace-sync` profile。relay 使用 IP masquerading 关闭的专用 bridge，以支持发布 TCP 22067；该设置不提供出站防火墙规则。正式公网启用前，须在 Linux 目标主机实测 nftables 入站与出站策略；将 `.env` 中 relay 地址改为可达的主机名或 IP、绑定地址改为公网入口，并在主机防火墙和云安全组仅开放 TCP 22067；管理/状态端口不开放。relay 会加入账号节点网络并能连接节点内部 REST/API，须随 Portal 一同按受信服务保护。
+
+Syncthing 节点与 relay 镜像只在本机生成，不需要推送外部 registry。创建 relay 状态目录时设为 `65532:65532` 所有、`0700` 权限；例如 `sudo install -d -o 65532 -g 65532 -m 0700 /srv/morde-workspace-sync-relay`。使用受控的 F02 Syncthing 源码 worktree 构建：
+
+```sh
+SYNCTHING_SOURCE_DIR="/path/to/local/syncthing-f02-worktree" IMAGE_PLATFORM=linux/amd64 images/workspace-sync/build.sh
+```
+
+构建脚本拒绝非本机 Docker endpoint、使用 `GOPROXY=off`，并输出两个镜像 tag 与内容 ID。将节点和 relay 内容 ID 分别填入 `CH_WORKSPACE_SYNC_NODE_IMAGE_ID`、`CH_WORKSPACE_SYNC_RELAY_IMAGE_ID`；将输出的 relay tag 填入 `CH_WORKSPACE_SYNC_RELAY_IMAGE`。再设置节点数据根目录和 relay 对外地址。Compose profile 仍须在 T04 的真实设备共享、relay 互通和撤权屏障验收后才可启动；当前没有进行这些部署操作。
 
 1. 在目标机本地准备 `/etc/cloudhost/cloudhost.env`（root 持有、0600），按 `.env.example` 填写真实值。PostgreSQL 密码与 DSN 一致；Portal 和 OpenSandbox 使用同一 API Key。`CH_DOCKER_DATA_DIR` 必须与 Docker Engine `/info` 返回的 `DockerRootDir` 相同，`CH_DOCKER_MIN_FREE_BYTES` 默认 10 GiB。低于此余量会阻止新建 Host；已运行 Host 和 PostgreSQL 仍可能继续占用空间。
 2. 若没有自有域名，可用目标机公网 IPv4 构造测试地址：`portal.<IPv4>.sslip.io` 和 `<IPv4>.nip.io`。分别设置为 `CH_PORTAL_DOMAIN` 与 `CH_HOST_SUFFIX`，`CH_CADDY_PORTAL_ADDRESS` 设为门户域名，`CH_CADDY_HOST_ADDRESS` 设为 `*.<IPv4>.nip.io`；设 `CH_SCHEME=https`、`CH_COOKIE_SECURE=true`。将两个 `CH_CADDY_*_TLS` 值分别设为多行 Caddy 配置 `tls {`、下一行缩进写 `on_demand`、最后一行 `}`。Caddy 按需申请每个具体主机名的证书，Portal 只授权门户自身和运行中的 Host/允许端口预览域名。公网入口须允许 TCP 80/443。动态 DNS 服务会公开目标 IP，适合临时验收；正式公网使用建议改成自有域名。临时域名不支持通配符证书。

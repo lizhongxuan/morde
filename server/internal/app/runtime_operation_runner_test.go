@@ -103,7 +103,7 @@ func TestRuntimeOperationRunnerExecutesAndQueriesOverPinnedRuntimeHTTP(t *testin
 
 	runner := NewRuntimeOperationRunner(time.Millisecond)
 	arguments := json.RawMessage(`{"target_id":"tab-1"}`)
-	operation, err := runner.Execute(ctx, session, taskID, operationID, 1, "browser.observe", "snapshot", arguments, "", 0, nil)
+	operation, err := runner.Execute(ctx, session, taskID, operationID, 1, "browser.observe", "snapshot", arguments, "", 0, "", 0, nil)
 	if err != nil {
 		t.Fatalf("execute runtime operation: %v", err)
 	}

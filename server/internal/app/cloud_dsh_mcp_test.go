@@ -13,6 +13,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 type cloudDSHMCPStoreStub struct {
@@ -20,6 +21,14 @@ type cloudDSHMCPStoreStub struct {
 	*mcpConnectorStoreStub
 	grants     []TaskMCPConnectorGrant
 	operations map[string]MCPConnectorOperation
+	binding    *workspace.Binding
+}
+
+func (s *cloudDSHMCPStoreStub) GetWorkspaceBinding(_ context.Context, hostID, workspaceID string) (workspace.Binding, error) {
+	if s.binding == nil || s.binding.HostID != hostID || s.binding.Workspace.ID != workspaceID {
+		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	}
+	return *s.binding, nil
 }
 
 func (s *cloudDSHMCPStoreStub) ListTaskMCPConnectorGrants(_ context.Context, ownerID, taskID string) ([]TaskMCPConnectorGrant, error) {
@@ -139,7 +148,11 @@ func (cloudDSHMCPCredentialStub) CredentialHeaders(context.Context, MCPConnector
 
 func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
-	fixture.store.details.Task.HostID = ""
+	inputRevision, checkpointRevision := int64(4), int64(7)
+	fixture.store.details.Task.HostID = "h1234567"
+	fixture.store.details.Task.WorkspaceID = "w1234567"
+	fixture.store.details.Task.InputRevision = &inputRevision
+	fixture.store.details.Task.WorkspaceCheckpointRevision = &checkpointRevision
 	fixture.store.details.Task.ExecutionLocation = "server"
 	connectorID := "k1234567"
 	connectorStore := &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
@@ -150,6 +163,8 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 		mcpConnectorStoreStub:   connectorStore,
 		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
 			ConnectorID: connectorID, ConnectorRevision: 1, CredentialVersion: 1, GrantVersion: 1}},
+		binding: &workspace.Binding{OwnerID: fixture.store.details.Task.OwnerID, HostID: fixture.store.details.Task.HostID,
+			Workspace: workspace.Workspace{ID: fixture.store.details.Task.WorkspaceID}, BindingVersion: 9},
 	}
 	fixture.executor.store = store
 	client := &cloudDSHMCPClientStub{
@@ -161,8 +176,8 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.Definitions(context.Background(), claimed)
-	if err != nil || len(definitions) != 2 || definitions[0].Name != cloudDSHMCPToolName(connectorID, "lookup") || definitions[0].RequiredScope != identity.ScopeMCPControl {
+	definitions, err := broker.mcpDefinitions(context.Background(), claimed)
+	if err != nil || len(definitions) != 1 || definitions[0].Name != cloudDSHMCPToolName(connectorID, "lookup") || definitions[0].RequiredScope != identity.ScopeMCPControl {
 		t.Fatalf("MCP definitions = %#v, err=%v", definitions, err)
 	}
 	grant := store.grants[0]
@@ -178,15 +193,18 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	if err := json.Unmarshal([]byte(first.Output), &output); err != nil || output.IsError || string(output.StructuredContent) != `{"count":1}` || len(output.Text) != 1 || output.Text[0] != "one record" {
 		t.Fatalf("MCP result envelope = %#v, err=%v", output, err)
 	}
-	if store.details.Task.Usage.ToolCalls != 1 || store.operations[agentOperationKey(call.CallID)].Status != task.OperationSucceeded {
-		t.Fatalf("MCP budget/operation = %d / %#v", store.details.Task.Usage.ToolCalls, store.operations)
+	stored := store.operations[agentOperationKey(call.CallID)]
+	if store.details.Task.Usage.ToolCalls != 1 || stored.Status != task.OperationSucceeded || stored.HostID != fixture.store.details.Task.HostID ||
+		stored.WorkspaceID != fixture.store.details.Task.WorkspaceID || stored.BindingVersion != 9 || stored.InputRevision == nil ||
+		*stored.InputRevision != inputRevision || stored.WorkspaceCheckpointRevision == nil || *stored.WorkspaceCheckpointRevision != checkpointRevision {
+		t.Fatalf("MCP budget/operation = %d / %#v", store.details.Task.Usage.ToolCalls, stored)
 	}
 	replayed, err := broker.Reconcile(context.Background(), claimed, call, nil)
 	if err != nil || replayed.Output != first.Output || client.callCalls != 1 {
 		t.Fatalf("replayed MCP result = %#v, err=%v; remote calls=%d", replayed, err, client.callCalls)
 	}
 	client.tools[0].Description = "Changed after the grant"
-	if _, err := broker.Definitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeConflict {
+	if _, err := broker.mcpDefinitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("changed tool schema error = %v", err)
 	}
 }
@@ -194,6 +212,9 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 func TestCloudDSHMCPBrokerPersistsUnknownWithoutReplaying(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
 	fixture.store.details.Task.ExecutionLocation = "server"
 	connectorID := "k7654321"
 	connectorStore := &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
@@ -231,6 +252,9 @@ func TestCloudDSHMCPBrokerPersistsUnknownWithoutReplaying(t *testing.T) {
 func TestCloudDSHMCPConfirmedUnsupportedResultPausesAndReplaysWithoutCallingAgain(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
 	fixture.store.details.Task.ExecutionLocation = "server"
 	connectorID := "k8765432"
 	store := &cloudDSHMCPStoreStub{
@@ -278,6 +302,9 @@ func TestCloudDSHMCPConfirmedUnsupportedResultPausesAndReplaysWithoutCallingAgai
 func TestCloudDSHMCPBrokerDiscardsResultAfterGrantRevocation(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
 	fixture.store.details.Task.ExecutionLocation = "server"
 	connectorID := "k2345678"
 	store := &cloudDSHMCPStoreStub{

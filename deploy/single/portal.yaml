@@ -63,6 +63,17 @@ workspace_storage:
   max_workspace_bytes: ${CH_WORKSPACE_MAX_BYTES}
   max_owner_bytes: ${CH_WORKSPACE_OWNER_MAX_BYTES}
   min_free_bytes: ${CH_WORKSPACE_MIN_FREE_BYTES}
+# Enable only after Workspace sync current-files, admission, private relay, and revocation barriers are verified.
+workspace_sync_node:
+  enabled: false
+  image_digest: ${CH_WORKSPACE_SYNC_NODE_IMAGE_ID}
+  relay_image_digest: ${CH_WORKSPACE_SYNC_RELAY_IMAGE_ID}
+  relay_public_address: ${CH_WORKSPACE_SYNC_RELAY_PUBLIC_ADDRESS}
+  relay_token: ${CH_WORKSPACE_SYNC_RELAY_TOKEN}
+  relay_state_root: ${CH_WORKSPACE_SYNC_RELAY_STATE_DIR}
+  state_root: ${CH_WORKSPACE_SYNC_NODE_STATE_DIR}
+  workspace_root: ${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR}
+  relay_container_name: morde-syncthing-relay
 site_storage:
   root_dir: ${CH_SITE_STORAGE_ROOT_DIR}
   max_release_bytes: ${CH_SITE_STORAGE_MAX_RELEASE_BYTES}

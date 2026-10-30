@@ -50,7 +50,7 @@ func (s *Store) ListUnknownOperations(ctx context.Context, ownerID, taskID strin
 		if !exists {
 			return missingTaskError()
 		}
-		rows, err := tx.Query(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision,
+		rows, err := tx.Query(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision, o.workspace_checkpoint_revision,
 o.runtime_generation, o.runtime_instance_id, o.control_version, o.lease_version, o.runtime_lease_version, o.status, o.external_id, o.result, o.created_at, o.updated_at
 FROM task_operations o JOIN tasks t ON t.id=o.task_id
 WHERE o.task_id=$1 AND t.owner_id=$2 AND o.status='unknown'
@@ -62,7 +62,7 @@ ORDER BY o.created_at, o.operation_key`, taskID, ownerID)
 		for rows.Next() {
 			var row sqlcgen.TaskOperation
 			if err := rows.Scan(&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID,
-				&row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion,
+				&row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion,
 				&row.RuntimeLeaseVersion, &row.Status, &row.ExternalID,
 				&row.Result, &row.CreatedAt, &row.UpdatedAt); err != nil {
 				return fmt.Errorf("read unknown task operation: %w", err)
@@ -364,7 +364,7 @@ func validateTaskArtifactWorkspaceProof(ctx context.Context, tx pgx.Tx, ownerID 
   JOIN workspace_revision_files f ON f.workspace_id=$3 AND f.file_path=$4
     AND f.valid_from_revision <= $5 AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $5)
     AND f.size_bytes=$6 AND f.sha256=$7
-  WHERE t.id=$1 AND t.owner_id=$2 AND t.workspace_id=$3
+  WHERE t.id=$1 AND t.owner_id=$2 AND t.workspace_id=$3 AND t.workspace_checkpoint_revision=$5
 )`, artifact.TaskID, ownerID, artifact.WorkspaceID, artifact.Path, artifact.Revision, artifact.SizeBytes, artifact.SHA256).Scan(&matches)
 	if err != nil {
 		return fmt.Errorf("verify task artifact workspace manifest proof: %w", err)
@@ -487,7 +487,8 @@ func validateCompletedTaskArtifacts(ctx context.Context, tx pgx.Tx, ownerID, tas
   LEFT JOIN task_batch_items bi ON bi.task_id=a.task_id AND bi.id=a.batch_item_id
   WHERE a.task_id=$1 AND (
     a.workspace_id IS NULL OR a.workspace_revision IS NULL OR a.size_bytes IS NULL OR a.sha256 IS NULL
-    OR t.workspace_id IS NULL OR a.workspace_id <> t.workspace_id OR w.id IS NULL OR f.file_path IS NULL
+    OR t.workspace_id IS NULL OR a.workspace_id <> t.workspace_id OR a.workspace_revision IS DISTINCT FROM t.workspace_checkpoint_revision
+    OR w.id IS NULL OR f.file_path IS NULL
     OR (a.batch_item_id IS NOT NULL AND (bi.id IS NULL OR bi.attempt <> a.batch_attempt OR bi.status <> 'succeeded'))
   )
 )`, taskID, ownerID).Scan(&invalid)
@@ -502,11 +503,11 @@ func validateCompletedTaskArtifacts(ctx context.Context, tx pgx.Tx, ownerID, tas
 
 func loadOwnedOperationByKey(ctx context.Context, tx pgx.Tx, ownerID, taskID, key string) (task.Operation, error) {
 	var row sqlcgen.TaskOperation
-	err := tx.QueryRow(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision,
+	err := tx.QueryRow(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision, o.workspace_checkpoint_revision,
 o.runtime_generation, o.runtime_instance_id, o.control_version, o.lease_version, o.runtime_lease_version, o.status, o.external_id, o.result, o.created_at, o.updated_at
 FROM task_operations o JOIN tasks t ON t.id=o.task_id
 WHERE t.owner_id=$1 AND o.task_id=$2 AND o.operation_key=$3`, ownerID, taskID, key).Scan(
-		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.RuntimeGeneration,
+		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration,
 		&row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status,
 		&row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {

@@ -156,6 +156,11 @@ func (s *WorkspaceSyncService) GetChanges(ctx context.Context, principal identit
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	for {
+		if principal.Kind == identity.KindDevice {
+			if err := s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID); err != nil {
+				return workspace.ChangePage{}, err
+			}
+		}
 		page, err := s.store.GetWorkspaceChangePage(ctx, workspaceID, cursor.Revision, cursor.Path, limit)
 		if err != nil {
 			return workspace.ChangePage{}, err
@@ -227,7 +232,7 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 	if err := validateSyncIdempotencyKey(idempotencyKey); err != nil {
 		return workspace.SyncSession{}, err
 	}
-	if err := workspace.ValidateCreateSyncSession(command, value.QuotaBytes); err != nil {
+	if err := workspace.ValidateCreateSyncSession(command, 0); err != nil {
 		message := err.Error()
 		if strings.Contains(message, "16 MiB") || strings.Contains(message, "item limits") {
 			return workspace.SyncSession{}, domain.NewError(domain.CodeRequestTooLarge, "workspace sync manifest exceeds its limits")
@@ -356,26 +361,61 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 	if session.OwnerID != value.OwnerID || session.ReplicaID != syncReplicaID(principal) {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
-	if session.State == workspace.SyncCompleted || session.State == workspace.SyncConflict || session.State == workspace.SyncCancelled {
-		return session, nil
-	}
-	if session.State == workspace.SyncExpired || session.State == workspace.SyncFailed {
-		return workspace.SyncSession{}, domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
-	}
-	if err := s.verifyUploadedFiles(ctx, workspaceID, session); err != nil {
-		if errors.Is(err, errIncompleteWorkspaceSync) {
-			return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace sync is missing acknowledged blocks")
-		}
-		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
-			_ = s.store.FailWorkspaceSyncSession(ctx, workspaceID, sessionID)
-		}
-		return workspace.SyncSession{}, err
-	}
 	record, err := idempotencyRecord(value.OwnerID, "workspace.sync.commit", idempotencyKey, struct {
 		WorkspaceID string `json:"workspace_id"`
 		SessionID   string `json:"session_id"`
 	}{workspaceID, sessionID}, sessionID, "")
 	if err != nil {
+		return workspace.SyncSession{}, err
+	}
+	receipt, err := s.store.ReserveWorkspaceSyncCommit(ctx, workspaceID, sessionID, record)
+	if err != nil {
+		return workspace.SyncSession{}, err
+	}
+	switch receipt.State {
+	case WorkspaceSyncCommitQuotaRejected:
+		return workspace.SyncSession{}, domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
+	case WorkspaceSyncCommitSucceeded:
+		return receipt.Result, nil
+	case WorkspaceSyncCommitPending:
+	default:
+		return workspace.SyncSession{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt state is invalid")
+	}
+	if session.State == workspace.SyncCompleted || session.State == workspace.SyncConflict || session.State == workspace.SyncCancelled ||
+		session.State == workspace.SyncExpired || session.State == workspace.SyncFailed {
+		updated, _, err := s.store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, record)
+		if err != nil {
+			return workspace.SyncSession{}, err
+		}
+		if updated.State == workspace.SyncExpired || updated.State == workspace.SyncFailed {
+			return workspace.SyncSession{}, domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
+		}
+		return updated, nil
+	}
+	if err := s.verifyUploadedFiles(ctx, workspaceID, session); err != nil {
+		receipt, lookupErr := s.store.InspectWorkspaceSyncCommit(ctx, workspaceID, sessionID, record)
+		if lookupErr != nil {
+			return workspace.SyncSession{}, lookupErr
+		}
+		switch receipt.State {
+		case WorkspaceSyncCommitQuotaRejected:
+			return workspace.SyncSession{}, domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
+		case WorkspaceSyncCommitSucceeded:
+			return receipt.Result, nil
+		case WorkspaceSyncCommitPending:
+		default:
+			return workspace.SyncSession{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt state is invalid")
+		}
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			_ = s.store.FailWorkspaceSyncSession(ctx, workspaceID, sessionID)
+			return workspace.SyncSession{}, err
+		}
+		if ctx.Err() != nil {
+			return workspace.SyncSession{}, ctx.Err()
+		}
+		if errors.Is(err, errIncompleteWorkspaceSync) || domain.CodeOf(err) == domain.CodeInternal {
+			return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace sync commit is still pending; retry with the same idempotency key")
+		}
 		return workspace.SyncSession{}, err
 	}
 	updated, _, err := s.store.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, record)
@@ -456,7 +496,13 @@ func (s *WorkspaceSyncService) PutSyncBlock(ctx context.Context, principal ident
 	if expected == nil {
 		return 0, domain.NewError(domain.CodeNotFound, "workspace sync block is not required by this session")
 	}
-	n, err := s.blocks.PutBlock(workspaceID, digest, body)
+	reader := body
+	if principal.Kind == identity.KindDevice {
+		reader = reauthorizeSyncReader{reader: body, authorize: func() error {
+			return s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID)
+		}}
+	}
+	n, err := s.blocks.PutBlock(workspaceID, digest, reader)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "exceeds 4 mib") {
 			return 0, domain.NewError(domain.CodeRequestTooLarge, "workspace sync block exceeds 4 MiB")
@@ -620,7 +666,14 @@ func (s *WorkspaceSyncService) GetSyncBlock(ctx context.Context, principal ident
 	if err != nil {
 		return nil, err
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	reader := io.NopCloser(bytes.NewReader(data))
+	if principal.Kind == identity.KindDevice {
+		return reauthorizeSyncReadCloser{
+			ReadCloser: reader,
+			authorize:  func() error { return s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID) },
+		}, nil
+	}
+	return reader, nil
 }
 
 func (s *WorkspaceSyncService) authorize(ctx context.Context, principal identity.Principal, workspaceID string) (workspace.Workspace, error) {
@@ -644,6 +697,9 @@ func (s *WorkspaceSyncService) authorize(ctx context.Context, principal identity
 		}
 		if !principal.AllowsWorkspace(workspaceID) {
 			return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID); err != nil {
+			return workspace.Workspace{}, err
 		}
 	case identity.KindHostReplica:
 		if !domain.ValidUserID(principal.UserID) || !domain.ValidHostID(principal.HostScope) || principal.HostGeneration < 1 ||
@@ -670,6 +726,30 @@ func (s *WorkspaceSyncService) authorize(ctx context.Context, principal identity
 		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	return value, nil
+}
+
+type reauthorizeSyncReader struct {
+	reader    io.Reader
+	authorize func() error
+}
+
+func (r reauthorizeSyncReader) Read(p []byte) (int, error) {
+	if err := r.authorize(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+type reauthorizeSyncReadCloser struct {
+	io.ReadCloser
+	authorize func() error
+}
+
+func (r reauthorizeSyncReadCloser) Read(p []byte) (int, error) {
+	if err := r.authorize(); err != nil {
+		return 0, err
+	}
+	return r.ReadCloser.Read(p)
 }
 
 func (s *WorkspaceSyncService) authorizeSession(ctx context.Context, principal identity.Principal, value workspace.Workspace, workspaceID, sessionID string) (workspace.SyncSession, error) {

@@ -243,29 +243,35 @@ type readiness struct {
 
 type workerApplicationAdapter struct {
 	*app.WorkerApp
-	workspaceBlockGC *app.WorkspaceBlockGarbageCollector
-	logger           *zap.Logger
+	workspaceBlockGC             *app.WorkspaceBlockGarbageCollector
+	workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
+	logger                       *zap.Logger
 }
 
 func (a workerApplicationAdapter) Reconcile(ctx context.Context) (map[string]int, error) {
 	actions, reconcileErr := a.WorkerApp.Reconcile(ctx)
-	if a.workspaceBlockGC == nil {
-		return actions, reconcileErr
-	}
-	stats, gcErr := a.workspaceBlockGC.Collect(ctx)
-	if stats.BlocksDeleted > 0 || stats.SessionsExpired > 0 {
-		logger := a.logger
-		if logger == nil {
-			logger = zap.NewNop()
+	var gcErr error
+	if a.workspaceBlockGC != nil {
+		stats, collectErr := a.workspaceBlockGC.Collect(ctx)
+		gcErr = collectErr
+		if stats.BlocksDeleted > 0 || stats.SessionsExpired > 0 {
+			logger := a.logger
+			if logger == nil {
+				logger = zap.NewNop()
+			}
+			logger.Info("workspace block garbage collection completed",
+				zap.Int64("workspaces_scanned", stats.WorkspacesScanned),
+				zap.Int64("sessions_expired", stats.SessionsExpired),
+				zap.Int64("blocks_deleted", stats.BlocksDeleted),
+				zap.Int64("block_bytes_unlinked", stats.BytesReclaimed),
+			)
 		}
-		logger.Info("workspace block garbage collection completed",
-			zap.Int64("workspaces_scanned", stats.WorkspacesScanned),
-			zap.Int64("sessions_expired", stats.SessionsExpired),
-			zap.Int64("blocks_deleted", stats.BlocksDeleted),
-			zap.Int64("block_bytes_unlinked", stats.BytesReclaimed),
-		)
 	}
-	return actions, errors.Join(reconcileErr, gcErr)
+	var syncNodeErr error
+	if a.workspaceSyncNodeProvisioner != nil {
+		syncNodeErr = a.workspaceSyncNodeProvisioner.ReconcilePendingWorkspaceSyncNodes(ctx)
+	}
+	return actions, errors.Join(reconcileErr, gcErr, syncNodeErr)
 }
 
 func (a workerApplicationAdapter) TryReconcilerLock(ctx context.Context) (worker.LeaderLock, bool, error) {

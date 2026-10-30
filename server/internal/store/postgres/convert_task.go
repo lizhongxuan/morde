@@ -33,7 +33,8 @@ func taskDomain(row sqlcgen.Task) task.Task {
 	return task.Task{
 		ID: row.ID, OwnerID: row.OwnerID, ConversationID: row.ConversationID, HostID: row.HostID.String,
 		ExecutionLocation: row.ExecutionLocation, WorkspaceID: row.WorkspaceID.String,
-		InputRevision: int64Pointer(row.InputRevision), ContextDigest: append([]byte(nil), row.ContextDigest...),
+		InputRevision: int64Pointer(row.InputRevision), WorkspaceCheckpointRevision: int64Pointer(row.WorkspaceCheckpointRevision),
+		ContextDigest:   append([]byte(nil), row.ContextDigest...),
 		AgentInstanceID: row.AgentInstanceID, AgentGeneration: row.AgentGeneration, AgentSessionID: row.AgentSessionID,
 		AgentEngineVersion: row.AgentEngineVersion, AgentProfileVersion: row.AgentProfileVersion,
 		CheckpointDigest: append([]byte(nil), row.CheckpointDigest...), CheckpointThroughSequence: row.CheckpointThroughSeq,
@@ -97,7 +98,8 @@ func taskOperationDomain(row sqlcgen.TaskOperation) task.Operation {
 	return task.Operation{
 		ID: row.ID, TaskID: row.TaskID, Key: row.OperationKey, RequestHash: row.RequestHash,
 		HostID: row.HostID, WorkspaceID: row.WorkspaceID, BindingVersion: row.BindingVersion, InputRevision: int64Pointer(row.InputRevision),
-		RuntimeGeneration: row.RuntimeGeneration, RuntimeInstanceID: row.RuntimeInstanceID,
+		WorkspaceCheckpointRevision: int64Pointer(row.WorkspaceCheckpointRevision),
+		RuntimeGeneration:           row.RuntimeGeneration, RuntimeInstanceID: row.RuntimeInstanceID,
 		ControlVersion: row.ControlVersion, LeaseVersion: row.LeaseVersion,
 		RuntimeLeaseVersion: row.RuntimeLeaseVersion, Status: task.OperationStatus(row.Status),
 		ExternalID: row.ExternalID, Result: row.Result, CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,

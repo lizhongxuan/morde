@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"morde-runtime/contract"
 	"morde/server/internal/domain"
 )
 
@@ -43,9 +44,82 @@ func TestNewRequiresVerifiedHTTPSURLAnd256BitCredential(t *testing.T) {
 	}
 }
 
+func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	viewID := "v" + strings.Repeat("a", 64)
+	inputDigest := strings.Repeat("b", 64)
+	manifestDigest := strings.Repeat("c", 64)
+	blockDigest := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	var corrupt atomic.Bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/runtime/v1/tasks/" + taskID + "/workspace-view/manifest":
+			if r.Method != http.MethodPost || r.Header.Get(ProtocolHeader) != ProtocolVersion {
+				t.Errorf("manifest request = %s %s", r.Method, r.URL.Path)
+			}
+			var request TaskWorkspaceManifestRequest
+			readJSON(t, r, &request)
+			responseFence := request.HostFence
+			if corrupt.Load() {
+				responseFence.ControlVersion++
+			}
+			writeJSON(t, w, TaskWorkspaceManifestResponse{
+				ProtocolVersion: ProtocolVersion, HostFence: responseFence, TaskID: taskID, WorkspaceID: request.WorkspaceID,
+				BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
+				WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
+				ViewID: viewID, ManifestSHA256: manifestDigest,
+				Files: []contract.TaskWorkspaceManifestFile{{Path: "hello.txt", SizeBytes: 5, SHA256: blockDigest, Mode: 0o600,
+					Chunks: []contract.TaskWorkspaceManifestChunk{{SHA256: blockDigest, SizeBytes: 5}}}},
+			})
+		case "/runtime/v1/tasks/" + taskID + "/workspace-view/block":
+			var request TaskWorkspaceBlockRequest
+			readJSON(t, r, &request)
+			writeJSON(t, w, TaskWorkspaceBlockResponse{
+				ProtocolVersion: ProtocolVersion, HostFence: request.HostFence, TaskID: taskID, WorkspaceID: request.WorkspaceID,
+				BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
+				WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
+				ViewID: viewID, ManifestSHA256: manifestDigest, SHA256: blockDigest, SizeBytes: 5, Data: []byte("hello"),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, runtimeCredential, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestRequest := TaskWorkspaceManifestRequest{
+		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, InputManifestSHA256: inputDigest, ViewID: viewID, Limit: 10,
+	}
+	page, err := client.TaskWorkspaceManifestPage(context.Background(), taskID, manifestRequest)
+	if err != nil || len(page.Files) != 1 || page.ManifestSHA256 != manifestDigest {
+		t.Fatalf("TaskWorkspaceManifestPage() = %#v, %v", page, err)
+	}
+	blockRequest := TaskWorkspaceBlockRequest{
+		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, InputManifestSHA256: inputDigest, ViewID: viewID,
+		ManifestSHA256: manifestDigest, SHA256: blockDigest,
+	}
+	block, err := client.ReadTaskWorkspaceBlock(context.Background(), taskID, blockRequest)
+	if err != nil || string(block.Data) != "hello" {
+		t.Fatalf("ReadTaskWorkspaceBlock() = %#v, %v", block, err)
+	}
+	corrupt.Store(true)
+	if _, err := client.TaskWorkspaceManifestPage(context.Background(), taskID, manifestRequest); err == nil {
+		t.Fatal("TaskWorkspaceManifestPage accepted a response with a different Host fence")
+	}
+	blockRequest.SHA256 = strings.ToUpper(blockRequest.SHA256)
+	if _, err := client.ReadTaskWorkspaceBlock(context.Background(), taskID, blockRequest); err == nil {
+		t.Fatal("ReadTaskWorkspaceBlock accepted a non-canonical block hash")
+	}
+}
+
 func TestClientMethodsUseProtocolAuthAndFences(t *testing.T) {
 	now := time.Date(2026, 10, 21, 3, 4, 5, 0, time.UTC)
 	currentFence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	viewID := "v" + strings.Repeat("a", 64)
 	var sawHandshake, sawControl, sawLease, sawExecute, sawGet, sawCancel, sawQuiesce atomic.Bool
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+runtimeCredential {
@@ -81,7 +155,7 @@ func TestClientMethodsUseProtocolAuthAndFences(t *testing.T) {
 			sawExecute.Store(true)
 			var request ExecuteRequest
 			readJSON(t, r, &request)
-			writeJSON(t, w, OperationResponse{ProtocolVersion: ProtocolVersion, RequestFence: request.HostFence, Operation: Operation{HostID: request.HostID, RuntimeGeneration: request.RuntimeGeneration, RuntimeInstanceID: request.RuntimeInstanceID, ControlVersion: request.ControlVersion, TaskID: request.TaskID, WorkspaceID: request.WorkspaceID, BindingVersion: request.BindingVersion, OperationID: request.OperationID, LeaseVersion: request.LeaseVersion, Status: OperationSucceeded, Result: json.RawMessage(`{"text":"done"}`)}})
+			writeJSON(t, w, OperationResponse{ProtocolVersion: ProtocolVersion, RequestFence: request.HostFence, Operation: Operation{HostID: request.HostID, RuntimeGeneration: request.RuntimeGeneration, RuntimeInstanceID: request.RuntimeInstanceID, ControlVersion: request.ControlVersion, TaskID: request.TaskID, WorkspaceID: request.WorkspaceID, BindingVersion: request.BindingVersion, WorkspaceViewID: request.WorkspaceViewID, WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, OperationID: request.OperationID, LeaseVersion: request.LeaseVersion, Status: OperationSucceeded, Result: json.RawMessage(`{"text":"done"}`)}})
 		case "/runtime/v1/operations/" + operationID:
 			sawGet.Store(true)
 			query := r.URL.Query()
@@ -127,7 +201,7 @@ func TestClientMethodsUseProtocolAuthAndFences(t *testing.T) {
 		t.Fatalf("SetTaskLease() = %#v, %v", lease, err)
 	}
 
-	operation, err := client.Execute(context.Background(), ExecuteRequest{HostFence: blocked, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, OperationID: operationID, LeaseVersion: 4, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567","command":"true"}`)})
+	operation, err := client.Execute(context.Background(), ExecuteRequest{HostFence: blocked, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, WorkspaceViewID: viewID, WorkspaceCheckpointRevision: 3, OperationID: operationID, LeaseVersion: 4, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567","command":"true"}`)})
 	if err != nil || operation.Status != OperationSucceeded {
 		t.Fatalf("Execute() = %#v, %v", operation, err)
 	}
@@ -149,6 +223,54 @@ func TestClientMethodsUseProtocolAuthAndFences(t *testing.T) {
 
 	if !sawHandshake.Load() || !sawControl.Load() || !sawLease.Load() || !sawExecute.Load() || !sawGet.Load() || !sawCancel.Load() || !sawQuiesce.Load() {
 		t.Fatal("not all RuntimeControl methods issued their HTTP requests")
+	}
+}
+
+func TestSetTaskWorkspaceViewEchoesTheExactTaskCheckpoint(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	request := SetTaskWorkspaceViewRequest{
+		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 4,
+		InputRevision: 3, WorkspaceCheckpointRevision: 3, ManifestSHA256: strings.Repeat("b", 64),
+	}
+	viewID := "v" + strings.Repeat("a", 64)
+	var mismatch atomic.Bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/runtime/v1/tasks/"+taskID+"/workspace-view" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var got SetTaskWorkspaceViewRequest
+		readJSON(t, r, &got)
+		if got.ProtocolVersion != ProtocolVersion || got.HostFence != fence || got.TaskID != taskID || got.WorkspaceID != request.WorkspaceID ||
+			got.BindingVersion != request.BindingVersion || got.InputRevision != request.InputRevision ||
+			got.WorkspaceCheckpointRevision != request.WorkspaceCheckpointRevision || got.ManifestSHA256 != request.ManifestSHA256 {
+			t.Errorf("task view request = %#v", got)
+		}
+		response := SetTaskWorkspaceViewResponse{
+			ProtocolVersion: ProtocolVersion, HostFence: fence, TaskID: taskID, WorkspaceID: request.WorkspaceID,
+			BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
+			WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, ManifestSHA256: request.ManifestSHA256, ViewID: viewID,
+		}
+		if mismatch.Load() {
+			response.WorkspaceCheckpointRevision++
+		}
+		writeJSON(t, w, response)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, runtimeCredential, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.SetTaskWorkspaceView(context.Background(), taskID, request)
+	if err != nil || response.ViewID != viewID {
+		t.Fatalf("SetTaskWorkspaceView() = %#v, %v", response, err)
+	}
+	mismatch.Store(true)
+	if _, err := client.SetTaskWorkspaceView(context.Background(), taskID, request); err == nil {
+		t.Fatal("SetTaskWorkspaceView accepted a response for another checkpoint")
+	}
+	request.ManifestSHA256 = strings.ToUpper(request.ManifestSHA256)
+	if _, err := client.SetTaskWorkspaceView(context.Background(), taskID, request); err == nil {
+		t.Fatal("SetTaskWorkspaceView accepted a non-canonical digest")
 	}
 }
 
@@ -436,7 +558,7 @@ func TestRequestBodyIsBoundedBeforeSending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.Execute(context.Background(), ExecuteRequest{HostFence: HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, OperationID: operationID, LeaseVersion: 4, Capability: "file.write", Action: "write", Arguments: arguments})
+	_, err = client.Execute(context.Background(), ExecuteRequest{HostFence: HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: 3, OperationID: operationID, LeaseVersion: 4, Capability: "file.write", Action: "write", Arguments: arguments})
 	var callError *Error
 	if !errors.As(err, &callError) || callError.Code != ErrorInvalidRequest || requests.Load() != 0 {
 		t.Fatalf("error = %#v, requests = %d; want local bound rejection before send", err, requests.Load())
@@ -488,13 +610,14 @@ func TestValidationHelpersCoverRuntimeFencesAndEnums(t *testing.T) {
 		}
 	}
 
-	validOperationRequest := ExecuteRequest{HostFence: validFence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, OperationID: operationID, LeaseVersion: 1, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567"}`)}
+	validOperationRequest := ExecuteRequest{HostFence: validFence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: 0, OperationID: operationID, LeaseVersion: 1, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567"}`)}
 	if err := validateExecute(validOperationRequest); err != nil {
 		t.Fatalf("valid execute request: %v", err)
 	}
 	for _, request := range []ExecuteRequest{
 		{HostFence: validFence, TaskID: taskID, OperationID: operationID, LeaseVersion: 1, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567"}`)},
 		{HostFence: validFence, TaskID: taskID, WorkspaceID: "w1234567", OperationID: operationID, LeaseVersion: 1, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567"}`)},
+		{HostFence: validFence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, OperationID: operationID, LeaseVersion: 1, Capability: "shell.exec", Action: "run", Arguments: json.RawMessage(`{"workspace_id":"w1234567"}`)},
 	} {
 		if err := validateExecute(request); err == nil {
 			t.Errorf("validateExecute(%#v) accepted a missing Workspace binding field", request)

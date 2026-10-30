@@ -274,6 +274,20 @@ func (s *enospcSyncTestStore) ListWorkspaceSyncTransferBlocks(context.Context, s
 	return append([]workspace.TransferBlock(nil), s.blocks...), nil
 }
 
+func (s *enospcSyncTestStore) ReserveWorkspaceSyncCommit(_ context.Context, workspaceID, sessionID string, record app.IdempotencyRecord) (app.WorkspaceSyncCommitReceipt, error) {
+	if workspaceID != s.workspace.ID || sessionID != s.session.ID || record.Operation != "workspace.sync.commit" || record.ResourceID != sessionID {
+		return app.WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeNotFound, "workspace sync commit receipt not found")
+	}
+	return app.WorkspaceSyncCommitReceipt{State: app.WorkspaceSyncCommitPending}, nil
+}
+
+func (s *enospcSyncTestStore) InspectWorkspaceSyncCommit(_ context.Context, workspaceID, sessionID string, record app.IdempotencyRecord) (app.WorkspaceSyncCommitReceipt, error) {
+	if workspaceID != s.workspace.ID || sessionID != s.session.ID || record.Operation != "workspace.sync.commit" || record.ResourceID != sessionID {
+		return app.WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeNotFound, "workspace sync commit receipt not found")
+	}
+	return app.WorkspaceSyncCommitReceipt{State: app.WorkspaceSyncCommitPending}, nil
+}
+
 func (s *enospcSyncTestStore) AckWorkspaceSyncBlock(_ context.Context, _, _, digest string, _, _ int64) error {
 	for i := range s.blocks {
 		if s.blocks[i].SHA256 == digest && s.blocks[i].Role == workspace.BlockUpload {

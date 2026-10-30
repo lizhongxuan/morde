@@ -30,8 +30,8 @@ func TestWorkspaceSyncCommitRetriesTemporaryBlockReadFailure(t *testing.T) {
 	store, blocks, service, principal, session, file := uploadedSyncFixture(t)
 	temporary := errors.New("temporary storage error")
 	blocks.openError = temporary
-	if _, err := service.CommitSyncSession(context.Background(), principal, store.workspace.ID, session.ID, "commit-retry"); !errors.Is(err, temporary) {
-		t.Fatalf("first commit error = %v, want temporary storage error", err)
+	if _, err := service.CommitSyncSession(context.Background(), principal, store.workspace.ID, session.ID, "commit-retry"); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("first commit error = %v, want retryable workspace busy", err)
 	}
 	if got := store.sessions[session.ID].State; got == workspace.SyncFailed || got == workspace.SyncCompleted {
 		t.Fatalf("first commit state = %s, want an active session", got)

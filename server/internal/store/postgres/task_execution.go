@@ -765,14 +765,14 @@ WHERE t.id=$1 AND c.id=$2 AND c.owner_id=$3 FOR UPDATE OF c`,
 		err := tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
 lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, application_id,
-execution_location, agent_session_id, auth_version, auth_expires_at, workspace_id, input_revision
+execution_location, agent_session_id, auth_version, auth_expires_at, workspace_id, input_revision, workspace_checkpoint_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			&current.ID, &current.OwnerID, &current.ConversationID, &current.HostID, &current.ModelID, &current.Objective, &current.Status,
 			&current.AuthKind, &current.AuthTokenID, &current.AuthScopes, &current.AuthClientInstallationID, &current.BudgetActiveSeconds, &current.BudgetToolCalls,
 			&current.BudgetModelTokens, &current.UsageActiveSeconds, &current.UsageToolCalls, &current.UsageModelTokens,
 			&current.LeaseOwner, &current.LeaseVersion, &current.LeaseExpiresAt, &current.EventSeq, &current.CurrentStep,
 			&current.Result, &current.WaitingReason, &current.CreatedAt, &current.UpdatedAt, &current.FinishedAt, &current.ApplicationID,
-			&current.ExecutionLocation, &current.AgentSessionID, &current.AuthVersion, &current.AuthExpiresAt, &current.WorkspaceID, &current.InputRevision)
+			&current.ExecutionLocation, &current.AgentSessionID, &current.AuthVersion, &current.AuthExpiresAt, &current.WorkspaceID, &current.InputRevision, &current.WorkspaceCheckpointRevision)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
@@ -875,7 +875,10 @@ WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.seque
 			}
 		}
 		if progress.Status == task.StatusCompleted {
-			if current.WorkspaceID.Valid && current.InputRevision.Valid {
+			if current.WorkspaceID.Valid {
+				if !current.WorkspaceCheckpointRevision.Valid {
+					return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace checkpoint is unavailable")
+				}
 				var revision int64
 				err := tx.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1 FOR SHARE`, current.WorkspaceID.String).Scan(&revision)
 				if errors.Is(err, pgx.ErrNoRows) {
@@ -884,25 +887,8 @@ WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.seque
 				if err != nil {
 					return fmt.Errorf("read Workspace before task completion: %w", err)
 				}
-				var outputMatchesCurrentRevision bool
-				if err := tx.QueryRow(ctx, `SELECT
-  EXISTS (SELECT 1 FROM task_artifacts WHERE task_id=$1)
-  AND NOT EXISTS (
-    SELECT 1 FROM task_artifacts a
-    WHERE a.task_id=$1 AND (
-      a.workspace_id IS DISTINCT FROM $2 OR a.workspace_revision IS NULL OR a.size_bytes IS NULL OR a.sha256 IS NULL
-      OR NOT EXISTS (
-        SELECT 1 FROM workspace_revision_files f
-        WHERE f.workspace_id=$2 AND f.file_path=a.path AND f.valid_from_revision <= $3
-          AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $3)
-          AND f.size_bytes=a.size_bytes AND f.sha256=a.sha256
-      )
-    )
-  )`, progress.TaskID, current.WorkspaceID.String, revision).Scan(&outputMatchesCurrentRevision); err != nil {
-					return fmt.Errorf("verify task output against current Workspace revision: %w", err)
-				}
-				if revision != current.InputRevision.Int64 && !outputMatchesCurrentRevision {
-					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task input was confirmed")
+				if revision != current.WorkspaceCheckpointRevision.Int64 {
+					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task checkpoint was confirmed")
 				}
 			}
 			var unsettledChild bool
@@ -1078,11 +1064,18 @@ func addObservationOutcomeToTaskResult(payload []byte, outcome schedule.Observat
 }
 
 func (s *Store) CreateOperation(ctx context.Context, value task.Operation, leaseOwner string) (task.Operation, bool, error) {
+	if value.WorkspaceCheckpointRevision == nil && value.InputRevision != nil {
+		checkpoint := *value.InputRevision
+		value.WorkspaceCheckpointRevision = &checkpoint
+	}
 	if !domain.ValidOperationID(value.ID) || !domain.ValidTaskID(value.TaskID) || value.Key == "" || len(value.Key) > 255 ||
 		len(value.RequestHash) != 32 || !domain.ValidHostID(value.HostID) || value.LeaseVersion < 1 ||
 		value.RuntimeLeaseVersion < 1 || value.RuntimeInstanceID == "" || leaseOwner == "" ||
 		!validOperationWorkspaceBinding(value.WorkspaceID, value.BindingVersion) ||
-		(value.InputRevision != nil && (value.WorkspaceID == "" || *value.InputRevision < 0)) {
+		(value.InputRevision != nil && (value.WorkspaceID == "" || *value.InputRevision < 0)) ||
+		(value.WorkspaceID == "") != (value.WorkspaceCheckpointRevision == nil) ||
+		(value.WorkspaceID != "" && value.InputRevision == nil) ||
+		(value.InputRevision != nil && value.WorkspaceCheckpointRevision != nil && *value.WorkspaceCheckpointRevision < *value.InputRevision) {
 		return task.Operation{}, false, domain.InvalidArgument("operation", "operation fields are invalid")
 	}
 	if value.Status != task.OperationPrepared {
@@ -1105,14 +1098,14 @@ func (s *Store) CreateOperation(ctx context.Context, value task.Operation, lease
 		var taskEpoch int64
 		err = tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
-lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, execution_epoch, application_id, workspace_id, input_revision
+lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, execution_epoch, application_id, workspace_id, input_revision, workspace_checkpoint_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			&row.ID, &row.OwnerID, &row.ConversationID, &row.HostID, &row.ModelID, &row.Objective, &row.Status,
 			&row.AuthKind, &row.AuthTokenID, &row.AuthScopes, &row.AuthClientInstallationID, &row.BudgetActiveSeconds, &row.BudgetToolCalls,
 			&row.BudgetModelTokens, &row.UsageActiveSeconds, &row.UsageToolCalls, &row.UsageModelTokens,
 			&row.LeaseOwner, &row.LeaseVersion, &row.LeaseExpiresAt, &row.EventSeq, &row.CurrentStep,
 			&row.Result, &row.WaitingReason, &row.CreatedAt, &row.UpdatedAt, &row.FinishedAt, &taskEpoch, &row.ApplicationID,
-			&row.WorkspaceID, &row.InputRevision)
+			&row.WorkspaceID, &row.InputRevision, &row.WorkspaceCheckpointRevision)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
@@ -1133,7 +1126,8 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err == nil {
 			if !equalOperationHash(existing.RequestHash, value.RequestHash) || existing.HostID != value.HostID ||
 				existing.WorkspaceID != value.WorkspaceID || existing.BindingVersion != value.BindingVersion ||
-				!sameTaskInputRevision(existing.InputRevision, value.InputRevision) {
+				!sameTaskInputRevision(existing.InputRevision, value.InputRevision) ||
+				!sameTaskInputRevision(existing.WorkspaceCheckpointRevision, value.WorkspaceCheckpointRevision) {
 				return idempotencyConflict()
 			}
 			result, replayed = existing, true
@@ -1142,10 +1136,13 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read existing task operation: %w", err)
 		}
+		if err := ensureNoPendingTaskWorkspacePublish(ctx, tx, value.TaskID); err != nil {
+			return err
+		}
 		if err := requireOperationHostFence(ctx, tx, ownerID, value); err != nil {
 			return err
 		}
-		if value.InputRevision != nil {
+		if value.WorkspaceID != "" {
 			if err := requireTaskWorkspaceInputAdmission(ctx, tx, row, value); err != nil {
 				return err
 			}
@@ -1153,9 +1150,9 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO task_operations (id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'prepared',$14,$15)`, value.ID, value.TaskID, value.Key, value.RequestHash,
-			value.HostID, value.WorkspaceID, value.BindingVersion, taskUsageTokens(value.InputRevision), value.RuntimeGeneration, value.RuntimeInstanceID,
+		_, err = tx.Exec(ctx, `INSERT INTO task_operations (id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'prepared',$15,$16)`, value.ID, value.TaskID, value.Key, value.RequestHash,
+			value.HostID, value.WorkspaceID, value.BindingVersion, taskUsageTokens(value.InputRevision), taskUsageTokens(value.WorkspaceCheckpointRevision), value.RuntimeGeneration, value.RuntimeInstanceID,
 			value.ControlVersion, value.LeaseVersion, value.RuntimeLeaseVersion, value.ExternalID, value.Result)
 		if err != nil {
 			return fmt.Errorf("create prepared task operation: %w", err)
@@ -1201,13 +1198,15 @@ func (s *Store) UpdateOperation(ctx context.Context, update app.OperationUpdate)
 		var taskEpoch int64
 		err = tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
-lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, execution_epoch, application_id
+lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, execution_epoch, application_id,
+workspace_id, input_revision, workspace_checkpoint_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 			&row.ID, &row.OwnerID, &row.ConversationID, &row.HostID, &row.ModelID, &row.Objective, &row.Status,
 			&row.AuthKind, &row.AuthTokenID, &row.AuthScopes, &row.AuthClientInstallationID, &row.BudgetActiveSeconds, &row.BudgetToolCalls,
 			&row.BudgetModelTokens, &row.UsageActiveSeconds, &row.UsageToolCalls, &row.UsageModelTokens,
 			&row.LeaseOwner, &row.LeaseVersion, &row.LeaseExpiresAt, &row.EventSeq, &row.CurrentStep,
-			&row.Result, &row.WaitingReason, &row.CreatedAt, &row.UpdatedAt, &row.FinishedAt, &taskEpoch, &row.ApplicationID)
+			&row.Result, &row.WaitingReason, &row.CreatedAt, &row.UpdatedAt, &row.FinishedAt, &taskEpoch, &row.ApplicationID,
+			&row.WorkspaceID, &row.InputRevision, &row.WorkspaceCheckpointRevision)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
@@ -1296,6 +1295,12 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 			}
 			if err := requireOperationHostFence(ctx, tx, row.OwnerID, dispatchFence); err != nil {
 				return err
+			}
+			// Prepared operations must recheck the Task snapshot at the side-effect boundary.
+			if row.WorkspaceID.Valid {
+				if err := requireTaskWorkspaceInputAdmission(ctx, tx, row, operation); err != nil {
+					return err
+				}
 			}
 		}
 		if adoptingPrepared || rearming || update.Status == task.OperationDispatched {
@@ -1414,27 +1419,30 @@ func requireOperationHostFence(ctx context.Context, tx pgx.Tx, ownerID string, o
 
 func requireTaskWorkspaceInputAdmission(ctx context.Context, tx pgx.Tx, row sqlcgen.Task, operation task.Operation) error {
 	if operation.InputRevision == nil || !row.WorkspaceID.Valid || row.WorkspaceID.String != operation.WorkspaceID ||
-		!row.InputRevision.Valid || row.InputRevision.Int64 != *operation.InputRevision {
+		!row.InputRevision.Valid || row.InputRevision.Int64 != *operation.InputRevision ||
+		!row.WorkspaceCheckpointRevision.Valid || operation.WorkspaceCheckpointRevision == nil ||
+		row.WorkspaceCheckpointRevision.Int64 != *operation.WorkspaceCheckpointRevision {
 		return domain.NewError(domain.CodeWorkspaceConflict, "task Workspace input changed before operation admission")
 	}
+	checkpoint := *operation.WorkspaceCheckpointRevision
 	var ownerID, state string
 	var revision int64
 	err := tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 FOR SHARE`, operation.WorkspaceID).
 		Scan(&ownerID, &state, &revision)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != row.OwnerID || state != string(workspace.StateReady) || revision != *operation.InputRevision)) {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != row.OwnerID || state != string(workspace.StateReady) || revision != checkpoint)) {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task input was confirmed")
 	}
 	if err != nil {
 		return fmt.Errorf("lock Workspace for task operation admission: %w", err)
 	}
+	// A verified Task publish advances its private view before the Host replica catches up.
 	var bindingOwner, bindingState, syncState string
-	var bindingVersion, desiredRevision, appliedRevision int64
-	err = tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version, desired_revision, applied_revision
+	var bindingVersion int64
+	err = tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version
 FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, operation.HostID, operation.WorkspaceID).
-		Scan(&bindingOwner, &bindingState, &syncState, &bindingVersion, &desiredRevision, &appliedRevision)
+		Scan(&bindingOwner, &bindingState, &syncState, &bindingVersion)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (bindingOwner != row.OwnerID || bindingState != string(workspace.BindingActive) ||
-		bindingVersion != operation.BindingVersion || syncState != string(workspace.BindingSyncHealthy) ||
-		desiredRevision != *operation.InputRevision || appliedRevision != *operation.InputRevision)) {
+		bindingVersion != operation.BindingVersion || syncState != string(workspace.BindingSyncHealthy))) {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace no longer matches the task input revision")
 	}
 	if err != nil {
@@ -1473,10 +1481,10 @@ func incrementTaskEventSequence(ctx context.Context, tx pgx.Tx, taskID string) (
 
 func loadOperationByKey(ctx context.Context, tx pgx.Tx, taskID, operationKey string) (task.Operation, error) {
 	var row sqlcgen.TaskOperation
-	err := tx.QueryRow(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result, created_at, updated_at
+	err := tx.QueryRow(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result, created_at, updated_at
 FROM task_operations WHERE task_id=$1 AND operation_key=$2`, taskID, operationKey).Scan(
 		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion,
-		&row.InputRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status,
+		&row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status,
 		&row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
 	return taskOperationDomain(row), err
 }

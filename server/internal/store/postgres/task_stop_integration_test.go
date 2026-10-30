@@ -8,6 +8,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
@@ -210,11 +211,29 @@ func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "stop-cancel-task")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_stop_test' WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
 	hostValue.RuntimeInstanceID = "ri_stop_test"
-	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "stop-cancel-task", "cancel this task"))
+	revision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "stop-cancel-task", "cancel this task")
+	submission.Task.WorkspaceID, submission.Task.InputRevision = workspaceValue.ID, &revision
+	submission.Task.ContextDigest = hashBytes("stop cancel workspace input")
+	submitted, err := store.SubmitTask(ctx, submission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +249,9 @@ func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 		operation := task.Operation{
 			ID: mustID(t, domain.NewOperationID), TaskID: running.ID, Key: operationKeys[i],
 			RequestHash: hashBytes("stop-op-" + string(status)), HostID: hostValue.ID,
-			WorkspaceID: "w1234567", BindingVersion: 9,
-			RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: hostValue.RuntimeInstanceID,
+			WorkspaceID: workspaceValue.ID, BindingVersion: binding.BindingVersion, InputRevision: &revision,
+			WorkspaceCheckpointRevision: &revision,
+			RuntimeGeneration:           hostValue.RuntimeGeneration, RuntimeInstanceID: hostValue.RuntimeInstanceID,
 			ControlVersion: hostValue.ControlVersion, LeaseVersion: running.Lease.Version,
 			RuntimeLeaseVersion: running.Lease.Version, Status: task.OperationPrepared,
 		}
@@ -292,7 +312,8 @@ func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 		if operation.ID != operations[i].ID || operation.RuntimeLeaseVersion != running.Lease.Version {
 			t.Fatalf("stop operation fence was rewritten: got %#v expected id=%s runtime lease=%d", operation, operations[i].ID, running.Lease.Version)
 		}
-		if operation.WorkspaceID != "w1234567" || operation.BindingVersion != 9 {
+		if operation.WorkspaceID != workspaceValue.ID || operation.BindingVersion != binding.BindingVersion ||
+			operation.WorkspaceCheckpointRevision == nil || *operation.WorkspaceCheckpointRevision != revision {
 			t.Fatalf("stop recovery lost operation Workspace binding: %#v", operation)
 		}
 	}

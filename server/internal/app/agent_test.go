@@ -775,6 +775,20 @@ func TestAgentCommitsVerifiedArtifactWithTaskCompletion(t *testing.T) {
 	}
 }
 
+func TestAgentPausesForWorkspaceInputChangeDuringVerification(t *testing.T) {
+	fixture := newAgentFixture(t, ModelResponse{Text: "The report is complete.", Usage: ModelUsage{Known: true, InputTokens: 5, OutputTokens: 2}})
+	fixture.tools.verification = AgentVerificationResult{
+		Status: AgentVerifyUnknown, WaitingReason: "workspace_input_changed", Summary: "Workspace changed after submission.",
+	}
+	result, err := fixture.agent.Run(context.Background(), fixture.claimed)
+	if err != nil || result.Status != task.StatusWaitingUser || result.WaitingReason != "workspace_input_changed" ||
+		fixture.store.details.Task.Status != task.StatusWaitingUser || fixture.store.details.Task.WaitingReason != "workspace_input_changed" ||
+		len(fixture.store.details.Artifacts) != 0 {
+		t.Fatalf("Run() after Workspace change = %+v, %v; task=%#v artifacts=%#v, want resubmission pause without artifacts",
+			result, err, fixture.store.details.Task, fixture.store.details.Artifacts)
+	}
+}
+
 func TestAgentRejectsUnsafeOrUnverifiedArtifactMetadata(t *testing.T) {
 	for _, result := range []AgentVerificationResult{
 		{Status: AgentVerified, Artifacts: []AgentVerifiedArtifact{{Label: "report", Path: "../secret.txt", MediaType: "text/plain"}}},

@@ -17,10 +17,6 @@ func TestTaskOperationWorkspaceAdmissionMigrationBackfillsTaskInputRevision(t *t
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := provider.DownTo(ctx, 71); err != nil {
-		t.Fatalf("prepare pre-admission schema: %v", err)
-	}
-
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "operation-revision-migration")
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
@@ -48,6 +44,9 @@ func TestTaskOperationWorkspaceAdmissionMigrationBackfillsTaskInputRevision(t *t
 	claimed, found, err := store.ClaimNextTask(ctx, "migration-worker", time.Minute)
 	if err != nil || !found || claimed.ID != created.Task.ID {
 		t.Fatalf("claim Workspace task: claimed=%t task=%s err=%v", found, claimed.ID, err)
+	}
+	if _, err := provider.DownTo(ctx, 71); err != nil {
+		t.Fatalf("prepare pre-admission schema: %v", err)
 	}
 	operationID := mustID(t, domain.NewOperationID)
 	if _, err := pool.Exec(ctx, `INSERT INTO task_operations

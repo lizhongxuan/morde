@@ -29,7 +29,7 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 		ID: "b1234567", Workspace: workspace.Workspace{ID: "w1234567", Name: "code", State: workspace.StateReady, Revision: 3, UsedBytes: 12, QuotaBytes: 1024},
 		Directory: "w1234567", State: workspace.BindingPreparing, BindingVersion: 2, DesiredRevision: 3,
 	}}}}
-	runtime := &runtimeComputerToolsStub{result: app.MCPRuntimeToolResult{Output: json.RawMessage(`{"stdout":"ok"}`)}}
+	runtime := &runtimeComputerToolsStub{result: app.MCPRuntimeToolResult{Output: json.RawMessage(`{"windows":[]}`)}}
 	audits := &auditStub{}
 	registry := prometheus.NewRegistry()
 	handler, err := New(Deps{
@@ -38,7 +38,7 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 		Domains: config.Domains{Scheme: "https", HostSuffix: "hosts.example.test"},
 		Hosts:   hosts, Applications: newApplicationStatusServiceStub(), RuntimeTools: runtime, Auth: apiKeyPrincipalVerifier{principal: identity.Principal{
 			UserID: "user_test", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "token_test",
-			HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeHostCreate, identity.ScopeComputerOperate},
+			HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeHostCreate, identity.ScopeComputerObserve, identity.ScopeComputerOperate},
 		}}, Audit: audits,
 		Logger: zap.NewNop(), Metrics: registry,
 	})
@@ -105,13 +105,13 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 		t.Fatalf("host_create response omitted bindings: %#v", created.StructuredContent)
 	}
 
-	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "shell_exec", Arguments: map[string]any{
-		"host_id": "h1234567", "workspace_id": "w1234567", "idempotency_key": "test-shell-call-0001", "command": "printf ok",
+	result, err := session.CallTool(context.Background(), &sdk.CallToolParams{Name: "window_list", Arguments: map[string]any{
+		"host_id": "h1234567", "idempotency_key": "test-window-list-0001",
 	}})
 	if err != nil || result.IsError {
-		t.Fatalf("shell_exec result=%+v err=%v", result, err)
+		t.Fatalf("window_list result=%+v err=%v", result, err)
 	}
-	if runtime.sessionID == "" || runtime.hostID != "h1234567" || runtime.key != "test-shell-call-0001" || runtime.tool != "shell_exec" {
+	if runtime.sessionID == "" || runtime.hostID != "h1234567" || runtime.key != "test-window-list-0001" || runtime.tool != "window_list" {
 		t.Fatalf("runtime call identity = %#v", runtime)
 	}
 	if hosts.computerGetCalls.Load() != 0 {
@@ -125,11 +125,11 @@ func TestStreamableHTTPAuthToolsUseRuntimeExecutor(t *testing.T) {
 			t.Fatalf("audit captured tool arguments: %+v", entry.Detail)
 		}
 	}
-	if calls, labels := gatheredCounter(t, registry, "cloudhost_mcp_tool_calls_total", map[string]string{"tool": "shell_exec", "result": "ok"}); calls != 1 || labels["host_id"] != "" {
+	if calls, labels := gatheredCounter(t, registry, "cloudhost_mcp_tool_calls_total", map[string]string{"tool": "window_list", "result": "ok"}); calls != 1 || labels["host_id"] != "" {
 		t.Fatalf("MCP calls=%v labels=%v", calls, labels)
 	}
-	if count := gatheredHistogramCount(t, registry, "cloudhost_mcp_tool_duration_seconds", map[string]string{"tool": "shell_exec"}); count != 1 {
-		t.Fatalf("shell duration samples = %d, want 1", count)
+	if count := gatheredHistogramCount(t, registry, "cloudhost_mcp_tool_duration_seconds", map[string]string{"tool": "window_list"}); count != 1 {
+		t.Fatalf("window list duration samples = %d, want 1", count)
 	}
 }
 
@@ -210,11 +210,10 @@ func TestValidateToolArguments(t *testing.T) {
 		json    string
 		wantErr bool
 	}{
-		{name: "defaults", spec: toolByName("file_list"), json: `{"host_id":"h1234567","workspace_id":"w1234567","idempotency_key":"test-file-list-0001","path":"."}`},
-		{name: "workspace required", spec: toolByName("file_list"), json: `{"host_id":"h1234567","idempotency_key":"test-file-list-0001","path":"."}`, wantErr: true},
+		{name: "runtime defaults", spec: toolByName("window_list"), json: `{"host_id":"h1234567","idempotency_key":"test-window-list-0001"}`},
 		{name: "unknown property", spec: toolByName("host_get"), json: `{"host_id":"host_test","token":"secret"}`, wantErr: true},
-		{name: "runtime idempotency key required", spec: toolByName("shell_exec"), json: `{"host_id":"host_test","command":"pwd"}`, wantErr: true},
-		{name: "runtime idempotency key invalid", spec: toolByName("shell_exec"), json: `{"host_id":"host_test","idempotency_key":"short","command":"pwd"}`, wantErr: true},
+		{name: "runtime idempotency key required", spec: toolByName("window_list"), json: `{"host_id":"h1234567"}`, wantErr: true},
+		{name: "runtime idempotency key invalid", spec: toolByName("window_list"), json: `{"host_id":"h1234567","idempotency_key":"short"}`, wantErr: true},
 		{name: "invalid port", spec: toolByName("preview_url"), json: `{"host_id":"host_test","port":65536}`, wantErr: true},
 		{name: "valid workspace IDs", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567"],"idempotency_key":"host-create-key-001"}`},
 		{name: "host create idempotency key required", spec: toolByName("host_create"), json: `{}`, wantErr: true},
@@ -226,7 +225,6 @@ func TestValidateToolArguments(t *testing.T) {
 		{name: "workspace IDs must be strings", spec: toolByName("host_create"), json: `{"workspace_ids":[1],"idempotency_key":"host-create-key-001"}`, wantErr: true},
 		{name: "legacy host delete option rejected", spec: toolByName("host_delete"), json: `{"host_id":"h1234567","keep_workspace":true}`, wantErr: true},
 		{name: "trailing JSON", spec: toolByName("host_get"), json: `{"host_id":"host_test"}{}`, wantErr: true},
-		{name: "reversed line range", spec: toolByName("file_read"), json: `{"host_id":"h1234567","idempotency_key":"test-file-read-0001","path":"x","start_line":3,"end_line":2}`, wantErr: true},
 		{name: "mutually exclusive type selectors", spec: toolByName("browser_type"), json: `{"host_id":"host_test","text":"x","index":1,"selector":"#x"}`, wantErr: true},
 	}
 	for _, tt := range tests {

@@ -3,8 +3,11 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,10 +21,296 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
+	storepostgres "morde/server/internal/store/postgres"
 )
+
+type f02MCPCommitObserver struct {
+	app.WorkspaceSyncStore
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *f02MCPCommitObserver) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string, key app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
+	s.once.Do(func() { close(s.entered) })
+	return s.WorkspaceSyncStore.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, key)
+}
+
+type f02MCPWorkspaceFixture struct {
+	store       *storepostgres.Store
+	principal   identity.Principal
+	workspaceID string
+	sessionID   string
+	connectorID string
+	claimed     task.Task
+	sync        *app.WorkspaceSyncService
+	broker      *app.CloudDSHToolBroker
+	provider    *f01LocalMCPProvider
+	commit      *f02MCPCommitObserver
+	call        app.ModelToolCall
+}
+
+func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspaceFixture {
+	t.Helper()
+	store, pool := newF01TemporaryStore(t)
+	owner := createF01User(t, ctx, store)
+	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	value := createF01Workspace(t, ctx, store, owner.ID)
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x39}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _, _ := createF01Host(t, ctx, store, sealer, owner.ID)
+	if _, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: host.ID, Workspace: value, Directory: value.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, host.ID, value.ID, 1, workspace.BindingPreparing, workspace.BindingActive, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	auditService, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, auditService, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifySession(ctx, createF01Session(t, ctx, store, owner.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectors, err := app.NewMCPConnectorService(store, sealer, "https://portal.example.test/api/mcp/oauth/callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector, err := connectors.Create(ctx, principal, app.CreateMCPConnectorCommand{
+		Name: "Local MCP fence test", EndpointURL: "https://connector.example.test/mcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector, err = connectors.SetEnabled(ctx, principal, connector.ID, true, app.MCPConnectorRevisionCommand{ExpectedRevision: connector.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(0)
+	submitted, err := tasks.Submit(ctx, principal, app.SubmitTaskCommand{
+		HostID: host.ID, WorkspaceID: value.ID, InputRevision: &revision,
+		ModelID: "p1234567", Objective: "Look up the record; text only.",
+		Budget:          task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000},
+		MCPConnectorIDs: []string{connector.ID}, IdempotencyKey: "f02-mcp-workspace-task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "f02-mcp-workspace-worker", time.Minute)
+	if err != nil || !found || claimed.ID != submitted.Task.ID {
+		t.Fatalf("claim Task = %#v, found=%t err=%v", claimed, found, err)
+	}
+	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "blocks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close Workspace block store: %v", err)
+		}
+	})
+	commit := &f02MCPCommitObserver{WorkspaceSyncStore: store, entered: make(chan struct{})}
+	syncService, err := app.NewWorkspaceSyncService(commit, blocks, 0, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeControl, err := app.NewRuntimeControl(store, f01SandboxRouter{}, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeTools, err := app.NewRuntimeToolExecutor(store, credentials, runtimeControl, runtimeControl, syncService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := newF01LocalMCPProvider()
+	broker, err := app.NewCloudDSHToolBroker(store, runtimeTools, connectors, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("synthetic external Workspace change")
+	digest := sha256.Sum256(content)
+	fileHash := hex.EncodeToString(digest[:])
+	file := workspace.File{
+		Path: "external.txt", SizeBytes: int64(len(content)), SHA256: fileHash, Mode: 0o644,
+		Chunks: []workspace.Chunk{{SHA256: fileHash, SizeBytes: int64(len(content))}},
+	}
+	session, err := syncService.CreateSyncSession(ctx, principal, value.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{file},
+	}, "f02-mcp-workspace-upload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written, err := syncService.PutSyncBlock(ctx, principal, value.ID, session.ID, fileHash, bytes.NewReader(content)); err != nil || written != int64(len(content)) {
+		t.Fatalf("upload synthetic block: written=%d err=%v", written, err)
+	}
+	toolDigest := sha256.Sum256([]byte("lookup"))
+	return f02MCPWorkspaceFixture{
+		store: store, principal: principal, workspaceID: value.ID, sessionID: session.ID, connectorID: connector.ID,
+		claimed: claimed, sync: syncService, broker: broker, provider: provider, commit: commit,
+		call: app.ModelToolCall{CallID: "f02-mcp-workspace-call", Name: fmt.Sprintf("mcp_%s_%x", connector.ID, toolDigest[:6]), Arguments: `{"query":"synthetic"}`},
+	}
+}
+
+func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
+	t.Run("unchanged_workspace_allows_call", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		f := newF02MCPWorkspaceFixture(t, ctx)
+		result, err := f.broker.Execute(ctx, f.claimed, f.call)
+		if err != nil || result.Status != app.AgentToolSucceeded || f.provider.remoteCalls.Load() != 1 {
+			t.Fatalf("unchanged Workspace MCP = %#v err=%v calls=%d", result, err, f.provider.remoteCalls.Load())
+		}
+	})
+
+	t.Run("workspace_change_before_dispatch_blocks_call", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		f := newF02MCPWorkspaceFixture(t, ctx)
+		committed, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
+		if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
+			t.Fatalf("commit external Workspace change = %#v err=%v", committed, err)
+		}
+		before, err := f.store.GetTask(ctx, f.claimed.ID, f.claimed.OwnerID)
+		if err != nil || before.Task.Status != task.StatusRunning || before.Task.InputRevision == nil || *before.Task.InputRevision != 0 {
+			t.Fatalf("Task before MCP dispatch = %#v err=%v", before.Task, err)
+		}
+		result, callErr := f.broker.Execute(ctx, f.claimed, f.call)
+		if got := f.provider.remoteCalls.Load(); got != 0 {
+			t.Errorf("MCP reached its in-process provider after Workspace revision changed: calls=%d result=%#v err=%v", got, result, callErr)
+		}
+		after, err := f.store.GetTask(ctx, f.claimed.ID, f.claimed.OwnerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if domain.CodeOf(callErr) != domain.CodeWorkspaceConflict &&
+			(after.Task.Status != task.StatusWaitingUser || after.Task.WaitingReason != "workspace_input_changed") {
+			t.Errorf("expected a Workspace conflict or stale-input pause, got result=%#v err=%v task=%s reason=%s", result, callErr, after.Task.Status, after.Task.WaitingReason)
+		}
+	})
+
+	t.Run("inflight_mcp_blocks_workspace_change", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		f := newF02MCPWorkspaceFixture(t, ctx)
+		f.provider.started = make(chan struct{}, 1)
+		release := make(chan struct{})
+		f.provider.release = release
+		var releaseOnce sync.Once
+		unblock := func() { releaseOnce.Do(func() { close(release) }) }
+		var goroutines sync.WaitGroup
+		defer func() {
+			unblock()
+			cancel()
+			goroutines.Wait()
+		}()
+		type callResult struct {
+			result app.AgentToolResult
+			err    error
+		}
+		callDone := make(chan callResult, 1)
+		goroutines.Add(1)
+		go func() {
+			defer goroutines.Done()
+			result, err := f.broker.Execute(ctx, f.claimed, f.call)
+			callDone <- callResult{result, err}
+		}()
+		select {
+		case <-f.provider.started:
+		case result := <-callDone:
+			t.Fatalf("MCP did not reach the in-process provider: result=%#v err=%v", result.result, result.err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		operation, err := f.store.GetMCPConnectorOperation(ctx, f.claimed.OwnerID, f.claimed.ID, f.connectorID, f01OperationKey(f.call.CallID))
+		if err != nil || operation.Status != task.OperationDispatched || f.provider.remoteCalls.Load() != 1 {
+			t.Fatalf("in-flight MCP operation = %#v err=%v calls=%d", operation, err, f.provider.remoteCalls.Load())
+		}
+		type commitResult struct {
+			session workspace.SyncSession
+			err     error
+		}
+		commitDone := make(chan commitResult, 1)
+		goroutines.Add(1)
+		go func() {
+			defer goroutines.Done()
+			session, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
+			commitDone <- commitResult{session, err}
+		}()
+		var earlyResult commitResult
+		var completedEarly bool
+		select {
+		case <-f.commit.entered:
+		case earlyResult = <-commitDone:
+			select {
+			case <-f.commit.entered:
+				completedEarly = true
+			default:
+				t.Fatalf("Workspace commit did not reach Store: session=%#v err=%v", earlyResult.session, earlyResult.err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if !completedEarly {
+			select {
+			case earlyResult = <-commitDone:
+				completedEarly = true
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+		if completedEarly && domain.CodeOf(earlyResult.err) != domain.CodeWorkspaceBusy {
+			t.Errorf("Workspace commit completed while MCP call was in flight: state=%s revision=%d err=%v", earlyResult.session.State, earlyResult.session.TargetRevision, earlyResult.err)
+		}
+		current, err := f.store.GetWorkspace(ctx, f.workspaceID)
+		if err != nil || current.Revision != 0 {
+			t.Errorf("Workspace changed before MCP call settled: revision=%d err=%v", current.Revision, err)
+		}
+		unblock()
+		select {
+		case result := <-callDone:
+			if result.err != nil || result.result.Status != app.AgentToolSucceeded {
+				t.Errorf("settle MCP call = %#v err=%v", result.result, result.err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if !completedEarly {
+			select {
+			case earlyResult = <-commitDone:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		}
+		if domain.CodeOf(earlyResult.err) != domain.CodeWorkspaceBusy {
+			t.Fatalf("Workspace commit during MCP call = %#v err=%v; want workspace_busy", earlyResult.session, earlyResult.err)
+		}
+		committed, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
+		if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
+			t.Fatalf("Workspace retry after MCP settled = %#v err=%v", committed, err)
+		}
+	})
+}
 
 func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -235,6 +524,8 @@ func (tools *f01InterruptAfterMCPDispatch) PauseRecovery(ctx context.Context, va
 type f01LocalMCPProvider struct {
 	server      *sdk.Server
 	remoteCalls atomic.Int32
+	started     chan struct{}
+	release     <-chan struct{}
 }
 
 func newF01LocalMCPProvider() *f01LocalMCPProvider {
@@ -242,8 +533,22 @@ func newF01LocalMCPProvider() *f01LocalMCPProvider {
 	provider.server.AddTool(&sdk.Tool{
 		Name: "lookup", Description: "Look up a record.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`),
-	}, func(_ context.Context, _ *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+	}, func(ctx context.Context, _ *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 		provider.remoteCalls.Add(1)
+		if provider.started != nil {
+			select {
+			case provider.started <- struct{}{}:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if provider.release != nil {
+			select {
+			case <-provider.release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 		return &sdk.CallToolResult{
 			Content:           []sdk.Content{&sdk.TextContent{Text: "one record"}},
 			StructuredContent: map[string]any{"record_id": "R-17"},

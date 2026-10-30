@@ -145,8 +145,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			map[string]any{"source": "cloud_dsh"}, "", nil)
 		return err
 	}
-	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepRunning,
-		"Verify cloud task output", "Checking successful file writes against the Host and committed Workspace.")
+	step, err := cloudDSHCompletionVerificationStep(current, details.Steps)
 	if err != nil {
 		return err
 	}
@@ -168,6 +167,11 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if verifyErr == nil && verification.Status == AgentVerifyUnknown && verification.WaitingReason == "workspace_input_changed" &&
+		len(verification.Artifacts) == 0 {
+		_, err := b.pauseForWorkspaceInputChange(ctx, current, step, current.Usage, "file.verify")
+		return err
+	}
 	if verifyErr != nil || verification.Status != AgentVerified || validateAgentVerificationArtifacts(verification) != nil || len(verification.Artifacts) == 0 {
 		return b.pauseCompletion(ctx, current, step, "output_verification_pending", "Host or committed Workspace could not verify the task output.")
 	}
@@ -180,6 +184,21 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	_, err = agent.completeWithArtifacts(ctx, current, step, current.Usage, completion.Result,
 		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts)
 	return err
+}
+
+func cloudDSHCompletionVerificationStep(current task.Task, steps []task.Step) (task.Step, error) {
+	var resumed task.Step
+	for _, step := range steps {
+		if step.Kind == "verification" && step.Status == task.StepRunning && step.Title == "Verify cloud task output" &&
+			step.Sequence > resumed.Sequence {
+			resumed = step
+		}
+	}
+	if resumed.ID != "" {
+		return resumed, nil
+	}
+	return newAgentStep(current.ID, maxStepSequence(steps)+1, "verification", task.StepRunning,
+		"Verify cloud task output", "Checking successful file writes against the Host and committed Workspace.")
 }
 
 // shortcut: fixed phrase matching can miss uncommon wording, upgrade when broader language coverage is required.
@@ -539,7 +558,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	operation, replayed, err := b.store.CreateOperation(ctx, task.Operation{
 		ID: operationID, TaskID: current.ID, Key: request.OperationKey, RequestHash: hash[:], HostID: current.HostID,
 		WorkspaceID: preparation.WorkspaceID, BindingVersion: preparation.BindingVersion,
-		InputRevision:     inputRevision,
+		InputRevision: inputRevision, WorkspaceCheckpointRevision: current.WorkspaceCheckpointRevision,
 		RuntimeGeneration: request.Fence.RuntimeGeneration, RuntimeInstanceID: request.Fence.RuntimeInstanceID,
 		ControlVersion: request.Fence.ControlVersion, LeaseVersion: current.Lease.Version,
 		RuntimeLeaseVersion: current.Lease.Version, Status: task.OperationPrepared,
@@ -557,7 +576,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The exact prior operation disappeared during recovery.")
 	}
 	if operation.ID == "" || operation.HostID != current.HostID || operation.WorkspaceID != preparation.WorkspaceID ||
-		operation.BindingVersion != preparation.BindingVersion || !bytes.Equal(operation.RequestHash, hash[:]) {
+		operation.BindingVersion != preparation.BindingVersion || !sameTaskInputRevision(operation.InputRevision, inputRevision) ||
+		!sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) ||
+		!bytes.Equal(operation.RequestHash, hash[:]) {
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The stored tool operation does not match this exact request.")
 	}
 	request.OperationID = operation.ID
@@ -873,9 +894,13 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 	if err != nil {
 		return pause("The prior tool operation could not be read safely.")
 	}
-	workspaceID := runtimeToolWorkspaceID(mapping, arguments)
+	workspaceID, workspaceErr := runtimeToolOperationWorkspaceID(mapping, arguments, current)
 	if operation.ID == "" || !domain.ValidOperationID(operation.ID) || operation.TaskID != current.ID || operation.Key != operationKey ||
-		operation.HostID != current.HostID || operation.WorkspaceID != workspaceID || !bytes.Equal(operation.RequestHash, hash[:]) {
+		workspaceErr != nil || operation.HostID != current.HostID || operation.WorkspaceID != workspaceID ||
+		!sameTaskInputRevision(operation.InputRevision, current.InputRevision) ||
+		!sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) ||
+		(operation.WorkspaceID != "" && operation.BindingVersion < 1) ||
+		(operation.WorkspaceID == "" && operation.BindingVersion != 0) || !bytes.Equal(operation.RequestHash, hash[:]) {
 		return pause("The stored tool operation does not match this exact checkpointed request.")
 	}
 	if operation.Status == task.OperationPrepared {

@@ -37,6 +37,13 @@ type WorkspaceSyncService interface {
 	AckDownloadAction(context.Context, identity.Principal, string, string, string, workspace.ChangeAction, string, int64) error
 }
 
+type WorkspaceSyncDeviceService interface {
+	CreateChallenge(context.Context, identity.Principal, string, string, []byte) (app.WorkspaceSyncDeviceChallengeResult, error)
+	Register(context.Context, identity.Principal, string, string, string, []byte) (app.WorkspaceSyncDeviceRegistration, error)
+	List(context.Context, identity.Principal, string) ([]workspace.SyncDeviceBinding, error)
+	Revoke(context.Context, identity.Principal, string, string) error
+}
+
 type SiteService interface {
 	Create(context.Context, identity.Principal, string, string, string) (sitedomain.Site, error)
 	List(context.Context, identity.Principal, app.PageRequest) (app.SitePage, error)

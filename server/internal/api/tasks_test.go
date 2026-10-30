@@ -68,6 +68,7 @@ func (s *taskServiceStub) Submit(_ context.Context, _ identity.Principal, comman
 	value := apiTestTask()
 	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
 	value.WorkspaceID, value.InputRevision = command.WorkspaceID, command.InputRevision
+	value.WorkspaceCheckpointRevision = command.InputRevision
 	return app.TaskSubmissionResult{Task: value}, s.err
 }
 
@@ -78,6 +79,7 @@ func (s *taskServiceStub) AppendMessage(_ context.Context, _ identity.Principal,
 	value := apiTestTask()
 	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
 	value.WorkspaceID, value.InputRevision = command.WorkspaceID, command.InputRevision
+	value.WorkspaceCheckpointRevision = command.InputRevision
 	return app.TaskSubmissionResult{
 		Task: value, Message: conversation.Message{
 			ID: "m1234567", ConversationID: id, Role: conversation.RoleUser, Content: command.Content,
@@ -172,6 +174,9 @@ func TestTaskSubmitHandlerPassesRequestAndReturnsStableShape(t *testing.T) {
 	}
 	if string(body["workspace_id"]) != `"w1234567"` || string(body["input_revision"]) != `7` {
 		t.Fatalf("workspace input snapshot = %s/%s", body["workspace_id"], body["input_revision"])
+	}
+	if string(body["workspace_checkpoint_revision"]) != `7` {
+		t.Fatalf("workspace checkpoint = %s, want 7", body["workspace_checkpoint_revision"])
 	}
 	for _, field := range []string{"steps", "batch_items", "artifacts"} {
 		if string(body[field]) != "[]" {

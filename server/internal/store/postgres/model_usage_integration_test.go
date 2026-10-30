@@ -504,9 +504,9 @@ VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engi
 	}
 	_, err = store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2 WHERE id=$1`, fence.TaskID, foreignHost.ID)
 	assertForeignKey(err)
-	_, err = store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2,input_revision=0 WHERE id=$1`, fence.TaskID, foreignWorkspace.ID)
+	_, err = store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2,input_revision=0,workspace_checkpoint_revision=0 WHERE id=$1`, fence.TaskID, foreignWorkspace.ID)
 	assertForeignKey(err)
-	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2,workspace_id=$3,input_revision=0 WHERE id=$1`, fence.TaskID, host.ID, workspace.ID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2,workspace_id=$3,input_revision=0,workspace_checkpoint_revision=0 WHERE id=$1`, fence.TaskID, host.ID, workspace.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, host.ID); err != nil {

@@ -31,9 +31,6 @@ import (
 
 var errInjectedCloudArtifactCommit = errors.New("injected transient artifact commit failure")
 
-// artifactCommitFailOnceStore makes only the final completed-task transaction
-// fail once. All reads, operation updates, verification steps, and later
-// commits continue through the real PostgreSQL store.
 type artifactCommitFailOnceStore struct {
 	app.TaskStore
 	fired atomic.Bool
@@ -86,17 +83,22 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err := os.MkdirAll(workspaceDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	files, err := runtimefiles.OpenWorkspace(hostRoot)
+	content := "Persist this artifact exactly once.\n"
+	if err := os.WriteFile(filepath.Join(workspaceDirectory, "recovery-note.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	taskWorkspace, err := runtimefiles.OpenTaskWorkspace(hostRoot,
+		filepath.Join(hostRoot, ".morde-task-views"), uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := files.Close(); err != nil {
-			t.Errorf("close Host runtime workspace: %v", err)
+		if err := taskWorkspace.Close(); err != nil {
+			t.Errorf("close Host Task Workspace views: %v", err)
 		}
 	}()
 	var fileWriteCalls atomic.Int32
-	runtimeHandlers := files.Handlers()
+	runtimeHandlers := taskWorkspace.Handlers()
 	for index, handler := range runtimeHandlers {
 		if handler.Capability() == "file.write" && handler.Action() == "write" {
 			runtimeHandlers[index] = &artifactFailureWriteCounter{ActionHandler: handler, calls: &fileWriteCalls}
@@ -109,7 +111,7 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	runtimeManager, err := runtimecore.Open(runtimecore.Options{
 		StoreDir: runtimeStore, ExpectedOwnerUID: uint32(os.Geteuid()),
 		HostID: hostValue.ID, Generation: hostValue.RuntimeGeneration, ProtocolVersion: contract.ProtocolVersion,
-		Handlers: runtimeHandlers,
+		Handlers: runtimeHandlers, TaskWorkspaceViews: taskWorkspace,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +161,32 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil || principal.UserID != owner.ID || principal.Kind != identity.KindSession {
 		t.Fatalf("verify task session: principal=%#v err=%v", principal, err)
 	}
+	contentDigest := sha256.Sum256([]byte(content))
+	contentHash := hex.EncodeToString(contentDigest[:])
+	manifestFile := workspace.File{
+		Path: "recovery-note.txt", SizeBytes: int64(len(content)), SHA256: contentHash, Mode: 0o600,
+		Chunks: []workspace.Chunk{{SHA256: contentHash, SizeBytes: int64(len(content))}},
+	}
+	initialUpload, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{manifestFile},
+	}, "f01-artifact-initial-upload")
+	if err != nil {
+		t.Fatalf("create initial Workspace upload session: %v", err)
+	}
+	if written, err := syncService.PutSyncBlock(ctx, principal, workspaceValue.ID, initialUpload.ID, contentHash, strings.NewReader(content)); err != nil || written != int64(len(content)) {
+		t.Fatalf("upload initial Workspace content block: written=%d err=%v", written, err)
+	}
+	initialCommitted, err := syncService.CommitSyncSession(ctx, principal, workspaceValue.ID, initialUpload.ID, "f01-artifact-initial-commit")
+	if err != nil || initialCommitted.State != workspace.SyncCompleted || initialCommitted.TargetRevision != 1 {
+		t.Fatalf("commit initial Workspace file: session=%#v err=%v", initialCommitted, err)
+	}
+	initialBinding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, workspaceValue.ID, initialBinding.BindingVersion, 1); err != nil {
+		t.Fatalf("record initial Host Workspace revision (binding=%#v): %v", initialBinding, err)
+	}
 	taskService, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
 	if err != nil {
 		t.Fatal(err)
@@ -180,9 +208,9 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	zeroRevision := int64(0)
+	inputRevision := int64(1)
 	submitted, err := taskService.Submit(ctx, principal, app.SubmitTaskCommand{
-		HostID: hostValue.ID, WorkspaceID: workspaceValue.ID, InputRevision: &zeroRevision,
+		HostID: hostValue.ID, WorkspaceID: workspaceValue.ID, InputRevision: &inputRevision,
 		ModelID: "p1234567", Objective: "Write and verify a note in the cloud Workspace.",
 		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000}, IdempotencyKey: "f01-artifact-commit-failure",
 	})
@@ -233,7 +261,6 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	}
 
 	callID := "artifact-failure-file-write-001"
-	content := "Persist this artifact exactly once.\n"
 	arguments, err := json.Marshal(map[string]string{
 		"workspace_id": workspaceValue.ID, "path": "recovery-note.txt", "content": content,
 	})
@@ -243,37 +270,15 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	call := app.ModelToolCall{CallID: callID, Name: "file_write", Arguments: string(arguments)}
 	toolResult, err := toolBroker.Execute(ctx, claimed, call)
 	if err != nil || toolResult.Status != app.AgentToolSucceeded {
-		t.Fatalf("execute Host file_write: result=%+v err=%v", toolResult, err)
+		t.Fatalf("execute Task Workspace file_write: result=%+v err=%v", toolResult, err)
 	}
 	operationKey := f01OperationKey(callID)
 	writeOperation, err := store.GetOperation(ctx, owner.ID, claimed.ID, operationKey)
 	if err != nil || writeOperation.Status != task.OperationSucceeded || writeOperation.ID == "" {
-		t.Fatalf("persist successful Host operation: operation=%#v err=%v", writeOperation, err)
+		t.Fatalf("persist successful Task Workspace operation: operation=%#v err=%v", writeOperation, err)
 	}
 	if fileWriteCalls.Load() != 1 {
-		t.Fatalf("Host file_write side effect count before artifact recovery = %d, want 1", fileWriteCalls.Load())
-	}
-
-	// Represent the independently completed Host-to-Workspace sync. The exact
-	// bytes written by file_write become an immutable committed Workspace file.
-	contentDigest := sha256.Sum256([]byte(content))
-	contentHash := hex.EncodeToString(contentDigest[:])
-	manifestFile := workspace.File{
-		Path: "recovery-note.txt", SizeBytes: int64(len(content)), SHA256: contentHash, Mode: 0o644,
-		Chunks: []workspace.Chunk{{SHA256: contentHash, SizeBytes: int64(len(content))}},
-	}
-	upload, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
-		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{manifestFile},
-	}, "f01-artifact-sync-upload")
-	if err != nil {
-		t.Fatalf("create Workspace upload session: %v", err)
-	}
-	if written, err := syncService.PutSyncBlock(ctx, principal, workspaceValue.ID, upload.ID, contentHash, strings.NewReader(content)); err != nil || written != int64(len(content)) {
-		t.Fatalf("upload Workspace content block: written=%d err=%v", written, err)
-	}
-	committed, err := syncService.CommitSyncSession(ctx, principal, workspaceValue.ID, upload.ID, "f01-artifact-sync-commit")
-	if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
-		t.Fatalf("commit Workspace file: session=%#v err=%v", committed, err)
+		t.Fatalf("Task Workspace file_write side effect count before artifact recovery = %d, want 1", fileWriteCalls.Load())
 	}
 
 	completion := app.CloudDSHTaskCompletion{
@@ -311,24 +316,25 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 			afterFailure.Task.Status, len(afterFailure.Artifacts), err)
 	}
 	firstOperationID := writeOperation.ID
-
 	if err := toolBroker.Complete(ctx, claimed, completion); err != nil {
 		t.Fatalf("retry completion after transient artifact failure: %v", err)
 	}
 	completed, err := store.GetTask(ctx, claimed.ID, owner.ID)
-	if err != nil || completed.Task.Status != task.StatusCompleted || len(completed.Artifacts) != 1 {
-		t.Fatalf("task after completion retry = status %s artifacts=%d err=%v; want completed with one artifact",
-			completed.Task.Status, len(completed.Artifacts), err)
+	if err != nil || completed.Task.Status != task.StatusCompleted || len(completed.Artifacts) != 1 ||
+		completed.Task.WorkspaceCheckpointRevision == nil || *completed.Task.WorkspaceCheckpointRevision != 2 {
+		t.Fatalf("task after completion retry = status %s waiting=%s checkpoint=%#v artifacts=%d steps=%#v err=%v; want completed with one artifact",
+			completed.Task.Status, completed.Task.WaitingReason, completed.Task.WorkspaceCheckpointRevision,
+			len(completed.Artifacts), completed.Steps, err)
 	}
 	finalOperation, err := store.GetOperation(ctx, owner.ID, claimed.ID, operationKey)
 	if err != nil || finalOperation.ID != firstOperationID || finalOperation.Status != task.OperationSucceeded {
 		t.Fatalf("file_write operation changed across recovery: before=%q after=%#v err=%v", firstOperationID, finalOperation, err)
 	}
 	if fileWriteCalls.Load() != 1 {
-		t.Fatalf("Host file_write side effect count after completion retry = %d, want 1", fileWriteCalls.Load())
+		t.Fatalf("Task Workspace file_write side effect count after completion retry = %d, want 1", fileWriteCalls.Load())
 	}
 	artifact := completed.Artifacts[0]
-	if artifact.WorkspaceID != workspaceValue.ID || artifact.Revision != 1 || artifact.Path != manifestFile.Path ||
+	if artifact.WorkspaceID != workspaceValue.ID || artifact.Revision != 2 || artifact.Path != manifestFile.Path ||
 		artifact.SizeBytes != manifestFile.SizeBytes || artifact.SHA256 != manifestFile.SHA256 {
 		t.Fatalf("recovered artifact metadata = %#v", artifact)
 	}
@@ -338,6 +344,6 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	}
 	hostBytes, err := os.ReadFile(filepath.Join(workspaceDirectory, artifact.Path))
 	if err != nil || string(hostBytes) != content {
-		t.Fatalf("Host file after recovery = %q err=%v", hostBytes, err)
+		t.Fatalf("Host file after artifact recovery = %q err=%v", hostBytes, err)
 	}
 }

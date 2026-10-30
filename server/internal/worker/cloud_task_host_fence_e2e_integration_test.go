@@ -70,7 +70,8 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	if err := os.MkdirAll(workspaceDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	files, err := runtimefiles.OpenWorkspace(hostRoot)
+	taskViewRoot := filepath.Join(t.TempDir(), "task-views")
+	files, err := runtimefiles.OpenTaskWorkspace(hostRoot, taskViewRoot, uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	runtimeManager, err := runtimecore.Open(runtimecore.Options{
 		StoreDir: runtimeStore, ExpectedOwnerUID: uint32(os.Geteuid()),
 		HostID: hostValue.ID, Generation: hostValue.RuntimeGeneration, ProtocolVersion: contract.ProtocolVersion,
-		Handlers: runtimeHandlers,
+		Handlers: runtimeHandlers, TaskWorkspaceViews: files,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -295,6 +296,14 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("dsh did not reach the Host file.write handler: %v", ctx.Err())
 	}
+	taskDetails, err := store.GetTask(ctx, accepted.ID, owner.ID)
+	if err != nil || taskDetails.Task.InputRevision == nil || taskDetails.Task.WorkspaceCheckpointRevision == nil || taskDetails.Task.Lease.Version < 1 {
+		t.Fatalf("read active Task workspace checkpoint: task=%#v err=%v", taskDetails.Task, err)
+	}
+	bindingVersion, taskViewID, err := oldSession.SetTaskWorkspaceView(ctx, taskDetails.Task, workspaceValue.ID, activeBinding.BindingVersion)
+	if err != nil || bindingVersion != activeBinding.BindingVersion {
+		t.Fatalf("prepare active Task workspace view: binding=%d view=%q err=%v", bindingVersion, taskViewID, err)
+	}
 	operation, err := store.GetOperation(ctx, owner.ID, accepted.ID, f01OperationKey("f01-host-fence-write-001"))
 	if err != nil || operation.Status != task.OperationDispatched {
 		t.Fatalf("Host operation at takeover boundary = %#v, %v; want dispatched", operation, err)
@@ -370,7 +379,7 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 		t.Fatalf("take-over response = %#v; want user control at a newer fence", takeover)
 	}
 
-	firstPath := filepath.Join(workspaceDirectory, "during-takeover.txt")
+	firstPath := filepath.Join(taskViewRoot, accepted.ID, taskViewID, "during-takeover.txt")
 	select {
 	case heldWrite.allowInitialWrite <- struct{}{}:
 	default:
@@ -389,13 +398,14 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = oldSession.Execute(ctx, "q1234567", oldOperationID, 1, "file.write", "write",
-		json.RawMessage(`{"path":"stale-fence.txt","content":"must not write"}`), workspaceValue.ID, activeBinding.BindingVersion, nil)
+	_, err = oldSession.Execute(ctx, accepted.ID, oldOperationID, taskDetails.Task.Lease.Version, "file.write", "write",
+		json.RawMessage(`{"path":"stale-fence.txt","content":"must not write"}`), workspaceValue.ID, bindingVersion,
+		taskViewID, *taskDetails.Task.WorkspaceCheckpointRevision, taskDetails.Task.InputRevision)
 	if domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("Host write with original fence after take-over = %v; want fence rejection", err)
 	}
 	assertF01HostRuntimeFenceRejected(t, ctx, oldSession)
-	if _, err := os.Stat(filepath.Join(workspaceDirectory, "stale-fence.txt")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(taskViewRoot, accepted.ID, taskViewID, "stale-fence.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale-fence Host file = stat error %v; want no file", err)
 	}
 
@@ -441,11 +451,21 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	inputRevision := *taskDetails.Task.InputRevision
+	newTask := task.Task{
+		ID: newTaskID, WorkspaceID: workspaceValue.ID, InputRevision: &inputRevision,
+		WorkspaceCheckpointRevision: &inputRevision, ContextDigest: append([]byte(nil), taskDetails.Task.ContextDigest...),
+	}
+	_, newTaskViewID, err := newSession.SetTaskWorkspaceView(ctx, newTask, workspaceValue.ID, activeBinding.BindingVersion)
+	if err != nil {
+		t.Fatalf("prepare Task workspace view under released Host fence: %v", err)
+	}
 	if err := newSession.SetTaskLease(ctx, newTaskID, 1, time.Now().UTC().Add(10*time.Second)); err != nil {
 		t.Fatalf("set lease under released Host fence: %v", err)
 	}
 	_, err = newSession.Execute(ctx, newTaskID, newOperationID, 1, "file.write", "write",
-		json.RawMessage(`{"path":"after-release.txt","content":"new fence write"}`), workspaceValue.ID, activeBinding.BindingVersion, nil)
+		json.RawMessage(`{"path":"after-release.txt","content":"new fence write"}`), workspaceValue.ID, activeBinding.BindingVersion,
+		newTaskViewID, inputRevision, &inputRevision)
 	if err != nil {
 		t.Fatalf("Host write under released fence: %v", err)
 	}
@@ -463,7 +483,7 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("new-fence Host operation did not succeed: %v", err)
 	}
-	content, err := os.ReadFile(filepath.Join(workspaceDirectory, "after-release.txt"))
+	content, err := os.ReadFile(filepath.Join(taskViewRoot, newTaskID, newTaskViewID, "after-release.txt"))
 	if err != nil || string(content) != "new fence write" {
 		t.Fatalf("new-fence Workspace content = %q err=%v", content, err)
 	}
@@ -475,13 +495,14 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = oldSession.Execute(ctx, "q1234567", staleAfterReleaseID, 1, "file.write", "write",
-		json.RawMessage(`{"path":"stale-after-release.txt","content":"must not write"}`), workspaceValue.ID, activeBinding.BindingVersion, nil)
+	_, err = oldSession.Execute(ctx, accepted.ID, staleAfterReleaseID, taskDetails.Task.Lease.Version, "file.write", "write",
+		json.RawMessage(`{"path":"stale-after-release.txt","content":"must not write"}`), workspaceValue.ID, bindingVersion,
+		taskViewID, *taskDetails.Task.WorkspaceCheckpointRevision, taskDetails.Task.InputRevision)
 	if domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("Host write with stale fence after release = %v; want fence rejection", err)
 	}
 	assertF01HostRuntimeFenceRejected(t, ctx, oldSession)
-	if _, err := os.Stat(filepath.Join(workspaceDirectory, "stale-after-release.txt")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(taskViewRoot, accepted.ID, taskViewID, "stale-after-release.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale after-release file = stat error %v; want no file", err)
 	}
 }
@@ -492,7 +513,7 @@ func assertF01HostRuntimeFenceRejected(t *testing.T, ctx context.Context, sessio
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = session.Execute(ctx, "q1234567", operationID, 1, "test.action", "run", json.RawMessage(`{}`), "", 0, nil)
+	_, err = session.Execute(ctx, "q1234567", operationID, 1, "test.action", "run", json.RawMessage(`{}`), "", 0, "", 0, nil)
 	var runtimeErr *runtimeclient.Error
 	if !errors.As(err, &runtimeErr) || runtimeErr.Code != runtimeclient.ErrorFenceRejected {
 		t.Fatalf("Host runtime accepted stale operation fence: %v; want %s", err, runtimeclient.ErrorFenceRejected)

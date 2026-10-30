@@ -8,9 +8,12 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const maxMCPConnectorOperationResultBytes = 64 << 10
@@ -30,6 +33,9 @@ func (s *Store) PrepareMCPConnectorOperation(ctx context.Context, value app.MCPC
 			if !sameMCPConnectorOperationRequest(stored, value) {
 				return idempotencyConflict()
 			}
+			if err := requireMCPConnectorTaskWorkspaceSnapshot(ctx, tx, value); err != nil {
+				return err
+			}
 			if stored.Status == task.OperationPrepared && stored.LeaseVersion != value.LeaseVersion {
 				if err := lockCurrentTaskMCPConnectorGrant(ctx, tx, value); err != nil {
 					return err
@@ -44,16 +50,27 @@ func (s *Store) PrepareMCPConnectorOperation(ctx context.Context, value app.MCPC
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read MCP connector operation before prepare: %w", err)
 		}
+		if err := requireMCPConnectorTaskWorkspaceSnapshot(ctx, tx, value); err != nil {
+			return err
+		}
+		if err := ensureNoPendingTaskWorkspacePublish(ctx, tx, value.TaskID); err != nil {
+			return err
+		}
 		if err := lockCurrentTaskMCPConnectorGrant(ctx, tx, value); err != nil {
+			return err
+		}
+		if err := lockMCPConnectorWorkspaceFence(ctx, tx, value); err != nil {
 			return err
 		}
 		command, err := tx.Exec(ctx, `INSERT INTO task_mcp_connector_operations (
 id, task_id, owner_id, connector_id, connector_revision, credential_version, grant_version, lease_version,
+host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision,
 operation_key, tool_name, request_hash, status
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'prepared')
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'prepared')
 ON CONFLICT (task_id, connector_id, operation_key) DO NOTHING`,
 			value.ID, value.TaskID, value.OwnerID, value.ConnectorID, value.ConnectorRevision, value.CredentialVersion,
-			value.GrantVersion, value.LeaseVersion, value.Key, value.ToolName, value.RequestHash)
+			value.GrantVersion, value.LeaseVersion, value.HostID, value.WorkspaceID, value.BindingVersion,
+			taskUsageTokens(value.InputRevision), taskUsageTokens(value.WorkspaceCheckpointRevision), value.Key, value.ToolName, value.RequestHash)
 		if err != nil {
 			return fmt.Errorf("prepare MCP connector operation: %w", err)
 		}
@@ -104,6 +121,12 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 		if err := lockMCPConnectorTaskLease(ctx, tx, value, leaseOwner); err != nil {
 			return err
 		}
+		if err := requireMCPConnectorTaskWorkspaceSnapshot(ctx, tx, value); err != nil {
+			return err
+		}
+		if err := lockMCPConnectorWorkspaceFence(ctx, tx, value); err != nil {
+			return err
+		}
 		if err := lockCurrentTaskMCPConnectorGrant(ctx, tx, value); err != nil {
 			return err
 		}
@@ -113,6 +136,9 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 		}
 		if !sameMCPConnectorOperationRequest(stored, value) || stored.LeaseVersion != value.LeaseVersion {
 			return idempotencyConflict()
+		}
+		if err := ensureNoPendingTaskWorkspacePublish(ctx, tx, value.TaskID); err != nil {
+			return err
 		}
 		if stored.Status != task.OperationPrepared {
 			return domain.NewError(domain.CodeConflict, "MCP connector operation is no longer prepared")
@@ -130,6 +156,88 @@ WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND connector_id=$4 AND operation_key
 		return nil
 	})
 	return result, err
+}
+
+func requireMCPConnectorTaskWorkspaceSnapshot(ctx context.Context, tx pgx.Tx, value app.MCPConnectorOperation) error {
+	var taskHostID pgtype.Text
+	var taskWorkspaceID pgtype.Text
+	var taskInputRevision, taskCheckpointRevision pgtype.Int8
+	if err := tx.QueryRow(ctx, `SELECT host_id, workspace_id, input_revision, workspace_checkpoint_revision
+FROM tasks WHERE id=$1 AND owner_id=$2`, value.TaskID, value.OwnerID).Scan(
+		&taskHostID, &taskWorkspaceID, &taskInputRevision, &taskCheckpointRevision); err != nil {
+		return fmt.Errorf("read MCP task Workspace snapshot: %w", err)
+	}
+	if !sameMCPWorkspaceHostID(taskHostID, value.HostID) || !sameMCPWorkspaceID(taskWorkspaceID, value.WorkspaceID) ||
+		!sameMCPWorkspaceRevision(taskInputRevision, value.InputRevision) ||
+		!sameMCPWorkspaceRevision(taskCheckpointRevision, value.WorkspaceCheckpointRevision) {
+		return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Task Workspace snapshot changed")
+	}
+	return nil
+}
+
+func lockMCPConnectorWorkspaceFence(ctx context.Context, tx pgx.Tx, value app.MCPConnectorOperation) error {
+	if value.WorkspaceID == "" {
+		if value.BindingVersion != 0 || value.InputRevision != nil || value.WorkspaceCheckpointRevision != nil {
+			return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Workspace fence is incomplete")
+		}
+		return nil
+	}
+	if value.InputRevision == nil || value.WorkspaceCheckpointRevision == nil ||
+		*value.InputRevision < 0 || *value.WorkspaceCheckpointRevision < *value.InputRevision || value.BindingVersion <= 0 {
+		return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Workspace fence is invalid")
+	}
+	var hostOwner, hostState string
+	var hostDeleted bool
+	if err := tx.QueryRow(ctx, `SELECT owner_id, state, deleted_at IS NOT NULL FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).
+		Scan(&hostOwner, &hostState, &hostDeleted); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Host is no longer available")
+		}
+		return fmt.Errorf("lock Host for MCP Workspace fence: %w", err)
+	}
+	if hostOwner != value.OwnerID || hostState != string(host.StateRunning) || hostDeleted {
+		return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Host changed after Task preparation")
+	}
+	var workspaceOwner, workspaceState string
+	var workspaceRevision int64
+	if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 FOR SHARE`, value.WorkspaceID).
+		Scan(&workspaceOwner, &workspaceState, &workspaceRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Workspace is no longer available")
+		}
+		return fmt.Errorf("lock Workspace for MCP operation fence: %w", err)
+	}
+	checkpoint := *value.WorkspaceCheckpointRevision
+	if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) || workspaceRevision != checkpoint {
+		return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this Task checkpoint was confirmed")
+	}
+	var bindingOwner, bindingState, syncState string
+	var bindingVersion, desiredRevision, appliedRevision int64
+	if err := tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version, desired_revision, applied_revision
+FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, value.HostID, value.WorkspaceID).
+		Scan(&bindingOwner, &bindingState, &syncState, &bindingVersion, &desiredRevision, &appliedRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Host Workspace binding is unavailable")
+		}
+		return fmt.Errorf("lock Host Workspace binding for MCP operation fence: %w", err)
+	}
+	if bindingOwner != value.OwnerID || bindingState != string(workspace.BindingActive) || syncState != string(workspace.BindingSyncHealthy) ||
+		bindingVersion != value.BindingVersion || desiredRevision != checkpoint || appliedRevision != checkpoint {
+		return domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed after Task preparation")
+	}
+	return nil
+}
+
+func sameMCPWorkspaceID(stored pgtype.Text, expected string) bool {
+	return expected == "" && !stored.Valid || expected != "" && stored.Valid && stored.String == expected
+}
+
+func sameMCPWorkspaceHostID(stored pgtype.Text, expected string) bool {
+	return expected == "" && (!stored.Valid || stored.String == "") || expected != "" && stored.Valid && stored.String == expected
+}
+
+func sameMCPWorkspaceRevision(stored pgtype.Int8, expected *int64) bool {
+	return expected == nil && !stored.Valid || expected != nil && stored.Valid && stored.Int64 == *expected
 }
 
 func (s *Store) CompleteMCPConnectorOperation(ctx context.Context, value app.MCPConnectorOperation, leaseOwner string, status task.OperationStatus, output string) (app.MCPConnectorOperation, error) {
@@ -211,16 +319,21 @@ func (s *Store) GetMCPConnectorOperation(ctx context.Context, ownerID, taskID, c
 		return app.MCPConnectorOperation{}, domain.InvalidArgument("operation", "MCP connector operation identity is invalid")
 	}
 	var result app.MCPConnectorOperation
+	var inputRevision, workspaceCheckpointRevision pgtype.Int8
 	err := s.pool.QueryRow(ctx, `SELECT id, task_id, owner_id, connector_id, connector_revision, credential_version,
-grant_version, lease_version, operation_key, tool_name, request_hash, status, cancel_requested, result, created_at, updated_at
+grant_version, lease_version, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision,
+operation_key, tool_name, request_hash, status, cancel_requested, result, created_at, updated_at
 FROM task_mcp_connector_operations WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 AND operation_key=$4`,
 		ownerID, taskID, connectorID, key).Scan(
 		&result.ID, &result.TaskID, &result.OwnerID, &result.ConnectorID, &result.ConnectorRevision, &result.CredentialVersion,
-		&result.GrantVersion, &result.LeaseVersion, &result.Key, &result.ToolName, &result.RequestHash, &result.Status, &result.CancelRequested,
+		&result.GrantVersion, &result.LeaseVersion, &result.HostID, &result.WorkspaceID, &result.BindingVersion, &inputRevision,
+		&workspaceCheckpointRevision, &result.Key, &result.ToolName, &result.RequestHash, &result.Status, &result.CancelRequested,
 		&result.Result, &result.CreatedAt, &result.UpdatedAt)
 	if err != nil {
 		return app.MCPConnectorOperation{}, storeError("get MCP connector operation", "MCP connector operation", err)
 	}
+	result.InputRevision = int64Pointer(inputRevision)
+	result.WorkspaceCheckpointRevision = int64Pointer(workspaceCheckpointRevision)
 	return result, nil
 }
 
@@ -277,14 +390,19 @@ FOR SHARE OF g, c`, value.TaskID, value.OwnerID, value.ConnectorID).Scan(
 
 func getMCPConnectorOperationForUpdate(ctx context.Context, tx pgx.Tx, ownerID, taskID, connectorID, key string) (app.MCPConnectorOperation, error) {
 	var result app.MCPConnectorOperation
+	var inputRevision, workspaceCheckpointRevision pgtype.Int8
 	err := tx.QueryRow(ctx, `SELECT id, task_id, owner_id, connector_id, connector_revision, credential_version,
-grant_version, lease_version, operation_key, tool_name, request_hash, status, cancel_requested, result, created_at, updated_at
+grant_version, lease_version, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision,
+operation_key, tool_name, request_hash, status, cancel_requested, result, created_at, updated_at
 FROM task_mcp_connector_operations
 WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 AND operation_key=$4 FOR UPDATE`,
 		ownerID, taskID, connectorID, key).Scan(
 		&result.ID, &result.TaskID, &result.OwnerID, &result.ConnectorID, &result.ConnectorRevision, &result.CredentialVersion,
-		&result.GrantVersion, &result.LeaseVersion, &result.Key, &result.ToolName, &result.RequestHash, &result.Status, &result.CancelRequested,
+		&result.GrantVersion, &result.LeaseVersion, &result.HostID, &result.WorkspaceID, &result.BindingVersion, &inputRevision,
+		&workspaceCheckpointRevision, &result.Key, &result.ToolName, &result.RequestHash, &result.Status, &result.CancelRequested,
 		&result.Result, &result.CreatedAt, &result.UpdatedAt)
+	result.InputRevision = int64Pointer(inputRevision)
+	result.WorkspaceCheckpointRevision = int64Pointer(workspaceCheckpointRevision)
 	return result, err
 }
 
@@ -292,7 +410,16 @@ func validMCPConnectorOperation(value app.MCPConnectorOperation) bool {
 	return domain.ValidOperationID(value.ID) && domain.ValidTaskID(value.TaskID) && domain.ValidUserID(value.OwnerID) &&
 		domain.ValidMCPConnectorID(value.ConnectorID) && validMCPConnectorOperationKey(value.Key) &&
 		value.ToolName != "" && len(value.ToolName) <= 128 && value.ConnectorRevision > 0 && value.CredentialVersion >= 0 &&
-		value.GrantVersion > 0 && value.LeaseVersion > 0 && len(value.RequestHash) == 32 && len(value.Result) <= maxMCPConnectorOperationResultBytes
+		value.GrantVersion > 0 && value.LeaseVersion > 0 && (value.HostID == "" || domain.ValidHostID(value.HostID)) &&
+		validMCPConnectorWorkspaceFence(value) && len(value.RequestHash) == 32 && len(value.Result) <= maxMCPConnectorOperationResultBytes
+}
+
+func validMCPConnectorWorkspaceFence(value app.MCPConnectorOperation) bool {
+	if value.WorkspaceID == "" {
+		return value.BindingVersion == 0 && value.InputRevision == nil && value.WorkspaceCheckpointRevision == nil
+	}
+	return domain.ValidHostID(value.HostID) && domain.ValidWorkspaceID(value.WorkspaceID) && value.BindingVersion > 0 && value.InputRevision != nil &&
+		*value.InputRevision >= 0 && value.WorkspaceCheckpointRevision != nil && *value.WorkspaceCheckpointRevision >= *value.InputRevision
 }
 
 func validMCPConnectorOperationKey(value string) bool {
@@ -302,8 +429,14 @@ func validMCPConnectorOperationKey(value string) bool {
 func sameMCPConnectorOperationRequest(stored, requested app.MCPConnectorOperation) bool {
 	return stored.TaskID == requested.TaskID && stored.OwnerID == requested.OwnerID && stored.ConnectorID == requested.ConnectorID &&
 		stored.ConnectorRevision == requested.ConnectorRevision && stored.CredentialVersion == requested.CredentialVersion &&
-		stored.GrantVersion == requested.GrantVersion &&
+		stored.GrantVersion == requested.GrantVersion && stored.HostID == requested.HostID && stored.WorkspaceID == requested.WorkspaceID &&
+		stored.BindingVersion == requested.BindingVersion && sameMCPNullableRevision(stored.InputRevision, requested.InputRevision) &&
+		sameMCPNullableRevision(stored.WorkspaceCheckpointRevision, requested.WorkspaceCheckpointRevision) &&
 		stored.Key == requested.Key && stored.ToolName == requested.ToolName && string(stored.RequestHash) == string(requested.RequestHash)
+}
+
+func sameMCPNullableRevision(a, b *int64) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
 var _ app.MCPConnectorOperationStore = (*Store)(nil)

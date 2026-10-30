@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -322,20 +323,28 @@ func boundedRuntimeLeaseExpiry(now, taskExpiry time.Time) time.Time {
 	return taskExpiry
 }
 
-func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64, inputRevision *int64) (runtimeclient.Operation, error) {
+func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64, workspaceViewID string, workspaceCheckpointRevision int64, inputRevision *int64) (runtimeclient.Operation, error) {
 	if s == nil || s.client == nil {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
 	}
 	if runtimeclient.WorkspaceScopedCapability(capability) {
-		if _, err := s.syncWorkspaceBindings(ctx, workspaceID, bindingVersion, inputRevision); err != nil {
+		if inputRevision == nil || *inputRevision < 0 || workspaceCheckpointRevision < *inputRevision {
+			return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Task Workspace view is invalid")
+		}
+		checkpoint := workspaceCheckpointRevision
+		if _, err := s.syncWorkspaceBindings(ctx, workspaceID, bindingVersion, &checkpoint); err != nil {
 			return runtimeclient.Operation{}, err
 		}
-	} else if workspaceID != "" || bindingVersion != 0 || inputRevision != nil {
+		if workspaceViewID == "" {
+			return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Task Workspace view is invalid")
+		}
+	} else if workspaceID != "" || bindingVersion != 0 || workspaceViewID != "" || workspaceCheckpointRevision != 0 || inputRevision != nil {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace binding is invalid")
 	}
 	return s.client.Execute(ctx, runtimeclient.ExecuteRequest{
 		HostFence: s.Fence, TaskID: taskID, OperationID: operationID,
 		WorkspaceID: workspaceID, BindingVersion: bindingVersion,
+		WorkspaceViewID: workspaceViewID, WorkspaceCheckpointRevision: workspaceCheckpointRevision,
 		LeaseVersion: leaseVersion, Capability: capability, Action: action, Arguments: arguments,
 	})
 }
@@ -348,10 +357,73 @@ func (s *RuntimeSession) SyncWorkspaceBindings(ctx context.Context, workspaceID 
 }
 
 func (s *RuntimeSession) SyncTaskWorkspaceBindings(ctx context.Context, current task.Task, workspaceID string, expectedVersion int64) (int64, error) {
-	if current.WorkspaceID != workspaceID || current.InputRevision == nil {
-		return 0, domain.NewError(domain.CodeWorkspaceConflict, "task has no matching pinned Workspace input")
+	if current.WorkspaceID != workspaceID || current.WorkspaceCheckpointRevision == nil {
+		return 0, domain.NewError(domain.CodeWorkspaceConflict, "task has no matching Workspace checkpoint")
 	}
-	return s.syncWorkspaceBindings(ctx, workspaceID, expectedVersion, current.InputRevision)
+	return s.syncWorkspaceBindings(ctx, workspaceID, expectedVersion, current.WorkspaceCheckpointRevision)
+}
+
+func (s *RuntimeSession) SetTaskWorkspaceView(ctx context.Context, current task.Task, workspaceID string, expectedVersion int64) (int64, string, error) {
+	if s == nil || !s.Supports("workspace.task_view") || current.WorkspaceID != workspaceID || !domain.ValidTaskID(current.ID) || current.InputRevision == nil ||
+		current.WorkspaceCheckpointRevision == nil || *current.InputRevision < 0 ||
+		*current.WorkspaceCheckpointRevision < *current.InputRevision || len(current.ContextDigest) != 32 {
+		return 0, "", domain.NewError(domain.CodeWorkspaceConflict, "task has no matching Workspace input snapshot")
+	}
+	bindingVersion, err := s.syncWorkspaceBindings(ctx, workspaceID, expectedVersion, current.WorkspaceCheckpointRevision)
+	if err != nil {
+		return 0, "", err
+	}
+	response, err := s.client.SetTaskWorkspaceView(ctx, current.ID, runtimeclient.SetTaskWorkspaceViewRequest{
+		HostFence: s.Fence, TaskID: current.ID, WorkspaceID: workspaceID, BindingVersion: bindingVersion,
+		InputRevision: *current.InputRevision, WorkspaceCheckpointRevision: *current.WorkspaceCheckpointRevision,
+		ManifestSHA256: hex.EncodeToString(current.ContextDigest),
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return bindingVersion, response.ViewID, nil
+}
+
+func (s *RuntimeSession) AdvanceTaskWorkspaceCheckpoint(ctx context.Context, current task.Task, bindingVersion int64) error {
+	if s == nil || s.client == nil || current.ID == "" || current.HostID != s.Fence.HostID ||
+		!domain.ValidWorkspaceID(current.WorkspaceID) || bindingVersion < 1 || current.InputRevision == nil ||
+		current.WorkspaceCheckpointRevision == nil || *current.InputRevision < 0 ||
+		*current.WorkspaceCheckpointRevision < *current.InputRevision || len(current.ContextDigest) != 32 {
+		return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace checkpoint is invalid")
+	}
+	_, err := s.client.SetTaskWorkspaceView(ctx, current.ID, runtimeclient.SetTaskWorkspaceViewRequest{
+		HostFence: s.Fence, TaskID: current.ID, WorkspaceID: current.WorkspaceID, BindingVersion: bindingVersion,
+		InputRevision: *current.InputRevision, WorkspaceCheckpointRevision: *current.WorkspaceCheckpointRevision,
+		ManifestSHA256: hex.EncodeToString(current.ContextDigest),
+	})
+	return err
+}
+
+func (s *RuntimeSession) TaskWorkspaceManifestPage(ctx context.Context, current task.Task, bindingVersion int64, viewID, manifestSHA256, afterPath string, limit int) (runtimeclient.TaskWorkspaceManifestResponse, error) {
+	if s == nil || s.client == nil || current.ID == "" || current.HostID != s.Fence.HostID ||
+		!domain.ValidWorkspaceID(current.WorkspaceID) || bindingVersion < 1 || viewID == "" ||
+		current.InputRevision == nil || current.WorkspaceCheckpointRevision == nil || len(current.ContextDigest) != 32 {
+		return runtimeclient.TaskWorkspaceManifestResponse{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace view is invalid")
+	}
+	return s.client.TaskWorkspaceManifestPage(ctx, current.ID, runtimeclient.TaskWorkspaceManifestRequest{
+		HostFence: s.Fence, TaskID: current.ID, WorkspaceID: current.WorkspaceID, BindingVersion: bindingVersion,
+		InputRevision: *current.InputRevision, WorkspaceCheckpointRevision: *current.WorkspaceCheckpointRevision,
+		InputManifestSHA256: hex.EncodeToString(current.ContextDigest), ViewID: viewID, ManifestSHA256: manifestSHA256,
+		AfterPath: afterPath, Limit: limit,
+	})
+}
+
+func (s *RuntimeSession) ReadTaskWorkspaceBlock(ctx context.Context, current task.Task, bindingVersion int64, viewID, manifestSHA256, blockSHA256 string) (runtimeclient.TaskWorkspaceBlockResponse, error) {
+	if s == nil || s.client == nil || current.ID == "" || current.HostID != s.Fence.HostID ||
+		!domain.ValidWorkspaceID(current.WorkspaceID) || bindingVersion < 1 || viewID == "" ||
+		current.InputRevision == nil || current.WorkspaceCheckpointRevision == nil || len(current.ContextDigest) != 32 {
+		return runtimeclient.TaskWorkspaceBlockResponse{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace view is invalid")
+	}
+	return s.client.ReadTaskWorkspaceBlock(ctx, current.ID, runtimeclient.TaskWorkspaceBlockRequest{
+		HostFence: s.Fence, TaskID: current.ID, WorkspaceID: current.WorkspaceID, BindingVersion: bindingVersion,
+		InputRevision: *current.InputRevision, WorkspaceCheckpointRevision: *current.WorkspaceCheckpointRevision,
+		InputManifestSHA256: hex.EncodeToString(current.ContextDigest), ViewID: viewID, ManifestSHA256: manifestSHA256, SHA256: blockSHA256,
+	})
 }
 
 func (s *RuntimeSession) syncWorkspaceBindings(ctx context.Context, workspaceID string, expectedVersion int64, expectedRevision *int64) (int64, error) {
@@ -380,9 +452,9 @@ func (s *RuntimeSession) syncWorkspaceBindings(ctx context.Context, workspaceID 
 		})
 		if binding.Workspace.ID == workspaceID {
 			selected = binding.BindingVersion
-			if expectedRevision != nil && (binding.SyncState != workspace.BindingSyncHealthy ||
-				binding.DesiredRevision != *expectedRevision || binding.AppliedRevision != *expectedRevision) {
-				return 0, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace no longer matches the task input revision")
+			// A Task-private checkpoint can be current while the Host replica catches up.
+			if expectedRevision != nil && (binding.Workspace.State != workspace.StateReady || binding.Workspace.Revision != *expectedRevision) {
+				return 0, domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task checkpoint was confirmed")
 			}
 		}
 	}

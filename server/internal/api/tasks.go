@@ -38,22 +38,23 @@ type taskPageResponse struct {
 }
 
 type taskSummaryResponse struct {
-	ID                string             `json:"id"`
-	OwnerID           string             `json:"owner_id"`
-	HostID            string             `json:"host_id,omitempty"`
-	ExecutionLocation string             `json:"execution_location"`
-	WorkspaceID       string             `json:"workspace_id,omitempty"`
-	InputRevision     *int64             `json:"input_revision,omitempty"`
-	ApplicationID     string             `json:"application_id,omitempty"`
-	ConversationID    string             `json:"conversation_id"`
-	ModelID           string             `json:"model_id"`
-	Objective         string             `json:"objective"`
-	Status            task.Status        `json:"status"`
-	CurrentStep       *string            `json:"current_step"`
-	Budget            taskBudgetResponse `json:"budget"`
-	Usage             taskUsageResponse  `json:"usage"`
-	CreatedAt         time.Time          `json:"created_at"`
-	UpdatedAt         time.Time          `json:"updated_at"`
+	ID                          string             `json:"id"`
+	OwnerID                     string             `json:"owner_id"`
+	HostID                      string             `json:"host_id,omitempty"`
+	ExecutionLocation           string             `json:"execution_location"`
+	WorkspaceID                 string             `json:"workspace_id,omitempty"`
+	InputRevision               *int64             `json:"input_revision,omitempty"`
+	WorkspaceCheckpointRevision *int64             `json:"workspace_checkpoint_revision,omitempty"`
+	ApplicationID               string             `json:"application_id,omitempty"`
+	ConversationID              string             `json:"conversation_id"`
+	ModelID                     string             `json:"model_id"`
+	Objective                   string             `json:"objective"`
+	Status                      task.Status        `json:"status"`
+	CurrentStep                 *string            `json:"current_step"`
+	Budget                      taskBudgetResponse `json:"budget"`
+	Usage                       taskUsageResponse  `json:"usage"`
+	CreatedAt                   time.Time          `json:"created_at"`
+	UpdatedAt                   time.Time          `json:"updated_at"`
 }
 
 type taskResponse struct {
@@ -472,7 +473,10 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
 		(value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
 		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
-		(value.WorkspaceID == "") != (value.InputRevision == nil) || (value.InputRevision != nil && *value.InputRevision < 0) ||
+		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
+		(value.WorkspaceID == "") != (value.WorkspaceCheckpointRevision == nil) ||
+		(value.InputRevision != nil && *value.InputRevision < 0) ||
+		(value.InputRevision != nil && value.WorkspaceCheckpointRevision != nil && *value.WorkspaceCheckpointRevision < *value.InputRevision) ||
 		(value.ExecutionLocation != "server" && value.ExecutionLocation != "legacy") ||
 		!domain.ValidConversationID(value.ConversationID) || strings.TrimSpace(value.ModelID) == "" ||
 		(value.ApplicationID != "" && !app.ValidHostApplicationID(value.ApplicationID)) || !validTaskStatusResponse(value.Status) ||
@@ -482,7 +486,7 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 	}
 	return taskSummaryResponse{
 		ID: value.ID, OwnerID: value.OwnerID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
-		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision,
+		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
 		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, CurrentStep: stringPointer(value.CurrentStep),
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{

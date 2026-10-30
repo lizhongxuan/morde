@@ -326,6 +326,9 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 			if _, err := tx.Exec(ctx, `UPDATE tokens SET revoked_at=COALESCE(revoked_at, now()) WHERE owner_id=$1 AND revoked_at IS NULL`, value.ID); err != nil {
 				return fmt.Errorf("revoke account credentials: %w", err)
 			}
+			if err := revokeWorkspaceSyncDevicesForOwner(ctx, tx, value.ID); err != nil {
+				return err
+			}
 		}
 		if auditParams != nil {
 			if _, err := sqlcgen.New(tx).CreateAuditLog(ctx, *auditParams); err != nil {
@@ -429,8 +432,8 @@ func (s *Store) RevokeToken(ctx context.Context, id, ownerID string) error {
 		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
 			return err
 		}
-		var tokenKind string
-		err := tx.QueryRow(ctx, `SELECT kind FROM tokens WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&tokenKind)
+		var tokenKind, installationID string
+		err := tx.QueryRow(ctx, `SELECT kind,COALESCE(client_installation_id,'') FROM tokens WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&tokenKind, &installationID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "token not found")
 		}
@@ -447,6 +450,11 @@ func (s *Store) RevokeToken(ctx context.Context, id, ownerID string) error {
 		}
 		if _, err := sqlcgen.New(tx).RevokeToken(ctx, sqlcgen.RevokeTokenParams{ID: id, OwnerID: ownerID}); err != nil {
 			return fmt.Errorf("revoke token: %w", err)
+		}
+		if (tokenKind == string(identity.KindClient) || tokenKind == string(identity.KindDevice)) && installationID != "" {
+			if err := revokeWorkspaceSyncDevicesForInstallation(ctx, tx, ownerID, installationID); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

@@ -54,12 +54,12 @@ func (s *Store) RequestTaskAction(ctx context.Context, record app.IdempotencyRec
 			}
 		}
 		var status, workspaceID, waitingReason string
-		var leaseVersion, inputRevision int64
+		var leaseVersion, workspaceCheckpointRevision int64
 		var taskEpoch int64
 		err := tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch, COALESCE(workspace_id,''),
-COALESCE(input_revision,-1), waiting_reason
+COALESCE(workspace_checkpoint_revision,-1), waiting_reason
 FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
-			Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &inputRevision, &waitingReason)
+			Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &workspaceCheckpointRevision, &waitingReason)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
@@ -86,7 +86,7 @@ FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
 				var workspaceState string
 				err := tx.QueryRow(ctx, `SELECT revision, state FROM workspaces WHERE id=$1 AND owner_id=$2`, workspaceID, record.OwnerID).
 					Scan(&currentRevision, &workspaceState)
-				if errors.Is(err, pgx.ErrNoRows) || (err == nil && (workspaceState != "ready" || currentRevision != inputRevision || waitingReason == "workspace_input_changed")) {
+				if errors.Is(err, pgx.ErrNoRows) || (err == nil && (workspaceState != "ready" || currentRevision != workspaceCheckpointRevision || waitingReason == "workspace_input_changed")) {
 					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace input changed; submit a new task with the current files")
 				}
 				if err != nil {
@@ -442,16 +442,15 @@ WHERE task_id=$1 AND status='dispatched'`, taskID); err != nil {
 			deferredConflict = domain.NewError(domain.CodeConflict, "task agent stop is unconfirmed")
 			return nil
 		}
-		var status, ownerID, hostID, workspaceID, waitingReason string
-		var inputRevision int64
-		if err := tx.QueryRow(ctx, `SELECT status, owner_id, COALESCE(host_id,''), COALESCE(workspace_id,''), COALESCE(input_revision,-1), waiting_reason
-FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &ownerID, &hostID, &workspaceID, &inputRevision, &waitingReason); err != nil {
+		var status, ownerID, workspaceID, waitingReason string
+		var workspaceCheckpointRevision int64
+		if err := tx.QueryRow(ctx, `SELECT status, owner_id, COALESCE(workspace_id,''), COALESCE(workspace_checkpoint_revision,-1), waiting_reason
+FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &ownerID, &workspaceID, &workspaceCheckpointRevision, &waitingReason); err != nil {
 			return fmt.Errorf("read task status for stop completion: %w", err)
 		}
 		workspaceInputChanged := false
-		if action == task.ActionPause && workspaceID != "" && inputRevision >= 0 {
-			changed, err := taskWorkspaceInputChanged(ctx, tx, taskID, ownerID, hostID, workspaceID, inputRevision,
-				waitingReason != "workspace_input_changed")
+		if action == task.ActionPause && workspaceID != "" && workspaceCheckpointRevision >= 0 {
+			changed, err := taskWorkspaceInputChanged(ctx, tx, ownerID, workspaceID, workspaceCheckpointRevision)
 			if err != nil {
 				return err
 			}
@@ -521,10 +520,10 @@ WHERE id=$1 AND task_id=$2 AND status='pending'`, stopID, taskID)
 // older Workspace revision and routes them through the existing safe-stop flow.
 func (s *Store) ReconcileStaleWorkspaceTasks(ctx context.Context) error {
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT t.id, t.owner_id, t.host_id, t.workspace_id, t.input_revision,
+		rows, err := tx.Query(ctx, `SELECT t.id, t.owner_id, t.workspace_id, t.workspace_checkpoint_revision,
 t.status, t.waiting_reason
 FROM tasks t JOIN workspaces w ON w.id=t.workspace_id
-WHERE t.input_revision IS NOT NULL AND (w.state <> 'ready' OR w.revision <> t.input_revision)
+WHERE t.workspace_checkpoint_revision IS NOT NULL AND (w.state <> 'ready' OR w.revision <> t.workspace_checkpoint_revision)
   AND t.status IN ('queued','running','waiting_user','paused')
   AND NOT (t.status='paused' AND t.waiting_reason='workspace_input_changed')
 ORDER BY t.updated_at, t.id LIMIT 100 FOR UPDATE OF t SKIP LOCKED`)
@@ -532,13 +531,13 @@ ORDER BY t.updated_at, t.id LIMIT 100 FOR UPDATE OF t SKIP LOCKED`)
 			return fmt.Errorf("list tasks with stale Workspace inputs: %w", err)
 		}
 		type staleTask struct {
-			id, ownerID, hostID, workspaceID, status, waitingReason string
-			inputRevision                                           int64
+			id, ownerID, workspaceID, status, waitingReason string
+			workspaceCheckpointRevision                     int64
 		}
 		stale := make([]staleTask, 0)
 		for rows.Next() {
 			var item staleTask
-			if err := rows.Scan(&item.id, &item.ownerID, &item.hostID, &item.workspaceID, &item.inputRevision,
+			if err := rows.Scan(&item.id, &item.ownerID, &item.workspaceID, &item.workspaceCheckpointRevision,
 				&item.status, &item.waitingReason); err != nil {
 				rows.Close()
 				return fmt.Errorf("read task with stale Workspace input: %w", err)
@@ -552,9 +551,7 @@ ORDER BY t.updated_at, t.id LIMIT 100 FOR UPDATE OF t SKIP LOCKED`)
 		rows.Close()
 
 		for _, item := range stale {
-			allowOwnWrites := item.status == string(task.StatusRunning) && item.waitingReason != "workspace_input_changed"
-			changed, err := taskWorkspaceInputChanged(ctx, tx, item.id, item.ownerID, item.hostID,
-				item.workspaceID, item.inputRevision, allowOwnWrites)
+			changed, err := taskWorkspaceInputChanged(ctx, tx, item.ownerID, item.workspaceID, item.workspaceCheckpointRevision)
 			if err != nil {
 				return err
 			}
@@ -619,7 +616,7 @@ VALUES ($1,$2,'pause','pending',$3)`, stopID, item.id, safeAfter); err != nil {
 	})
 }
 
-func taskWorkspaceInputChanged(ctx context.Context, tx pgx.Tx, taskID, ownerID, hostID, workspaceID string, inputRevision int64, allowOwnWrites bool) (bool, error) {
+func taskWorkspaceInputChanged(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string, checkpointRevision int64) (bool, error) {
 	var currentRevision int64
 	var state string
 	err := tx.QueryRow(ctx, `SELECT revision, state FROM workspaces WHERE id=$1 AND owner_id=$2`, workspaceID, ownerID).
@@ -630,96 +627,7 @@ func taskWorkspaceInputChanged(ctx context.Context, tx pgx.Tx, taskID, ownerID, 
 	if err != nil {
 		return false, fmt.Errorf("read current Workspace revision for task: %w", err)
 	}
-	if state == "ready" && currentRevision == inputRevision {
-		return false, nil
-	}
-	if allowOwnWrites && state == "ready" && currentRevision > inputRevision {
-		matches, err := workspaceChangesMatchTaskWrites(ctx, tx, taskID, hostID, workspaceID, inputRevision, currentRevision)
-		if err != nil {
-			return false, err
-		}
-		if matches {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func workspaceChangesMatchTaskWrites(ctx context.Context, tx pgx.Tx, taskID, hostID, workspaceID string, inputRevision, currentRevision int64) (bool, error) {
-	type writeEvidence struct {
-		Path         string `json:"path"`
-		BytesWritten int64  `json:"bytes_written"`
-		SHA256       string `json:"sha256"`
-	}
-	type fileIdentity struct {
-		path, sha256 string
-		size         int64
-	}
-	evidence := make(map[fileIdentity]int)
-	// The operation result is durable before its Task progress event, so it is
-	// the recovery proof when Workspace sync commits between those transactions.
-	rows, err := tx.Query(ctx, `SELECT o.result FROM task_operations o
-WHERE o.task_id=$1 AND o.host_id=$2 AND o.workspace_id=$3 AND o.status='succeeded'`, taskID, hostID, workspaceID)
-	if err != nil {
-		return false, fmt.Errorf("read successful task file writes: %w", err)
-	}
-	for rows.Next() {
-		var result string
-		if err := rows.Scan(&result); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("read task file write result: %w", err)
-		}
-		var write writeEvidence
-		if json.Unmarshal([]byte(result), &write) == nil && write.Path != "" && write.BytesWritten >= 0 && write.SHA256 != "" {
-			evidence[fileIdentity{path: write.Path, size: write.BytesWritten, sha256: write.SHA256}]++
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return false, fmt.Errorf("iterate successful task file writes: %w", err)
-	}
-	rows.Close()
-
-	rows, err = tx.Query(ctx, `SELECT file_path, action, file FROM workspace_changes
-WHERE workspace_id=$1 AND revision>$2 AND revision<=$3 ORDER BY revision, file_path`, workspaceID, inputRevision, currentRevision)
-	if err != nil {
-		return false, fmt.Errorf("read Workspace changes for stale task: %w", err)
-	}
-	changeCount := 0
-	for rows.Next() {
-		var path, action string
-		var fileJSON []byte
-		if err := rows.Scan(&path, &action, &fileJSON); err != nil {
-			rows.Close()
-			return false, fmt.Errorf("read Workspace change for stale task: %w", err)
-		}
-		changeCount++
-		if action != "upsert" {
-			rows.Close()
-			return false, nil
-		}
-		var file struct {
-			Path      string `json:"path"`
-			SizeBytes int64  `json:"size_bytes"`
-			SHA256    string `json:"sha256"`
-		}
-		if json.Unmarshal(fileJSON, &file) != nil || file.Path != path {
-			rows.Close()
-			return false, nil
-		}
-		key := fileIdentity{path: file.Path, size: file.SizeBytes, sha256: file.SHA256}
-		if evidence[key] == 0 {
-			rows.Close()
-			return false, nil
-		}
-		evidence[key]--
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return false, fmt.Errorf("iterate Workspace changes for stale task: %w", err)
-	}
-	rows.Close()
-	return changeCount > 0, nil
+	return state != "ready" || currentRevision != checkpointRevision, nil
 }
 
 func insertWorkspaceInputChangedEvent(ctx context.Context, tx pgx.Tx, taskID string) error {
@@ -828,7 +736,7 @@ func countUnsettledTaskOperations(ctx context.Context, tx pgx.Tx, taskID string,
 }
 
 func listStopOperations(ctx context.Context, tx pgx.Tx, taskID string) ([]task.Operation, error) {
-	rows, err := tx.Query(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, runtime_generation,
+	rows, err := tx.Query(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation,
 runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result, created_at, updated_at
 FROM task_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','unknown') ORDER BY operation_key`, taskID)
 	if err != nil {
@@ -839,7 +747,7 @@ FROM task_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','un
 	for rows.Next() {
 		var row sqlcgen.TaskOperation
 		if err := rows.Scan(&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID,
-			&row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion,
+			&row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion,
 			&row.RuntimeLeaseVersion, &row.Status, &row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("read task operation for stop: %w", err)
 		}
@@ -853,11 +761,11 @@ FROM task_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','un
 
 func loadOperationByID(ctx context.Context, tx pgx.Tx, taskID, operationID string) (task.Operation, error) {
 	var row sqlcgen.TaskOperation
-	err := tx.QueryRow(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, runtime_generation, runtime_instance_id,
+	err := tx.QueryRow(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id,
 control_version, lease_version, runtime_lease_version, status, external_id, result, created_at, updated_at
 FROM task_operations WHERE task_id=$1 AND id=$2`, taskID, operationID).Scan(
 		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion,
-		&row.InputRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion,
+		&row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion,
 		&row.Status, &row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
 	return taskOperationDomain(row), err
 }

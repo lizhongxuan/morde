@@ -47,6 +47,50 @@ services:
       - caddy_data:/data
       - caddy_config:/config
 
+  workspace-sync-relay:
+    image: ${CH_WORKSPACE_SYNC_RELAY_IMAGE:-local/morde-workspace-sync-relay:unset}
+    container_name: morde-syncthing-relay
+    profiles: [workspace-sync]
+    restart: unless-stopped
+    user: "65532:65532"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    command:
+      - -listen
+      - :22067
+      - -keys
+      - /var/lib/morde-relay
+      - -token
+      - ${CH_WORKSPACE_SYNC_RELAY_TOKEN:?Set CH_WORKSPACE_SYNC_RELAY_TOKEN in /etc/cloudhost/cloudhost.env}
+      - -status-srv=
+      - -pools=
+      - -ext-address
+      - ${CH_WORKSPACE_SYNC_RELAY_PUBLIC_ADDRESS:-127.0.0.1:22067}
+      - -provided-by
+      - Morde
+    ports:
+      - "${CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS:-127.0.0.1}:${CH_WORKSPACE_SYNC_RELAY_PORT:-22067}:22067/tcp"
+    volumes:
+      - type: bind
+        source: ${CH_WORKSPACE_SYNC_RELAY_STATE_DIR:-/srv/morde-workspace-sync-relay}
+        target: /var/lib/morde-relay
+        bind:
+          create_host_path: false
+    networks:
+      - workspace_sync_relay
+
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  workspace_sync_relay:
+    driver: bridge
+    driver_opts:
+      # shortcut: disabling IP masquerading does not enforce an egress ACL; configure the host firewall before external exposure.
+      com.docker.network.bridge.enable_ip_masquerade: "false"

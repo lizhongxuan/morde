@@ -36,7 +36,7 @@ func NewRuntimeOperationRunner(pollEvery time.Duration) *RuntimeOperationRunner 
 func RuntimeComputerTools() []RuntimeComputerToolDefinition {
 	result := make([]RuntimeComputerToolDefinition, 0, len(runtimeToolMappings))
 	for _, mapping := range runtimeToolMappings {
-		if mapping.internal {
+		if mapping.internal || runtimeclient.WorkspaceScopedCapability(mapping.capability) {
 			continue
 		}
 		result = append(result, RuntimeComputerToolDefinition{
@@ -51,7 +51,7 @@ func RuntimeComputerTools() []RuntimeComputerToolDefinition {
 // Execute dispatches one already-persisted operation. It resolves an uncertain
 // response by querying the same ID and retries only when the exact runtime
 // instance reports that ID as not found.
-func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string, leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64, inputRevision *int64) (runtimeclient.Operation, error) {
+func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string, leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64, workspaceViewID string, workspaceCheckpointRevision int64, inputRevision *int64) (runtimeclient.Operation, error) {
 	if err := validateRuntimeOperationCall(session, runtimeTaskID, operationID, leaseVersion, capability, action); err != nil {
 		return runtimeclient.Operation{}, err
 	}
@@ -59,7 +59,7 @@ func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSe
 	if !json.Valid(trimmed) || len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime operation arguments are invalid")
 	}
-	operation, err := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, inputRevision)
+	operation, err := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision)
 	if err == nil {
 		return operation, nil
 	}
@@ -75,7 +75,7 @@ func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSe
 		return runtimeclient.Operation{}, queryErr
 	}
 
-	operation, retryErr := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, inputRevision)
+	operation, retryErr := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision)
 	if retryErr == nil {
 		return operation, nil
 	}

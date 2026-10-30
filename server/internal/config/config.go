@@ -20,27 +20,31 @@ import (
 
 const maxCloudDSHConcurrentPerOwner = 16
 
+var workspaceSyncImagePattern = regexp.MustCompile(`^(?:[A-Za-z0-9][A-Za-z0-9._:/-]*@)?sha256:[a-f0-9]{64}$`)
+var workspaceSyncRelayTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
+
 type Config struct {
-	Instance         string           `yaml:"instance"`
-	Listen           Listen           `yaml:"listen"`
-	HTTP             HTTP             `yaml:"http"`
-	Domains          Domains          `yaml:"domains"`
-	Database         Database         `yaml:"database"`
-	Security         Security         `yaml:"security"`
-	Orchestrator     Orchestrator     `yaml:"orchestrator"`
-	Templates        Templates        `yaml:"templates"`
-	Hosts            Hosts            `yaml:"hosts"`
-	Capacity         Capacity         `yaml:"capacity"`
-	Reconciler       Reconciler       `yaml:"reconciler"`
-	Storage          Storage          `yaml:"storage"`
-	WorkspaceStorage WorkspaceStorage `yaml:"workspace_storage"`
-	SiteStorage      SiteStorage      `yaml:"site_storage"`
-	Models           Models           `yaml:"models"`
-	CloudDSH         CloudDSH         `yaml:"cloud_dsh"`
-	Gateway          Gateway          `yaml:"gateway"`
-	MCP              MCP              `yaml:"mcp"`
-	PortalWeb        PortalWeb        `yaml:"portal_web"`
-	Log              Log              `yaml:"log"`
+	Instance          string            `yaml:"instance"`
+	Listen            Listen            `yaml:"listen"`
+	HTTP              HTTP              `yaml:"http"`
+	Domains           Domains           `yaml:"domains"`
+	Database          Database          `yaml:"database"`
+	Security          Security          `yaml:"security"`
+	Orchestrator      Orchestrator      `yaml:"orchestrator"`
+	Templates         Templates         `yaml:"templates"`
+	Hosts             Hosts             `yaml:"hosts"`
+	Capacity          Capacity          `yaml:"capacity"`
+	Reconciler        Reconciler        `yaml:"reconciler"`
+	Storage           Storage           `yaml:"storage"`
+	WorkspaceStorage  WorkspaceStorage  `yaml:"workspace_storage"`
+	WorkspaceSyncNode WorkspaceSyncNode `yaml:"workspace_sync_node"`
+	SiteStorage       SiteStorage       `yaml:"site_storage"`
+	Models            Models            `yaml:"models"`
+	CloudDSH          CloudDSH          `yaml:"cloud_dsh"`
+	Gateway           Gateway           `yaml:"gateway"`
+	MCP               MCP               `yaml:"mcp"`
+	PortalWeb         PortalWeb         `yaml:"portal_web"`
+	Log               Log               `yaml:"log"`
 }
 
 type Listen struct {
@@ -125,6 +129,18 @@ type WorkspaceStorage struct {
 	MaxWorkspaceBytes int64  `yaml:"max_workspace_bytes"`
 	MaxOwnerBytes     int64  `yaml:"max_owner_bytes"`
 	MinFreeBytes      int64  `yaml:"min_free_bytes"`
+}
+
+type WorkspaceSyncNode struct {
+	Enabled            bool   `yaml:"enabled"`
+	ImageDigest        string `yaml:"image_digest"`
+	RelayImageDigest   string `yaml:"relay_image_digest"`
+	RelayPublicAddress string `yaml:"relay_public_address"`
+	RelayToken         string `yaml:"relay_token"`
+	RelayStateRoot     string `yaml:"relay_state_root"`
+	StateRoot          string `yaml:"state_root"`
+	WorkspaceRoot      string `yaml:"workspace_root"`
+	RelayContainerName string `yaml:"relay_container_name"`
 }
 
 type SiteStorage struct {
@@ -406,6 +422,53 @@ func (c Config) validate() error {
 	if pathsOverlap(workspaceRoot, dockerRoot) {
 		return fmt.Errorf("config.workspace_storage.root_dir must be separate from config.storage.docker_data_dir")
 	}
+	if c.WorkspaceSyncNode.Enabled {
+		if _, ok := localDockerSocketPath(c.Storage.DockerHost); !ok {
+			return fmt.Errorf("config.workspace_sync_node requires config.storage.docker_host to use a Unix socket")
+		}
+		if !workspaceSyncImagePattern.MatchString(c.WorkspaceSyncNode.ImageDigest) {
+			return fmt.Errorf("config.workspace_sync_node.image_digest must pin an image by sha256 digest")
+		}
+		if !workspaceSyncImagePattern.MatchString(c.WorkspaceSyncNode.RelayImageDigest) {
+			return fmt.Errorf("config.workspace_sync_node.relay_image_digest must pin an image by sha256 digest")
+		}
+		if !validWorkspaceSyncRelayAddress(c.WorkspaceSyncNode.RelayPublicAddress) {
+			return fmt.Errorf("config.workspace_sync_node.relay_public_address must be a host and port")
+		}
+		if !workspaceSyncRelayTokenPattern.MatchString(c.WorkspaceSyncNode.RelayToken) {
+			return fmt.Errorf("config.workspace_sync_node.relay_token must be a 32 to 128 character URL-safe secret")
+		}
+		for _, field := range []struct {
+			name  string
+			value string
+		}{{"relay_state_root", c.WorkspaceSyncNode.RelayStateRoot}, {"state_root", c.WorkspaceSyncNode.StateRoot}, {"workspace_root", c.WorkspaceSyncNode.WorkspaceRoot}} {
+			if strings.TrimSpace(field.value) == "" || !filepath.IsAbs(field.value) || filepath.Clean(field.value) != field.value || field.value == string(filepath.Separator) {
+				return fmt.Errorf("config.workspace_sync_node.%s must be an absolute clean non-root path", field.name)
+			}
+		}
+		if !cloudDSHSupervisorIDPattern.MatchString(c.WorkspaceSyncNode.RelayContainerName) {
+			return fmt.Errorf("config.workspace_sync_node.relay_container_name is invalid")
+		}
+		syncStateRoot := filepath.Clean(c.WorkspaceSyncNode.StateRoot)
+		syncWorkspaceRoot := filepath.Clean(c.WorkspaceSyncNode.WorkspaceRoot)
+		syncRelayStateRoot := filepath.Clean(c.WorkspaceSyncNode.RelayStateRoot)
+		if pathsOverlap(syncStateRoot, syncWorkspaceRoot) || pathsOverlap(syncRelayStateRoot, syncStateRoot) || pathsOverlap(syncRelayStateRoot, syncWorkspaceRoot) {
+			return fmt.Errorf("config.workspace_sync_node roots must be separate")
+		}
+		for _, root := range []struct {
+			name string
+			path string
+		}{{"relay_state_root", syncRelayStateRoot}, {"state_root", syncStateRoot}, {"workspace_root", syncWorkspaceRoot}} {
+			for _, protected := range []struct {
+				name string
+				path string
+			}{{"config.workspace_storage.root_dir", workspaceRoot}, {"config.storage.docker_data_dir", dockerRoot}, {"config.site_storage.root_dir", c.SiteStorage.RootDir}, {"config.gateway.workbench_dir", c.Gateway.WorkbenchDir}, {"config.portal_web.dir", c.PortalWeb.Dir}} {
+				if protected.path != "" && pathsOverlap(root.path, protected.path) {
+					return fmt.Errorf("config.workspace_sync_node.%s must be separate from %s", root.name, protected.name)
+				}
+			}
+		}
+	}
 	if strings.TrimSpace(c.SiteStorage.RootDir) == "" || !filepath.IsAbs(c.SiteStorage.RootDir) || filepath.Clean(c.SiteStorage.RootDir) == string(filepath.Separator) {
 		return fmt.Errorf("config.site_storage.root_dir must be an absolute non-root path")
 	}
@@ -521,6 +584,35 @@ func validateListenAddress(address string) error {
 		return fmt.Errorf("port must be between 1 and 65535")
 	}
 	return nil
+}
+
+func validWorkspaceSyncRelayAddress(address string) bool {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if len(host) > 253 || strings.ContainsAny(host, ":/@?#*\\%") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+				(char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func LoadTemplates(dir string, profiles map[string]Profile) (map[string]templatedomain.Template, error) {

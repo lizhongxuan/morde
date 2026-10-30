@@ -25,6 +25,9 @@ func TestIDs(t *testing.T) {
 		{NewPendingRequestID, ValidPendingRequestID},
 		{NewModelConnectionID, ValidModelConnectionID},
 		{NewMCPConnectorID, ValidMCPConnectorID},
+		{NewWorkspaceSyncDeviceBindingID, ValidWorkspaceSyncDeviceBindingID},
+		{NewWorkspaceSyncDeviceChallengeID, ValidWorkspaceSyncDeviceChallengeID},
+		{NewWorkspaceSyncDeviceIdentityID, ValidWorkspaceSyncDeviceIdentityID},
 	} {
 		id, err := tc.newID()
 		if err != nil || !tc.valid(id) {

@@ -34,26 +34,26 @@ func (s *runtimeComputerToolsStub) Execute(_ context.Context, principal identity
 }
 
 func TestHostToolDelegatesToSharedRuntimeExecutor(t *testing.T) {
-	executor := &runtimeComputerToolsStub{result: app.MCPRuntimeToolResult{Output: json.RawMessage(`{"stdout":"ok"}`)}}
+	executor := &runtimeComputerToolsStub{result: app.MCPRuntimeToolResult{Output: json.RawMessage(`{"windows":[]}`)}}
 	service := &service{deps: Deps{RuntimeTools: executor}}
 	principal := identity.Principal{Kind: identity.KindAPIKey, UserID: "user_test"}
-	args := map[string]any{"host_id": "h1234567", "idempotency_key": "call-00000001", "command": "pwd", "timeout": json.Number("10")}
-	value, image, err := service.hostTool(context.Background(), principal, "mcp-session-123", toolByName("shell_exec"), args)
+	args := map[string]any{"host_id": "h1234567", "idempotency_key": "call-00000001"}
+	value, image, err := service.hostTool(context.Background(), principal, "mcp-session-123", toolByName("window_list"), args)
 	if err != nil || image != nil {
 		t.Fatalf("hostTool() = %#v, %#v, %v", value, image, err)
 	}
-	if value.(map[string]any)["stdout"] != "ok" {
+	if _, ok := value.(map[string]any)["windows"]; !ok {
 		t.Fatalf("decoded runtime value = %#v", value)
 	}
 	if executor.principal.UserID != principal.UserID || executor.sessionID != "mcp-session-123" || executor.hostID != "h1234567" ||
-		executor.key != "call-00000001" || executor.tool != "shell_exec" {
+		executor.key != "call-00000001" || executor.tool != "window_list" {
 		t.Fatalf("runtime executor request = %#v", executor)
 	}
 	var got map[string]any
 	if err := json.Unmarshal(executor.arguments, &got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got["command"] != "pwd" || got["timeout"] != float64(10) {
+	if len(got) != 0 {
 		t.Fatalf("runtime tool arguments = %#v", got)
 	}
 }
@@ -110,8 +110,8 @@ func TestHostToolRejectsInvalidSessionAndRuntimeOutput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			executor := &runtimeComputerToolsStub{result: app.MCPRuntimeToolResult{Output: tc.output}}
 			service := &service{deps: Deps{RuntimeTools: executor}}
-			_, _, err := service.hostTool(context.Background(), identity.Principal{}, tc.session, toolByName("shell_exec"), map[string]any{
-				"host_id": "h1234567", "idempotency_key": "call-00000003", "command": "pwd",
+			_, _, err := service.hostTool(context.Background(), identity.Principal{}, tc.session, toolByName("window_list"), map[string]any{
+				"host_id": "h1234567", "idempotency_key": "call-00000003",
 			})
 			if err == nil {
 				t.Fatal("hostTool accepted invalid protocol state or output")

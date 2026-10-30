@@ -100,6 +100,9 @@ func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstal
   WHERE client_installation_id=$1 AND revoked_at IS NULL`, installation.ID); err != nil {
 			return fmt.Errorf("rotate client credentials: %w", err)
 		}
+		if err := cancelWorkspaceSyncSessions(ctx, tx, requested.OwnerID, installation.ID, "", false); err != nil {
+			return err
+		}
 		q := sqlcgen.New(tx)
 		if _, err := createToken(ctx, q, issued.Client); err != nil {
 			return err
@@ -243,6 +246,9 @@ func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip st
 		if _, err := tx.Exec(ctx, `UPDATE tokens SET revoked_at=COALESCE(revoked_at,now())
   WHERE client_installation_id=$1 AND revoked_at IS NULL`, id); err != nil {
 			return fmt.Errorf("revoke client credentials: %w", err)
+		}
+		if err := revokeWorkspaceSyncDevicesForInstallation(ctx, tx, ownerID, id); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO audit_logs (actor_id,actor_kind,action,target,ip)
   VALUES ($1,$2,'client.revoke',$3,$4)`, ownerID, string(actorKind), id, ip); err != nil {

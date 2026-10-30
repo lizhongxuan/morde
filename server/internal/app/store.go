@@ -64,11 +64,50 @@ type workspaceBindingSyncStatusStore interface {
 	SetWorkspaceBindingSyncStatus(context.Context, string, string, int64, workspace.BindingSyncState, []string) (workspace.Binding, error)
 }
 
+type WorkspaceSyncCommitState string
+
+const (
+	WorkspaceSyncCommitPending       WorkspaceSyncCommitState = "pending"
+	WorkspaceSyncCommitSucceeded     WorkspaceSyncCommitState = "succeeded"
+	WorkspaceSyncCommitQuotaRejected WorkspaceSyncCommitState = "quota_rejected"
+)
+
+type WorkspaceSyncCommitReceipt struct {
+	State  WorkspaceSyncCommitState
+	Result workspace.SyncSession
+}
+
+type TaskWorkspacePublishState string
+
+const (
+	TaskWorkspacePublishPending       TaskWorkspacePublishState = "pending"
+	TaskWorkspacePublishSucceeded     TaskWorkspacePublishState = "succeeded"
+	TaskWorkspacePublishConflict      TaskWorkspacePublishState = "conflict"
+	TaskWorkspacePublishQuotaRejected TaskWorkspacePublishState = "quota_rejected"
+)
+
+type TaskWorkspacePublishCommand struct {
+	OwnerID, TaskID, WorkspaceID, HostID, LeaseOwner, OperationKey string
+	BindingVersion, LeaseVersion, InputRevision, BaseRevision      int64
+	HostFence                                                      AgentHostFence
+	ViewID, InputManifestSHA256                                    string
+	RequestHash                                                    []byte
+}
+
+type TaskWorkspacePublishReceipt struct {
+	State             TaskWorkspacePublishState
+	WorkspaceID       string
+	BaseRevision      int64
+	PublishedRevision int64
+	ManifestSHA256    string
+}
+
 // WorkspaceSyncStore owns durable manifests, change cursors, and resumable
 // transfer plans. Chunk bytes stay in the workspace-scoped block store.
 type WorkspaceSyncStore interface {
 	GetWorkspace(context.Context, string) (workspace.Workspace, error)
 	GetWorkspaceBinding(context.Context, string, string) (workspace.Binding, error)
+	CheckWorkspaceSyncDeviceAccess(context.Context, identity.Principal, string) error
 	TryWorkspaceBlockStoreLock(context.Context, string) (LeaderLock, bool, error)
 	TryWorkspaceBlockStoreReadLock(context.Context, string) (LeaderLock, bool, error)
 	GetWorkspaceManifestPage(context.Context, string, int64, string, string, int32) (workspace.ManifestPage, error)
@@ -81,7 +120,15 @@ type WorkspaceSyncStore interface {
 	FinalizeWorkspaceBlockUsage(context.Context, string, string, int64, int64) error
 	AckWorkspaceSyncDownloadBlock(context.Context, string, string, string) error
 	AckWorkspaceSyncDownloadAction(context.Context, string, string, string, workspace.ChangeAction, string, int64) error
+	ReserveWorkspaceSyncCommit(context.Context, string, string, IdempotencyRecord) (WorkspaceSyncCommitReceipt, error)
+	InspectWorkspaceSyncCommit(context.Context, string, string, IdempotencyRecord) (WorkspaceSyncCommitReceipt, error)
 	CommitWorkspaceSyncSession(context.Context, string, string, IdempotencyRecord) (workspace.SyncSession, bool, error)
+	ReserveTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error)
+	GetTaskWorkspacePublishReceipt(context.Context, TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error)
+	FindTaskWorkspacePublishReceipt(context.Context, string, string, string, string) (TaskWorkspacePublishReceipt, error)
+	CommitTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, []workspace.File, string) (TaskWorkspacePublishReceipt, error)
+	RejectTaskWorkspacePublishQuota(context.Context, TaskWorkspacePublishCommand) error
+	ReserveTaskWorkspaceBlockUsage(context.Context, string, []WorkspaceBlockReservation, int64) error
 	CancelWorkspaceSyncSession(context.Context, string, string, IdempotencyRecord) (workspace.SyncSession, bool, error)
 	FailWorkspaceSyncSession(context.Context, string, string) error
 }

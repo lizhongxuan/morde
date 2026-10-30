@@ -387,6 +387,7 @@ func (s *Store) AppendMessage(ctx context.Context, submission app.TaskSubmission
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens,
 lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, application_id,
 workspace_id, input_revision, context_digest, file_delivery_intent,
+workspace_checkpoint_revision,
 EXISTS (SELECT 1 FROM task_clarification_requests r WHERE r.task_id=tasks.id AND r.call_id=$3 AND r.status='pending')
 FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','running','waiting_user','pausing','cancelling') FOR UPDATE`,
 			message.ConversationID, message.OwnerID, app.FileDeliveryIntentClarificationCallID).Scan(
@@ -395,7 +396,8 @@ FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND status IN ('queued','run
 			&active.BudgetModelTokens, &active.UsageActiveSeconds, &active.UsageToolCalls, &active.UsageModelTokens,
 			&active.LeaseOwner, &active.LeaseVersion, &active.LeaseExpiresAt, &active.EventSeq, &active.CurrentStep,
 			&active.Result, &active.WaitingReason, &active.CreatedAt, &active.UpdatedAt, &active.FinishedAt, &active.ApplicationID,
-			&active.WorkspaceID, &active.InputRevision, &active.ContextDigest, &active.FileDeliveryIntent, &fileIntentClarificationPending)
+			&active.WorkspaceID, &active.InputRevision, &active.ContextDigest, &active.FileDeliveryIntent,
+			&active.WorkspaceCheckpointRevision, &fileIntentClarificationPending)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("find active conversation task: %w", err)
 		}
@@ -690,17 +692,17 @@ INSERT INTO tasks (
   id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes,
   budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls,
   usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, finished_at, execution_epoch, application_id,
-  auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at,
+  auth_client_installation_id, execution_location, workspace_id, input_revision, workspace_checkpoint_revision, context_digest, auth_version, auth_expires_at,
   file_delivery_intent
 ) VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::text[], '{}'::text[]),$11,$12,$13,$14,$15,$16,'',0,NULL,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::text[], '{}'::text[]),$11,$12,$13,$14,$15,$16,'',0,NULL,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32
 )`, value.ID, value.OwnerID, value.ConversationID, nullableText(value.HostID), value.ModelID, value.Objective,
 		string(value.Status), value.Authorization.Kind, value.Authorization.TokenID, value.Authorization.Scopes,
 		value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
 		value.Usage.ActiveSeconds, value.Usage.ToolCalls, int64(0),
 		eventSequence, value.CurrentStep, value.Result, value.WaitingReason, nullableTimestamp(value.FinishedAt), executionEpoch, value.ApplicationID,
 		nullableText(value.Authorization.ClientInstallationID), value.ExecutionLocation, nullableText(value.WorkspaceID),
-		value.InputRevision, value.ContextDigest, value.Authorization.Version, value.Authorization.ExpiresAt, string(value.FileDeliveryIntent))
+		value.InputRevision, value.WorkspaceCheckpointRevision, value.ContextDigest, value.Authorization.Version, value.Authorization.ExpiresAt, string(value.FileDeliveryIntent))
 	if err != nil {
 		return fmt.Errorf("insert task: %w", err)
 	}

@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const workspaceSyncCreateQuotaRejectedResource = "workspace_sync_create_quota_rejected"
 
 const maxWorkspaceSyncPage int32 = 1000
 
@@ -229,7 +232,12 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 	}
 	var created workspace.SyncSession
 	replayed := false
+	quotaRejected := false
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceReplica(ctx, tx, value.OwnerID, value.WorkspaceID, value.ReplicaID)
+		if err != nil {
+			return err
+		}
 		var hostOwner, hostState string
 		var hostGeneration int64
 		var hostDeletedAt pgtype.Timestamptz
@@ -240,18 +248,29 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			}
 		}
 		var ownerID, state string
-		var revision int64
-		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 FOR UPDATE`, value.WorkspaceID).Scan(&ownerID, &state, &revision); err != nil {
+		var revision, quotaBytes int64
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, quota_bytes FROM workspaces WHERE id=$1 FOR UPDATE`, value.WorkspaceID).
+			Scan(&ownerID, &state, &revision, &quotaBytes); err != nil {
 			return storeError("lock workspace for sync session", "workspace", err)
 		}
 		if ownerID != value.OwnerID || state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, ownerID, value.WorkspaceID, value.ReplicaID); err != nil {
+			return err
 		}
 		stored, wasReplay, err := reserveIdempotency(ctx, tx, idempotency, value.ID, "")
 		if err != nil {
 			return err
 		}
 		if wasReplay {
+			if stored.ResourceID == workspaceSyncCreateQuotaRejectedResource {
+				if stored.RelatedID != value.ReplicaID {
+					return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key is bound to another workspace replica")
+				}
+				quotaRejected = true
+				return nil
+			}
 			row, err := sqlcgen.New(tx).GetWorkspaceSyncSession(ctx, sqlcgen.GetWorkspaceSyncSessionParams{WorkspaceID: value.WorkspaceID, ID: stored.ResourceID})
 			if err != nil {
 				return storeError("replay workspace sync session", "workspace sync session", err)
@@ -289,6 +308,20 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 		if revision != value.PinnedRevision || value.TargetRevision != revision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace changed while the sync plan was being created")
 		}
+		var manifestBytes int64
+		for _, file := range value.Files {
+			if file.SizeBytes < 0 || manifestBytes > int64(^uint64(0)>>1)-file.SizeBytes {
+				return domain.InvalidArgument("sync_session", "workspace manifest size is invalid")
+			}
+			manifestBytes += file.SizeBytes
+		}
+		if manifestBytes > quotaBytes {
+			if err := persistWorkspaceSyncCreateQuotaRejection(ctx, tx, idempotency, value.ReplicaID); err != nil {
+				return err
+			}
+			quotaRejected = true
+			return nil
+		}
 		hasUploadBlocks := false
 		for _, block := range blocks {
 			if block.Role == workspace.BlockUpload {
@@ -297,8 +330,25 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			}
 		}
 		if hasUploadBlocks {
-			if err := reserveWorkspaceBlockUsage(ctx, tx, value.WorkspaceID, ownerID, reservations, maxOwnerBytes); err != nil {
+			reservationTx, err := tx.Begin(ctx)
+			if err != nil {
+				return fmt.Errorf("start workspace block reservation savepoint: %w", err)
+			}
+			if err := reserveWorkspaceBlockUsage(ctx, reservationTx, value.WorkspaceID, ownerID, reservations, maxOwnerBytes); err != nil {
+				if rollbackErr := reservationTx.Rollback(ctx); rollbackErr != nil {
+					return errors.Join(err, fmt.Errorf("rollback workspace block reservation savepoint: %w", rollbackErr))
+				}
+				if domain.CodeOf(err) == domain.CodeQuotaExceeded {
+					if persistErr := persistWorkspaceSyncCreateQuotaRejection(ctx, tx, idempotency, value.ReplicaID); persistErr != nil {
+						return errors.Join(err, persistErr)
+					}
+					quotaRejected = true
+					return nil
+				}
 				return err
+			}
+			if err := reservationTx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit workspace block reservation savepoint: %w", err)
 			}
 		}
 		q := sqlcgen.New(tx)
@@ -335,7 +385,24 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 	if err != nil {
 		return workspace.SyncSession{}, false, err
 	}
+	if quotaRejected {
+		return workspace.SyncSession{}, false, domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
+	}
 	return created, replayed, nil
+}
+
+func persistWorkspaceSyncCreateQuotaRejection(ctx context.Context, tx pgx.Tx, idempotency app.IdempotencyRecord, replicaID string) error {
+	result, err := tx.Exec(ctx, `UPDATE idempotency_keys
+SET resource_id=$4, related_id=$5
+WHERE owner_id=$1 AND operation=$2 AND key=$3 AND request_hash=$6`,
+		idempotency.OwnerID, idempotency.Operation, idempotency.Key, workspaceSyncCreateQuotaRejectedResource, replicaID, idempotency.RequestHash)
+	if err != nil {
+		return fmt.Errorf("persist rejected workspace sync create: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeInternal, "workspace sync create rejection lost its idempotency record")
+	}
+	return nil
 }
 
 func (s *Store) GetWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string) (workspace.SyncSession, error) {
@@ -404,6 +471,10 @@ func (s *Store) AckWorkspaceSyncBlock(ctx context.Context, workspaceID, sessionI
 	}
 	var settlementErr error
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
+		if err != nil {
+			return err
+		}
 		if err := lockWorkspaceForSyncMutation(ctx, tx, workspaceID); err != nil {
 			return err
 		}
@@ -411,6 +482,9 @@ func (s *Store) AckWorkspaceSyncBlock(ctx context.Context, workspaceID, sessionI
 		row, err := q.LockWorkspaceSyncSession(ctx, sqlcgen.LockWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
 		if err != nil {
 			return storeError("lock workspace sync session for block acknowledgement", "workspace sync session", err)
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, row.OwnerID, workspaceID, row.ReplicaID); err != nil {
+			return err
 		}
 		block, err := q.GetWorkspaceSyncTransferBlock(ctx, sqlcgen.GetWorkspaceSyncTransferBlockParams{
 			WorkspaceID: workspaceID, SessionID: sessionID, Sha256: digest, Role: string(workspace.BlockUpload),
@@ -461,6 +535,10 @@ func (s *Store) AckWorkspaceSyncDownloadBlock(ctx context.Context, workspaceID, 
 		return domain.NewError(domain.CodeNotFound, "workspace sync block not found")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
+		if err != nil {
+			return err
+		}
 		if err := lockWorkspaceForSyncMutation(ctx, tx, workspaceID); err != nil {
 			return err
 		}
@@ -468,6 +546,9 @@ func (s *Store) AckWorkspaceSyncDownloadBlock(ctx context.Context, workspaceID, 
 		row, err := q.LockWorkspaceSyncSession(ctx, sqlcgen.LockWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
 		if err != nil {
 			return storeError("lock workspace sync session for download acknowledgement", "workspace sync session", err)
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, row.OwnerID, workspaceID, row.ReplicaID); err != nil {
+			return err
 		}
 		var size int64
 		var received bool
@@ -515,6 +596,10 @@ func (s *Store) AckWorkspaceSyncDownloadAction(ctx context.Context, workspaceID,
 		return domain.InvalidArgument("download_action", "workspace download action acknowledgement is invalid")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
+		if err != nil {
+			return err
+		}
 		if err := lockWorkspaceForSyncMutation(ctx, tx, workspaceID); err != nil {
 			return err
 		}
@@ -522,6 +607,9 @@ func (s *Store) AckWorkspaceSyncDownloadAction(ctx context.Context, workspaceID,
 		session, err := q.LockWorkspaceSyncSession(ctx, sqlcgen.LockWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
 		if err != nil {
 			return storeError("lock workspace sync session for download action acknowledgement", "workspace sync session", err)
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, session.OwnerID, workspaceID, session.ReplicaID); err != nil {
+			return err
 		}
 		var plannedAction string
 		var plannedSHA pgtype.Text
@@ -580,12 +668,144 @@ WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID, string(state), string(
 	})
 }
 
+func validateWorkspaceSyncCommitReceipt(workspaceID, sessionID string, idempotency app.IdempotencyRecord) error {
+	if !domain.ValidWorkspaceID(workspaceID) || !workspace.ValidSessionID(sessionID) ||
+		idempotency.Operation != "workspace.sync.commit" || idempotency.ResourceID != sessionID {
+		return domain.InvalidArgument("sync_session", "workspace sync commit fields are invalid")
+	}
+	return validateIdempotency(idempotency)
+}
+
+func readWorkspaceSyncCommitReceipt(ctx context.Context, tx pgx.Tx, workspaceID, sessionID string, idempotency app.IdempotencyRecord, lock bool) (app.WorkspaceSyncCommitReceipt, error) {
+	if err := validateWorkspaceSyncCommitReceipt(workspaceID, sessionID, idempotency); err != nil {
+		return app.WorkspaceSyncCommitReceipt{}, err
+	}
+	query := `SELECT request_hash, workspace_id, session_id, state
+FROM workspace_sync_commit_receipts WHERE owner_id=$1 AND operation=$2 AND key=$3`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var requestHash []byte
+	var storedWorkspace, storedSession, state string
+	if err := tx.QueryRow(ctx, query, idempotency.OwnerID, idempotency.Operation, idempotency.Key).
+		Scan(&requestHash, &storedWorkspace, &storedSession, &state); err != nil {
+		return app.WorkspaceSyncCommitReceipt{}, storeError("read workspace sync commit receipt", "workspace sync commit receipt", err)
+	}
+	if !bytes.Equal(requestHash, idempotency.RequestHash) || storedWorkspace != workspaceID || storedSession != sessionID {
+		return app.WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different request")
+	}
+	receipt := app.WorkspaceSyncCommitReceipt{State: app.WorkspaceSyncCommitState(state)}
+	switch receipt.State {
+	case app.WorkspaceSyncCommitPending, app.WorkspaceSyncCommitQuotaRejected:
+	case app.WorkspaceSyncCommitSucceeded:
+		row, err := sqlcgen.New(tx).GetWorkspaceSyncSession(ctx, sqlcgen.GetWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
+		if err != nil {
+			return app.WorkspaceSyncCommitReceipt{}, storeError("read completed workspace sync session", "workspace sync session", err)
+		}
+		if row.OwnerID != idempotency.OwnerID {
+			return app.WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt owner does not match")
+		}
+		receipt.Result, err = syncSessionDomain(ctx, sqlcgen.New(tx), row)
+		if err != nil {
+			return app.WorkspaceSyncCommitReceipt{}, err
+		}
+	default:
+		return app.WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt state is invalid")
+	}
+	return receipt, nil
+}
+
+func (s *Store) ReserveWorkspaceSyncCommit(ctx context.Context, workspaceID, sessionID string, idempotency app.IdempotencyRecord) (app.WorkspaceSyncCommitReceipt, error) {
+	if err := validateWorkspaceSyncCommitReceipt(workspaceID, sessionID, idempotency); err != nil {
+		return app.WorkspaceSyncCommitReceipt{}, err
+	}
+	var receipt app.WorkspaceSyncCommitReceipt
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
+		if err != nil {
+			return err
+		}
+		if err := lockWorkspaceForSyncMutation(ctx, tx, workspaceID); err != nil {
+			return err
+		}
+		var sessionOwner, replicaID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id,replica_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
+			Scan(&sessionOwner, &replicaID); err != nil {
+			return storeError("read workspace sync session before commit reservation", "workspace sync session", err)
+		}
+		if sessionOwner != idempotency.OwnerID {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, sessionOwner, workspaceID, replicaID); err != nil {
+			return err
+		}
+		// Keep keys written by the previous commit path in the same idempotency namespace.
+		stored, exists, err := findIdempotency(ctx, tx, idempotency)
+		if err != nil {
+			return err
+		}
+		if exists && stored.ResourceID != sessionID {
+			return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key is bound to another sync session")
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_sync_commit_receipts
+(owner_id, operation, key, request_hash, workspace_id, session_id, state)
+VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+ON CONFLICT (owner_id, operation, key) DO NOTHING`, idempotency.OwnerID, idempotency.Operation,
+			idempotency.Key, idempotency.RequestHash, workspaceID, sessionID); err != nil {
+			return fmt.Errorf("reserve workspace sync commit receipt: %w", err)
+		}
+		receipt, err = readWorkspaceSyncCommitReceipt(ctx, tx, workspaceID, sessionID, idempotency, false)
+		return err
+	})
+	return receipt, err
+}
+
+func (s *Store) InspectWorkspaceSyncCommit(ctx context.Context, workspaceID, sessionID string, idempotency app.IdempotencyRecord) (app.WorkspaceSyncCommitReceipt, error) {
+	var receipt app.WorkspaceSyncCommitReceipt
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
+		if err != nil {
+			return err
+		}
+		if err := lockWorkspaceForSyncMutation(ctx, tx, workspaceID); err != nil {
+			return err
+		}
+		var sessionOwner, replicaID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id,replica_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
+			Scan(&sessionOwner, &replicaID); err != nil {
+			return storeError("read workspace sync session before commit inspection", "workspace sync session", err)
+		}
+		if sessionOwner != idempotency.OwnerID {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, sessionOwner, workspaceID, replicaID); err != nil {
+			return err
+		}
+		receipt, err = readWorkspaceSyncCommitReceipt(ctx, tx, workspaceID, sessionID, idempotency, true)
+		return err
+	})
+	return receipt, err
+}
+
+func saveWorkspaceSyncCommitSuccess(ctx context.Context, tx pgx.Tx, idempotency app.IdempotencyRecord) error {
+	updated, err := tx.Exec(ctx, `UPDATE workspace_sync_commit_receipts SET state='succeeded', updated_at=now()
+WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.OwnerID, idempotency.Operation, idempotency.Key)
+	if err != nil {
+		return fmt.Errorf("save workspace sync commit receipt: %w", err)
+	}
+	if updated.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeInternal, "workspace sync commit receipt changed")
+	}
+	return nil
+}
+
 func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string, idempotency app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
-	if !domain.ValidWorkspaceID(workspaceID) || !workspace.ValidSessionID(sessionID) || idempotency.Operation != "workspace.sync.commit" || idempotency.ResourceID != sessionID {
-		return workspace.SyncSession{}, false, domain.InvalidArgument("sync_session", "workspace sync commit fields are invalid")
+	if err := validateWorkspaceSyncCommitReceipt(workspaceID, sessionID, idempotency); err != nil {
+		return workspace.SyncSession{}, false, err
 	}
 	var result workspace.SyncSession
 	replayed := false
+	var rejected error
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		// Host authorization is revalidated in the binding transition lock order
 		// so detach or rebind cannot race a revision commit.
@@ -595,6 +815,10 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		}
 		if !validReplicaID(replicaID) {
 			return domain.NewError(domain.CodeInternal, "stored workspace sync replica is invalid")
+		}
+		deviceAccess, err := prepareWorkspaceSyncDeviceReplica(ctx, tx, idempotency.OwnerID, workspaceID, replicaID)
+		if err != nil {
+			return err
 		}
 		hostReplica, hostScoped := parseHostSyncReplicaID(replicaID)
 		if hostScoped {
@@ -616,12 +840,14 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		var workspaceOwner, workspaceState string
 		var currentRevision, currentBytes, quotaBytes, currentFileCount, revisionBytes int64
 		if err := tx.QueryRow(ctx, `
-SELECT w.owner_id, w.state, w.revision, w.used_bytes, w.quota_bytes,
-       r.file_count, r.total_bytes
-FROM workspaces w
-JOIN workspace_revisions r ON r.workspace_id=w.id AND r.revision=w.revision
-WHERE w.id=$1 FOR UPDATE OF w`, workspaceID).Scan(&workspaceOwner, &workspaceState, &currentRevision, &currentBytes, &quotaBytes, &currentFileCount, &revisionBytes); err != nil {
+			SELECT owner_id, state, revision, used_bytes, quota_bytes
+			FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&workspaceOwner, &workspaceState, &currentRevision, &currentBytes, &quotaBytes); err != nil {
 			return storeError("lock workspace for sync commit", "workspace", err)
+		}
+		// Read after acquiring the Workspace lock so a waiting transaction sees the new revision.
+		if err := tx.QueryRow(ctx, `SELECT file_count, total_bytes FROM workspace_revisions WHERE workspace_id=$1 AND revision=$2`,
+			workspaceID, currentRevision).Scan(&currentFileCount, &revisionBytes); err != nil {
+			return storeError("read locked workspace revision for sync commit", "workspace revision", err)
 		}
 		if hostScoped {
 			var bindingOwner, bindingState string
@@ -652,21 +878,30 @@ WHERE w.id=$1 FOR UPDATE OF w`, workspaceID).Scan(&workspaceOwner, &workspaceSta
 		if row.ReplicaID != replicaID {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace sync replica changed before commit")
 		}
-		stored, wasReplay, err := reserveIdempotency(ctx, tx, idempotency, sessionID, "")
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, row.OwnerID, workspaceID, row.ReplicaID); err != nil {
+			return err
+		}
+		stored, err := readWorkspaceSyncCommitReceipt(ctx, tx, workspaceID, sessionID, idempotency, true)
 		if err != nil {
 			return err
 		}
-		if wasReplay {
-			if stored.ResourceID != sessionID {
-				return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key is bound to another sync session")
-			}
-			result, err = syncSessionDomain(ctx, q, row)
-			replayed = err == nil
-			return err
+		if stored.State == app.WorkspaceSyncCommitQuotaRejected {
+			rejected = domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
+			return nil
+		}
+		if stored.State == app.WorkspaceSyncCommitSucceeded {
+			result, replayed = stored.Result, true
+			return nil
 		}
 		if isTerminalSyncState(workspace.SyncState(row.State)) {
 			result, err = syncSessionDomain(ctx, q, row)
-			return err
+			if err != nil {
+				return err
+			}
+			if result.State == workspace.SyncExpired || result.State == workspace.SyncFailed {
+				return nil
+			}
+			return saveWorkspaceSyncCommitSuccess(ctx, tx, idempotency)
 		}
 		if workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "workspace is not available for synchronization")
@@ -760,17 +995,36 @@ WHERE w.id=$1 FOR UPDATE OF w`, workspaceID).Scan(&workspaceOwner, &workspaceSta
 		}
 		if len(mutations) > 0 {
 			var activeTaskOperation bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (
-SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')
-)`, workspaceID).Scan(&activeTaskOperation); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT
+EXISTS (SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')) OR
+EXISTS (SELECT 1 FROM task_mcp_connector_operations o JOIN tasks t ON t.id=o.task_id
+  WHERE t.workspace_id=$1 AND o.status IN ('dispatched','unknown'))`, workspaceID).Scan(&activeTaskOperation); err != nil {
 				return fmt.Errorf("check admitted task operations before Workspace revision commit: %w", err)
 			}
 			if activeTaskOperation {
-				return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an admitted task operation; retry synchronization after it settles")
+				return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an in-flight task operation; retry synchronization after it settles")
 			}
 		}
+		if _, err := tx.Exec(ctx, `SAVEPOINT workspace_sync_apply`); err != nil {
+			return fmt.Errorf("start workspace sync apply savepoint: %w", err)
+		}
 		if err := applyWorkspaceSyncMutations(ctx, tx, workspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, mutations); err != nil {
-			return err
+			if domain.CodeOf(err) != domain.CodeQuotaExceeded {
+				return err
+			}
+			if _, rollbackErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT workspace_sync_apply`); rollbackErr != nil {
+				return fmt.Errorf("rollback workspace sync apply savepoint: %w", rollbackErr)
+			}
+			updated, markErr := tx.Exec(ctx, `UPDATE workspace_sync_commit_receipts SET state='quota_rejected', updated_at=now()
+WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.OwnerID, idempotency.Operation, idempotency.Key)
+			if markErr != nil {
+				return fmt.Errorf("record workspace sync quota rejection: %w", markErr)
+			}
+			if updated.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeInternal, "workspace sync commit receipt changed")
+			}
+			rejected = err
+			return nil
 		}
 		targetRevision := currentRevision
 		if len(mutations) > 0 {
@@ -807,10 +1061,16 @@ SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','d
 			return fmt.Errorf("read committed workspace sync session: %w", err)
 		}
 		result, err = syncSessionDomain(ctx, q, finalRow)
-		return err
+		if err != nil {
+			return err
+		}
+		return saveWorkspaceSyncCommitSuccess(ctx, tx, idempotency)
 	})
 	if err != nil {
 		return workspace.SyncSession{}, false, err
+	}
+	if rejected != nil {
+		return workspace.SyncSession{}, false, rejected
 	}
 	return result, replayed, nil
 }
@@ -822,6 +1082,10 @@ func (s *Store) CancelWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 	var result workspace.SyncSession
 	replayed := false
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
+		if err != nil {
+			return err
+		}
 		if err := lockWorkspaceForSyncMutation(ctx, tx, workspaceID); err != nil {
 			return err
 		}
@@ -829,6 +1093,9 @@ func (s *Store) CancelWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		row, err := q.LockWorkspaceSyncSession(ctx, sqlcgen.LockWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
 		if err != nil {
 			return storeError("lock workspace sync session for cancellation", "workspace sync session", err)
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, row.OwnerID, workspaceID, row.ReplicaID); err != nil {
+			return err
 		}
 		if idempotency.OwnerID != row.OwnerID {
 			return domain.NewError(domain.CodeForbidden, "workspace sync owner does not match")

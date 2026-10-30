@@ -171,6 +171,8 @@ func validateTask(value task.Task) error {
 		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
 		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
 		(value.InputRevision != nil && *value.InputRevision < 0) || (len(value.ContextDigest) != 0 && len(value.ContextDigest) != 32) ||
+		(value.WorkspaceID == "") != (value.WorkspaceCheckpointRevision == nil) ||
+		(value.WorkspaceCheckpointRevision != nil && *value.WorkspaceCheckpointRevision != *value.InputRevision) ||
 		(value.WorkspaceID != "" && len(value.ContextDigest) != 32) ||
 		(value.WorkspaceID == "") != (len(value.ContextDigest) == 0) ||
 		value.AgentInstanceID != "" || value.AgentGeneration != 0 || value.AgentSessionID != "" ||
@@ -199,6 +201,10 @@ func normalizeNewTask(value task.Task) task.Task {
 	}
 	if !value.FileDeliveryIntent.Valid() {
 		value.FileDeliveryIntent = app.ClassifyFileDeliveryIntent(value.Objective, value.WorkspaceID != "")
+	}
+	if value.WorkspaceCheckpointRevision == nil && value.InputRevision != nil {
+		checkpoint := *value.InputRevision
+		value.WorkspaceCheckpointRevision = &checkpoint
 	}
 	return value
 }

@@ -220,7 +220,8 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	}
 	if hasOperation && (operation.TaskID != current.ID || operation.OwnerID != current.OwnerID || operation.ConnectorID != grant.ConnectorID ||
 		operation.Key != key || operation.ToolName != call.Name || !bytes.Equal(operation.RequestHash, hash[:]) ||
-		operation.ConnectorRevision != grant.ConnectorRevision || operation.CredentialVersion != grant.CredentialVersion || operation.GrantVersion != grant.GrantVersion) {
+		operation.ConnectorRevision != grant.ConnectorRevision || operation.CredentialVersion != grant.CredentialVersion || operation.GrantVersion != grant.GrantVersion ||
+		!sameMCPConnectorOperationTaskSnapshot(operation, current)) {
 		step, stepErr := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
 			"Review MCP connector recovery", "The prior MCP connector operation does not match this exact request.")
 		if stepErr != nil {
@@ -268,19 +269,41 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	if err != nil {
 		return AgentToolResult{}, fmt.Errorf("generate MCP connector operation ID: %w", err)
 	}
-	operation, replayed, err := operationStore.PrepareMCPConnectorOperation(ctx, MCPConnectorOperation{
+	preparedFence := MCPConnectorOperation{
 		ID: operationID, TaskID: current.ID, OwnerID: current.OwnerID, ConnectorID: grant.ConnectorID, Key: key,
 		ToolName: call.Name, ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion,
-		GrantVersion: grant.GrantVersion, LeaseVersion: current.Lease.Version, RequestHash: hash[:], Status: task.OperationPrepared,
-	}, current.Lease.Owner)
+		GrantVersion: grant.GrantVersion, LeaseVersion: current.Lease.Version, HostID: current.HostID,
+		WorkspaceID: current.WorkspaceID, InputRevision: current.InputRevision,
+		WorkspaceCheckpointRevision: current.WorkspaceCheckpointRevision,
+		RequestHash:                 hash[:], Status: task.OperationPrepared,
+	}
+	if hasOperation {
+		// A replay keeps the checkpoint captured by the original operation. The
+		// store compares it with the current Task and never refreshes this fence.
+		preparedFence.BindingVersion = operation.BindingVersion
+	} else if current.WorkspaceID != "" {
+		binding, err := operationStore.GetWorkspaceBinding(ctx, current.HostID, current.WorkspaceID)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		if binding.OwnerID != current.OwnerID || binding.HostID != current.HostID || binding.Workspace.ID != current.WorkspaceID || binding.BindingVersion <= 0 {
+			return AgentToolResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed before MCP operation preparation")
+		}
+		preparedFence.BindingVersion = binding.BindingVersion
+	}
+	operation, replayed, err := operationStore.PrepareMCPConnectorOperation(ctx, preparedFence, current.Lease.Owner)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			return b.pauseMCPWorkspaceInputChange(ctx, current, step, usage, call.Name)
+		}
 		return AgentToolResult{}, err
 	}
 	if recovering && hasOperation && !replayed {
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector operation disappeared during recovery.")
 	}
 	if operation.ID == "" || operation.TaskID != current.ID || operation.ConnectorID != grant.ConnectorID || operation.Key != key ||
-		operation.Status == task.OperationPrepared && operation.LeaseVersion != current.Lease.Version || !bytes.Equal(operation.RequestHash, hash[:]) {
+		operation.Status == task.OperationPrepared && operation.LeaseVersion != current.Lease.Version || !bytes.Equal(operation.RequestHash, hash[:]) ||
+		!sameMCPConnectorOperationTaskSnapshot(operation, current) || operation.BindingVersion != preparedFence.BindingVersion {
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The stored MCP connector operation does not match this request.")
 	}
 	if replayed {
@@ -323,6 +346,9 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		if latest, getErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, grant.ConnectorID, key); getErr == nil &&
 			(latest.Status == task.OperationCancelled || latest.Status == task.OperationUnknown) {
 			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant changed before dispatch.")
+		}
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			return b.pauseMCPWorkspaceInputChange(ctx, current, step, usage, call.Name)
 		}
 		return AgentToolResult{}, err
 	}
@@ -375,6 +401,12 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		return AgentToolResult{Status: AgentToolUnknown}, ctx.Err()
 	}
 	return b.commitMCPResult(ctx, current, step, usage, call.Name, AgentToolResult{Status: resultStatus, Output: output})
+}
+
+func sameMCPConnectorOperationTaskSnapshot(operation MCPConnectorOperation, current task.Task) bool {
+	return operation.HostID == current.HostID && operation.WorkspaceID == current.WorkspaceID &&
+		sameTaskInputRevision(operation.InputRevision, current.InputRevision) &&
+		sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision)
 }
 
 func definitionForPinnedMCPTool(raw []byte, connectorID, alias, remoteName string) (MCPConnectorToolDefinition, error) {
@@ -506,6 +538,17 @@ func (b *CloudDSHToolBroker) pauseMCPNeedsUser(ctx context.Context, current task
 		"operation_key": key, "operation_status": task.OperationCancelled,
 	})
 	return AgentToolResult{Status: AgentToolNeedsUser}, err
+}
+
+func (b *CloudDSHToolBroker) pauseMCPWorkspaceInputChange(ctx context.Context, current task.Task, step task.Step, usage task.Usage, tool string) (AgentToolResult, error) {
+	message := "Workspace changed after this task was submitted. Submit a new task to use the updated files."
+	step.Status, step.Summary = task.StepWaitingUser, message
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+	defer cancel()
+	err := b.commitProgress(persistCtx, current, step, usage, task.StatusWaitingUser, "workspace_input_changed", "task.waiting_user", map[string]any{
+		"tool": tool, "message": message,
+	})
+	return AgentToolResult{Status: AgentToolNeedsUser, WaitingReason: "workspace_input_changed", Output: message}, err
 }
 
 func (b *CloudDSHToolBroker) markMCPUnknown(ctx context.Context, current task.Task, operation MCPConnectorOperation, reason string) error {

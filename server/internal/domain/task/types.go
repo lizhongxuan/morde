@@ -125,37 +125,38 @@ type Lease struct {
 }
 
 type Task struct {
-	ID                        string
-	OwnerID                   string
-	ConversationID            string
-	HostID                    string
-	ExecutionLocation         string
-	ApplicationID             string
-	ModelID                   string
-	WorkspaceID               string
-	InputRevision             *int64
-	ContextDigest             []byte
-	AgentInstanceID           string
-	AgentGeneration           int64
-	AgentSessionID            string
-	AgentEngineVersion        string
-	AgentProfileVersion       string
-	CheckpointDigest          []byte
-	CheckpointThroughSequence int64
-	EventSequence             int64
-	Objective                 string
-	FileDeliveryIntent        FileDeliveryIntent
-	Status                    Status
-	Authorization             Authorization
-	Budget                    Budget
-	Usage                     Usage
-	Lease                     Lease
-	CurrentStep               string
-	Result                    string
-	WaitingReason             string
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
-	FinishedAt                *time.Time
+	ID                          string
+	OwnerID                     string
+	ConversationID              string
+	HostID                      string
+	ExecutionLocation           string
+	ApplicationID               string
+	ModelID                     string
+	WorkspaceID                 string
+	InputRevision               *int64
+	WorkspaceCheckpointRevision *int64
+	ContextDigest               []byte
+	AgentInstanceID             string
+	AgentGeneration             int64
+	AgentSessionID              string
+	AgentEngineVersion          string
+	AgentProfileVersion         string
+	CheckpointDigest            []byte
+	CheckpointThroughSequence   int64
+	EventSequence               int64
+	Objective                   string
+	FileDeliveryIntent          FileDeliveryIntent
+	Status                      Status
+	Authorization               Authorization
+	Budget                      Budget
+	Usage                       Usage
+	Lease                       Lease
+	CurrentStep                 string
+	Result                      string
+	WaitingReason               string
+	CreatedAt                   time.Time
+	UpdatedAt                   time.Time
+	FinishedAt                  *time.Time
 }
 
 type Step struct {
@@ -170,18 +171,19 @@ type Step struct {
 }
 
 type Operation struct {
-	ID                string
-	TaskID            string
-	Key               string
-	RequestHash       []byte
-	HostID            string
-	WorkspaceID       string
-	BindingVersion    int64
-	InputRevision     *int64
-	RuntimeGeneration int64
-	RuntimeInstanceID string
-	ControlVersion    int64
-	LeaseVersion      int64
+	ID                          string
+	TaskID                      string
+	Key                         string
+	RequestHash                 []byte
+	HostID                      string
+	WorkspaceID                 string
+	BindingVersion              int64
+	InputRevision               *int64
+	WorkspaceCheckpointRevision *int64
+	RuntimeGeneration           int64
+	RuntimeInstanceID           string
+	ControlVersion              int64
+	LeaseVersion                int64
 	// RuntimeLeaseVersion is the task lease version fencing this operation's
 	// runtime journal entry. It does not advance merely because a new worker
 	// owns the task; it may advance only when an exact-fenced operation_not_found

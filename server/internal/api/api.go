@@ -31,35 +31,36 @@ const (
 )
 
 type Deps struct {
-	Hosts              app.HostService
-	HostSharing        app.HostSharingService
-	HostReplicas       app.HostReplicaService
-	TLSAuthorizer      app.HostTLSAuthorizer
-	Verifier           app.Verifier
-	Auth               AuthService
-	WorkspaceOps       WorkspaceService
-	WorkspaceSync      WorkspaceSyncService
-	Sites              SiteService
-	Templates          TemplateReader
-	Tokens             TokenService
-	ClientLogin        ClientLoginService
-	Notifications      NotificationService
-	Control            ControlService
-	ExecutionControl   ExecutionControlService
-	Tasks              TaskService
-	Conversations      ConversationService
-	InstantChat        InstantChatService
-	ModelConnections   ModelConnectionManager
-	MCPConnectors      MCPConnectorManager
-	ModelGateway       ModelGateway
-	ModelUsageAdmin    ModelUsageAdmin
-	Onboarding         OnboardingManager
-	Admin              AdminService
-	AdminHostResources AdminHostResourcesService
-	AdminWorkspaces    AdminWorkspaceService
-	Readiness          ReadinessChecker
-	MCP                http.Handler
-	MCPDisabled        bool
+	Hosts                app.HostService
+	HostSharing          app.HostSharingService
+	HostReplicas         app.HostReplicaService
+	TLSAuthorizer        app.HostTLSAuthorizer
+	Verifier             app.Verifier
+	Auth                 AuthService
+	WorkspaceOps         WorkspaceService
+	WorkspaceSync        WorkspaceSyncService
+	WorkspaceSyncDevices WorkspaceSyncDeviceService
+	Sites                SiteService
+	Templates            TemplateReader
+	Tokens               TokenService
+	ClientLogin          ClientLoginService
+	Notifications        NotificationService
+	Control              ControlService
+	ExecutionControl     ExecutionControlService
+	Tasks                TaskService
+	Conversations        ConversationService
+	InstantChat          InstantChatService
+	ModelConnections     ModelConnectionManager
+	MCPConnectors        MCPConnectorManager
+	ModelGateway         ModelGateway
+	ModelUsageAdmin      ModelUsageAdmin
+	Onboarding           OnboardingManager
+	Admin                AdminService
+	AdminHostResources   AdminHostResourcesService
+	AdminWorkspaces      AdminWorkspaceService
+	Readiness            ReadinessChecker
+	MCP                  http.Handler
+	MCPDisabled          bool
 }
 
 type Options struct {
@@ -144,6 +145,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerTasks(group, deps.Tasks)
 	h.registerResources(group)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync)
+	h.registerWorkspaceSyncDeviceRoutes(group, deps.WorkspaceSyncDevices)
 	h.registerSites(group)
 	h.registerClients(group)
 	h.registerInstantChat(group)
@@ -167,6 +169,9 @@ func (h *api) limitBody(c *gin.Context) {
 		limit = modelGatewayBodyLimit
 	case c.Request.Method == http.MethodPost && strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-sessions"):
 		limit = workspaceSyncJSONBodyLimit
+	case c.Request.Method == http.MethodPost && (strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-device-challenges") ||
+		strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-devices")):
+		limit = workspaceSyncActionBodyLimit
 	case c.Request.Method == http.MethodPut && strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-sessions/:session_id/blocks/:digest"):
 		limit = workspaceSyncBlockBodyLimit
 	case c.Request.Method == http.MethodPost && strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-sessions/:session_id/download-actions/ack"):
@@ -443,6 +448,8 @@ func clientCredentialRoute(method, path string) bool {
 			return true
 		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
 			"/api/tasks/:id/inputs", "/api/tasks/:id/approvals/:approval_id/responses":
+			return true
+		case "/api/workspaces/:id/sync-device-challenges", "/api/workspaces/:id/sync-devices":
 			return true
 		case "/api/model/v1/chat/completions":
 			return true

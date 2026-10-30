@@ -1360,6 +1360,106 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/sync-device-challenges:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: createWorkspaceSyncDeviceChallenge
+      summary: Start a Syncthing device registration proof
+      description: Desktop client credential only. The certificate is public DER encoded as base64; the service derives and verifies its Syncthing Device ID, then returns a five-minute signing payload bound to this Workspace and installation. Sign the decoded signing_payload bytes with the certificate private key. At most eight challenges may be outstanding per installation. This endpoint does not enable synchronization; the folder remains pending until a server node is provisioned.
+      security:
+        - clientCredential: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkspaceSyncDeviceChallengeRequest' }
+      x-morde-max-body-bytes: 32768
+      responses:
+        '201':
+          description: One-time device proof challenge
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceSyncDeviceChallenge' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/sync-devices:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Workspaces]
+      operationId: listWorkspaceSyncDevices
+      summary: List Workspace Syncthing device bindings
+      description: Portal sessions only. Includes pending, active, revoking, and revoked bindings for this Workspace so authorized users can inspect and revoke a specific device. Certificate private material is never returned.
+      security:
+        - portalSession: []
+      responses:
+        '200':
+          description: Workspace device bindings
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkspaceSyncDeviceBinding' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Workspaces]
+      operationId: registerWorkspaceSyncDevice
+      summary: Register a proven Syncthing device for a Workspace
+      description: Desktop client credential only. The proof is single-use, bound to the current installation, and idempotent by key. Success returns the authorized server node ID and pinned private relay URI after the node config is applied.
+      security:
+        - clientCredential: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterWorkspaceSyncDeviceRequest' }
+      x-morde-max-body-bytes: 32768
+      responses:
+        '200':
+          description: Workspace device binding and server connection details
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceSyncDeviceBinding' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Workspaces]
+      operationId: revokeWorkspaceSyncDevice
+      summary: Revoke a Workspace Syncthing device binding
+      description: Revokes only the selected device binding. The owning portal session is required; the account and installation remain otherwise unchanged.
+      security:
+        - portalSession: []
+      parameters:
+        - name: binding_id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^d[a-z0-9]{7}$' }
+      responses:
+        '204': { description: Binding revoked }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/workspaces/{id}/sync-sessions:
     parameters:
       - $ref: '#/components/parameters/WorkspaceId'
@@ -4298,6 +4398,45 @@ components:
         download_actions_done: { type: integer, format: int64, minimum: 0 }
         updated_at: { type: string, format: date-time }
       additionalProperties: false
+    CreateWorkspaceSyncDeviceChallengeRequest:
+      type: object
+      required: [device_id, certificate_der]
+      properties:
+        device_id: { type: string, minLength: 63, maxLength: 63 }
+        certificate_der: { type: string, format: byte, description: Base64-encoded public X.509 certificate DER; private keys are never accepted. }
+      additionalProperties: false
+    WorkspaceSyncDeviceChallenge:
+      type: object
+      required: [id, device_id, nonce, signing_payload, expires_at]
+      properties:
+        id: { type: string, pattern: '^n[a-z0-9]{7}$' }
+        device_id: { type: string, minLength: 63, maxLength: 63 }
+        nonce: { type: string, format: byte }
+        signing_payload: { type: string, format: byte, description: Base64-encoded bytes that the device private key must sign. }
+        expires_at: { type: string, format: date-time }
+      additionalProperties: false
+    RegisterWorkspaceSyncDeviceRequest:
+      type: object
+      required: [challenge_id, signature]
+      properties:
+        challenge_id: { type: string, pattern: '^n[a-z0-9]{7}$' }
+        signature: { type: string, format: byte, description: Base64-encoded signature over the decoded signing_payload bytes. }
+      additionalProperties: false
+    WorkspaceSyncDeviceBinding:
+      type: object
+      required: [id, workspace_id, client_installation_id, device_id, folder_id, state, created_at]
+      properties:
+        id: { type: string, pattern: '^d[a-z0-9]{7}$' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        client_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
+        device_id: { type: string, minLength: 63, maxLength: 63 }
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$' }
+        server_device_id: { type: string, minLength: 63, maxLength: 63, description: Returned only by registration; certificate identity of the server Syncthing node. }
+        relay_address: { type: string, format: uri, description: Returned only by registration; static Morde relay URI pinned to the relay certificate ID. }
+        state: { type: string, enum: [pending_node, active, revoking, revoked] }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
     SyncSession:
       type: object
       required: [id, workspace_id, direction, policy, state, base_revision, target_revision, stage, planned_bytes, confirmed_bytes, transfer_blocks, download_actions, conflicts, created_at, updated_at]
@@ -4594,6 +4733,7 @@ components:
         execution_location: { type: string, enum: [server, legacy] }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
         input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision this task started from. }
+        workspace_checkpoint_revision: { type: integer, minimum: 0, description: Current confirmed Workspace revision available to this task; advances only after a durable task-owned publish. }
         application_id: { type: string }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
         model_id: { type: string }

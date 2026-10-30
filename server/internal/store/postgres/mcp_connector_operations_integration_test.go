@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 func TestPostgresMCPConnectorOperationReplayCASAndVersionFences(t *testing.T) {
@@ -161,6 +164,144 @@ func TestPostgresMCPConnectorOperationDispatchedCompletionAndUnknownAreTerminal(
 	}
 	if err := store.MarkMCPConnectorOperationUnknown(ctx, unknownDispatched, fixture.leaseOwner, "different summary"); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("unknown result was overwritten: %v", err)
+	}
+}
+
+func TestPostgresMCPConnectorOperationPersistsWorkspaceFence(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "mcp-operation-workspace-fence")
+	fixture := newMCPConnectorOperationFixtureWithWorkspace(t, ctx, store, owner.ID, "mcp-operation-workspace-fence", &workspaceValue)
+	input := fixture.operation("workspace-fence", "search")
+	prepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, input, fixture.leaseOwner)
+	if err != nil || replayed || prepared.Status != task.OperationPrepared || prepared.HostID != fixture.hostID ||
+		prepared.WorkspaceID != workspaceValue.ID || prepared.BindingVersion != fixture.bindingVersion || prepared.InputRevision == nil ||
+		*prepared.InputRevision != workspaceValue.Revision || prepared.WorkspaceCheckpointRevision == nil ||
+		*prepared.WorkspaceCheckpointRevision != workspaceValue.Revision {
+		t.Fatalf("prepare Workspace-fenced operation = %#v replay=%t err=%v", prepared, replayed, err)
+	}
+	loaded, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, input.Key)
+	if err != nil || !sameMCPConnectorOperationRequest(loaded, input) {
+		t.Fatalf("loaded Workspace-fenced operation = %#v err=%v", loaded, err)
+	}
+
+	changedBinding := input
+	changedBinding.BindingVersion++
+	if _, _, err := store.PrepareMCPConnectorOperation(ctx, changedBinding, fixture.leaseOwner); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("same operation key with a new binding version = %v", err)
+	}
+	changedCheckpoint := input
+	newRevision := workspaceValue.Revision + 1
+	changedCheckpoint.InputRevision, changedCheckpoint.WorkspaceCheckpointRevision = &newRevision, &newRevision
+	if _, _, err := store.PrepareMCPConnectorOperation(ctx, changedCheckpoint, fixture.leaseOwner); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("same operation key with a new checkpoint = %v", err)
+	}
+	staleTaskSnapshot := fixture.operation("stale-task-snapshot", "search")
+	staleTaskSnapshot.InputRevision, staleTaskSnapshot.WorkspaceCheckpointRevision = &newRevision, &newRevision
+	if _, _, err := store.PrepareMCPConnectorOperation(ctx, staleTaskSnapshot, fixture.leaseOwner); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("new operation with a different Task checkpoint = %v", err)
+	}
+
+	wrongBinding := fixture.operation("stale-binding", "search")
+	wrongBinding.BindingVersion++
+	if _, _, err := store.PrepareMCPConnectorOperation(ctx, wrongBinding, fixture.leaseOwner); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("new operation with stale binding version = %v", err)
+	}
+	if _, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, wrongBinding.Key); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("stale binding operation was persisted: %v", err)
+	}
+}
+
+func TestPostgresMCPConnectorDispatchWaitsForWorkspaceCommitFence(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "mcp-operation-commit-race")
+	fixture := newMCPConnectorOperationFixtureWithWorkspace(t, ctx, store, owner.ID, "mcp-operation-commit-race", &workspaceValue)
+	prepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, fixture.operation("commit-race", "search"), fixture.leaseOwner)
+	if err != nil || replayed {
+		t.Fatalf("prepare MCP operation before Workspace commit: %#v replay=%t err=%v", prepared, replayed, err)
+	}
+
+	file := syncTestFile("external-update.txt", []byte("new Workspace revision"))
+	session := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	session.PlannedBytes = 0
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", fixture.hostID, fixture.hostGeneration, workspaceValue.ID, fixture.bindingVersion)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks([]workspace.File{file}),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "mcp-commit-race-create", session.ID)); err != nil {
+		t.Fatalf("create Host-scoped Workspace sync session: %v", err)
+	}
+
+	const advisoryLockKey int64 = 824726199
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION wait_for_mcp_workspace_revision_race_release() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(824726199);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create Workspace revision test barrier: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TRIGGER wait_for_mcp_workspace_revision_race_release
+BEFORE INSERT ON workspace_revisions FOR EACH ROW EXECUTE FUNCTION wait_for_mcp_workspace_revision_race_release()`); err != nil {
+		t.Fatalf("install Workspace revision test barrier: %v", err)
+	}
+	advisoryConn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = advisoryConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, advisoryLockKey)
+		advisoryConn.Release()
+	}()
+	if _, err := advisoryConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+
+	type commitResult struct {
+		session workspace.SyncSession
+		err     error
+	}
+	committed := make(chan commitResult, 1)
+	go func() {
+		value, _, commitErr := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
+			syncTestIdempotency(owner.ID, "workspace.sync.commit", "mcp-commit-race-commit", session.ID))
+		committed <- commitResult{session: value, err: commitErr}
+	}()
+	waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer waitCancel()
+	waitForPostgresLockWait(t, waitCtx, pool, "%INSERT INTO workspace_revisions%", 1)
+
+	dispatched := make(chan error, 1)
+	go func() {
+		_, dispatchErr := store.MarkMCPConnectorOperationDispatched(ctx, prepared, fixture.leaseOwner)
+		dispatched <- dispatchErr
+	}()
+	waitForPostgresLockWait(t, waitCtx, pool, "%FROM hosts WHERE id=$1 FOR SHARE%", 1)
+	var unlocked bool
+	if err := advisoryConn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+		t.Fatalf("release Workspace revision test barrier: unlocked=%t err=%v", unlocked, err)
+	}
+	select {
+	case result := <-committed:
+		if result.err != nil || result.session.State != workspace.SyncCompleted || result.session.TargetRevision != workspaceValue.Revision+1 {
+			t.Fatalf("Workspace commit that won dispatch race = %#v err=%v", result.session, result.err)
+		}
+	case <-waitCtx.Done():
+		t.Fatalf("Workspace sync commit did not finish: %v", waitCtx.Err())
+	}
+	select {
+	case err := <-dispatched:
+		if domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+			t.Fatalf("dispatch after Workspace commit = %v, want Workspace conflict", err)
+		}
+	case <-waitCtx.Done():
+		t.Fatalf("MCP dispatch did not finish after Workspace commit: %v", waitCtx.Err())
+	}
+	stored, err := store.GetMCPConnectorOperation(ctx, owner.ID, fixture.running.ID, fixture.connectorID, prepared.Key)
+	if err != nil || stored.Status != task.OperationPrepared {
+		t.Fatalf("operation after stale dispatch rejection = %#v err=%v", stored, err)
 	}
 }
 
@@ -339,17 +480,58 @@ func TestPostgresConnectorRevisionChangeFencesOperations(t *testing.T) {
 }
 
 type mcpConnectorOperationFixture struct {
-	t           *testing.T
-	ownerID     string
-	connectorID string
-	running     task.Task
-	leaseOwner  string
+	t                           *testing.T
+	ownerID                     string
+	connectorID                 string
+	hostID                      string
+	hostGeneration              int64
+	workspaceID                 string
+	bindingVersion              int64
+	inputRevision               *int64
+	workspaceCheckpointRevision *int64
+	running                     task.Task
+	leaseOwner                  string
 }
 
 func newMCPConnectorOperationFixture(t *testing.T, ctx context.Context, store *Store, ownerID, idempotencyKey string) mcpConnectorOperationFixture {
+	return newMCPConnectorOperationFixtureWithWorkspace(t, ctx, store, ownerID, idempotencyKey, nil)
+}
+
+func newMCPConnectorOperationFixtureWithWorkspace(t *testing.T, ctx context.Context, store *Store, ownerID, idempotencyKey string,
+	workspaceValue *workspace.Workspace) mcpConnectorOperationFixture {
 	t.Helper()
 	hostValue := createRunningControlHost(t, ctx, store, ownerID, "ai", 0)
-	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, ownerID, hostValue.ID, idempotencyKey, "run a task with a connector"))
+	var bindingVersion int64
+	if workspaceValue != nil {
+		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: ownerID, HostID: hostValue.ID, Workspace: *workspaceValue, Directory: workspaceValue.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+			SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bindingVersion = binding.BindingVersion
+	}
+	submission := newTestTaskSubmission(t, ownerID, hostValue.ID, idempotencyKey, "run a task with a connector")
+	if workspaceValue != nil {
+		revision := workspaceValue.Revision
+		manifestSHA, err := workspace.ManifestSHA256([]workspace.File{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		contextDigest, err := hex.DecodeString(manifestSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		submission.Task.WorkspaceID, submission.Task.InputRevision, submission.Task.ContextDigest = workspaceValue.ID, &revision, contextDigest
+	}
+	submitted, err := store.SubmitTask(ctx, submission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,13 +549,24 @@ VALUES ($1,$2,$3,$4,true,0,1)`, connectorID, ownerID, "test connector", "https:/
 VALUES ($1,$2,$3,1,0,1)`, running.ID, ownerID, connectorID); err != nil {
 		t.Fatal(err)
 	}
-	return mcpConnectorOperationFixture{t: t, ownerID: ownerID, connectorID: connectorID, running: running, leaseOwner: running.Lease.Owner}
+	fixture := mcpConnectorOperationFixture{
+		t: t, ownerID: ownerID, connectorID: connectorID, hostID: hostValue.ID,
+		hostGeneration: hostValue.RuntimeGeneration, running: running, leaseOwner: running.Lease.Owner,
+	}
+	if workspaceValue != nil {
+		revision := workspaceValue.Revision
+		fixture.workspaceID, fixture.bindingVersion = workspaceValue.ID, bindingVersion
+		fixture.inputRevision, fixture.workspaceCheckpointRevision = &revision, &revision
+	}
+	return fixture
 }
 
 func (f mcpConnectorOperationFixture) operation(key, toolName string) app.MCPConnectorOperation {
 	return app.MCPConnectorOperation{
 		ID: mustID(f.t, domain.NewOperationID), TaskID: f.running.ID, OwnerID: f.ownerID, ConnectorID: f.connectorID,
 		Key: key, ToolName: toolName, ConnectorRevision: 1, CredentialVersion: 0, GrantVersion: 1,
-		LeaseVersion: f.running.Lease.Version, RequestHash: hashBytes("connector-request:" + key),
+		LeaseVersion: f.running.Lease.Version, HostID: f.hostID, WorkspaceID: f.workspaceID, BindingVersion: f.bindingVersion,
+		InputRevision: f.inputRevision, WorkspaceCheckpointRevision: f.workspaceCheckpointRevision,
+		RequestHash: hashBytes("connector-request:" + key),
 	}
 }

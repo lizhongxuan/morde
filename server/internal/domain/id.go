@@ -13,22 +13,25 @@ const idAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 var ErrIDAttemptsExhausted = errors.New("id collision retries exhausted")
 
-func NewHostID() (string, error)               { return newID('h') }
-func NewWorkspaceID() (string, error)          { return newID('w') }
-func NewUserID() (string, error)               { return newID('u') }
-func NewTokenID() (string, error)              { return newID('t') }
-func NewClientInstallationID() (string, error) { return newID('i') }
-func NewConversationID() (string, error)       { return newID('c') }
-func NewTaskID() (string, error)               { return newID('q') }
-func NewMessageID() (string, error)            { return newID('m') }
-func NewStepID() (string, error)               { return newID('s') }
-func NewOperationID() (string, error)          { return newID('o') }
-func NewBatchItemID() (string, error)          { return newID('b') }
-func NewArtifactID() (string, error)           { return newID('a') }
-func NewPendingRequestID() (string, error)     { return newID('r') }
-func NewTaskActionID() (string, error)         { return newID('x') }
-func NewModelConnectionID() (string, error)    { return newID('p') }
-func NewMCPConnectorID() (string, error)       { return newID('k') }
+func NewHostID() (string, error)                         { return newID('h') }
+func NewWorkspaceID() (string, error)                    { return newID('w') }
+func NewUserID() (string, error)                         { return newID('u') }
+func NewTokenID() (string, error)                        { return newID('t') }
+func NewClientInstallationID() (string, error)           { return newID('i') }
+func NewConversationID() (string, error)                 { return newID('c') }
+func NewTaskID() (string, error)                         { return newID('q') }
+func NewMessageID() (string, error)                      { return newID('m') }
+func NewStepID() (string, error)                         { return newID('s') }
+func NewOperationID() (string, error)                    { return newID('o') }
+func NewBatchItemID() (string, error)                    { return newID('b') }
+func NewArtifactID() (string, error)                     { return newID('a') }
+func NewPendingRequestID() (string, error)               { return newID('r') }
+func NewTaskActionID() (string, error)                   { return newID('x') }
+func NewModelConnectionID() (string, error)              { return newID('p') }
+func NewMCPConnectorID() (string, error)                 { return newID('k') }
+func NewWorkspaceSyncDeviceBindingID() (string, error)   { return newID('d') }
+func NewWorkspaceSyncDeviceChallengeID() (string, error) { return newID('n') }
+func NewWorkspaceSyncDeviceIdentityID() (string, error)  { return newID('e') }
 
 func newID(prefix byte) (string, error) {
 	var id [8]byte
@@ -44,22 +47,25 @@ func newID(prefix byte) (string, error) {
 	return string(id[:]), nil
 }
 
-func ValidHostID(id string) bool               { return validID(id, 'h') }
-func ValidWorkspaceID(id string) bool          { return validID(id, 'w') }
-func ValidUserID(id string) bool               { return validID(id, 'u') }
-func ValidTokenID(id string) bool              { return validID(id, 't') }
-func ValidClientInstallationID(id string) bool { return validID(id, 'i') }
-func ValidConversationID(id string) bool       { return validID(id, 'c') }
-func ValidTaskID(id string) bool               { return validID(id, 'q') }
-func ValidMessageID(id string) bool            { return validID(id, 'm') }
-func ValidStepID(id string) bool               { return validID(id, 's') }
-func ValidOperationID(id string) bool          { return validID(id, 'o') }
-func ValidBatchItemID(id string) bool          { return validID(id, 'b') }
-func ValidArtifactID(id string) bool           { return validID(id, 'a') }
-func ValidPendingRequestID(id string) bool     { return validID(id, 'r') }
-func ValidTaskActionID(id string) bool         { return validID(id, 'x') }
-func ValidModelConnectionID(id string) bool    { return validID(id, 'p') }
-func ValidMCPConnectorID(id string) bool       { return validID(id, 'k') }
+func ValidHostID(id string) bool                         { return validID(id, 'h') }
+func ValidWorkspaceID(id string) bool                    { return validID(id, 'w') }
+func ValidUserID(id string) bool                         { return validID(id, 'u') }
+func ValidTokenID(id string) bool                        { return validID(id, 't') }
+func ValidClientInstallationID(id string) bool           { return validID(id, 'i') }
+func ValidConversationID(id string) bool                 { return validID(id, 'c') }
+func ValidTaskID(id string) bool                         { return validID(id, 'q') }
+func ValidMessageID(id string) bool                      { return validID(id, 'm') }
+func ValidStepID(id string) bool                         { return validID(id, 's') }
+func ValidOperationID(id string) bool                    { return validID(id, 'o') }
+func ValidBatchItemID(id string) bool                    { return validID(id, 'b') }
+func ValidArtifactID(id string) bool                     { return validID(id, 'a') }
+func ValidPendingRequestID(id string) bool               { return validID(id, 'r') }
+func ValidTaskActionID(id string) bool                   { return validID(id, 'x') }
+func ValidModelConnectionID(id string) bool              { return validID(id, 'p') }
+func ValidMCPConnectorID(id string) bool                 { return validID(id, 'k') }
+func ValidWorkspaceSyncDeviceBindingID(id string) bool   { return validID(id, 'd') }
+func ValidWorkspaceSyncDeviceChallengeID(id string) bool { return validID(id, 'n') }
+func ValidWorkspaceSyncDeviceIdentityID(id string) bool  { return validID(id, 'e') }
 
 func validID(id string, prefix byte) bool {
 	if len(id) != 8 || id[0] != prefix {

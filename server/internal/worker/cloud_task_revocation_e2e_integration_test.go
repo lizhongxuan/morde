@@ -38,7 +38,7 @@ func TestCloudTaskAuthorizationRevocationFencesHostDispatch(t *testing.T) {
 }
 
 // TestCloudTaskOwnerAccountDisableFencesHostDispatch covers disabling the
-// owner account while its Host write request is held in flight.
+// owner account while its Task Workspace write request is held in flight.
 func TestCloudTaskOwnerAccountDisableFencesHostDispatch(t *testing.T) {
 	runCloudTaskAuthorizationRevocationE2E(t, true)
 }
@@ -46,8 +46,8 @@ func TestCloudTaskOwnerAccountDisableFencesHostDispatch(t *testing.T) {
 // runCloudTaskAuthorizationRevocationE2E uses the real task API, PostgreSQL
 // lease/revocation logic, Node dsh subprocess, CloudDSH broker,
 // RuntimeToolExecutor, Host Runtime, and TaskStopWorker. The request is held at
-// the Host HTTP boundary until revocation cancels it; the real Runtime handler
-// must never receive the file-write operation.
+// the Host HTTP boundary until revocation cancels it; the Runtime handler must
+// never receive the Task Workspace write operation.
 func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -81,13 +81,14 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	if err := os.MkdirAll(workspaceDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	files, err := runtimefiles.OpenWorkspace(hostRoot)
+	taskWorkspace, err := runtimefiles.OpenTaskWorkspace(hostRoot,
+		filepath.Join(hostRoot, ".morde-task-views"), uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := files.Close(); err != nil {
-			t.Errorf("close Host runtime workspace: %v", err)
+		if err := taskWorkspace.Close(); err != nil {
+			t.Errorf("close Host Task Workspace views: %v", err)
 		}
 	}()
 	runtimeStore := filepath.Join(t.TempDir(), "runtime-state")
@@ -97,7 +98,7 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	runtimeManager, err := runtimecore.Open(runtimecore.Options{
 		StoreDir: runtimeStore, ExpectedOwnerUID: uint32(os.Geteuid()),
 		HostID: hostValue.ID, Generation: hostValue.RuntimeGeneration, ProtocolVersion: contract.ProtocolVersion,
-		Handlers: files.Handlers(),
+		Handlers: taskWorkspace.Handlers(), TaskWorkspaceViews: taskWorkspace,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +231,7 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 		t.Fatal(err)
 	}
 	model := &f01CloudTaskModel{
-		store: store, hostID: hostValue.ID, workspaceID: workspaceValue.ID,
+		workspaceID:   workspaceValue.ID,
 		secondStarted: make(chan struct{}), content: "this file must not be written after authorization revocation\n",
 	}
 	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}

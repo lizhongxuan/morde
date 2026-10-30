@@ -165,7 +165,7 @@ func TestCloudTaskApprovalIsRevalidatedAfterHostControlFenceChanges(t *testing.T
 		t.Fatal(err)
 	}
 	model := &f01CloudTaskModel{
-		store: store, hostID: hostValue.ID, approvalFirst: true,
+		approvalFirst: true,
 		secondStarted: make(chan struct{}), content: "unused after stale approval",
 	}
 	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}

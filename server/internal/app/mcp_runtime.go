@@ -95,6 +95,9 @@ func (e *MCPRuntimeToolExecutor) Execute(ctx context.Context, principal identity
 		!principal.HasScope(mapping.scope) || !principal.AllowsHost(hostID) {
 		return MCPRuntimeToolResult{}, domain.NewError(domain.CodeForbidden, "MCP runtime tool request is invalid or unauthorized")
 	}
+	if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
+		return MCPRuntimeToolResult{}, domain.NewError(domain.CodeUnsupported, "Workspace file and shell tools require a persistent Task workspace")
+	}
 	hostValue, err := e.authorize(ctx, principal, "", hostID, mapping.scope)
 	if err != nil {
 		return MCPRuntimeToolResult{}, err
@@ -238,7 +241,7 @@ func (e *MCPRuntimeToolExecutor) Execute(ctx context.Context, principal identity
 	}
 
 	runtimeOperation, err := e.operations.Execute(operationCtx, session, operation.RuntimeTaskID, operation.OperationID,
-		operation.LeaseVersion, mapping.capability, mapping.action, operation.Arguments, operation.WorkspaceID, operation.BindingVersion, nil)
+		operation.LeaseVersion, mapping.capability, mapping.action, operation.Arguments, operation.WorkspaceID, operation.BindingVersion, "", 0, nil)
 	if err == nil {
 		runtimeOperation, err = e.operations.Poll(operationCtx, session, operation.RuntimeTaskID, operation.OperationID, operation.LeaseVersion, runtimeOperation)
 	}

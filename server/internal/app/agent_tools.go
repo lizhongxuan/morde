@@ -158,6 +158,7 @@ const (
 
 type AgentVerificationResult struct {
 	Status                 AgentVerificationStatus
+	WaitingReason          string
 	Summary                string
 	Observation            string
 	ObservationFingerprint string
