@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,7 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 	network := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_NETWORK")
 	relayName := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_RELAY_NAME")
 	relayAddress := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_RELAY_ADDRESS")
+	relayBindAddress := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_RELAY_BIND_ADDRESS")
 	relayToken := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_RELAY_TOKEN")
 	relayImage := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_RELAY_IMAGE")
 	nodeImage := workspaceSyncDockerTestEnv(t, "CH_TEST_WORKSPACE_SYNC_DOCKER_NODE_IMAGE")
@@ -74,7 +76,6 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 		defer cleanupCancel()
 		_, _ = workspaceSyncDockerCommand(cleanupCtx, "rm", "--force", pcName)
 		_, _ = workspaceSyncDockerCommand(cleanupCtx, "rm", "--force", nodeName)
-		_, _ = workspaceSyncDockerCommand(cleanupCtx, "network", "disconnect", networkName, relayName)
 		_, _ = workspaceSyncDockerCommand(cleanupCtx, "network", "rm", networkName)
 		_ = os.RemoveAll(runRoot)
 	}()
@@ -122,7 +123,8 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 		Folders:  []workspace.SyncNodeFolder{{WorkspaceID: workspaceID, FolderID: folderID, DeviceIDs: []string{pcID}}},
 	}}
 	supervisor, err := NewDockerWorkspaceSyncNodeSupervisor(DockerWorkspaceSyncNodeSupervisorOptions{
-		ImageDigest: nodeImage, RelayImageDigest: relayImage, RelayPublicAddress: relayAddress, RelayToken: relayToken,
+		ImageDigest: nodeImage, RelayImageDigest: relayImage, RelayPublicAddress: relayAddress,
+		RelayBindAddress: relayBindAddress, RelayToken: relayToken,
 		DockerSocket: socket, RelayStateRoot: filepath.Join(root, "relay-state"), StateRoot: filepath.Join(runRoot, "node-state"),
 		WorkspaceRoot: filepath.Join(runRoot, "workspaces"), RelayContainerName: relayName,
 		Resources: DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
@@ -156,14 +158,21 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 		t.Fatal("provisioned server node returned an invalid or duplicate device identity")
 	}
 
-	if err := pcAPI.ConfigurePrivateRelay(ctx, connection.RelayAddress); err != nil {
+	// This PC is a container on the same Ubuntu host, so avoid requiring provider NAT hairpin.
+	pcRelayURL, err := url.Parse(connection.RelayAddress)
+	if err != nil {
+		t.Fatal("parse public PC relay address")
+	}
+	pcRelayURL.Host = net.JoinHostPort(relayBindAddress, "22067")
+	pcRelayAddress := pcRelayURL.String()
+	if err := pcAPI.ConfigurePrivateRelay(ctx, pcRelayAddress); err != nil {
 		t.Fatalf("configure local PC private relay: %v", err)
 	}
 	deviceRaw, err := pcAPI.GetDefaultDevice(ctx)
 	if err != nil {
 		t.Fatalf("read local PC default device configuration: %v", err)
 	}
-	deviceConfig, err := configureSyncthingDevice(deviceRaw, serverID)
+	deviceConfig, err := configureSyncthingDevice(deviceRaw, serverID, pcRelayAddress)
 	if err != nil {
 		t.Fatalf("configure local PC server device: %v", err)
 	}

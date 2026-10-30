@@ -15,8 +15,6 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
-const taskWorkspacePublishFileLimit int64 = 300 << 20
-
 var taskWorkspaceViewIDPattern = regexp.MustCompile(`^v[a-f0-9]{64}$`)
 
 type TaskWorkspaceBlockReader func(context.Context, string) ([]byte, error)
@@ -67,7 +65,7 @@ func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, v
 	}
 	chunks := make(map[string]int64)
 	for _, file := range files {
-		if err := workspace.ValidateFile(file); err != nil || file.SizeBytes > taskWorkspacePublishFileLimit {
+		if err := workspace.ValidateFile(file); err != nil || file.SizeBytes > workspace.MaxSyncFileBytes {
 			return TaskWorkspacePublishReceipt{}, domain.InvalidArgument("task_workspace_publish", "Task Workspace output file is invalid")
 		}
 		for _, chunk := range file.Chunks {

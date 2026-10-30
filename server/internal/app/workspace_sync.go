@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,13 +20,14 @@ import (
 )
 
 const (
-	manifestPageLimit    int32 = 1000
-	changesDefaultLimit  int32 = 200
-	changesMaxLimit      int32 = 500
-	manifestDefaultLimit int32 = 500
-	manifestMaxLimit     int32 = 1000
-	maxSyncWait                = 25 * time.Second
-	syncPollInterval           = 300 * time.Millisecond
+	manifestPageLimit             int32 = 1000
+	changesDefaultLimit           int32 = 200
+	changesMaxLimit               int32 = 500
+	manifestDefaultLimit          int32 = 500
+	manifestMaxLimit              int32 = 1000
+	workspaceSyncStreamChunkBytes       = 32 << 10
+	maxSyncWait                         = 25 * time.Second
+	syncPollInterval                    = 300 * time.Millisecond
 )
 
 var syncIdempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
@@ -633,7 +633,36 @@ func (s *WorkspaceSyncService) AckDownloadAction(ctx context.Context, principal 
 	return s.store.AckWorkspaceSyncDownloadAction(ctx, workspaceID, sessionID, path, action, sha256, sizeBytes)
 }
 
-func (s *WorkspaceSyncService) GetSyncBlock(ctx context.Context, principal identity.Principal, workspaceID, sessionID, digest string) (io.ReadCloser, error) {
+func (s *WorkspaceSyncService) StreamSyncBlock(ctx context.Context, principal identity.Principal, workspaceID, sessionID, digest string, write func(int64, []byte) error) error {
+	if write == nil {
+		return domain.InvalidArgument("stream", "workspace sync block stream is required")
+	}
+	data, err := s.readSyncBlock(ctx, principal, workspaceID, sessionID, digest)
+	if err != nil {
+		return err
+	}
+	total := int64(len(data))
+	writeChunk := func(chunk []byte) error {
+		if principal.Kind != identity.KindDevice {
+			return write(total, chunk)
+		}
+		return s.store.WithWorkspaceSyncDeviceSessionAccess(ctx, principal, workspaceID, sessionID, func() error {
+			return write(total, chunk)
+		})
+	}
+	if len(data) == 0 {
+		return writeChunk(data)
+	}
+	for offset := 0; offset < len(data); offset += workspaceSyncStreamChunkBytes {
+		end := min(offset+workspaceSyncStreamChunkBytes, len(data))
+		if err := writeChunk(data[offset:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *WorkspaceSyncService) readSyncBlock(ctx context.Context, principal identity.Principal, workspaceID, sessionID, digest string) ([]byte, error) {
 	value, err := s.authorize(ctx, principal, workspaceID)
 	if err != nil {
 		return nil, err
@@ -666,14 +695,7 @@ func (s *WorkspaceSyncService) GetSyncBlock(ctx context.Context, principal ident
 	if err != nil {
 		return nil, err
 	}
-	reader := io.NopCloser(bytes.NewReader(data))
-	if principal.Kind == identity.KindDevice {
-		return reauthorizeSyncReadCloser{
-			ReadCloser: reader,
-			authorize:  func() error { return s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID) },
-		}, nil
-	}
-	return reader, nil
+	return data, nil
 }
 
 func (s *WorkspaceSyncService) authorize(ctx context.Context, principal identity.Principal, workspaceID string) (workspace.Workspace, error) {
@@ -738,18 +760,6 @@ func (r reauthorizeSyncReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return r.reader.Read(p)
-}
-
-type reauthorizeSyncReadCloser struct {
-	io.ReadCloser
-	authorize func() error
-}
-
-func (r reauthorizeSyncReadCloser) Read(p []byte) (int, error) {
-	if err := r.authorize(); err != nil {
-		return 0, err
-	}
-	return r.ReadCloser.Read(p)
 }
 
 func (s *WorkspaceSyncService) authorizeSession(ctx context.Context, principal identity.Principal, value workspace.Workspace, workspaceID, sessionID string) (workspace.SyncSession, error) {
@@ -975,7 +985,7 @@ var _ interface {
 	CommitSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	CancelSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	PutSyncBlock(context.Context, identity.Principal, string, string, string, io.Reader) (int64, error)
+	StreamSyncBlock(context.Context, identity.Principal, string, string, string, func(int64, []byte) error) error
 	AckDownloadedBlock(context.Context, identity.Principal, string, string, string) error
 	AckDownloadAction(context.Context, identity.Principal, string, string, string, workspace.ChangeAction, string, int64) error
-	GetSyncBlock(context.Context, identity.Principal, string, string, string) (io.ReadCloser, error)
 } = (*WorkspaceSyncService)(nil)

@@ -265,6 +265,34 @@ current_fingerprint() {
   printf 'inet\n%s\nbridge\n%s\n' "$inet_table" "$bridge_table" | sha256sum | awk '{print $1}'
 }
 
+workspace_sync_relay_bind_ipv4() {
+  python3 - "${CH_WORKSPACE_SYNC_RELAY_PUBLIC_ADDRESS:-}" "${CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS:-}" <<'PY'
+import ipaddress
+import sys
+
+public_value, bind_value = sys.argv[1:]
+if not public_value or public_value == "127.0.0.1:22067":
+    print("")
+    raise SystemExit(0)
+host, separator, port = public_value.rpartition(":")
+if not separator or port != "22067":
+    raise SystemExit("FAIL network-policy Workspace relay must be a public IPv4 address on TCP 22067")
+try:
+    public = ipaddress.ip_address(host)
+except ValueError as exc:
+    raise SystemExit("FAIL network-policy Workspace relay must use a static public IPv4 address") from exc
+if public.version != 4 or not public.is_global:
+    raise SystemExit("FAIL network-policy Workspace relay must use a static public IPv4 address")
+try:
+    bind = ipaddress.ip_address(bind_value)
+except ValueError as exc:
+    raise SystemExit("FAIL network-policy Workspace relay bind must be a usable host IPv4 address") from exc
+if bind.version != 4 or bind.is_unspecified or bind.is_loopback or bind.is_link_local or bind.is_multicast:
+    raise SystemExit("FAIL network-policy Workspace relay bind must be a usable host IPv4 address")
+print(bind)
+PY
+}
+
 check_protected_directory_chain() {
   local target="$1" current="/" part owner mode
   local -a parts
@@ -320,6 +348,8 @@ lock_policy_state() {
 }
 
 install_policy_rules() {
+  local relay_ip
+  relay_ip="$(workspace_sync_relay_bind_ipv4)" || fail 'Workspace relay bind destination is invalid'
   cat >"$TMP_DIR/rules.nft" <<'NFT'
 destroy table inet cloudhost
 destroy table bridge cloudhost
@@ -329,12 +359,32 @@ add chain inet cloudhost input { type filter hook input priority filter - 1; pol
 add chain inet cloudhost forward { type filter hook forward priority filter - 1; policy accept; }
 add rule inet cloudhost input iifname "chbr0" ct state { established, related } accept
 add rule inet cloudhost input iifname "chbr0" counter drop
+add rule inet cloudhost input iifname "msync*" ct state { established, related } accept
+add rule inet cloudhost input iifname "msync*" counter drop
+add rule inet cloudhost forward iifname "msync*" meta nfproto ipv6 counter drop
+__WORKSPACE_SYNC_RELAY_ALLOW__
+add rule inet cloudhost forward oifname "msync*" ct state { established, related } accept
+add rule inet cloudhost forward iifname "msync*" counter drop
 add rule inet cloudhost forward iifname "chbr0" ct direction original ip daddr @blocked4 counter drop
 add rule inet cloudhost forward iifname "chbr0" meta nfproto ipv6 counter drop
 add table bridge cloudhost
 add chain bridge cloudhost forward { type filter hook forward priority filter; policy accept; }
 add rule bridge cloudhost forward ibrname "chbr0" obrname "chbr0" counter drop
 NFT
+
+  python3 - "$TMP_DIR/rules.nft" "$relay_ip" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+rules = path.read_text()
+marker = "__WORKSPACE_SYNC_RELAY_ALLOW__"
+if rules.count(marker) != 1:
+    raise SystemExit("FAIL network-policy Workspace relay rule marker is invalid")
+ip = sys.argv[2]
+rule = f'add rule inet cloudhost forward iifname "msync*" meta l4proto tcp ct original ip daddr {ip} ct original proto-dst 22067 accept' if ip else ""
+path.write_text(rules.replace(marker, rule))
+PY
 
   "$NFT_BIN" --check --file "$TMP_DIR/rules.nft" >/dev/null || fail 'nftables rejected the isolated network policy; no rules were changed'
   "$NFT_BIN" --file "$TMP_DIR/rules.nft" >/dev/null || fail 'nftables could not atomically replace the dedicated network-policy tables'

@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -26,22 +27,38 @@ import (
 )
 
 const (
-	testWorkspaceSyncOwner   = "u1234567"
-	testWorkspaceSyncDevice  = "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA"
-	testWorkspaceSyncNodeID  = "BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB"
-	testWorkspaceSyncRelayID = "CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC"
+	testWorkspaceSyncOwner    = "u1234567"
+	testWorkspaceSyncDevice   = "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA"
+	testWorkspaceSyncNodeID   = "BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB"
+	testWorkspaceSyncRelayID  = "CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC-CCCCCCC"
+	testWorkspaceSyncRelayURI = "relay://8.8.8.8:22067/?id=" + testWorkspaceSyncRelayID + "&token=" + workspaceSyncTestRelayToken
 )
 
 type workspaceSyncNodeSupervisorStub struct {
-	ownerID string
-	apiKey  string
-	apiURL  string
+	ownerID          string
+	apiKey           string
+	apiURL           string
+	ensureError      error
+	stopError        error
+	stopCalls        int
+	stopOwnerID      string
+	stopContextError error
 	workspaceSyncRelayConfig
 }
 
 func (s *workspaceSyncNodeSupervisorStub) Ensure(_ context.Context, ownerID, apiKey string) (DockerWorkspaceSyncNode, error) {
 	s.ownerID, s.apiKey = ownerID, apiKey
+	if s.ensureError != nil {
+		return DockerWorkspaceSyncNode{}, s.ensureError
+	}
 	return DockerWorkspaceSyncNode{ContainerID: strings.Repeat("a", 64), APIURL: s.apiURL}, nil
+}
+
+func (s *workspaceSyncNodeSupervisorStub) StopOwner(ctx context.Context, ownerID string) error {
+	s.stopCalls++
+	s.stopOwnerID = ownerID
+	s.stopContextError = ctx.Err()
+	return s.stopError
 }
 
 func (s *workspaceSyncNodeSupervisorStub) relayConfig() workspaceSyncRelayConfig {
@@ -53,9 +70,18 @@ type workspaceSyncNodeStoreStub struct {
 	state      workspace.SyncNodeDesiredState
 	reconcile  int
 	applyError error
+	expiryScan bool
+}
+
+func (s *workspaceSyncNodeStoreStub) RevokeExpiredWorkspaceSyncDevices(context.Context) error {
+	s.expiryScan = true
+	return nil
 }
 
 func (s *workspaceSyncNodeStoreStub) ListWorkspaceSyncNodeOwnersToReconcile(context.Context) ([]string, error) {
+	if !s.expiryScan {
+		return nil, fmt.Errorf("expired Workspace sync devices were not scanned before listing owners")
+	}
 	return append([]string(nil), s.owners...), nil
 }
 
@@ -79,6 +105,8 @@ type workspaceSyncNodeTestAPI struct {
 	statusFailures       int
 	statusCalls          atomic.Int32
 	apiKey               string
+	nodeID               string
+	optionsError         bool
 	listenAddresses      []string
 	events               []string
 	omitConnectionDevice string
@@ -98,8 +126,16 @@ func (s *workspaceSyncNodeTestAPI) handler(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "starting", http.StatusServiceUnavailable)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"myID":%q}`, testWorkspaceSyncNodeID)
+		nodeID := s.nodeID
+		if nodeID == "" {
+			nodeID = testWorkspaceSyncNodeID
+		}
+		_, _ = fmt.Fprintf(w, `{"myID":%q}`, nodeID)
 	case r.Method == http.MethodPatch && r.URL.Path == "/rest/config/options":
+		if s.optionsError {
+			http.Error(w, "options update failed", http.StatusInternalServerError)
+			return
+		}
 		var patch struct {
 			ListenAddresses []string `json:"listenAddresses"`
 		}
@@ -228,6 +264,8 @@ func writeConfigItem(w http.ResponseWriter, values map[string]map[string]any, id
 func TestWorkspaceSyncNodeProvisionerAppliesSnapshotAndReturnsPinnedRelay(t *testing.T) {
 	relayRoot := t.TempDir()
 	relayID := writeWorkspaceSyncRelayCertificate(t, relayRoot)
+	publicRelayURI := "relay://8.8.8.8:22067/?id=" + relayID + "&token=" + workspaceSyncTestRelayToken
+	nodeRelayURI := "relay://172.18.141.222:22067/?id=" + relayID + "&token=" + workspaceSyncTestRelayToken
 	api := &workspaceSyncNodeTestAPI{
 		folders: make(map[string]map[string]any), devices: make(map[string]map[string]any),
 		pausedDevices: make(map[string]bool), statusFailures: 1,
@@ -236,7 +274,7 @@ func TestWorkspaceSyncNodeProvisionerAppliesSnapshotAndReturnsPinnedRelay(t *tes
 	defer server.Close()
 	api.apiKey = ""
 	supervisor := &workspaceSyncNodeSupervisorStub{apiURL: server.URL, workspaceSyncRelayConfig: workspaceSyncRelayConfig{
-		StateRoot: relayRoot, PublicAddress: "relay.example.test:22067", Token: workspaceSyncTestRelayToken,
+		StateRoot: relayRoot, PublicAddress: "8.8.8.8:22067", BindAddress: "172.18.141.222", Token: workspaceSyncTestRelayToken,
 	}}
 	store := &workspaceSyncNodeStoreStub{state: workspace.SyncNodeDesiredState{
 		Revision: 1,
@@ -254,12 +292,12 @@ func TestWorkspaceSyncNodeProvisionerAppliesSnapshotAndReturnsPinnedRelay(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if connection.DeviceID != testWorkspaceSyncNodeID || connection.RelayAddress != "relay://relay.example.test:22067/?id="+relayID+"&token="+workspaceSyncTestRelayToken ||
-		supervisor.ownerID != testWorkspaceSyncOwner || supervisor.apiKey != api.apiKey || store.reconcile != 1 || api.statusCalls.Load() != 3 {
+	if connection.DeviceID != testWorkspaceSyncNodeID || connection.RelayAddress != publicRelayURI ||
+		supervisor.ownerID != testWorkspaceSyncOwner || supervisor.apiKey != api.apiKey || store.reconcile != 1 || api.statusCalls.Load() != 3 || supervisor.stopCalls != 0 {
 		t.Fatalf("connection=%+v owner=%q key_match=%t reconciles=%d status_calls=%d", connection, supervisor.ownerID,
 			supervisor.apiKey == api.apiKey, store.reconcile, api.statusCalls.Load())
 	}
-	if len(api.listenAddresses) != 1 || api.listenAddresses[0] != "relay://morde-relay:22067/?id="+relayID+"&token="+workspaceSyncTestRelayToken {
+	if len(api.listenAddresses) != 1 || api.listenAddresses[0] != nodeRelayURI {
 		t.Fatalf("node listen addresses = %v", api.listenAddresses)
 	}
 	if len(api.folders) != 1 || len(api.devices) != 2 {
@@ -274,8 +312,120 @@ func TestWorkspaceSyncNodeProvisionerAppliesSnapshotAndReturnsPinnedRelay(t *tes
 		t.Fatalf("folder config = %#v", folder)
 	}
 	device := api.devices[testWorkspaceSyncDevice]
-	if device["autoAcceptFolders"] != false || device["paused"] != false {
+	addresses, ok := device["addresses"].([]any)
+	if device["autoAcceptFolders"] != false || device["paused"] != false || !ok || !slices.Equal(addresses, []any{nodeRelayURI}) {
 		t.Fatalf("device config = %#v", device)
+	}
+}
+
+func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing.T) {
+	storeFailure := errors.New("desired state store failed")
+	tests := []struct {
+		name             string
+		apiURL           string
+		ensureError      error
+		statusFailures   int
+		nodeID           string
+		invalidRelayCert bool
+		optionsError     bool
+		storeError       error
+		cancelRequestCtx bool
+	}{
+		{name: "supervisor ensure", ensureError: errors.New("supervisor failed")},
+		{name: "invalid API configuration", apiURL: "not a URL"},
+		{name: "API readiness", statusFailures: 1, cancelRequestCtx: true},
+		{name: "node identity", nodeID: "invalid device id"},
+		{name: "relay certificate", invalidRelayCert: true},
+		{name: "private relay configuration", optionsError: true},
+		{name: "store reconciliation", storeError: storeFailure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			relayRoot := t.TempDir()
+			if test.invalidRelayCert {
+				if err := os.WriteFile(filepath.Join(relayRoot, "cert.pem"), []byte("invalid certificate"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				_ = writeWorkspaceSyncRelayCertificate(t, relayRoot)
+			}
+			api := &workspaceSyncNodeTestAPI{
+				folders: make(map[string]map[string]any), devices: make(map[string]map[string]any),
+				pausedDevices: make(map[string]bool), statusFailures: test.statusFailures,
+				nodeID: test.nodeID, optionsError: test.optionsError,
+			}
+			server := httptest.NewServer(http.HandlerFunc(api.handler))
+			defer server.Close()
+			apiURL := server.URL
+			if test.apiURL != "" {
+				apiURL = test.apiURL
+			}
+			supervisor := &workspaceSyncNodeSupervisorStub{
+				apiURL: apiURL, ensureError: test.ensureError,
+				workspaceSyncRelayConfig: workspaceSyncRelayConfig{
+					StateRoot: relayRoot, PublicAddress: "8.8.8.8:22067", BindAddress: "172.18.141.222", Token: workspaceSyncTestRelayToken,
+				},
+			}
+			store := &workspaceSyncNodeStoreStub{applyError: test.storeError}
+			provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
+				Supervisor: supervisor, Store: store, DataKey: []byte(strings.Repeat("k", 32)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.apiKey = provisioner.apiKey(testWorkspaceSyncOwner)
+
+			ctx := context.Background()
+			if test.cancelRequestCtx {
+				cancelledCtx, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelledCtx
+			}
+			if _, err := provisioner.EnsureWorkspaceSyncNode(ctx, testWorkspaceSyncOwner); err == nil {
+				t.Fatal("provisioning failure was accepted")
+			}
+			if supervisor.stopCalls != 1 || supervisor.stopOwnerID != testWorkspaceSyncOwner {
+				t.Fatalf("stop calls=%d owner=%q", supervisor.stopCalls, supervisor.stopOwnerID)
+			}
+			if supervisor.stopContextError != nil {
+				t.Fatalf("StopOwner received canceled context: %v", supervisor.stopContextError)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSyncNodeProvisionerJoinsStopErrorAndRedactsSecrets(t *testing.T) {
+	relayRoot := t.TempDir()
+	_ = writeWorkspaceSyncRelayCertificate(t, relayRoot)
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	cleanup := errors.New("cleanup failure includes relay token " + workspaceSyncTestRelayToken)
+	supervisor := &workspaceSyncNodeSupervisorStub{
+		apiURL: server.URL, stopError: cleanup,
+		workspaceSyncRelayConfig: workspaceSyncRelayConfig{
+			StateRoot: relayRoot, PublicAddress: "8.8.8.8:22067", BindAddress: "172.18.141.222", Token: workspaceSyncTestRelayToken,
+		},
+	}
+	provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
+		Supervisor: supervisor, Store: &workspaceSyncNodeStoreStub{}, DataKey: []byte(strings.Repeat("k", 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey := provisioner.apiKey(testWorkspaceSyncOwner)
+	primary := errors.New("primary failure includes api key " + apiKey)
+	supervisor.ensureError = primary
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = provisioner.EnsureWorkspaceSyncNode(ctx, testWorkspaceSyncOwner)
+	if err == nil || !errors.Is(err, primary) || !errors.Is(err, cleanup) {
+		t.Fatalf("error=%v, want primary and cleanup errors joined", err)
+	}
+	if strings.Contains(err.Error(), apiKey) || strings.Contains(err.Error(), workspaceSyncTestRelayToken) {
+		t.Fatalf("provisioning error leaked a secret: %v", err)
+	}
+	if supervisor.stopCalls != 1 || supervisor.stopContextError != nil {
+		t.Fatalf("stop calls=%d context error=%v", supervisor.stopCalls, supervisor.stopContextError)
 	}
 }
 
@@ -302,7 +452,7 @@ func TestWorkspaceSyncNodeApplyRevokesOneFolderButKeepsOtherWorkspaceDevice(t *t
 	}
 	state := workspace.SyncNodeDesiredState{OwnerID: testWorkspaceSyncOwner, Revision: 2,
 		Folders: []workspace.SyncNodeFolder{{WorkspaceID: "w1234567", FolderID: keptFolder, DeviceIDs: []string{testWorkspaceSyncDevice}}}}
-	if err := applyWorkspaceSyncNodeDesiredState(context.Background(), client, state, testWorkspaceSyncNodeID); err != nil {
+	if err := applyWorkspaceSyncNodeDesiredState(context.Background(), client, state, testWorkspaceSyncNodeID, testWorkspaceSyncRelayURI); err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := api.folders[removedFolder]; exists || api.folders[keptFolder] == nil || api.devices[testWorkspaceSyncDevice] == nil {
@@ -344,7 +494,7 @@ func TestWorkspaceSyncNodeApplyRepairsManagedFolderTypeAndLabel(t *testing.T) {
 	}
 	state := workspace.SyncNodeDesiredState{OwnerID: testWorkspaceSyncOwner, Revision: 2,
 		Folders: []workspace.SyncNodeFolder{{WorkspaceID: "w1234567", FolderID: folderID, DeviceIDs: []string{testWorkspaceSyncDevice}}}}
-	if err := applyWorkspaceSyncNodeDesiredState(context.Background(), client, state, testWorkspaceSyncNodeID); err != nil {
+	if err := applyWorkspaceSyncNodeDesiredState(context.Background(), client, state, testWorkspaceSyncNodeID, testWorkspaceSyncRelayURI); err != nil {
 		t.Fatal(err)
 	}
 	folder := api.folders[folderID]
@@ -369,7 +519,7 @@ func TestWorkspaceSyncNodeApplyFailsClosedWhenPauseStateOmitsConfiguredDevice(t 
 		t.Fatal(err)
 	}
 	if err := applyWorkspaceSyncNodeDesiredState(context.Background(), client,
-		workspace.SyncNodeDesiredState{OwnerID: testWorkspaceSyncOwner, Revision: 2}, testWorkspaceSyncNodeID); err == nil {
+		workspace.SyncNodeDesiredState{OwnerID: testWorkspaceSyncOwner, Revision: 2}, testWorkspaceSyncNodeID, testWorkspaceSyncRelayURI); err == nil {
 		t.Fatal("missing configured-device connection state was treated as a completed pause")
 	}
 	if api.folders[folderID] == nil || api.devices[testWorkspaceSyncDevice] == nil {
@@ -398,7 +548,7 @@ func TestWorkspaceSyncNodeApplyWaitsForActiveConnectionToClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	if err := applyWorkspaceSyncNodeDesiredState(ctx, client,
-		workspace.SyncNodeDesiredState{OwnerID: testWorkspaceSyncOwner, Revision: 2}, testWorkspaceSyncNodeID); err == nil {
+		workspace.SyncNodeDesiredState{OwnerID: testWorkspaceSyncOwner, Revision: 2}, testWorkspaceSyncNodeID, testWorkspaceSyncRelayURI); err == nil {
 		t.Fatal("active Syncthing connection was treated as disconnected")
 	}
 	if api.folders[folderID] == nil || api.devices[testWorkspaceSyncDevice] == nil {
@@ -416,7 +566,7 @@ func TestWorkspaceSyncNodeProvisionerRejectsInvalidInputsAndReconcilesPendingOwn
 	relayRoot := t.TempDir()
 	_ = writeWorkspaceSyncRelayCertificate(t, relayRoot)
 	supervisor := &workspaceSyncNodeSupervisorStub{apiURL: server.URL, workspaceSyncRelayConfig: workspaceSyncRelayConfig{
-		StateRoot: relayRoot, PublicAddress: "relay.example.test:22067", Token: workspaceSyncTestRelayToken,
+		StateRoot: relayRoot, PublicAddress: "8.8.8.8:22067", BindAddress: "172.18.141.222", Token: workspaceSyncTestRelayToken,
 	}}
 	store := &workspaceSyncNodeStoreStub{owners: []string{testWorkspaceSyncOwner}, state: workspace.SyncNodeDesiredState{Revision: 1}}
 	options := WorkspaceSyncNodeProvisionerOptions{Supervisor: supervisor, Store: store, DataKey: []byte(strings.Repeat("k", 32))}
@@ -436,6 +586,11 @@ func TestWorkspaceSyncNodeProvisionerRejectsInvalidInputsAndReconcilesPendingOwn
 	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, DataKey: options.DataKey}); err == nil {
 		t.Fatal("missing relay token was accepted")
 	}
+	invalidRelaySupervisor = *supervisor
+	invalidRelaySupervisor.workspaceSyncRelayConfig.BindAddress = "0.0.0.0"
+	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, DataKey: options.DataKey}); err == nil {
+		t.Fatal("unspecified relay bind address was accepted")
+	}
 	provisioner, err := NewWorkspaceSyncNodeProvisioner(options)
 	if err != nil {
 		t.Fatal(err)
@@ -444,11 +599,37 @@ func TestWorkspaceSyncNodeProvisionerRejectsInvalidInputsAndReconcilesPendingOwn
 	if err := provisioner.ReconcilePendingWorkspaceSyncNodes(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if store.reconcile != 1 || supervisor.ownerID != testWorkspaceSyncOwner {
-		t.Fatalf("pending reconciliation calls=%d owner=%q", store.reconcile, supervisor.ownerID)
+	if !store.expiryScan || store.reconcile != 1 || supervisor.ownerID != testWorkspaceSyncOwner {
+		t.Fatalf("pending reconciliation expiry_scan=%t calls=%d owner=%q", store.expiryScan, store.reconcile, supervisor.ownerID)
 	}
 	if _, err := provisioner.EnsureWorkspaceSyncNode(context.Background(), "../other"); err == nil {
 		t.Fatal("invalid owner ID was accepted")
+	}
+}
+
+func TestWorkspaceSyncRelayHostRequiresPublicIPv4AndPort22067(t *testing.T) {
+	for _, address := range []string{"8.8.8.8:22067"} {
+		if !validWorkspaceSyncRelayHost(address) {
+			t.Errorf("valid relay address %q was rejected", address)
+		}
+	}
+	for _, address := range []string{"relay.example.test:22067", "10.0.0.1:22067", "127.0.0.1:22067", "8.8.8.8:22068", "[2001:db8::1]:22067"} {
+		if validWorkspaceSyncRelayHost(address) {
+			t.Errorf("unsafe relay address %q was accepted", address)
+		}
+	}
+}
+
+func TestWorkspaceSyncRelayNodeURIAllowsOnlyRoutableIPv4AndPort22067(t *testing.T) {
+	for _, address := range []string{"172.18.141.222:22067", "8.8.8.8:22067"} {
+		if !validWorkspaceSyncRelayURIHost(address) {
+			t.Errorf("valid relay URI host %q was rejected", address)
+		}
+	}
+	for _, address := range []string{"127.0.0.1:22067", "169.254.1.1:22067", "0.0.0.0:22067", "relay.example.test:22067", "172.18.141.222:22068", "[::ffff:8.8.8.8]:22067"} {
+		if validWorkspaceSyncRelayURIHost(address) {
+			t.Errorf("invalid relay URI host %q was accepted", address)
+		}
 	}
 }
 

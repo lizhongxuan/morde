@@ -20,6 +20,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/workspace"
 )
 
 type clientLoginHTTPAuth struct {
@@ -58,7 +59,7 @@ func clientLoginFixture(t *testing.T) (*Store, *app.CredentialService, *app.Clie
 	if err != nil {
 		t.Fatal(err)
 	}
-	clients, err := app.NewClientLoginService(store, credentials)
+	clients, err := app.NewClientLoginService(store, credentials, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +158,55 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	items, err := store.ListClientInstallations(ctx, owner.ID)
 	if err != nil || len(items) != 1 || items[0].RevokedAt == nil {
 		t.Fatalf("installation list = %#v, %v", items, err)
+	}
+}
+
+func TestClientLoginCredentialRotationCancelsDeviceSyncSession(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	first, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-rotate-0001", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := credentials.VerifyClient(ctx, first.ClientCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDevice, err := credentials.VerifyDevice(ctx, first.SyncCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-credential-rotation")
+	registerTestWorkspaceSyncDevice(t, store, client, value.ID,
+		"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA", "credential rotation certificate")
+	applyWorkspaceSyncNodeState(t, store, owner.ID)
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	session.ReplicaID = "device:" + oldDevice.TokenID
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "credential-rotation-session", session.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", first.InstallationID, "login-rotate-0002", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentials.VerifyDevice(ctx, first.SyncCredential); err == nil {
+		t.Fatal("old Device credential remained active after rotation")
+	}
+	newDevice, err := credentials.VerifyDevice(ctx, rotated.SyncCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckWorkspaceSyncDeviceAccess(ctx, oldDevice, value.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("old Device credential access after rotation = %v; want not found", err)
+	}
+	if err := store.CheckWorkspaceSyncDeviceAccess(ctx, newDevice, value.ID); err != nil {
+		t.Fatalf("new Device credential lost its installation binding: %v", err)
+	}
+	cancelled, err := store.GetWorkspaceSyncSession(ctx, value.ID, session.ID)
+	if err != nil || cancelled.State != workspace.SyncCancelled {
+		t.Fatalf("session after credential rotation = %q, %v; want cancelled", cancelled.State, err)
 	}
 }
 

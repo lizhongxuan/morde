@@ -22,12 +22,16 @@ import (
 
 type workspaceSyncNodeSupervisor interface {
 	Ensure(context.Context, string, string) (DockerWorkspaceSyncNode, error)
+	StopOwner(context.Context, string) error
 	relayConfig() workspaceSyncRelayConfig
 }
+
+const workspaceSyncNodeStopTimeout = 5 * time.Second
 
 type workspaceSyncRelayConfig struct {
 	StateRoot     string
 	PublicAddress string
+	BindAddress   string
 	Token         string
 }
 
@@ -39,6 +43,7 @@ type WorkspaceSyncNodeProvisioner struct {
 }
 
 type workspaceSyncNodeReconciliationStore interface {
+	RevokeExpiredWorkspaceSyncDevices(context.Context) error
 	ListWorkspaceSyncNodeOwnersToReconcile(context.Context) ([]string, error)
 	ReconcileWorkspaceSyncNode(context.Context, string, func(context.Context, workspace.SyncNodeDesiredState) error) error
 }
@@ -55,7 +60,8 @@ func NewWorkspaceSyncNodeProvisioner(options WorkspaceSyncNodeProvisionerOptions
 	}
 	relay := options.Supervisor.relayConfig()
 	if !filepath.IsAbs(relay.StateRoot) || filepath.Clean(relay.StateRoot) != relay.StateRoot || relay.StateRoot == string(filepath.Separator) ||
-		!validWorkspaceSyncRelayHost(relay.PublicAddress) || !workspaceSyncRelayTokenPattern.MatchString(relay.Token) {
+		!validWorkspaceSyncRelayHost(relay.PublicAddress) || !validWorkspaceSyncRelayBindAddress(relay.BindAddress) ||
+		!workspaceSyncRelayTokenPattern.MatchString(relay.Token) {
 		return nil, errors.New("workspace sync node supervisor relay configuration is invalid")
 	}
 	return &WorkspaceSyncNodeProvisioner{
@@ -67,14 +73,20 @@ func NewWorkspaceSyncNodeProvisioner(options WorkspaceSyncNodeProvisionerOptions
 // EnsureWorkspaceSyncNode creates or reuses the owner's persistent node and
 // applies the current authorized device and folder snapshot before returning
 // connection details to the desktop client.
-func (p *WorkspaceSyncNodeProvisioner) EnsureWorkspaceSyncNode(ctx context.Context, ownerID string) (workspace.SyncNodeConnection, error) {
+func (p *WorkspaceSyncNodeProvisioner) EnsureWorkspaceSyncNode(ctx context.Context, ownerID string) (connection workspace.SyncNodeConnection, retErr error) {
 	if ctx == nil || !domain.ValidUserID(ownerID) {
 		return workspace.SyncNodeConnection{}, errors.New("invalid workspace sync node owner")
 	}
 	key := p.apiKey(ownerID)
+	defer func() {
+		if retErr != nil {
+			retErr = p.stopOwnerAfterFailure(ownerID, key, retErr)
+		}
+	}()
+
 	node, err := p.supervisor.Ensure(ctx, ownerID, key)
 	if err != nil {
-		return workspace.SyncNodeConnection{}, errors.New("workspace sync node provisioning failed")
+		return workspace.SyncNodeConnection{}, fmt.Errorf("workspace sync node provisioning failed: %w", err)
 	}
 	client, err := NewSyncthingAPIClient(node.APIURL, key)
 	if err != nil {
@@ -93,30 +105,67 @@ func (p *WorkspaceSyncNodeProvisioner) EnsureWorkspaceSyncNode(ctx context.Conte
 	if err != nil {
 		return workspace.SyncNodeConnection{}, err
 	}
-	internalRelay, err := staticRelayURI("morde-relay:22067", relayID, p.relay.Token)
-	if err != nil {
-		return workspace.SyncNodeConnection{}, err
-	}
-	if err := client.ConfigurePrivateRelay(readyCtx, internalRelay); err != nil {
-		return workspace.SyncNodeConnection{}, fmt.Errorf("configure private Workspace sync relay: %w", err)
-	}
-	if err := p.store.ReconcileWorkspaceSyncNode(readyCtx, ownerID, func(applyCtx context.Context, state workspace.SyncNodeDesiredState) error {
-		return applyWorkspaceSyncNodeDesiredState(applyCtx, client, state, nodeID)
-	}); err != nil {
-		return workspace.SyncNodeConnection{}, fmt.Errorf("reconcile Workspace sync node: %w", err)
-	}
 	publicRelay, err := staticRelayURI(p.relay.PublicAddress, relayID, p.relay.Token)
 	if err != nil {
 		return workspace.SyncNodeConnection{}, err
 	}
+	nodeRelay, err := staticRelayURI(net.JoinHostPort(p.relay.BindAddress, "22067"), relayID, p.relay.Token)
+	if err != nil {
+		return workspace.SyncNodeConnection{}, err
+	}
+	if err := client.ConfigurePrivateRelay(readyCtx, nodeRelay); err != nil {
+		return workspace.SyncNodeConnection{}, fmt.Errorf("configure private Workspace sync relay: %w", err)
+	}
+	if err := p.store.ReconcileWorkspaceSyncNode(readyCtx, ownerID, func(applyCtx context.Context, state workspace.SyncNodeDesiredState) error {
+		return applyWorkspaceSyncNodeDesiredState(applyCtx, client, state, nodeID, nodeRelay)
+	}); err != nil {
+		return workspace.SyncNodeConnection{}, fmt.Errorf("reconcile Workspace sync node: %w", err)
+	}
 	return workspace.SyncNodeConnection{DeviceID: nodeID, RelayAddress: publicRelay}, nil
 }
+
+func (p *WorkspaceSyncNodeProvisioner) stopOwnerAfterFailure(ownerID, apiKey string, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), workspaceSyncNodeStopTimeout)
+	defer cancel()
+	if err := p.supervisor.StopOwner(ctx, ownerID); err != nil {
+		cause = errors.Join(cause, fmt.Errorf("stop Workspace sync node after provisioning failure: %w", err))
+	}
+	return redactWorkspaceSyncNodeSecrets(cause, apiKey, p.relay.Token)
+}
+
+func redactWorkspaceSyncNodeSecrets(err error, secrets ...string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	if message == err.Error() {
+		return err
+	}
+	return workspaceSyncNodeRedactedError{message: message, cause: err}
+}
+
+type workspaceSyncNodeRedactedError struct {
+	message string
+	cause   error
+}
+
+func (e workspaceSyncNodeRedactedError) Error() string { return e.message }
+
+func (e workspaceSyncNodeRedactedError) Unwrap() error { return e.cause }
 
 // ReconcilePendingWorkspaceSyncNodes reapplies durable owner snapshots after
 // process restart or an earlier node API failure.
 func (p *WorkspaceSyncNodeProvisioner) ReconcilePendingWorkspaceSyncNodes(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("workspace sync reconciliation context is required")
+	}
+	if err := p.store.RevokeExpiredWorkspaceSyncDevices(ctx); err != nil {
+		return fmt.Errorf("revoke expired Workspace sync devices: %w", err)
 	}
 	owners, err := p.store.ListWorkspaceSyncNodeOwnersToReconcile(ctx)
 	if err != nil {
@@ -132,6 +181,23 @@ func (p *WorkspaceSyncNodeProvisioner) ReconcilePendingWorkspaceSyncNodes(ctx co
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (p *WorkspaceSyncNodeProvisioner) ReconcileWorkspaceSyncNodeOwner(ctx context.Context, ownerID string) error {
+	if ctx == nil || !domain.ValidUserID(ownerID) {
+		return errors.New("invalid workspace sync node owner")
+	}
+	owners, err := p.store.ListWorkspaceSyncNodeOwnersToReconcile(ctx)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range owners {
+		if candidate == ownerID {
+			_, err := p.EnsureWorkspaceSyncNode(ctx, ownerID)
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *WorkspaceSyncNodeProvisioner) apiKey(ownerID string) string {
@@ -188,7 +254,7 @@ func (p *WorkspaceSyncNodeProvisioner) relayDeviceID(ctx context.Context) (strin
 }
 
 func staticRelayURI(hostPort, relayID, relayToken string) (string, error) {
-	if !validSyncthingDeviceID(relayID) || !validWorkspaceSyncRelayHost(hostPort) || !workspaceSyncRelayTokenPattern.MatchString(relayToken) {
+	if !validSyncthingDeviceID(relayID) || !validWorkspaceSyncRelayURIHost(hostPort) || !workspaceSyncRelayTokenPattern.MatchString(relayToken) {
 		return "", errors.New("invalid Workspace sync relay identity")
 	}
 	u, err := url.Parse("relay://" + hostPort)
@@ -201,34 +267,37 @@ func staticRelayURI(hostPort, relayID, relayToken string) (string, error) {
 	return u.String(), nil
 }
 
+func validWorkspaceSyncRelayURIHost(hostPort string) bool {
+	if strings.TrimSpace(hostPort) != hostPort || strings.ContainsAny(hostPort, "/?#@\\") {
+		return false
+	}
+	host, portText, err := net.SplitHostPort(hostPort)
+	ip := net.ParseIP(host)
+	if err != nil || strings.Contains(host, ":") || ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	port, err := strconv.Atoi(portText)
+	return err == nil && port == 22067
+}
+
+func validWorkspaceSyncRelayBindAddress(address string) bool {
+	if strings.TrimSpace(address) != address || strings.ContainsAny(address, ":/?#@\\") {
+		return false
+	}
+	ip := net.ParseIP(address)
+	return ip != nil && ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+}
+
 func validWorkspaceSyncRelayHost(hostPort string) bool {
 	if strings.TrimSpace(hostPort) != hostPort || strings.ContainsAny(hostPort, "/?#@\\") {
 		return false
 	}
 	host, portText, err := net.SplitHostPort(hostPort)
-	if err != nil || host == "" {
+	ip := net.ParseIP(host)
+	if err != nil || strings.Contains(host, ":") || ip == nil || ip.To4() == nil {
 		return false
 	}
 	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return false
-	}
-	if net.ParseIP(host) != nil {
-		return true
-	}
-	if len(host) > 253 {
-		return false
-	}
-	for _, label := range strings.Split(host, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, char := range label {
-			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
-				(char < '0' || char > '9') && char != '-' {
-				return false
-			}
-		}
-	}
-	return true
+	return err == nil && port == 22067 && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
+		!ip.IsUnspecified() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast()
 }

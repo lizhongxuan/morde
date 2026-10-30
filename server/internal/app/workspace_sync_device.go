@@ -36,6 +36,10 @@ type WorkspaceSyncNodeEnsurer interface {
 	EnsureWorkspaceSyncNode(context.Context, string) (workspace.SyncNodeConnection, error)
 }
 
+type WorkspaceSyncNodeOwnerReconciler interface {
+	ReconcileWorkspaceSyncNodeOwner(context.Context, string) error
+}
+
 type WorkspaceSyncDeviceChallengeResult struct {
 	ID             string
 	DeviceID       string

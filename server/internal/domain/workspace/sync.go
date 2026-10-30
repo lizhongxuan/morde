@@ -19,6 +19,7 @@ import (
 
 const (
 	MaxSyncBlockBytes    int64 = 4 << 20
+	MaxSyncFileBytes     int64 = 300 << 20
 	MaxSyncFiles               = 100_000
 	MaxSyncManifestBytes       = 16 << 20
 	MaxSyncScopeItems          = 10_000

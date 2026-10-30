@@ -762,6 +762,20 @@ type TaskStopRequest struct {
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
+type TaskWorkspacePublishReceipt struct {
+	TaskID            string             `json:"task_id"`
+	OwnerID           string             `json:"owner_id"`
+	WorkspaceID       string             `json:"workspace_id"`
+	OperationKey      string             `json:"operation_key"`
+	RequestHash       []byte             `json:"request_hash"`
+	BaseRevision      int64              `json:"base_revision"`
+	State             string             `json:"state"`
+	ManifestSha256    pgtype.Text        `json:"manifest_sha256"`
+	PublishedRevision pgtype.Int8        `json:"published_revision"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Token struct {
 	ID                   string             `json:"id"`
 	OwnerID              string             `json:"owner_id"`
@@ -910,6 +924,65 @@ type WorkspaceSyncCursor struct {
 	Revision    int64              `json:"revision"`
 	FilePath    string             `json:"file_path"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkspaceSyncDeviceBinding struct {
+	ID                   string             `json:"id"`
+	OwnerID              string             `json:"owner_id"`
+	WorkspaceID          string             `json:"workspace_id"`
+	ClientInstallationID string             `json:"client_installation_id"`
+	DeviceIdentityID     string             `json:"device_identity_id"`
+	State                string             `json:"state"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type WorkspaceSyncDeviceChallenge struct {
+	ID                   string             `json:"id"`
+	OwnerID              string             `json:"owner_id"`
+	WorkspaceID          string             `json:"workspace_id"`
+	ClientInstallationID string             `json:"client_installation_id"`
+	DeviceID             string             `json:"device_id"`
+	CertificateDer       []byte             `json:"certificate_der"`
+	CertificateSha256    []byte             `json:"certificate_sha256"`
+	Nonce                []byte             `json:"nonce"`
+	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkspaceSyncDeviceIdentity struct {
+	ID                   string             `json:"id"`
+	OwnerID              string             `json:"owner_id"`
+	ClientInstallationID string             `json:"client_installation_id"`
+	DeviceID             string             `json:"device_id"`
+	CertificateSha256    []byte             `json:"certificate_sha256"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type WorkspaceSyncDeviceRegistrationRequest struct {
+	OwnerID            string             `json:"owner_id"`
+	WorkspaceID        string             `json:"workspace_id"`
+	IdempotencyKeyHash []byte             `json:"idempotency_key_hash"`
+	RequestHash        []byte             `json:"request_hash"`
+	BindingID          string             `json:"binding_id"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkspaceSyncFolder struct {
+	WorkspaceID string             `json:"workspace_id"`
+	OwnerID     string             `json:"owner_id"`
+	FolderID    string             `json:"folder_id"`
+	State       string             `json:"state"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkspaceSyncNodeRevision struct {
+	OwnerID         string             `json:"owner_id"`
+	DesiredRevision int64              `json:"desired_revision"`
+	AppliedRevision int64              `json:"applied_revision"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WorkspaceSyncSession struct {

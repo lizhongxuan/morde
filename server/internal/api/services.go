@@ -32,7 +32,7 @@ type WorkspaceSyncService interface {
 	CommitSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	CancelSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	PutSyncBlock(context.Context, identity.Principal, string, string, string, io.Reader) (int64, error)
-	GetSyncBlock(context.Context, identity.Principal, string, string, string) (io.ReadCloser, error)
+	StreamSyncBlock(context.Context, identity.Principal, string, string, string, func(int64, []byte) error) error
 	AckDownloadedBlock(context.Context, identity.Principal, string, string, string) error
 	AckDownloadAction(context.Context, identity.Principal, string, string, string, workspace.ChangeAction, string, int64) error
 }

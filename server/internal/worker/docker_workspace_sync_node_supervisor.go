@@ -29,7 +29,6 @@ const (
 	dockerWorkspaceSyncFilesPath      = "/workspaces"
 	dockerWorkspaceSyncAPIPort        = "8384/tcp"
 	dockerWorkspaceSyncContainerAlias = "morde-syncthing"
-	dockerWorkspaceSyncRelayAlias     = "morde-relay"
 	dockerWorkspaceSyncLabelManaged   = "morde.workspace-sync.managed"
 	dockerWorkspaceSyncLabelOwner     = "morde.workspace-sync.owner-sha256"
 	dockerWorkspaceSyncLabelImage     = "morde.workspace-sync.image-digest"
@@ -56,6 +55,7 @@ type DockerWorkspaceSyncNodeSupervisorOptions struct {
 	ImageDigest        string
 	RelayImageDigest   string
 	RelayPublicAddress string
+	RelayBindAddress   string
 	RelayToken         string
 	DockerSocket       string
 	RelayStateRoot     string
@@ -92,6 +92,7 @@ func NewDockerWorkspaceSyncNodeSupervisor(options DockerWorkspaceSyncNodeSupervi
 	if !dockerWorkspaceSyncImageDigest.MatchString(options.ImageDigest) ||
 		!dockerWorkspaceSyncImageDigest.MatchString(options.RelayImageDigest) ||
 		!validWorkspaceSyncRelayHost(options.RelayPublicAddress) ||
+		!validWorkspaceSyncRelayBindAddress(options.RelayBindAddress) ||
 		!workspaceSyncRelayTokenPattern.MatchString(options.RelayToken) ||
 		!cleanDockerWorkspaceSyncPath(options.DockerSocket) ||
 		!cleanDockerWorkspaceSyncPath(options.RelayStateRoot) ||
@@ -132,7 +133,8 @@ func NewDockerWorkspaceSyncNodeSupervisor(options DockerWorkspaceSyncNodeSupervi
 
 func (s *DockerWorkspaceSyncNodeSupervisor) relayConfig() workspaceSyncRelayConfig {
 	return workspaceSyncRelayConfig{
-		StateRoot: s.options.RelayStateRoot, PublicAddress: s.options.RelayPublicAddress, Token: s.options.RelayToken,
+		StateRoot: s.options.RelayStateRoot, PublicAddress: s.options.RelayPublicAddress,
+		BindAddress: s.options.RelayBindAddress, Token: s.options.RelayToken,
 	}
 }
 
@@ -180,17 +182,11 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 	if err != nil {
 		return DockerWorkspaceSyncNode{}, err
 	}
-	if !validDockerWorkspaceSyncNetwork(network, networkName, ownerHashHex) {
+	bridgeName := dockerWorkspaceSyncBridgeName(ownerHashHex)
+	if !validDockerWorkspaceSyncNetwork(network, networkName, ownerHashHex, bridgeName) {
 		return DockerWorkspaceSyncNode{}, errors.New("workspace sync network isolation contract mismatch")
 	}
-	if err := s.ensureRelayAttached(ctx, network, relay, networkName); err != nil {
-		return DockerWorkspaceSyncNode{}, err
-	}
-	network, err = s.inspectNetwork(ctx, networkName)
-	if err != nil || !validDockerWorkspaceSyncNetwork(network, networkName, ownerHashHex) {
-		return DockerWorkspaceSyncNode{}, errors.New("workspace sync network inspection failed")
-	}
-	if err := validWorkspaceSyncNetworkMembers(network, relayID, s.options.RelayContainerName, node.ID, containerName, nodeExists); err != nil {
+	if err := validWorkspaceSyncNetworkMembers(network, node.ID, containerName, nodeExists); err != nil {
 		return DockerWorkspaceSyncNode{}, err
 	}
 
@@ -236,12 +232,12 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 	}
 
 	currentRelay, relayErr := s.inspectRelay(ctx)
-	if relayErr != nil || currentRelay.ID != relayID || !hasWorkspaceSyncNetworkAlias(currentRelay.NetworkSettings.Networks, networkName, dockerWorkspaceSyncRelayAlias) {
+	if relayErr != nil || currentRelay.ID != relayID {
 		return DockerWorkspaceSyncNode{}, errors.New("dedicated workspace sync relay changed during startup")
 	}
 	network, err = s.inspectNetwork(ctx, networkName)
-	if err != nil || !validDockerWorkspaceSyncNetwork(network, networkName, ownerHashHex) ||
-		validWorkspaceSyncNetworkMembers(network, relayID, s.options.RelayContainerName, node.ID, containerName, true) != nil {
+	if err != nil || !validDockerWorkspaceSyncNetwork(network, networkName, ownerHashHex, bridgeName) ||
+		validWorkspaceSyncNetworkMembers(network, node.ID, containerName, true) != nil {
 		return DockerWorkspaceSyncNode{}, errors.New("workspace sync network membership mismatch")
 	}
 	address, ok := dockerWorkspaceSyncPrivateIPv4(node, networkName)
@@ -384,29 +380,20 @@ type dockerWorkspaceSyncNetwork struct {
 	} `json:"Containers"`
 }
 
-func validDockerWorkspaceSyncNetwork(value dockerWorkspaceSyncNetwork, name, ownerHash string) bool {
-	return dockerWorkspaceSyncContainerID.MatchString(value.ID) && value.Name == name && value.Scope == "local" && value.Driver == "bridge" && value.Internal &&
-		!value.EnableIPv6 && !value.Attachable && !value.Ingress && !value.ConfigOnly && validWorkspaceSyncNetworkOptions(value.Options) &&
+func validDockerWorkspaceSyncNetwork(value dockerWorkspaceSyncNetwork, name, ownerHash, bridgeName string) bool {
+	return dockerWorkspaceSyncContainerID.MatchString(value.ID) && value.Name == name && value.Scope == "local" && value.Driver == "bridge" && !value.Internal &&
+		!value.EnableIPv6 && !value.Attachable && !value.Ingress && !value.ConfigOnly && validWorkspaceSyncNetworkOptions(value.Options, bridgeName) &&
 		value.IPAM.Driver == "default" && len(value.IPAM.Options) == 0 && value.Labels[dockerWorkspaceSyncLabelManaged] == "true" &&
 		value.Labels[dockerWorkspaceSyncLabelOwner] == ownerHash && len(value.Labels) == 2
 }
 
-func validWorkspaceSyncNetworkOptions(options map[string]string) bool {
-	for key, value := range options {
-		switch key {
-		case "com.docker.network.enable_ipv4":
-			if value != "true" {
-				return false
-			}
-		case "com.docker.network.enable_ipv6":
-			if value != "false" {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
+func dockerWorkspaceSyncBridgeName(ownerHash string) string {
+	return "msync" + ownerHash[:10]
+}
+
+func validWorkspaceSyncNetworkOptions(options map[string]string, bridgeName string) bool {
+	return len(options) == 2 && options["com.docker.network.bridge.name"] == bridgeName &&
+		options["com.docker.network.bridge.enable_ip_masquerade"] == "true"
 }
 
 func (s *DockerWorkspaceSyncNodeSupervisor) ensureNetwork(ctx context.Context, ownerHash, name string) (dockerWorkspaceSyncNetwork, error) {
@@ -417,10 +404,15 @@ func (s *DockerWorkspaceSyncNodeSupervisor) ensureNetwork(ctx context.Context, o
 	if !errors.Is(err, errDockerObjectNotFound) {
 		return dockerWorkspaceSyncNetwork{}, err
 	}
+	bridgeName := dockerWorkspaceSyncBridgeName(ownerHash)
 	body := map[string]any{
-		"Name": name, "Driver": "bridge", "Internal": true, "EnableIPv6": false,
+		"Name": name, "Driver": "bridge", "Internal": false, "EnableIPv6": false,
 		"Attachable": false, "Labels": map[string]string{
 			dockerWorkspaceSyncLabelManaged: "true", dockerWorkspaceSyncLabelOwner: ownerHash,
+		},
+		"Options": map[string]string{
+			"com.docker.network.bridge.name":                 bridgeName,
+			"com.docker.network.bridge.enable_ip_masquerade": "true",
 		},
 	}
 	var created struct {
@@ -559,7 +551,7 @@ func validDockerWorkspaceSyncContainer(value dockerWorkspaceSyncInspect, expecte
 		value.HostConfig.CgroupnsMode != "private" || value.HostConfig.Init == nil || !*value.HostConfig.Init ||
 		value.HostConfig.AutoRemove || len(value.HostConfig.Binds) != 0 ||
 		len(value.HostConfig.Devices) != 0 || len(value.HostConfig.DeviceRequests) != 0 || len(value.HostConfig.VolumesFrom) != 0 ||
-		value.HostConfig.LogConfig.Type != "none" || value.HostConfig.RestartPolicy.Name != "always" ||
+		value.HostConfig.LogConfig.Type != "none" || value.HostConfig.RestartPolicy.Name != "unless-stopped" ||
 		!validDockerWorkspaceSyncMounts(value, expected.StatePath, expected.WorkspacePath) ||
 		!dockerWorkspaceSyncHasNoPublishedPorts(value.HostConfig.PortBindings, value.NetworkSettings.Ports) ||
 		len(value.NetworkSettings.Networks) != 1 || !hasWorkspaceSyncNetworkAlias(value.NetworkSettings.Networks, expected.NetworkName, dockerWorkspaceSyncContainerAlias) {
@@ -645,13 +637,9 @@ func dockerWorkspaceSyncPrivateIPv4(value dockerWorkspaceSyncInspect, networkNam
 	return ip.To4().String(), true
 }
 
-func validWorkspaceSyncNetworkMembers(network dockerWorkspaceSyncNetwork, relayID, relayName, nodeID, nodeName string, nodeExists bool) error {
-	if len(network.Containers) != 1 && !(nodeExists && len(network.Containers) == 2) {
+func validWorkspaceSyncNetworkMembers(network dockerWorkspaceSyncNetwork, nodeID, nodeName string, nodeExists bool) error {
+	if (!nodeExists && len(network.Containers) != 0) || (nodeExists && len(network.Containers) != 1) {
 		return errors.New("workspace sync network has unexpected members")
-	}
-	relay, ok := network.Containers[relayID]
-	if !ok || relay.Name != relayName {
-		return errors.New("workspace sync relay attachment is incompatible")
 	}
 	if nodeExists {
 		node, ok := network.Containers[nodeID]
@@ -726,7 +714,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context) (d
 		return dockerWorkspaceSyncRelayInspect{}, errors.New("dedicated workspace sync relay image digest is unavailable")
 	}
 	if !dockerWorkspaceSyncContainerID.MatchString(relay.ID) || relay.Name != "/"+s.options.RelayContainerName ||
-		!validWorkspaceSyncRelay(relay, s.options.RelayStateRoot, s.options.RelayToken, s.options.RelayPublicAddress) || relay.State == nil ||
+		!validWorkspaceSyncRelay(relay, s.options.RelayStateRoot, s.options.RelayToken, s.options.RelayPublicAddress, s.options.RelayBindAddress) || relay.State == nil ||
 		relay.State.Running == nil || relay.State.Restarting == nil || relay.State.Paused == nil || !*relay.State.Running ||
 		*relay.State.Restarting || *relay.State.Paused {
 		return dockerWorkspaceSyncRelayInspect{}, errors.New("dedicated workspace sync relay is not running")
@@ -734,7 +722,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context) (d
 	return relay, nil
 }
 
-func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRoot, relayToken, relayPublicAddress string) bool {
+func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRoot, relayToken, relayPublicAddress, relayBindAddress string) bool {
 	cmd := relay.Config.Cmd
 	if relay.Config.User != "65532:65532" || len(relay.Config.Volumes) != 0 || len(relay.Config.ExposedPorts) != 1 ||
 		relay.Config.ExposedPorts["22067/tcp"] == nil || relay.HostConfig.NetworkMode == "host" || relay.HostConfig.Privileged ||
@@ -749,8 +737,7 @@ func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRo
 		return false
 	}
 	binding := relay.HostConfig.PortBindings["22067/tcp"][0]
-	port, err := strconv.Atoi(binding.HostPort)
-	if err != nil || port < 1 || port > 65535 || (binding.HostIP != "" && net.ParseIP(binding.HostIP) == nil) {
+	if !validWorkspaceSyncRelayHostBinding(binding, relayPublicAddress, relayBindAddress) {
 		return false
 	}
 	return hasWorkspaceSyncRelayArg(cmd, "-listen", ":22067") &&
@@ -758,6 +745,23 @@ func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRo
 		hasWorkspaceSyncRelayArg(cmd, "-token", relayToken) && !hasWorkspaceSyncRelayTokenEqualsFlag(cmd) &&
 		hasExactWorkspaceSyncRelayFlag(cmd, "-pools=") && hasExactWorkspaceSyncRelayFlag(cmd, "-status-srv=") &&
 		hasWorkspaceSyncRelayArg(cmd, "-ext-address", relayPublicAddress)
+}
+
+func validWorkspaceSyncRelayHostBinding(binding dockerPortBinding, publicAddress, bindAddress string) bool {
+	_, publicPort, err := net.SplitHostPort(publicAddress)
+	if err != nil || !validWorkspaceSyncRelayHost(publicAddress) || !validWorkspaceSyncRelayBindAddress(bindAddress) {
+		return false
+	}
+	port, err := strconv.Atoi(binding.HostPort)
+	if err != nil || port < 1 || port > 65535 || binding.HostPort != publicPort {
+		return false
+	}
+	actualBindIP, expectedBindIP := net.ParseIP(binding.HostIP), net.ParseIP(bindAddress)
+	if actualBindIP == nil || actualBindIP.To4() == nil || expectedBindIP == nil || expectedBindIP.To4() == nil || !actualBindIP.Equal(expectedBindIP) {
+		return false
+	}
+	// The advertised public IPv4 may be mapped to a private host IPv4 by cloud NAT.
+	return validWorkspaceSyncRelayBindAddress(binding.HostIP)
 }
 
 func hasExactWorkspaceSyncRelayFlag(args []string, expected string) bool {
@@ -803,30 +807,6 @@ func workspaceSyncImageMatches(configured, imageID string, repoDigests []string)
 	return slices.Contains(repoDigests, configured)
 }
 
-func (s *DockerWorkspaceSyncNodeSupervisor) ensureRelayAttached(ctx context.Context, network dockerWorkspaceSyncNetwork, relay dockerWorkspaceSyncRelayInspect, networkName string) error {
-	if endpoint, ok := network.Containers[relay.ID]; ok {
-		if endpoint.Name != s.options.RelayContainerName {
-			return errors.New("workspace sync relay attachment is incompatible")
-		}
-	} else {
-		request := map[string]any{
-			"Container":      relay.ID,
-			"EndpointConfig": map[string]any{"Aliases": []string{dockerWorkspaceSyncRelayAlias}},
-		}
-		if err := s.requestJSON(ctx, http.MethodPost, "/networks/"+url.PathEscape(network.ID)+"/connect", request, http.StatusOK, nil); err != nil {
-			updated, inspectErr := s.inspectNetwork(ctx, networkName)
-			endpoint, exists := updated.Containers[relay.ID]
-			if inspectErr != nil || !exists || endpoint.Name != s.options.RelayContainerName {
-				return errors.New("workspace sync relay attachment failed")
-			}
-		}
-	}
-	updatedRelay, err := s.inspectRelay(ctx)
-	if err != nil || updatedRelay.ID != relay.ID || !hasWorkspaceSyncNetworkAlias(updatedRelay.NetworkSettings.Networks, networkName, dockerWorkspaceSyncRelayAlias) {
-		return errors.New("workspace sync relay alias is incompatible")
-	}
-	return nil
-}
 func (s *DockerWorkspaceSyncNodeSupervisor) inspectContainerByName(ctx context.Context, name string) (dockerWorkspaceSyncInspect, bool, error) {
 	value, err := s.inspectContainer(ctx, name)
 	if errors.Is(err, errDockerObjectNotFound) {
@@ -864,7 +844,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) createNode(ctx context.Context, owne
 			"NanoCpus": s.options.Resources.NanoCPUs, "PidsLimit": s.options.Resources.PIDsLimit,
 			"IpcMode": "private", "CgroupnsMode": "private", "Init": true,
 			"AutoRemove": false, "LogConfig": map[string]any{"Type": "none", "Config": map[string]string{}},
-			"RestartPolicy":   map[string]string{"Name": "always"},
+			"RestartPolicy":   map[string]string{"Name": "unless-stopped"},
 			"PublishAllPorts": false,
 			"Mounts": []map[string]any{
 				{"Type": "bind", "Source": statePath, "Target": dockerWorkspaceSyncConfigPath, "ReadOnly": false,

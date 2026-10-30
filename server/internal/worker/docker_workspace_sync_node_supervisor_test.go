@@ -30,6 +30,7 @@ type workspaceSyncFakeNetwork struct {
 	Scope      string            `json:"Scope"`
 	Driver     string            `json:"Driver"`
 	Internal   bool              `json:"Internal"`
+	Options    map[string]string `json:"Options"`
 	EnableIPv6 bool              `json:"EnableIPv6"`
 	Attachable bool              `json:"Attachable"`
 	Labels     map[string]string `json:"Labels"`
@@ -60,7 +61,8 @@ type workspaceSyncFakeEngine struct {
 	relayStateRoot      string
 	relayToken          string
 	relayPublicAddress  string
-	relayNetworkAliases map[string][]string
+	relayHostIP         string
+	relayHostPort       string
 	networks            map[string]*workspaceSyncFakeNetwork
 	networksByID        map[string]*workspaceSyncFakeNetwork
 	containers          map[string]*workspaceSyncFakeContainer
@@ -79,9 +81,8 @@ type workspaceSyncFakeEngine struct {
 func newWorkspaceSyncFakeEngine(image, relayImage, relayName string) *workspaceSyncFakeEngine {
 	return &workspaceSyncFakeEngine{
 		image: image, relayImage: relayImage, relayName: relayName, relayID: strings.Repeat("d", 64),
-		relayToken: workspaceSyncTestRelayToken, relayPublicAddress: "127.0.0.1:22067",
-		relayNetworkAliases: make(map[string][]string),
-		networks:            make(map[string]*workspaceSyncFakeNetwork), networksByID: make(map[string]*workspaceSyncFakeNetwork),
+		relayToken: workspaceSyncTestRelayToken, relayPublicAddress: "8.8.8.8:22067", relayHostIP: "172.18.141.222", relayHostPort: "22067",
+		networks: make(map[string]*workspaceSyncFakeNetwork), networksByID: make(map[string]*workspaceSyncFakeNetwork),
 		containers: make(map[string]*workspaceSyncFakeContainer), containersByID: make(map[string]*workspaceSyncFakeContainer),
 		lastContainerByName: make(map[string]map[string]any),
 	}
@@ -117,12 +118,6 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if f.publicRelay {
 			relayCmd = append(relayCmd, "-pools=relays.syncthing.net")
 		}
-		networks := make(map[string]any)
-		for name, network := range f.networks {
-			if _, ok := network.Containers[f.relayID]; ok {
-				networks[name] = map[string]any{"Aliases": f.relayNetworkAliases[name]}
-			}
-		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"Id": f.relayID, "Image": f.relayImage, "Name": "/" + f.relayName,
 			"Config": map[string]any{
@@ -135,10 +130,10 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 				"CapAdd": []string{}, "CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges:true"},
 				"Memory": 256 << 20, "NanoCpus": 250_000_000, "PidsLimit": 64,
 				"RestartPolicy": map[string]string{"Name": "unless-stopped"},
-				"PortBindings":  map[string]any{"22067/tcp": []any{map[string]string{"HostIp": "127.0.0.1", "HostPort": "22067"}}},
+				"PortBindings":  map[string]any{"22067/tcp": []any{map[string]string{"HostIp": f.relayHostIP, "HostPort": f.relayHostPort}}},
 			},
 			"State":           map[string]any{"Running": true, "Restarting": false, "Paused": false},
-			"NetworkSettings": map[string]any{"Networks": networks},
+			"NetworkSettings": map[string]any{"Networks": map[string]any{}},
 		})
 	case r.Method == http.MethodPost && path == "/networks/create":
 		var payload map[string]any
@@ -153,7 +148,7 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		}
 		network := &workspaceSyncFakeNetwork{
 			ID: id, Name: name, Scope: "local", Driver: payload["Driver"].(string), Internal: payload["Internal"].(bool),
-			EnableIPv6: payload["EnableIPv6"].(bool), Attachable: payload["Attachable"].(bool),
+			EnableIPv6: payload["EnableIPv6"].(bool), Attachable: payload["Attachable"].(bool), Options: stringMap(payload["Options"]),
 			Labels: stringMap(payload["Labels"]), Containers: make(map[string]workspaceSyncEndpoint),
 		}
 		network.IPAM.Driver = "default"
@@ -173,27 +168,6 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		_ = json.NewEncoder(w).Encode(network)
-	case r.Method == http.MethodPost && strings.HasPrefix(path, "/networks/") && strings.HasSuffix(path, "/connect"):
-		ref := strings.TrimSuffix(strings.TrimPrefix(path, "/networks/"), "/connect")
-		network := f.networksByID[ref]
-		if network == nil {
-			http.NotFound(w, r)
-			return
-		}
-		var payload struct {
-			Container      string `json:"Container"`
-			EndpointConfig struct {
-				Aliases []string `json:"Aliases"`
-			} `json:"EndpointConfig"`
-		}
-		if json.NewDecoder(r.Body).Decode(&payload) != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		network.Containers[payload.Container] = workspaceSyncEndpoint{Name: f.relayName}
-		f.relayNetworkAliases[network.Name] = append([]string(nil), payload.EndpointConfig.Aliases...)
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "{}")
 	case r.Method == http.MethodPost && path == "/containers/create":
 		if f.createErrorCode != 0 {
 			w.WriteHeader(f.createErrorCode)
@@ -386,7 +360,7 @@ func newWorkspaceSyncFixture(t *testing.T) *workspaceSyncFixture {
 	t.Cleanup(server.Close)
 	options := DockerWorkspaceSyncNodeSupervisorOptions{
 		ImageDigest: image, RelayImageDigest: relayImage, DockerSocket: socket,
-		RelayPublicAddress: "127.0.0.1:22067", RelayToken: workspaceSyncTestRelayToken,
+		RelayPublicAddress: "8.8.8.8:22067", RelayBindAddress: "172.18.141.222", RelayToken: workspaceSyncTestRelayToken,
 		RelayStateRoot: relayStateRoot,
 		StateRoot:      filepath.Join(root, "state"), WorkspaceRoot: filepath.Join(root, "current-workspaces"),
 		RelayContainerName: relay,
@@ -435,6 +409,9 @@ func TestDockerWorkspaceSyncNodeEnsureCreatesIsolatedNode(t *testing.T) {
 		t.Fatalf("per-owner API key environment = %#v", env)
 	}
 	host := created["HostConfig"].(map[string]any)
+	if host["RestartPolicy"].(map[string]any)["Name"] != "unless-stopped" {
+		t.Fatalf("revoked node may restart automatically after Docker restart: %#v", host["RestartPolicy"])
+	}
 	if host["NetworkMode"] != "morde-sync-net-"+ownerHash[:32] || host["ReadonlyRootfs"] != true || host["Privileged"] != false ||
 		host["Memory"] != float64(256<<20) || host["MemorySwap"] != float64(256<<20) || host["NanoCpus"] != float64(250_000_000) ||
 		host["PidsLimit"] != float64(64) || host["AutoRemove"] != false {
@@ -464,43 +441,49 @@ func TestDockerWorkspaceSyncNodeEnsureCreatesIsolatedNode(t *testing.T) {
 	if _, ok := host["PortBindings"]; ok {
 		t.Fatalf("container unexpectedly publishes host ports: %#v", host["PortBindings"])
 	}
-	if f.engine.lastNetworkPayload["Internal"] != true || f.engine.lastNetworkPayload["Driver"] != "bridge" || f.engine.lastNetworkPayload["Attachable"] != false {
+	if f.engine.lastNetworkPayload["Internal"] != false || f.engine.lastNetworkPayload["Driver"] != "bridge" || f.engine.lastNetworkPayload["Attachable"] != false {
 		t.Fatalf("network config = %#v", f.engine.lastNetworkPayload)
 	}
-	var relayFound bool
-	for _, network := range f.engine.networks {
-		if _, ok := network.Containers[f.engine.relayID]; ok && slicesContainsString(f.engine.relayNetworkAliases[network.Name], dockerWorkspaceSyncRelayAlias) {
-			relayFound = true
-		}
+	options := stringMap(f.engine.lastNetworkPayload["Options"])
+	if options["com.docker.network.bridge.name"] != dockerWorkspaceSyncBridgeName(ownerHash) ||
+		options["com.docker.network.bridge.enable_ip_masquerade"] != "true" {
+		t.Fatalf("network bridge options = %#v", options)
 	}
-	if !relayFound {
-		t.Fatal("relay was not attached under the required alias")
+	for _, network := range f.engine.networks {
+		if _, ok := network.Containers[f.engine.relayID]; ok {
+			t.Fatal("shared relay must not be attached to an account network")
+		}
 	}
 }
 
-func TestWorkspaceSyncNodeNetworkAllowsOnlyDockerDefaultIPOptions(t *testing.T) {
+func TestWorkspaceSyncNodeNetworkRequiresDedicatedMasqueradedBridge(t *testing.T) {
+	ownerHash := strings.Repeat("b", 64)
+	bridgeName := dockerWorkspaceSyncBridgeName(ownerHash)
 	value := dockerWorkspaceSyncNetwork{
-		ID: strings.Repeat("a", 64), Name: "morde-sync-net-test", Scope: "local", Driver: "bridge", Internal: true,
+		ID: strings.Repeat("a", 64), Name: "morde-sync-net-test", Scope: "local", Driver: "bridge", Internal: false,
 		Labels: map[string]string{dockerWorkspaceSyncLabelManaged: "true", dockerWorkspaceSyncLabelOwner: strings.Repeat("b", 64)},
 	}
 	value.IPAM.Driver = "default"
-	for _, options := range []map[string]string{
-		nil,
-		{"com.docker.network.enable_ipv4": "true", "com.docker.network.enable_ipv6": "false"},
-	} {
-		value.Options = options
-		if !validDockerWorkspaceSyncNetwork(value, value.Name, strings.Repeat("b", 64)) {
-			t.Errorf("default Docker network options %v were rejected", options)
-		}
+	value.Options = map[string]string{
+		"com.docker.network.bridge.name":                 bridgeName,
+		"com.docker.network.bridge.enable_ip_masquerade": "true",
 	}
-	for _, options := range []map[string]string{
-		{"com.docker.network.enable_ipv4": "false"},
-		{"com.docker.network.enable_ipv6": "true"},
-		{"com.docker.network.bridge.name": "untrusted0"},
+	if !validDockerWorkspaceSyncNetwork(value, value.Name, ownerHash, bridgeName) {
+		t.Fatal("expected account bridge configuration was rejected")
+	}
+	for _, mutate := range []func(){
+		func() { value.Internal = true },
+		func() { value.Options["com.docker.network.bridge.enable_ip_masquerade"] = "false" },
+		func() { value.Options["com.docker.network.bridge.name"] = "untrusted0" },
 	} {
-		value.Options = options
-		if validDockerWorkspaceSyncNetwork(value, value.Name, strings.Repeat("b", 64)) {
-			t.Errorf("unexpected Docker network options %v were accepted", options)
+		value.Internal = false
+		value.Options = map[string]string{
+			"com.docker.network.bridge.name":                 bridgeName,
+			"com.docker.network.bridge.enable_ip_masquerade": "true",
+		}
+		mutate()
+		if validDockerWorkspaceSyncNetwork(value, value.Name, ownerHash, bridgeName) {
+			t.Error("unsafe account network configuration was accepted")
 		}
 	}
 }
@@ -660,7 +643,7 @@ func TestDockerWorkspaceSyncNodeRejectsRelayWithWrongToken(t *testing.T) {
 
 func TestDockerWorkspaceSyncNodeRejectsRelayWithWrongPublicAddress(t *testing.T) {
 	f := newWorkspaceSyncFixture(t)
-	f.engine.relayPublicAddress = "relay.example.test:22067"
+	f.engine.relayPublicAddress = "8.8.4.4:22067"
 	if _, err := f.supervisor(t).Ensure(context.Background(), workspaceSyncTestOwnerA, workspaceSyncTestKeyA); err == nil {
 		t.Fatal("relay advertising a different public address was accepted")
 	}
@@ -671,11 +654,68 @@ func TestDockerWorkspaceSyncNodeRejectsRelayWithWrongPublicAddress(t *testing.T)
 	}
 }
 
+func TestDockerWorkspaceSyncNodeRejectsRelayHostBindingMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		hostIP   string
+		hostPort string
+	}{
+		{name: "wrong port", hostIP: "172.18.141.222", hostPort: "22068"},
+		{name: "unexpected loopback bind", hostIP: "127.0.0.1", hostPort: "22067"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newWorkspaceSyncFixture(t)
+			f.engine.relayHostIP = test.hostIP
+			f.engine.relayHostPort = test.hostPort
+			if _, err := f.supervisor(t).Ensure(context.Background(), workspaceSyncTestOwnerA, workspaceSyncTestKeyA); err == nil {
+				t.Fatal("relay with a mismatched advertised endpoint was accepted")
+			}
+			f.engine.mu.Lock()
+			defer f.engine.mu.Unlock()
+			if f.engine.networkCreates != 0 || f.engine.containerCreates != 0 {
+				t.Fatalf("created with a mismatched relay endpoint: networks %d, containers %d", f.engine.networkCreates, f.engine.containerCreates)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSyncRelayHostBindingMatchesAdvertisedAddress(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		binding     dockerPortBinding
+		address     string
+		bindAddress string
+		want        bool
+	}{
+		{name: "wildcard bind", binding: dockerPortBinding{HostIP: "0.0.0.0", HostPort: "22067"}, address: "8.8.8.8:22067", bindAddress: "0.0.0.0", want: false},
+		{name: "NAT to private host IPv4", binding: dockerPortBinding{HostIP: "172.18.141.222", HostPort: "22067"}, address: "120.25.178.93:22067", bindAddress: "172.18.141.222", want: true},
+		{name: "private bind without NAT advertisement", binding: dockerPortBinding{HostIP: "172.18.141.222", HostPort: "22067"}, address: "relay.example.test:22067", bindAddress: "172.18.141.222", want: false},
+		{name: "unexpected loopback bind", binding: dockerPortBinding{HostIP: "127.0.0.1", HostPort: "22067"}, address: "192.0.2.8:22067", bindAddress: "127.0.0.1", want: false},
+		{name: "wrong port", binding: dockerPortBinding{HostIP: "172.18.141.222", HostPort: "22068"}, address: "8.8.8.8:22067", bindAddress: "172.18.141.222", want: false},
+		{name: "wrong explicit IPv4", binding: dockerPortBinding{HostIP: "172.18.141.223", HostPort: "22067"}, address: "8.8.8.8:22067", bindAddress: "172.18.141.222", want: false},
+		{name: "unexpected configured bind address", binding: dockerPortBinding{HostIP: "0.0.0.0", HostPort: "22067"}, address: "8.8.8.8:22067", bindAddress: "0.0.0.0", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validWorkspaceSyncRelayHostBinding(test.binding, test.address, test.bindAddress); got != test.want {
+				t.Fatalf("validWorkspaceSyncRelayHostBinding(%#v, %q, %q) = %t; want %t", test.binding, test.address, test.bindAddress, got, test.want)
+			}
+		})
+	}
+}
+
 func TestDockerWorkspaceSyncNodeRequiresRelayToken(t *testing.T) {
 	f := newWorkspaceSyncFixture(t)
 	f.options.RelayToken = ""
 	if _, err := NewDockerWorkspaceSyncNodeSupervisor(f.options); err == nil {
 		t.Fatal("missing relay token was accepted")
+	}
+}
+
+func TestDockerWorkspaceSyncNodeRequiresRelayBindAddress(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	f.options.RelayBindAddress = ""
+	if _, err := NewDockerWorkspaceSyncNodeSupervisor(f.options); err == nil {
+		t.Fatal("missing relay bind address was accepted")
 	}
 }
 

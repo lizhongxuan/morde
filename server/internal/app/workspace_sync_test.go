@@ -169,6 +169,13 @@ func (s *syncServiceStore) CheckWorkspaceSyncDeviceAccess(_ context.Context, _ i
 	return nil
 }
 
+func (s *syncServiceStore) WithWorkspaceSyncDeviceSessionAccess(ctx context.Context, principal identity.Principal, workspaceID, _ string, write func() error) error {
+	if err := s.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID); err != nil {
+		return err
+	}
+	return write()
+}
+
 func (s *syncServiceStore) TryWorkspaceBlockStoreLock(ctx context.Context, _ string) (LeaderLock, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -669,13 +676,22 @@ func TestWorkspaceSyncServiceAuthorizesDeviceWorkspaceDynamically(t *testing.T) 
 	}
 }
 
-func TestWorkspaceSyncDeviceDownloadStopsAfterRevocation(t *testing.T) {
+type revokeOnOpenWorkspaceBlockStore struct {
+	WorkspaceBlockStore
+	revoke func()
+}
+
+func (s revokeOnOpenWorkspaceBlockStore) Open(workspaceID, digest string) (io.ReadCloser, error) {
+	reader, err := s.WorkspaceBlockStore.Open(workspaceID, digest)
+	if err == nil {
+		s.revoke()
+	}
+	return reader, err
+}
+
+func TestWorkspaceSyncDeviceBlockStreamRechecksAccessBeforeSending(t *testing.T) {
 	store := newSyncServiceStore()
 	blocks := newSyncBlockMemory()
-	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
-	if err != nil {
-		t.Fatal(err)
-	}
 	content := []byte("workspace file content")
 	file := syncServiceFile("notes.txt", content)
 	if _, err := blocks.PutBlock(store.workspace.ID, file.SHA256, bytes.NewReader(content)); err != nil {
@@ -687,24 +703,106 @@ func TestWorkspaceSyncDeviceDownloadStopsAfterRevocation(t *testing.T) {
 		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice,
 		TokenID: "t1234567", ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
 	}
+	service, err := NewWorkspaceSyncService(store, revokeOnOpenWorkspaceBlockStore{
+		WorkspaceBlockStore: blocks,
+		revoke:              func() { store.syncDeviceRevoked = true },
+	}, workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
 	session, err := service.CreateSyncSession(context.Background(), device, store.workspace.ID, workspace.CreateSyncSession{
 		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
-	}, "device-download-revoke")
+	}, "device-download-stream-revoke")
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := service.GetSyncBlock(context.Background(), device, store.workspace.ID, session.ID, file.SHA256)
+	streamCalled := false
+	err = service.StreamSyncBlock(context.Background(), device, store.workspace.ID, session.ID, file.SHA256, func(int64, []byte) error {
+		streamCalled = true
+		return nil
+	})
+	if domain.CodeOf(err) != domain.CodeNotFound || streamCalled {
+		t.Fatalf("device block stream after read-time revocation = %v, callback called %t; want denied before sending", err, streamCalled)
+	}
+}
+
+func TestWorkspaceSyncDeviceBlockStreamStopsAtRevocationBoundary(t *testing.T) {
+	store := newSyncServiceStore()
+	blocks := newSyncBlockMemory()
+	content := bytes.Repeat([]byte("x"), 2*workspaceSyncStreamChunkBytes+17)
+	file := syncServiceFile("notes.txt", content)
+	if _, err := blocks.PutBlock(store.workspace.ID, file.SHA256, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	store.workspace.Revision = 1
+	store.snapshots[1] = []workspace.File{file}
+	device := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: "t1234567", ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = reader.Close() })
-	buffer := make([]byte, 2)
-	if n, err := reader.Read(buffer); err != nil || n != len(buffer) {
-		t.Fatalf("first block read = %d, %v", n, err)
+	session, err := service.CreateSyncSession(context.Background(), device, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
+	}, "device-download-stream-boundary")
+	if err != nil {
+		t.Fatal(err)
 	}
-	store.syncDeviceRevoked = true
-	if n, err := reader.Read(buffer); n != 0 || domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("block read after device revocation = %d, %v; want no more bytes and not found", n, err)
+	var transferred []byte
+	writeCalls := 0
+	err = service.StreamSyncBlock(context.Background(), device, store.workspace.ID, session.ID, file.SHA256, func(_ int64, chunk []byte) error {
+		writeCalls++
+		transferred = append(transferred, chunk...)
+		store.syncDeviceRevoked = true
+		return nil
+	})
+	if domain.CodeOf(err) != domain.CodeNotFound || writeCalls != 1 || len(transferred) != workspaceSyncStreamChunkBytes {
+		t.Fatalf("revoked device stream = err %v, calls %d, bytes %d; want one authorized chunk then stop", err, writeCalls, len(transferred))
+	}
+}
+
+type revokeAfterFirstRead struct {
+	*bytes.Reader
+	revoked bool
+	revoke  func()
+}
+
+func (r *revokeAfterFirstRead) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 && !r.revoked {
+		r.revoked = true
+		r.revoke()
+	}
+	return n, err
+}
+
+func TestWorkspaceSyncDeviceUploadStopsAfterRevocation(t *testing.T) {
+	store := newSyncServiceStore()
+	blocks := newSyncBlockMemory()
+	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("workspace upload content")
+	file := syncServiceFile("upload.txt", content)
+	device := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: "t1234567", ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	session, err := service.CreateSyncSession(context.Background(), device, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{file},
+	}, "device-upload-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &revokeAfterFirstRead{Reader: bytes.NewReader(content), revoke: func() { store.syncDeviceRevoked = true }}
+	if _, err := service.PutSyncBlock(context.Background(), device, store.workspace.ID, session.ID, file.SHA256, source); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("upload after mid-transfer device revocation = %v; want not found", err)
+	}
+	if _, exists := blocks.data[file.SHA256]; exists {
+		t.Fatal("partially authorized upload published a block")
 	}
 }
 
@@ -811,12 +909,14 @@ func TestWorkspaceSyncServiceDownloadOnlyReturnsSessionPlannedBlocks(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := service.GetSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, chunk.SHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	actual, err := io.ReadAll(reader)
-	_ = reader.Close()
+	var actual []byte
+	err = service.StreamSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, chunk.SHA256, func(total int64, part []byte) error {
+		if total != int64(len(body)) {
+			t.Fatalf("download total size = %d; want %d", total, len(body))
+		}
+		actual = append(actual, part...)
+		return nil
+	})
 	if err != nil || !bytes.Equal(actual, body) {
 		t.Fatalf("download data=%q, err=%v", actual, err)
 	}
@@ -849,7 +949,10 @@ func TestWorkspaceSyncServiceDownloadOnlyReturnsSessionPlannedBlocks(t *testing.
 	if err != nil || committed.State != workspace.SyncCompleted || committed.ConfirmedBytes != int64(len(body)) {
 		t.Fatalf("download committed session = %#v, err=%v", committed, err)
 	}
-	if _, err := service.GetSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, strings.Repeat("0", 64)); domain.CodeOf(err) != domain.CodeNotFound {
+	if err := service.StreamSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, strings.Repeat("0", 64), func(int64, []byte) error {
+		t.Fatal("unplanned block stream invoked callback")
+		return nil
+	}); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("unplanned block read error = %v", err)
 	}
 }

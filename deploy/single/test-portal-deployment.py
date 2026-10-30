@@ -94,6 +94,16 @@ class DeploymentTests(unittest.TestCase):
         self.assertLess(apply.index("config_preflight apply"), apply.index("install_policy_rules"))
         self.assertEqual(policy.count('cat >"$TMP_DIR/rules.nft"'), 1)
 
+    def test_workspace_sync_egress_is_limited_to_the_static_relay(self):
+        policy = (ROOT / "network-policy.sh").read_text()
+        self.assertIn('public_value == "127.0.0.1:22067"', policy)
+        self.assertIn("public.version != 4 or not public.is_global", policy)
+        self.assertIn("bind.is_unspecified or bind.is_loopback or bind.is_link_local or bind.is_multicast", policy)
+        self.assertIn('iifname "msync*" meta l4proto tcp ct original ip daddr {ip} ct original proto-dst 22067', policy)
+        self.assertIn('oifname "msync*" ct state { established, related } accept', policy)
+        self.assertIn('iifname "msync*" counter drop', policy)
+        self.assertLess(policy.index("workspace_sync_relay_bind_ipv4()"), policy.index("install_policy_rules()"))
+
     def test_installer_installs_and_starts_in_dependency_order(self):
         installer = (ROOT / "install-portal-service.sh").read_text()
         self.assertNotIn('. "$env_file"', installer)

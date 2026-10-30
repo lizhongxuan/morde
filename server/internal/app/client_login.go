@@ -50,15 +50,16 @@ type ClientInfo struct {
 const clientTokenTTL = 30 * 24 * time.Hour
 
 type ClientLoginService struct {
-	store       ClientLoginStore
-	credentials *CredentialService
+	store                   ClientLoginStore
+	credentials             *CredentialService
+	workspaceSyncReconciler WorkspaceSyncNodeOwnerReconciler
 }
 
-func NewClientLoginService(store ClientLoginStore, credentials *CredentialService) (*ClientLoginService, error) {
+func NewClientLoginService(store ClientLoginStore, credentials *CredentialService, workspaceSyncReconciler WorkspaceSyncNodeOwnerReconciler) (*ClientLoginService, error) {
 	if store == nil || credentials == nil {
 		return nil, domain.InvalidArgument("dependencies", "client login dependencies are required")
 	}
-	return &ClientLoginService{store: store, credentials: credentials}, nil
+	return &ClientLoginService{store: store, credentials: credentials, workspaceSyncReconciler: workspaceSyncReconciler}, nil
 }
 
 func (s *ClientLoginService) Login(ctx context.Context, name, password, platform, displayName, renewalID, idempotencyKey, ip string) (ClientLoginResult, error) {
@@ -150,14 +151,20 @@ func (s *ClientLoginService) Logout(ctx context.Context, principal identity.Prin
 	if principal.Kind != identity.KindClient || !domain.ValidUserID(principal.UserID) || !domain.ValidClientInstallationID(principal.ClientInstallationID) {
 		return domain.NewError(domain.CodeUnauthenticated, "client credential required")
 	}
-	return s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorClient)
+	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorClient); err != nil {
+		return err
+	}
+	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
 }
 
 func (s *ClientLoginService) LogoutWebSession(ctx context.Context, principal identity.Principal, ip string) error {
 	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) || !domain.ValidClientInstallationID(principal.ClientInstallationID) {
 		return domain.NewError(domain.CodeUnauthenticated, "client Web session required")
 	}
-	return s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorSession)
+	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorSession); err != nil {
+		return err
+	}
+	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
 }
 
 func (s *ClientLoginService) List(ctx context.Context, principal identity.Principal) ([]ClientInfo, error) {
@@ -183,7 +190,19 @@ func (s *ClientLoginService) Revoke(ctx context.Context, principal identity.Prin
 	if !domain.ValidClientInstallationID(id) {
 		return domain.InvalidArgument("client_id", "invalid client id")
 	}
-	return s.store.RevokeClientInstallation(ctx, id, principal.UserID, ip, audit.ActorKind(principal.Kind))
+	if err := s.store.RevokeClientInstallation(ctx, id, principal.UserID, ip, audit.ActorKind(principal.Kind)); err != nil {
+		return err
+	}
+	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
+}
+
+func (s *ClientLoginService) reconcileWorkspaceSyncAfterInstallationRevocation(ctx context.Context, ownerID string) error {
+	if s.workspaceSyncReconciler != nil {
+		if err := s.workspaceSyncReconciler.ReconcileWorkspaceSyncNodeOwner(ctx, ownerID); err != nil {
+			return domain.NewError(domain.CodeUpstreamError, "workspace sync node could not confirm installation revocation")
+		}
+	}
+	return nil
 }
 
 func validateClientAccountPrincipal(principal identity.Principal) error {

@@ -15,6 +15,7 @@ import (
 	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/config"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/template"
@@ -139,9 +140,10 @@ func (a templateAdapter) ListTemplates(context.Context) ([]api.TemplateRecord, e
 }
 
 type adminAdapter struct {
-	users    *app.UserService
-	audit    *app.AuditService
-	capacity interface {
+	users                   *app.UserService
+	audit                   *app.AuditService
+	workspaceSyncReconciler app.WorkspaceSyncNodeOwnerReconciler
+	capacity                interface {
 		Capacity(context.Context, identity.Principal) (app.CapacitySnapshot, error)
 	}
 }
@@ -173,6 +175,11 @@ func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Princip
 	})
 	if err != nil {
 		return api.AdminUserRecord{}, err
+	}
+	if command.Status != nil && *command.Status != identity.StatusApproved && a.workspaceSyncReconciler != nil {
+		if err := a.workspaceSyncReconciler.ReconcileWorkspaceSyncNodeOwner(ctx, id); err != nil {
+			return api.AdminUserRecord{}, domain.NewError(domain.CodeUpstreamError, "workspace sync node could not confirm account revocation")
+		}
 	}
 	return adminUser(updated), nil
 }

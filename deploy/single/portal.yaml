@@ -69,6 +69,7 @@ workspace_sync_node:
   image_digest: ${CH_WORKSPACE_SYNC_NODE_IMAGE_ID}
   relay_image_digest: ${CH_WORKSPACE_SYNC_RELAY_IMAGE_ID}
   relay_public_address: ${CH_WORKSPACE_SYNC_RELAY_PUBLIC_ADDRESS}
+  relay_bind_address: ${CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS}
   relay_token: ${CH_WORKSPACE_SYNC_RELAY_TOKEN}
   relay_state_root: ${CH_WORKSPACE_SYNC_RELAY_STATE_DIR}
   state_root: ${CH_WORKSPACE_SYNC_NODE_STATE_DIR}

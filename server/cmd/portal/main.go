@@ -357,7 +357,8 @@ func serve(ctx context.Context, configPath string) error {
 		}
 		nodeSupervisor, err := worker.NewDockerWorkspaceSyncNodeSupervisor(worker.DockerWorkspaceSyncNodeSupervisorOptions{
 			ImageDigest: cfg.WorkspaceSyncNode.ImageDigest, RelayImageDigest: cfg.WorkspaceSyncNode.RelayImageDigest,
-			RelayPublicAddress: cfg.WorkspaceSyncNode.RelayPublicAddress, RelayToken: cfg.WorkspaceSyncNode.RelayToken,
+			RelayPublicAddress: cfg.WorkspaceSyncNode.RelayPublicAddress, RelayBindAddress: cfg.WorkspaceSyncNode.RelayBindAddress,
+			RelayToken:   cfg.WorkspaceSyncNode.RelayToken,
 			DockerSocket: dockerSocket, RelayStateRoot: cfg.WorkspaceSyncNode.RelayStateRoot, StateRoot: cfg.WorkspaceSyncNode.StateRoot,
 			WorkspaceRoot: cfg.WorkspaceSyncNode.WorkspaceRoot, RelayContainerName: cfg.WorkspaceSyncNode.RelayContainerName,
 			Resources: worker.DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
@@ -389,7 +390,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	clientLogin, err := app.NewClientLoginService(store, credentials)
+	clientLogin, err := app.NewClientLoginService(store, credentials, workspaceSyncNodeProvisioner)
 	if err != nil {
 		return err
 	}
@@ -451,7 +452,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	admin := adminAdapter{users: users, audit: auditService, capacity: hosts}
+	admin := adminAdapter{users: users, audit: auditService, capacity: hosts, workspaceSyncReconciler: workspaceSyncNodeProvisioner}
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices,

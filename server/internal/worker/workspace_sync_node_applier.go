@@ -20,12 +20,13 @@ const (
 )
 
 type syncthingFolderConfig struct {
-	ID      string `json:"id"`
-	Label   string `json:"label"`
-	Path    string `json:"path"`
-	Type    string `json:"type"`
-	Paused  bool   `json:"paused"`
-	Devices []struct {
+	ID                      string `json:"id"`
+	Label                   string `json:"label"`
+	Path                    string `json:"path"`
+	Type                    string `json:"type"`
+	Paused                  bool   `json:"paused"`
+	MordeMaxSingleFileBytes int64  `json:"mordeMaxSingleFileBytes"`
+	Devices                 []struct {
 		DeviceID string `json:"deviceID"`
 	} `json:"devices"`
 }
@@ -42,8 +43,9 @@ type syncthingConnections struct {
 	} `json:"connections"`
 }
 
-func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAPIClient, state workspace.SyncNodeDesiredState, localDeviceID string) error {
-	if ctx == nil || client == nil || !domain.ValidUserID(state.OwnerID) || state.Revision < 1 || !validSyncthingDeviceID(localDeviceID) {
+func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAPIClient, state workspace.SyncNodeDesiredState, localDeviceID, relayAddress string) error {
+	if ctx == nil || client == nil || !domain.ValidUserID(state.OwnerID) || state.Revision < 1 ||
+		!validSyncthingDeviceID(localDeviceID) || !validStaticRelayAddress(relayAddress) {
 		return errors.New("invalid workspace sync node desired state")
 	}
 
@@ -161,7 +163,7 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 				return fmt.Errorf("read Syncthing device configuration: %w", err)
 			}
 		}
-		configured, err := configureSyncthingDevice(raw, deviceID)
+		configured, err := configureSyncthingDevice(raw, deviceID, relayAddress)
 		if err != nil {
 			return err
 		}
@@ -241,7 +243,10 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 	return nil
 }
 
-func configureSyncthingDevice(raw json.RawMessage, deviceID string) (json.RawMessage, error) {
+func configureSyncthingDevice(raw json.RawMessage, deviceID, relayAddress string) (json.RawMessage, error) {
+	if !validSyncthingDeviceID(deviceID) || !validStaticRelayAddress(relayAddress) {
+		return nil, errors.New("invalid Syncthing device or private relay address")
+	}
 	var value map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &value); err != nil || len(value) == 0 {
 		return nil, errors.New("invalid Syncthing default device configuration")
@@ -250,7 +255,7 @@ func configureSyncthingDevice(raw json.RawMessage, deviceID string) (json.RawMes
 	value["deviceID"] = encoded
 	name, _ := json.Marshal("Morde")
 	value["name"] = name
-	addresses, _ := json.Marshal([]string{"dynamic"})
+	addresses, _ := json.Marshal([]string{relayAddress})
 	value["addresses"] = addresses
 	value["autoAcceptFolders"] = json.RawMessage("false")
 	value["introducer"] = json.RawMessage("false")
@@ -269,6 +274,8 @@ func configureSyncthingFolder(raw json.RawMessage, desired workspace.SyncNodeFol
 		encoded, _ := json.Marshal(item)
 		value[key] = encoded
 	}
+	maxFileBytes, _ := json.Marshal(workspace.MaxSyncFileBytes)
+	value["mordeMaxSingleFileBytes"] = maxFileBytes
 	value["paused"] = json.RawMessage("false")
 	devices := make([]struct {
 		DeviceID string `json:"deviceID"`
@@ -336,7 +343,8 @@ func verifySyncthingNodeConfig(ctx context.Context, client *SyncthingAPIClient, 
 		}
 		want, exists := folders[actual.ID]
 		if !exists || actual.Label != "Morde Workspace" || actual.Path != workspaceSyncNodeFolderRoot+want.WorkspaceID ||
-			actual.Type != "sendreceive" || actual.Paused || !sameDeviceIDs(actual.Devices, want.DeviceIDs) {
+			actual.Type != "sendreceive" || actual.Paused || actual.MordeMaxSingleFileBytes != workspace.MaxSyncFileBytes ||
+			!sameDeviceIDs(actual.Devices, want.DeviceIDs) {
 			return errors.New("Syncthing folder configuration does not match the authorized Workspace snapshot")
 		}
 	}
@@ -406,7 +414,9 @@ func currentFolderMatches(want json.RawMessage, current syncthingFolderConfig) b
 		return false
 	}
 	return expected.ID == current.ID && expected.Label == current.Label && expected.Path == current.Path &&
-		expected.Type == current.Type && expected.Paused == current.Paused && sameDeviceIDs(expected.Devices, deviceIDsFromConfig(current.Devices))
+		expected.Type == current.Type && expected.Paused == current.Paused &&
+		expected.MordeMaxSingleFileBytes == current.MordeMaxSingleFileBytes &&
+		sameDeviceIDs(expected.Devices, deviceIDsFromConfig(current.Devices))
 }
 
 func deviceIDsFromConfig(input []struct {

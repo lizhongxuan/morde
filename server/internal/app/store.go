@@ -108,6 +108,7 @@ type WorkspaceSyncStore interface {
 	GetWorkspace(context.Context, string) (workspace.Workspace, error)
 	GetWorkspaceBinding(context.Context, string, string) (workspace.Binding, error)
 	CheckWorkspaceSyncDeviceAccess(context.Context, identity.Principal, string) error
+	WithWorkspaceSyncDeviceSessionAccess(context.Context, identity.Principal, string, string, func() error) error
 	TryWorkspaceBlockStoreLock(context.Context, string) (LeaderLock, bool, error)
 	TryWorkspaceBlockStoreReadLock(context.Context, string) (LeaderLock, bool, error)
 	GetWorkspaceManifestPage(context.Context, string, int64, string, string, int32) (workspace.ManifestPage, error)

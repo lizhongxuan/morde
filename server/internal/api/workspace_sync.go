@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -290,17 +289,17 @@ func (h *api) putWorkspaceSyncBlock(service WorkspaceSyncService) gin.HandlerFun
 			writeError(c, domain.InvalidArgument("body", "content type must be application/octet-stream"))
 			return
 		}
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			writeWorkspaceSyncBodyError(c, err)
-			return
-		}
-		if len(body) == 0 {
+		if c.Request.ContentLength == 0 {
 			writeError(c, domain.InvalidArgument("body", "block body must not be empty"))
 			return
 		}
-		if _, err := service.PutSyncBlock(c.Request.Context(), principal, workspaceID, sessionID, digest, bytes.NewReader(body)); err != nil {
-			writeError(c, err)
+		if _, err := service.PutSyncBlock(c.Request.Context(), principal, workspaceID, sessionID, digest, c.Request.Body); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				writeError(c, domain.NewError(domain.CodeRequestTooLarge, "request body too large"))
+			} else {
+				writeError(c, err)
+			}
 			return
 		}
 		c.Status(http.StatusNoContent)
@@ -326,23 +325,34 @@ func (h *api) getWorkspaceSyncBlock(service WorkspaceSyncService) gin.HandlerFun
 		if !ok {
 			return
 		}
-		body, err := service.GetSyncBlock(c.Request.Context(), principal, workspaceID, sessionID, digest)
+		started := false
+		err := service.StreamSyncBlock(c.Request.Context(), principal, workspaceID, sessionID, digest, func(total int64, chunk []byte) error {
+			if !started {
+				c.Header("Cache-Control", "no-store")
+				c.Header("Content-Type", "application/octet-stream")
+				c.Header("Content-Length", strconv.FormatInt(total, 10))
+				c.Status(http.StatusOK)
+				c.Writer.WriteHeaderNow()
+				started = true
+			}
+			if len(chunk) > 0 {
+				if _, err := c.Writer.Write(chunk); err != nil {
+					return err
+				}
+			}
+			c.Writer.Flush()
+			if err := c.Request.Context().Err(); err != nil {
+				return err
+			}
+			return nil
+		})
 		if err != nil {
+			if c.Writer.Written() {
+				c.Abort()
+				return
+			}
 			writeError(c, err)
-			return
 		}
-		if body == nil {
-			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
-			return
-		}
-		defer func() { _ = body.Close() }()
-		contents, err := io.ReadAll(io.LimitReader(body, workspace.MaxSyncBlockBytes+1))
-		if err != nil || int64(len(contents)) > workspace.MaxSyncBlockBytes {
-			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
-			return
-		}
-		c.Header("Cache-Control", "no-store")
-		c.Data(http.StatusOK, "application/octet-stream", contents)
 	}
 }
 

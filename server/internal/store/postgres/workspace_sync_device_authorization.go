@@ -10,6 +10,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/workspace"
 )
 
 type workspaceSyncDeviceAccess struct {
@@ -34,6 +35,40 @@ func (s *Store) CheckWorkspaceSyncDeviceAccess(ctx context.Context, principal id
 			return err
 		}
 		return requireActiveWorkspaceSyncDeviceBinding(ctx, tx, access)
+	})
+}
+
+func (s *Store) WithWorkspaceSyncDeviceSessionAccess(ctx context.Context, principal identity.Principal, workspaceID, sessionID string, write func() error) error {
+	if principal.Kind != identity.KindDevice || principal.Role != identity.RoleUser ||
+		!domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		!domain.ValidClientInstallationID(principal.ClientInstallationID) || !domain.ValidWorkspaceID(workspaceID) ||
+		!workspace.ValidSessionID(sessionID) || write == nil {
+		return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		access, err := lockWorkspaceSyncDeviceCredentials(ctx, tx, principal.UserID, principal.ClientInstallationID, principal.TokenID, workspaceID)
+		if err != nil {
+			return err
+		}
+		if err := lockReadyWorkspaceForSyncDevice(ctx, tx, principal.UserID, workspaceID, false); err != nil {
+			return err
+		}
+		var ownerID, replicaID, state string
+		err = tx.QueryRow(ctx, `SELECT owner_id,replica_id,state FROM workspace_sync_sessions
+WHERE workspace_id=$1 AND id=$2 FOR SHARE`, workspaceID, sessionID).Scan(&ownerID, &replicaID, &state)
+		if err != nil {
+			return storeError("lock Workspace sync download session", "workspace sync session", err)
+		}
+		if ownerID != principal.UserID || replicaID != "device:"+principal.TokenID {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		if state == string(workspace.SyncCancelled) || state == string(workspace.SyncExpired) || state == string(workspace.SyncFailed) {
+			return domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
+		}
+		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, access, ownerID, workspaceID, replicaID); err != nil {
+			return err
+		}
+		return write()
 	})
 }
 
@@ -131,4 +166,3 @@ func prepareWorkspaceSyncDeviceReplica(ctx context.Context, tx pgx.Tx, ownerID, 
 	}
 	return lockWorkspaceSyncDeviceCredentials(ctx, tx, ownerID, installationID, tokenID, workspaceID)
 }
-

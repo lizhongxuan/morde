@@ -30,6 +30,30 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	}
 }
 
+func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
+	workbenchDir := t.TempDir()
+	t.Setenv("T02_TEST_INSTANCE", "test-instance")
+	root := filepath.Join(t.TempDir(), "workspace-sync")
+	data := validConfigYAML(workbenchDir) + fmt.Sprintf("workspace_sync_node:\n"+
+		"  enabled: true\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
+		"  relay_public_address: 8.8.8.8:22067\n  relay_bind_address: 172.18.141.222\n"+
+		"  relay_token: %s\n  relay_state_root: %q\n  state_root: %q\n  workspace_root: %q\n"+
+		"  relay_container_name: morde-sync-relay\n",
+		strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64),
+		filepath.Join(root, "relay"), filepath.Join(root, "state"), filepath.Join(root, "files"))
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkspaceSyncNode.RelayBindAddress != "172.18.141.222" {
+		t.Fatalf("relay bind address = %q; want 172.18.141.222", cfg.WorkspaceSyncNode.RelayBindAddress)
+	}
+}
+
 func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.CloudDSH = CloudDSH{
@@ -97,9 +121,9 @@ func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 	cfg.WorkspaceSyncNode = WorkspaceSyncNode{
 		Enabled: true, ImageDigest: "morde-syncthing@sha256:" + strings.Repeat("a", 64),
 		RelayImageDigest:   "morde-syncthing-relay@sha256:" + strings.Repeat("b", 64),
-		RelayPublicAddress: "127.0.0.1:22067",
-		RelayToken:         strings.Repeat("c", 64),
-		RelayStateRoot:     filepath.Join(root, "relay"), StateRoot: filepath.Join(root, "state"),
+		RelayPublicAddress: "8.8.8.8:22067", RelayBindAddress: "172.18.141.222",
+		RelayToken:     strings.Repeat("c", 64),
+		RelayStateRoot: filepath.Join(root, "relay"), StateRoot: filepath.Join(root, "state"),
 		WorkspaceRoot: filepath.Join(root, "files"), RelayContainerName: "morde-sync-relay",
 	}
 	if err := cfg.validate(); err != nil {
@@ -118,7 +142,11 @@ func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 	}{
 		{name: "unpinned image", want: "image_digest must pin an image by sha256 digest", mutate: func(value *WorkspaceSyncNode) { value.ImageDigest = "morde-syncthing:latest" }},
 		{name: "unpinned relay image", want: "relay_image_digest must pin an image by sha256 digest", mutate: func(value *WorkspaceSyncNode) { value.RelayImageDigest = "morde-relay:latest" }},
-		{name: "invalid relay public address", want: "relay_public_address must be a host and port", mutate: func(value *WorkspaceSyncNode) { value.RelayPublicAddress = "https://relay.example.test:22067/path" }},
+		{name: "invalid relay public address", want: "relay_public_address must be a public IPv4 address on port 22067", mutate: func(value *WorkspaceSyncNode) { value.RelayPublicAddress = "https://relay.example.test:22067/path" }},
+		{name: "missing relay bind address", want: "relay_bind_address must be a usable host IPv4 address", mutate: func(value *WorkspaceSyncNode) { value.RelayBindAddress = "" }},
+		{name: "invalid relay bind address", want: "relay_bind_address must be a usable host IPv4 address", mutate: func(value *WorkspaceSyncNode) { value.RelayBindAddress = "relay.example.test" }},
+		{name: "wildcard relay bind address", want: "relay_bind_address must be a usable host IPv4 address", mutate: func(value *WorkspaceSyncNode) { value.RelayBindAddress = "0.0.0.0" }},
+		{name: "loopback relay bind address", want: "relay_bind_address must be a usable host IPv4 address", mutate: func(value *WorkspaceSyncNode) { value.RelayBindAddress = "127.0.0.1" }},
 		{name: "missing relay token", want: "relay_token must be a 32 to 128 character URL-safe secret", mutate: func(value *WorkspaceSyncNode) { value.RelayToken = "" }},
 		{name: "missing relay state root", want: "relay_state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = "" }},
 		{name: "missing state root", want: "state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.StateRoot = "" }},
@@ -127,12 +155,12 @@ func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 		{name: "overlapping relay root", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = filepath.Join(value.StateRoot, "relay") }},
 		{name: "unsafe relay name", want: "relay_container_name is invalid", mutate: func(value *WorkspaceSyncNode) { value.RelayContainerName = "../relay" }},
 	}
-	for _, address := range []string{"relay.example.test:22067", "[2001:db8::1]:22067"} {
+	for _, address := range []string{"8.8.8.8:22067"} {
 		if !validWorkspaceSyncRelayAddress(address) {
 			t.Fatalf("valid relay public address %q rejected", address)
 		}
 	}
-	for _, address := range []string{"", "relay.example.test", "relay.example.test:0", "relay.example.test:65536", "relay.example.test:22067/path"} {
+	for _, address := range []string{"", "8.8.8.8", "8.8.8.8:22068", "relay.example.test:22067", "[2001:db8::1]:22067", "127.0.0.1:22067", "10.0.0.1:22067"} {
 		if validWorkspaceSyncRelayAddress(address) {
 			t.Fatalf("invalid relay public address %q accepted", address)
 		}

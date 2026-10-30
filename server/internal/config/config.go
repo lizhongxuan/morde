@@ -136,6 +136,7 @@ type WorkspaceSyncNode struct {
 	ImageDigest        string `yaml:"image_digest"`
 	RelayImageDigest   string `yaml:"relay_image_digest"`
 	RelayPublicAddress string `yaml:"relay_public_address"`
+	RelayBindAddress   string `yaml:"relay_bind_address"`
 	RelayToken         string `yaml:"relay_token"`
 	RelayStateRoot     string `yaml:"relay_state_root"`
 	StateRoot          string `yaml:"state_root"`
@@ -433,7 +434,12 @@ func (c Config) validate() error {
 			return fmt.Errorf("config.workspace_sync_node.relay_image_digest must pin an image by sha256 digest")
 		}
 		if !validWorkspaceSyncRelayAddress(c.WorkspaceSyncNode.RelayPublicAddress) {
-			return fmt.Errorf("config.workspace_sync_node.relay_public_address must be a host and port")
+			return fmt.Errorf("config.workspace_sync_node.relay_public_address must be a public IPv4 address on port 22067")
+		}
+		bindIP := net.ParseIP(c.WorkspaceSyncNode.RelayBindAddress)
+		if strings.TrimSpace(c.WorkspaceSyncNode.RelayBindAddress) != c.WorkspaceSyncNode.RelayBindAddress || strings.Contains(c.WorkspaceSyncNode.RelayBindAddress, ":") || bindIP == nil || bindIP.To4() == nil ||
+			!bindIP.IsGlobalUnicast() || bindIP.IsLoopback() || bindIP.IsLinkLocalUnicast() {
+			return fmt.Errorf("config.workspace_sync_node.relay_bind_address must be a usable host IPv4 address")
 		}
 		if !workspaceSyncRelayTokenPattern.MatchString(c.WorkspaceSyncNode.RelayToken) {
 			return fmt.Errorf("config.workspace_sync_node.relay_token must be a 32 to 128 character URL-safe secret")
@@ -588,31 +594,13 @@ func validateListenAddress(address string) error {
 
 func validWorkspaceSyncRelayAddress(address string) bool {
 	host, portText, err := net.SplitHostPort(address)
-	if err != nil || host == "" {
+	ip := net.ParseIP(host)
+	if err != nil || strings.Contains(host, ":") || ip == nil || ip.To4() == nil {
 		return false
 	}
 	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return false
-	}
-	if net.ParseIP(host) != nil {
-		return true
-	}
-	if len(host) > 253 || strings.ContainsAny(host, ":/@?#*\\%") {
-		return false
-	}
-	for _, label := range strings.Split(host, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, char := range label {
-			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
-				(char < '0' || char > '9') && char != '-' {
-				return false
-			}
-		}
-	}
-	return true
+	return err == nil && port == 22067 && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
+		!ip.IsUnspecified() && !ip.IsMulticast() && !ip.IsLinkLocalUnicast()
 }
 
 func LoadTemplates(dir string, profiles map[string]Profile) (map[string]templatedomain.Template, error) {

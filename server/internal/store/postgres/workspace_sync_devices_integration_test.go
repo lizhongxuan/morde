@@ -602,10 +602,31 @@ func TestWorkspaceSyncDeviceClientTokenRevocationClosesBinding(t *testing.T) {
 	principal := syncDeviceTestPrincipal(t, store, owner.ID)
 	binding := registerTestWorkspaceSyncDevice(t, store, principal, value.ID,
 		"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA", "token-revoke-certificate")
-	if err := store.RevokeToken(ctx, principal.TokenID, owner.ID); err != nil {
+	applyWorkspaceSyncNodeState(t, store, owner.ID)
+	deviceToken := clientTestToken(t, owner.ID, principal.ClientInstallationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, deviceToken); err != nil {
+		t.Fatal(err)
+	}
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	session.ReplicaID = "device:" + deviceToken.ID
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "token-revoke-session", session.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeToken(ctx, deviceToken.ID, owner.ID); err != nil {
 		t.Fatal(err)
 	}
 	assertWorkspaceSyncDeviceRevocationQueued(t, store, binding.ID)
+	if err := store.CheckWorkspaceSyncDeviceAccess(ctx, identity.Principal{
+		UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: deviceToken.ID, ClientInstallationID: principal.ClientInstallationID,
+	}, value.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked device token access = %v; want not found", err)
+	}
+	cancelled, err := store.GetWorkspaceSyncSession(ctx, value.ID, session.ID)
+	if err != nil || cancelled.State != workspace.SyncCancelled {
+		t.Fatalf("session after device token revoke = %q, %v; want cancelled", cancelled.State, err)
+	}
 	if got := applyWorkspaceSyncNodeState(t, store, owner.ID); len(got.Folders) != 0 {
 		t.Fatalf("token revoke left desired folders: %#v", got.Folders)
 	}
@@ -646,7 +667,8 @@ func registerTestWorkspaceSyncDevice(t *testing.T, store *Store, principal ident
 	if err != nil {
 		t.Fatal(err)
 	}
-	folderID := "morde-" + hex.EncodeToString(certificateHash[:16])
+	folderHash := sha256.Sum256([]byte(workspaceID + "\x00" + string(certificateDER)))
+	folderID := "morde-" + hex.EncodeToString(folderHash[:16])
 	binding, err := store.RegisterWorkspaceSyncDevice(ctx, principal, workspaceID, challenge.ID, keyHash, requestHash, bindingID, folderID)
 	if err != nil {
 		t.Fatal(err)

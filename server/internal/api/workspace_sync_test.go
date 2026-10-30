@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,12 +20,14 @@ import (
 )
 
 type workspaceSyncServiceStub struct {
-	manifest workspace.ManifestPage
-	changes  workspace.ChangePage
-	session  workspace.SyncSession
-	progress []workspace.DeviceSyncProgress
-	block    []byte
-	err      error
+	manifest    workspace.ManifestPage
+	changes     workspace.ChangePage
+	session     workspace.SyncSession
+	progress    []workspace.DeviceSyncProgress
+	block       []byte
+	err         error
+	streamErr   error
+	streamTotal int64
 
 	principal        identity.Principal
 	workspaceID      string
@@ -111,19 +114,30 @@ func (s *workspaceSyncServiceStub) CancelSyncSession(_ context.Context, principa
 func (s *workspaceSyncServiceStub) PutSyncBlock(_ context.Context, principal identity.Principal, workspaceID, sessionID, digest string, body io.Reader) (int64, error) {
 	s.capture(principal, workspaceID)
 	s.sessionID, s.digest = sessionID, digest
-	s.putBody, _ = io.ReadAll(body)
+	var err error
+	s.putBody, err = io.ReadAll(body)
 	s.putCalls++
+	if err != nil {
+		return 0, err
+	}
 	return int64(len(s.putBody)), s.err
 }
 
-func (s *workspaceSyncServiceStub) GetSyncBlock(_ context.Context, principal identity.Principal, workspaceID, sessionID, digest string) (io.ReadCloser, error) {
+func (s *workspaceSyncServiceStub) StreamSyncBlock(_ context.Context, principal identity.Principal, workspaceID, sessionID, digest string, write func(int64, []byte) error) error {
 	s.capture(principal, workspaceID)
 	s.sessionID, s.digest = sessionID, digest
 	s.getBlockCalls++
 	if s.err != nil {
-		return nil, s.err
+		return s.err
 	}
-	return io.NopCloser(bytes.NewReader(s.block)), nil
+	total := s.streamTotal
+	if total == 0 {
+		total = int64(len(s.block))
+	}
+	if err := write(total, s.block); err != nil {
+		return err
+	}
+	return s.streamErr
 }
 
 func (s *workspaceSyncServiceStub) AckDownloadedBlock(_ context.Context, principal identity.Principal, workspaceID, sessionID, digest string) error {
@@ -317,7 +331,8 @@ func TestWorkspaceSyncSessionActionsAndBinaryBlocks(t *testing.T) {
 
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	getBlock := workspaceSyncRequest(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/sync-sessions/p1234567/blocks/"+digest, nil, "", "", cookie)
-	if getBlock.Code != http.StatusOK || getBlock.Header().Get("Content-Type") != "application/octet-stream" || getBlock.Header().Get("Cache-Control") != "no-store" || getBlock.Body.String() != "verified block" {
+	if getBlock.Code != http.StatusOK || getBlock.Header().Get("Content-Type") != "application/octet-stream" ||
+		getBlock.Header().Get("Cache-Control") != "no-store" || getBlock.Header().Get("Content-Length") != "14" || getBlock.Body.String() != "verified block" {
 		t.Fatalf("get block status/headers/body = %d, %#v, %q", getBlock.Code, getBlock.Header(), getBlock.Body.String())
 	}
 	actionHash := strings.Repeat("b", 64)
@@ -362,6 +377,31 @@ func TestWorkspaceSyncSessionActionsAndBinaryBlocks(t *testing.T) {
 
 	if response := workspaceSyncRequest(router, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/sync-sessions", body, "application/json", "Bearer "+apiKeyCredential(), nil); response.Code != http.StatusCreated {
 		t.Fatalf("request repeated with fresh idempotency key: %d %s", response.Code, response.Body)
+	}
+}
+
+func TestWorkspaceSyncBlockHTTPReportsInterruptedDownload(t *testing.T) {
+	service := &workspaceSyncServiceStub{
+		block:       []byte("partial"),
+		streamErr:   errors.New("device access revoked"),
+		streamTotal: 100,
+	}
+	server := httptest.NewServer(newWorkspaceSyncRouter(t, service, Options{}))
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/workspaces/"+testWorkspaceID+"/sync-sessions/p1234567/blocks/"+strings.Repeat("a", 64), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "portal.example.test"
+	request.Header.Set("Authorization", "Bearer "+apiKeyCredential())
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	contents, readErr := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || response.ContentLength != 100 || !bytes.Equal(contents, service.block) || !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("interrupted block response = status %d, content length %d, body %q, read error %v; want detectable truncation", response.StatusCode, response.ContentLength, contents, readErr)
 	}
 }
 
