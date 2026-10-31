@@ -110,7 +110,9 @@ func (s *TaskService) workspaceInputSnapshot(ctx context.Context, ownerID, hostI
 	if *requestedRevision > value.Revision {
 		return nil, nil, domain.NewError(domain.CodeWorkspaceConflict, "workspace input revision is not committed")
 	}
-	manifestDigest, err := workspace.ManifestSHA256Stream(func(yield func(workspace.File) error) error {
+	files := make([]workspace.File, 0)
+	emptyDirectories := make([]string, 0)
+	err = func() error {
 		afterPath := ""
 		for {
 			page, err := reader.GetWorkspaceManifestPage(ctx, workspaceID, *requestedRevision, "", afterPath, manifestPageLimit)
@@ -120,21 +122,42 @@ func (s *TaskService) workspaceInputSnapshot(ctx context.Context, ownerID, hostI
 			if page.WorkspaceID != workspaceID || page.Revision != *requestedRevision {
 				return errors.New("workspace manifest snapshot does not match the requested revision")
 			}
+			if len(files)+len(emptyDirectories)+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
+				return errors.New("workspace manifest exceeds item limit")
+			}
+			pageLastPath := afterPath
+			files = append(files, page.Files...)
+			emptyDirectories = append(emptyDirectories, page.EmptyDirectories...)
 			for _, file := range page.Files {
-				if err := yield(file); err != nil {
-					return err
+				if file.Path <= afterPath {
+					return errors.New("workspace manifest files are not in cursor order")
+				}
+				if file.Path > pageLastPath {
+					pageLastPath = file.Path
+				}
+			}
+			for _, directory := range page.EmptyDirectories {
+				if directory <= afterPath {
+					return errors.New("workspace manifest directories are not in cursor order")
+				}
+				if directory > pageLastPath {
+					pageLastPath = directory
 				}
 			}
 			if page.NextCursor == nil {
 				return nil
 			}
 			cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
-			if err != nil || cursor.Revision != *requestedRevision || cursor.Prefix != "" || cursor.After == afterPath || len(page.Files) == 0 {
+			if err != nil || cursor.Revision != *requestedRevision || cursor.Prefix != "" || cursor.After != pageLastPath || cursor.After <= afterPath || len(page.Files)+len(page.EmptyDirectories) == 0 {
 				return errors.New("workspace manifest cursor is invalid")
 			}
 			afterPath = cursor.After
 		}
-	})
+	}()
+	manifestDigest, digestErr := workspace.ManifestTreeSHA256(files, emptyDirectories)
+	if err == nil {
+		err = digestErr
+	}
 	if err != nil {
 		return nil, nil, domain.NewError(domain.CodeWorkspaceConflict, "workspace input manifest is unavailable")
 	}

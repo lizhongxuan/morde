@@ -2,6 +2,10 @@
 INSERT INTO workspace_revisions (workspace_id, revision, file_count, total_bytes)
 VALUES ($1, $2, $3, $4);
 
+-- name: CreateWorkspaceTreeRevision :exec
+INSERT INTO workspace_revisions (workspace_id, revision, file_count, total_bytes, directory_count)
+VALUES ($1, $2, $3, $4, $5);
+
 -- name: CloseWorkspaceRevisionFile :execrows
 UPDATE workspace_revision_files SET valid_to_revision=$3
 WHERE workspace_id=$1 AND file_path=$2 AND valid_to_revision IS NULL AND valid_from_revision < $3;
@@ -23,6 +27,15 @@ WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NU
   AND ($3::text = '' OR file_path=$3 OR starts_with(file_path, $3 || '/'))
   AND file_path > $4
 ORDER BY file_path
+LIMIT $5;
+
+-- name: ListWorkspaceRevisionEmptyDirectoriesPage :many
+SELECT directory_path
+FROM workspace_revision_empty_directories
+WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
+  AND ($3::text = '' OR directory_path=$3 OR starts_with(directory_path, $3 || '/'))
+  AND directory_path > $4
+ORDER BY directory_path
 LIMIT $5;
 
 -- name: GetWorkspaceRevisionFile :one
@@ -77,6 +90,20 @@ ORDER BY file_path;
 INSERT INTO workspace_revision_files (workspace_id, valid_from_revision, file_path, folded_path, size_bytes, sha256, mode, chunks)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
 
+-- name: ListWorkspaceRevisionEmptyDirectories :many
+SELECT directory_path
+FROM workspace_revision_empty_directories
+WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
+ORDER BY directory_path;
+
+-- name: CloseWorkspaceRevisionEmptyDirectory :execrows
+UPDATE workspace_revision_empty_directories SET valid_to_revision=$3
+WHERE workspace_id=$1 AND directory_path=$2 AND valid_to_revision IS NULL AND valid_from_revision < $3;
+
+-- name: InsertWorkspaceRevisionEmptyDirectory :exec
+INSERT INTO workspace_revision_empty_directories (workspace_id, valid_from_revision, directory_path, folded_path)
+VALUES ($1, $2, $3, $4);
+
 -- name: InsertWorkspaceChange :exec
 INSERT INTO workspace_changes (workspace_id, revision, file_path, action, file)
 VALUES ($1, $2, $3, $4, $5);
@@ -93,10 +120,11 @@ INSERT INTO workspace_sync_sessions (
   id, workspace_id, owner_id, replica_id, direction, policy, state, stage,
   base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes,
   files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths,
-  download_deleted_paths, ack_cursor, conflicts
+  download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories,
+  deleted_directories, upload_deleted_directories, download_deleted_directories, ack_cursor, conflicts
 )
 VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28
 )
 RETURNING *;
 

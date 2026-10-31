@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -111,6 +112,21 @@ func (s *Store) TransitionWorkspaceBinding(
 	from, to workspace.BindingState,
 	desiredRevision, appliedRevision int64,
 ) (workspace.Binding, error) {
+	return s.transitionWorkspaceBinding(ctx, 0, hostID, workspaceID, expectedVersion, from, to, desiredRevision, appliedRevision)
+}
+
+func (s *Store) ActivateWorkspaceBindingForHost(ctx context.Context, hostID string, expectedGeneration int64,
+	workspaceID string, expectedVersion, desiredRevision, appliedRevision int64) (workspace.Binding, error) {
+	if expectedGeneration < 1 {
+		return workspace.Binding{}, domain.InvalidArgument("workspace_binding", "Host generation is invalid")
+	}
+	return s.transitionWorkspaceBinding(ctx, expectedGeneration, hostID, workspaceID, expectedVersion,
+		workspace.BindingPreparing, workspace.BindingActive, desiredRevision, appliedRevision)
+}
+
+func (s *Store) transitionWorkspaceBinding(ctx context.Context, expectedGeneration int64,
+	hostID, workspaceID string, expectedVersion int64, from, to workspace.BindingState,
+	desiredRevision, appliedRevision int64) (workspace.Binding, error) {
 	if err := workspace.ValidateBindingTransition(from, to); err != nil {
 		return workspace.Binding{}, err
 	}
@@ -122,10 +138,18 @@ func (s *Store) TransitionWorkspaceBinding(
 	var updated workspace.Binding
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var hostState string
-		if err := tx.QueryRow(ctx, `SELECT state FROM hosts WHERE id=$1 FOR UPDATE`, hostID).Scan(&hostState); errors.Is(err, pgx.ErrNoRows) {
+		var hostGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
+			Scan(&hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock host before binding transition: %w", err)
+		}
+		if expectedGeneration > 0 && hostGeneration != expectedGeneration {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
+		}
+		if expectedGeneration > 0 && hostState != string(host.StateRunning) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to activate a workspace binding")
 		}
 		if to == workspace.BindingPreparing && hostState != "running" {
 			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to bind a workspace")
@@ -197,17 +221,20 @@ WHERE host_id=$1 AND workspace_id=$2 AND binding_version=$3 AND state=$4
 	return updated, nil
 }
 
-func (s *Store) CompleteWorkspaceBindingUnbind(ctx context.Context, hostID, workspaceID string, expectedVersion, checkpointRevision int64) (workspace.Binding, error) {
-	if !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) || expectedVersion <= 0 || checkpointRevision < 0 {
+func (s *Store) CompleteWorkspaceBindingUnbind(ctx context.Context, hostID, workspaceID string, expectedVersion, expectedGeneration, checkpointRevision int64) (workspace.Binding, error) {
+	if !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) || expectedVersion <= 0 || expectedGeneration < 1 || checkpointRevision < 0 {
 		return workspace.Binding{}, domain.InvalidArgument("workspace_binding", "workspace unbind checkpoint is invalid")
 	}
 	var updated workspace.Binding
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var hostIdentity string
-		if err := tx.QueryRow(ctx, `SELECT id FROM hosts WHERE id=$1 FOR UPDATE`, hostID).Scan(&hostIdentity); errors.Is(err, pgx.ErrNoRows) {
+		var hostGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).Scan(&hostGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock host before completing workspace unbind: %w", err)
+		}
+		if hostGeneration != expectedGeneration {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica authentication required")
 		}
 		var workspaceState string
 		var workspaceRevision int64
@@ -230,7 +257,7 @@ func (s *Store) CompleteWorkspaceBindingUnbind(ctx context.Context, hostID, work
 		if current.BindingVersion != expectedVersion || current.BindingState != string(workspace.BindingUnbinding) {
 			return bindingStateConflict(ctx, tx, hostID, workspaceID)
 		}
-		if workspaceState != string(workspace.StateReady) || checkpointRevision != workspaceRevision || checkpointRevision != current.DesiredRevision {
+		if workspaceState != string(workspace.StateReady) || checkpointRevision != workspaceRevision || checkpointRevision != current.DesiredRevision || checkpointRevision != current.AppliedRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace changed after the Host checkpoint")
 		}
 		if err := rejectUnfinishedHostWorkspaceSync(ctx, tx, hostID, workspaceID); err != nil {
@@ -239,9 +266,9 @@ func (s *Store) CompleteWorkspaceBindingUnbind(ctx context.Context, hostID, work
 		result, err := tx.Exec(ctx, `
 UPDATE workspace_bindings
 SET state='detached', binding_version=binding_version+1,
-    desired_revision=$4, applied_revision=$4, updated_at=now()
+    desired_revision=$4, updated_at=now()
 WHERE host_id=$1 AND workspace_id=$2 AND binding_version=$3 AND state='unbinding'
-  AND desired_revision=$4`, hostID, workspaceID, expectedVersion, checkpointRevision)
+  AND desired_revision=$4 AND applied_revision=$4`, hostID, workspaceID, expectedVersion, checkpointRevision)
 		if err != nil {
 			return fmt.Errorf("complete workspace unbind: %w", err)
 		}
@@ -278,12 +305,24 @@ SELECT EXISTS (
 	return nil
 }
 
-func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, hostID, workspaceID string, expectedVersion, revision int64) (workspace.Binding, error) {
-	if !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) || expectedVersion <= 0 || revision < 0 {
+func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, hostID string, hostGeneration int64, workspaceID string, expectedVersion int64, sessionID string, revision int64) (workspace.Binding, error) {
+	if !domain.ValidHostID(hostID) || hostGeneration < 1 || !domain.ValidWorkspaceID(workspaceID) || expectedVersion <= 0 ||
+		!workspace.ValidSessionID(sessionID) || revision < 0 {
 		return workspace.Binding{}, domain.InvalidArgument("workspace_binding", "workspace applied revision receipt is invalid")
 	}
 	var updated workspace.Binding
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var hostOwner string
+		var currentGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT owner_id, runtime_generation FROM hosts WHERE id=$1 FOR SHARE`, hostID).
+			Scan(&hostOwner, &currentGeneration); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "host not found")
+		} else if err != nil {
+			return fmt.Errorf("lock Host before applied revision receipt: %w", err)
+		}
+		if currentGeneration != hostGeneration {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
+		}
 		var workspaceState string
 		var workspaceRevision int64
 		if err := tx.QueryRow(ctx, `SELECT state, revision FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&workspaceState, &workspaceRevision); errors.Is(err, pgx.ErrNoRows) {
@@ -307,6 +346,28 @@ func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, host
 		}
 		if workspaceState != string(workspace.StateReady) || revision > workspaceRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace applied revision is not available")
+		}
+		row, err := sqlcgen.New(tx).LockWorkspaceSyncSession(ctx, sqlcgen.LockWorkspaceSyncSessionParams{
+			WorkspaceID: workspaceID, ID: sessionID,
+		})
+		if err != nil {
+			return storeError("lock Host workspace applied receipt session", "workspace sync session", err)
+		}
+		expectedReplicaID := fmt.Sprintf("host:%s:g%d:%s:b%d", hostID, hostGeneration, workspaceID, expectedVersion)
+		if row.OwnerID != current.OwnerID || row.OwnerID != hostOwner || row.ReplicaID != expectedReplicaID {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		validDirection := row.Direction == string(workspace.SyncDownload) || row.Direction == string(workspace.SyncBidirectional)
+		validPolicy := row.Policy == string(workspace.SyncFillMissing) || row.Policy == string(workspace.SyncLive)
+		if row.State != string(workspace.SyncCompleted) || !validDirection || !validPolicy || row.TargetRevision != revision {
+			return domain.NewError(domain.CodeWorkspaceConflict, "workspace revision was not fully applied by a completed download session")
+		}
+		var conflicts []workspace.Conflict
+		if err := json.Unmarshal(row.Conflicts, &conflicts); err != nil {
+			return fmt.Errorf("decode Host workspace applied receipt conflicts: %w", err)
+		}
+		if len(conflicts) != 0 {
+			return domain.NewError(domain.CodeWorkspaceConflict, "workspace revision was not fully applied by a conflict-free download session")
 		}
 		if revision > current.AppliedRevision {
 			result, err := tx.Exec(ctx, `UPDATE workspace_bindings SET applied_revision=$4, updated_at=now()
@@ -332,6 +393,19 @@ WHERE host_id=$1 AND workspace_id=$2 AND binding_version=$3 AND applied_revision
 }
 
 func (s *Store) SetWorkspaceBindingSyncStatus(ctx context.Context, hostID, workspaceID string, expectedVersion int64, state workspace.BindingSyncState, conflicts []string) (workspace.Binding, error) {
+	return s.setWorkspaceBindingSyncStatus(ctx, hostID, 0, workspaceID, expectedVersion, state, conflicts)
+}
+
+func (s *Store) SetWorkspaceBindingSyncStatusForHost(ctx context.Context, hostID string, expectedGeneration int64,
+	workspaceID string, expectedVersion int64, state workspace.BindingSyncState, conflicts []string) (workspace.Binding, error) {
+	if expectedGeneration < 1 {
+		return workspace.Binding{}, domain.InvalidArgument("sync_status", "Host generation is invalid")
+	}
+	return s.setWorkspaceBindingSyncStatus(ctx, hostID, expectedGeneration, workspaceID, expectedVersion, state, conflicts)
+}
+
+func (s *Store) setWorkspaceBindingSyncStatus(ctx context.Context, hostID string, expectedGeneration int64,
+	workspaceID string, expectedVersion int64, state workspace.BindingSyncState, conflicts []string) (workspace.Binding, error) {
 	if !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) || expectedVersion < 1 ||
 		workspace.ValidateBindingSyncStatus(state, conflicts) != nil {
 		return workspace.Binding{}, domain.InvalidArgument("sync_status", "workspace sync status is invalid")
@@ -342,10 +416,15 @@ func (s *Store) SetWorkspaceBindingSyncStatus(ctx context.Context, hostID, works
 	var updated workspace.Binding
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var hostState string
-		if err := tx.QueryRow(ctx, `SELECT state FROM hosts WHERE id=$1 FOR UPDATE`, hostID).Scan(&hostState); errors.Is(err, pgx.ErrNoRows) {
+		var hostGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
+			Scan(&hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock host before workspace sync status: %w", err)
+		}
+		if expectedGeneration > 0 && hostGeneration != expectedGeneration {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
 		}
 		if hostState != string(host.StateRunning) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to report workspace sync status")
@@ -448,7 +527,14 @@ func (s *Store) ClaimWorkspaceForDelete(ctx context.Context, workspaceID string,
 		var bound bool
 		if err := tx.QueryRow(ctx, `
 SELECT EXISTS (SELECT 1 FROM workspace_bindings WHERE workspace_id=$1 AND state <> 'detached')
-    OR EXISTS (SELECT 1 FROM workspace_sync_sessions WHERE workspace_id=$1 AND state IN ('planned','transferring','verifying','applying'))`, workspaceID).Scan(&bound); err != nil {
+    OR EXISTS (SELECT 1 FROM workspace_sync_sessions WHERE workspace_id=$1 AND state IN ('planned','transferring','verifying','applying'))
+    OR EXISTS (SELECT 1 FROM workspace_sync_folders WHERE workspace_id=$1 AND state IN ('pending_node','active','revoking'))
+    OR EXISTS (SELECT 1 FROM workspace_sync_receive_reservations WHERE workspace_id=$1 AND state IN ('reserved','aborting'))
+    OR EXISTS (
+      SELECT 1 FROM workspace_sync_folders f
+      JOIN workspace_sync_node_revisions r ON r.owner_id=f.owner_id
+      WHERE f.workspace_id=$1 AND r.desired_revision>r.applied_revision
+    )`, workspaceID).Scan(&bound); err != nil {
 			return fmt.Errorf("check workspace bindings before deletion: %w", err)
 		}
 		if bound {
@@ -567,3 +653,4 @@ func (s *Store) SetWorkspaceError(ctx context.Context, workspaceID string, expec
 }
 
 var _ app.WorkspaceStore = (*Store)(nil)
+var _ app.HostReplicaWorkspaceStore = (*Store)(nil)

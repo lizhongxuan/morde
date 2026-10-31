@@ -25,6 +25,8 @@ const deviceProgress: components['schemas']['DeviceWorkspaceSyncProgress'] = {
   state: 'applying', stage: 'apply', planned_bytes: 2048, confirmed_bytes: 1024,
   download_actions_total: 3, download_actions_done: 2, updated_at: '2026-10-24T00:00:00Z',
 };
+const deviceProgressSummary = { revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
+  remaining_bytes: workspace.quota_bytes - workspace.used_bytes, quota_status: 'available' as const };
 
 function renderWorkspaces() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
@@ -368,7 +370,7 @@ describe('Workspaces', () => {
 
   it('loads and labels only the authorized device sync summary without file details', async () => {
     vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
-    vi.spyOn(portalApi, 'workspaceDeviceSyncProgress').mockResolvedValue({ items: [deviceProgress] });
+    vi.spyOn(portalApi, 'workspaceDeviceSyncProgress').mockResolvedValue({ ...deviceProgressSummary, items: [deviceProgress] });
     const user = userEvent.setup();
     renderWorkspaces();
 
@@ -383,8 +385,8 @@ describe('Workspaces', () => {
   it('keeps looking for a session while the user is viewing an empty device progress panel', async () => {
     vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
     const progress = vi.spyOn(portalApi, 'workspaceDeviceSyncProgress')
-      .mockResolvedValueOnce({ items: [] })
-      .mockResolvedValue({ items: [deviceProgress] });
+      .mockResolvedValueOnce({ ...deviceProgressSummary, items: [] })
+      .mockResolvedValue({ ...deviceProgressSummary, items: [deviceProgress] });
     const user = userEvent.setup();
     renderWorkspaces();
 
@@ -397,7 +399,7 @@ describe('Workspaces', () => {
 
   it('closes the device progress panel, stops polling, and allows reopening it', async () => {
     vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
-    const progress = vi.spyOn(portalApi, 'workspaceDeviceSyncProgress').mockResolvedValue({ items: [] });
+    const progress = vi.spyOn(portalApi, 'workspaceDeviceSyncProgress').mockResolvedValue({ ...deviceProgressSummary, items: [] });
     const user = userEvent.setup();
     renderWorkspaces();
 

@@ -40,6 +40,7 @@ import (
 	"morde/server/internal/orchestrator"
 	"morde/server/internal/storage"
 	"morde/server/internal/storage/sitefs"
+	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 	"morde/server/internal/store/postgres"
 	"morde/server/internal/worker"
@@ -141,6 +142,22 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	if configuredRoot := os.Getenv("CH_WORKSPACE_SYNC_CURRENT_FILES_DIR"); configuredRoot != "" && configuredRoot != cfg.WorkspaceSyncNode.WorkspaceRoot {
+		return fmt.Errorf("config.workspace_sync_node.workspace_root must match CH_WORKSPACE_SYNC_CURRENT_FILES_DIR")
+	}
+	if cfg.WorkspaceSyncNode.Enabled {
+		if err := storage.CheckWorkspaceSyncStorageIsolation(
+			cfg.WorkspaceStorage.RootDir, cfg.WorkspaceSyncNode.WorkspaceRoot, cfg.Storage.DockerDataDir, cfg.SiteStorage.RootDir,
+			cfg.WorkspaceSyncNode.StateRoot, cfg.WorkspaceSyncNode.RelayStateRoot, cfg.WorkspaceSyncNode.ProtectedStorageRoots,
+		); err != nil {
+			return fmt.Errorf("validate workspace sync filesystem isolation: %w", err)
+		}
+	} else if err := storage.CheckWorkspaceCurrentStorageIsolation(
+		cfg.WorkspaceStorage.RootDir, cfg.WorkspaceSyncNode.WorkspaceRoot, cfg.Storage.DockerDataDir, cfg.SiteStorage.RootDir,
+		cfg.WorkspaceSyncNode.ProtectedStorageRoots,
+	); err != nil {
+		return fmt.Errorf("validate Workspace current-filesystem isolation: %w", err)
+	}
 	if err := checkNetworkPolicies(ctx, cfg.Orchestrator.Profiles); err != nil {
 		return err
 	}
@@ -193,11 +210,35 @@ func serve(ctx context.Context, configPath string) error {
 		return fmt.Errorf("check legacy workspace imports: %w", err)
 	}
 	if len(pendingImports) > 0 {
-		ids := make([]string, 0, len(pendingImports))
+		items := make([]string, 0, len(pendingImports))
 		for _, pending := range pendingImports {
-			ids = append(ids, pending.WorkspaceID)
+			item := pending.WorkspaceID
+			if pending.ImportError != "" {
+				item += " (needs cleanup: " + pending.ImportError + ")"
+			}
+			items = append(items, item)
 		}
-		return fmt.Errorf("legacy workspace volumes must be imported before serving (pending workspaces: %s); run portal workspace import-legacy --workspace <id>", strings.Join(ids, ", "))
+		return fmt.Errorf("legacy workspace volumes must be imported or cleaned up before serving (pending workspaces: %s); run portal workspace import-legacy --workspace <id>", strings.Join(items, ", "))
+	}
+	workspaceCurrent, err := workspacecurrent.Open(cfg.WorkspaceSyncNode.WorkspaceRoot)
+	if err != nil {
+		return fmt.Errorf("open Workspace current-file storage: %w", err)
+	}
+	defer func() { _ = workspaceCurrent.Close() }()
+	workspaceSync, err := app.NewWorkspaceSyncService(store, workspaceBlocks, workspace.MaxSyncManifestBytes, cfg.WorkspaceStorage.MaxOwnerBytes)
+	if err != nil {
+		return err
+	}
+	if err := workspaceSync.SetWorkspaceCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string) error {
+		return workspaceCurrent.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, workspaceBlocks)
+	}); err != nil {
+		return fmt.Errorf("configure Workspace current-file materializer: %w", err)
+	}
+	if err := workspaceSync.SetWorkspaceCurrentRevisionReader(workspaceCurrent.CurrentRevision); err != nil {
+		return fmt.Errorf("configure Workspace current revision reader: %w", err)
+	}
+	if err := workspaceSync.SetWorkspaceCurrentManifestVerifier(workspaceCurrent.MatchesManifest); err != nil {
+		return fmt.Errorf("configure Workspace current manifest verifier: %w", err)
 	}
 	workspaceCapacity, err := storage.NewWorkspaceCapacity(cfg.WorkspaceStorage.RootDir, cfg.WorkspaceStorage.MinFreeBytes)
 	if err != nil {
@@ -310,10 +351,69 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize MCP Host authorization: %w", err)
 	}
+	var workspaceSyncNodeEnsurer app.WorkspaceSyncNodeEnsurer
+	var workspaceSyncNodeOwnerReconciler app.WorkspaceSyncNodeOwnerReconciler
+	var workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
+	if cfg.WorkspaceSyncNode.Enabled {
+		quotaService, err := app.NewWorkspaceSyncQuotaService(workspaceSync, workspaceCurrent)
+		if err != nil {
+			return fmt.Errorf("initialize Workspace sync quota service: %w", err)
+		}
+		quotaSockets, err := worker.NewWorkspaceSyncNodeQuotaSockets(cfg.WorkspaceSyncNode.QuotaSocketRoot, quotaService)
+		if err != nil {
+			return fmt.Errorf("initialize Workspace sync quota sockets: %w", err)
+		}
+		defer func() { _ = quotaSockets.Close() }()
+		dockerSocket, err := workspaceSyncDockerSocketPath(cfg.Storage.DockerHost)
+		if err != nil {
+			return err
+		}
+		nodeSupervisor, err := worker.NewDockerWorkspaceSyncNodeSupervisor(worker.DockerWorkspaceSyncNodeSupervisorOptions{
+			ImageDigest: cfg.WorkspaceSyncNode.ImageDigest, RelayImageDigest: cfg.WorkspaceSyncNode.RelayImageDigest,
+			RelayPublicAddress: cfg.WorkspaceSyncNode.RelayPublicAddress, RelayBindAddress: cfg.WorkspaceSyncNode.RelayBindAddress,
+			RelayToken:   cfg.WorkspaceSyncNode.RelayToken,
+			DockerSocket: dockerSocket, RelayStateRoot: cfg.WorkspaceSyncNode.RelayStateRoot, StateRoot: cfg.WorkspaceSyncNode.StateRoot,
+			WorkspaceRoot: cfg.WorkspaceSyncNode.WorkspaceRoot, QuotaSocketRoot: cfg.WorkspaceSyncNode.QuotaSocketRoot,
+			RelayContainerName: cfg.WorkspaceSyncNode.RelayContainerName,
+			Resources:          worker.DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Workspace sync node supervisor: %w", err)
+		}
+		startGuard := worker.WorkspaceSyncNodeStartGuardFunc(func(ctx context.Context, ownerID string) error {
+			owners, err := workspaceSync.ListActiveWorkspaceSyncReceiveOwners(ctx)
+			if err != nil {
+				return err
+			}
+			for _, activeOwner := range owners {
+				if activeOwner == ownerID {
+					return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an unresolved file receive")
+				}
+			}
+			return nil
+		})
+		workspaceSyncNodeProvisioner, err = worker.NewWorkspaceSyncNodeProvisioner(worker.WorkspaceSyncNodeProvisionerOptions{
+			Supervisor: nodeSupervisor, Store: store, RelayGate: worker.NewCommandWorkspaceSyncRelayGate(),
+			QuotaSockets: quotaSockets, StartGuard: startGuard, DataKey: dataKey,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Workspace sync node provisioner: %w", err)
+		}
+		if err := workspaceSyncNodeProvisioner.StopAllWorkspaceSyncNodesForStartup(ctx); err != nil {
+			return fmt.Errorf("stop Workspace sync nodes before startup recovery: %w", err)
+		}
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = workspaceSyncNodeProvisioner.StopAllWorkspaceSyncNodesForStartup(stopCtx)
+		}()
+		workspaceSyncNodeEnsurer = workspaceSyncNodeProvisioner
+		workspaceSyncNodeOwnerReconciler = workspaceSyncNodeProvisioner
+	}
 	credentials, err := app.NewCredentialService(store, store, store, countedAudit, app.CredentialOptions{
 		SessionTTL: cfg.Security.SessionTTL, TicketTTL: cfg.Security.TicketTTL,
 		LoginLimit: loginLimit(cfg.Security.LoginRateLimit), LoginWindow: time.Minute,
-	}, hosts)
+	}, hosts, workspaceSyncNodeOwnerReconciler)
 	if err != nil {
 		return err
 	}
@@ -329,50 +429,26 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize task chat compatibility: %w", err)
 	}
-	users, err := app.NewUserService(store, store)
-	if err != nil {
-		return err
-	}
 	workspaces, err := app.NewWorkspaceService(
-		store, workspaceBlocks, workspaceCapacity, countedAudit,
+		store, workspaceBlocks, workspaceCurrent, workspaceCapacity, countedAudit,
 		cfg.WorkspaceStorage.MaxWorkspaceBytes,
 	)
 	if err != nil {
 		return err
 	}
+	if err := workspaces.SetWorkspaceCurrentInitializer(workspaceSync.InitializeWorkspaceCurrent); err != nil {
+		return fmt.Errorf("configure Workspace current initializer: %w", err)
+	}
 	adminWorkspaces, err := app.NewAdminWorkspaceService(store)
 	if err != nil {
 		return err
 	}
-	workspaceSync, err := app.NewWorkspaceSyncService(store, workspaceBlocks, workspace.MaxSyncManifestBytes, cfg.WorkspaceStorage.MaxOwnerBytes)
+	if err := workspaceSync.ReconcilePendingWorkspaceCurrentMaterializations(ctx); err != nil {
+		return fmt.Errorf("reconcile Workspace current-file materializations before serving: %w", err)
+	}
+	users, err := app.NewUserService(store, store, workspaceSyncNodeOwnerReconciler)
 	if err != nil {
 		return err
-	}
-	var workspaceSyncNodeEnsurer app.WorkspaceSyncNodeEnsurer
-	var workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
-	if cfg.WorkspaceSyncNode.Enabled {
-		dockerSocket, err := workspaceSyncDockerSocketPath(cfg.Storage.DockerHost)
-		if err != nil {
-			return err
-		}
-		nodeSupervisor, err := worker.NewDockerWorkspaceSyncNodeSupervisor(worker.DockerWorkspaceSyncNodeSupervisorOptions{
-			ImageDigest: cfg.WorkspaceSyncNode.ImageDigest, RelayImageDigest: cfg.WorkspaceSyncNode.RelayImageDigest,
-			RelayPublicAddress: cfg.WorkspaceSyncNode.RelayPublicAddress, RelayBindAddress: cfg.WorkspaceSyncNode.RelayBindAddress,
-			RelayToken:   cfg.WorkspaceSyncNode.RelayToken,
-			DockerSocket: dockerSocket, RelayStateRoot: cfg.WorkspaceSyncNode.RelayStateRoot, StateRoot: cfg.WorkspaceSyncNode.StateRoot,
-			WorkspaceRoot: cfg.WorkspaceSyncNode.WorkspaceRoot, RelayContainerName: cfg.WorkspaceSyncNode.RelayContainerName,
-			Resources: worker.DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
-		})
-		if err != nil {
-			return fmt.Errorf("initialize Workspace sync node supervisor: %w", err)
-		}
-		workspaceSyncNodeProvisioner, err = worker.NewWorkspaceSyncNodeProvisioner(worker.WorkspaceSyncNodeProvisionerOptions{
-			Supervisor: nodeSupervisor, Store: store, DataKey: dataKey,
-		})
-		if err != nil {
-			return fmt.Errorf("initialize Workspace sync node provisioner: %w", err)
-		}
-		workspaceSyncNodeEnsurer = workspaceSyncNodeProvisioner
 	}
 	workspaceSyncDevices, err := app.NewWorkspaceSyncDeviceService(store, workspaceSyncNodeEnsurer)
 	if err != nil {
@@ -390,7 +466,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	clientLogin, err := app.NewClientLoginService(store, credentials, workspaceSyncNodeProvisioner)
+	clientLogin, err := app.NewClientLoginService(store, credentials, workspaceSyncNodeOwnerReconciler)
 	if err != nil {
 		return err
 	}
@@ -452,7 +528,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	admin := adminAdapter{users: users, audit: auditService, capacity: hosts, workspaceSyncReconciler: workspaceSyncNodeProvisioner}
+	admin := adminAdapter{users: users, audit: auditService, capacity: hosts, workspaceSyncReconciler: workspaceSyncNodeOwnerReconciler}
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices,
@@ -495,6 +571,11 @@ func serve(ctx context.Context, configPath string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if workspaceSyncNodeProvisioner != nil {
+		if err := workspaceSyncNodeProvisioner.ReconcileWorkspaceSyncNodesOnStartup(ctx); err != nil {
+			logger.Warn("Workspace sync startup reconciliation incomplete; affected relay gates remain closed", zap.Error(err))
+		}
 	}
 	apiServer := httpserver.NewServer(cfg.Listen.API, apiHandler, cfg.HTTP)
 	gatewayServer := httpserver.NewServer(cfg.Listen.Gateway, gatewayHandler, cfg.HTTP)
@@ -677,7 +758,15 @@ func verifyWorkspaceContent(ctx context.Context, configPath string, stdout io.Wr
 		return fmt.Errorf("write workspace verification result: %w", err)
 	}
 	if len(pendingImports) > 0 {
-		return fmt.Errorf("%d legacy workspace volume(s) are pending import; run portal workspace import-legacy --workspace <id>", len(pendingImports))
+		items := make([]string, 0, len(pendingImports))
+		for _, pending := range pendingImports {
+			item := pending.WorkspaceID
+			if pending.ImportError != "" {
+				item += " (needs cleanup: " + pending.ImportError + ")"
+			}
+			items = append(items, item)
+		}
+		return fmt.Errorf("%d legacy workspace volume(s) are pending import or cleanup (%s); run portal workspace import-legacy --workspace <id>", len(pendingImports), strings.Join(items, ", "))
 	}
 	return nil
 }
@@ -776,6 +865,13 @@ func importLegacyWorkspace(ctx context.Context, configPath, workspaceID string, 
 	store := postgres.New(pool)
 	if err := reconcileWorkspaceBlockUsage(ctx, store, blocks, cfg.WorkspaceStorage.MaxOwnerBytes); err != nil {
 		return fmt.Errorf("reconcile workspace physical usage before legacy import: %w", err)
+	}
+	blockGC, err := app.NewWorkspaceBlockGarbageCollector(store, blocks)
+	if err != nil {
+		return fmt.Errorf("initialize legacy Workspace block recovery: %w", err)
+	}
+	if _, err := blockGC.CollectPendingLegacyImport(ctx, workspaceID); err != nil {
+		return fmt.Errorf("recover blocks from a previous legacy import attempt: %w", err)
 	}
 	volumeSource, err := newVolumeDeleter(cfg.Storage)
 	if err != nil {

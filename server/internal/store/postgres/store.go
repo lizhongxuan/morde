@@ -164,6 +164,10 @@ func (s *Store) CreateWorkspace(ctx context.Context, value workspace.Workspace, 
 		}); err != nil {
 			return fmt.Errorf("create initial workspace revision: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_current_materializations
+(workspace_id, desired_revision, applied_revision) VALUES ($1, 0, -1)`, value.ID); err != nil {
+			return fmt.Errorf("create initial Workspace current materialization: %w", err)
+		}
 		created = workspaceDomain(row)
 		return nil
 	})
@@ -231,25 +235,25 @@ func (s *Store) CreateUser(ctx context.Context, value identity.User) (identity.U
 }
 
 func (s *Store) UpdateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User) (identity.User, error) {
-	return s.updateUser(ctx, actorID, expectedStatus, value, nil)
+	return s.updateUser(ctx, actorID, expectedStatus, value, nil, nil)
 }
 
-func (s *Store) UpdateUserWithAudit(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, entry audit.Entry) (identity.User, error) {
+func (s *Store) UpdateUserWithAudit(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, entry audit.Entry, disableRelay func(context.Context) error) (identity.User, error) {
 	params, err := auditParams(entry)
 	if err != nil {
 		return identity.User{}, err
 	}
-	return s.updateUser(ctx, actorID, expectedStatus, value, &params)
+	return s.updateUser(ctx, actorID, expectedStatus, value, &params, disableRelay)
 }
 
-func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, auditParams *sqlcgen.CreateAuditLogParams) (identity.User, error) {
+func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, auditParams *sqlcgen.CreateAuditLogParams, disableRelay func(context.Context) error) (identity.User, error) {
 	if !domain.ValidUserID(value.ID) || !expectedStatus.Valid() || !value.Status.Valid() ||
 		(value.Role != identity.RoleUser && value.Role != identity.RoleAdmin && value.Role != identity.RoleSuperAdmin) ||
 		value.QuotaHosts < 0 || value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 || value.DefaultHostCPUMilli <= 0 || value.DefaultHostMemMiB <= 0 {
 		return identity.User{}, domain.InvalidArgument("user", "user fields or expected status are invalid")
 	}
 	var updated identity.User
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+	err := s.withWorkspaceSyncOwnerTx(ctx, value.ID, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('morde:admin-user-update', 0))`); err != nil {
 			return fmt.Errorf("lock admin user updates: %w", err)
 		}
@@ -303,6 +307,11 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 		}
 		identityChanged := current.Name != value.Name || current.PasswordHash != value.PasswordHash || current.Role != value.Role ||
 			current.Status != value.Status || current.MustChangePassword != value.MustChangePassword
+		if identityChanged && disableRelay != nil {
+			if err := disableRelay(ctx); err != nil {
+				return fmt.Errorf("disable Workspace sync relay before account authorization change: %w", err)
+			}
+		}
 		row, err := sqlcgen.New(tx).UpdateUser(ctx, sqlcgen.UpdateUserParams{
 			ID: value.ID, Name: value.Name, PasswordHash: value.PasswordHash, Role: string(value.Role),
 			Status: string(value.Status), MustChangePassword: value.MustChangePassword,
@@ -336,7 +345,7 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 			}
 		}
 		return nil
-	})
+	}, nil, nil)
 	if err != nil {
 		return identity.User{}, err
 	}
@@ -428,7 +437,7 @@ func createToken(ctx context.Context, q *sqlcgen.Queries, value identity.Token) 
 }
 
 func (s *Store) RevokeToken(ctx context.Context, id, ownerID string) error {
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+	return s.withWorkspaceSyncOwnerTx(ctx, ownerID, func(tx pgx.Tx) error {
 		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
 			return err
 		}
@@ -457,7 +466,7 @@ func (s *Store) RevokeToken(ctx context.Context, id, ownerID string) error {
 			}
 		}
 		return nil
-	})
+	}, nil, nil)
 }
 
 func (s *Store) WriteAudit(ctx context.Context, entry audit.Entry) error {

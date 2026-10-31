@@ -219,7 +219,8 @@ func (e *RuntimeToolExecutor) Definitions(ctx context.Context, claimed task.Task
 	canOperate := e.authorize(ctx, current, identity.ScopeComputerOperate) == nil
 	definitions := make([]AgentToolDefinition, 0, len(runtimeToolMappings))
 	for _, mapping := range runtimeToolMappings {
-		if mapping.internal || !session.Supports(mapping.capability) || (mapping.scope == identity.ScopeComputerOperate && !canOperate) {
+		if mapping.internal || workspaceTaskDesktopInputDisabled(current, mapping) || !session.Supports(mapping.capability) ||
+			(mapping.scope == identity.ScopeComputerOperate && !canOperate) {
 			continue
 		}
 		if runtimeclient.WorkspaceScopedCapability(mapping.capability) && !session.Supports("workspace.task_view") {
@@ -244,6 +245,9 @@ func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequ
 	current, err := e.currentTask(ctx, request.Task)
 	if err != nil {
 		return AgentToolPreparation{}, err
+	}
+	if workspaceTaskDesktopInputDisabled(current, mapping) {
+		return AgentToolPreparation{}, domain.NewError(domain.CodeUnsupported, "AI desktop input is disabled for Workspace tasks")
 	}
 	if err := checkRuntimeToolBudget(current); err != nil {
 		return AgentToolPreparation{}, err
@@ -380,6 +384,9 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	if err != nil {
 		return AgentToolResult{}, err
 	}
+	if workspaceTaskDesktopInputDisabled(current, mapping) {
+		return AgentToolResult{Status: AgentToolFailed, Output: "AI desktop input is disabled for Workspace tasks."}, nil
+	}
 	workspaceID, err := runtimeToolOperationWorkspaceID(mapping, request.Arguments, current)
 	if err != nil || preparation.WorkspaceID != workspaceID || request.WorkspaceID != workspaceID ||
 		(workspaceID != "" && preparation.BindingVersion < 1) || (workspaceID == "" && preparation.BindingVersion != 0) ||
@@ -484,6 +491,10 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	return result, err
 }
 
+func workspaceTaskDesktopInputDisabled(current task.Task, mapping runtimeToolMapping) bool {
+	return current.WorkspaceID != "" && mapping.capability == "desktop.input"
+}
+
 func workspaceInputChangedResult() AgentToolResult {
 	return AgentToolResult{
 		Status: AgentToolNeedsUser, WaitingReason: "workspace_input_changed",
@@ -521,6 +532,10 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 	current, err := e.currentTaskForOperationReconciliation(ctx, request.Task)
 	if err != nil {
 		return AgentToolResult{}, err
+	}
+	// An unresolved legacy GUI action cannot be proven safe to rearm after the Workspace gate closes.
+	if workspaceTaskDesktopInputDisabled(current, mapping) && persisted.Status != task.OperationSucceeded && persisted.Status != task.OperationFailed {
+		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	currentWorkspaceID, workspaceErr := runtimeToolOperationWorkspaceID(mapping, request.Arguments, current)
 	if workspaceErr != nil || currentWorkspaceID != persisted.WorkspaceID || !sameTaskInputRevision(current.InputRevision, persisted.InputRevision) ||
@@ -1355,11 +1370,11 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 	if receipt.State == TaskWorkspacePublishQuotaRejected {
 		return workspacePublishQuotaVerification()
 	}
-	files, manifestSHA, err := taskWorkspaceOutputManifest(ctx, session, current, group)
+	files, emptyDirectories, manifestSHA, err := taskWorkspaceOutputManifest(ctx, session, current, group)
 	if err != nil {
 		return taskWorkspacePublishErrorVerification(err)
 	}
-	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, manifestSHA, func(ctx context.Context, digest string) ([]byte, error) {
+	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, manifestSHA, func(ctx context.Context, digest string) ([]byte, error) {
 		block, err := session.ReadTaskWorkspaceBlock(ctx, current, group.bindingVersion, group.viewID, manifestSHA, digest)
 		if err != nil {
 			return nil, err
@@ -1379,40 +1394,63 @@ func taskWorkspacePublishOperationKey(stepID, workspaceID string) string {
 	return "task-workspace-publish:" + stepID + ":" + workspaceID
 }
 
-func taskWorkspaceOutputManifest(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup) ([]workspace.File, string, error) {
+func taskWorkspaceOutputManifest(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup) ([]workspace.File, []string, string, error) {
 	files := make([]workspace.File, 0)
+	emptyDirectories := make([]string, 0)
 	afterPath, manifestSHA := "", ""
 	for {
 		page, err := session.TaskWorkspaceManifestPage(ctx, current, group.bindingVersion, group.viewID, manifestSHA, afterPath, 1000)
 		if err != nil {
-			return nil, "", err
+			return nil, nil, "", err
 		}
 		if page.TaskID != current.ID || page.WorkspaceID != group.workspaceID || page.BindingVersion != group.bindingVersion ||
 			page.InputRevision != *current.InputRevision || page.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision ||
 			page.InputManifestSHA256 != hex.EncodeToString(current.ContextDigest) || page.ViewID != group.viewID ||
 			(manifestSHA != "" && page.ManifestSHA256 != manifestSHA) || (page.NextCursor != "" && page.NextCursor <= afterPath) {
-			return nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest changed during export")
+			return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest changed during export")
+		}
+		if len(files)+len(emptyDirectories)+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
+			return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest exceeds its item limit")
 		}
 		if manifestSHA == "" {
 			manifestSHA = page.ManifestSHA256
 		}
+		pageLastPath := afterPath
 		for _, item := range page.Files {
+			if item.Path <= afterPath {
+				return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest cursor is invalid")
+			}
+			if item.Path > pageLastPath {
+				pageLastPath = item.Path
+			}
 			chunks := make([]workspace.Chunk, len(item.Chunks))
 			for index, chunk := range item.Chunks {
 				chunks[index] = workspace.Chunk{SHA256: chunk.SHA256, SizeBytes: chunk.SizeBytes}
 			}
 			files = append(files, workspace.File{Path: item.Path, SizeBytes: item.SizeBytes, SHA256: item.SHA256, Mode: item.Mode, Chunks: chunks})
 		}
+		for _, directory := range page.EmptyDirectories {
+			if directory <= afterPath {
+				return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output directory cursor is invalid")
+			}
+			if directory > pageLastPath {
+				pageLastPath = directory
+			}
+			emptyDirectories = append(emptyDirectories, directory)
+		}
+		if page.NextCursor != "" && (page.NextCursor != pageLastPath || pageLastPath == afterPath) {
+			return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest cursor is invalid")
+		}
 		if page.NextCursor == "" {
 			break
 		}
 		afterPath = page.NextCursor
 	}
-	actualManifestSHA, err := workspace.ManifestSHA256(files)
+	actualManifestSHA, err := workspace.ManifestTreeSHA256(files, emptyDirectories)
 	if err != nil || manifestSHA == "" || actualManifestSHA != manifestSHA {
-		return nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest failed integrity verification")
+		return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest failed integrity verification")
 	}
-	return files, manifestSHA, nil
+	return files, emptyDirectories, manifestSHA, nil
 }
 
 func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifacts(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup, receipt TaskWorkspacePublishReceipt, result *AgentVerificationResult) AgentVerificationResult {

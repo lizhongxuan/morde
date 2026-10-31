@@ -211,6 +211,9 @@ func lockMCPConnectorWorkspaceFence(ctx context.Context, tx pgx.Tx, value app.MC
 	if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) || workspaceRevision != checkpoint {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this Task checkpoint was confirmed")
 	}
+	if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
+		return err
+	}
 	var bindingOwner, bindingState, syncState string
 	var bindingVersion, desiredRevision, appliedRevision int64
 	if err := tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version, desired_revision, applied_revision

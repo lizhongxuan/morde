@@ -23,7 +23,7 @@ type workspaceSyncServiceStub struct {
 	manifest    workspace.ManifestPage
 	changes     workspace.ChangePage
 	session     workspace.SyncSession
-	progress    []workspace.DeviceSyncProgress
+	progress    workspace.DeviceSyncProgressSummary
 	block       []byte
 	err         error
 	streamErr   error
@@ -88,11 +88,11 @@ func (s *workspaceSyncServiceStub) GetSyncSession(_ context.Context, principal i
 	return s.session, s.err
 }
 
-func (s *workspaceSyncServiceStub) ListDeviceSyncProgress(_ context.Context, principal identity.Principal, workspaceID string) ([]workspace.DeviceSyncProgress, error) {
+func (s *workspaceSyncServiceStub) ListDeviceSyncProgress(_ context.Context, principal identity.Principal, workspaceID string) (workspace.DeviceSyncProgressSummary, error) {
 	s.capture(principal, workspaceID)
 	s.progressCalls++
 	if principal.Kind != identity.KindSession {
-		return nil, domain.NewError(domain.CodeForbidden, "portal session required")
+		return workspace.DeviceSyncProgressSummary{}, domain.NewError(domain.CodeForbidden, "portal session required")
 	}
 	return s.progress, s.err
 }
@@ -236,11 +236,14 @@ func TestWorkspaceSyncManifestAndChangesForwardPrincipalAndBounds(t *testing.T) 
 }
 
 func TestWorkspaceSyncProgressIsPortalOnlyAndOmitsFileDetails(t *testing.T) {
-	service := &workspaceSyncServiceStub{progress: []workspace.DeviceSyncProgress{{
-		WorkspaceID: testWorkspaceID, DeviceID: "t7654321", SessionID: "p1234567",
-		Direction: workspace.SyncDownload, State: workspace.SyncApplying, Stage: workspace.SyncStageApply,
-		PlannedBytes: 20, ConfirmedBytes: 20, DownloadActionsTotal: 3, DownloadActionsDone: 2,
-	}}}
+	service := &workspaceSyncServiceStub{progress: workspace.DeviceSyncProgressSummary{
+		Revision: 7, UsedBytes: 1234, QuotaBytes: 1 << 30, RemainingBytes: (1 << 30) - 1234, QuotaStatus: workspace.SyncQuotaAvailable,
+		Items: []workspace.DeviceSyncProgress{{
+			WorkspaceID: testWorkspaceID, DeviceID: "t7654321", SessionID: "p1234567",
+			Direction: workspace.SyncDownload, State: workspace.SyncApplying, Stage: workspace.SyncStageApply,
+			PlannedBytes: 20, ConfirmedBytes: 20, DownloadActionsTotal: 3, DownloadActionsDone: 2,
+		}},
+	}}
 	router := newWorkspaceSyncRouter(t, service, Options{})
 	path := "/api/workspaces/" + testWorkspaceID + "/sync-progress"
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
@@ -248,10 +251,9 @@ func TestWorkspaceSyncProgressIsPortalOnlyAndOmitsFileDetails(t *testing.T) {
 	if response.Code != http.StatusOK || service.progressCalls != 1 || service.principal.Kind != identity.KindSession {
 		t.Fatalf("progress response status=%d calls=%d body=%s", response.Code, service.progressCalls, response.Body)
 	}
-	var body struct {
-		Items []workspace.DeviceSyncProgress `json:"items"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Items) != 1 || body.Items[0].DownloadActionsDone != 2 {
+	var body workspace.DeviceSyncProgressSummary
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body.Revision != 7 || body.UsedBytes != 1234 || body.QuotaBytes != 1<<30 ||
+		body.RemainingBytes != (1<<30)-1234 || body.QuotaStatus != workspace.SyncQuotaAvailable || len(body.Items) != 1 || body.Items[0].DownloadActionsDone != 2 {
 		t.Fatalf("progress response = %#v, err=%v", body, err)
 	}
 	for _, omitted := range []string{"file_path", "conflicts", "manifest"} {
@@ -398,7 +400,11 @@ func TestWorkspaceSyncBlockHTTPReportsInterruptedDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Errorf("close interrupted response body: %v", err)
+		}
+	}()
 	contents, readErr := io.ReadAll(response.Body)
 	if response.StatusCode != http.StatusOK || response.ContentLength != 100 || !bytes.Equal(contents, service.block) || !errors.Is(readErr, io.ErrUnexpectedEOF) {
 		t.Fatalf("interrupted block response = status %d, content length %d, body %q, read error %v; want detectable truncation", response.StatusCode, response.ContentLength, contents, readErr)

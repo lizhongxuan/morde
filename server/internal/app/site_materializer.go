@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 
 	"morde/server/internal/domain"
 	sitedomain "morde/server/internal/domain/site"
@@ -113,16 +114,30 @@ func (m *SiteRevisionMaterializer) Materialize(ctx context.Context, release site
 			if err != nil {
 				return fmt.Errorf("read pinned workspace revision page: %w", err)
 			}
-			if page.WorkspaceID != release.WorkspaceID || page.Revision != release.WorkspaceRevision || len(page.Files) > int(siteManifestPageSize) {
+			if page.WorkspaceID != release.WorkspaceID || page.Revision != release.WorkspaceRevision ||
+				len(page.Files)+len(page.EmptyDirectories) > int(siteManifestPageSize) {
 				return errors.New("workspace revision page identity or size is invalid")
 			}
-			if len(page.Files) == 0 && page.NextCursor != nil {
+			if _, err := workspace.ManifestTreeSHA256(page.Files, page.EmptyDirectories); err != nil {
+				return errors.New("workspace revision page paths are invalid")
+			}
+			pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
+			for _, file := range page.Files {
+				pagePaths = append(pagePaths, file.Path)
+			}
+			pagePaths = append(pagePaths, page.EmptyDirectories...)
+			sort.Strings(pagePaths)
+			if page.NextCursor != nil && len(pagePaths) == 0 {
 				return errors.New("workspace revision cursor did not advance")
 			}
-			for _, file := range page.Files {
-				if file.Path <= afterPath {
+			pageLastPath := afterPath
+			for _, path := range pagePaths {
+				if path <= afterPath {
 					return errors.New("workspace revision pages are not in strict path order")
 				}
+				pageLastPath = path
+			}
+			for _, file := range page.Files {
 				if file.SizeBytes > m.maxBytes-totalBytes {
 					return domain.NewError(domain.CodeCapacityExceeded, "site release exceeds its byte limit")
 				}
@@ -134,15 +149,15 @@ func (m *SiteRevisionMaterializer) Materialize(ctx context.Context, release site
 				}
 				fileCount++
 				totalBytes += file.SizeBytes
-				afterPath = file.Path
 			}
 			if page.NextCursor == nil {
 				return nil
 			}
 			cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
-			if err != nil || cursor.Revision != release.WorkspaceRevision || cursor.Prefix != "" || cursor.After != afterPath || cursor.After == "" || cursor.After <= lastCursor {
+			if err != nil || cursor.Revision != release.WorkspaceRevision || cursor.Prefix != "" || cursor.After != pageLastPath || cursor.After == "" || cursor.After <= lastCursor {
 				return errors.New("workspace revision cursor is invalid or did not advance")
 			}
+			afterPath = pageLastPath
 			lastCursor = cursor.After
 		}
 	})

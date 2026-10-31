@@ -92,6 +92,9 @@ func TestRuntimeToolExecutorExposesDesktopToolsOnlyWhenRuntimeCapabilitiesExist(
 		{capability: "desktop.input", action: "press_key", result: `{"key":"Enter","pressed":true}`},
 		{capability: "window.activate", action: "activate", result: `{"window_id":"0x1","activated":true}`},
 	})
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
 	definitions, err := fixture.executor.Definitions(context.Background(), fixture.store.details.Task)
 	if err != nil {
 		t.Fatalf("Definitions() error = %v", err)
@@ -106,6 +109,51 @@ func TestRuntimeToolExecutorExposesDesktopToolsOnlyWhenRuntimeCapabilitiesExist(
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("desktop definitions = %v, want %v", got, want)
+	}
+}
+
+func TestWorkspaceTaskDisablesAIDesktopInput(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
+		{capability: "desktop.observe", action: "screenshot", result: `{"mime_type":"image/jpeg","width":1,"height":1,"data_base64":"unused"}`},
+		{capability: "desktop.input", action: "click", result: `{"x":1,"y":1,"button":"left","clicked":true}`},
+		{taskWorkspaceAction: "read"},
+	})
+	definitions, err := fixture.executor.Definitions(context.Background(), fixture.store.details.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool, len(definitions))
+	for _, definition := range definitions {
+		seen[definition.Name] = true
+	}
+	if seen[runtimeToolDesktopClick] || !seen[runtimeToolDesktopScreenshot] || !seen[runtimeToolFileRead] {
+		t.Fatalf("Workspace Task tools include desktop input or omit safe tools: %v", seen)
+	}
+
+	request := fixture.request(runtimeToolDesktopClick, `{"window_id":"0x1","x":1,"y":1}`, identity.ScopeComputerOperate)
+	if _, err := fixture.executor.Prepare(context.Background(), request); domain.CodeOf(err) != domain.CodeUnsupported {
+		t.Fatalf("Prepare(Workspace desktop input) error = %v; want unsupported", err)
+	}
+	request.OperationID = "o1234567"
+	preparation := AgentToolPreparation{Status: AgentToolReady, Fence: request.Fence}
+	preparation.Token = runtimeToolPreparationToken(request, preparation.Fence, 0)
+	result, err := fixture.executor.Execute(context.Background(), request, preparation)
+	if err != nil || result.Status != AgentToolFailed || fixture.handlers["desktop.input"].calls.Load() != 0 {
+		t.Fatalf("Execute(Workspace desktop input) = %#v, %v; handler calls=%d", result, err, fixture.handlers["desktop.input"].calls.Load())
+	}
+
+	hash, err := agentOperationHash(request.Call.Name, request.Arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = fixture.executor.ReconcileOperation(context.Background(), request, task.Operation{
+		ID: request.OperationID, TaskID: request.Task.ID, Key: request.OperationKey, RequestHash: hash[:], HostID: request.Task.HostID,
+		InputRevision: request.Task.InputRevision, WorkspaceCheckpointRevision: request.Task.WorkspaceCheckpointRevision,
+		RuntimeGeneration: 1, RuntimeInstanceID: "ri_workspace_task", LeaseVersion: request.Task.Lease.Version,
+		RuntimeLeaseVersion: request.Task.Lease.Version, Status: task.OperationUnknown,
+	})
+	if err != nil || result.Status != AgentToolUnknown || fixture.handlers["desktop.input"].calls.Load() != 0 {
+		t.Fatalf("Reconcile(Workspace desktop input) = %#v, %v; handler calls=%d", result, err, fixture.handlers["desktop.input"].calls.Load())
 	}
 }
 

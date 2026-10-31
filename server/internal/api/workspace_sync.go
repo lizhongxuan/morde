@@ -20,24 +20,6 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
-type deviceWorkspaceSyncProgressResponse struct {
-	Items []deviceWorkspaceSyncProgressItem `json:"items"`
-}
-
-type deviceWorkspaceSyncProgressItem struct {
-	WorkspaceID          string    `json:"workspace_id"`
-	DeviceID             string    `json:"device_id"`
-	SessionID            string    `json:"session_id"`
-	Direction            string    `json:"direction"`
-	State                string    `json:"state"`
-	Stage                string    `json:"stage"`
-	PlannedBytes         int64     `json:"planned_bytes"`
-	ConfirmedBytes       int64     `json:"confirmed_bytes"`
-	DownloadActionsTotal int64     `json:"download_actions_total"`
-	DownloadActionsDone  int64     `json:"download_actions_done"`
-	UpdatedAt            time.Time `json:"updated_at"`
-}
-
 func (h *api) registerWorkspaceSync(group *gin.RouterGroup, service WorkspaceSyncService) {
 	group.GET("/workspaces/:id/manifest", h.getWorkspaceManifest(service))
 	group.GET("/workspaces/:id/changes", h.getWorkspaceChanges(service))
@@ -67,22 +49,15 @@ func (h *api) listDeviceWorkspaceSyncProgress(service WorkspaceSyncService) gin.
 		if !ok {
 			return
 		}
-		items, err := service.ListDeviceSyncProgress(c.Request.Context(), principal, workspaceID)
+		progress, err := service.ListDeviceSyncProgress(c.Request.Context(), principal, workspaceID)
 		if err != nil {
 			writeError(c, err)
 			return
 		}
-		response := deviceWorkspaceSyncProgressResponse{Items: make([]deviceWorkspaceSyncProgressItem, 0, len(items))}
-		for _, item := range items {
-			response.Items = append(response.Items, deviceWorkspaceSyncProgressItem{
-				WorkspaceID: item.WorkspaceID, DeviceID: item.DeviceID, SessionID: item.SessionID,
-				Direction: string(item.Direction), State: string(item.State), Stage: string(item.Stage),
-				PlannedBytes: item.PlannedBytes, ConfirmedBytes: item.ConfirmedBytes,
-				DownloadActionsTotal: item.DownloadActionsTotal, DownloadActionsDone: item.DownloadActionsDone,
-				UpdatedAt: item.UpdatedAt,
-			})
+		if progress.Items == nil {
+			progress.Items = []workspace.DeviceSyncProgress{}
 		}
-		c.JSON(http.StatusOK, response)
+		c.JSON(http.StatusOK, progress)
 	}
 }
 

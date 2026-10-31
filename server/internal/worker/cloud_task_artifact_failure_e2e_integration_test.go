@@ -66,15 +66,17 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID)
-	if _, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID)
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
 		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, 1,
-		workspace.BindingPreparing, workspace.BindingActive, 0, 0); err != nil {
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
+	if err != nil {
 		t.Fatalf("activate empty test Workspace binding: %v", err)
 	}
 
@@ -180,12 +182,35 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil || initialCommitted.State != workspace.SyncCompleted || initialCommitted.TargetRevision != 1 {
 		t.Fatalf("commit initial Workspace file: session=%#v err=%v", initialCommitted, err)
 	}
-	initialBinding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+	localWorkspaceFile, err := os.ReadFile(filepath.Join(workspaceDirectory, manifestFile.Path))
+	if err != nil || !bytes.Equal(localWorkspaceFile, []byte(content)) {
+		t.Fatalf("Host Workspace file before download receipt = %q, err=%v", localWorkspaceFile, err)
+	}
+	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, workspaceValue.ID, initialBinding.BindingVersion, 1); err != nil {
-		t.Fatalf("record initial Host Workspace revision (binding=%#v): %v", initialBinding, err)
+	replicaPrincipal, err := hostReplicas.Authenticate(ctx, hostValue.ID, hostValue.RuntimeGeneration, replicaCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replicaPrincipal, err = hostReplicas.ScopeWorkspace(ctx, replicaPrincipal, workspaceValue.ID, binding.BindingVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	download, err := syncService.CreateSyncSession(ctx, replicaPrincipal, workspaceValue.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{manifestFile},
+	}, "f01-artifact-host-download")
+	if err != nil {
+		t.Fatalf("create Host replica download session: %v", err)
+	}
+	completedDownload, err := syncService.CommitSyncSession(ctx, replicaPrincipal, workspaceValue.ID, download.ID, "f01-artifact-host-download-commit")
+	if err != nil || completedDownload.State != workspace.SyncCompleted || completedDownload.TargetRevision != 1 {
+		t.Fatalf("complete Host replica download session: session=%#v err=%v", completedDownload, err)
+	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID,
+		binding.BindingVersion, completedDownload.ID, completedDownload.TargetRevision); err != nil {
+		t.Fatalf("record applied revision from Host download session: %v", err)
 	}
 	taskService, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
 	if err != nil {

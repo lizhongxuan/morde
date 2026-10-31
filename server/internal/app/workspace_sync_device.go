@@ -29,15 +29,17 @@ type WorkspaceSyncDeviceStore interface {
 	GetWorkspaceSyncDeviceRegistration(context.Context, identity.Principal, string, []byte, []byte) (workspace.SyncDeviceBinding, bool, error)
 	ListWorkspaceSyncDeviceBindings(context.Context, identity.Principal, string) ([]workspace.SyncDeviceBinding, error)
 	RegisterWorkspaceSyncDevice(context.Context, identity.Principal, string, string, []byte, []byte, string, string) (workspace.SyncDeviceBinding, error)
-	RevokeWorkspaceSyncDevice(context.Context, identity.Principal, string, string) error
+	RevokeWorkspaceSyncDevice(context.Context, identity.Principal, string, string, func(context.Context) error) error
 }
 
 type WorkspaceSyncNodeEnsurer interface {
 	EnsureWorkspaceSyncNode(context.Context, string) (workspace.SyncNodeConnection, error)
+	DisableWorkspaceSyncNodeRelay(context.Context, string) error
 }
 
 type WorkspaceSyncNodeOwnerReconciler interface {
 	ReconcileWorkspaceSyncNodeOwner(context.Context, string) error
+	DisableWorkspaceSyncNodeRelay(context.Context, string) error
 }
 
 type WorkspaceSyncDeviceChallengeResult struct {
@@ -153,7 +155,7 @@ func (s *WorkspaceSyncDeviceService) Register(ctx context.Context, principal ide
 		return WorkspaceSyncDeviceRegistration{}, fmt.Errorf("generate workspace sync folder ID: %w", err)
 	}
 	folderID := "morde-" + hex.EncodeToString(folderBytes)
-	binding, err := s.store.RegisterWorkspaceSyncDevice(ctx, principal, workspaceID, challengeID, keyHash[:], requestHash[:], bindingID, folderID)
+	_, err = s.store.RegisterWorkspaceSyncDevice(ctx, principal, workspaceID, challengeID, keyHash[:], requestHash[:], bindingID, folderID)
 	if err != nil {
 		return WorkspaceSyncDeviceRegistration{}, err
 	}
@@ -161,7 +163,7 @@ func (s *WorkspaceSyncDeviceService) Register(ctx context.Context, principal ide
 	if err != nil {
 		return WorkspaceSyncDeviceRegistration{}, err
 	}
-	binding, _, err = s.store.GetWorkspaceSyncDeviceRegistration(ctx, principal, workspaceID, keyHash[:], requestHash[:])
+	binding, _, err := s.store.GetWorkspaceSyncDeviceRegistration(ctx, principal, workspaceID, keyHash[:], requestHash[:])
 	if err != nil {
 		return WorkspaceSyncDeviceRegistration{}, err
 	}
@@ -186,7 +188,12 @@ func (s *WorkspaceSyncDeviceService) Revoke(ctx context.Context, principal ident
 	if !domain.ValidWorkspaceID(workspaceID) || !domain.ValidWorkspaceSyncDeviceBindingID(bindingID) {
 		return domain.NewError(domain.CodeNotFound, "workspace sync device binding not found")
 	}
-	if err := s.store.RevokeWorkspaceSyncDevice(ctx, principal, workspaceID, bindingID); err != nil {
+	if err := s.store.RevokeWorkspaceSyncDevice(ctx, principal, workspaceID, bindingID, func(gateCtx context.Context) error {
+		if s.nodeMaker == nil {
+			return nil
+		}
+		return s.nodeMaker.DisableWorkspaceSyncNodeRelay(gateCtx, principal.UserID)
+	}); err != nil {
 		return err
 	}
 	_, err := s.ensureOwnerNode(ctx, principal.UserID)

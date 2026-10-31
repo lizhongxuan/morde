@@ -28,7 +28,7 @@ const expiredWorkspaceSyncInstallationNeedsCleanup = `(
   )
 )`
 
-func (s *Store) RevokeExpiredWorkspaceSyncDevices(ctx context.Context) error {
+func (s *Store) RevokeExpiredWorkspaceSyncDevices(ctx context.Context, disableRelay func(context.Context, string) error) error {
 	rows, err := s.pool.Query(ctx, `SELECT DISTINCT i.owner_id
 FROM client_installations i
 WHERE i.platform='desktop' AND i.revoked_at IS NULL
@@ -57,7 +57,7 @@ ORDER BY i.owner_id`)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		err := s.withWorkspaceSyncOwnerTx(ctx, ownerID, func(tx pgx.Tx) error {
 			if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
 				return err
 			}
@@ -83,13 +83,18 @@ ORDER BY i.expires_at NULLS FIRST,i.id FOR UPDATE OF i`, ownerID)
 			if err := installations.Err(); err != nil {
 				return fmt.Errorf("read expired Workspace sync installations: %w", err)
 			}
+			if len(installationIDs) > 0 && disableRelay != nil {
+				if err := disableRelay(ctx, ownerID); err != nil {
+					return fmt.Errorf("disable Workspace sync relay before expired installation revocation: %w", err)
+				}
+			}
 			for _, installationID := range installationIDs {
 				if err := revokeWorkspaceSyncDevicesForInstallation(ctx, tx, ownerID, installationID); err != nil {
 					return err
 				}
 			}
 			return nil
-		})
+		}, nil, nil)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("revoke expired Workspace sync devices for owner %s: %w", ownerID, err))
 		}

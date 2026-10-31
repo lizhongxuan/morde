@@ -43,11 +43,32 @@ type WorkspaceBlockStore interface {
 	BlockAllocatedBytes(workspaceID, digest string) (int64, error)
 }
 
+type WorkspaceCurrentMaterializer func(context.Context, string, string, int64, []workspace.File, []string) error
+type WorkspaceCurrentRevisionReader func(string, string) (int64, bool, error)
+type WorkspaceCurrentManifestVerifier func(context.Context, string, string, []workspace.File, []string) (bool, error)
+
+type WorkspaceCurrentMaterializationStore interface {
+	ListWorkspaceCurrentMaterializations(context.Context, string, int32) ([]WorkspaceCurrentMaterialization, error)
+	MarkWorkspaceCurrentMaterialized(context.Context, string, int64) error
+}
+
+type WorkspaceCurrentMaterializationBarrierStore interface {
+	BeginWorkspaceCurrentMaterialization(context.Context, string, int64, string) error
+	MarkWorkspaceCurrentMaterializedForReceive(context.Context, string, int64, string) error
+}
+
+type WorkspaceCurrentMaterializationLockStore interface {
+	TryWorkspaceCurrentMaterializationLock(context.Context, string) (LeaderLock, bool, error)
+}
+
 type WorkspaceSyncService struct {
-	store            WorkspaceSyncStore
-	blocks           WorkspaceBlockStore
-	maxManifestBytes int64
-	maxOwnerBytes    int64
+	store              WorkspaceSyncStore
+	blocks             WorkspaceBlockStore
+	maxManifestBytes   int64
+	maxOwnerBytes      int64
+	materializeCurrent WorkspaceCurrentMaterializer
+	currentRevision    WorkspaceCurrentRevisionReader
+	verifyCurrent      WorkspaceCurrentManifestVerifier
 }
 
 func NewWorkspaceSyncService(store WorkspaceSyncStore, blocks WorkspaceBlockStore, maxManifestBytes, maxOwnerBytes int64) (*WorkspaceSyncService, error) {
@@ -58,6 +79,227 @@ func NewWorkspaceSyncService(store WorkspaceSyncStore, blocks WorkspaceBlockStor
 		maxManifestBytes = workspace.MaxSyncManifestBytes
 	}
 	return &WorkspaceSyncService{store: store, blocks: blocks, maxManifestBytes: maxManifestBytes, maxOwnerBytes: maxOwnerBytes}, nil
+}
+
+func (s *WorkspaceSyncService) SetWorkspaceCurrentMaterializer(materializer WorkspaceCurrentMaterializer) error {
+	if s == nil || materializer == nil {
+		return errors.New("workspace current materializer is required")
+	}
+	s.materializeCurrent = materializer
+	return nil
+}
+
+func (s *WorkspaceSyncService) SetWorkspaceCurrentRevisionReader(reader WorkspaceCurrentRevisionReader) error {
+	if s == nil || reader == nil {
+		return errors.New("workspace current revision reader is required")
+	}
+	s.currentRevision = reader
+	return nil
+}
+
+func (s *WorkspaceSyncService) SetWorkspaceCurrentManifestVerifier(verifier WorkspaceCurrentManifestVerifier) error {
+	if s == nil || verifier == nil {
+		return errors.New("workspace current manifest verifier is required")
+	}
+	s.verifyCurrent = verifier
+	return nil
+}
+
+func (s *WorkspaceSyncService) InitializeWorkspaceCurrent(ctx context.Context, workspaceID string) error {
+	if s == nil || s.materializeCurrent == nil {
+		return errors.New("workspace current materializer is unavailable")
+	}
+	return s.materializeWorkspaceCurrent(ctx, workspaceID)
+}
+
+func (s *WorkspaceSyncService) ReconcilePendingWorkspaceCurrentMaterializations(ctx context.Context) error {
+	if s == nil || s.materializeCurrent == nil || s.currentRevision == nil {
+		return errors.New("workspace current materializer is unavailable")
+	}
+	state, ok := s.store.(WorkspaceCurrentMaterializationStore)
+	if !ok {
+		return errors.New("workspace current materialization store is unavailable")
+	}
+	receiveStore, ok := s.store.(WorkspaceSyncReceiveStore)
+	if !ok {
+		return errors.New("workspace receive store is unavailable for startup recovery")
+	}
+	active, err := receiveStore.ListActiveWorkspaceSyncReceiveReservations(ctx)
+	if err != nil {
+		return fmt.Errorf("list active Workspace receive reservations: %w", err)
+	}
+	for _, reservation := range active {
+		if reservation.State != "reserved" && reservation.State != "aborting" {
+			continue
+		}
+		if err := s.AbortWorkspaceSyncReceive(ctx, reservation.OwnerID, reservation.ID); err != nil {
+			return fmt.Errorf("recover active Workspace %s receive reservation: %w", reservation.WorkspaceID, err)
+		}
+	}
+	afterWorkspaceID := ""
+	for {
+		pending, err := state.ListWorkspaceCurrentMaterializations(ctx, afterWorkspaceID, 100)
+		if err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		for _, item := range pending {
+			if err := s.materializeWorkspaceCurrent(ctx, item.WorkspaceID); err != nil {
+				return fmt.Errorf("recover Workspace %s current revision %d: %w", item.WorkspaceID, item.DesiredRevision, err)
+			}
+			afterWorkspaceID = item.WorkspaceID
+		}
+	}
+}
+
+func (s *WorkspaceSyncService) materializeWorkspaceCurrent(ctx context.Context, workspaceID string) error {
+	return s.materializeWorkspaceCurrentForReceive(ctx, workspaceID, "")
+}
+
+func (s *WorkspaceSyncService) materializeWorkspaceCurrentForReceive(ctx context.Context, workspaceID, allowedReservationID string) (retErr error) {
+	if s.materializeCurrent == nil {
+		if allowedReservationID != "" {
+			return errors.New("workspace current materializer is unavailable for receive recovery")
+		}
+		return nil
+	}
+	state, ok := s.store.(WorkspaceCurrentMaterializationStore)
+	if !ok {
+		return errors.New("workspace current materialization store is unavailable")
+	}
+	barrier, hasBarrier := s.store.(WorkspaceCurrentMaterializationBarrierStore)
+	if allowedReservationID != "" && !hasBarrier {
+		return errors.New("workspace current materialization barrier is unavailable for receive recovery")
+	}
+	if lockStore, ok := s.store.(WorkspaceCurrentMaterializationLockStore); ok {
+		lock, acquired, err := lockStore.TryWorkspaceCurrentMaterializationLock(ctx, workspaceID)
+		if err != nil {
+			return fmt.Errorf("lock Workspace current materialization: %w", err)
+		}
+		if !acquired {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace current materialization is already in progress")
+		}
+		defer func() {
+			unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if err := lock.Release(unlockCtx); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("release Workspace current materialization lock: %w", err))
+			}
+		}()
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		value, err := s.store.GetWorkspace(ctx, workspaceID)
+		if err != nil {
+			return err
+		}
+		files := make([]workspace.File, 0)
+		emptyDirectories := make([]string, 0)
+		afterPath := ""
+		lastCursor := ""
+		var totalBytes int64
+		totalItems := 0
+		for {
+			page, err := s.store.GetWorkspaceManifestPage(ctx, workspaceID, value.Revision, "", afterPath, manifestPageLimit)
+			if err != nil {
+				return fmt.Errorf("read current Workspace revision: %w", err)
+			}
+			if page.WorkspaceID != workspaceID || page.Revision != value.Revision || len(page.Files)+len(page.EmptyDirectories) > int(manifestPageLimit) || totalItems+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
+				return errors.New("current Workspace manifest identity or size is invalid")
+			}
+			if len(page.Files)+len(page.EmptyDirectories) == 0 && page.NextCursor != nil {
+				return errors.New("current Workspace manifest cursor did not advance")
+			}
+			pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
+			for _, file := range page.Files {
+				if file.SizeBytes < 0 || totalBytes > int64(^uint64(0)>>1)-file.SizeBytes {
+					return errors.New("current Workspace manifest order or size is invalid")
+				}
+				files = append(files, file)
+				pagePaths = append(pagePaths, file.Path)
+				totalBytes += file.SizeBytes
+			}
+			for _, directory := range page.EmptyDirectories {
+				if err := workspace.ValidateRelativePath(directory); err != nil {
+					return errors.New("current Workspace manifest contains an invalid empty directory path")
+				}
+				emptyDirectories = append(emptyDirectories, directory)
+				pagePaths = append(pagePaths, directory)
+			}
+			sort.Strings(pagePaths)
+			for _, itemPath := range pagePaths {
+				if itemPath <= afterPath {
+					return errors.New("current Workspace manifest order or size is invalid")
+				}
+				afterPath = itemPath
+			}
+			totalItems += len(pagePaths)
+			if page.NextCursor == nil {
+				break
+			}
+			cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
+			if err != nil || cursor.Revision != value.Revision || cursor.Prefix != "" || cursor.After != afterPath || cursor.After == "" || cursor.After <= lastCursor {
+				return errors.New("current Workspace manifest cursor is invalid or did not advance")
+			}
+			lastCursor = cursor.After
+		}
+		if totalBytes != value.UsedBytes {
+			return domain.NewError(domain.CodeWorkspaceConflict, "current Workspace manifest does not match its committed usage")
+		}
+		if allowedReservationID == "" && s.currentRevision != nil && s.verifyCurrent != nil {
+			currentRevision, exists, err := s.currentRevision(value.OwnerID, workspaceID)
+			if err != nil {
+				return fmt.Errorf("inspect Workspace %s current revision: %w", workspaceID, err)
+			}
+			if exists && currentRevision == value.Revision {
+				matches, err := s.verifyCurrent(ctx, value.OwnerID, workspaceID, files, emptyDirectories)
+				if err != nil {
+					return fmt.Errorf("verify Workspace %s current revision: %w", workspaceID, err)
+				}
+				if matches {
+					return state.MarkWorkspaceCurrentMaterialized(ctx, workspaceID, value.Revision)
+				}
+			}
+		}
+		if hasBarrier {
+			if err := barrier.BeginWorkspaceCurrentMaterialization(ctx, workspaceID, value.Revision, allowedReservationID); err != nil {
+				return err
+			}
+		}
+		if err := s.materializeCurrent(ctx, value.OwnerID, workspaceID, value.Revision, files, emptyDirectories); err != nil {
+			return fmt.Errorf("publish current Workspace directory: %w", err)
+		}
+		if hasBarrier && allowedReservationID != "" {
+			err = barrier.MarkWorkspaceCurrentMaterializedForReceive(ctx, workspaceID, value.Revision, allowedReservationID)
+		} else {
+			err = state.MarkWorkspaceCurrentMaterialized(ctx, workspaceID, value.Revision)
+		}
+		if err != nil {
+			return err
+		}
+		latest, err := s.store.GetWorkspace(ctx, workspaceID)
+		if err != nil {
+			return err
+		}
+		if latest.Revision == value.Revision {
+			return nil
+		}
+	}
+	return domain.NewError(domain.CodeWorkspaceBusy, "Workspace changed repeatedly while its current directory was being materialized")
+}
+
+func (s *WorkspaceSyncService) finishWorkspaceSyncCommit(ctx context.Context, result workspace.SyncSession) (workspace.SyncSession, error) {
+	if result.State != workspace.SyncCompleted && result.State != workspace.SyncConflict {
+		return result, nil
+	}
+	if err := s.materializeWorkspaceCurrent(ctx, result.WorkspaceID); err != nil {
+		if ctx.Err() != nil {
+			return workspace.SyncSession{}, ctx.Err()
+		}
+		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace commit is durable but current-directory materialization is pending; retry with the same idempotency key")
+	}
+	return result, nil
 }
 
 func (s *WorkspaceSyncService) GetManifest(ctx context.Context, principal identity.Principal, workspaceID string, revision int64, prefix, cursor string, limit int32) (workspace.ManifestPage, error) {
@@ -121,18 +363,9 @@ func (s *WorkspaceSyncService) GetManifest(ctx context.Context, principal identi
 }
 
 func (s *WorkspaceSyncService) GetChanges(ctx context.Context, principal identity.Principal, workspaceID, after string, wait time.Duration, limit int32) (workspace.ChangePage, error) {
-	value, err := s.authorize(ctx, principal, workspaceID)
+	value, err := s.authorizeWorkspaceChanges(ctx, principal, workspaceID)
 	if err != nil {
 		return workspace.ChangePage{}, err
-	}
-	if principal.Kind == identity.KindHostReplica {
-		binding, err := s.store.GetWorkspaceBinding(ctx, principal.HostScope, workspaceID)
-		if err != nil {
-			return workspace.ChangePage{}, err
-		}
-		if (binding.State != workspace.BindingActive && binding.State != workspace.BindingUnbinding) || binding.DesiredRevision != value.Revision {
-			return workspace.ChangePage{}, domain.NewError(domain.CodeWorkspaceBusy, "Host workspace binding is not active at the current revision")
-		}
 	}
 	if after == "" || len(after) > 512 {
 		return workspace.ChangePage{}, domain.InvalidArgument("after", "workspace changes cursor is required")
@@ -166,6 +399,11 @@ func (s *WorkspaceSyncService) GetChanges(ctx context.Context, principal identit
 			return workspace.ChangePage{}, err
 		}
 		if len(page.Items) > 0 || wait == 0 {
+			if principal.Kind == identity.KindHostReplica {
+				if _, err := s.authorizeWorkspaceChanges(ctx, principal, workspaceID); err != nil {
+					return workspace.ChangePage{}, err
+				}
+			}
 			return page, nil
 		}
 		ticker := time.NewTimer(syncPollInterval)
@@ -175,17 +413,36 @@ func (s *WorkspaceSyncService) GetChanges(ctx context.Context, principal identit
 			return workspace.ChangePage{}, ctx.Err()
 		case <-deadline.C:
 			ticker.Stop()
+			if principal.Kind == identity.KindHostReplica {
+				if _, err := s.authorizeWorkspaceChanges(ctx, principal, workspaceID); err != nil {
+					return workspace.ChangePage{}, err
+				}
+			}
 			return page, nil
 		case <-ticker.C:
-			current, err := s.store.GetWorkspace(ctx, workspaceID)
-			if err != nil {
+			if _, err := s.authorizeWorkspaceChanges(ctx, principal, workspaceID); err != nil {
 				return workspace.ChangePage{}, err
-			}
-			if current.State != workspace.StateReady || current.OwnerID != value.OwnerID {
-				return workspace.ChangePage{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 			}
 		}
 	}
+}
+
+func (s *WorkspaceSyncService) authorizeWorkspaceChanges(ctx context.Context, principal identity.Principal, workspaceID string) (workspace.Workspace, error) {
+	value, err := s.authorize(ctx, principal, workspaceID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if principal.Kind == identity.KindHostReplica {
+		binding, err := s.store.GetWorkspaceBinding(ctx, principal.HostScope, workspaceID)
+		if err != nil {
+			return workspace.Workspace{}, err
+		}
+		if binding.OwnerID != principal.UserID || binding.BindingVersion != principal.BindingVersion ||
+			(binding.State != workspace.BindingActive && binding.State != workspace.BindingUnbinding) || binding.DesiredRevision != value.Revision {
+			return workspace.Workspace{}, domain.NewError(domain.CodeWorkspaceBusy, "Host workspace binding is not active at the current revision")
+		}
+	}
+	return value, nil
 }
 
 func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal identity.Principal, workspaceID string, command workspace.CreateSyncSession, idempotencyKey string) (result workspace.SyncSession, retErr error) {
@@ -207,21 +464,21 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 		switch binding.State {
 		case workspace.BindingPreparing:
 			if command.Direction != workspace.SyncDownload || command.Policy != workspace.SyncFillMissing || command.BaseRevision != 0 ||
-				len(command.DeletedPaths) != 0 || command.AckCursor != nil || len(command.Scope) != 0 {
+				len(command.DeletedPaths) != 0 || len(command.DeletedDirectories) != 0 || command.AckCursor != nil || len(command.Scope) != 0 {
 				return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "preparing Host replicas may only download from their last applied revision")
 			}
 		case workspace.BindingActive:
 			safeDownload := command.Direction == workspace.SyncDownload && command.Policy == workspace.SyncFillMissing && command.BaseRevision == 0 &&
-				len(command.DeletedPaths) == 0 && command.AckCursor == nil && len(command.Scope) == 0
+				len(command.DeletedPaths) == 0 && len(command.DeletedDirectories) == 0 && command.AckCursor == nil && len(command.Scope) == 0
 			liveSync := command.Direction == workspace.SyncBidirectional &&
 				(command.Policy == workspace.SyncLive || command.Policy == workspace.SyncFillMissing) &&
-				(len(command.DeletedPaths) == 0 || command.Policy == workspace.SyncLive)
+				((len(command.DeletedPaths) == 0 && len(command.DeletedDirectories) == 0) || command.Policy == workspace.SyncLive)
 			if !safeDownload && !liveSync {
 				return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "active Host replicas require live bidirectional synchronization")
 			}
 		case workspace.BindingUnbinding:
 			liveCheckpoint := command.Direction == workspace.SyncBidirectional && command.Policy == workspace.SyncLive
-			initialCheckpoint := command.Direction == workspace.SyncBidirectional && command.Policy == workspace.SyncFillMissing && len(command.DeletedPaths) == 0
+			initialCheckpoint := command.Direction == workspace.SyncBidirectional && command.Policy == workspace.SyncFillMissing && len(command.DeletedPaths) == 0 && len(command.DeletedDirectories) == 0
 			if !liveCheckpoint && !initialCheckpoint {
 				return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "unbinding Host replicas require a live or non-destructive initial checkpoint")
 			}
@@ -255,15 +512,20 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 			return workspace.SyncSession{}, domain.InvalidArgument("ack_cursor", "workspace acknowledgement cursor is invalid or ahead of the current revision")
 		}
 	}
-	baseFiles, err := s.readManifest(ctx, workspaceID, command.BaseRevision, command.Scope)
+	baseFiles, baseEmptyDirectories, err := s.readManifest(ctx, workspaceID, command.BaseRevision, command.Scope)
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
-	currentFiles, err := s.readManifest(ctx, workspaceID, value.Revision, command.Scope)
+	currentFiles, currentEmptyDirectories, err := s.readManifest(ctx, workspaceID, value.Revision, command.Scope)
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
-	plan := workspace.PlanSync(baseFiles, currentFiles, command)
+	plan := workspace.PlanSyncTree(baseFiles, currentFiles, baseEmptyDirectories, currentEmptyDirectories, command)
+	for _, file := range plan.UploadFiles {
+		if file.SizeBytes > workspace.MaxSyncFileBytes {
+			return workspace.SyncSession{}, domain.NewError(domain.CodeRequestTooLarge, "workspace sync file exceeds 300 MiB")
+		}
+	}
 	blockLock, err := s.lockWorkspaceBlockStore(ctx, workspaceID, false)
 	if err != nil {
 		return workspace.SyncSession{}, err
@@ -290,9 +552,13 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 		Conflicts: plan.Conflicts,
 		Files:     append([]workspace.File(nil), command.Files...), UploadFiles: plan.UploadFiles,
 		DownloadFiles: plan.DownloadFiles, Scope: append([]string(nil), command.Scope...),
-		DeletedPaths:       append([]string(nil), command.DeletedPaths...),
+		DeletedPaths:           append([]string(nil), command.DeletedPaths...),
+		EmptyDirectories:       append([]string(nil), command.EmptyDirectories...),
+		UploadEmptyDirectories: plan.UploadEmptyDirectories, DownloadEmptyDirectories: plan.DownloadEmptyDirectories,
+		DeletedDirectories:       append([]string(nil), command.DeletedDirectories...),
+		UploadDeletedDirectories: plan.UploadDeletedDirectories, DownloadDeletedDirectories: plan.DownloadDeletedDirectories,
 		UploadDeletedPaths: plan.UploadDeletedPaths, DownloadDeletedPaths: plan.DownloadDeletedPaths,
-		DownloadActions: workspace.DownloadActionsForPlan(plan.DownloadFiles, plan.DownloadDeletedPaths),
+		DownloadActions: workspace.DownloadActionsForTreePlan(plan.DownloadFiles, plan.DownloadDeletedPaths, plan.DownloadEmptyDirectories, plan.DownloadDeletedDirectories),
 		AckCursor:       command.AckCursor, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	requestForHash := struct {
@@ -332,15 +598,24 @@ func (s *WorkspaceSyncService) GetSyncSession(ctx context.Context, principal ide
 	return session, nil
 }
 
-func (s *WorkspaceSyncService) ListDeviceSyncProgress(ctx context.Context, principal identity.Principal, workspaceID string) ([]workspace.DeviceSyncProgress, error) {
+func (s *WorkspaceSyncService) ListDeviceSyncProgress(ctx context.Context, principal identity.Principal, workspaceID string) (workspace.DeviceSyncProgressSummary, error) {
 	if err := requireSession(principal); err != nil {
-		return nil, err
+		return workspace.DeviceSyncProgressSummary{}, err
 	}
 	value, err := s.authorize(ctx, principal, workspaceID)
 	if err != nil {
-		return nil, err
+		return workspace.DeviceSyncProgressSummary{}, err
 	}
-	return s.store.ListDeviceWorkspaceSyncProgress(ctx, value.OwnerID, workspaceID)
+	items, err := s.store.ListDeviceWorkspaceSyncProgress(ctx, value.OwnerID, workspaceID)
+	if err != nil {
+		return workspace.DeviceSyncProgressSummary{}, err
+	}
+	return workspace.DeviceSyncProgressSummary{
+		Revision: value.Revision, UsedBytes: value.UsedBytes, QuotaBytes: value.QuotaBytes,
+		RemainingBytes: max(int64(0), value.QuotaBytes-value.UsedBytes),
+		QuotaStatus:    workspace.SyncQuotaStatusForUsage(value.UsedBytes, value.QuotaBytes),
+		Items:          items,
+	}, nil
 }
 
 func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID, idempotencyKey string) (workspace.SyncSession, error) {
@@ -376,7 +651,7 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 	case WorkspaceSyncCommitQuotaRejected:
 		return workspace.SyncSession{}, domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
 	case WorkspaceSyncCommitSucceeded:
-		return receipt.Result, nil
+		return s.finishWorkspaceSyncCommit(ctx, receipt.Result)
 	case WorkspaceSyncCommitPending:
 	default:
 		return workspace.SyncSession{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt state is invalid")
@@ -390,7 +665,7 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 		if updated.State == workspace.SyncExpired || updated.State == workspace.SyncFailed {
 			return workspace.SyncSession{}, domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
 		}
-		return updated, nil
+		return s.finishWorkspaceSyncCommit(ctx, updated)
 	}
 	if err := s.verifyUploadedFiles(ctx, workspaceID, session); err != nil {
 		receipt, lookupErr := s.store.InspectWorkspaceSyncCommit(ctx, workspaceID, sessionID, record)
@@ -401,7 +676,7 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 		case WorkspaceSyncCommitQuotaRejected:
 			return workspace.SyncSession{}, domain.NewError(domain.CodeQuotaExceeded, "workspace storage quota would be exceeded")
 		case WorkspaceSyncCommitSucceeded:
-			return receipt.Result, nil
+			return s.finishWorkspaceSyncCommit(ctx, receipt.Result)
 		case WorkspaceSyncCommitPending:
 		default:
 			return workspace.SyncSession{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt state is invalid")
@@ -422,7 +697,7 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
-	return updated, nil
+	return s.finishWorkspaceSyncCommit(ctx, updated)
 }
 
 func (s *WorkspaceSyncService) CancelSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID, idempotencyKey string) (workspace.SyncSession, error) {
@@ -729,13 +1004,8 @@ func (s *WorkspaceSyncService) authorize(ctx context.Context, principal identity
 			len(principal.HostIDs) != 0 || len(principal.WorkspaceIDs) != 0 || len(principal.Scopes) != 0 {
 			return workspace.Workspace{}, domain.NewError(domain.CodeUnauthenticated, "host replica authentication required")
 		}
-		binding, err := s.store.GetWorkspaceBinding(ctx, principal.HostScope, workspaceID)
-		if err != nil {
+		if err := s.store.CheckWorkspaceSyncHostReplicaAccess(ctx, principal); err != nil {
 			return workspace.Workspace{}, err
-		}
-		if binding.OwnerID != principal.UserID || binding.BindingVersion != principal.BindingVersion ||
-			(binding.State != workspace.BindingPreparing && binding.State != workspace.BindingActive && binding.State != workspace.BindingUnbinding) {
-			return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
 		}
 	default:
 		return workspace.Workspace{}, domain.NewError(domain.CodeForbidden, "workspace synchronization is not allowed for this credential")
@@ -776,51 +1046,92 @@ func (s *WorkspaceSyncService) authorizeSession(ctx context.Context, principal i
 	return session, nil
 }
 
-func (s *WorkspaceSyncService) readManifest(ctx context.Context, workspaceID string, revision int64, scopes []string) ([]workspace.File, error) {
+func (s *WorkspaceSyncService) readManifest(ctx context.Context, workspaceID string, revision int64, scopes []string) ([]workspace.File, []string, error) {
 	files := make([]workspace.File, 0)
+	emptyDirectories := make([]string, 0)
 	prefixes := scopes
 	if len(prefixes) == 0 {
 		prefixes = []string{""}
 	}
 	manifestBytes := int64(2) // JSON array brackets.
+	totalItems := 0
 	for _, prefix := range prefixes {
 		after := ""
 		for {
 			page, err := s.store.GetWorkspaceManifestPage(ctx, workspaceID, revision, prefix, after, manifestPageLimit)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+			if page.WorkspaceID != workspaceID || page.Revision != revision {
+				return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest page identity is invalid")
+			}
+			if len(page.Files)+len(page.EmptyDirectories) > int(manifestPageLimit) {
+				return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest page exceeds its item limit")
+			}
+			pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
 			for _, file := range page.Files {
-				if len(files) >= workspace.MaxSyncFiles {
-					return nil, domain.NewError(domain.CodeRequestTooLarge, "workspace manifest exceeds the file limit")
+				if totalItems >= workspace.MaxSyncFiles {
+					return nil, nil, domain.NewError(domain.CodeRequestTooLarge, "workspace manifest exceeds the item limit")
 				}
 				encoded, err := json.Marshal(file)
 				if err != nil {
-					return nil, domain.NewError(domain.CodeInternal, "workspace manifest file cannot be encoded")
+					return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest file cannot be encoded")
 				}
-				if len(files) > 0 {
+				if totalItems > 0 {
 					manifestBytes++ // comma between array entries.
 				}
 				if manifestBytes > s.maxManifestBytes-int64(len(encoded)) {
-					return nil, domain.NewError(domain.CodeRequestTooLarge, "workspace manifest exceeds its byte limit; narrow the sync scope")
+					return nil, nil, domain.NewError(domain.CodeRequestTooLarge, "workspace manifest exceeds its byte limit; narrow the sync scope")
 				}
 				manifestBytes += int64(len(encoded))
 				files = append(files, file)
+				pagePaths = append(pagePaths, file.Path)
+				totalItems++
+			}
+			for _, directory := range page.EmptyDirectories {
+				if totalItems >= workspace.MaxSyncFiles {
+					return nil, nil, domain.NewError(domain.CodeRequestTooLarge, "workspace manifest exceeds the item limit")
+				}
+				if err := workspace.ValidateRelativePath(directory); err != nil {
+					return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest contains an invalid empty directory")
+				}
+				encoded, err := json.Marshal(directory)
+				if err != nil {
+					return nil, nil, domain.NewError(domain.CodeInternal, "workspace empty directory cannot be encoded")
+				}
+				if totalItems > 0 {
+					manifestBytes++
+				}
+				if manifestBytes > s.maxManifestBytes-int64(len(encoded)) {
+					return nil, nil, domain.NewError(domain.CodeRequestTooLarge, "workspace manifest exceeds its byte limit; narrow the sync scope")
+				}
+				manifestBytes += int64(len(encoded))
+				emptyDirectories = append(emptyDirectories, directory)
+				pagePaths = append(pagePaths, directory)
+				totalItems++
+			}
+			sort.Strings(pagePaths)
+			previousPath := after
+			for _, itemPath := range pagePaths {
+				if itemPath <= previousPath || strings.EqualFold(itemPath, previousPath) {
+					return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest pagination is not strictly ordered")
+				}
+				previousPath = itemPath
 			}
 			if page.NextCursor == nil || *page.NextCursor == "" {
 				break
 			}
 			cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
 			if err != nil || cursor.Revision != revision || cursor.Prefix != prefix {
-				return nil, domain.NewError(domain.CodeInternal, "workspace manifest cursor is invalid")
+				return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest cursor is invalid")
 			}
-			if cursor.After == after {
-				return nil, domain.NewError(domain.CodeInternal, "workspace manifest pagination did not advance")
+			if len(pagePaths) == 0 || cursor.After != pagePaths[len(pagePaths)-1] || cursor.After <= after {
+				return nil, nil, domain.NewError(domain.CodeInternal, "workspace manifest pagination did not advance")
 			}
 			after = cursor.After
 		}
 	}
-	return files, nil
+	return files, emptyDirectories, nil
 }
 
 func (s *WorkspaceSyncService) prepareTransferPlan(ctx context.Context, workspaceID string, plan workspace.SyncPlan) ([]workspace.TransferBlock, int64, error) {
@@ -981,7 +1292,7 @@ var _ interface {
 	GetChanges(context.Context, identity.Principal, string, string, time.Duration, int32) (workspace.ChangePage, error)
 	CreateSyncSession(context.Context, identity.Principal, string, workspace.CreateSyncSession, string) (workspace.SyncSession, error)
 	GetSyncSession(context.Context, identity.Principal, string, string) (workspace.SyncSession, error)
-	ListDeviceSyncProgress(context.Context, identity.Principal, string) ([]workspace.DeviceSyncProgress, error)
+	ListDeviceSyncProgress(context.Context, identity.Principal, string) (workspace.DeviceSyncProgressSummary, error)
 	CommitSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	CancelSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	PutSyncBlock(context.Context, identity.Principal, string, string, string, io.Reader) (int64, error)

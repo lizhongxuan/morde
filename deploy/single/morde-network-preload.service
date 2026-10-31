@@ -1,14 +1,14 @@
 [Unit]
 Description=Preload Morde host isolation before Docker restores containers
 Before=docker.service
+Requires=nftables.service
 After=nftables.service
-PartOf=docker.service
+PartOf=docker.service nftables.service
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/cloudhost/cloudhost.env
 ExecStart=/opt/cloudhost/network-policy.sh preload
-ExecReload=/opt/cloudhost/network-policy.sh preload
 RemainAfterExit=yes
 
 [Install]

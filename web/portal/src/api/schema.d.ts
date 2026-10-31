@@ -361,7 +361,7 @@ export interface paths {
         put?: never;
         /**
          * Release host compute while retaining data
-         * @description API keys require current account ownership of this host. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks are active or user control is enabled. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
+         * @description API keys require current account ownership of this host. The Host ID, owner, Workspace attachment, and runtime data volume are retained. Release is rejected while tasks or tool operations are active, a Host Workspace upload is uncommitted, a Host Workspace sync conflict remains, or user control is enabled. For these release conflicts, 409 details contain reason=host_release_uncommitted_sync, host_release_sync_conflict, or host_release_unsettled_operation and the validated workspace_id or task_id. A current-generation terminal session in creating, ready, or unknown state requires explicit confirmation that running shell processes may be terminated. Morde does not verify or explicitly kill GUI or PTY processes.
          */
         post: operations["releaseHost"];
         delete?: never;
@@ -898,12 +898,64 @@ export interface paths {
         };
         /**
          * Read active desktop synchronization progress
-         * @description Portal sessions only. Returns only the latest active session for each currently authorized device. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted.
+         * @description Portal sessions only. Returns the current Workspace revision, committed logical bytes, configured quota, remaining committed capacity, quota admission state, and only the latest active session for each currently authorized device. Quota state is available below the limit, full at the limit, and over_quota above it; shrinking and deletion remain allowed when full or over quota. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted. Usage is based on committed explicit sync revisions and is not yet a ledger for direct Syncthing writes.
          */
         get: operations["listDeviceWorkspaceSyncProgress"];
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/sync-device-challenges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a Syncthing device registration proof
+         * @description Desktop client credential only. The certificate is public DER encoded as base64; the service derives and verifies its Syncthing Device ID, then returns a five-minute signing payload bound to this Workspace and installation. Sign the decoded signing_payload bytes with the certificate private key. At most eight challenges may be outstanding per installation. This endpoint does not enable synchronization; the folder remains pending until a server node is provisioned.
+         */
+        post: operations["createWorkspaceSyncDeviceChallenge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/sync-devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List Workspace Syncthing device bindings
+         * @description Portal sessions only. Includes pending, active, revoking, and revoked bindings for this Workspace so authorized users can inspect and revoke a specific device. Certificate private material is never returned.
+         */
+        get: operations["listWorkspaceSyncDevices"];
+        put?: never;
+        /**
+         * Register a proven Syncthing device for a Workspace
+         * @description Desktop client credential only. The proof is single-use, bound to the current installation, and idempotent by key. Success returns the authorized server node ID and pinned private relay URI after the node config is applied.
+         */
+        post: operations["registerWorkspaceSyncDevice"];
+        /**
+         * Revoke a Workspace Syncthing device binding
+         * @description Revokes only the selected device binding. The owning portal session is required; the account and installation remain otherwise unchanged.
+         */
+        delete: operations["revokeWorkspaceSyncDevice"];
         options?: never;
         head?: never;
         patch?: never;
@@ -922,7 +974,7 @@ export interface paths {
         put?: never;
         /**
          * Plan an upload, missing-only download, merge, or live synchronization batch
-         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. A session is resumable and idempotent; omitted files never imply deletion.
+         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
          */
         post: operations["createWorkspaceSyncSession"];
         delete?: never;
@@ -1383,7 +1435,7 @@ export interface paths {
         };
         /**
          * Get the current user's cloud task execution control
-         * @description Requires a Portal Session. Client credentials and API keys cannot change or inspect the owner execution gate.
+         * @description Requires a Portal Session. Returns the owner-scoped execution gate, account Runtime generation and quota, and active Task summary. Client credentials and API keys cannot change or inspect this state.
          */
         get: operations["getExecutionControl"];
         put?: never;
@@ -1405,7 +1457,7 @@ export interface paths {
         put?: never;
         /**
          * Stop all cloud task execution for the current user
-         * @description The expected epoch prevents stale control requests. The same Idempotency-Key may only retry this exact action and epoch. HTTP 202 means tasks are still stopping; poll GET /api/execution until the state is disabled.
+         * @description The expected epoch prevents stale control requests. The same Idempotency-Key may only retry this exact action and epoch. HTTP 202 means Task processes or the account Runtime lack stop confirmation; poll GET /api/execution until the state is disabled.
          */
         post: operations["stopAllExecution"];
         delete?: never;
@@ -1425,7 +1477,7 @@ export interface paths {
         put?: never;
         /**
          * Enable cloud task execution for the current user
-         * @description Requires a Portal Session and the current execution epoch. Reuse the Idempotency-Key only for an exact retry of this action and epoch.
+         * @description Requires a Portal Session and the current execution epoch. Reuse the Idempotency-Key only for an exact retry of this action and epoch. The request conflicts while an account Runtime stop is unconfirmed.
          */
         post: operations["enableExecution"];
         delete?: never;
@@ -2238,8 +2290,17 @@ export interface components {
             state: "enabled" | "stopping" | "disabled";
             epoch: number;
             pending_task_count: number;
+            runtime: components["schemas"]["ExecutionRuntime"];
             /** Format: date-time */
             updated_at: string;
+        };
+        ExecutionRuntime: {
+            /** @enum {string} */
+            state: "not_started" | "starting" | "running" | "stopping" | "stopped" | "failed";
+            runtime_id?: string;
+            runtime_generation: number;
+            max_concurrent_tasks: number;
+            active_task_count: number;
         };
         ModelGatewayToolCall: {
             id: string;
@@ -2842,6 +2903,7 @@ export interface components {
             /** Format: int64 */
             revision: number;
             files: components["schemas"]["WorkspaceFile"][];
+            empty_directories: string[];
             next_cursor: string | null;
         };
         WorkspaceChangePage: {
@@ -2849,8 +2911,11 @@ export interface components {
                 /** Format: int64 */
                 revision: number;
                 path: string;
-                /** @enum {string} */
-                action: "upsert" | "delete";
+                /**
+                 * @description Directory actions have file=null; directory_upsert creates an empty leaf directory.
+                 * @enum {string}
+                 */
+                action: "upsert" | "delete" | "directory_upsert" | "directory_delete";
                 file: components["schemas"]["WorkspaceFile"] | null;
             }[];
             next_cursor: string;
@@ -2864,7 +2929,9 @@ export interface components {
             base_revision: number;
             scope?: string[];
             files: components["schemas"]["WorkspaceFile"][];
+            empty_directories?: string[];
             deleted_paths?: string[];
+            deleted_directories?: string[];
             /** @description Advance this replica's durable cursor only after this session is applied and committed. */
             ack_cursor?: string | null;
         };
@@ -2884,8 +2951,8 @@ export interface components {
         WorkspaceSyncDownloadActionAck: {
             path: string;
             /** @enum {string} */
-            action: "upsert" | "delete";
-            /** @description Required for upsert; omitted or null for delete. */
+            action: "upsert" | "delete" | "directory_upsert" | "directory_delete";
+            /** @description Required for upsert; null for deletes and directory actions. */
             sha256?: string | null;
             /** Format: int64 */
             size_bytes: number;
@@ -2893,7 +2960,7 @@ export interface components {
         WorkspaceSyncDownloadAction: {
             path: string;
             /** @enum {string} */
-            action: "upsert" | "delete";
+            action: "upsert" | "delete" | "directory_upsert" | "directory_delete";
             sha256: string | null;
             /** Format: int64 */
             size_bytes: number;
@@ -2919,6 +2986,74 @@ export interface components {
             download_actions_done: number;
             /** Format: date-time */
             updated_at: string;
+        };
+        DeviceWorkspaceSyncProgressSummary: {
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            /**
+             * Format: int64
+             * @description Remaining committed logical capacity; zero when full or over quota
+             */
+            remaining_bytes: number;
+            /**
+             * @description Current committed-usage admission state; shrinking and deletion remain allowed when full or over quota
+             * @enum {string}
+             */
+            quota_status: "available" | "full" | "over_quota";
+            items: components["schemas"]["DeviceWorkspaceSyncProgress"][];
+        };
+        CreateWorkspaceSyncDeviceChallengeRequest: {
+            device_id: string;
+            /**
+             * Format: byte
+             * @description Base64-encoded public X.509 certificate DER; private keys are never accepted.
+             */
+            certificate_der: string;
+        };
+        WorkspaceSyncDeviceChallenge: {
+            id: string;
+            device_id: string;
+            /** Format: byte */
+            nonce: string;
+            /**
+             * Format: byte
+             * @description Base64-encoded bytes that the device private key must sign.
+             */
+            signing_payload: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        RegisterWorkspaceSyncDeviceRequest: {
+            challenge_id: string;
+            /**
+             * Format: byte
+             * @description Base64-encoded signature over the decoded signing_payload bytes.
+             */
+            signature: string;
+        };
+        WorkspaceSyncDeviceBinding: {
+            id: string;
+            workspace_id: components["schemas"]["WorkspaceId"];
+            client_installation_id: components["schemas"]["ClientInstallationId"];
+            device_id: string;
+            folder_id: string;
+            /** @description Returned only by registration; certificate identity of the server Syncthing node. */
+            server_device_id?: string;
+            /**
+             * Format: uri
+             * @description Returned only by registration; static Morde relay URI pinned to the relay certificate ID.
+             */
+            relay_address?: string;
+            /** @enum {string} */
+            state: "pending_node" | "active" | "revoking" | "revoked";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            revoked_at?: string | null;
         };
         SyncSession: {
             id: string;
@@ -3179,6 +3314,8 @@ export interface components {
             workspace_id?: components["schemas"]["WorkspaceId"];
             /** @description Immutable committed Workspace revision this task started from. */
             input_revision?: number;
+            /** @description Current confirmed Workspace revision available to this task; advances only after a durable task-owned publish. */
+            workspace_checkpoint_revision?: number;
             application_id?: string;
             conversation_id: components["schemas"]["ConversationId"];
             model_id: string;
@@ -5008,10 +5145,125 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
+                    "application/json": components["schemas"]["DeviceWorkspaceSyncProgressSummary"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createWorkspaceSyncDeviceChallenge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWorkspaceSyncDeviceChallengeRequest"];
+            };
+        };
+        responses: {
+            /** @description One-time device proof challenge */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceSyncDeviceChallenge"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listWorkspaceSyncDevices: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workspace device bindings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
                     "application/json": {
-                        items: components["schemas"]["DeviceWorkspaceSyncProgress"][];
+                        items: components["schemas"]["WorkspaceSyncDeviceBinding"][];
                     };
                 };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    registerWorkspaceSyncDevice: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterWorkspaceSyncDeviceRequest"];
+            };
+        };
+        responses: {
+            /** @description Workspace device binding and server connection details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceSyncDeviceBinding"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeWorkspaceSyncDevice: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Binding revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
@@ -5737,7 +5989,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current execution gate and epoch */
+            /** @description Current execution gate, account Runtime, quota, and Task summary */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5775,7 +6027,7 @@ export interface operations {
                     "application/json": components["schemas"]["ExecutionControl"];
                 };
             };
-            /** @description Stop requests are still being confirmed */
+            /** @description Task or account Runtime stop proof is still pending */
             202: {
                 headers: {
                     [name: string]: unknown;

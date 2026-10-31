@@ -28,7 +28,7 @@ type WorkspaceSyncService interface {
 	GetChanges(context.Context, identity.Principal, string, string, time.Duration, int32) (workspace.ChangePage, error)
 	CreateSyncSession(context.Context, identity.Principal, string, workspace.CreateSyncSession, string) (workspace.SyncSession, error)
 	GetSyncSession(context.Context, identity.Principal, string, string) (workspace.SyncSession, error)
-	ListDeviceSyncProgress(context.Context, identity.Principal, string) ([]workspace.DeviceSyncProgress, error)
+	ListDeviceSyncProgress(context.Context, identity.Principal, string) (workspace.DeviceSyncProgressSummary, error)
 	CommitSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	CancelSyncSession(context.Context, identity.Principal, string, string, string) (workspace.SyncSession, error)
 	PutSyncBlock(context.Context, identity.Principal, string, string, string, io.Reader) (int64, error)

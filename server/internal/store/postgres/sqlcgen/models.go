@@ -869,6 +869,13 @@ type WorkspaceChange struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type WorkspaceCurrentMaterialization struct {
+	WorkspaceID     string             `json:"workspace_id"`
+	DesiredRevision int64              `json:"desired_revision"`
+	AppliedRevision int64              `json:"applied_revision"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type WorkspaceLegacyVolume struct {
 	WorkspaceID string             `json:"workspace_id"`
 	VolumeName  string             `json:"volume_name"`
@@ -886,11 +893,20 @@ type WorkspaceOwnerBlockUsage struct {
 }
 
 type WorkspaceRevision struct {
-	WorkspaceID string             `json:"workspace_id"`
-	Revision    int64              `json:"revision"`
-	FileCount   int64              `json:"file_count"`
-	TotalBytes  int64              `json:"total_bytes"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	WorkspaceID    string             `json:"workspace_id"`
+	Revision       int64              `json:"revision"`
+	FileCount      int64              `json:"file_count"`
+	TotalBytes     int64              `json:"total_bytes"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	DirectoryCount int64              `json:"directory_count"`
+}
+
+type WorkspaceRevisionEmptyDirectory struct {
+	WorkspaceID       string      `json:"workspace_id"`
+	ValidFromRevision int64       `json:"valid_from_revision"`
+	ValidToRevision   pgtype.Int8 `json:"valid_to_revision"`
+	DirectoryPath     string      `json:"directory_path"`
+	FoldedPath        string      `json:"folded_path"`
 }
 
 type WorkspaceRevisionFile struct {
@@ -985,31 +1001,66 @@ type WorkspaceSyncNodeRevision struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type WorkspaceSyncReceiveBlock struct {
+	ReservationID string `json:"reservation_id"`
+	WorkspaceID   string `json:"workspace_id"`
+	Sha256        string `json:"sha256"`
+	SizeBytes     int64  `json:"size_bytes"`
+	ReservedBytes int64  `json:"reserved_bytes"`
+}
+
+type WorkspaceSyncReceiveReservation struct {
+	ID             string             `json:"id"`
+	OwnerID        string             `json:"owner_id"`
+	WorkspaceID    string             `json:"workspace_id"`
+	OperationID    string             `json:"operation_id"`
+	RequestHash    []byte             `json:"request_hash"`
+	FilePath       string             `json:"file_path"`
+	FoldedPath     string             `json:"folded_path"`
+	Operation      string             `json:"operation"`
+	TargetSize     int64              `json:"target_size"`
+	BaseRevision   int64              `json:"base_revision"`
+	BaseFileSize   pgtype.Int8        `json:"base_file_size"`
+	BaseFileSha256 pgtype.Text        `json:"base_file_sha256"`
+	State          string             `json:"state"`
+	ResultRevision pgtype.Int8        `json:"result_revision"`
+	ResultSha256   pgtype.Text        `json:"result_sha256"`
+	ResultMode     pgtype.Int4        `json:"result_mode"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type WorkspaceSyncSession struct {
-	ID                   string             `json:"id"`
-	WorkspaceID          string             `json:"workspace_id"`
-	OwnerID              string             `json:"owner_id"`
-	ReplicaID            string             `json:"replica_id"`
-	Direction            string             `json:"direction"`
-	Policy               string             `json:"policy"`
-	State                string             `json:"state"`
-	Stage                string             `json:"stage"`
-	BaseRevision         int64              `json:"base_revision"`
-	TargetRevision       int64              `json:"target_revision"`
-	PinnedRevision       int64              `json:"pinned_revision"`
-	PlannedBytes         int64              `json:"planned_bytes"`
-	ConfirmedBytes       int64              `json:"confirmed_bytes"`
-	Files                []byte             `json:"files"`
-	UploadFiles          []byte             `json:"upload_files"`
-	DownloadFiles        []byte             `json:"download_files"`
-	Scope                []string           `json:"scope"`
-	DeletedPaths         []string           `json:"deleted_paths"`
-	UploadDeletedPaths   []string           `json:"upload_deleted_paths"`
-	AckCursor            pgtype.Text        `json:"ack_cursor"`
-	Conflicts            []byte             `json:"conflicts"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
-	DownloadDeletedPaths []string           `json:"download_deleted_paths"`
+	ID                         string             `json:"id"`
+	WorkspaceID                string             `json:"workspace_id"`
+	OwnerID                    string             `json:"owner_id"`
+	ReplicaID                  string             `json:"replica_id"`
+	Direction                  string             `json:"direction"`
+	Policy                     string             `json:"policy"`
+	State                      string             `json:"state"`
+	Stage                      string             `json:"stage"`
+	BaseRevision               int64              `json:"base_revision"`
+	TargetRevision             int64              `json:"target_revision"`
+	PinnedRevision             int64              `json:"pinned_revision"`
+	PlannedBytes               int64              `json:"planned_bytes"`
+	ConfirmedBytes             int64              `json:"confirmed_bytes"`
+	Files                      []byte             `json:"files"`
+	UploadFiles                []byte             `json:"upload_files"`
+	DownloadFiles              []byte             `json:"download_files"`
+	Scope                      []string           `json:"scope"`
+	DeletedPaths               []string           `json:"deleted_paths"`
+	UploadDeletedPaths         []string           `json:"upload_deleted_paths"`
+	AckCursor                  pgtype.Text        `json:"ack_cursor"`
+	Conflicts                  []byte             `json:"conflicts"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	DownloadDeletedPaths       []string           `json:"download_deleted_paths"`
+	EmptyDirectories           []string           `json:"empty_directories"`
+	UploadEmptyDirectories     []string           `json:"upload_empty_directories"`
+	DownloadEmptyDirectories   []string           `json:"download_empty_directories"`
+	DeletedDirectories         []string           `json:"deleted_directories"`
+	UploadDeletedDirectories   []string           `json:"upload_deleted_directories"`
+	DownloadDeletedDirectories []string           `json:"download_deleted_directories"`
 }
 
 type WorkspaceSyncSessionBlock struct {

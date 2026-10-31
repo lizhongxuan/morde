@@ -1696,7 +1696,7 @@ func (s *hostServiceTestWorkspaceStore) TransitionWorkspaceBinding(_ context.Con
 	return value, nil
 }
 
-func (s *hostServiceTestWorkspaceStore) AdvanceWorkspaceBindingAppliedRevision(_ context.Context, hostID, workspaceID string, expectedVersion, revision int64) (workspace.Binding, error) {
+func (s *hostServiceTestWorkspaceStore) AdvanceWorkspaceBindingAppliedRevision(_ context.Context, hostID string, _ int64, workspaceID string, expectedVersion int64, _ string, revision int64) (workspace.Binding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := hostID + "/" + workspaceID
@@ -1715,21 +1715,20 @@ func (s *hostServiceTestWorkspaceStore) AdvanceWorkspaceBindingAppliedRevision(_
 	return value, nil
 }
 
-func (s *hostServiceTestWorkspaceStore) CompleteWorkspaceBindingUnbind(_ context.Context, hostID, workspaceID string, expectedVersion, checkpointRevision int64) (workspace.Binding, error) {
+func (s *hostServiceTestWorkspaceStore) CompleteWorkspaceBindingUnbind(_ context.Context, hostID, workspaceID string, expectedVersion, expectedGeneration, checkpointRevision int64) (workspace.Binding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := hostID + "/" + workspaceID
 	value, ok := s.bindings[key]
 	current := s.values[workspaceID]
-	if !ok || value.BindingVersion != expectedVersion || value.State != workspace.BindingUnbinding {
+	if !ok || expectedGeneration < 1 || value.BindingVersion != expectedVersion || value.State != workspace.BindingUnbinding {
 		return workspace.Binding{}, domain.NewError(domain.CodeInvalidState, "workspace binding state changed")
 	}
-	if current.State != workspace.StateReady || current.Revision != checkpointRevision || value.DesiredRevision != checkpointRevision {
+	if current.State != workspace.StateReady || current.Revision != checkpointRevision || value.DesiredRevision != checkpointRevision || value.AppliedRevision != checkpointRevision {
 		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace changed after the Host checkpoint")
 	}
 	value.State = workspace.BindingDetached
 	value.BindingVersion++
-	value.AppliedRevision = checkpointRevision
 	s.bindings[key] = value
 	return value, nil
 }

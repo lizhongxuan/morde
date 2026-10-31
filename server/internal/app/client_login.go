@@ -151,7 +151,8 @@ func (s *ClientLoginService) Logout(ctx context.Context, principal identity.Prin
 	if principal.Kind != identity.KindClient || !domain.ValidUserID(principal.UserID) || !domain.ValidClientInstallationID(principal.ClientInstallationID) {
 		return domain.NewError(domain.CodeUnauthenticated, "client credential required")
 	}
-	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorClient); err != nil {
+	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorClient,
+		func(gateCtx context.Context) error { return s.disableWorkspaceSyncRelay(gateCtx, principal.UserID) }); err != nil {
 		return err
 	}
 	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
@@ -161,7 +162,8 @@ func (s *ClientLoginService) LogoutWebSession(ctx context.Context, principal ide
 	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) || !domain.ValidClientInstallationID(principal.ClientInstallationID) {
 		return domain.NewError(domain.CodeUnauthenticated, "client Web session required")
 	}
-	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorSession); err != nil {
+	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorSession,
+		func(gateCtx context.Context) error { return s.disableWorkspaceSyncRelay(gateCtx, principal.UserID) }); err != nil {
 		return err
 	}
 	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
@@ -190,10 +192,18 @@ func (s *ClientLoginService) Revoke(ctx context.Context, principal identity.Prin
 	if !domain.ValidClientInstallationID(id) {
 		return domain.InvalidArgument("client_id", "invalid client id")
 	}
-	if err := s.store.RevokeClientInstallation(ctx, id, principal.UserID, ip, audit.ActorKind(principal.Kind)); err != nil {
+	if err := s.store.RevokeClientInstallation(ctx, id, principal.UserID, ip, audit.ActorKind(principal.Kind),
+		func(gateCtx context.Context) error { return s.disableWorkspaceSyncRelay(gateCtx, principal.UserID) }); err != nil {
 		return err
 	}
 	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
+}
+
+func (s *ClientLoginService) disableWorkspaceSyncRelay(ctx context.Context, ownerID string) error {
+	if s.workspaceSyncReconciler != nil {
+		return s.workspaceSyncReconciler.DisableWorkspaceSyncNodeRelay(ctx, ownerID)
+	}
+	return nil
 }
 
 func (s *ClientLoginService) reconcileWorkspaceSyncAfterInstallationRevocation(ctx context.Context, ownerID string) error {

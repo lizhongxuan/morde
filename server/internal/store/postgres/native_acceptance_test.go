@@ -29,6 +29,12 @@ import (
 	"morde/server/internal/worker"
 )
 
+type nativeAcceptanceWorkspaceCurrentDeleter struct{}
+
+func (nativeAcceptanceWorkspaceCurrentDeleter) Delete(context.Context, string, string) error {
+	return nil
+}
+
 // Opt-in native smoke test: a loopback Portal backed by a disposable PostgreSQL database.
 func TestNativeDesktopAcceptance(t *testing.T) {
 	if os.Getenv("MORDE_NATIVE_ACCEPTANCE") != "1" {
@@ -62,7 +68,7 @@ func TestNativeDesktopAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workspaces, err := app.NewWorkspaceService(store, blocks, capacity, audit, 1<<30)
+	workspaces, err := app.NewWorkspaceService(store, blocks, nativeAcceptanceWorkspaceCurrentDeleter{}, capacity, audit, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 	"time"
 
 	"morde/server/internal/domain"
@@ -15,8 +14,9 @@ import (
 )
 
 const (
-	workspaceSyncNodeFolderRoot = "/workspaces/"
-	workspaceSyncDeviceWait     = 10 * time.Second
+	workspaceSyncNodeFolderRoot  = "/workspaces/"
+	workspaceSyncNodeQuotaSocket = dockerWorkspaceSyncQuotaPath + "/quota.sock"
+	workspaceSyncDeviceWait      = 10 * time.Second
 )
 
 type syncthingFolderConfig struct {
@@ -26,6 +26,8 @@ type syncthingFolderConfig struct {
 	Type                    string `json:"type"`
 	Paused                  bool   `json:"paused"`
 	MordeMaxSingleFileBytes int64  `json:"mordeMaxSingleFileBytes"`
+	MordeQuotaSocket        string `json:"mordeQuotaSocket"`
+	MordeWorkspaceID        string `json:"mordeWorkspaceId"`
 	Devices                 []struct {
 		DeviceID string `json:"deviceID"`
 	} `json:"devices"`
@@ -53,8 +55,7 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 	desiredDevices := make(map[string]struct{})
 	desiredMembership := make(map[string]map[string]struct{})
 	for _, folder := range state.Folders {
-		if !domain.ValidWorkspaceID(folder.WorkspaceID) || len(folder.FolderID) != 38 || !strings.HasPrefix(folder.FolderID, "morde-") ||
-			!validSyncthingPathSegment(folder.FolderID) || len(folder.DeviceIDs) == 0 {
+		if !domain.ValidWorkspaceID(folder.WorkspaceID) || !workspace.ValidSyncFolderID(folder.FolderID) || len(folder.DeviceIDs) == 0 {
 			return errors.New("invalid Workspace sync folder in desired state")
 		}
 		if _, exists := desiredFolders[folder.FolderID]; exists {
@@ -64,7 +65,7 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 		slices.Sort(ids)
 		ids = slices.Compact(ids)
 		if len(ids) == 0 {
-			return errors.New("Workspace sync folder has no authorized devices")
+			return errors.New("workspace sync folder has no authorized devices")
 		}
 		if slices.Contains(ids, localDeviceID) {
 			return errors.New("local Syncthing device cannot be registered as a remote device")
@@ -103,15 +104,15 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 	for _, raw := range existingFolders {
 		var folder syncthingFolderConfig
 		if err := json.Unmarshal(raw, &folder); err != nil || !validSyncthingPathSegment(folder.ID) {
-			return errors.New("Syncthing returned an invalid folder configuration")
+			return errors.New("syncthing returned an invalid folder configuration")
 		}
 		if _, exists := folders[folder.ID]; exists {
-			return errors.New("Syncthing returned duplicate folder configurations")
+			return errors.New("syncthing returned duplicate folder configurations")
 		}
 		folders[folder.ID] = folder
 		for _, item := range folder.Devices {
 			if !validSyncthingDeviceID(item.DeviceID) {
-				return errors.New("Syncthing returned an invalid folder device")
+				return errors.New("syncthing returned an invalid folder device")
 			}
 			if oldMembership[item.DeviceID] == nil {
 				oldMembership[item.DeviceID] = make(map[string]struct{})
@@ -122,10 +123,10 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 	for _, raw := range existingDevices {
 		var device syncthingDeviceConfig
 		if err := json.Unmarshal(raw, &device); err != nil || !validSyncthingDeviceID(device.DeviceID) {
-			return errors.New("Syncthing returned an invalid device configuration")
+			return errors.New("syncthing returned an invalid device configuration")
 		}
 		if _, exists := devices[device.DeviceID]; exists {
-			return errors.New("Syncthing returned duplicate device configurations")
+			return errors.New("syncthing returned duplicate device configurations")
 		}
 		devices[device.DeviceID] = device
 	}
@@ -188,7 +189,7 @@ func applyWorkspaceSyncNodeDesiredState(ctx context.Context, client *SyncthingAP
 				return fmt.Errorf("read Syncthing folder configuration: %w", err)
 			}
 		}
-		configured, err := configureSyncthingFolder(raw, desired)
+		configured, err := configureSyncthingFolder(raw, desired, workspaceSyncNodeQuotaSocket)
 		if err != nil {
 			return err
 		}
@@ -263,7 +264,7 @@ func configureSyncthingDevice(raw json.RawMessage, deviceID, relayAddress string
 	return json.Marshal(value)
 }
 
-func configureSyncthingFolder(raw json.RawMessage, desired workspace.SyncNodeFolder) (json.RawMessage, error) {
+func configureSyncthingFolder(raw json.RawMessage, desired workspace.SyncNodeFolder, quotaSocket string) (json.RawMessage, error) {
 	var value map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &value); err != nil || len(value) == 0 {
 		return nil, errors.New("invalid Syncthing default folder configuration")
@@ -276,6 +277,15 @@ func configureSyncthingFolder(raw json.RawMessage, desired workspace.SyncNodeFol
 	}
 	maxFileBytes, _ := json.Marshal(workspace.MaxSyncFileBytes)
 	value["mordeMaxSingleFileBytes"] = maxFileBytes
+	if quotaSocket == "" {
+		delete(value, "mordeQuotaSocket")
+		delete(value, "mordeWorkspaceId")
+	} else {
+		encodedSocket, _ := json.Marshal(quotaSocket)
+		encodedWorkspace, _ := json.Marshal(desired.WorkspaceID)
+		value["mordeQuotaSocket"] = encodedSocket
+		value["mordeWorkspaceId"] = encodedWorkspace
+	}
 	value["paused"] = json.RawMessage("false")
 	devices := make([]struct {
 		DeviceID string `json:"deviceID"`
@@ -305,11 +315,11 @@ func waitSyncthingDevicePaused(ctx context.Context, client *SyncthingAPIClient, 
 		}
 		var state syncthingConnections
 		if err := json.Unmarshal(connections, &state); err != nil || state.Connections == nil {
-			return errors.New("Syncthing returned invalid connection state")
+			return errors.New("syncthing returned invalid connection state")
 		}
 		connection, exists := state.Connections[deviceID]
 		if !exists {
-			return errors.New("Syncthing connection state omitted a configured device")
+			return errors.New("syncthing connection state omitted a configured device")
 		}
 		if connection.Paused && !connection.Connected {
 			return nil
@@ -318,7 +328,7 @@ func waitSyncthingDevicePaused(ctx context.Context, client *SyncthingAPIClient, 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return errors.New("Syncthing device connection did not stop after pause")
+			return errors.New("syncthing device connection did not stop after pause")
 		case <-ticker.C:
 		}
 	}
@@ -334,38 +344,39 @@ func verifySyncthingNodeConfig(ctx context.Context, client *SyncthingAPIClient, 
 		return fmt.Errorf("verify Syncthing devices: %w", err)
 	}
 	if len(actualFolders) != len(folders) || len(actualDevices) != len(devices)+1 {
-		return errors.New("Syncthing configuration does not match the authorized Workspace snapshot")
+		return errors.New("syncthing configuration does not match the authorized Workspace snapshot")
 	}
 	for _, raw := range actualFolders {
 		var actual syncthingFolderConfig
 		if err := json.Unmarshal(raw, &actual); err != nil {
-			return errors.New("Syncthing returned invalid folder configuration")
+			return errors.New("syncthing returned invalid folder configuration")
 		}
 		want, exists := folders[actual.ID]
 		if !exists || actual.Label != "Morde Workspace" || actual.Path != workspaceSyncNodeFolderRoot+want.WorkspaceID ||
 			actual.Type != "sendreceive" || actual.Paused || actual.MordeMaxSingleFileBytes != workspace.MaxSyncFileBytes ||
+			actual.MordeQuotaSocket != workspaceSyncNodeQuotaSocket || actual.MordeWorkspaceID != want.WorkspaceID ||
 			!sameDeviceIDs(actual.Devices, want.DeviceIDs) {
-			return errors.New("Syncthing folder configuration does not match the authorized Workspace snapshot")
+			return errors.New("syncthing folder configuration does not match the authorized Workspace snapshot")
 		}
 	}
 	seenDevices := make(map[string]struct{}, len(actualDevices))
 	for _, raw := range actualDevices {
 		var actual syncthingDeviceConfig
 		if err := json.Unmarshal(raw, &actual); err != nil {
-			return errors.New("Syncthing returned invalid device configuration")
+			return errors.New("syncthing returned invalid device configuration")
 		}
 		if _, duplicate := seenDevices[actual.DeviceID]; duplicate {
-			return errors.New("Syncthing returned duplicate device configurations")
+			return errors.New("syncthing returned duplicate device configurations")
 		}
 		seenDevices[actual.DeviceID] = struct{}{}
 		if actual.DeviceID == localDeviceID {
 			if actual.Paused {
-				return errors.New("Syncthing local device configuration is paused")
+				return errors.New("syncthing local device configuration is paused")
 			}
 			continue
 		}
 		if _, exists := devices[actual.DeviceID]; !exists || actual.Paused {
-			return errors.New("Syncthing device configuration does not match the authorized Workspace snapshot")
+			return errors.New("syncthing device configuration does not match the authorized Workspace snapshot")
 		}
 	}
 	return nil
@@ -416,6 +427,7 @@ func currentFolderMatches(want json.RawMessage, current syncthingFolderConfig) b
 	return expected.ID == current.ID && expected.Label == current.Label && expected.Path == current.Path &&
 		expected.Type == current.Type && expected.Paused == current.Paused &&
 		expected.MordeMaxSingleFileBytes == current.MordeMaxSingleFileBytes &&
+		expected.MordeQuotaSocket == current.MordeQuotaSocket && expected.MordeWorkspaceID == current.MordeWorkspaceID &&
 		sameDeviceIDs(expected.Devices, deviceIDsFromConfig(current.Devices))
 }
 

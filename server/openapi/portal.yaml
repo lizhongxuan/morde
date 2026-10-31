@@ -1341,7 +1341,7 @@ paths:
       tags: [Workspaces]
       operationId: listDeviceWorkspaceSyncProgress
       summary: Read active desktop synchronization progress
-      description: Portal sessions only. Returns only the latest active session for each currently authorized device. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted.
+      description: Portal sessions only. Returns the current Workspace revision, committed logical bytes, configured quota, remaining committed capacity, quota admission state, and only the latest active session for each currently authorized device. Quota state is available below the limit, full at the limit, and over_quota above it; shrinking and deletion remain allowed when full or over quota. Confirmed bytes mean durably acknowledged blocks; download action counts mean files applied. File paths and conflicts are omitted. Usage is based on committed explicit sync revisions and is not yet a ledger for direct Syncthing writes.
       security:
         - portalSession: []
       responses:
@@ -1349,13 +1349,7 @@ paths:
           description: Active progress summaries for authorized devices
           content:
             application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items: { $ref: '#/components/schemas/DeviceWorkspaceSyncProgress' }
+              schema: { $ref: '#/components/schemas/DeviceWorkspaceSyncProgressSummary' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1467,7 +1461,7 @@ paths:
       tags: [Workspaces]
       operationId: createWorkspaceSyncSession
       summary: Plan an upload, missing-only download, merge, or live synchronization batch
-      description: The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. A session is resumable and idempotent; omitted files never imply deletion.
+      description: The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
       security:
         - portalSession: []
         - bearerToken: []
@@ -4299,7 +4293,7 @@ components:
       additionalProperties: false
     WorkspaceManifest:
       type: object
-      required: [workspace_id, revision, files, next_cursor]
+      required: [workspace_id, revision, files, empty_directories, next_cursor]
       properties:
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
         revision: { type: integer, format: int64, minimum: 0 }
@@ -4307,6 +4301,10 @@ components:
           type: array
           maxItems: 100000
           items: { $ref: '#/components/schemas/WorkspaceFile' }
+        empty_directories:
+          type: array
+          maxItems: 100000
+          items: { type: string, minLength: 1, maxLength: 4096, description: Empty leaf directory path; combined with files, at most 100000 manifest entries. }
         next_cursor: { type: [string, 'null'], maxLength: 512 }
       additionalProperties: false
     WorkspaceChangePage:
@@ -4322,7 +4320,7 @@ components:
             properties:
               revision: { type: integer, format: int64, minimum: 1 }
               path: { type: string, minLength: 1, maxLength: 4096 }
-              action: { type: string, enum: [upsert, delete] }
+              action: { type: string, enum: [upsert, delete, directory_upsert, directory_delete], description: Directory actions have file=null; directory_upsert creates an empty leaf directory. }
               file: { oneOf: [{ $ref: '#/components/schemas/WorkspaceFile' }, { type: 'null' }] }
         next_cursor: { type: string, minLength: 1, maxLength: 512 }
       additionalProperties: false
@@ -4341,10 +4339,18 @@ components:
           type: array
           maxItems: 100000
           items: { $ref: '#/components/schemas/WorkspaceFile' }
+        empty_directories:
+          type: array
+          maxItems: 100000
+          items: { type: string, minLength: 1, maxLength: 4096, description: Empty leaf directories in the submitted snapshot; combined with files, at most 100000 entries. }
         deleted_paths:
           type: array
           maxItems: 100000
           items: { type: string, minLength: 1, maxLength: 4096 }
+        deleted_directories:
+          type: array
+          maxItems: 100000
+          items: { type: string, minLength: 1, maxLength: 4096, description: Explicit empty-directory deletions; omitted directories never imply deletion. }
         ack_cursor: { type: [string, 'null'], maxLength: 512, description: Advance this replica's durable cursor only after this session is applied and committed. }
       additionalProperties: false
     SyncConflict:
@@ -4368,8 +4374,8 @@ components:
       required: [path, action, size_bytes]
       properties:
         path: { type: string, minLength: 1, maxLength: 4096 }
-        action: { type: string, enum: [upsert, delete] }
-        sha256: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$', description: Required for upsert; omitted or null for delete. }
+        action: { type: string, enum: [upsert, delete, directory_upsert, directory_delete] }
+        sha256: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$', description: Required for upsert; null for deletes and directory actions. }
         size_bytes: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
     WorkspaceSyncDownloadAction:
@@ -4377,7 +4383,7 @@ components:
       required: [path, action, sha256, size_bytes, applied]
       properties:
         path: { type: string, minLength: 1, maxLength: 4096 }
-        action: { type: string, enum: [upsert, delete] }
+        action: { type: string, enum: [upsert, delete, directory_upsert, directory_delete] }
         sha256: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
         size_bytes: { type: integer, format: int64, minimum: 0 }
         applied: { type: boolean }
@@ -4397,6 +4403,19 @@ components:
         download_actions_total: { type: integer, format: int64, minimum: 0 }
         download_actions_done: { type: integer, format: int64, minimum: 0 }
         updated_at: { type: string, format: date-time }
+      additionalProperties: false
+    DeviceWorkspaceSyncProgressSummary:
+      type: object
+      required: [revision, used_bytes, quota_bytes, remaining_bytes, quota_status, items]
+      properties:
+        revision: { type: integer, format: int64, minimum: 0 }
+        used_bytes: { type: integer, format: int64, minimum: 0 }
+        quota_bytes: { type: integer, format: int64, minimum: 0 }
+        remaining_bytes: { type: integer, format: int64, minimum: 0, description: Remaining committed logical capacity; zero when full or over quota }
+        quota_status: { type: string, enum: [available, full, over_quota], description: Current committed-usage admission state; shrinking and deletion remain allowed when full or over quota }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceWorkspaceSyncProgress' }
       additionalProperties: false
     CreateWorkspaceSyncDeviceChallengeRequest:
       type: object

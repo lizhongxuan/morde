@@ -16,6 +16,64 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
+func TestPostgresHostReplicaBindingChangesRequireCurrentRunningGeneration(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+	activationWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "host-replica-activation-fence")
+	statusWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "host-replica-status-fence")
+	createBinding := func(value workspace.Workspace) workspace.Binding {
+		t.Helper()
+		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: value, Directory: value.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: value.Revision,
+		})
+		if err != nil {
+			t.Fatalf("create Host workspace binding: %v", err)
+		}
+		return binding
+	}
+	activationBinding := createBinding(activationWorkspace)
+	statusBinding := createBinding(statusWorkspace)
+	statusBinding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, statusWorkspace.ID, statusBinding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, statusBinding.DesiredRevision, statusBinding.AppliedRevision)
+	if err != nil {
+		t.Fatalf("activate sync-status fixture binding: %v", err)
+	}
+
+	staleGeneration := hostValue.RuntimeGeneration + 1
+	if _, err := store.ActivateWorkspaceBindingForHost(ctx, hostValue.ID, staleGeneration, activationWorkspace.ID,
+		activationBinding.BindingVersion, activationBinding.DesiredRevision, activationBinding.AppliedRevision); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("activate with stale Host generation error = %v", err)
+	}
+	if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, staleGeneration, statusWorkspace.ID,
+		statusBinding.BindingVersion, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("sync status with stale Host generation error = %v", err)
+	}
+
+	stopping, changed, err := store.BeginHostRelease(ctx, hostValue.ID, false)
+	if err != nil || !changed || stopping.State != host.StateStopping {
+		t.Fatalf("begin Host release = %#v, changed=%t, err=%v", stopping, changed, err)
+	}
+	if _, err := store.ActivateWorkspaceBindingForHost(ctx, hostValue.ID, hostValue.RuntimeGeneration, activationWorkspace.ID,
+		activationBinding.BindingVersion, activationBinding.DesiredRevision, activationBinding.AppliedRevision); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("activate after Host stopped admission error = %v", err)
+	}
+	if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, hostValue.RuntimeGeneration, statusWorkspace.ID,
+		statusBinding.BindingVersion, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("sync status after Host stopped admission error = %v", err)
+	}
+	activationAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, activationWorkspace.ID)
+	if err != nil || activationAfter.State != workspace.BindingPreparing || activationAfter.BindingVersion != activationBinding.BindingVersion {
+		t.Fatalf("Host activation changed binding after rejection = %#v, err=%v", activationAfter, err)
+	}
+	statusAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, statusWorkspace.ID)
+	if err != nil || statusAfter.SyncState != workspace.BindingSyncHealthy || len(statusAfter.SyncConflicts) != 0 {
+		t.Fatalf("Host status changed binding after rejection = %#v, err=%v", statusAfter, err)
+	}
+}
+
 func TestHostComputeReleaseAndConcurrentRestore(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
@@ -264,6 +322,8 @@ func TestBeginHostReleaseBlocksUncommittedHostWorkspaceSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	binding = completeHostWorkspaceDownloadForTest(t, store, ctx, owner.ID, hostValue, binding,
+		workspaceValue.ID, binding.AppliedRevision, updatedWorkspace.Revision)
 	deletion := newTestSyncSession(t, updatedWorkspace, owner.ID, nil, nil, []string{file.Path})
 	deletion.ReplicaID = session.ReplicaID
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, deletion, nil,
@@ -279,6 +339,12 @@ func TestBeginHostReleaseBlocksUncommittedHostWorkspaceSync(t *testing.T) {
 		syncTestIdempotency(owner.ID, "workspace.sync.commit", "release-uncommitted:delete-commit", deletion.ID)); err != nil || deleted.State != workspace.SyncCompleted {
 		t.Fatalf("commit Host deletion = %#v, %v", deleted, err)
 	}
+	updatedWorkspace, err = store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding = completeHostWorkspaceDownloadForTest(t, store, ctx, owner.ID, hostValue, binding,
+		workspaceValue.ID, binding.AppliedRevision, updatedWorkspace.Revision)
 	if _, err := store.SetWorkspaceBindingSyncStatus(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingSyncConflict, []string{file.Path}); err != nil {
 		t.Fatal(err)
@@ -296,6 +362,227 @@ func TestBeginHostReleaseBlocksUncommittedHostWorkspaceSync(t *testing.T) {
 	if err != nil || !changed || stopping.State != host.StateStopping {
 		t.Fatalf("release after Host upload and conflict settle = %#v, changed=%t, err=%v", stopping, changed, err)
 	}
+}
+
+func TestBeginHostReleaseRequiresAppliedWorkspaceRevisionAndSettledDirectoryUploads(t *testing.T) {
+	cases := []struct {
+		name       string
+		wantReason string
+		prepare    func(t *testing.T, store *Store, ctx context.Context, ownerID string, value workspace.Workspace, hostValue host.Host, binding workspace.Binding)
+	}{
+		{
+			name:       "applied revision lags Workspace",
+			wantReason: "host_release_workspace_checkpoint_pending",
+			prepare: func(t *testing.T, store *Store, ctx context.Context, ownerID string, value workspace.Workspace, hostValue host.Host, binding workspace.Binding) {
+				file := syncTestFile("pending.txt", []byte("new Workspace revision"))
+				session := newTestSyncSession(t, value, ownerID, []workspace.File{file}, []workspace.File{file}, nil)
+				if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+					syncTestIdempotency(ownerID, "workspace.sync.create", "release-checkpoint:create", session.ID)); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, session.ID,
+					syncTestIdempotency(ownerID, "workspace.sync.commit", "release-checkpoint:commit", session.ID)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "unfinished file upload",
+			wantReason: "host_release_uncommitted_sync",
+			prepare: func(t *testing.T, store *Store, ctx context.Context, ownerID string, value workspace.Workspace, hostValue host.Host, binding workspace.Binding) {
+				file := syncTestFile("pending.txt", []byte("Host file upload"))
+				session := newTestSyncSession(t, value, ownerID, []workspace.File{file}, []workspace.File{file}, nil)
+				session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, value.ID, binding.BindingVersion)
+				if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+					syncTestIdempotency(ownerID, "workspace.sync.create", "release-file-upload:create", session.ID)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "empty-directory upload",
+			wantReason: "host_release_uncommitted_sync",
+			prepare: func(t *testing.T, store *Store, ctx context.Context, ownerID string, value workspace.Workspace, hostValue host.Host, binding workspace.Binding) {
+				directory := "notes/empty"
+				session := newTestSyncSession(t, value, ownerID, []workspace.File{}, []workspace.File{}, nil)
+				session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, value.ID, binding.BindingVersion)
+				session.EmptyDirectories = []string{directory}
+				session.UploadEmptyDirectories = []string{directory}
+				if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, nil,
+					syncTestIdempotency(ownerID, "workspace.sync.create", "release-empty-dir-upload:create", session.ID)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "empty-directory deletion",
+			wantReason: "host_release_uncommitted_sync",
+			prepare: func(t *testing.T, store *Store, ctx context.Context, ownerID string, value workspace.Workspace, hostValue host.Host, binding workspace.Binding) {
+				directory := "notes/empty"
+				create := newTestSyncSession(t, value, ownerID, []workspace.File{}, []workspace.File{}, nil)
+				create.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, value.ID, binding.BindingVersion)
+				create.Direction = workspace.SyncBidirectional
+				create.EmptyDirectories = []string{directory}
+				create.UploadEmptyDirectories = []string{directory}
+				if _, _, err := createTestWorkspaceSyncSession(ctx, store, create, nil,
+					syncTestIdempotency(ownerID, "workspace.sync.create", "release-empty-dir-delete:seed", create.ID)); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, create.ID,
+					syncTestIdempotency(ownerID, "workspace.sync.commit", "release-empty-dir-delete:seed-commit", create.ID)); err != nil {
+					t.Fatal(err)
+				}
+				current, err := store.GetWorkspace(ctx, value.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				binding = completeHostWorkspaceDownloadForTest(t, store, ctx, ownerID, hostValue, binding,
+					value.ID, binding.AppliedRevision, current.Revision)
+				remove := newTestSyncSession(t, current, ownerID, []workspace.File{}, []workspace.File{}, nil)
+				remove.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, value.ID, binding.BindingVersion)
+				remove.DeletedDirectories = []string{directory}
+				remove.UploadDeletedDirectories = []string{directory}
+				if _, _, err := createTestWorkspaceSyncSession(ctx, store, remove, nil,
+					syncTestIdempotency(ownerID, "workspace.sync.create", "release-empty-dir-delete:create", remove.ID)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			store, _ := newTemporaryStore(t)
+			ctx := context.Background()
+			owner := createTestUser(t, store, 3, 20_000, 40_000)
+			value := createTestWorkspace(t, ctx, store, owner.ID, "release-checkpoint")
+			hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+			if err := store.MarkCreateAttempt(ctx, hostValue.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.TransitionHost(ctx, hostValue.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, 1,
+				workspace.BindingPreparing, workspace.BindingActive, value.Revision, value.Revision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.prepare(t, store, ctx, owner.ID, value, hostValue, binding)
+
+			_, changed, err := store.BeginHostRelease(ctx, hostValue.ID, true)
+			var scoped *domain.Error
+			if changed || domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &scoped) ||
+				scoped.Details["reason"] != test.wantReason || scoped.Details["workspace_id"] != value.ID {
+				t.Fatalf("release with %s: changed=%t err=%v", test.name, changed, err)
+			}
+			if current, getErr := store.GetHost(ctx, hostValue.ID); getErr != nil || current.State != host.StateRunning {
+				t.Fatalf("Host after refused release = %#v, %v", current, getErr)
+			}
+		})
+	}
+}
+
+func completeHostWorkspaceDownloadForTest(t *testing.T, store *Store, ctx context.Context, ownerID string, hostValue host.Host,
+	binding workspace.Binding, workspaceID string, baseRevision, targetRevision int64) workspace.Binding {
+	t.Helper()
+	baseline, err := store.GetWorkspaceManifestPage(ctx, workspaceID, baseRevision, "", "", 100)
+	if err != nil {
+		t.Fatalf("read Host download baseline: %v", err)
+	}
+	changes, err := store.GetWorkspaceChangePage(ctx, workspaceID, baseRevision, "", 500)
+	if err != nil {
+		t.Fatalf("read Host download changes: %v", err)
+	}
+	latestByPath := make(map[string]workspace.Change, len(changes.Items))
+	for _, change := range changes.Items {
+		if change.Revision <= targetRevision {
+			latestByPath[change.Path] = change
+		}
+	}
+	var downloadFiles []workspace.File
+	var downloadDeletedPaths, downloadEmptyDirectories, downloadDeletedDirectories []string
+	for _, change := range latestByPath {
+		switch change.Action {
+		case workspace.ChangeUpsert:
+			if change.File == nil {
+				t.Fatalf("Host download file change %q has no file metadata", change.Path)
+			}
+			downloadFiles = append(downloadFiles, *change.File)
+		case workspace.ChangeDelete:
+			downloadDeletedPaths = append(downloadDeletedPaths, change.Path)
+		case workspace.ChangeDirectoryUpsert:
+			downloadEmptyDirectories = append(downloadEmptyDirectories, change.Path)
+		case workspace.ChangeDirectoryDelete:
+			downloadDeletedDirectories = append(downloadDeletedDirectories, change.Path)
+		default:
+			t.Fatalf("unsupported Host download action %q", change.Action)
+		}
+	}
+
+	current, err := store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		t.Fatalf("read Workspace for Host download: %v", err)
+	}
+	session := newTestSyncSession(t, current, ownerID, baseline.Files, []workspace.File{}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceID, binding.BindingVersion)
+	session.Direction = workspace.SyncDownload
+	session.Policy = workspace.SyncLive
+	session.BaseRevision = baseRevision
+	session.PinnedRevision = targetRevision
+	session.TargetRevision = targetRevision
+	session.EmptyDirectories = baseline.EmptyDirectories
+	session.DownloadFiles = downloadFiles
+	session.DownloadDeletedPaths = downloadDeletedPaths
+	session.DownloadEmptyDirectories = downloadEmptyDirectories
+	session.DownloadDeletedDirectories = downloadDeletedDirectories
+	session.AckCursor = &changes.NextCursor
+	for _, file := range downloadFiles {
+		session.PlannedBytes += file.SizeBytes
+	}
+	session.DownloadActions = workspace.DownloadActionsForTreePlan(
+		downloadFiles, downloadDeletedPaths, downloadEmptyDirectories, downloadDeletedDirectories)
+
+	chunksByDigest := make(map[string]workspace.Chunk)
+	for _, file := range downloadFiles {
+		for _, chunk := range file.Chunks {
+			chunksByDigest[chunk.SHA256] = chunk
+		}
+	}
+	blocks := make([]workspace.TransferBlock, 0, len(chunksByDigest))
+	for _, chunk := range chunksByDigest {
+		blocks = append(blocks, workspace.TransferBlock{Chunk: chunk, Role: workspace.BlockDownload})
+	}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, blocks,
+		syncTestIdempotency(ownerID, "workspace.sync.create", "release-applied-download:create:"+session.ID, session.ID)); err != nil {
+		t.Fatalf("create Host download receipt session: %v", err)
+	}
+	for _, block := range blocks {
+		if err := store.AckWorkspaceSyncDownloadBlock(ctx, workspaceID, session.ID, block.SHA256); err != nil {
+			t.Fatalf("ack Host download block %s: %v", block.SHA256, err)
+		}
+	}
+	for _, action := range session.DownloadActions {
+		digest := ""
+		if action.SHA256 != nil {
+			digest = *action.SHA256
+		}
+		if err := store.AckWorkspaceSyncDownloadAction(ctx, workspaceID, session.ID,
+			action.Path, action.Action, digest, action.SizeBytes); err != nil {
+			t.Fatalf("ack Host download action %s: %v", action.Path, err)
+		}
+	}
+	committed, _, err := commitWorkspaceSyncSession(ctx, store, workspaceID, session.ID,
+		syncTestIdempotency(ownerID, "workspace.sync.commit", "release-applied-download:commit:"+session.ID, session.ID))
+	if err != nil || committed.State != workspace.SyncCompleted {
+		t.Fatalf("complete Host download receipt session: %#v, %v", committed, err)
+	}
+	updated, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration,
+		workspaceID, binding.BindingVersion, committed.ID, committed.TargetRevision)
+	if err != nil {
+		t.Fatalf("advance Host applied revision from completed download: %v", err)
+	}
+	return updated
 }
 
 func TestHostSyncSessionCreationSerializesWithRelease(t *testing.T) {

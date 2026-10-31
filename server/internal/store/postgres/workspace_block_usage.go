@@ -376,7 +376,12 @@ WHERE w.id=u.workspace_id AND w.state='deleted'
 		if _, err := tx.Exec(ctx, `
 DELETE FROM workspace_block_usage u
 WHERE NOT EXISTS (SELECT 1 FROM workspace_block_quota_scan a WHERE a.workspace_id=u.workspace_id AND a.sha256=u.sha256)
-  AND u.state='stored'`); err != nil {
+  AND u.state='stored'
+  AND NOT EXISTS (
+    SELECT 1 FROM workspace_sync_receive_blocks b
+    JOIN workspace_sync_receive_reservations r ON r.id=b.reservation_id
+    WHERE b.workspace_id=u.workspace_id AND b.sha256=u.sha256 AND r.state IN ('reserved','aborting')
+  )`); err != nil {
 			return fmt.Errorf("remove absent workspace block usage: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -388,6 +393,11 @@ WHERE u.state='reserved'
     JOIN workspace_sync_session_blocks b ON b.workspace_id=s.workspace_id AND b.session_id=s.id
     WHERE s.workspace_id=u.workspace_id AND b.sha256=u.sha256 AND b.role='upload' AND b.received=false
       AND s.state IN ('planned','transferring','verifying','applying')
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM workspace_sync_receive_blocks b
+    JOIN workspace_sync_receive_reservations r ON r.id=b.reservation_id
+    WHERE b.workspace_id=u.workspace_id AND b.sha256=u.sha256 AND r.state IN ('reserved','aborting')
   )
   AND NOT EXISTS (SELECT 1 FROM workspace_legacy_volumes v WHERE v.workspace_id=u.workspace_id AND v.import_state='pending')`); err != nil {
 			return fmt.Errorf("release orphaned workspace block reservations: %w", err)
@@ -482,6 +492,133 @@ WHERE owner_id=$1`, ownerID, ownerAllocated-allocatedDebit, ownerReserved-reserv
 		return fmt.Errorf("debit collected workspace owner block usage: %w", err)
 	}
 	return nil
+}
+
+// WithPendingLegacyImportWorkspaceBlockGC removes abandoned import blocks only
+// while the Workspace is still an empty pending import and no operation can
+// reference uncommitted bytes.
+func (s *Store) WithPendingLegacyImportWorkspaceBlockGC(ctx context.Context, workspaceID string,
+	collect func([]workspace.BlockReference) ([]app.WorkspaceBlockRemoval, error)) error {
+	if !domain.ValidWorkspaceID(workspaceID) || collect == nil {
+		return domain.InvalidArgument("workspace_gc", "pending legacy Workspace block cleanup fields are invalid")
+	}
+	var collectErr error
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var state, importState string
+		var revision, usedBytes int64
+		var deleted bool
+		if err := tx.QueryRow(ctx, `
+SELECT w.state, w.deleted_at IS NOT NULL, w.revision, w.used_bytes, v.import_state
+FROM workspaces w
+JOIN workspace_legacy_volumes v ON v.workspace_id=w.id
+WHERE w.id=$1
+FOR UPDATE OF w, v`, workspaceID).Scan(&state, &deleted, &revision, &usedBytes, &importState); err != nil {
+			return storeError("lock pending legacy Workspace for block cleanup", "workspace legacy volume", err)
+		}
+		if state != string(workspace.StateReady) || deleted {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for pending legacy import cleanup")
+		}
+		if importState != "pending" || revision != 0 || usedBytes != 0 {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace is no longer an empty pending legacy import")
+		}
+		for _, check := range []func(context.Context, pgx.Tx, string) error{
+			ensureNoPendingWorkspaceSyncCommit,
+			ensureNoPendingWorkspaceTaskPublish,
+			ensureNoActiveWorkspaceSyncSessions,
+			ensureNoActiveWorkspaceTaskOperations,
+		} {
+			if err := check(ctx, tx, workspaceID); err != nil {
+				return err
+			}
+		}
+		if err := ensureNoWorkspaceSyncReceive(ctx, tx, workspaceID, ""); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+SELECT DISTINCT f.workspace_id, (chunk->>'sha256')::text AS sha256, (chunk->>'size_bytes')::bigint AS size_bytes
+FROM workspace_revision_files f
+CROSS JOIN LATERAL jsonb_array_elements(f.chunks) AS chunk
+WHERE f.workspace_id=$1
+ORDER BY sha256, size_bytes`, workspaceID)
+		if err != nil {
+			return fmt.Errorf("list retained Workspace blocks before legacy cleanup: %w", err)
+		}
+		references := make([]workspace.BlockReference, 0)
+		for rows.Next() {
+			var reference workspace.BlockReference
+			if err := rows.Scan(&reference.WorkspaceID, &reference.SHA256, &reference.SizeBytes); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan retained Workspace block before legacy cleanup: %w", err)
+			}
+			references = append(references, reference)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read retained Workspace blocks before legacy cleanup: %w", err)
+		}
+		rows.Close()
+
+		removed, err := collect(references)
+		collectErr = err
+		if err := applyWorkspaceBlockRemovals(ctx, tx, workspaceID, removed); err != nil {
+			return err
+		}
+		if collectErr != nil {
+			return nil
+		}
+		var ownerID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id FROM workspaces WHERE id=$1`, workspaceID).Scan(&ownerID); err != nil {
+			return storeError("read pending legacy Workspace owner", "workspace", err)
+		}
+		_, ownerReserved, err := lockWorkspaceOwnerUsage(ctx, tx, ownerID)
+		if err != nil {
+			return err
+		}
+		staleRows, err := tx.Query(ctx, `
+DELETE FROM workspace_block_usage u
+WHERE u.workspace_id=$1 AND u.state='reserved'
+  AND NOT EXISTS (
+    SELECT 1 FROM workspace_revision_files f
+    CROSS JOIN LATERAL jsonb_array_elements(f.chunks) c
+    WHERE f.workspace_id=u.workspace_id AND c->>'sha256'=u.sha256
+  )
+RETURNING u.reserved_bytes`, workspaceID)
+		if err != nil {
+			return fmt.Errorf("remove abandoned pending legacy block reservations: %w", err)
+		}
+		var reservedToRelease int64
+		for staleRows.Next() {
+			var reservedBytes int64
+			if err := staleRows.Scan(&reservedBytes); err != nil {
+				staleRows.Close()
+				return fmt.Errorf("read abandoned pending legacy block reservation: %w", err)
+			}
+			if reservedBytes < 0 || reservedToRelease > math.MaxInt64-reservedBytes {
+				staleRows.Close()
+				return domain.NewError(domain.CodeInternal, "pending legacy block reservation total is invalid")
+			}
+			reservedToRelease += reservedBytes
+		}
+		if err := staleRows.Err(); err != nil {
+			staleRows.Close()
+			return fmt.Errorf("iterate abandoned pending legacy block reservations: %w", err)
+		}
+		staleRows.Close()
+		if ownerReserved < reservedToRelease {
+			return domain.NewError(domain.CodeInternal, "workspace owner reserved-byte counter is inconsistent")
+		}
+		if reservedToRelease > 0 {
+			if _, err := tx.Exec(ctx, `UPDATE workspace_owner_block_usage
+SET reserved_bytes=$2, updated_at=now() WHERE owner_id=$1`, ownerID, ownerReserved-reservedToRelease); err != nil {
+				return fmt.Errorf("release abandoned pending legacy owner reservations: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return collectErr
 }
 
 func ensureWorkspaceMutationsBlockUsageStored(ctx context.Context, tx pgx.Tx, workspaceID string, mutations []syncMutation) error {

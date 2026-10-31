@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -30,11 +31,15 @@ type legacyImportStoreFake struct {
 	volume           LegacyWorkspaceVolume
 	pending          bool
 	lockBusy         bool
+	importReadyErr   error
+	importReadyCalls int
 	lockReleaseCalls int
 	commitCall       int
+	cleanupReason    string
 	reservations     []WorkspaceBlockReservation
 	finalized        []WorkspaceBlockAllocation
 	files            []workspace.File
+	emptyDirectories []string
 }
 
 type legacyImportLockFake struct {
@@ -66,6 +71,28 @@ func (s *legacyImportStoreFake) GetPendingWorkspaceLegacyVolume(ctx context.Cont
 	return s.volume, nil
 }
 
+func (s *legacyImportStoreFake) EnsureWorkspaceLegacyImportReady(ctx context.Context, id string) error {
+	s.importReadyCalls++
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if id != s.volume.WorkspaceID || !s.pending {
+		return errors.New("legacy volume is not pending")
+	}
+	return s.importReadyErr
+}
+
+func (s *legacyImportStoreFake) MarkWorkspaceLegacyVolumeNeedsCleanup(ctx context.Context, id, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !s.pending || id != s.volume.WorkspaceID {
+		return errors.New("legacy workspace is not pending")
+	}
+	s.cleanupReason = reason
+	return nil
+}
+
 func (s *legacyImportStoreFake) ReserveWorkspaceBlockUsage(ctx context.Context, workspaceID string, reservations []WorkspaceBlockReservation, _ int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -85,7 +112,7 @@ func (s *legacyImportStoreFake) FinalizeWorkspaceBlockUsage(ctx context.Context,
 	return nil
 }
 
-func (s *legacyImportStoreFake) CommitWorkspaceLegacyVolumeImport(ctx context.Context, value LegacyWorkspaceVolume, files []workspace.File) (workspace.Workspace, error) {
+func (s *legacyImportStoreFake) CommitWorkspaceLegacyVolumeImport(ctx context.Context, value LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (workspace.Workspace, error) {
 	if err := ctx.Err(); err != nil {
 		return workspace.Workspace{}, err
 	}
@@ -95,8 +122,9 @@ func (s *legacyImportStoreFake) CommitWorkspaceLegacyVolumeImport(ctx context.Co
 	s.pending = false
 	s.commitCall++
 	s.files = append([]workspace.File{}, files...)
+	s.emptyDirectories = append([]string{}, emptyDirectories...)
 	revision := int64(1)
-	if len(files) == 0 {
+	if len(files)+len(emptyDirectories) == 0 {
 		revision = 0
 	}
 	return workspace.Workspace{ID: value.WorkspaceID, Revision: revision, UsedBytes: legacyFilesSize(files)}, nil
@@ -171,6 +199,19 @@ func (s *legacyImportBlocksFake) ListBlockDigests(_ string) ([]string, error) {
 	}
 	sort.Strings(digests)
 	return digests, nil
+}
+
+func (s *legacyImportBlocksFake) ListBlockNames(_ string) ([]string, error) {
+	return s.ListBlockDigests("")
+}
+
+func (s *legacyImportBlocksFake) DeleteBlock(_ string, digest string) (int64, error) {
+	body, ok := s.data[digest]
+	if !ok {
+		return 0, nil
+	}
+	delete(s.data, digest)
+	return int64(len(body)), nil
 }
 
 func (s *legacyImportBlocksFake) RemoveStaleTempBlocks(string) error {
@@ -287,6 +328,18 @@ func TestWorkspaceLegacyImportRejectsConcurrentRunAndReleasesLockOnFailure(t *te
 	}
 }
 
+func TestWorkspaceLegacyImportChecksActivityBeforeTempCleanup(t *testing.T) {
+	service, store, blocks, source := newLegacyImportHarness(fstest.MapFS{}, 1<<20)
+	store.importReadyErr = domain.NewError(domain.CodeWorkspaceBusy, "workspace has active task work")
+
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("import with active work error = %v; want workspace busy", err)
+	}
+	if store.importReadyCalls != 1 || blocks.removeTempCalls != 0 || source.openName != "" || store.lockReleaseCalls != 1 {
+		t.Fatalf("preflight calls=%d cleanup=%d source=%q lock releases=%d; want check before any cleanup", store.importReadyCalls, blocks.removeTempCalls, source.openName, store.lockReleaseCalls)
+	}
+}
+
 func TestWorkspaceLegacyImportAllowsEmptyVolume(t *testing.T) {
 	service, store, _, source := newLegacyImportHarness(fstest.MapFS{}, 100)
 	result, err := service.Import(context.Background(), legacyImportWorkspaceID)
@@ -298,11 +351,28 @@ func TestWorkspaceLegacyImportAllowsEmptyVolume(t *testing.T) {
 	}
 }
 
+func TestWorkspaceLegacyImportPreservesEmptyDirectories(t *testing.T) {
+	service, store, _, _ := newLegacyImportHarness(fstest.MapFS{
+		"empty-dir":    {Mode: fs.ModeDir | 0755, ModTime: legacyImportTime},
+		"nested":       {Mode: fs.ModeDir | 0755, ModTime: legacyImportTime},
+		"nested/empty": {Mode: fs.ModeDir | 0755, ModTime: legacyImportTime},
+		"nested/file":  legacyMapFile([]byte("content"), 0644),
+	}, 100)
+	result, err := service.Import(context.Background(), legacyImportWorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Revision != 1 || len(store.emptyDirectories) != 2 || store.emptyDirectories[0] != "empty-dir" || store.emptyDirectories[1] != "nested/empty" {
+		t.Fatalf("legacy empty directories = %#v, result %+v", store.emptyDirectories, result)
+	}
+}
+
 func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing.T) {
 	tests := []struct {
 		name  string
 		fs    fs.FS
 		quota int64
+		want  string
 	}{
 		{
 			name:  "invalid path",
@@ -326,14 +396,6 @@ func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing
 			quota: 10,
 		},
 		{
-			name: "empty directory",
-			fs: fstest.MapFS{
-				"ok.txt":    legacyMapFile([]byte("ok"), 0644),
-				"empty-dir": {Mode: fs.ModeDir | 0755, ModTime: legacyImportTime},
-			},
-			quota: 10,
-		},
-		{
 			name: "case collision",
 			fs: fstest.MapFS{
 				"A.txt": legacyMapFile([]byte("one"), 0644),
@@ -345,16 +407,26 @@ func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing
 			name:  "quota exceeded",
 			fs:    fstest.MapFS{"large": legacyMapFile([]byte("12345"), 0644)},
 			quota: 4,
+			want:  "large",
+		},
+		{
+			name:  "single file above sync limit",
+			fs:    legacyOversizedFS{},
+			quota: workspace.MaxSyncFileBytes + 1,
+			want:  "cleanup is required",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			service, store, blocks, source := newLegacyImportHarness(test.fs, test.quota)
-			if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil {
-				t.Fatal("unsafe volume import succeeded")
+			if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || (test.want != "" && !strings.Contains(err.Error(), test.want)) {
+				t.Fatalf("unsafe volume import error = %v", err)
 			}
 			if store.commitCall != 0 || blocks.putCalls != 0 || !source.closer.closed {
 				t.Fatalf("commits=%d puts=%d closed=%v", store.commitCall, blocks.putCalls, source.closer.closed)
+			}
+			if test.want != "" && !strings.Contains(store.cleanupReason, test.want) {
+				t.Fatalf("cleanup-required record = %q", store.cleanupReason)
 			}
 		})
 	}
@@ -393,7 +465,70 @@ func TestWorkspaceLegacyImportChecksExistingBlocksAndSourceStability(t *testing.
 	})
 }
 
+func TestWorkspaceLegacyImportRetryAfterSourceChangesRecoversPartialBlock(t *testing.T) {
+	oldBody := []byte("old source bytes")
+	newBody := []byte("updated source bytes")
+	oldDigest := sha256.Sum256(oldBody)
+	oldDigestText := hex.EncodeToString(oldDigest[:])
+	service, _, blocks, source := newLegacyImportHarness(fstest.MapFS{
+		"a.txt": legacyMapFile(oldBody, 0644),
+		"b.txt": legacyMapFile([]byte("second file"), 0644),
+	}, 1<<20)
+	blocks.onPut = func() {
+		if blocks.putCalls == 2 {
+			blocks.putErr = errors.New("injected failure after first final block")
+		}
+	}
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "injected failure") {
+		t.Fatalf("first import error = %v, want injected failure", err)
+	}
+	if _, ok := blocks.data[oldDigestText]; !ok {
+		t.Fatal("first failed import did not leave its expected partial final block")
+	}
+
+	// The source changes after the failed run. Without targeted cleanup the old
+	// digest is rejected as unrelated during preflight and the pending import
+	// cannot make progress.
+	source.fs = fstest.MapFS{"a.txt": legacyMapFile(newBody, 0644)}
+	blocks.putErr = nil
+	gcStore := &blockGCTestStore{}
+	gc, err := NewWorkspaceBlockGarbageCollector(gcStore, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := gc.CollectPendingLegacyImport(context.Background(), legacyImportWorkspaceID)
+	if err != nil {
+		t.Fatalf("recover partial import blocks: %v", err)
+	}
+	if stats.BlocksDeleted != 1 || stats.BytesReclaimed != int64(len(oldBody)) {
+		t.Fatalf("partial import recovery stats = %#v", stats)
+	}
+	if _, ok := blocks.data[oldDigestText]; ok {
+		t.Fatal("recovery retained the block from the changed source")
+	}
+
+	result, err := service.Import(context.Background(), legacyImportWorkspaceID)
+	if err != nil {
+		t.Fatalf("retry import after source changed: %v", err)
+	}
+	newDigest := sha256.Sum256(newBody)
+	if result.Revision != 1 || len(blocks.data) != 1 || !bytes.Equal(blocks.data[hex.EncodeToString(newDigest[:])], newBody) {
+		t.Fatalf("retry result=%+v stored blocks=%v", result, blocks.data)
+	}
+}
+
 func TestWorkspaceLegacyImportPropagatesBlockAndContextErrors(t *testing.T) {
+	t.Run("nil context", func(t *testing.T) {
+		service, store, blocks, _ := newLegacyImportHarness(fstest.MapFS{}, 100)
+		var nilContext context.Context
+		if _, err := service.Import(nilContext, legacyImportWorkspaceID); err == nil {
+			t.Fatal("import accepted a nil context")
+		}
+		if store.commitCall != 0 || blocks.putCalls != 0 {
+			t.Fatalf("commits=%d puts=%d", store.commitCall, blocks.putCalls)
+		}
+	})
+
 	t.Run("block digest mismatch", func(t *testing.T) {
 		service, store, blocks, _ := newLegacyImportHarness(fstest.MapFS{"file": legacyMapFile([]byte("body"), 0644)}, 100)
 		blocks.putErr = errors.New("digest mismatch")
@@ -474,9 +609,33 @@ func TestWorkspaceLegacyImportLimitsTotalPathEntries(t *testing.T) {
 	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "path entry limit") {
 		t.Fatalf("import error = %v", err)
 	}
+	if !strings.Contains(store.cleanupReason, "path entry limit") {
+		t.Fatalf("path-entry cleanup record = %q", store.cleanupReason)
+	}
 	if store.commitCall != 0 || blocks.putCalls != 0 {
 		t.Fatalf("commits=%d puts=%d", store.commitCall, blocks.putCalls)
 	}
+}
+
+func TestWorkspaceLegacyImportPersistsFileCountAndManifestCleanupReasons(t *testing.T) {
+	t.Run("file count", func(t *testing.T) {
+		service, store, blocks, _ := newLegacyImportHarness(legacyLimitFilesFS{count: workspace.MaxSyncFiles + 1}, 1<<30)
+		if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "file count limit") {
+			t.Fatalf("import error = %v", err)
+		}
+		if !strings.Contains(store.cleanupReason, "file count limit") || store.commitCall != 0 || blocks.putCalls != 0 {
+			t.Fatalf("cleanup=%q commits=%d puts=%d", store.cleanupReason, store.commitCall, blocks.putCalls)
+		}
+	})
+	t.Run("manifest size", func(t *testing.T) {
+		service, store, blocks, _ := newLegacyImportHarness(legacyLimitFilesFS{count: 6000, namePadding: 3000}, 1<<30)
+		if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "manifest exceeds 16 MiB") {
+			t.Fatalf("import error = %v", err)
+		}
+		if !strings.Contains(store.cleanupReason, "manifest exceeds 16 MiB") || store.commitCall != 0 || blocks.putCalls != 0 {
+			t.Fatalf("cleanup=%q commits=%d puts=%d", store.cleanupReason, store.commitCall, blocks.putCalls)
+		}
+	})
 }
 
 type legacyChangingFS struct {
@@ -554,6 +713,33 @@ var _ fs.FS = legacyInvalidPathFS{}
 var _ fs.StatFS = legacyInvalidPathFS{}
 var _ fs.ReadDirFS = legacyInvalidPathFS{}
 
+type legacyOversizedFS struct{}
+
+func (legacyOversizedFS) Open(name string) (fs.File, error) {
+	if name != "." {
+		return nil, fs.ErrNotExist
+	}
+	return legacyStaticFile{info: legacyStaticInfo{name: ".", mode: fs.ModeDir | 0755}}, nil
+}
+
+func (legacyOversizedFS) Stat(name string) (fs.FileInfo, error) {
+	if name != "." {
+		return nil, fs.ErrNotExist
+	}
+	return legacyStaticInfo{name: ".", mode: fs.ModeDir | 0755}, nil
+}
+
+func (legacyOversizedFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name != "." {
+		return nil, fs.ErrNotExist
+	}
+	return []fs.DirEntry{legacyStaticEntry{info: legacyStaticInfo{name: "oversized.bin", size: workspace.MaxSyncFileBytes + 1, mode: 0644}}}, nil
+}
+
+var _ fs.FS = legacyOversizedFS{}
+var _ fs.StatFS = legacyOversizedFS{}
+var _ fs.ReadDirFS = legacyOversizedFS{}
+
 type legacyLargeDirFS struct {
 	count int
 }
@@ -586,6 +772,59 @@ func (f legacyLargeDirFS) ReadDir(name string) ([]fs.DirEntry, error) {
 var _ fs.FS = legacyLargeDirFS{}
 var _ fs.StatFS = legacyLargeDirFS{}
 var _ fs.ReadDirFS = legacyLargeDirFS{}
+
+type legacyLimitFilesFS struct {
+	count       int
+	namePadding int
+}
+
+func (f legacyLimitFilesFS) Open(name string) (fs.File, error) {
+	if name == "." {
+		return legacyStaticFile{info: legacyStaticInfo{name: ".", mode: fs.ModeDir | 0755}}, nil
+	}
+	if _, ok := f.fileIndex(name); !ok {
+		return nil, fs.ErrNotExist
+	}
+	return legacyStaticFile{info: legacyStaticInfo{name: path.Base(name), mode: 0644}}, nil
+}
+
+func (f legacyLimitFilesFS) Stat(name string) (fs.FileInfo, error) {
+	if name == "." {
+		return legacyStaticInfo{name: ".", mode: fs.ModeDir | 0755}, nil
+	}
+	if _, ok := f.fileIndex(name); !ok {
+		return nil, fs.ErrNotExist
+	}
+	return legacyStaticInfo{name: path.Base(name), mode: 0644}, nil
+}
+
+func (f legacyLimitFilesFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name != "." {
+		return nil, fs.ErrNotExist
+	}
+	entries := make([]fs.DirEntry, f.count)
+	for i := range entries {
+		fileName := f.fileName(i)
+		entries[i] = legacyStaticEntry{info: legacyStaticInfo{name: fileName, mode: 0644}}
+	}
+	return entries, nil
+}
+
+func (f legacyLimitFilesFS) fileName(index int) string {
+	return fmt.Sprintf("f%05d%s", index, strings.Repeat("x", f.namePadding))
+}
+
+func (f legacyLimitFilesFS) fileIndex(name string) (int, bool) {
+	if len(name) != 6+f.namePadding || name[0] != 'f' || strings.Trim(name[6:], "x") != "" {
+		return 0, false
+	}
+	index, err := strconv.Atoi(name[1:6])
+	return index, err == nil && index >= 0 && index < f.count && f.fileName(index) == name
+}
+
+var _ fs.FS = legacyLimitFilesFS{}
+var _ fs.StatFS = legacyLimitFilesFS{}
+var _ fs.ReadDirFS = legacyLimitFilesFS{}
 
 func TestLegacyManifestSizeMatchesJSONEncoding(t *testing.T) {
 	file := workspace.File{

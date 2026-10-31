@@ -1435,6 +1435,9 @@ func requireTaskWorkspaceInputAdmission(ctx context.Context, tx pgx.Tx, row sqlc
 	if err != nil {
 		return fmt.Errorf("lock Workspace for task operation admission: %w", err)
 	}
+	if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, operation.WorkspaceID); err != nil {
+		return err
+	}
 	// A verified Task publish advances its private view before the Host replica catches up.
 	var bindingOwner, bindingState, syncState string
 	var bindingVersion int64

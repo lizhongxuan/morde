@@ -62,7 +62,7 @@ func (s *credentialUsers) CreateUser(_ context.Context, user identity.User) (ide
 	return user, nil
 }
 
-func (s *credentialUsers) UpdateUserWithAudit(_ context.Context, _ string, expected identity.AccountStatus, user identity.User, _ audit.Entry) (identity.User, error) {
+func (s *credentialUsers) UpdateUserWithAudit(_ context.Context, _ string, expected identity.AccountStatus, user identity.User, _ audit.Entry, _ func(context.Context) error) (identity.User, error) {
 	current, ok := s.values[user.ID]
 	if !ok {
 		return identity.User{}, domain.NewError(domain.CodeNotFound, "user not found")

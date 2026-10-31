@@ -63,7 +63,7 @@ const cancelWorkspaceSyncSession = `-- name: CancelWorkspaceSyncSession :one
 UPDATE workspace_sync_sessions
 SET state='cancelled', stage='complete', updated_at=now()
 WHERE workspace_id=$1 AND id=$2 AND state IN ('planned','transferring','verifying','applying')
-RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths
+RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories
 `
 
 type CancelWorkspaceSyncSessionParams struct {
@@ -99,8 +99,33 @@ func (q *Queries) CancelWorkspaceSyncSession(ctx context.Context, arg CancelWork
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DownloadDeletedPaths,
+		&i.EmptyDirectories,
+		&i.UploadEmptyDirectories,
+		&i.DownloadEmptyDirectories,
+		&i.DeletedDirectories,
+		&i.UploadDeletedDirectories,
+		&i.DownloadDeletedDirectories,
 	)
 	return i, err
+}
+
+const closeWorkspaceRevisionEmptyDirectory = `-- name: CloseWorkspaceRevisionEmptyDirectory :execrows
+UPDATE workspace_revision_empty_directories SET valid_to_revision=$3
+WHERE workspace_id=$1 AND directory_path=$2 AND valid_to_revision IS NULL AND valid_from_revision < $3
+`
+
+type CloseWorkspaceRevisionEmptyDirectoryParams struct {
+	WorkspaceID     string      `json:"workspace_id"`
+	DirectoryPath   string      `json:"directory_path"`
+	ValidToRevision pgtype.Int8 `json:"valid_to_revision"`
+}
+
+func (q *Queries) CloseWorkspaceRevisionEmptyDirectory(ctx context.Context, arg CloseWorkspaceRevisionEmptyDirectoryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, closeWorkspaceRevisionEmptyDirectory, arg.WorkspaceID, arg.DirectoryPath, arg.ValidToRevision)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const closeWorkspaceRevisionFile = `-- name: CloseWorkspaceRevisionFile :execrows
@@ -149,37 +174,44 @@ INSERT INTO workspace_sync_sessions (
   id, workspace_id, owner_id, replica_id, direction, policy, state, stage,
   base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes,
   files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths,
-  download_deleted_paths, ack_cursor, conflicts
+  download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories,
+  deleted_directories, upload_deleted_directories, download_deleted_directories, ack_cursor, conflicts
 )
 VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28
 )
-RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths
+RETURNING id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories
 `
 
 type CreateWorkspaceSyncSessionParams struct {
-	ID                   string      `json:"id"`
-	WorkspaceID          string      `json:"workspace_id"`
-	OwnerID              string      `json:"owner_id"`
-	ReplicaID            string      `json:"replica_id"`
-	Direction            string      `json:"direction"`
-	Policy               string      `json:"policy"`
-	State                string      `json:"state"`
-	Stage                string      `json:"stage"`
-	BaseRevision         int64       `json:"base_revision"`
-	TargetRevision       int64       `json:"target_revision"`
-	PinnedRevision       int64       `json:"pinned_revision"`
-	PlannedBytes         int64       `json:"planned_bytes"`
-	ConfirmedBytes       int64       `json:"confirmed_bytes"`
-	Files                []byte      `json:"files"`
-	UploadFiles          []byte      `json:"upload_files"`
-	DownloadFiles        []byte      `json:"download_files"`
-	Scope                []string    `json:"scope"`
-	DeletedPaths         []string    `json:"deleted_paths"`
-	UploadDeletedPaths   []string    `json:"upload_deleted_paths"`
-	DownloadDeletedPaths []string    `json:"download_deleted_paths"`
-	AckCursor            pgtype.Text `json:"ack_cursor"`
-	Conflicts            []byte      `json:"conflicts"`
+	ID                         string      `json:"id"`
+	WorkspaceID                string      `json:"workspace_id"`
+	OwnerID                    string      `json:"owner_id"`
+	ReplicaID                  string      `json:"replica_id"`
+	Direction                  string      `json:"direction"`
+	Policy                     string      `json:"policy"`
+	State                      string      `json:"state"`
+	Stage                      string      `json:"stage"`
+	BaseRevision               int64       `json:"base_revision"`
+	TargetRevision             int64       `json:"target_revision"`
+	PinnedRevision             int64       `json:"pinned_revision"`
+	PlannedBytes               int64       `json:"planned_bytes"`
+	ConfirmedBytes             int64       `json:"confirmed_bytes"`
+	Files                      []byte      `json:"files"`
+	UploadFiles                []byte      `json:"upload_files"`
+	DownloadFiles              []byte      `json:"download_files"`
+	Scope                      []string    `json:"scope"`
+	DeletedPaths               []string    `json:"deleted_paths"`
+	UploadDeletedPaths         []string    `json:"upload_deleted_paths"`
+	DownloadDeletedPaths       []string    `json:"download_deleted_paths"`
+	EmptyDirectories           []string    `json:"empty_directories"`
+	UploadEmptyDirectories     []string    `json:"upload_empty_directories"`
+	DownloadEmptyDirectories   []string    `json:"download_empty_directories"`
+	DeletedDirectories         []string    `json:"deleted_directories"`
+	UploadDeletedDirectories   []string    `json:"upload_deleted_directories"`
+	DownloadDeletedDirectories []string    `json:"download_deleted_directories"`
+	AckCursor                  pgtype.Text `json:"ack_cursor"`
+	Conflicts                  []byte      `json:"conflicts"`
 }
 
 func (q *Queries) CreateWorkspaceSyncSession(ctx context.Context, arg CreateWorkspaceSyncSessionParams) (WorkspaceSyncSession, error) {
@@ -204,6 +236,12 @@ func (q *Queries) CreateWorkspaceSyncSession(ctx context.Context, arg CreateWork
 		arg.DeletedPaths,
 		arg.UploadDeletedPaths,
 		arg.DownloadDeletedPaths,
+		arg.EmptyDirectories,
+		arg.UploadEmptyDirectories,
+		arg.DownloadEmptyDirectories,
+		arg.DeletedDirectories,
+		arg.UploadDeletedDirectories,
+		arg.DownloadDeletedDirectories,
 		arg.AckCursor,
 		arg.Conflicts,
 	)
@@ -233,8 +271,38 @@ func (q *Queries) CreateWorkspaceSyncSession(ctx context.Context, arg CreateWork
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DownloadDeletedPaths,
+		&i.EmptyDirectories,
+		&i.UploadEmptyDirectories,
+		&i.DownloadEmptyDirectories,
+		&i.DeletedDirectories,
+		&i.UploadDeletedDirectories,
+		&i.DownloadDeletedDirectories,
 	)
 	return i, err
+}
+
+const createWorkspaceTreeRevision = `-- name: CreateWorkspaceTreeRevision :exec
+INSERT INTO workspace_revisions (workspace_id, revision, file_count, total_bytes, directory_count)
+VALUES ($1, $2, $3, $4, $5)
+`
+
+type CreateWorkspaceTreeRevisionParams struct {
+	WorkspaceID    string `json:"workspace_id"`
+	Revision       int64  `json:"revision"`
+	FileCount      int64  `json:"file_count"`
+	TotalBytes     int64  `json:"total_bytes"`
+	DirectoryCount int64  `json:"directory_count"`
+}
+
+func (q *Queries) CreateWorkspaceTreeRevision(ctx context.Context, arg CreateWorkspaceTreeRevisionParams) error {
+	_, err := q.db.Exec(ctx, createWorkspaceTreeRevision,
+		arg.WorkspaceID,
+		arg.Revision,
+		arg.FileCount,
+		arg.TotalBytes,
+		arg.DirectoryCount,
+	)
+	return err
 }
 
 const expireIdleWorkspaceSyncSessions = `-- name: ExpireIdleWorkspaceSyncSessions :execrows
@@ -265,9 +333,17 @@ WHERE wr.workspace_id=$1
 ORDER BY wr.revision DESC LIMIT 1
 `
 
-func (q *Queries) GetLatestWorkspaceRevision(ctx context.Context, workspaceID string) (WorkspaceRevision, error) {
+type GetLatestWorkspaceRevisionRow struct {
+	WorkspaceID string             `json:"workspace_id"`
+	Revision    int64              `json:"revision"`
+	FileCount   int64              `json:"file_count"`
+	TotalBytes  int64              `json:"total_bytes"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) GetLatestWorkspaceRevision(ctx context.Context, workspaceID string) (GetLatestWorkspaceRevisionRow, error) {
 	row := q.db.QueryRow(ctx, getLatestWorkspaceRevision, workspaceID)
-	var i WorkspaceRevision
+	var i GetLatestWorkspaceRevisionRow
 	err := row.Scan(
 		&i.WorkspaceID,
 		&i.Revision,
@@ -288,9 +364,17 @@ type GetWorkspaceRevisionParams struct {
 	Revision    int64  `json:"revision"`
 }
 
-func (q *Queries) GetWorkspaceRevision(ctx context.Context, arg GetWorkspaceRevisionParams) (WorkspaceRevision, error) {
+type GetWorkspaceRevisionRow struct {
+	WorkspaceID string             `json:"workspace_id"`
+	Revision    int64              `json:"revision"`
+	FileCount   int64              `json:"file_count"`
+	TotalBytes  int64              `json:"total_bytes"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) GetWorkspaceRevision(ctx context.Context, arg GetWorkspaceRevisionParams) (GetWorkspaceRevisionRow, error) {
 	row := q.db.QueryRow(ctx, getWorkspaceRevision, arg.WorkspaceID, arg.Revision)
-	var i WorkspaceRevision
+	var i GetWorkspaceRevisionRow
 	err := row.Scan(
 		&i.WorkspaceID,
 		&i.Revision,
@@ -360,7 +444,7 @@ func (q *Queries) GetWorkspaceSyncCursor(ctx context.Context, arg GetWorkspaceSy
 }
 
 const getWorkspaceSyncSession = `-- name: GetWorkspaceSyncSession :one
-SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2
+SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2
 `
 
 type GetWorkspaceSyncSessionParams struct {
@@ -396,6 +480,12 @@ func (q *Queries) GetWorkspaceSyncSession(ctx context.Context, arg GetWorkspaceS
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DownloadDeletedPaths,
+		&i.EmptyDirectories,
+		&i.UploadEmptyDirectories,
+		&i.DownloadEmptyDirectories,
+		&i.DeletedDirectories,
+		&i.UploadDeletedDirectories,
+		&i.DownloadDeletedDirectories,
 	)
 	return i, err
 }
@@ -457,6 +547,28 @@ func (q *Queries) InsertWorkspaceChange(ctx context.Context, arg InsertWorkspace
 		arg.FilePath,
 		arg.Action,
 		arg.File,
+	)
+	return err
+}
+
+const insertWorkspaceRevisionEmptyDirectory = `-- name: InsertWorkspaceRevisionEmptyDirectory :exec
+INSERT INTO workspace_revision_empty_directories (workspace_id, valid_from_revision, directory_path, folded_path)
+VALUES ($1, $2, $3, $4)
+`
+
+type InsertWorkspaceRevisionEmptyDirectoryParams struct {
+	WorkspaceID       string `json:"workspace_id"`
+	ValidFromRevision int64  `json:"valid_from_revision"`
+	DirectoryPath     string `json:"directory_path"`
+	FoldedPath        string `json:"folded_path"`
+}
+
+func (q *Queries) InsertWorkspaceRevisionEmptyDirectory(ctx context.Context, arg InsertWorkspaceRevisionEmptyDirectoryParams) error {
+	_, err := q.db.Exec(ctx, insertWorkspaceRevisionEmptyDirectory,
+		arg.WorkspaceID,
+		arg.ValidFromRevision,
+		arg.DirectoryPath,
+		arg.FoldedPath,
 	)
 	return err
 }
@@ -808,6 +920,82 @@ func (q *Queries) ListWorkspaceIDsForBlockGC(ctx context.Context) ([]string, err
 	return items, nil
 }
 
+const listWorkspaceRevisionEmptyDirectories = `-- name: ListWorkspaceRevisionEmptyDirectories :many
+SELECT directory_path
+FROM workspace_revision_empty_directories
+WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
+ORDER BY directory_path
+`
+
+type ListWorkspaceRevisionEmptyDirectoriesParams struct {
+	WorkspaceID       string `json:"workspace_id"`
+	ValidFromRevision int64  `json:"valid_from_revision"`
+}
+
+func (q *Queries) ListWorkspaceRevisionEmptyDirectories(ctx context.Context, arg ListWorkspaceRevisionEmptyDirectoriesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceRevisionEmptyDirectories, arg.WorkspaceID, arg.ValidFromRevision)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var directory_path string
+		if err := rows.Scan(&directory_path); err != nil {
+			return nil, err
+		}
+		items = append(items, directory_path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkspaceRevisionEmptyDirectoriesPage = `-- name: ListWorkspaceRevisionEmptyDirectoriesPage :many
+SELECT directory_path
+FROM workspace_revision_empty_directories
+WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
+  AND ($3::text = '' OR directory_path=$3 OR starts_with(directory_path, $3 || '/'))
+  AND directory_path > $4
+ORDER BY directory_path
+LIMIT $5
+`
+
+type ListWorkspaceRevisionEmptyDirectoriesPageParams struct {
+	WorkspaceID       string `json:"workspace_id"`
+	ValidFromRevision int64  `json:"valid_from_revision"`
+	Column3           string `json:"column_3"`
+	DirectoryPath     string `json:"directory_path"`
+	Limit             int32  `json:"limit"`
+}
+
+func (q *Queries) ListWorkspaceRevisionEmptyDirectoriesPage(ctx context.Context, arg ListWorkspaceRevisionEmptyDirectoriesPageParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceRevisionEmptyDirectoriesPage,
+		arg.WorkspaceID,
+		arg.ValidFromRevision,
+		arg.Column3,
+		arg.DirectoryPath,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var directory_path string
+		if err := rows.Scan(&directory_path); err != nil {
+			return nil, err
+		}
+		items = append(items, directory_path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkspaceRevisionFiles = `-- name: ListWorkspaceRevisionFiles :many
 SELECT file_path, size_bytes, sha256, mode, chunks
 FROM workspace_revision_files
@@ -1003,7 +1191,7 @@ func (q *Queries) ListWorkspaceSyncTransferBlocks(ctx context.Context, arg ListW
 }
 
 const lockWorkspaceSyncSession = `-- name: LockWorkspaceSyncSession :one
-SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE
+SELECT id, workspace_id, owner_id, replica_id, direction, policy, state, stage, base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes, files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths, ack_cursor, conflicts, created_at, updated_at, download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories, deleted_directories, upload_deleted_directories, download_deleted_directories FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE
 `
 
 type LockWorkspaceSyncSessionParams struct {
@@ -1039,6 +1227,12 @@ func (q *Queries) LockWorkspaceSyncSession(ctx context.Context, arg LockWorkspac
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DownloadDeletedPaths,
+		&i.EmptyDirectories,
+		&i.UploadEmptyDirectories,
+		&i.DownloadEmptyDirectories,
+		&i.DeletedDirectories,
+		&i.UploadDeletedDirectories,
+		&i.DownloadDeletedDirectories,
 	)
 	return i, err
 }

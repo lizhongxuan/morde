@@ -69,6 +69,88 @@ func TestWorkspaceSyncPersistsPlanAndCommitsImmutableRevision(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncPersistsAndDeletesEmptyDirectoriesAcrossRevisions(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-empty-dirs")
+	directory := "notes/empty"
+	create := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	create.EmptyDirectories = []string{directory}
+	create.UploadEmptyDirectories = []string{directory}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, create, nil, syncTestIdempotency(owner.ID, "workspace.sync.create", "empty-dir:create", create.ID)); err != nil {
+		t.Fatal(err)
+	}
+	created, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, create.ID, syncTestIdempotency(owner.ID, "workspace.sync.commit", "empty-dir:commit", create.ID))
+	if err != nil || created.State != workspace.SyncCompleted || created.TargetRevision != 1 {
+		t.Fatalf("commit empty-directory creation = %#v, err=%v", created, err)
+	}
+	page, err := store.GetWorkspaceManifestPage(ctx, value.ID, 1, "", "", 10)
+	if err != nil || len(page.Files) != 0 || len(page.EmptyDirectories) != 1 || page.EmptyDirectories[0] != directory {
+		t.Fatalf("revision 1 empty-directory manifest = %#v, err=%v", page, err)
+	}
+	var fileCount, directoryCount, usedBytes int64
+	if err := store.pool.QueryRow(ctx, `SELECT file_count, directory_count, total_bytes FROM workspace_revisions WHERE workspace_id=$1 AND revision=1`, value.ID).
+		Scan(&fileCount, &directoryCount, &usedBytes); err != nil || fileCount != 0 || directoryCount != 1 || usedBytes != 0 {
+		t.Fatalf("empty-directory revision accounting = files:%d dirs:%d bytes:%d err:%v", fileCount, directoryCount, usedBytes, err)
+	}
+	download := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	download.Direction = workspace.SyncDownload
+	download.Policy = workspace.SyncCompareMerge
+	download.BaseRevision = 0
+	download.PinnedRevision = 1
+	download.TargetRevision = 1
+	download.DownloadEmptyDirectories = []string{directory}
+	download.DownloadActions = workspace.DownloadActionsForTreePlan(nil, nil, []string{directory}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, download, nil, syncTestIdempotency(owner.ID, "workspace.sync.create", "empty-dir:download", download.ID)); err != nil {
+		t.Fatal(err)
+	}
+	storedDownload, err := store.GetWorkspaceSyncSession(ctx, value.ID, download.ID)
+	if err != nil || len(storedDownload.DownloadActions) != 1 || storedDownload.DownloadActions[0].Action != workspace.ChangeDirectoryUpsert {
+		t.Fatalf("persisted empty-directory download action = %#v, err=%v", storedDownload.DownloadActions, err)
+	}
+	if err := store.AckWorkspaceSyncDownloadAction(ctx, value.ID, download.ID, directory, workspace.ChangeDirectoryUpsert, "", 0); err != nil {
+		t.Fatalf("ack empty-directory download action: %v", err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, download.ID, syncTestIdempotency(owner.ID, "workspace.sync.commit", "empty-dir:download-commit", download.ID)); err != nil {
+		t.Fatalf("commit empty-directory download plan: %v", err)
+	}
+	changes, err := store.GetWorkspaceChangePage(ctx, value.ID, 0, "", 10)
+	if err != nil || len(changes.Items) != 1 || changes.Items[0].Action != workspace.ChangeDirectoryUpsert || changes.Items[0].File != nil {
+		t.Fatalf("empty-directory creation changelog = %#v, err=%v", changes, err)
+	}
+
+	current, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remove := newTestSyncSession(t, current, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	remove.BaseRevision = current.Revision
+	remove.PinnedRevision = current.Revision
+	remove.TargetRevision = current.Revision
+	remove.DeletedDirectories = []string{directory}
+	remove.UploadDeletedDirectories = []string{directory}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, remove, nil, syncTestIdempotency(owner.ID, "workspace.sync.create", "empty-dir:delete", remove.ID)); err != nil {
+		t.Fatal(err)
+	}
+	deleted, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, remove.ID, syncTestIdempotency(owner.ID, "workspace.sync.commit", "empty-dir:delete-commit", remove.ID))
+	if err != nil || deleted.State != workspace.SyncCompleted || deleted.TargetRevision != 2 {
+		t.Fatalf("commit empty-directory deletion = %#v, err=%v", deleted, err)
+	}
+	historical, err := store.GetWorkspaceManifestPage(ctx, value.ID, 1, "", "", 10)
+	if err != nil || len(historical.EmptyDirectories) != 1 || historical.EmptyDirectories[0] != directory {
+		t.Fatalf("historical directory revision changed after delete: %#v, err=%v", historical, err)
+	}
+	latest, err := store.GetWorkspaceManifestPage(ctx, value.ID, 2, "", "", 10)
+	if err != nil || len(latest.EmptyDirectories) != 0 {
+		t.Fatalf("revision 2 retained a deleted directory: %#v, err=%v", latest, err)
+	}
+	changes, err = store.GetWorkspaceChangePage(ctx, value.ID, 1, "", 10)
+	if err != nil || len(changes.Items) != 1 || changes.Items[0].Action != workspace.ChangeDirectoryDelete || changes.Items[0].File != nil {
+		t.Fatalf("empty-directory deletion changelog = %#v, err=%v", changes, err)
+	}
+}
+
 func TestWorkspaceSyncQuotaCommitReceiptStaysRejectedAfterSpaceIsFreed(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -768,11 +850,14 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 	if err != nil {
 		t.Fatalf("begin workspace unbinding: %v", err)
 	}
+	if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration+1, 0); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("complete unbind with stale Host generation error = %v; want unauthenticated", err)
+	}
 	if _, err := store.TransitionWorkspaceBinding(ctx, created.ID, value.ID, unbinding.BindingVersion,
 		workspace.BindingUnbinding, workspace.BindingDetached, 0, 0); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("direct detach with unfinished Host session error = %v, want workspace busy", err)
 	}
-	if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, 0); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+	if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration, 0); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("complete unbind with unfinished Host session error = %v, want workspace busy", err)
 	}
 	stillUnbinding, err := store.GetWorkspaceBinding(ctx, created.ID, value.ID)
@@ -783,7 +868,7 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 		syncTestIdempotency(owner.ID, "workspace.sync.cancel", "host-detach:cancel", session.ID)); err != nil {
 		t.Fatalf("cancel unfinished Host sync session: %v", err)
 	}
-	detached, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, 0)
+	detached, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration, 0)
 	if err != nil || detached.State != workspace.BindingDetached || detached.AppliedRevision != 0 || detached.BindingVersion != unbinding.BindingVersion+1 {
 		t.Fatalf("complete workspace unbind after session cancellation = %#v, err=%v", detached, err)
 	}
@@ -808,6 +893,47 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 	unchanged, err := store.GetWorkspaceSyncSession(ctx, value.ID, session.ID)
 	if err != nil || unchanged.State != workspace.SyncCancelled {
 		t.Fatalf("Host session state after cancellation = %#v, err=%v", unchanged, err)
+	}
+}
+
+func TestWorkspaceBindingUnbindRequiresAppliedRevisionAndCurrentHostGeneration(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "host-unbind-applied-revision")
+	created := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	active, err := store.TransitionWorkspaceBinding(ctx, created.ID, value.ID, 1,
+		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
+	if err != nil {
+		t.Fatalf("activate Host workspace binding: %v", err)
+	}
+	unbinding, err := store.TransitionWorkspaceBinding(ctx, created.ID, value.ID, active.BindingVersion,
+		workspace.BindingActive, workspace.BindingUnbinding, 0, 0)
+	if err != nil {
+		t.Fatalf("begin workspace unbinding: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET revision=1 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET desired_revision=1, applied_revision=0 WHERE host_id=$1 AND workspace_id=$2`, created.ID, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration+1, 1); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("complete unbind with stale Host generation = %v; want unauthenticated", err)
+	}
+	if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration, 1); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("complete unbind before applied checkpoint = %v; want workspace conflict", err)
+	}
+	binding, err := store.GetWorkspaceBinding(ctx, created.ID, value.ID)
+	if err != nil || binding.State != workspace.BindingUnbinding || binding.AppliedRevision != 0 {
+		t.Fatalf("binding after unapplied checkpoint rejection = %#v, err=%v", binding, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET applied_revision=1 WHERE host_id=$1 AND workspace_id=$2`, created.ID, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	detached, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration, 1)
+	if err != nil || detached.State != workspace.BindingDetached || detached.AppliedRevision != 1 {
+		t.Fatalf("complete unbind after applied checkpoint = %#v, err=%v", detached, err)
 	}
 }
 
@@ -843,7 +969,7 @@ func TestWorkspaceBindingDetachSerializesHostSyncSessionCreate(t *testing.T) {
 	}()
 	go func() {
 		<-start
-		_, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, 0)
+		_, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration, 0)
 		detachDone <- err
 	}()
 	close(start)
@@ -858,7 +984,7 @@ func TestWorkspaceBindingDetachSerializesHostSyncSessionCreate(t *testing.T) {
 			syncTestIdempotency(owner.ID, "workspace.sync.cancel", "host-detach-race:cancel", session.ID)); err != nil {
 			t.Fatalf("cancel Host sync session after serialized create: %v", err)
 		}
-		if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, 0); err != nil {
+		if _, err := store.CompleteWorkspaceBindingUnbind(ctx, created.ID, value.ID, unbinding.BindingVersion, created.RuntimeGeneration, 0); err != nil {
 			t.Fatalf("complete unbind after serialized session cancellation: %v", err)
 		}
 	case domain.CodeOf(createErr) == domain.CodeInvalidState:

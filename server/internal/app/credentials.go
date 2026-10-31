@@ -55,14 +55,15 @@ type LoginResult struct {
 }
 
 type CredentialService struct {
-	users        UserStore
-	hosts        HostStore
-	tokens       TokenStore
-	audit        AuditWriter
-	options      CredentialOptions
-	dummyHash    []byte
-	limiter      loginLimiter
-	defaultHosts DefaultHostEnsurer
+	users                   UserStore
+	hosts                   HostStore
+	tokens                  TokenStore
+	audit                   AuditWriter
+	options                 CredentialOptions
+	dummyHash               []byte
+	limiter                 loginLimiter
+	defaultHosts            DefaultHostEnsurer
+	workspaceSyncController WorkspaceSyncNodeOwnerReconciler
 }
 
 type DefaultHostEnsurer interface {
@@ -79,8 +80,8 @@ type loginLimiter struct {
 	attempts map[string]loginAttempt
 }
 
-func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, writer AuditWriter, options CredentialOptions, defaultHosts DefaultHostEnsurer) (*CredentialService, error) {
-	if users == nil || hosts == nil || tokens == nil || writer == nil || defaultHosts == nil {
+func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, writer AuditWriter, options CredentialOptions, defaultHosts DefaultHostEnsurer, controllers ...WorkspaceSyncNodeOwnerReconciler) (*CredentialService, error) {
+	if users == nil || hosts == nil || tokens == nil || writer == nil || defaultHosts == nil || len(controllers) > 1 {
 		return nil, fmt.Errorf("credential service dependencies are required")
 	}
 	if options.SessionTTL <= 0 || options.TicketTTL <= 0 || options.LoginLimit <= 0 || options.LoginWindow <= 0 {
@@ -90,11 +91,15 @@ func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, w
 	if err != nil {
 		return nil, fmt.Errorf("prepare password verifier: %w", err)
 	}
+	var workspaceSyncController WorkspaceSyncNodeOwnerReconciler
+	if len(controllers) == 1 {
+		workspaceSyncController = controllers[0]
+	}
 	return &CredentialService{
 		users: users, hosts: hosts, tokens: tokens, audit: writer,
 		options: options, dummyHash: dummyHash,
-		defaultHosts: defaultHosts,
-		limiter:      loginLimiter{attempts: make(map[string]loginAttempt)},
+		defaultHosts: defaultHosts, workspaceSyncController: workspaceSyncController,
+		limiter: loginLimiter{attempts: make(map[string]loginAttempt)},
 	}, nil
 }
 
@@ -198,12 +203,23 @@ func (s *CredentialService) ChangePassword(ctx context.Context, principal identi
 	}
 	user.PasswordHash = string(hash)
 	user.MustChangePassword = false
+	var disableRelay func(context.Context) error
+	if s.workspaceSyncController != nil {
+		disableRelay = func(gateCtx context.Context) error {
+			return s.workspaceSyncController.DisableWorkspaceSyncNodeRelay(gateCtx, user.ID)
+		}
+	}
 	_, err = s.users.UpdateUserWithAudit(ctx, user.ID, user.Status, user, audit.Entry{
 		ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionUserUpdate,
 		Target: user.ID, Detail: map[string]any{"password_changed": true},
-	})
+	}, disableRelay)
 	if err != nil {
 		return err
+	}
+	if s.workspaceSyncController != nil {
+		if err := s.workspaceSyncController.ReconcileWorkspaceSyncNodeOwner(ctx, user.ID); err != nil {
+			return domain.NewError(domain.CodeUpstreamError, "workspace sync node could not confirm account credential revocation")
+		}
 	}
 	return nil
 }

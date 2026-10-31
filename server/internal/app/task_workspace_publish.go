@@ -52,14 +52,14 @@ func (s *WorkspaceSyncService) FindTaskWorkspacePublishReceipt(ctx context.Conte
 	return s.store.FindTaskWorkspacePublishReceipt(ctx, ownerID, taskID, workspaceID, operationKey)
 }
 
-func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
+func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
 	if err := ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return TaskWorkspacePublishReceipt{}, err
 	}
-	if readBlock == nil || !validSyncDigest(manifestSHA) || len(files) > workspace.MaxSyncFiles {
+	if readBlock == nil || !validSyncDigest(manifestSHA) || len(files)+len(emptyDirectories) > workspace.MaxSyncFiles {
 		return TaskWorkspacePublishReceipt{}, domain.InvalidArgument("task_workspace_publish", "Task Workspace output manifest is invalid")
 	}
-	actualManifestSHA, err := workspace.ManifestSHA256(files)
+	actualManifestSHA, err := workspace.ManifestTreeSHA256(files, emptyDirectories)
 	if err != nil || actualManifestSHA != manifestSHA {
 		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest digest changed")
 	}
@@ -77,7 +77,7 @@ func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, v
 	}
 	if receipt, err := s.GetTaskWorkspacePublishReceipt(ctx, value); err == nil {
 		if receipt.State != TaskWorkspacePublishPending {
-			return taskWorkspacePublishReceiptResult(receipt)
+			return s.finishTaskWorkspacePublish(ctx, value.WorkspaceID, receipt)
 		}
 	} else if domain.CodeOf(err) != domain.CodeNotFound {
 		return TaskWorkspacePublishReceipt{}, err
@@ -173,11 +173,25 @@ func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, v
 			return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output file failed integrity verification")
 		}
 	}
-	receipt, err = s.store.CommitTaskWorkspacePublish(ctx, value, files, manifestSHA)
+	receipt, err = s.store.CommitTaskWorkspacePublish(ctx, value, files, emptyDirectories, manifestSHA)
 	if err != nil {
 		return TaskWorkspacePublishReceipt{}, err
 	}
-	return taskWorkspacePublishReceiptResult(receipt)
+	return s.finishTaskWorkspacePublish(ctx, value.WorkspaceID, receipt)
+}
+
+func (s *WorkspaceSyncService) finishTaskWorkspacePublish(ctx context.Context, workspaceID string, receipt TaskWorkspacePublishReceipt) (TaskWorkspacePublishReceipt, error) {
+	result, err := taskWorkspacePublishReceiptResult(receipt)
+	if err != nil {
+		return result, err
+	}
+	if err := s.materializeWorkspaceCurrent(ctx, workspaceID); err != nil {
+		if ctx.Err() != nil {
+			return TaskWorkspacePublishReceipt{}, ctx.Err()
+		}
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceBusy, "Task Workspace publish is durable but current-directory materialization is pending; retry with the same operation key")
+	}
+	return result, nil
 }
 
 func taskWorkspacePublishReceiptResult(receipt TaskWorkspacePublishReceipt) (TaskWorkspacePublishReceipt, error) {

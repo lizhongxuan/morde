@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+func ValidSyncFolderID(value string) bool {
+	return len(value) == 38 && strings.HasPrefix(value, "morde-") && strings.Trim(value[6:], "0123456789abcdef") == ""
+}
+
 func SyncthingDeviceIDFromCertificateDER(der []byte) (string, error) {
 	certificate, err := x509.ParseCertificate(der)
 	if err != nil || !bytes.Equal(certificate.Raw, der) ||

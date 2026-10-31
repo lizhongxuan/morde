@@ -240,6 +240,9 @@ SELECT EXISTS (
 		if active {
 			return nil
 		}
+		if err := lockHostWorkspaceReleaseCheckpoints(ctx, tx, hostID); err != nil {
+			return err
+		}
 		var workspaceID string
 		err = tx.QueryRow(ctx, `
 SELECT workspace_id FROM workspace_bindings
@@ -260,7 +263,8 @@ JOIN workspace_sync_sessions s ON s.workspace_id=b.workspace_id
 WHERE b.host_id=$1 AND b.state <> 'detached'
   AND s.replica_id LIKE 'host:' || $1 || ':g' || $2::bigint::text || ':%'
   AND s.state IN ('planned','transferring','verifying','applying')
-  AND (s.upload_files <> '[]'::jsonb OR cardinality(s.upload_deleted_paths) > 0)
+  AND (s.upload_files <> '[]'::jsonb OR cardinality(s.upload_deleted_paths) > 0
+       OR cardinality(s.upload_empty_directories) > 0 OR cardinality(s.upload_deleted_directories) > 0)
 LIMIT 1`, hostID, result.RuntimeGeneration).Scan(&workspaceID)
 		if err == nil {
 			conflict := domain.NewError(domain.CodeConflict, "host Workspace has uncommitted sync changes; finish synchronization before release")
@@ -298,6 +302,61 @@ WHERE id=$1 AND state='running' AND control_state='ai'`, hostID)
 		return host.Host{}, false, err
 	}
 	return result, changed, nil
+}
+
+func lockHostWorkspaceReleaseCheckpoints(ctx context.Context, tx pgx.Tx, hostID string) error {
+	// Lock Workspace rows before bindings so sync commits cannot race this checkpoint or invert the mutation lock order.
+	rows, err := tx.Query(ctx, `
+SELECT w.id
+FROM workspaces w
+JOIN workspace_bindings b ON b.workspace_id=w.id
+WHERE b.host_id=$1 AND b.state <> 'detached'
+ORDER BY w.id
+FOR UPDATE OF w`, hostID)
+	if err != nil {
+		return fmt.Errorf("lock Workspace rows before Host release checkpoint check: %w", err)
+	}
+	for rows.Next() {
+		var workspaceID string
+		if err := rows.Scan(&workspaceID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read Workspace rows before Host release checkpoint check: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate Workspace rows before Host release checkpoint check: %w", err)
+	}
+	rows.Close()
+
+	rows, err = tx.Query(ctx, `
+SELECT w.id, b.desired_revision, b.applied_revision, w.revision
+FROM workspaces w
+JOIN workspace_bindings b ON b.workspace_id=w.id
+WHERE b.host_id=$1 AND b.state <> 'detached'
+ORDER BY w.id
+FOR UPDATE OF b`, hostID)
+	if err != nil {
+		return fmt.Errorf("lock Workspace bindings before Host release checkpoint check: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var workspaceID string
+		var desiredRevision, appliedRevision, workspaceRevision int64
+		if err := rows.Scan(&workspaceID, &desiredRevision, &appliedRevision, &workspaceRevision); err != nil {
+			return fmt.Errorf("read Workspace binding before Host release checkpoint check: %w", err)
+		}
+		if appliedRevision != desiredRevision || desiredRevision != workspaceRevision {
+			conflict := domain.NewError(domain.CodeConflict, "host Workspace has not applied the current Workspace revision; synchronize before release")
+			conflict.Details["reason"] = "host_release_workspace_checkpoint_pending"
+			conflict.Details["workspace_id"] = workspaceID
+			return conflict
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate Workspace bindings before Host release checkpoint check: %w", err)
+	}
+	return nil
 }
 
 // CompleteHostRelease is the only transition that marks the Host stopped.

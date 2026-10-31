@@ -223,14 +223,27 @@ func (s *Store) GetClientInstallation(ctx context.Context, id string) (identity.
   COALESCE(expires_at,created_at),created_at,last_used_at,revoked_at FROM client_installations WHERE id=$1`, id))
 }
 
-func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip string, actorKind audit.ActorKind) error {
+func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip string, actorKind audit.ActorKind, disableRelay func(context.Context) error) error {
 	if actorKind != audit.ActorSession && actorKind != audit.ActorClient {
 		return domain.InvalidArgument("actor_kind", "client revocation actor is invalid")
 	}
 	// Installation, its tokens and audit commit together so every credential is revoked at once.
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+	return s.withWorkspaceSyncOwnerTx(ctx, ownerID, func(tx pgx.Tx) error {
 		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
 			return err
+		}
+		var active bool
+		err := tx.QueryRow(ctx, `SELECT revoked_at IS NULL FROM client_installations WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&active)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && !active {
+			return domain.NewError(domain.CodeNotFound, "client installation not found")
+		}
+		if err != nil {
+			return fmt.Errorf("lock client installation for revocation: %w", err)
+		}
+		if disableRelay != nil {
+			if err := disableRelay(ctx); err != nil {
+				return fmt.Errorf("disable Workspace sync relay before installation revocation: %w", err)
+			}
 		}
 		command, err := tx.Exec(ctx, `UPDATE client_installations SET revoked_at=COALESCE(revoked_at,now())
   WHERE id=$1 AND owner_id=$2 AND revoked_at IS NULL`, id, ownerID)
@@ -255,7 +268,7 @@ func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip st
 			return fmt.Errorf("audit client revocation: %w", err)
 		}
 		return nil
-	})
+	}, nil, nil)
 }
 
 func (s *Store) ActiveClientInstallation(ctx context.Context, id, userID string) (bool, error) {

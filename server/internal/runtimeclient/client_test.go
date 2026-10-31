@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"morde-runtime/contract"
+
 	"morde/server/internal/domain"
 )
 
@@ -70,6 +71,7 @@ func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 				ViewID: viewID, ManifestSHA256: manifestDigest,
 				Files: []contract.TaskWorkspaceManifestFile{{Path: "hello.txt", SizeBytes: 5, SHA256: blockDigest, Mode: 0o600,
 					Chunks: []contract.TaskWorkspaceManifestChunk{{SHA256: blockDigest, SizeBytes: 5}}}},
+				EmptyDirectories: []string{"empty"},
 			})
 		case "/runtime/v1/tasks/" + taskID + "/workspace-view/block":
 			var request TaskWorkspaceBlockRequest
@@ -94,7 +96,7 @@ func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 		WorkspaceCheckpointRevision: 0, InputManifestSHA256: inputDigest, ViewID: viewID, Limit: 10,
 	}
 	page, err := client.TaskWorkspaceManifestPage(context.Background(), taskID, manifestRequest)
-	if err != nil || len(page.Files) != 1 || page.ManifestSHA256 != manifestDigest {
+	if err != nil || len(page.Files) != 1 || len(page.EmptyDirectories) != 1 || page.ManifestSHA256 != manifestDigest {
 		t.Fatalf("TaskWorkspaceManifestPage() = %#v, %v", page, err)
 	}
 	blockRequest := TaskWorkspaceBlockRequest{
@@ -113,6 +115,35 @@ func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 	blockRequest.SHA256 = strings.ToUpper(blockRequest.SHA256)
 	if _, err := client.ReadTaskWorkspaceBlock(context.Background(), taskID, blockRequest); err == nil {
 		t.Fatal("ReadTaskWorkspaceBlock accepted a non-canonical block hash")
+	}
+}
+
+func TestTaskWorkspaceManifestResponseValidatesDirectoryOnlyPages(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	viewID := "v" + strings.Repeat("a", 64)
+	request := TaskWorkspaceManifestRequest{
+		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, InputManifestSHA256: strings.Repeat("b", 64), ViewID: viewID,
+		AfterPath: "before", Limit: 1,
+	}
+	response := TaskWorkspaceManifestResponse{
+		ProtocolVersion: ProtocolVersion, HostFence: fence, TaskID: taskID, WorkspaceID: request.WorkspaceID,
+		BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
+		WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
+		ViewID: viewID, ManifestSHA256: strings.Repeat("c", 64),
+		Files: []contract.TaskWorkspaceManifestFile{}, EmptyDirectories: []string{"docs"}, NextCursor: "docs",
+	}
+	if !taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("directory-only page with its path cursor was rejected")
+	}
+	response.NextCursor = "other"
+	if taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("directory-only page with a mismatched cursor was accepted")
+	}
+	response.NextCursor = "docs"
+	response.EmptyDirectories = []string{"../outside"}
+	if taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("page with an unsafe directory path was accepted")
 	}
 }
 

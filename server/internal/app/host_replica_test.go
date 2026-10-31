@@ -27,8 +27,11 @@ func TestHostReplicaAppliesAndActivatesOnlyCurrentBindingRevision(t *testing.T) 
 		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
 		bindings: map[string]workspace.Binding{hostValue.ID + "/" + workspaceValue.ID: binding},
 	}
+	replicaWorkspaces := &hostReplicaWorkspaceStoreTest{
+		hostServiceTestWorkspaceStore: workspaces, generation: hostValue.RuntimeGeneration, running: true,
+	}
 	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
-	service, err := NewHostReplicaService(hosts, workspaces, users, sealer)
+	service, err := NewHostReplicaService(hosts, replicaWorkspaces, users, sealer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,13 +73,21 @@ func TestHostReplicaAppliesAndActivatesOnlyCurrentBindingRevision(t *testing.T) 
 	if _, err := service.ScopeWorkspace(ctx, principal, workspaceValue.ID, binding.BindingVersion+1); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("ScopeWorkspace() with stale binding version error = %v, want workspace conflict", err)
 	}
-	updated, err := service.RecordAppliedRevision(ctx, principal, workspaceValue.ID, binding.BindingVersion, workspaceValue.Revision)
+	updated, err := service.RecordAppliedRevision(ctx, principal, workspaceValue.ID, binding.BindingVersion, "p1234567", workspaceValue.Revision)
 	if err != nil || updated.AppliedRevision != workspaceValue.Revision || updated.State != workspace.BindingPreparing {
 		t.Fatalf("RecordAppliedRevision() = %#v, %v", updated, err)
 	}
-	if _, err := service.RecordAppliedRevision(ctx, principal, workspaceValue.ID, binding.BindingVersion, workspaceValue.Revision+1); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+	if _, err := service.RecordAppliedRevision(ctx, principal, workspaceValue.ID, binding.BindingVersion, "p1234567", workspaceValue.Revision+1); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("RecordAppliedRevision() for unavailable revision error = %v", err)
 	}
+	if _, err := service.RecordAppliedRevision(ctx, principal, workspaceValue.ID, binding.BindingVersion, "", workspaceValue.Revision); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("RecordAppliedRevision() without a session receipt error = %v", err)
+	}
+	replicaWorkspaces.generation++
+	if _, err := service.ActivateBinding(ctx, principal, workspaceValue.ID, binding.BindingVersion); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("ActivateBinding() with a stale generation error = %v", err)
+	}
+	replicaWorkspaces.generation--
 	active, err := service.ActivateBinding(ctx, principal, workspaceValue.ID, binding.BindingVersion)
 	if err != nil || active.State != workspace.BindingActive || active.BindingVersion != binding.BindingVersion+1 {
 		t.Fatalf("ActivateBinding() = %#v, %v", active, err)
@@ -111,8 +122,11 @@ func TestHostReplicaReportsWorkspaceSyncConflictAndRecovery(t *testing.T) {
 		values:   map[string]workspace.Workspace{workspaceValue.ID: workspaceValue},
 		bindings: map[string]workspace.Binding{hostValue.ID + "/" + workspaceValue.ID: binding},
 	}
+	replicaWorkspaces := &hostReplicaWorkspaceStoreTest{
+		hostServiceTestWorkspaceStore: workspaces, generation: hostValue.RuntimeGeneration, running: true,
+	}
 	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
-	service, err := NewHostReplicaService(&hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}, workspaces, users, sealer)
+	service, err := NewHostReplicaService(&hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}, replicaWorkspaces, users, sealer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +144,11 @@ func TestHostReplicaReportsWorkspaceSyncConflictAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	replicaWorkspaces.generation++
+	if _, err := service.ReportWorkspaceSyncStatus(ctx, principal, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("ReportWorkspaceSyncStatus() with a stale generation error = %v", err)
+	}
+	replicaWorkspaces.generation--
 	conflict, err := service.ReportWorkspaceSyncStatus(ctx, principal, workspace.BindingSyncConflict, []string{"src/main.go"})
 	if err != nil || conflict.SyncState != workspace.BindingSyncConflict || len(conflict.SyncConflicts) != 1 || conflict.SyncConflicts[0] != "src/main.go" {
 		t.Fatalf("ReportWorkspaceSyncStatus(conflict) = %#v, %v", conflict, err)
@@ -214,6 +233,11 @@ func TestHostReplicaDetachesOnlyAfterCurrentCheckpoint(t *testing.T) {
 	if _, err := service.CompleteUnbinding(ctx, principal, workspaceValue.ID, binding.BindingVersion, 2); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("CompleteUnbinding(stale checkpoint) error = %v", err)
 	}
+	if _, err := service.CompleteUnbinding(ctx, principal, workspaceValue.ID, binding.BindingVersion, workspaceValue.Revision); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("CompleteUnbinding(unapplied checkpoint) error = %v; want workspace conflict", err)
+	}
+	binding.AppliedRevision = workspaceValue.Revision
+	workspaces.bindings[hostValue.ID+"/"+workspaceValue.ID] = binding
 	detached, err := service.CompleteUnbinding(ctx, principal, workspaceValue.ID, binding.BindingVersion, workspaceValue.Revision)
 	if err != nil || detached.State != workspace.BindingDetached || detached.AppliedRevision != workspaceValue.Revision || detached.BindingVersion != binding.BindingVersion+1 {
 		t.Fatalf("CompleteUnbinding(current checkpoint) = %#v, %v", detached, err)
@@ -221,3 +245,34 @@ func TestHostReplicaDetachesOnlyAfterCurrentCheckpoint(t *testing.T) {
 }
 
 var _ HostStore = (*hostServiceTestHostStore)(nil)
+
+type hostReplicaWorkspaceStoreTest struct {
+	*hostServiceTestWorkspaceStore
+	generation int64
+	running    bool
+}
+
+func (s *hostReplicaWorkspaceStoreTest) ActivateWorkspaceBindingForHost(ctx context.Context, hostID string, expectedGeneration int64,
+	workspaceID string, expectedVersion, desiredRevision, appliedRevision int64) (workspace.Binding, error) {
+	if expectedGeneration != s.generation {
+		return workspace.Binding{}, domain.NewError(domain.CodeUnauthenticated, "Host replica generation is no longer current")
+	}
+	if !s.running {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "Host must be running to activate a workspace binding")
+	}
+	return s.TransitionWorkspaceBinding(ctx, hostID, workspaceID, expectedVersion,
+		workspace.BindingPreparing, workspace.BindingActive, desiredRevision, appliedRevision)
+}
+
+func (s *hostReplicaWorkspaceStoreTest) SetWorkspaceBindingSyncStatusForHost(ctx context.Context, hostID string, expectedGeneration int64,
+	workspaceID string, expectedVersion int64, state workspace.BindingSyncState, conflicts []string) (workspace.Binding, error) {
+	if expectedGeneration != s.generation {
+		return workspace.Binding{}, domain.NewError(domain.CodeUnauthenticated, "Host replica generation is no longer current")
+	}
+	if !s.running {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "Host must be running to report workspace sync status")
+	}
+	return s.SetWorkspaceBindingSyncStatus(ctx, hostID, workspaceID, expectedVersion, state, conflicts)
+}
+
+var _ HostReplicaWorkspaceStore = (*hostReplicaWorkspaceStoreTest)(nil)

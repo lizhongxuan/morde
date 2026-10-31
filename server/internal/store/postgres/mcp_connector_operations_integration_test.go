@@ -174,6 +174,15 @@ func TestPostgresMCPConnectorOperationPersistsWorkspaceFence(t *testing.T) {
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "mcp-operation-workspace-fence")
 	fixture := newMCPConnectorOperationFixtureWithWorkspace(t, ctx, store, owner.ID, "mcp-operation-workspace-fence", &workspaceValue)
 	input := fixture.operation("workspace-fence", "search")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, workspaceValue.ID, "legacy-"+workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.PrepareMCPConnectorOperation(ctx, fixture.operation("blocked-by-import", "search"), fixture.leaseOwner); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("MCP operation preparation during pending legacy import = %v; want workspace busy", err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM workspace_legacy_volumes WHERE workspace_id=$1`, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
 	prepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, input, fixture.leaseOwner)
 	if err != nil || replayed || prepared.Status != task.OperationPrepared || prepared.HostID != fixture.hostID ||
 		prepared.WorkspaceID != workspaceValue.ID || prepared.BindingVersion != fixture.bindingVersion || prepared.InputRevision == nil ||

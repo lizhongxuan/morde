@@ -25,16 +25,22 @@ type UpdateUserCommand struct {
 }
 
 type UserService struct {
-	users         UserStore
-	hosts         HostStore
-	registrations loginLimiter
+	users                   UserStore
+	hosts                   HostStore
+	workspaceSyncController WorkspaceSyncNodeOwnerReconciler
+	registrations           loginLimiter
 }
 
-func NewUserService(users UserStore, hosts HostStore) (*UserService, error) {
-	if users == nil || hosts == nil {
+func NewUserService(users UserStore, hosts HostStore, controllers ...WorkspaceSyncNodeOwnerReconciler) (*UserService, error) {
+	if users == nil || hosts == nil || len(controllers) > 1 {
 		return nil, errors.New("user service dependencies are required")
 	}
-	return &UserService{users: users, hosts: hosts, registrations: loginLimiter{attempts: make(map[string]loginAttempt)}}, nil
+	var workspaceSyncController WorkspaceSyncNodeOwnerReconciler
+	if len(controllers) == 1 {
+		workspaceSyncController = controllers[0]
+	}
+	return &UserService{users: users, hosts: hosts, workspaceSyncController: workspaceSyncController,
+		registrations: loginLimiter{attempts: make(map[string]loginAttempt)}}, nil
 }
 
 func (s *UserService) Register(ctx context.Context, name, password, ip string) (UserSummary, error) {
@@ -157,10 +163,16 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 		int64(user.QuotaHosts)*int64(user.DefaultHostMemMiB) > int64(user.QuotaMemMiB) {
 		return UserSummary{}, domain.InvalidArgument("quota", "quota CPU and memory must cover the host limit and default resources")
 	}
+	var disableRelay func(context.Context) error
+	if s.workspaceSyncController != nil {
+		disableRelay = func(gateCtx context.Context) error {
+			return s.workspaceSyncController.DisableWorkspaceSyncNodeRelay(gateCtx, user.ID)
+		}
+	}
 	user, err = s.users.UpdateUserWithAudit(ctx, adminActorID(principal), command.ExpectedStatus, user, audit.Entry{
 		ActorID: adminActorID(principal), ActorKind: adminActorKind(principal), Action: audit.ActionUserUpdate,
 		Target: user.ID, Detail: changes,
-	})
+	}, disableRelay)
 	if err != nil {
 		return UserSummary{}, err
 	}

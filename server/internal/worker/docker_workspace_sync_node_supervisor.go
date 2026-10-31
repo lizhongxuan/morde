@@ -22,23 +22,33 @@ import (
 	"time"
 
 	"morde/server/internal/dockerapi"
+	"morde/server/internal/domain"
+	"morde/server/internal/domain/workspace"
 )
 
 const (
 	dockerWorkspaceSyncConfigPath     = "/var/syncthing"
 	dockerWorkspaceSyncFilesPath      = "/workspaces"
+	dockerWorkspaceSyncQuotaPath      = "/run/morde-quota"
 	dockerWorkspaceSyncAPIPort        = "8384/tcp"
+	dockerWorkspaceSyncRelayNetwork   = "cloudhost_workspace_sync_relay"
 	dockerWorkspaceSyncContainerAlias = "morde-syncthing"
 	dockerWorkspaceSyncLabelManaged   = "morde.workspace-sync.managed"
 	dockerWorkspaceSyncLabelOwner     = "morde.workspace-sync.owner-sha256"
 	dockerWorkspaceSyncLabelImage     = "morde.workspace-sync.image-digest"
+	dockerWorkspaceSyncQuotaHookLabel = "org.morde.syncthing.workspace-quota-hook"
+	dockerWorkspaceSyncQuotaHook      = "f02-v1"
 )
 
 var (
-	dockerWorkspaceSyncImageDigest = regexp.MustCompile(`^(?:[a-zA-Z0-9][a-zA-Z0-9._:/-]*@)?sha256:[a-f0-9]{64}$`)
-	dockerWorkspaceSyncContainerID = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	dockerWorkspaceSyncRelayName   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
-	workspaceSyncRelayTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
+	dockerWorkspaceSyncImageDigest       = regexp.MustCompile(`^(?:[a-zA-Z0-9][a-zA-Z0-9._:/-]*@)?sha256:[a-f0-9]{64}$`)
+	dockerWorkspaceSyncContainerID       = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	dockerWorkspaceSyncRelayName         = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
+	workspaceSyncRelayTokenPattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
+	errWorkspaceSyncObservationInvalid   = errors.New("workspace sync observation: invalid request")
+	errWorkspaceSyncObservationDocker    = errors.New("workspace sync observation: Docker unavailable")
+	errWorkspaceSyncObservationContract  = errors.New("workspace sync observation: isolation contract mismatch")
+	errWorkspaceSyncObservationSyncthing = errors.New("workspace sync observation: Syncthing API unavailable")
 )
 
 // DockerWorkspaceSyncNodeResourceLimits are fixed for the lifetime of a
@@ -50,7 +60,8 @@ type DockerWorkspaceSyncNodeResourceLimits struct {
 }
 
 // DockerWorkspaceSyncNodeSupervisorOptions contains the pinned image and the
-// dedicated host paths used for persistent Syncthing state and current files.
+// dedicated host paths used for persistent Syncthing state, current files, and
+// the owner-private quota socket.
 type DockerWorkspaceSyncNodeSupervisorOptions struct {
 	ImageDigest        string
 	RelayImageDigest   string
@@ -61,6 +72,7 @@ type DockerWorkspaceSyncNodeSupervisorOptions struct {
 	RelayStateRoot     string
 	StateRoot          string
 	WorkspaceRoot      string
+	QuotaSocketRoot    string
 	RelayContainerName string
 	Resources          DockerWorkspaceSyncNodeResourceLimits
 }
@@ -75,19 +87,20 @@ type DockerWorkspaceSyncNode struct {
 // DockerWorkspaceSyncNodeSupervisor creates or reuses one isolated persistent
 // Syncthing container for each owner ID.
 type DockerWorkspaceSyncNodeSupervisor struct {
-	options DockerWorkspaceSyncNodeSupervisorOptions
-	client  *http.Client
-	api     *dockerapi.EndpointResolver
-	user    string
-	uid     int
-	gid     int
-	mu      sync.Mutex
+	options                DockerWorkspaceSyncNodeSupervisorOptions
+	client                 *http.Client
+	api                    *dockerapi.EndpointResolver
+	syncthingClientFactory func(string, string) (*SyncthingAPIClient, error)
+	user                   string
+	uid                    int
+	gid                    int
+	mu                     sync.Mutex
 }
 
 // NewDockerWorkspaceSyncNodeSupervisor constructs a supervisor for a Unix
 // Docker socket. Resource values are fixed in options and bounded to 512 MiB,
 // 500 milli-CPU, and 128 PIDs. The pinned image must not declare Docker VOLUME
-// paths; its state and current files must use only the two explicit binds.
+// paths; it receives only the state, current files, and owner quota socket binds.
 func NewDockerWorkspaceSyncNodeSupervisor(options DockerWorkspaceSyncNodeSupervisorOptions) (*DockerWorkspaceSyncNodeSupervisor, error) {
 	if !dockerWorkspaceSyncImageDigest.MatchString(options.ImageDigest) ||
 		!dockerWorkspaceSyncImageDigest.MatchString(options.RelayImageDigest) ||
@@ -98,9 +111,13 @@ func NewDockerWorkspaceSyncNodeSupervisor(options DockerWorkspaceSyncNodeSupervi
 		!cleanDockerWorkspaceSyncPath(options.RelayStateRoot) ||
 		!cleanDockerWorkspaceSyncPath(options.StateRoot) ||
 		!cleanDockerWorkspaceSyncPath(options.WorkspaceRoot) ||
+		!cleanDockerWorkspaceSyncPath(options.QuotaSocketRoot) ||
 		workspaceSyncPathsOverlap(options.RelayStateRoot, options.StateRoot) ||
 		workspaceSyncPathsOverlap(options.RelayStateRoot, options.WorkspaceRoot) ||
+		workspaceSyncPathsOverlap(options.RelayStateRoot, options.QuotaSocketRoot) ||
 		workspaceSyncPathsOverlap(options.StateRoot, options.WorkspaceRoot) ||
+		workspaceSyncPathsOverlap(options.StateRoot, options.QuotaSocketRoot) ||
+		workspaceSyncPathsOverlap(options.WorkspaceRoot, options.QuotaSocketRoot) ||
 		!dockerWorkspaceSyncRelayName.MatchString(options.RelayContainerName) ||
 		!validDockerWorkspaceSyncResources(options.Resources) {
 		return nil, errors.New("invalid docker workspace sync node supervisor options")
@@ -122,13 +139,157 @@ func NewDockerWorkspaceSyncNodeSupervisor(options DockerWorkspaceSyncNodeSupervi
 		return http.ErrUseLastResponse
 	}
 	return &DockerWorkspaceSyncNodeSupervisor{
-		options: options,
-		client:  client,
-		api:     dockerapi.NewEndpointResolver(client),
-		user:    strconv.Itoa(uid) + ":" + strconv.Itoa(gid),
-		uid:     uid,
-		gid:     gid,
+		options:                options,
+		client:                 client,
+		api:                    dockerapi.NewEndpointResolver(client),
+		syncthingClientFactory: NewSyncthingAPIClient,
+		user:                   strconv.Itoa(uid) + ":" + strconv.Itoa(gid),
+		uid:                    uid,
+		gid:                    gid,
 	}, nil
+}
+
+// Observe reads the owner's current node state without provisioning or changing
+// any Docker, filesystem, Syncthing, or relay state.
+func (s *DockerWorkspaceSyncNodeSupervisor) Observe(ctx context.Context, ownerID, apiKey string) (workspace.SyncNodeObservation, error) {
+	if s == nil || ctx == nil || ownerID == "" || len(ownerID) > 256 || strings.TrimSpace(ownerID) != ownerID ||
+		strings.ContainsAny(ownerID, "\x00\r\n") || !domain.ValidUserID(ownerID) || !validDockerWorkspaceSyncAPIKey(apiKey) {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationInvalid
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ownerHash := sha256.Sum256([]byte(ownerID))
+	ownerHashHex := hex.EncodeToString(ownerHash[:])
+	containerName := "morde-sync-" + ownerHashHex[:32]
+	networkName := "morde-sync-net-" + ownerHashHex[:32]
+	if s.options.RelayContainerName == containerName {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+
+	node, exists, err := s.inspectContainerByName(ctx, containerName)
+	if errors.Is(err, errDockerObjectNotFound) {
+		return workspace.SyncNodeObservation{}, nil
+	}
+	if err != nil || !exists {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationDocker
+	}
+
+	statePath, workspacePath, quotaSocketPath, err := s.ownerMountPathsReadOnly(ownerHashHex)
+	if err != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+	imageEnv, imageLabels, err := s.validateImage(ctx)
+	if err != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationDocker
+	}
+	if err := validDockerWorkspaceSyncContainer(node, dockerWorkspaceSyncExpected{
+		ID: node.ID, Name: containerName, OwnerHash: ownerHashHex, Image: s.options.ImageDigest, ImageLabels: imageLabels,
+		ImageEnv: imageEnv, APIKey: apiKey, User: s.user, NetworkName: networkName,
+		StatePath: statePath, WorkspacePath: workspacePath, QuotaSocketPath: quotaSocketPath,
+		QuotaGroups: s.quotaSupplementaryGroups(), Resources: s.options.Resources,
+	}); err != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+
+	network, err := s.inspectNetwork(ctx, networkName)
+	if errors.Is(err, errDockerObjectNotFound) {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+	if err != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationDocker
+	}
+	if !validDockerWorkspaceSyncNetwork(network, networkName, ownerHashHex, dockerWorkspaceSyncBridgeName(ownerHashHex)) ||
+		validWorkspaceSyncNetworkMembers(network, node.ID, containerName, true) != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+
+	observation := workspace.SyncNodeObservation{Present: true, Running: *node.State.Running}
+	if !observation.Running {
+		return observation, nil
+	}
+	if *node.State.PID < 1 {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+	address, ok := dockerWorkspaceSyncPrivateIPv4(node, networkName)
+	if !ok {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationContract
+	}
+	factory := s.syncthingClientFactory
+	if factory == nil {
+		factory = NewSyncthingAPIClient
+	}
+	client, err := factory("http://"+net.JoinHostPort(address, "8384"), apiKey)
+	if err != nil || client == nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationSyncthing
+	}
+	connected, err := client.ConnectedDeviceIDs(ctx)
+	if err != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationSyncthing
+	}
+	folders, err := client.WorkspaceFolderStatuses(ctx)
+	if err != nil {
+		return workspace.SyncNodeObservation{}, errWorkspaceSyncObservationSyncthing
+	}
+	observation.ConnectedDeviceIDs = connected
+	observation.Folders = make([]workspace.SyncNodeFolderObservation, 0, len(folders))
+	for _, folder := range folders {
+		observation.Folders = append(observation.Folders, workspace.SyncNodeFolderObservation{
+			FolderID: folder.FolderID, State: folder.State, NeedBytes: folder.NeedBytes, NeedFiles: folder.NeedFiles,
+		})
+	}
+	return observation, nil
+}
+
+// ownerMountPathsReadOnly derives and validates the same mount sources used by
+// Ensure, but never creates, chmods, or chowns any path.
+func (s *DockerWorkspaceSyncNodeSupervisor) ownerMountPathsReadOnly(ownerHash string) (string, string, string, error) {
+	stateRoot, err := existingWorkspaceSyncRoot(s.options.StateRoot)
+	if err != nil {
+		return "", "", "", err
+	}
+	workspaceRoot, err := existingWorkspaceSyncRoot(s.options.WorkspaceRoot)
+	if err != nil || workspaceSyncPathsOverlap(stateRoot, workspaceRoot) {
+		return "", "", "", errors.New("workspace sync roots are unavailable")
+	}
+	quotaInfo, err := os.Lstat(s.options.QuotaSocketRoot)
+	if err != nil || !quotaInfo.IsDir() || quotaInfo.Mode()&os.ModeSymlink != 0 ||
+		!workspaceSyncQuotaPathOwnedBy(quotaInfo, os.Geteuid()) || quotaInfo.Mode().Perm()&0o022 != 0 {
+		return "", "", "", errors.New("workspace sync quota root is unavailable")
+	}
+	quotaRoot, err := filepath.EvalSymlinks(s.options.QuotaSocketRoot)
+	if err != nil || !filepath.IsAbs(quotaRoot) || workspaceSyncPathsOverlap(quotaRoot, stateRoot) || workspaceSyncPathsOverlap(quotaRoot, workspaceRoot) {
+		return "", "", "", errors.New("workspace sync quota root is unavailable")
+	}
+	statePath := filepath.Join(stateRoot, ownerHash)
+	workspacePath := filepath.Join(workspaceRoot, ownerHash)
+	quotaSocketPath := filepath.Join(quotaRoot, ownerHash)
+	for _, path := range []string{statePath, workspacePath} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+			return "", "", "", errors.New("workspace sync owner root is unavailable")
+		}
+	}
+	quotaOwnerInfo, err := os.Lstat(quotaSocketPath)
+	if err != nil || !quotaOwnerInfo.IsDir() || quotaOwnerInfo.Mode()&os.ModeSymlink != 0 ||
+		quotaOwnerInfo.Mode().Perm() != 0o710 || quotaOwnerInfo.Mode()&os.ModeSetgid == 0 ||
+		!workspaceSyncQuotaPathOwnedBy(quotaOwnerInfo, os.Geteuid()) {
+		return "", "", "", errors.New("workspace sync quota owner root is unavailable")
+	}
+	return statePath, workspacePath, quotaSocketPath, nil
+}
+
+func existingWorkspaceSyncRoot(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("workspace sync root is unavailable")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(resolved) {
+		return "", errors.New("workspace sync root is unavailable")
+	}
+	return resolved, nil
 }
 
 func (s *DockerWorkspaceSyncNodeSupervisor) relayConfig() workspaceSyncRelayConfig {
@@ -156,7 +317,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 	if s.options.RelayContainerName == containerName {
 		return DockerWorkspaceSyncNode{}, errors.New("workspace sync relay name conflicts with account node")
 	}
-	statePath, workspacePath, err := s.prepareOwnerPaths(ownerHashHex)
+	statePath, workspacePath, quotaSocketPath, err := s.prepareOwnerPaths(ownerHashHex)
 	if err != nil {
 		return DockerWorkspaceSyncNode{}, err
 	}
@@ -191,7 +352,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 	}
 
 	if !nodeExists {
-		created, createErr := s.createNode(ctx, ownerHashHex, containerName, networkName, statePath, workspacePath, apiKey)
+		created, createErr := s.createNode(ctx, ownerHashHex, containerName, networkName, statePath, workspacePath, quotaSocketPath, apiKey)
 		if createErr != nil {
 			// A concurrent supervisor may have created the deterministic name. Reuse
 			// it only after inspecting the complete isolation contract below.
@@ -203,13 +364,13 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 		} else {
 			node = created
 		}
-		nodeExists = true
 	}
 
 	if err := validDockerWorkspaceSyncContainer(node, dockerWorkspaceSyncExpected{
 		ID: node.ID, Name: containerName, OwnerHash: ownerHashHex, Image: s.options.ImageDigest, ImageLabels: imageLabels,
 		ImageEnv: imageEnv, APIKey: apiKey, User: s.user, NetworkName: networkName,
-		StatePath: statePath, WorkspacePath: workspacePath, Resources: s.options.Resources,
+		StatePath: statePath, WorkspacePath: workspacePath, QuotaSocketPath: quotaSocketPath,
+		QuotaGroups: s.quotaSupplementaryGroups(), Resources: s.options.Resources,
 	}); err != nil {
 		return DockerWorkspaceSyncNode{}, err
 	}
@@ -225,7 +386,8 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 		if err != nil || validDockerWorkspaceSyncContainer(node, dockerWorkspaceSyncExpected{
 			ID: node.ID, Name: containerName, OwnerHash: ownerHashHex, Image: s.options.ImageDigest, ImageLabels: imageLabels,
 			ImageEnv: imageEnv, APIKey: apiKey, User: s.user, NetworkName: networkName,
-			StatePath: statePath, WorkspacePath: workspacePath, Resources: s.options.Resources,
+			StatePath: statePath, WorkspacePath: workspacePath, QuotaSocketPath: quotaSocketPath,
+			QuotaGroups: s.quotaSupplementaryGroups(), Resources: s.options.Resources,
 		}) != nil || node.State == nil || node.State.Running == nil || !*node.State.Running {
 			return DockerWorkspaceSyncNode{}, errors.New("started workspace sync node failed isolation inspection")
 		}
@@ -277,46 +439,71 @@ func workspaceSyncPathsOverlap(first, second string) bool {
 	return within(first, second) || within(second, first)
 }
 
-func (s *DockerWorkspaceSyncNodeSupervisor) prepareOwnerPaths(ownerHash string) (string, string, error) {
+func (s *DockerWorkspaceSyncNodeSupervisor) prepareOwnerPaths(ownerHash string) (string, string, string, error) {
 	roots := []string{s.options.StateRoot, s.options.WorkspaceRoot}
 	canonical := make([]string, 0, len(roots))
 	for _, path := range roots {
 		if err := os.MkdirAll(path, 0750); err != nil {
-			return "", "", errors.New("workspace sync root is unavailable")
+			return "", "", "", errors.New("workspace sync root is unavailable")
 		}
 		info, err := os.Lstat(path)
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return "", "", errors.New("workspace sync root is incompatible")
+			return "", "", "", errors.New("workspace sync root is incompatible")
 		}
 		resolved, err := filepath.EvalSymlinks(path)
 		if err != nil || !filepath.IsAbs(resolved) {
-			return "", "", errors.New("workspace sync root is incompatible")
+			return "", "", "", errors.New("workspace sync root is incompatible")
 		}
 		canonical = append(canonical, resolved)
 	}
 	if workspaceSyncPathsOverlap(canonical[0], canonical[1]) {
-		return "", "", errors.New("workspace sync roots overlap")
+		return "", "", "", errors.New("workspace sync roots overlap")
+	}
+	quotaRootInfo, err := os.Lstat(s.options.QuotaSocketRoot)
+	if err != nil || !quotaRootInfo.IsDir() || quotaRootInfo.Mode()&os.ModeSymlink != 0 || !workspaceSyncQuotaPathOwnedBy(quotaRootInfo, os.Geteuid()) || quotaRootInfo.Mode().Perm()&0o022 != 0 {
+		return "", "", "", errors.New("workspace sync quota socket root is incompatible")
+	}
+	quotaRoot, err := filepath.EvalSymlinks(s.options.QuotaSocketRoot)
+	if err != nil || !filepath.IsAbs(quotaRoot) || workspaceSyncPathsOverlap(quotaRoot, canonical[0]) || workspaceSyncPathsOverlap(quotaRoot, canonical[1]) {
+		return "", "", "", errors.New("workspace sync quota socket root is incompatible")
 	}
 	statePath := filepath.Join(canonical[0], ownerHash)
 	workspacePath := filepath.Join(canonical[1], ownerHash)
+	quotaSocketPath := filepath.Join(quotaRoot, ownerHash)
 	for _, path := range []string{statePath, workspacePath} {
 		if err := os.Mkdir(path, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-			return "", "", errors.New("workspace sync owner directory is unavailable")
+			return "", "", "", errors.New("workspace sync owner directory is unavailable")
 		}
 		info, err := os.Lstat(path)
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return "", "", errors.New("workspace sync owner directory is incompatible")
+			return "", "", "", errors.New("workspace sync owner directory is incompatible")
 		}
 		if os.Geteuid() == 0 {
 			if err := os.Chown(path, s.uid, s.gid); err != nil {
-				return "", "", errors.New("workspace sync owner directory ownership is unavailable")
+				return "", "", "", errors.New("workspace sync owner directory ownership is unavailable")
 			}
 		}
 		if err := os.Chmod(path, 0700); err != nil {
-			return "", "", errors.New("workspace sync owner directory permissions are unavailable")
+			return "", "", "", errors.New("workspace sync owner directory permissions are unavailable")
 		}
 	}
-	return statePath, workspacePath, nil
+	if err := os.Mkdir(quotaSocketPath, 0o2710); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", "", "", errors.New("workspace sync quota socket owner directory is unavailable")
+	}
+	quotaInfo, err := os.Lstat(quotaSocketPath)
+	if err != nil || !quotaInfo.IsDir() || quotaInfo.Mode()&os.ModeSymlink != 0 || !workspaceSyncQuotaPathOwnedBy(quotaInfo, os.Geteuid()) {
+		return "", "", "", errors.New("workspace sync quota socket owner directory is unsafe")
+	}
+	if quotaInfo.Mode().Perm() != 0o710 || quotaInfo.Mode()&os.ModeSetgid == 0 {
+		if err := os.Chmod(quotaSocketPath, 0o2710); err != nil {
+			return "", "", "", errors.New("workspace sync quota socket owner directory permissions are unavailable")
+		}
+	}
+	quotaInfo, err = os.Lstat(quotaSocketPath)
+	if err != nil || !quotaInfo.IsDir() || quotaInfo.Mode()&os.ModeSymlink != 0 || quotaInfo.Mode().Perm() != 0o710 || quotaInfo.Mode()&os.ModeSetgid == 0 || !workspaceSyncQuotaPathOwnedBy(quotaInfo, os.Geteuid()) {
+		return "", "", "", errors.New("workspace sync quota socket owner directory permissions are unavailable")
+	}
+	return statePath, workspacePath, quotaSocketPath, nil
 }
 
 type dockerWorkspaceSyncImage struct {
@@ -340,6 +527,9 @@ func (s *DockerWorkspaceSyncNodeSupervisor) validateImage(ctx context.Context) (
 	if image.Config == nil || !workspaceSyncImageMatches(s.options.ImageDigest, image.ID, image.RepoDigests) || len(image.Config.Volumes) != 0 ||
 		(len(image.Config.ExposedPorts) != 0 && (len(image.Config.ExposedPorts) != 1 || image.Config.ExposedPorts[dockerWorkspaceSyncAPIPort] == nil)) {
 		return nil, nil, errors.New("workspace sync image digest or volume declarations are invalid")
+	}
+	if image.Config.Labels[dockerWorkspaceSyncQuotaHookLabel] != dockerWorkspaceSyncQuotaHook {
+		return nil, nil, errors.New("workspace sync image is missing the required Morde quota hook")
 	}
 	for _, value := range image.Config.Env {
 		key, _, ok := strings.Cut(value, "=")
@@ -485,6 +675,7 @@ type dockerWorkspaceSyncInspect struct {
 		Privileged      bool                                 `json:"Privileged"`
 		CapDrop         []string                             `json:"CapDrop"`
 		CapAdd          []string                             `json:"CapAdd"`
+		GroupAdd        []string                             `json:"GroupAdd"`
 		SecurityOpt     []string                             `json:"SecurityOpt"`
 		Memory          int64                                `json:"Memory"`
 		MemorySwap      int64                                `json:"MemorySwap"`
@@ -522,18 +713,20 @@ type dockerWorkspaceSyncNetworkEndpoint struct {
 }
 
 type dockerWorkspaceSyncExpected struct {
-	ID            string
-	Name          string
-	OwnerHash     string
-	Image         string
-	ImageLabels   map[string]string
-	ImageEnv      []string
-	APIKey        string
-	User          string
-	NetworkName   string
-	StatePath     string
-	WorkspacePath string
-	Resources     DockerWorkspaceSyncNodeResourceLimits
+	ID              string
+	Name            string
+	OwnerHash       string
+	Image           string
+	ImageLabels     map[string]string
+	ImageEnv        []string
+	APIKey          string
+	User            string
+	NetworkName     string
+	StatePath       string
+	WorkspacePath   string
+	QuotaSocketPath string
+	QuotaGroups     []string
+	Resources       DockerWorkspaceSyncNodeResourceLimits
 }
 
 func validDockerWorkspaceSyncContainer(value dockerWorkspaceSyncInspect, expected dockerWorkspaceSyncExpected) error {
@@ -544,6 +737,7 @@ func validDockerWorkspaceSyncContainer(value dockerWorkspaceSyncInspect, expecte
 		len(value.Config.ExposedPorts) != 1 || value.Config.ExposedPorts[dockerWorkspaceSyncAPIPort] == nil ||
 		value.HostConfig.NetworkMode != expected.NetworkName || !value.HostConfig.ReadonlyRootfs || value.HostConfig.Privileged ||
 		!slices.Equal(value.HostConfig.CapDrop, []string{"ALL"}) || len(value.HostConfig.CapAdd) != 0 ||
+		!slices.Equal(value.HostConfig.GroupAdd, expected.QuotaGroups) ||
 		!slices.Equal(value.HostConfig.SecurityOpt, []string{"no-new-privileges:true"}) || value.HostConfig.PublishAllPorts ||
 		value.HostConfig.Memory != expected.Resources.MemoryBytes || value.HostConfig.MemorySwap != expected.Resources.MemoryBytes ||
 		value.HostConfig.NanoCPUs != expected.Resources.NanoCPUs || value.HostConfig.PidsLimit == nil ||
@@ -552,7 +746,7 @@ func validDockerWorkspaceSyncContainer(value dockerWorkspaceSyncInspect, expecte
 		value.HostConfig.AutoRemove || len(value.HostConfig.Binds) != 0 ||
 		len(value.HostConfig.Devices) != 0 || len(value.HostConfig.DeviceRequests) != 0 || len(value.HostConfig.VolumesFrom) != 0 ||
 		value.HostConfig.LogConfig.Type != "none" || value.HostConfig.RestartPolicy.Name != "unless-stopped" ||
-		!validDockerWorkspaceSyncMounts(value, expected.StatePath, expected.WorkspacePath) ||
+		!validDockerWorkspaceSyncMounts(value, expected.StatePath, expected.WorkspacePath, expected.QuotaSocketPath) ||
 		!dockerWorkspaceSyncHasNoPublishedPorts(value.HostConfig.PortBindings, value.NetworkSettings.Ports) ||
 		len(value.NetworkSettings.Networks) != 1 || !hasWorkspaceSyncNetworkAlias(value.NetworkSettings.Networks, expected.NetworkName, dockerWorkspaceSyncContainerAlias) {
 		return errors.New("workspace sync container isolation contract mismatch")
@@ -589,22 +783,36 @@ func equalDockerWorkspaceSyncEnv(got, imageEnv []string, apiKey string) bool {
 	return true
 }
 
-func validDockerWorkspaceSyncMounts(value dockerWorkspaceSyncInspect, statePath, workspacePath string) bool {
-	if len(value.Mounts) != 2 || len(value.HostConfig.Mounts) != 2 {
+func validDockerWorkspaceSyncMounts(value dockerWorkspaceSyncInspect, statePath, workspacePath, quotaSocketPath string) bool {
+	if len(value.Mounts) != 3 || len(value.HostConfig.Mounts) != 3 {
 		return false
 	}
-	want := map[string]string{dockerWorkspaceSyncConfigPath: statePath, dockerWorkspaceSyncFilesPath: workspacePath}
-	requestWant := map[string]string{dockerWorkspaceSyncConfigPath: statePath, dockerWorkspaceSyncFilesPath: workspacePath}
+	want := map[string]struct {
+		path     string
+		readOnly bool
+	}{
+		dockerWorkspaceSyncConfigPath: {path: statePath},
+		dockerWorkspaceSyncFilesPath:  {path: workspacePath},
+		dockerWorkspaceSyncQuotaPath:  {path: quotaSocketPath, readOnly: true},
+	}
+	requestWant := map[string]struct {
+		path     string
+		readOnly bool
+	}{
+		dockerWorkspaceSyncConfigPath: {path: statePath},
+		dockerWorkspaceSyncFilesPath:  {path: workspacePath},
+		dockerWorkspaceSyncQuotaPath:  {path: quotaSocketPath, readOnly: true},
+	}
 	for _, mount := range value.HostConfig.Mounts {
-		path, ok := requestWant[mount.Target]
-		if !ok || mount.Type != "bind" || mount.Source != path || mount.ReadOnly || mount.BindOptions.Propagation != "rprivate" {
+		expected, ok := requestWant[mount.Target]
+		if !ok || mount.Type != "bind" || mount.Source != expected.path || mount.ReadOnly != expected.readOnly || mount.BindOptions.Propagation != "rprivate" {
 			return false
 		}
 		delete(requestWant, mount.Target)
 	}
 	for _, mount := range value.Mounts {
-		path, ok := want[mount.Destination]
-		if !ok || mount.Type != "bind" || mount.Source != path || !mount.RW {
+		expected, ok := want[mount.Destination]
+		if !ok || mount.Type != "bind" || mount.Source != expected.path || mount.RW == expected.readOnly {
 			return false
 		}
 		delete(want, mount.Destination)
@@ -725,7 +933,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context) (d
 func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRoot, relayToken, relayPublicAddress, relayBindAddress string) bool {
 	cmd := relay.Config.Cmd
 	if relay.Config.User != "65532:65532" || len(relay.Config.Volumes) != 0 || len(relay.Config.ExposedPorts) != 1 ||
-		relay.Config.ExposedPorts["22067/tcp"] == nil || relay.HostConfig.NetworkMode == "host" || relay.HostConfig.Privileged ||
+		relay.Config.ExposedPorts["22067/tcp"] == nil || !validWorkspaceSyncRelayNetwork(relay) || relay.HostConfig.Privileged ||
 		!relay.HostConfig.ReadonlyRootfs || len(relay.HostConfig.CapAdd) != 0 || !slices.Contains(relay.HostConfig.CapDrop, "ALL") ||
 		!slices.Contains(relay.HostConfig.SecurityOpt, "no-new-privileges:true") || relay.HostConfig.Memory != 256<<20 ||
 		relay.HostConfig.NanoCPUs != 250_000_000 || relay.HostConfig.PidsLimit != 64 || relay.HostConfig.RestartPolicy.Name != "unless-stopped" ||
@@ -745,6 +953,11 @@ func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRo
 		hasWorkspaceSyncRelayArg(cmd, "-token", relayToken) && !hasWorkspaceSyncRelayTokenEqualsFlag(cmd) &&
 		hasExactWorkspaceSyncRelayFlag(cmd, "-pools=") && hasExactWorkspaceSyncRelayFlag(cmd, "-status-srv=") &&
 		hasWorkspaceSyncRelayArg(cmd, "-ext-address", relayPublicAddress)
+}
+
+func validWorkspaceSyncRelayNetwork(relay dockerWorkspaceSyncRelayInspect) bool {
+	_, attached := relay.NetworkSettings.Networks[dockerWorkspaceSyncRelayNetwork]
+	return relay.HostConfig.NetworkMode == dockerWorkspaceSyncRelayNetwork && attached && len(relay.NetworkSettings.Networks) == 1
 }
 
 func validWorkspaceSyncRelayHostBinding(binding dockerPortBinding, publicAddress, bindAddress string) bool {
@@ -807,6 +1020,13 @@ func workspaceSyncImageMatches(configured, imageID string, repoDigests []string)
 	return slices.Contains(repoDigests, configured)
 }
 
+func (s *DockerWorkspaceSyncNodeSupervisor) quotaSupplementaryGroups() []string {
+	if s.gid == workspaceSyncNodeQuotaGroupID {
+		return nil
+	}
+	return []string{strconv.Itoa(workspaceSyncNodeQuotaGroupID)}
+}
+
 func (s *DockerWorkspaceSyncNodeSupervisor) inspectContainerByName(ctx context.Context, name string) (dockerWorkspaceSyncInspect, bool, error) {
 	value, err := s.inspectContainer(ctx, name)
 	if errors.Is(err, errDockerObjectNotFound) {
@@ -821,7 +1041,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) inspectContainer(ctx context.Context
 	return value, err
 }
 
-func (s *DockerWorkspaceSyncNodeSupervisor) createNode(ctx context.Context, ownerHash, name, networkName, statePath, workspacePath, apiKey string) (dockerWorkspaceSyncInspect, error) {
+func (s *DockerWorkspaceSyncNodeSupervisor) createNode(ctx context.Context, ownerHash, name, networkName, statePath, workspacePath, quotaSocketPath, apiKey string) (dockerWorkspaceSyncInspect, error) {
 	labels := map[string]string{
 		dockerWorkspaceSyncLabelManaged: "true",
 		dockerWorkspaceSyncLabelOwner:   ownerHash,
@@ -840,7 +1060,8 @@ func (s *DockerWorkspaceSyncNodeSupervisor) createNode(ctx context.Context, owne
 		"HostConfig": map[string]any{
 			"NetworkMode": networkName, "ReadonlyRootfs": true, "Privileged": false,
 			"CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges:true"},
-			"Memory": s.options.Resources.MemoryBytes, "MemorySwap": s.options.Resources.MemoryBytes,
+			"GroupAdd": s.quotaSupplementaryGroups(),
+			"Memory":   s.options.Resources.MemoryBytes, "MemorySwap": s.options.Resources.MemoryBytes,
 			"NanoCpus": s.options.Resources.NanoCPUs, "PidsLimit": s.options.Resources.PIDsLimit,
 			"IpcMode": "private", "CgroupnsMode": "private", "Init": true,
 			"AutoRemove": false, "LogConfig": map[string]any{"Type": "none", "Config": map[string]string{}},
@@ -850,6 +1071,8 @@ func (s *DockerWorkspaceSyncNodeSupervisor) createNode(ctx context.Context, owne
 				{"Type": "bind", "Source": statePath, "Target": dockerWorkspaceSyncConfigPath, "ReadOnly": false,
 					"BindOptions": map[string]string{"Propagation": "rprivate"}},
 				{"Type": "bind", "Source": workspacePath, "Target": dockerWorkspaceSyncFilesPath, "ReadOnly": false,
+					"BindOptions": map[string]string{"Propagation": "rprivate"}},
+				{"Type": "bind", "Source": quotaSocketPath, "Target": dockerWorkspaceSyncQuotaPath, "ReadOnly": true,
 					"BindOptions": map[string]string{"Propagation": "rprivate"}},
 			},
 		},

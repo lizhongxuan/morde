@@ -68,6 +68,49 @@ func TestManifestSHA256RejectsCaseFoldedDirectoryCollisions(t *testing.T) {
 	}
 }
 
+func TestManifestTreeSHA256PreservesV1WithoutEmptyDirectories(t *testing.T) {
+	emptyDigest, err := ManifestSHA256(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	treeDigest, err := ManifestTreeSHA256(nil, nil)
+	if err != nil || treeDigest != emptyDigest {
+		t.Fatalf("file-only tree digest = %q, %v; want V1 %q", treeDigest, err, emptyDigest)
+	}
+}
+
+func TestManifestTreeSHA256IncludesCanonicalEmptyDirectories(t *testing.T) {
+	emptySHA256 := sha256.Sum256(nil)
+	file := File{Path: "README.md", SizeBytes: 0, SHA256: hex.EncodeToString(emptySHA256[:]), Mode: 0644, Chunks: []Chunk{}}
+	first, err := ManifestTreeSHA256([]File{file}, []string{"cache", "docs/empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ManifestTreeSHA256([]File{file}, []string{"docs/empty", "cache"})
+	if err != nil || first != second {
+		t.Fatalf("tree digest depends on input order: %q, %q, %v", first, second, err)
+	}
+	changed, err := ManifestTreeSHA256([]File{file}, []string{"cache", "docs/other"})
+	if err != nil || changed == first {
+		t.Fatalf("tree digest ignored empty-directory path change: %q, %v", changed, err)
+	}
+	withoutDirectory, err := ManifestTreeSHA256([]File{file}, nil)
+	legacy, legacyErr := ManifestSHA256([]File{file})
+	if err != nil || legacyErr != nil || withoutDirectory != legacy {
+		t.Fatalf("file-only tree digest = %q, %v; legacy = %q, %v", withoutDirectory, err, legacy, legacyErr)
+	}
+}
+
+func TestManifestTreeSHA256RejectsDirectoryConflicts(t *testing.T) {
+	emptySHA256 := sha256.Sum256(nil)
+	file := File{Path: "cache/item", SizeBytes: 0, SHA256: hex.EncodeToString(emptySHA256[:]), Mode: 0644, Chunks: []Chunk{}}
+	for _, directories := range [][]string{{"cache"}, {"cache/item"}, {"cache/child", "cache"}, {"Cache", "cache"}, {"../escape"}} {
+		if _, err := ManifestTreeSHA256([]File{file}, directories); err == nil {
+			t.Fatalf("accepted conflicting empty directories %q", directories)
+		}
+	}
+}
+
 func TestManifestSHA256StreamMatchesSliceAndRejectsInvalidStreams(t *testing.T) {
 	emptySHA256 := sha256.Sum256(nil)
 	other := File{Path: "README.md", SHA256: hex.EncodeToString(emptySHA256[:]), Mode: 0644, Chunks: []Chunk{}}

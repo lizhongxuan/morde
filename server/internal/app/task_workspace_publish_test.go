@@ -46,7 +46,7 @@ func TestTaskWorkspacePublishPersistsOutputAndReplaysReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	reads := 0
-	receipt, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+	receipt, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, nil, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
 		reads++
 		if digest != file.SHA256 {
 			t.Fatalf("block digest = %q; want %q", digest, file.SHA256)
@@ -66,7 +66,7 @@ func TestTaskWorkspacePublishPersistsOutputAndReplaysReceipt(t *testing.T) {
 	if err != nil || proof.Revision != receipt.PublishedRevision {
 		t.Fatalf("VerifyCommittedArtifact() = %#v, %v", proof, err)
 	}
-	replayed, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, manifestSHA, func(context.Context, string) ([]byte, error) {
+	replayed, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, nil, manifestSHA, func(context.Context, string) ([]byte, error) {
 		t.Fatal("idempotent publish replay fetched Runtime block bytes")
 		return nil, nil
 	})
@@ -84,7 +84,7 @@ func TestTaskWorkspacePublishPersistsCASConflict(t *testing.T) {
 	}
 	store.workspace.Revision = 1
 	manifestSHA, _ := workspace.ManifestSHA256([]workspace.File{file})
-	receipt, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, manifestSHA, func(context.Context, string) ([]byte, error) {
+	receipt, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, nil, manifestSHA, func(context.Context, string) ([]byte, error) {
 		return append([]byte(nil), data...), nil
 	})
 	if domain.CodeOf(err) != domain.CodeWorkspaceConflict || receipt.State != TaskWorkspacePublishConflict || len(store.snapshots[2]) != 0 {
@@ -112,7 +112,7 @@ func TestTaskWorkspacePublishQuotaRejectsPendingReceipt(t *testing.T) {
 		t.Fatalf("ReserveTaskWorkspacePublish() error = %v", err)
 	}
 	manifestSHA, _ := workspace.ManifestSHA256([]workspace.File{file})
-	_, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, manifestSHA, func(context.Context, string) ([]byte, error) {
+	_, err := service.CommitTaskWorkspacePublish(context.Background(), command, []workspace.File{file}, nil, manifestSHA, func(context.Context, string) ([]byte, error) {
 		return append([]byte(nil), data...), nil
 	})
 	if domain.CodeOf(err) != domain.CodeQuotaExceeded {

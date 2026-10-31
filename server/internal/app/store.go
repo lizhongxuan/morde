@@ -56,12 +56,18 @@ type WorkspaceStore interface {
 	GetWorkspaceBinding(context.Context, string, string) (workspace.Binding, error)
 	CreateWorkspaceBinding(context.Context, workspace.Binding) (workspace.Binding, error)
 	TransitionWorkspaceBinding(context.Context, string, string, int64, workspace.BindingState, workspace.BindingState, int64, int64) (workspace.Binding, error)
-	AdvanceWorkspaceBindingAppliedRevision(context.Context, string, string, int64, int64) (workspace.Binding, error)
-	CompleteWorkspaceBindingUnbind(context.Context, string, string, int64, int64) (workspace.Binding, error)
+	AdvanceWorkspaceBindingAppliedRevision(context.Context, string, int64, string, int64, string, int64) (workspace.Binding, error)
+	CompleteWorkspaceBindingUnbind(context.Context, string, string, int64, int64, int64) (workspace.Binding, error)
 }
 
 type workspaceBindingSyncStatusStore interface {
 	SetWorkspaceBindingSyncStatus(context.Context, string, string, int64, workspace.BindingSyncState, []string) (workspace.Binding, error)
+}
+
+// HostReplicaWorkspaceStore provides generation-fenced mutations for the Host runtime; management paths keep using WorkspaceStore.
+type HostReplicaWorkspaceStore interface {
+	ActivateWorkspaceBindingForHost(context.Context, string, int64, string, int64, int64, int64) (workspace.Binding, error)
+	SetWorkspaceBindingSyncStatusForHost(context.Context, string, int64, string, int64, workspace.BindingSyncState, []string) (workspace.Binding, error)
 }
 
 type WorkspaceSyncCommitState string
@@ -75,6 +81,11 @@ const (
 type WorkspaceSyncCommitReceipt struct {
 	State  WorkspaceSyncCommitState
 	Result workspace.SyncSession
+}
+
+type WorkspaceCurrentMaterialization struct {
+	WorkspaceID, OwnerID             string
+	DesiredRevision, AppliedRevision int64
 }
 
 type TaskWorkspacePublishState string
@@ -107,6 +118,7 @@ type TaskWorkspacePublishReceipt struct {
 type WorkspaceSyncStore interface {
 	GetWorkspace(context.Context, string) (workspace.Workspace, error)
 	GetWorkspaceBinding(context.Context, string, string) (workspace.Binding, error)
+	CheckWorkspaceSyncHostReplicaAccess(context.Context, identity.Principal) error
 	CheckWorkspaceSyncDeviceAccess(context.Context, identity.Principal, string) error
 	WithWorkspaceSyncDeviceSessionAccess(context.Context, identity.Principal, string, string, func() error) error
 	TryWorkspaceBlockStoreLock(context.Context, string) (LeaderLock, bool, error)
@@ -127,7 +139,7 @@ type WorkspaceSyncStore interface {
 	ReserveTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error)
 	GetTaskWorkspacePublishReceipt(context.Context, TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error)
 	FindTaskWorkspacePublishReceipt(context.Context, string, string, string, string) (TaskWorkspacePublishReceipt, error)
-	CommitTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, []workspace.File, string) (TaskWorkspacePublishReceipt, error)
+	CommitTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, []workspace.File, []string, string) (TaskWorkspacePublishReceipt, error)
 	RejectTaskWorkspacePublishQuota(context.Context, TaskWorkspacePublishCommand) error
 	ReserveTaskWorkspaceBlockUsage(context.Context, string, []WorkspaceBlockReservation, int64) error
 	CancelWorkspaceSyncSession(context.Context, string, string, IdempotencyRecord) (workspace.SyncSession, bool, error)
@@ -147,6 +159,7 @@ type WorkspaceBlockReservation struct {
 	WorkspaceID   string
 	Digest        string
 	ReservedBytes int64
+	SizeBytes     int64
 }
 
 type WorkspaceBlockReservationTarget struct {
@@ -178,7 +191,7 @@ type UserStore interface {
 	GetUserByName(context.Context, string) (identity.User, error)
 	ListUsersByStatus(context.Context, *identity.AccountStatus) ([]identity.User, error)
 	CreateUser(context.Context, identity.User) (identity.User, error)
-	UpdateUserWithAudit(context.Context, string, identity.AccountStatus, identity.User, audit.Entry) (identity.User, error)
+	UpdateUserWithAudit(context.Context, string, identity.AccountStatus, identity.User, audit.Entry, func(context.Context) error) (identity.User, error)
 }
 
 type TokenStore interface {
@@ -195,7 +208,7 @@ type ClientLoginStore interface {
 	IssueClientWebSession(context.Context, identity.Principal, identity.Token) error
 	ListClientInstallations(context.Context, string) ([]identity.ClientInstallation, error)
 	GetClientInstallation(context.Context, string) (identity.ClientInstallation, error)
-	RevokeClientInstallation(context.Context, string, string, string, audit.ActorKind) error
+	RevokeClientInstallation(context.Context, string, string, string, audit.ActorKind, func(context.Context) error) error
 }
 
 type AuditStore interface {

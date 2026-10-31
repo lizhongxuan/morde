@@ -29,15 +29,18 @@ type LegacyWorkspaceVolume struct {
 	Revision    int64
 	UsedBytes   int64
 	QuotaBytes  int64
+	ImportError string
 }
 
-// WorkspaceLegacyImportStore commits the imported manifest and workspace state atomically.
+// WorkspaceLegacyImportStore persists legacy import and cleanup state.
 type WorkspaceLegacyImportStore interface {
 	TryWorkspaceBlockStoreLock(ctx context.Context, workspaceID string) (LeaderLock, bool, error)
 	GetPendingWorkspaceLegacyVolume(ctx context.Context, workspaceID string) (LegacyWorkspaceVolume, error)
+	EnsureWorkspaceLegacyImportReady(ctx context.Context, workspaceID string) error
+	MarkWorkspaceLegacyVolumeNeedsCleanup(context.Context, string, string) error
 	ReserveWorkspaceBlockUsage(context.Context, string, []WorkspaceBlockReservation, int64) error
 	FinalizeWorkspaceBlockUsage(context.Context, string, string, int64, int64) error
-	CommitWorkspaceLegacyVolumeImport(ctx context.Context, value LegacyWorkspaceVolume, files []workspace.File) (workspace.Workspace, error)
+	CommitWorkspaceLegacyVolumeImport(ctx context.Context, value LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (workspace.Workspace, error)
 }
 
 // LegacyWorkspaceVolumeSource opens an unattached legacy volume as a read-only filesystem.
@@ -60,6 +63,18 @@ type WorkspaceLegacyImportService struct {
 	maxOwnerBytes int64
 }
 
+type legacyWorkspaceCleanupRequiredError struct {
+	message string
+}
+
+func (e *legacyWorkspaceCleanupRequiredError) Error() string {
+	return e.message
+}
+
+func legacyWorkspaceCleanupRequired(message string) error {
+	return &legacyWorkspaceCleanupRequiredError{message: message}
+}
+
 func NewWorkspaceLegacyImportService(store WorkspaceLegacyImportStore, source LegacyWorkspaceVolumeSource, blocks WorkspaceLegacyImportBlockStore, maxOwnerBytes int64) (*WorkspaceLegacyImportService, error) {
 	if store == nil || source == nil || blocks == nil || maxOwnerBytes <= 0 {
 		return nil, errors.New("legacy workspace import dependencies and owner quota are required")
@@ -68,6 +83,9 @@ func NewWorkspaceLegacyImportService(store WorkspaceLegacyImportStore, source Le
 }
 
 func (s *WorkspaceLegacyImportService) Import(ctx context.Context, workspaceID string) (result workspace.Workspace, retErr error) {
+	if ctx == nil {
+		return workspace.Workspace{}, errors.New("context is required")
+	}
 	if !domain.ValidWorkspaceID(workspaceID) {
 		return workspace.Workspace{}, domain.InvalidArgument("workspace_id", "workspace id is invalid")
 	}
@@ -94,8 +112,11 @@ func (s *WorkspaceLegacyImportService) Import(ctx context.Context, workspaceID s
 	if legacy.WorkspaceID != workspaceID || legacy.VolumeName == "" || legacy.Revision != 0 || legacy.UsedBytes != 0 || legacy.QuotaBytes <= 0 {
 		return workspace.Workspace{}, errors.New("legacy workspace volume is not in an importable initial state")
 	}
-	// Portal refuses to serve while legacy imports are pending; the advisory lock
-	// serializes import commands, so only abandoned temporary blocks can exist here.
+	if err := s.store.EnsureWorkspaceLegacyImportReady(ctx, workspaceID); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("check workspace activity before legacy import cleanup: %w", err)
+	}
+	// The import lock excludes block writers; pending-import admission gates exclude
+	// new Task, MCP, receive, and publish work until the import commits.
 	if err := s.blocks.RemoveStaleTempBlocks(workspaceID); err != nil {
 		return workspace.Workspace{}, fmt.Errorf("recover temporary workspace blocks: %w", err)
 	}
@@ -111,10 +132,16 @@ func (s *WorkspaceLegacyImportService) Import(ctx context.Context, workspaceID s
 		return workspace.Workspace{}, errors.New("legacy workspace volume source returned an incomplete filesystem")
 	}
 
-	files, sources, existing, importErr := s.prepareLegacyImport(ctx, legacy, volumeFS)
+	files, sources, emptyDirectories, existing, importErr := s.prepareLegacyImport(ctx, legacy, volumeFS)
 	if importErr != nil {
-		_ = closer.Close()
-		return workspace.Workspace{}, importErr
+		closeErr := closer.Close()
+		var cleanupRequired *legacyWorkspaceCleanupRequiredError
+		if errors.As(importErr, &cleanupRequired) {
+			if err := s.store.MarkWorkspaceLegacyVolumeNeedsCleanup(ctx, workspaceID, importErr.Error()); err != nil {
+				return workspace.Workspace{}, errors.Join(importErr, fmt.Errorf("record legacy workspace cleanup requirement: %w", err), closeErr)
+			}
+		}
+		return workspace.Workspace{}, errors.Join(importErr, closeErr)
 	}
 	reservations, err := s.legacyBlockReservations(workspaceID, files, existing)
 	if err != nil {
@@ -125,7 +152,7 @@ func (s *WorkspaceLegacyImportService) Import(ctx context.Context, workspaceID s
 		_ = closer.Close()
 		return workspace.Workspace{}, err
 	}
-	writeErr := s.writeLegacyBlocks(ctx, legacy, volumeFS, sources, files, existing)
+	writeErr := s.writeLegacyBlocks(ctx, legacy, volumeFS, sources, files, existing, emptyDirectories)
 	closeErr := closer.Close()
 	if writeErr != nil {
 		return workspace.Workspace{}, writeErr
@@ -133,7 +160,7 @@ func (s *WorkspaceLegacyImportService) Import(ctx context.Context, workspaceID s
 	if closeErr != nil {
 		return workspace.Workspace{}, fmt.Errorf("close legacy workspace volume: %w", closeErr)
 	}
-	result, err = s.store.CommitWorkspaceLegacyVolumeImport(ctx, legacy, files)
+	result, err = s.store.CommitWorkspaceLegacyVolumeImport(ctx, legacy, files, emptyDirectories)
 	if err != nil {
 		return workspace.Workspace{}, fmt.Errorf("commit legacy workspace volume import: %w", err)
 	}
@@ -165,43 +192,47 @@ func (i legacyFileInfo) ModTime() time.Time { return i.modTime }
 func (i legacyFileInfo) IsDir() bool        { return i.mode.IsDir() }
 func (i legacyFileInfo) Sys() any           { return i.sys }
 
-func (s *WorkspaceLegacyImportService) prepareLegacyImport(ctx context.Context, legacy LegacyWorkspaceVolume, volumeFS fs.FS) ([]workspace.File, []legacySourceFile, map[string]struct{}, error) {
-	sources, err := scanLegacyWorkspace(ctx, volumeFS, legacy.QuotaBytes)
+func (s *WorkspaceLegacyImportService) prepareLegacyImport(ctx context.Context, legacy LegacyWorkspaceVolume, volumeFS fs.FS) ([]workspace.File, []legacySourceFile, []string, map[string]struct{}, error) {
+	sources, emptyDirectories, err := scanLegacyWorkspace(ctx, volumeFS, legacy.QuotaBytes)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	files := make([]workspace.File, 0, len(sources))
 	manifestBytes := int64(2) // JSON array delimiters.
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		file, err := readLegacyFile(ctx, volumeFS, source, nil)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("preflight legacy workspace file %q: %w", source.path, err)
+			return nil, nil, nil, nil, fmt.Errorf("preflight legacy workspace file %q: %w", source.path, err)
 		}
 		if len(files) > 0 {
 			manifestBytes++
 		}
 		encodedSize, err := legacyFileManifestSize(source.path, source.info.Size(), uint32(source.info.Mode().Perm()&0777))
 		if err != nil || manifestBytes > workspace.MaxSyncManifestBytes-encodedSize {
-			return nil, nil, nil, errors.New("legacy workspace manifest exceeds 16 MiB")
+			return nil, nil, nil, nil, legacyWorkspaceCleanupRequired("legacy workspace manifest exceeds 16 MiB; cleanup is required and the source Docker volume was retained")
 		}
 		manifestBytes += encodedSize
 		files = append(files, file)
 	}
 	if manifestBytes > workspace.MaxSyncManifestBytes {
-		return nil, nil, nil, errors.New("legacy workspace manifest exceeds 16 MiB")
+		return nil, nil, nil, nil, legacyWorkspaceCleanupRequired("legacy workspace manifest exceeds 16 MiB; cleanup is required and the source Docker volume was retained")
 	}
 	encodedManifest, err := json.Marshal(files)
 	if err != nil || int64(len(encodedManifest)) > workspace.MaxSyncManifestBytes {
-		return nil, nil, nil, errors.New("legacy workspace manifest exceeds 16 MiB")
+		return nil, nil, nil, nil, legacyWorkspaceCleanupRequired("legacy workspace manifest exceeds 16 MiB; cleanup is required and the source Docker volume was retained")
+	}
+	encodedDirectories, err := json.Marshal(emptyDirectories)
+	if err != nil || int64(len(encodedManifest)+len(encodedDirectories)) > workspace.MaxSyncManifestBytes {
+		return nil, nil, nil, nil, legacyWorkspaceCleanupRequired("legacy workspace manifest exceeds 16 MiB; cleanup is required and the source Docker volume was retained")
 	}
 
 	// Refuse unrelated pre-existing blocks so a retry can only reuse bytes from this source.
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	knownBlocks := make(map[string]struct{})
 	for _, file := range files {
@@ -211,16 +242,16 @@ func (s *WorkspaceLegacyImportService) prepareLegacyImport(ctx context.Context, 
 	}
 	existingBlocks, err := s.blocks.ListBlockDigests(legacy.WorkspaceID)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("list existing workspace blocks: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("list existing workspace blocks: %w", err)
 	}
 	existing := make(map[string]struct{}, len(existingBlocks))
 	for _, digest := range existingBlocks {
 		if _, ok := knownBlocks[digest]; !ok {
-			return nil, nil, nil, fmt.Errorf("legacy workspace import found an unrelated block %q", digest)
+			return nil, nil, nil, nil, fmt.Errorf("legacy workspace import found an unrelated block %q", digest)
 		}
 		existing[digest] = struct{}{}
 	}
-	return files, sources, existing, nil
+	return files, sources, emptyDirectories, existing, nil
 }
 
 func (s *WorkspaceLegacyImportService) legacyBlockReservations(workspaceID string, files []workspace.File, existing map[string]struct{}) ([]WorkspaceBlockReservation, error) {
@@ -248,7 +279,7 @@ func (s *WorkspaceLegacyImportService) legacyBlockReservations(workspaceID strin
 	return reservations, nil
 }
 
-func (s *WorkspaceLegacyImportService) writeLegacyBlocks(ctx context.Context, legacy LegacyWorkspaceVolume, volumeFS fs.FS, sources []legacySourceFile, files []workspace.File, existing map[string]struct{}) error {
+func (s *WorkspaceLegacyImportService) writeLegacyBlocks(ctx context.Context, legacy LegacyWorkspaceVolume, volumeFS fs.FS, sources []legacySourceFile, files []workspace.File, existing map[string]struct{}, emptyDirectories []string) error {
 	for i, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -261,16 +292,16 @@ func (s *WorkspaceLegacyImportService) writeLegacyBlocks(ctx context.Context, le
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := verifyLegacyWorkspaceTree(ctx, volumeFS, sources, legacy.QuotaBytes); err != nil {
+	if err := verifyLegacyWorkspaceTree(ctx, volumeFS, sources, emptyDirectories, legacy.QuotaBytes); err != nil {
 		return err
 	}
 	return ctx.Err()
 }
 
-func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) ([]legacySourceFile, error) {
+func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) ([]legacySourceFile, []string, error) {
 	root, err := fs.Stat(volumeFS, ".")
 	if err != nil || !root.IsDir() {
-		return nil, errors.New("legacy workspace volume root is unavailable")
+		return nil, nil, errors.New("legacy workspace volume root is unavailable")
 	}
 	sources := make([]legacySourceFile, 0)
 	pathCase := make(map[string]string)
@@ -299,7 +330,7 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 		}
 		entryCount++
 		if entryCount > maxLegacyWorkspaceEntries {
-			return errors.New("legacy workspace exceeds path entry limit")
+			return legacyWorkspaceCleanupRequired("legacy workspace exceeds the path entry limit; cleanup is required and the source Docker volume was retained")
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -308,6 +339,9 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 		mode := info.Mode()
 		if mode&fs.ModeSymlink != 0 || (!mode.IsDir() && !mode.IsRegular()) {
 			return fmt.Errorf("legacy workspace path %q is not a regular file or directory", name)
+		}
+		if mode.IsRegular() && info.Size() > workspace.MaxSyncFileBytes {
+			return legacyWorkspaceCleanupRequired(fmt.Sprintf("legacy workspace file %q is %d bytes, exceeding the 300 MiB file limit; cleanup is required and the source Docker volume was retained", name, info.Size()))
 		}
 		folded := strings.ToLower(name)
 		if previous, ok := pathCase[folded]; ok && previous != name {
@@ -337,24 +371,24 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 			return fmt.Errorf("legacy workspace file %q conflicts with a child path", name)
 		}
 		if fileCount >= workspace.MaxSyncFiles {
-			return errors.New("legacy workspace exceeds file count limit")
+			return legacyWorkspaceCleanupRequired("legacy workspace exceeds the file count limit; cleanup is required and the source Docker volume was retained")
 		}
 		if info.Size() < 0 || totalBytes > int64(^uint64(0)>>1)-info.Size() {
 			return errors.New("legacy workspace file sizes overflow int64")
 		}
 		if totalBytes > quotaBytes-info.Size() {
-			return errors.New("legacy workspace exceeds its quota")
+			return legacyWorkspaceCleanupRequired(fmt.Sprintf("legacy workspace file %q makes total size exceed its configured quota; cleanup is required and the source Docker volume was retained", name))
 		}
 		if fileCount > 0 {
 			manifestBytes++
 		}
 		encodedSize, err := legacyFileManifestSize(name, info.Size(), uint32(mode.Perm()&0777))
 		if err != nil || manifestBytes > workspace.MaxSyncManifestBytes-encodedSize {
-			return errors.New("legacy workspace manifest exceeds 16 MiB")
+			return legacyWorkspaceCleanupRequired("legacy workspace manifest exceeds 16 MiB; cleanup is required and the source Docker volume was retained")
 		}
 		manifestBytes += encodedSize
 		if manifestBytes > workspace.MaxSyncManifestBytes {
-			return errors.New("legacy workspace manifest exceeds 16 MiB")
+			return legacyWorkspaceCleanupRequired("legacy workspace manifest exceeds 16 MiB; cleanup is required and the source Docker volume was retained")
 		}
 		totalBytes += info.Size()
 		files[folded] = name
@@ -363,15 +397,20 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	emptyDirectories := make([]string, 0)
 	for dir, children := range dirChildren {
 		if dir != "." && children == 0 {
-			return nil, fmt.Errorf("legacy workspace contains empty directory %q", dir)
+			emptyDirectories = append(emptyDirectories, pathCase[dir])
 		}
 	}
+	if fileCount+len(emptyDirectories) > workspace.MaxSyncFiles {
+		return nil, nil, legacyWorkspaceCleanupRequired("legacy workspace exceeds the file and directory count limit; cleanup is required and the source Docker volume was retained")
+	}
 	sort.Slice(sources, func(i, j int) bool { return sources[i].path < sources[j].path })
-	return sources, nil
+	sort.Strings(emptyDirectories)
+	return sources, emptyDirectories, nil
 }
 
 type legacyBlockWriter struct {
@@ -519,16 +558,21 @@ func legacyFileManifestSize(filePath string, sizeBytes int64, mode uint32) (int6
 	return added, nil
 }
 
-func verifyLegacyWorkspaceTree(ctx context.Context, volumeFS fs.FS, sources []legacySourceFile, quotaBytes int64) error {
-	current, err := scanLegacyWorkspace(ctx, volumeFS, quotaBytes)
+func verifyLegacyWorkspaceTree(ctx context.Context, volumeFS fs.FS, sources []legacySourceFile, emptyDirectories []string, quotaBytes int64) error {
+	current, currentEmptyDirectories, err := scanLegacyWorkspace(ctx, volumeFS, quotaBytes)
 	if err != nil {
 		return fmt.Errorf("recheck legacy workspace volume: %w", err)
 	}
-	if len(current) != len(sources) {
+	if len(current) != len(sources) || len(currentEmptyDirectories) != len(emptyDirectories) {
 		return errors.New("legacy workspace volume changed during import")
 	}
 	for i := range sources {
 		if current[i].path != sources[i].path || !sameLegacyFileInfo(current[i].info, sources[i].info) {
+			return errors.New("legacy workspace volume changed during import")
+		}
+	}
+	for i := range emptyDirectories {
+		if currentEmptyDirectories[i] != emptyDirectories[i] {
 			return errors.New("legacy workspace volume changed during import")
 		}
 	}

@@ -154,14 +154,15 @@ func (s *hostReplicaService) CredentialForBinding(ctx context.Context, principal
 	return payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
-func (s *hostReplicaService) RecordAppliedRevision(ctx context.Context, principal identity.Principal, workspaceID string, bindingVersion, revision int64) (workspace.Binding, error) {
-	if principal.ReplicaWorkspaceID != workspaceID || principal.BindingVersion != bindingVersion || revision < 0 {
+func (s *hostReplicaService) RecordAppliedRevision(ctx context.Context, principal identity.Principal, workspaceID string, bindingVersion int64, sessionID string, revision int64) (workspace.Binding, error) {
+	if principal.ReplicaWorkspaceID != workspaceID || principal.BindingVersion != bindingVersion || !workspace.ValidSessionID(sessionID) || revision < 0 {
 		return workspace.Binding{}, domain.NewError(domain.CodeUnauthenticated, "host replica binding authorization is unavailable")
 	}
 	if err := s.verifyPrincipal(ctx, principal); err != nil {
 		return workspace.Binding{}, err
 	}
-	binding, err := s.workspaces.AdvanceWorkspaceBindingAppliedRevision(ctx, principal.HostScope, workspaceID, bindingVersion, revision)
+	binding, err := s.workspaces.AdvanceWorkspaceBindingAppliedRevision(ctx, principal.HostScope, principal.HostGeneration,
+		workspaceID, bindingVersion, sessionID, revision)
 	if err != nil {
 		return workspace.Binding{}, err
 	}
@@ -186,12 +187,12 @@ func (s *hostReplicaService) ReportWorkspaceSyncStatus(ctx context.Context, prin
 	if binding.OwnerID != principal.UserID || binding.BindingVersion != principal.BindingVersion || binding.State != workspace.BindingActive {
 		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "active workspace binding not found")
 	}
-	store, ok := s.workspaces.(workspaceBindingSyncStatusStore)
+	store, ok := s.workspaces.(HostReplicaWorkspaceStore)
 	if !ok {
 		return workspace.Binding{}, domain.NewError(domain.CodeUnsupported, "workspace sync status is unavailable")
 	}
-	return store.SetWorkspaceBindingSyncStatus(ctx, principal.HostScope, principal.ReplicaWorkspaceID,
-		principal.BindingVersion, state, conflicts)
+	return store.SetWorkspaceBindingSyncStatusForHost(ctx, principal.HostScope, principal.HostGeneration,
+		principal.ReplicaWorkspaceID, principal.BindingVersion, state, conflicts)
 }
 
 func (s *hostReplicaService) ActivateBinding(ctx context.Context, principal identity.Principal, workspaceID string, bindingVersion int64) (workspace.Binding, error) {
@@ -214,8 +215,12 @@ func (s *hostReplicaService) ActivateBinding(ctx context.Context, principal iden
 	if binding.State != workspace.BindingPreparing {
 		return workspace.Binding{}, domain.NewError(domain.CodeInvalidState, "workspace binding is not preparing")
 	}
-	return s.workspaces.TransitionWorkspaceBinding(ctx, principal.HostScope, workspaceID, bindingVersion,
-		workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
+	store, ok := s.workspaces.(HostReplicaWorkspaceStore)
+	if !ok {
+		return workspace.Binding{}, domain.NewError(domain.CodeUnsupported, "workspace binding activation is unavailable")
+	}
+	return store.ActivateWorkspaceBindingForHost(ctx, principal.HostScope, principal.HostGeneration, workspaceID,
+		bindingVersion, binding.DesiredRevision, binding.AppliedRevision)
 }
 
 func (s *hostReplicaService) CompleteUnbinding(ctx context.Context, principal identity.Principal, workspaceID string, bindingVersion, checkpointRevision int64) (workspace.Binding, error) {
@@ -232,10 +237,10 @@ func (s *hostReplicaService) CompleteUnbinding(ctx context.Context, principal id
 	if binding.OwnerID != principal.UserID || binding.BindingVersion != bindingVersion || binding.State != workspace.BindingUnbinding {
 		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding is not unbinding")
 	}
-	if binding.Workspace.Revision != checkpointRevision || binding.DesiredRevision != checkpointRevision {
+	if binding.Workspace.Revision != checkpointRevision || binding.DesiredRevision != checkpointRevision || binding.AppliedRevision != checkpointRevision {
 		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace changed after the Host checkpoint")
 	}
-	return s.workspaces.CompleteWorkspaceBindingUnbind(ctx, principal.HostScope, workspaceID, bindingVersion, checkpointRevision)
+	return s.workspaces.CompleteWorkspaceBindingUnbind(ctx, principal.HostScope, workspaceID, bindingVersion, principal.HostGeneration, checkpointRevision)
 }
 
 func (s *hostReplicaService) verifyPrincipal(ctx context.Context, principal identity.Principal) error {

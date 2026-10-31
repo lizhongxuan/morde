@@ -180,9 +180,17 @@ docker exec --env MORDE_RUNTIME_BOOTSTRAP_KEY= --env MORDE_HOST_REPLICA_KEY= "$c
 ' sh "$credential" "$replica_credential"
 docker exec --env MORDE_RUNTIME_BOOTSTRAP_KEY= --env MORDE_HOST_REPLICA_KEY= --user 1000:1000 "$container" sh -c 'test ! -r /run/morde-runtime/credential && test ! -r /run/morde-runtime/replica-credential'
 docker exec --user 0:0 "$container" sh -c '
-  test "$(stat -c %u:%g:%a /home/gem/workspace)" = 0:1000:2770
+  test "$(stat -c %u:%g:%a /home/gem/workspace)" = 0:1000:3770
+  install -d -o root -g root -m 0700 /home/gem/workspace/.morde-task-views
   printf runtime-created > /home/gem/workspace/runtime-created-by-root
   chmod 0660 /home/gem/workspace/runtime-created-by-root
+'
+docker exec --user 1000:1000 "$container" sh -c '
+  if mv /home/gem/workspace/.morde-task-views /home/gem/workspace/.morde-task-views-replaced 2>/dev/null; then
+    exit 1
+  fi
+  test -d /home/gem/workspace/.morde-task-views
+  test ! -r /home/gem/workspace/.morde-task-views
 '
 docker exec "$container" sh -c '
   for process_env in /proc/[0-9]*/environ; do

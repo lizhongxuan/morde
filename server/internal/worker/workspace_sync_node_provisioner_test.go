@@ -26,6 +26,51 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
+type workspaceSyncQuotaSocketManagerStub struct{ err error }
+
+func (s workspaceSyncQuotaSocketManagerStub) EnsureOwner(context.Context, string) error { return s.err }
+func (workspaceSyncQuotaSocketManagerStub) Close() error                                { return nil }
+
+func workspaceSyncNoopStartGuard() WorkspaceSyncNodeStartGuard {
+	return WorkspaceSyncNodeStartGuardFunc(func(context.Context, string) error { return nil })
+}
+
+func TestWorkspaceSyncNodeProvisionerObserveDoesNotEnsureOrTouchRelayGate(t *testing.T) {
+	relayRoot := t.TempDir()
+	supervisor := &workspaceSyncNodeSupervisorStub{
+		observation: workspace.SyncNodeObservation{
+			Present: true, Running: true,
+			ConnectedDeviceIDs: []string{testWorkspaceSyncDevice},
+			Folders: []workspace.SyncNodeFolderObservation{{
+				FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", State: "syncing", NeedBytes: 11, NeedFiles: 2,
+			}},
+		},
+		workspaceSyncRelayConfig: workspaceSyncRelayConfig{
+			StateRoot: relayRoot, PublicAddress: "8.8.8.8:22067", BindAddress: "172.18.141.222", Token: workspaceSyncTestRelayToken,
+		},
+	}
+	gate := &workspaceSyncRelayGateStub{}
+	provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
+		Supervisor: supervisor, Store: &workspaceSyncNodeStoreStub{}, RelayGate: gate,
+		QuotaSockets: workspaceSyncQuotaSocketManagerStub{}, StartGuard: workspaceSyncNoopStartGuard(), DataKey: []byte(strings.Repeat("k", 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := provisioner.ObserveWorkspaceSyncNode(context.Background(), testWorkspaceSyncOwner)
+	if err != nil {
+		t.Fatalf("ObserveWorkspaceSyncNode() error = %v", err)
+	}
+	if got.Present != supervisor.observation.Present || got.Running != supervisor.observation.Running ||
+		len(got.ConnectedDeviceIDs) != 1 || len(got.Folders) != 1 || supervisor.observeCalls != 1 ||
+		supervisor.observeOwnerID != testWorkspaceSyncOwner || supervisor.observeAPIKey == "" || supervisor.ensureCalls != 0 || supervisor.stopCalls != 0 {
+		t.Fatalf("observation=%+v supervisor=%+v", got, supervisor)
+	}
+	if len(gate.calls) != 0 {
+		t.Fatalf("ObserveWorkspaceSyncNode() changed relay gate: %v", gate.calls)
+	}
+}
+
 const (
 	testWorkspaceSyncOwner    = "u1234567"
 	testWorkspaceSyncDevice   = "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA"
@@ -38,6 +83,12 @@ type workspaceSyncNodeSupervisorStub struct {
 	ownerID          string
 	apiKey           string
 	apiURL           string
+	ensureCalls      int
+	observeCalls     int
+	observeOwnerID   string
+	observeAPIKey    string
+	observation      workspace.SyncNodeObservation
+	observeError     error
 	ensureError      error
 	stopError        error
 	stopCalls        int
@@ -46,12 +97,40 @@ type workspaceSyncNodeSupervisorStub struct {
 	workspaceSyncRelayConfig
 }
 
+type workspaceSyncRelayGateStub struct {
+	mu           sync.Mutex
+	calls        []string
+	enableError  error
+	disableError error
+}
+
+func (s *workspaceSyncRelayGateStub) Enable(_ context.Context, ownerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "enable:"+ownerID)
+	return s.enableError
+}
+
+func (s *workspaceSyncRelayGateStub) Disable(_ context.Context, ownerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "disable:"+ownerID)
+	return s.disableError
+}
+
 func (s *workspaceSyncNodeSupervisorStub) Ensure(_ context.Context, ownerID, apiKey string) (DockerWorkspaceSyncNode, error) {
+	s.ensureCalls++
 	s.ownerID, s.apiKey = ownerID, apiKey
 	if s.ensureError != nil {
 		return DockerWorkspaceSyncNode{}, s.ensureError
 	}
 	return DockerWorkspaceSyncNode{ContainerID: strings.Repeat("a", 64), APIURL: s.apiURL}, nil
+}
+
+func (s *workspaceSyncNodeSupervisorStub) Observe(_ context.Context, ownerID, apiKey string) (workspace.SyncNodeObservation, error) {
+	s.observeCalls++
+	s.observeOwnerID, s.observeAPIKey = ownerID, apiKey
+	return s.observation, s.observeError
 }
 
 func (s *workspaceSyncNodeSupervisorStub) StopOwner(ctx context.Context, ownerID string) error {
@@ -66,14 +145,15 @@ func (s *workspaceSyncNodeSupervisorStub) relayConfig() workspaceSyncRelayConfig
 }
 
 type workspaceSyncNodeStoreStub struct {
-	owners     []string
-	state      workspace.SyncNodeDesiredState
-	reconcile  int
-	applyError error
-	expiryScan bool
+	owners        []string
+	pendingOwners []string
+	state         workspace.SyncNodeDesiredState
+	reconcile     int
+	applyError    error
+	expiryScan    bool
 }
 
-func (s *workspaceSyncNodeStoreStub) RevokeExpiredWorkspaceSyncDevices(context.Context) error {
+func (s *workspaceSyncNodeStoreStub) RevokeExpiredWorkspaceSyncDevices(context.Context, func(context.Context, string) error) error {
 	s.expiryScan = true
 	return nil
 }
@@ -82,18 +162,36 @@ func (s *workspaceSyncNodeStoreStub) ListWorkspaceSyncNodeOwnersToReconcile(cont
 	if !s.expiryScan {
 		return nil, fmt.Errorf("expired Workspace sync devices were not scanned before listing owners")
 	}
+	if s.pendingOwners != nil {
+		return append([]string(nil), s.pendingOwners...), nil
+	}
 	return append([]string(nil), s.owners...), nil
 }
 
-func (s *workspaceSyncNodeStoreStub) ReconcileWorkspaceSyncNode(ctx context.Context, ownerID string,
-	apply func(context.Context, workspace.SyncNodeDesiredState) error) error {
+func (s *workspaceSyncNodeStoreStub) ListWorkspaceSyncNodeOwners(context.Context) ([]string, error) {
+	return append([]string(nil), s.owners...), nil
+}
+
+func (s *workspaceSyncNodeStoreStub) ReconcileWorkspaceSyncNodeWithRelayGate(ctx context.Context, ownerID string,
+	apply func(context.Context, workspace.SyncNodeDesiredState) error,
+	enableRelay func(context.Context, workspace.SyncNodeDesiredState) error,
+	disableRelay func(context.Context) error) error {
 	s.reconcile++
+	if err := disableRelay(ctx); err != nil {
+		return err
+	}
 	if s.applyError != nil {
 		return s.applyError
 	}
 	state := s.state
 	state.OwnerID = ownerID
-	return apply(ctx, state)
+	if err := apply(ctx, state); err != nil {
+		return err
+	}
+	if len(state.Folders) > 0 {
+		return enableRelay(ctx, state)
+	}
+	return nil
 }
 
 type workspaceSyncNodeTestAPI struct {
@@ -282,7 +380,8 @@ func TestWorkspaceSyncNodeProvisionerAppliesSnapshotAndReturnsPinnedRelay(t *tes
 	}}
 	dataKey := []byte(strings.Repeat("k", 32))
 	provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
-		Supervisor: supervisor, Store: store, DataKey: dataKey,
+		Supervisor: supervisor, Store: store, RelayGate: &workspaceSyncRelayGateStub{}, QuotaSockets: workspaceSyncQuotaSocketManagerStub{},
+		StartGuard: workspaceSyncNoopStartGuard(), DataKey: dataKey,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -296,6 +395,9 @@ func TestWorkspaceSyncNodeProvisionerAppliesSnapshotAndReturnsPinnedRelay(t *tes
 		supervisor.ownerID != testWorkspaceSyncOwner || supervisor.apiKey != api.apiKey || store.reconcile != 1 || api.statusCalls.Load() != 3 || supervisor.stopCalls != 0 {
 		t.Fatalf("connection=%+v owner=%q key_match=%t reconciles=%d status_calls=%d", connection, supervisor.ownerID,
 			supervisor.apiKey == api.apiKey, store.reconcile, api.statusCalls.Load())
+	}
+	if calls := strings.Join(provisioner.relayGate.(*workspaceSyncRelayGateStub).calls, ","); calls != "disable:"+testWorkspaceSyncOwner+",enable:"+testWorkspaceSyncOwner {
+		t.Fatalf("relay gate calls = %q", calls)
 	}
 	if len(api.listenAddresses) != 1 || api.listenAddresses[0] != nodeRelayURI {
 		t.Fatalf("node listen addresses = %v", api.listenAddresses)
@@ -329,6 +431,7 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 		invalidRelayCert bool
 		optionsError     bool
 		storeError       error
+		gateEnableError  error
 		cancelRequestCtx bool
 	}{
 		{name: "supervisor ensure", ensureError: errors.New("supervisor failed")},
@@ -338,6 +441,7 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 		{name: "relay certificate", invalidRelayCert: true},
 		{name: "private relay configuration", optionsError: true},
 		{name: "store reconciliation", storeError: storeFailure},
+		{name: "relay gate activation", gateEnableError: errors.New("nftables gate failed")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -367,8 +471,17 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 				},
 			}
 			store := &workspaceSyncNodeStoreStub{applyError: test.storeError}
+			if test.gateEnableError != nil {
+				store.owners = []string{testWorkspaceSyncOwner}
+				store.pendingOwners = []string{}
+				store.state = workspace.SyncNodeDesiredState{Folders: []workspace.SyncNodeFolder{{
+					WorkspaceID: "w1234567", FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeviceIDs: []string{testWorkspaceSyncDevice},
+				}}}
+			}
+			gate := &workspaceSyncRelayGateStub{enableError: test.gateEnableError}
 			provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
-				Supervisor: supervisor, Store: store, DataKey: []byte(strings.Repeat("k", 32)),
+				Supervisor: supervisor, Store: store, RelayGate: gate, QuotaSockets: workspaceSyncQuotaSocketManagerStub{},
+				StartGuard: workspaceSyncNoopStartGuard(), DataKey: []byte(strings.Repeat("k", 32)),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -381,7 +494,12 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 				cancel()
 				ctx = cancelledCtx
 			}
-			if _, err := provisioner.EnsureWorkspaceSyncNode(ctx, testWorkspaceSyncOwner); err == nil {
+			if test.gateEnableError != nil {
+				err = provisioner.ReconcileWorkspaceSyncNodesOnStartup(ctx)
+			} else {
+				_, err = provisioner.EnsureWorkspaceSyncNode(ctx, testWorkspaceSyncOwner)
+			}
+			if err == nil {
 				t.Fatal("provisioning failure was accepted")
 			}
 			if supervisor.stopCalls != 1 || supervisor.stopOwnerID != testWorkspaceSyncOwner {
@@ -389,6 +507,24 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 			}
 			if supervisor.stopContextError != nil {
 				t.Fatalf("StopOwner received canceled context: %v", supervisor.stopContextError)
+			}
+			if test.gateEnableError != nil && !slices.Equal(gate.calls, []string{
+				"disable:" + testWorkspaceSyncOwner, "enable:" + testWorkspaceSyncOwner,
+				"disable:" + testWorkspaceSyncOwner,
+			}) {
+				t.Fatalf("relay gate calls after activation failure = %v", gate.calls)
+			}
+			if test.gateEnableError != nil {
+				gate.enableError = nil
+				if err := provisioner.ReconcilePendingWorkspaceSyncNodes(context.Background()); err != nil {
+					t.Fatalf("retry startup owner after transient gate failure: %v", err)
+				}
+				if store.reconcile != 2 || !slices.Equal(gate.calls[len(gate.calls)-2:], []string{
+					"disable:" + testWorkspaceSyncOwner,
+					"enable:" + testWorkspaceSyncOwner,
+				}) {
+					t.Fatalf("startup relay retry reconcile=%d gate calls=%v", store.reconcile, gate.calls)
+				}
 			}
 		})
 	}
@@ -407,7 +543,8 @@ func TestWorkspaceSyncNodeProvisionerJoinsStopErrorAndRedactsSecrets(t *testing.
 		},
 	}
 	provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
-		Supervisor: supervisor, Store: &workspaceSyncNodeStoreStub{}, DataKey: []byte(strings.Repeat("k", 32)),
+		Supervisor: supervisor, Store: &workspaceSyncNodeStoreStub{}, RelayGate: &workspaceSyncRelayGateStub{},
+		QuotaSockets: workspaceSyncQuotaSocketManagerStub{}, StartGuard: workspaceSyncNoopStartGuard(), DataKey: []byte(strings.Repeat("k", 32)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -569,26 +706,27 @@ func TestWorkspaceSyncNodeProvisionerRejectsInvalidInputsAndReconcilesPendingOwn
 		StateRoot: relayRoot, PublicAddress: "8.8.8.8:22067", BindAddress: "172.18.141.222", Token: workspaceSyncTestRelayToken,
 	}}
 	store := &workspaceSyncNodeStoreStub{owners: []string{testWorkspaceSyncOwner}, state: workspace.SyncNodeDesiredState{Revision: 1}}
-	options := WorkspaceSyncNodeProvisionerOptions{Supervisor: supervisor, Store: store, DataKey: []byte(strings.Repeat("k", 32))}
+	options := WorkspaceSyncNodeProvisionerOptions{Supervisor: supervisor, Store: store, RelayGate: &workspaceSyncRelayGateStub{},
+		QuotaSockets: workspaceSyncQuotaSocketManagerStub{}, StartGuard: workspaceSyncNoopStartGuard(), DataKey: []byte(strings.Repeat("k", 32))}
 	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: supervisor, DataKey: options.DataKey}); err == nil {
 		t.Fatal("missing durable reconciliation store was accepted")
 	}
-	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: supervisor, Store: store, DataKey: []byte("short")}); err == nil {
+	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: supervisor, Store: store, RelayGate: options.RelayGate, DataKey: []byte("short")}); err == nil {
 		t.Fatal("short data key was accepted")
 	}
 	invalidRelaySupervisor := *supervisor
-	invalidRelaySupervisor.workspaceSyncRelayConfig.PublicAddress = "https://relay.example.test:22067/path"
-	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, DataKey: options.DataKey}); err == nil {
+	invalidRelaySupervisor.PublicAddress = "https://relay.example.test:22067/path"
+	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, RelayGate: options.RelayGate, DataKey: options.DataKey}); err == nil {
 		t.Fatal("invalid relay address was accepted")
 	}
 	invalidRelaySupervisor = *supervisor
-	invalidRelaySupervisor.workspaceSyncRelayConfig.Token = ""
-	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, DataKey: options.DataKey}); err == nil {
+	invalidRelaySupervisor.Token = ""
+	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, RelayGate: options.RelayGate, DataKey: options.DataKey}); err == nil {
 		t.Fatal("missing relay token was accepted")
 	}
 	invalidRelaySupervisor = *supervisor
-	invalidRelaySupervisor.workspaceSyncRelayConfig.BindAddress = "0.0.0.0"
-	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, DataKey: options.DataKey}); err == nil {
+	invalidRelaySupervisor.BindAddress = "0.0.0.0"
+	if _, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{Supervisor: &invalidRelaySupervisor, Store: store, RelayGate: options.RelayGate, DataKey: options.DataKey}); err == nil {
 		t.Fatal("unspecified relay bind address was accepted")
 	}
 	provisioner, err := NewWorkspaceSyncNodeProvisioner(options)

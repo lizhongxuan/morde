@@ -18,6 +18,8 @@ type blockGCTestStore struct {
 	lockBusy     bool
 	lockCalls    int
 	expireCalls  int
+	legacyCalls  int
+	legacyErr    error
 	cutoff       time.Time
 }
 
@@ -44,6 +46,15 @@ func (s *blockGCTestStore) ExpireIdleWorkspaceSyncSessions(_ context.Context, _ 
 }
 
 func (s *blockGCTestStore) WithWorkspaceBlockGC(_ context.Context, _ string, collect func([]workspace.BlockReference) ([]WorkspaceBlockRemoval, error)) error {
+	_, err := collect(append([]workspace.BlockReference(nil), s.references...))
+	return err
+}
+
+func (s *blockGCTestStore) WithPendingLegacyImportWorkspaceBlockGC(_ context.Context, _ string, collect func([]workspace.BlockReference) ([]WorkspaceBlockRemoval, error)) error {
+	s.legacyCalls++
+	if s.legacyErr != nil {
+		return s.legacyErr
+	}
 	_, err := collect(append([]workspace.BlockReference(nil), s.references...))
 	return err
 }
@@ -184,5 +195,52 @@ func TestWorkspaceBlockGarbageCollectorReportsTempCleanupFailure(t *testing.T) {
 	_, err = gc.Collect(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "temp cleanup failed") {
 		t.Fatalf("Collect() error = %v, want temp cleanup failure", err)
+	}
+}
+
+func TestWorkspaceBlockGarbageCollectorRecoversPendingLegacyImport(t *testing.T) {
+	kept := strings.Repeat("1", 64)
+	active := strings.Repeat("2", 64)
+	orphan := strings.Repeat("3", 64)
+	store := &blockGCTestStore{
+		references: []workspace.BlockReference{
+			{WorkspaceID: "w1234567", SHA256: kept, SizeBytes: 8},
+			{WorkspaceID: "w1234567", SHA256: active, SizeBytes: 16},
+		},
+	}
+	files := &blockGCTestFiles{blocks: map[string]map[string]int64{
+		"w1234567": {kept: 8, active: 16, orphan: 32},
+	}}
+	gc, err := NewWorkspaceBlockGarbageCollector(store, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := gc.CollectPendingLegacyImport(context.Background(), "w1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.legacyCalls != 1 || store.expireCalls != 0 || store.lockCalls != 1 ||
+		stats.WorkspacesScanned != 1 || stats.BlocksDeleted != 1 || stats.BytesReclaimed != 32 {
+		t.Fatalf("pending import cleanup stats=%#v legacy=%d expire=%d locks=%d", stats, store.legacyCalls, store.expireCalls, store.lockCalls)
+	}
+	if len(files.blocks["w1234567"]) != 2 || files.blocks["w1234567"][kept] != 8 || files.blocks["w1234567"][active] != 16 {
+		t.Fatalf("pending import GC removed a protected block: %v", files.blocks["w1234567"])
+	}
+}
+
+func TestWorkspaceBlockGarbageCollectorRecoversMoreThanRoutineBatch(t *testing.T) {
+	blocks := make(map[string]int64, workspaceBlockGCDeletesPerRun+1)
+	for i := 0; i <= workspaceBlockGCDeletesPerRun; i++ {
+		blocks[fmt.Sprintf("%064x", i+1)] = 1
+	}
+	store := &blockGCTestStore{}
+	files := &blockGCTestFiles{blocks: map[string]map[string]int64{"w1234567": blocks}}
+	gc, err := NewWorkspaceBlockGarbageCollector(store, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := gc.CollectPendingLegacyImport(context.Background(), "w1234567")
+	if err != nil || stats.BlocksDeleted != workspaceBlockGCDeletesPerRun+1 || len(blocks) != 0 {
+		t.Fatalf("pending import cleanup = %#v, %v; remaining=%d", stats, err, len(blocks))
 	}
 }

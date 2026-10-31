@@ -482,6 +482,20 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskOperationAdmission(t *test
 		loadedOperation.WorkspaceCheckpointRevision == nil || *loadedOperation.WorkspaceCheckpointRevision != revision {
 		t.Fatalf("load revision-bound task operation: %#v, err=%v", loadedOperation, err)
 	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, workspaceValue.ID, "legacy-"+workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureWorkspaceLegacyImportReady(ctx, workspaceValue.ID); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("legacy import preflight during active Task operations = %v; want workspace busy", err)
+	}
+	blockedByImport := operation
+	blockedByImport.ID, blockedByImport.Key, blockedByImport.RequestHash = mustID(t, domain.NewOperationID), "blocked-by-legacy-import", hashBytes("blocked by legacy import")
+	if _, _, err := store.CreateOperation(ctx, blockedByImport, claimed.Lease.Owner); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("Task operation admission during pending legacy import = %v; want workspace busy", err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM workspace_legacy_volumes WHERE workspace_id=$1`, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
 	writeKey := "file-write-output"
 	writerOperation, replayed, err := store.CreateOperation(ctx, task.Operation{
 		ID: mustID(t, domain.NewOperationID), TaskID: writer.ID, Key: writeKey,
@@ -810,7 +824,7 @@ func TestPostgresClientTaskAuthorizationSnapshotSurvivesReloadAndRevocation(t *t
 		claimed.Authorization.TokenID, hostValue.ID, nil, identity.ScopeTaskSubmit); err != nil {
 		t.Fatalf("authorize task before installation revocation: %v", err)
 	}
-	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", auditdomain.ActorSession); err != nil {
+	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", auditdomain.ActorSession, nil); err != nil {
 		t.Fatalf("revoke installation: %v", err)
 	}
 	if err := credentials.AuthorizeTaskAction(ctx, owner.ID, identity.Kind(claimed.Authorization.Kind),

@@ -98,7 +98,29 @@ def is_within(parent: Path, child: Path) -> bool:
 def reject_overlapping_paths(*paths: Path) -> None:
     for index, path in enumerate(paths):
         if any(is_within(path, other) or is_within(other, path) for other in paths[index + 1 :]):
-            raise BackupError("PostgreSQL, Workspace, and Site storage directories must not overlap")
+            raise BackupError("PostgreSQL, Workspace block, Workspace current, and Site storage directories must not overlap")
+
+
+def directory_identities(path: Path, label: str) -> tuple[tuple[int, int] | None, set[tuple[int, int]]]:
+    identities: set[tuple[int, int]] = set()
+    leaf_identity: tuple[int, int] | None = None
+    current = path
+    first = True
+    while True:
+        try:
+            info = current.stat()
+        except OSError as exc:
+            raise BackupError(f"cannot verify directory ancestry for {label}") from exc
+        if stat.S_ISDIR(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
+            identities.add(identity)
+            if first:
+                leaf_identity = identity
+        if current == current.parent:
+            break
+        current = current.parent
+        first = False
+    return leaf_identity, identities
 
 
 def ensure_local_filesystem(path: Path, label: str) -> None:
@@ -283,6 +305,12 @@ def require_portal_stopped() -> None:
 
 
 def require_no_running_container_mounts(sources: dict[str, Path]) -> None:
+    protected = []
+    for root in sources.values():
+        identity, ancestry = directory_identities(root, "protected storage")
+        if identity is None:
+            raise BackupError("protected storage root is not a directory")
+        protected.append((root, identity, ancestry))
     for container_id in run([DOCKER_BIN, "ps", "--quiet"]).split():
         if not re.fullmatch(r"[0-9a-fA-F]{12,64}", container_id):
             raise BackupError("Docker returned an invalid running container identifier")
@@ -340,7 +368,14 @@ def require_no_running_container_mounts(sources: dict[str, Path]) -> None:
                         mounted_path = Path(device).resolve(strict=False)
                     except (OSError, RuntimeError) as exc:
                         raise BackupError("Docker returned an unresolvable local volume device path") from exc
-            if any(is_within(root, mounted_path) or is_within(mounted_path, root) for root in sources.values()):
+            mounted_identity, mounted_ancestry = directory_identities(mounted_path, "running Docker container mount source")
+            if any(
+                is_within(root, mounted_path)
+                or is_within(mounted_path, root)
+                or identity in mounted_ancestry
+                or (mounted_identity is not None and mounted_identity in ancestry)
+                for root, identity, ancestry in protected
+            ):
                 mount_label = "bind mount" if mount_type == "bind" else "named volume"
                 raise BackupError(
                     f"running Docker container {container_id[:12]} has a writable {mount_label} overlapping protected storage; "
@@ -392,9 +427,15 @@ def postgres_control_data(root: Path, image: str) -> str:
 def source_paths(args: argparse.Namespace) -> dict[str, Path]:
     pgdata = canonical_dir(args.postgres_data_dir, "PostgreSQL data directory")
     workspace = canonical_dir(args.workspace_root, "workspace block store")
+    current = canonical_dir(args.workspace_current_root, "Workspace current directory")
     site = canonical_dir(args.site_storage_root, "Site artifact store")
-    reject_overlapping_paths(pgdata, workspace, site)
-    return {"postgres_data_dir": pgdata, "workspace_root": workspace, "site_storage_root": site}
+    reject_overlapping_paths(pgdata, workspace, current, site)
+    return {
+        "postgres_data_dir": pgdata,
+        "workspace_root": workspace,
+        "workspace_current_root": current,
+        "site_storage_root": site,
+    }
 
 
 def bundle_path(path_text: str) -> Path:
@@ -463,7 +504,8 @@ def create_bundle(bundle: Path, sources: dict[str, Path], image: str) -> None:
     if bundle.exists():
         raise BackupError("backup bundle already exists; refusing to overwrite it")
     ensure_local_filesystem(bundle.parent.resolve(strict=True), "backup destination")
-    for key, path in sources.items():
+    for key, _ in BACKUP_TARGETS:
+        path = sources[key]
         ensure_local_filesystem(path, key)
         if os.path.ismount(path):
             raise BackupError("data directory roots cannot themselves be mount points; same-path restore requires sibling renames")
@@ -489,7 +531,7 @@ def create_bundle(bundle: Path, sources: dict[str, Path], image: str) -> None:
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
             "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-            "source_paths": {key: str(path) for key, path in sources.items()},
+            "source_paths": {key: str(sources[key]) for key, _ in BACKUP_TARGETS},
             "postgres": {"major_version": pg_major, "image": image},
             "workspace_store": {"block_count": block_count, "block_bytes": block_bytes},
             "site_store": {"release_count": release_count, "file_count": site_file_count, "file_bytes": site_file_bytes},
@@ -791,7 +833,7 @@ def validate_live_sources(sources: dict[str, Path], image: str, major: str) -> N
     validate_workspace_store(sources["workspace_root"])
     validate_site_store(sources["site_storage_root"])
     postgres_control_data(sources["postgres_data_dir"], image)
-    if any(os.path.ismount(path) for path in sources.values()):
+    if any(os.path.ismount(sources[key]) for key, _ in BACKUP_TARGETS):
         raise BackupError("data directory roots cannot themselves be mount points; same-path restore requires sibling renames")
 
 
@@ -832,7 +874,7 @@ def restore_command(args: argparse.Namespace) -> None:
     metadata = verify_bundle(bundle)
     env_file, compose_file, sources = get_args_paths(args)
     ensure_bundle_outside_sources(bundle, sources)
-    if {key: str(path) for key, path in sources.items()} != metadata["source_paths"]:
+    if {key: str(sources[key]) for key, _ in BACKUP_TARGETS} != metadata["source_paths"]:
         raise BackupError("restore requires the exact PostgreSQL, Workspace, and Site paths recorded in the backup")
     image = check_services_stopped(env_file, compose_file, sources)
     if image != metadata["postgres"]["image"]:
@@ -857,7 +899,7 @@ def restore_command(args: argparse.Namespace) -> None:
         "status": "staging",
         "backup_bundle": str(bundle),
         "rollback_bundle": str(rollback_bundle),
-        "targets": {key: str(target) for key, target in sources.items()},
+        "targets": {key: str(sources[key]) for key, _ in BACKUP_TARGETS},
         "temporary_paths": {
             **{f"{key}_stage": str(stage) for key, _, _, stage, _ in paths},
             **{f"{key}_before_restore": str(hold) for key, _, hold, _, _ in paths},
@@ -922,7 +964,7 @@ def recover_command(args: argparse.Namespace) -> None:
     env_file, compose_file, sources = get_args_paths(args)
     ensure_bundle_outside_sources(rollback_bundle, sources)
     expected_paths = metadata["source_paths"]
-    if {key: str(path) for key, path in sources.items()} != expected_paths:
+    if {key: str(sources[key]) for key, _ in BACKUP_TARGETS} != expected_paths:
         raise BackupError("recovery requires the exact PostgreSQL, Workspace, and Site paths recorded in the rollback bundle")
     image = check_services_stopped(env_file, compose_file, sources)
     if image != metadata["postgres"]["image"]:
@@ -951,7 +993,7 @@ def recover_command(args: argparse.Namespace) -> None:
         raise BackupError("restore journal has an unknown state; refusing automatic recovery")
     target_record = state.get("targets")
     temp_record = state.get("temporary_paths")
-    if target_record != {key: str(path) for key, path in sources.items()} or not isinstance(temp_record, dict):
+    if target_record != {key: str(sources[key]) for key, _ in BACKUP_TARGETS} or not isinstance(temp_record, dict):
         raise BackupError("restore journal target paths do not match the selected deployment")
 
     paths: list[tuple[str, Path, Path, Path, Path]] = []
@@ -1083,6 +1125,7 @@ def add_target_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--compose-file", default=str(DEFAULT_COMPOSE_FILE))
     parser.add_argument("--postgres-data-dir", required=True)
     parser.add_argument("--workspace-root", required=True)
+    parser.add_argument("--workspace-current-root", required=True)
     parser.add_argument("--site-storage-root", required=True)
 
 

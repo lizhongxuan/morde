@@ -12,10 +12,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
 	"morde-runtime/contract"
+
 	"morde/server/internal/domain/workspace"
 )
 
@@ -452,24 +454,45 @@ func taskWorkspaceManifestResponseMatches(response TaskWorkspaceManifestResponse
 		response.WorkspaceID != request.WorkspaceID || response.BindingVersion != request.BindingVersion ||
 		response.InputRevision != request.InputRevision || response.WorkspaceCheckpointRevision != request.WorkspaceCheckpointRevision ||
 		response.InputManifestSHA256 != request.InputManifestSHA256 || !validTaskWorkspaceViewID(response.ViewID) || response.ViewID != request.ViewID ||
-		!validSHA256(response.ManifestSHA256) || response.Files == nil || len(response.Files) > request.Limit || len(response.NextCursor) > 4096 ||
-		response.NextCursor != "" && len(response.Files) == 0 {
+		!validSHA256(response.ManifestSHA256) || response.Files == nil || response.EmptyDirectories == nil ||
+		len(response.Files)+len(response.EmptyDirectories) > request.Limit || len(response.NextCursor) > 4096 ||
+		response.NextCursor != "" && len(response.Files)+len(response.EmptyDirectories) == 0 {
 		return false
 	}
-	previous := request.AfterPath
+	paths := make([]string, 0, len(response.Files)+len(response.EmptyDirectories))
+	files := make([]workspace.File, 0, len(response.Files))
 	for _, file := range response.Files {
 		chunks := make([]workspace.Chunk, len(file.Chunks))
 		for index, chunk := range file.Chunks {
 			chunks[index] = workspace.Chunk{SHA256: chunk.SHA256, SizeBytes: chunk.SizeBytes}
 		}
-		if file.Path <= previous || workspace.ValidateFile(workspace.File{
+		converted := workspace.File{
 			Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, Chunks: chunks,
-		}) != nil {
+		}
+		if workspace.ValidateFile(converted) != nil {
 			return false
 		}
-		previous = file.Path
+		paths = append(paths, file.Path)
+		files = append(files, converted)
 	}
-	return response.NextCursor == "" || len(response.Files) > 0 && response.NextCursor == response.Files[len(response.Files)-1].Path
+	for _, directory := range response.EmptyDirectories {
+		if workspace.ValidateRelativePath(directory) != nil {
+			return false
+		}
+		paths = append(paths, directory)
+	}
+	if _, err := workspace.ManifestTreeSHA256(files, response.EmptyDirectories); err != nil {
+		return false
+	}
+	sort.Strings(paths)
+	previous := request.AfterPath
+	for _, path := range paths {
+		if path <= previous {
+			return false
+		}
+		previous = path
+	}
+	return response.NextCursor == "" || len(paths) > 0 && response.NextCursor == paths[len(paths)-1]
 }
 
 func validBlockSHA256(data []byte, expected string) bool {

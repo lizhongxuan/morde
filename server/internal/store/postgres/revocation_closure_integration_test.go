@@ -50,7 +50,7 @@ func TestPostgresTokenAndInstallationRevocationStopsOnlyMatchingTasks(t *testing
 	assertTaskStatus(t, ctx, store, clientTask.Task.ID, task.StatusQueued)
 	assertTaskStatus(t, ctx, store, otherTask.Task.ID, task.StatusQueued)
 
-	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", audit.ActorSession); err != nil {
+	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", audit.ActorSession, nil); err != nil {
 		t.Fatalf("revoke client installation: %v", err)
 	}
 	assertTaskStatus(t, ctx, store, clientTask.Task.ID, task.StatusCancelling)

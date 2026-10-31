@@ -21,6 +21,10 @@ type workspaceBlockGCFiles interface {
 	RemoveStaleTempBlocks(workspaceID string) error
 }
 
+type pendingLegacyWorkspaceBlockGCStore interface {
+	WithPendingLegacyImportWorkspaceBlockGC(context.Context, string, func([]workspace.BlockReference) ([]WorkspaceBlockRemoval, error)) error
+}
+
 type WorkspaceBlockGCStats struct {
 	WorkspacesScanned int64
 	SessionsExpired   int64
@@ -70,6 +74,36 @@ func (g *WorkspaceBlockGarbageCollector) Collect(ctx context.Context) (Workspace
 	return stats, errors.Join(failures...)
 }
 
+// CollectPendingLegacyImport removes only unreferenced blocks from an initial
+// pending legacy import. Unlike routine GC, it does not expire active work.
+func (g *WorkspaceBlockGarbageCollector) CollectPendingLegacyImport(ctx context.Context, workspaceID string) (stats WorkspaceBlockGCStats, retErr error) {
+	if ctx == nil || !domain.ValidWorkspaceID(workspaceID) {
+		return stats, errors.New("pending legacy Workspace block cleanup identity is invalid")
+	}
+	store, ok := g.store.(pendingLegacyWorkspaceBlockGCStore)
+	if !ok {
+		return stats, errors.New("pending legacy Workspace block cleanup is unavailable")
+	}
+	lock, acquired, err := g.store.TryWorkspaceBlockStoreLock(ctx, workspaceID)
+	if err != nil {
+		return stats, fmt.Errorf("lock pending legacy Workspace block cleanup: %w", err)
+	}
+	if !acquired || lock == nil {
+		return stats, domain.NewError(domain.CodeWorkspaceBusy, "Workspace block storage is busy; retry legacy import cleanup")
+	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := lock.Release(unlockCtx); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release pending legacy Workspace block cleanup lock: %w", err))
+		}
+	}()
+	if err := g.collectWorkspaceBlocks(ctx, workspaceID, &stats, store.WithPendingLegacyImportWorkspaceBlockGC, 0); err != nil {
+		return stats, fmt.Errorf("clean pending legacy Workspace blocks: %w", err)
+	}
+	return stats, nil
+}
+
 func (g *WorkspaceBlockGarbageCollector) collectWorkspace(ctx context.Context, workspaceID string, cutoff time.Time, stats *WorkspaceBlockGCStats) (retErr error) {
 	lock, acquired, err := g.store.TryWorkspaceBlockStoreLock(ctx, workspaceID)
 	if err != nil {
@@ -92,7 +126,16 @@ func (g *WorkspaceBlockGarbageCollector) collectWorkspace(ctx context.Context, w
 		return fmt.Errorf("expire idle workspace sync sessions: %w", err)
 	}
 	stats.SessionsExpired += expired
-	err = g.store.WithWorkspaceBlockGC(ctx, workspaceID, func(references []workspace.BlockReference) ([]WorkspaceBlockRemoval, error) {
+	err = g.collectWorkspaceBlocks(ctx, workspaceID, stats, g.store.WithWorkspaceBlockGC, workspaceBlockGCDeletesPerRun)
+	if err != nil {
+		return fmt.Errorf("lock references and collect workspace blocks: %w", err)
+	}
+	return nil
+}
+
+func (g *WorkspaceBlockGarbageCollector) collectWorkspaceBlocks(ctx context.Context, workspaceID string, stats *WorkspaceBlockGCStats,
+	withGC func(context.Context, string, func([]workspace.BlockReference) ([]WorkspaceBlockRemoval, error)) error, maxDeletes int64) error {
+	err := withGC(ctx, workspaceID, func(references []workspace.BlockReference) ([]WorkspaceBlockRemoval, error) {
 		if err := g.blocks.RemoveStaleTempBlocks(workspaceID); err != nil {
 			return nil, fmt.Errorf("remove abandoned upload temp blocks: %w", err)
 		}
@@ -117,7 +160,7 @@ func (g *WorkspaceBlockGarbageCollector) collectWorkspace(ctx context.Context, w
 			if _, ok := protected[digest]; ok {
 				continue
 			}
-			if deleted >= workspaceBlockGCDeletesPerRun {
+			if maxDeletes > 0 && deleted >= maxDeletes {
 				break
 			}
 			removed, err := g.blocks.DeleteBlock(workspaceID, digest)
@@ -136,8 +179,5 @@ func (g *WorkspaceBlockGarbageCollector) collectWorkspace(ctx context.Context, w
 		}
 		return removals, nil
 	})
-	if err != nil {
-		return fmt.Errorf("lock references and collect workspace blocks: %w", err)
-	}
-	return nil
+	return err
 }

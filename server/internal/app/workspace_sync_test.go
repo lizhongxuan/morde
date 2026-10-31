@@ -36,6 +36,8 @@ type syncServiceStore struct {
 	blockLockHeld                            bool
 	blockReadLocksHeld                       int
 	onCreate                                 func()
+	onChangesPage                            func()
+	hostGeneration                           int64
 	syncDeviceRevoked                        bool
 	usageFinalizeCalls                       int
 }
@@ -106,7 +108,8 @@ func (s *syncServiceStore) FindTaskWorkspacePublishReceipt(_ context.Context, ow
 	return receipt, nil
 }
 
-func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand, files []workspace.File, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
+func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
+	_ = emptyDirectories
 	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
 	receipt, exists := s.taskWorkspacePublishReceipts[key]
 	if !exists || receipt.State != TaskWorkspacePublishPending {
@@ -160,6 +163,15 @@ func (s *syncServiceStore) GetWorkspaceBinding(_ context.Context, hostID, worksp
 		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
 	}
 	return s.binding, nil
+}
+
+func (s *syncServiceStore) CheckWorkspaceSyncHostReplicaAccess(_ context.Context, principal identity.Principal) error {
+	if principal.Kind != identity.KindHostReplica || s.binding.HostID != principal.HostScope || s.binding.Workspace.ID != principal.ReplicaWorkspaceID ||
+		s.binding.OwnerID != principal.UserID || s.binding.BindingVersion != principal.BindingVersion || s.hostGeneration != principal.HostGeneration ||
+		(s.binding.State != workspace.BindingPreparing && s.binding.State != workspace.BindingActive && s.binding.State != workspace.BindingUnbinding) {
+		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	}
+	return nil
 }
 
 func (s *syncServiceStore) CheckWorkspaceSyncDeviceAccess(_ context.Context, _ identity.Principal, _ string) error {
@@ -225,6 +237,11 @@ func (s *syncServiceStore) GetWorkspaceManifestPage(_ context.Context, id string
 }
 
 func (s *syncServiceStore) GetWorkspaceChangePage(_ context.Context, _ string, revision int64, after string, limit int32) (workspace.ChangePage, error) {
+	if s.onChangesPage != nil {
+		callback := s.onChangesPage
+		s.onChangesPage = nil
+		callback()
+	}
 	items := make([]workspace.Change, 0)
 	for _, change := range s.changes {
 		if change.Revision > revision || change.Revision == revision && change.Path > after {
@@ -575,6 +592,57 @@ func TestWorkspaceSyncServiceCreateReportsQuotaExceeded(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncServiceRejectsOversizedUploadsButAllowsExistingFiles(t *testing.T) {
+	oversized := workspace.File{
+		Path: "large.bin", SizeBytes: workspace.MaxSyncFileBytes + 1,
+		SHA256: strings.Repeat("b", 64), Mode: 0644,
+	}
+	remaining := oversized.SizeBytes
+	for remaining > 0 {
+		size := min(remaining, workspace.MaxSyncBlockBytes)
+		oversized.Chunks = append(oversized.Chunks, workspace.Chunk{SHA256: strings.Repeat("a", 64), SizeBytes: size})
+		remaining -= size
+	}
+
+	exactLimit := oversized
+	exactLimit.SizeBytes = workspace.MaxSyncFileBytes
+	exactLimit.Chunks = exactLimit.Chunks[:len(exactLimit.Chunks)-1]
+	exactStore := newSyncServiceStore()
+	exactService, err := NewWorkspaceSyncService(exactStore, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: exactStore.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	if _, err := exactService.CreateSyncSession(context.Background(), principal, exactStore.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, Files: []workspace.File{exactLimit},
+	}, "exact-file-limit"); err != nil {
+		t.Fatalf("file at the 300 MiB limit was rejected: %v", err)
+	}
+
+	store := newSyncServiceStore()
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal = identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	command := workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, Files: []workspace.File{oversized},
+	}
+	if _, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, command, "oversized-upload"); domain.CodeOf(err) != domain.CodeRequestTooLarge {
+		t.Fatalf("oversized upload error = %v, want request_too_large", err)
+	}
+	if len(store.sessions) != 0 {
+		t.Fatalf("oversized upload persisted %d sessions", len(store.sessions))
+	}
+
+	store.workspace.Revision = 1
+	store.snapshots[1] = []workspace.File{oversized}
+	command.Direction, command.BaseRevision = workspace.SyncBidirectional, 1
+	if _, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, command, "existing-oversized-file"); err != nil {
+		t.Fatalf("unchanged existing oversized file was rejected: %v", err)
+	}
+}
+
 func TestWorkspaceSyncServiceBlockStoreLockContention(t *testing.T) {
 	store := newSyncServiceStore()
 	blocks := newSyncBlockMemory()
@@ -808,6 +876,7 @@ func TestWorkspaceSyncDeviceUploadStopsAfterRevocation(t *testing.T) {
 
 func TestWorkspaceSyncServiceFencesPreparingHostReplicaToInitialDownload(t *testing.T) {
 	store := newSyncServiceStore()
+	store.hostGeneration = 3
 	store.workspace.Revision = 2
 	store.snapshots[2] = []workspace.File{}
 	store.binding = workspace.Binding{
@@ -854,6 +923,7 @@ func TestWorkspaceSyncServiceFencesPreparingHostReplicaToInitialDownload(t *test
 
 func TestWorkspaceSyncProgressIsPortalOwnerOnlyAndSanitized(t *testing.T) {
 	store := newSyncServiceStore()
+	store.workspace.Revision, store.workspace.UsedBytes = 7, 1234
 	store.progress = []workspace.DeviceSyncProgress{{
 		WorkspaceID: store.workspace.ID, DeviceID: "t7654321", SessionID: "p1234567",
 		Direction: workspace.SyncDownload, State: workspace.SyncApplying, Stage: workspace.SyncStageApply,
@@ -864,9 +934,11 @@ func TestWorkspaceSyncProgressIsPortalOwnerOnlyAndSanitized(t *testing.T) {
 		t.Fatal(err)
 	}
 	portal := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
-	items, err := service.ListDeviceSyncProgress(context.Background(), portal, store.workspace.ID)
-	if err != nil || len(items) != 1 || items[0].DownloadActionsDone != 1 {
-		t.Fatalf("ListDeviceSyncProgress() = %#v, %v", items, err)
+	progress, err := service.ListDeviceSyncProgress(context.Background(), portal, store.workspace.ID)
+	if err != nil || progress.Revision != store.workspace.Revision || progress.UsedBytes != store.workspace.UsedBytes || progress.QuotaBytes != store.workspace.QuotaBytes ||
+		progress.RemainingBytes != store.workspace.QuotaBytes-store.workspace.UsedBytes || progress.QuotaStatus != workspace.SyncQuotaAvailable ||
+		len(progress.Items) != 1 || progress.Items[0].DownloadActionsDone != 1 {
+		t.Fatalf("ListDeviceSyncProgress() = %#v, %v", progress, err)
 	}
 	if store.progressOwner != store.workspace.OwnerID || store.progressWorkspace != store.workspace.ID {
 		t.Fatalf("progress query scope = %q / %q", store.progressOwner, store.progressWorkspace)
@@ -1079,5 +1151,32 @@ func TestWorkspaceSyncServiceBoundsChangesWait(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("zero-wait changes query took %s", time.Since(start))
+	}
+}
+
+func TestWorkspaceSyncServiceStopsHostChangesPollAfterBindingVersionRevocation(t *testing.T) {
+	store := newSyncServiceStore()
+	store.hostGeneration = 3
+	store.binding = workspace.Binding{
+		HostID: "h1234567", OwnerID: store.workspace.OwnerID, Workspace: store.workspace,
+		State: workspace.BindingActive, BindingVersion: 4, DesiredRevision: store.workspace.Revision,
+	}
+	store.onChangesPage = func() {
+		store.binding.State = workspace.BindingUnbinding
+		store.binding.BindingVersion++
+	}
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindHostReplica,
+		HostScope: store.binding.HostID, HostGeneration: store.hostGeneration,
+		ReplicaWorkspaceID: store.workspace.ID, BindingVersion: store.binding.BindingVersion,
+	}
+	cursor := workspace.EncodeChangeCursor(workspace.ChangeCursor{Revision: store.workspace.Revision})
+	_, err = service.GetChanges(context.Background(), principal, store.workspace.ID, cursor, time.Second, 10)
+	if domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("Host changes poll after binding revocation = %v; want not found", err)
 	}
 }

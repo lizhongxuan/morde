@@ -93,6 +93,49 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 	if err != nil || initialA.Session.State != "completed" || initialA.Session.TargetRevision != 0 {
 		t.Fatalf("Host A initial download = %#v, %v", initialA.Session, err)
 	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostA.ID, hostA.RuntimeGeneration+1, workspaceValue.ID,
+		bindingA.BindingVersion, initialA.Session.ID, initialA.Session.TargetRevision); err == nil {
+		t.Fatal("applied receipt accepted a stale Host generation")
+	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID,
+		bindingA.BindingVersion, initialA.Session.ID, initialA.Session.TargetRevision+1); err == nil {
+		t.Fatal("applied receipt accepted a target revision different from its sync session")
+	}
+	wrongReplicaID := fmt.Sprintf("host:%s:g%d:%s:b%d", hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID, bindingA.BindingVersion+1)
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_sessions SET replica_id=$3 WHERE workspace_id=$1 AND id=$2`,
+		workspaceValue.ID, initialA.Session.ID, wrongReplicaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID,
+		bindingA.BindingVersion, initialA.Session.ID, initialA.Session.TargetRevision); err == nil {
+		t.Fatal("applied receipt accepted a sync session from another binding version")
+	}
+	correctReplicaID := fmt.Sprintf("host:%s:g%d:%s:b%d", hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID, bindingA.BindingVersion)
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_sync_sessions SET replica_id=$3 WHERE workspace_id=$1 AND id=$2`,
+		workspaceValue.ID, initialA.Session.ID, correctReplicaID); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []struct {
+		name  string
+		query string
+		args  []any
+		reset string
+	}{
+		{name: "incomplete session", query: `UPDATE workspace_sync_sessions SET state='planned' WHERE workspace_id=$1 AND id=$2`, args: []any{workspaceValue.ID, initialA.Session.ID}, reset: `UPDATE workspace_sync_sessions SET state='completed' WHERE workspace_id=$1 AND id=$2`},
+		{name: "upload session", query: `UPDATE workspace_sync_sessions SET direction='upload' WHERE workspace_id=$1 AND id=$2`, args: []any{workspaceValue.ID, initialA.Session.ID}, reset: `UPDATE workspace_sync_sessions SET direction='download' WHERE workspace_id=$1 AND id=$2`},
+		{name: "conflicted session", query: `UPDATE workspace_sync_sessions SET conflicts='[{}]'::jsonb WHERE workspace_id=$1 AND id=$2`, args: []any{workspaceValue.ID, initialA.Session.ID}, reset: `UPDATE workspace_sync_sessions SET conflicts='[]'::jsonb WHERE workspace_id=$1 AND id=$2`},
+	} {
+		if _, err := store.pool.Exec(ctx, invalid.query, invalid.args...); err != nil {
+			t.Fatalf("prepare %s: %v", invalid.name, err)
+		}
+		if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID,
+			bindingA.BindingVersion, initialA.Session.ID, initialA.Session.TargetRevision); err == nil {
+			t.Fatalf("applied receipt accepted %s", invalid.name)
+		}
+		if _, err := store.pool.Exec(ctx, invalid.reset, workspaceValue.ID, initialA.Session.ID); err != nil {
+			t.Fatalf("restore %s: %v", invalid.name, err)
+		}
+	}
 	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, bindingA.BindingVersion, workspaceValue.ID,
 		rootCredentialA, initialA.Session.ID, initialA.Session.TargetRevision)
 	hostHandoffActivate(t, httpClient, httpServer.URL, hostA, bindingA.BindingVersion, workspaceValue.ID, rootCredentialA)
@@ -136,6 +179,12 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 	if err != nil || checkpointRevision != 1 || finalCheckpoint.ID == "" || finalCheckpoint.TargetRevision != checkpointRevision {
 		t.Fatalf("Host A final checkpoint = revision %d session %#v, %v", checkpointRevision, finalCheckpoint, err)
 	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID,
+		unbindingCredential.BindingVersion, finalCheckpoint.ID, checkpointRevision-1); err == nil {
+		t.Fatal("applied receipt accepted a revision different from the completed session target")
+	}
+	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, unbindingCredential.BindingVersion, workspaceValue.ID,
+		rootCredentialA, finalCheckpoint.ID, checkpointRevision)
 	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, unbindingCredential.BindingVersion, workspaceValue.ID,
 		rootCredentialA, finalCheckpoint.ID, checkpointRevision)
 	hostHandoffDetach(t, httpClient, httpServer.URL, hostA, unbindingCredential.BindingVersion, workspaceValue.ID, rootCredentialA, checkpointRevision)

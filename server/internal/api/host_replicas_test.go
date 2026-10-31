@@ -40,7 +40,7 @@ func (s *hostReplicaServiceStub) CredentialForBinding(context.Context, identity.
 	return "credential", nil
 }
 
-func (s *hostReplicaServiceStub) RecordAppliedRevision(context.Context, identity.Principal, string, int64, int64) (workspace.Binding, error) {
+func (s *hostReplicaServiceStub) RecordAppliedRevision(context.Context, identity.Principal, string, int64, string, int64) (workspace.Binding, error) {
 	return s.binding, nil
 }
 

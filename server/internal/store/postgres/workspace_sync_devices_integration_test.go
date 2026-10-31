@@ -45,6 +45,9 @@ func TestWorkspaceSyncDeviceRegistrationIsInstallationBoundAndIdempotent(t *test
 	if err != nil || first.State != workspace.SyncDeviceBindingPendingNode || first.FolderID != "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || first.DeviceID != deviceID {
 		t.Fatalf("register first Workspace device = %#v, %v", first, err)
 	}
+	if _, err := store.ClaimWorkspaceForDelete(ctx, workspaceOne.ID, workspaceOne.Revision); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("delete Workspace with an active sync folder = %v; want workspace busy", err)
+	}
 	replayedID, err := domain.NewWorkspaceSyncDeviceBindingID()
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +79,7 @@ func TestWorkspaceSyncDeviceRegistrationIsInstallationBoundAndIdempotent(t *test
 		t.Fatal(err)
 	}
 	portalPrincipal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portalToken.ID}
-	if err := store.RevokeWorkspaceSyncDevice(ctx, portalPrincipal, workspaceOne.ID, first.ID); err != nil {
+	if err := store.RevokeWorkspaceSyncDevice(ctx, portalPrincipal, workspaceOne.ID, first.ID, nil); err != nil {
 		t.Fatal(err)
 	}
 	var remainingBindingState, revokedFolderState, remainingFolderState string
@@ -234,6 +237,53 @@ JOIN workspace_sync_folders f ON f.workspace_id=b.workspace_id WHERE b.id=$1`, b
 	}
 }
 
+func TestWorkspaceSyncRelayGateEnablesAfterAppliedRevisionCommit(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-node-relay-gate-commit")
+	principal := syncDeviceTestPrincipal(t, store, owner.ID)
+	registerTestWorkspaceSyncDevice(t, store, principal, value.ID,
+		"HHHHHHH-HHHHHHH-HHHHHHH-HHHHHHH-HHHHHHH-HHHHHHH-HHHHHHH-HHHHHHH", "sync-node-relay-gate-commit-certificate")
+
+	var events []string
+	err := store.ReconcileWorkspaceSyncNodeWithRelayGate(ctx, owner.ID,
+		func(_ context.Context, state workspace.SyncNodeDesiredState) error {
+			if len(state.Folders) != 1 || state.OwnerID != owner.ID {
+				return errors.New("unexpected Workspace sync node desired state")
+			}
+			events = append(events, "apply")
+			return nil
+		},
+		func(_ context.Context, state workspace.SyncNodeDesiredState) error {
+			var desiredRevision, appliedRevision int64
+			var bindingState string
+			if err := store.pool.QueryRow(ctx, `SELECT desired_revision,applied_revision FROM workspace_sync_node_revisions WHERE owner_id=$1`, owner.ID).
+				Scan(&desiredRevision, &appliedRevision); err != nil {
+				return err
+			}
+			if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_sync_device_bindings WHERE owner_id=$1`, owner.ID).
+				Scan(&bindingState); err != nil {
+				return err
+			}
+			if desiredRevision != appliedRevision || state.Revision != appliedRevision || bindingState != string(workspace.SyncDeviceBindingActive) {
+				return errors.New("relay was enabled before the applied revision committed")
+			}
+			events = append(events, "enable")
+			return nil
+		},
+		func(context.Context) error {
+			events = append(events, "disable")
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, []string{"disable", "apply", "enable"}) {
+		t.Fatalf("relay gate lifecycle = %v", events)
+	}
+}
+
 func TestWorkspaceSyncNodeReconcileFencesConcurrentRegistration(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -343,7 +393,7 @@ func TestWorkspaceSyncDeviceRevocationClosesInstallationBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	portalPrincipal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portal.ID}
-	if err := store.RevokeWorkspaceSyncDevice(ctx, portalPrincipal, value.ID, binding.ID); err != nil {
+	if err := store.RevokeWorkspaceSyncDevice(ctx, portalPrincipal, value.ID, binding.ID, nil); err != nil {
 		t.Fatal(err)
 	}
 	staleKeyHash, staleRequestHash := syncDeviceTestHashes("revoked-stale-challenge", value.ID, principal.ClientInstallationID, deviceID, certificateHash[:])
@@ -378,7 +428,7 @@ func TestWorkspaceSyncDeviceRevocationClosesInstallationBindings(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&reopenedFolderState); err != nil || reopenedFolderState != "pending_node" {
 		t.Fatalf("folder state after pairing a replacement device = %q, want pending_node: %v", reopenedFolderState, err)
 	}
-	if err := store.RevokeClientInstallation(ctx, principal.ClientInstallationID, owner.ID, "", audit.ActorSession); err != nil {
+	if err := store.RevokeClientInstallation(ctx, principal.ClientInstallationID, owner.ID, "", audit.ActorSession, nil); err != nil {
 		t.Fatal(err)
 	}
 	var identityRevoked bool
@@ -416,7 +466,7 @@ func TestWorkspaceSyncDeviceListIsScopedToPortalOwnerAndWorkspace(t *testing.T) 
 		t.Fatal(err)
 	}
 	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portal.ID}
-	if err := store.RevokeWorkspaceSyncDevice(ctx, principal, value.ID, first.ID); err != nil {
+	if err := store.RevokeWorkspaceSyncDevice(ctx, principal, value.ID, first.ID, nil); err != nil {
 		t.Fatal(err)
 	}
 	items, err := store.ListWorkspaceSyncDeviceBindings(ctx, principal, value.ID)

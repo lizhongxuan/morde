@@ -48,7 +48,7 @@ func TestWorkspaceSyncDeviceRevocationFencesHTTPAccessAndCancelsItsSession(t *te
 		t.Fatal(err)
 	}
 	portal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portalToken.ID}
-	if err := store.RevokeWorkspaceSyncDevice(ctx, portal, firstWorkspace.ID, firstBinding.ID); err != nil {
+	if err := store.RevokeWorkspaceSyncDevice(ctx, portal, firstWorkspace.ID, firstBinding.ID, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CheckWorkspaceSyncDeviceAccess(ctx, device, firstWorkspace.ID); domain.CodeOf(err) != domain.CodeNotFound {
@@ -131,7 +131,7 @@ func TestWorkspaceSyncDeviceRevocationWaitsForActiveBlockChunk(t *testing.T) {
 	revokeDone := make(chan error, 1)
 	go func() {
 		close(revokeStarted)
-		revokeDone <- store.RevokeWorkspaceSyncDevice(ctx, portal, value.ID, binding.ID)
+		revokeDone <- store.RevokeWorkspaceSyncDevice(ctx, portal, value.ID, binding.ID, nil)
 	}()
 	<-revokeStarted
 	select {

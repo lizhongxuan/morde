@@ -54,7 +54,7 @@ WHERE id=$1`, renewedClient.ClientInstallationID); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := store.RevokeExpiredWorkspaceSyncDevices(ctx); err != nil {
+	if err := store.RevokeExpiredWorkspaceSyncDevices(ctx, nil); err != nil {
 		t.Fatalf("revoke expired Workspace sync devices: %v", err)
 	}
 	assertWorkspaceSyncDeviceRevocationQueued(t, store, expiredBinding.ID)

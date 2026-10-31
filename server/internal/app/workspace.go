@@ -28,6 +28,12 @@ type WorkspaceContentDeleter interface {
 	DeleteWorkspace(string) error
 }
 
+type WorkspaceCurrentDeleter interface {
+	Delete(context.Context, string, string) error
+}
+
+type WorkspaceCurrentInitializer func(context.Context, string) error
+
 type WorkspaceCapacityChecker interface {
 	CheckCapacity(context.Context) error
 }
@@ -35,19 +41,29 @@ type WorkspaceCapacityChecker interface {
 type WorkspaceService struct {
 	store             WorkspaceStore
 	content           WorkspaceContentDeleter
+	current           WorkspaceCurrentDeleter
+	initializeCurrent WorkspaceCurrentInitializer
 	capacity          WorkspaceCapacityChecker
 	audit             AuditWriter
 	maxWorkspaceBytes int64
 }
 
-func NewWorkspaceService(store WorkspaceStore, content WorkspaceContentDeleter, capacity WorkspaceCapacityChecker, writer AuditWriter, maxWorkspaceBytes int64) (*WorkspaceService, error) {
-	if store == nil || content == nil || capacity == nil || writer == nil || maxWorkspaceBytes <= 0 {
+func NewWorkspaceService(store WorkspaceStore, content WorkspaceContentDeleter, current WorkspaceCurrentDeleter, capacity WorkspaceCapacityChecker, writer AuditWriter, maxWorkspaceBytes int64) (*WorkspaceService, error) {
+	if store == nil || content == nil || current == nil || capacity == nil || writer == nil || maxWorkspaceBytes <= 0 {
 		return nil, errors.New("workspace service dependencies and quotas are required")
 	}
 	return &WorkspaceService{
-		store: store, content: content, capacity: capacity, audit: writer,
+		store: store, content: content, current: current, capacity: capacity, audit: writer,
 		maxWorkspaceBytes: maxWorkspaceBytes,
 	}, nil
+}
+
+func (s *WorkspaceService) SetWorkspaceCurrentInitializer(initializer WorkspaceCurrentInitializer) error {
+	if s == nil || initializer == nil {
+		return errors.New("workspace current initializer is required")
+	}
+	s.initializeCurrent = initializer
+	return nil
 }
 
 func (s *WorkspaceService) CreateWorkspace(ctx context.Context, principal identity.Principal, command CreateWorkspaceCommand, idempotencyKey string) (workspace.Workspace, error) {
@@ -81,6 +97,12 @@ func (s *WorkspaceService) CreateWorkspace(ctx context.Context, principal identi
 	created, _, err := s.store.CreateWorkspace(ctx, value, record)
 	if err != nil {
 		return workspace.Workspace{}, err
+	}
+	if s.initializeCurrent == nil {
+		return workspace.Workspace{}, errors.New("workspace current initializer is unavailable")
+	}
+	if err := s.initializeCurrent(ctx, created.ID); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("initialize Workspace current directory: %w", err)
 	}
 	return created, nil
 }
@@ -206,6 +228,9 @@ func (s *WorkspaceService) DeleteWorkspace(ctx context.Context, principal identi
 	}
 	if err := s.content.DeleteWorkspace(id); err != nil {
 		return workspace.Workspace{}, fmt.Errorf("delete workspace content: %w", err)
+	}
+	if err := s.current.Delete(ctx, value.OwnerID, id); err != nil {
+		return workspace.Workspace{}, fmt.Errorf("delete workspace current directory: %w", err)
 	}
 	deleted, err := s.store.CompleteWorkspaceDelete(ctx, id, value.Revision)
 	if err != nil {

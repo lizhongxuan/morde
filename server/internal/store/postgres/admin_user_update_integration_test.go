@@ -118,7 +118,7 @@ func TestUserUpdateAndAuditAreAtomic(t *testing.T) {
 	_, err = store.UpdateUserWithAudit(ctx, admin.ID, identity.StatusPending, member, audit.Entry{
 		ActorID: admin.ID, ActorKind: audit.ActorKind("invalid"), Action: audit.ActionUserUpdate,
 		Target: member.ID, Detail: map[string]any{"status": identity.StatusApproved},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("invalid audit entry unexpectedly committed user update")
 	}

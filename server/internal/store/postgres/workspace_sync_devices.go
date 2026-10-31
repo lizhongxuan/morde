@@ -146,7 +146,6 @@ func (s *Store) RegisterWorkspaceSyncDevice(ctx context.Context, principal ident
 		if err := lockReadyWorkspaceForSyncDevice(ctx, tx, principal.UserID, workspaceID, true); err != nil {
 			return err
 		}
-
 		var existingBindingID string
 		var savedRequestHash []byte
 		err := tx.QueryRow(ctx, `SELECT request_hash,binding_id FROM workspace_sync_device_registration_requests
@@ -275,8 +274,8 @@ WHERE b.id=$1 AND b.owner_id=$2 AND b.workspace_id=$3`, existingBindingID, princ
 	return result, err
 }
 
-func (s *Store) RevokeWorkspaceSyncDevice(ctx context.Context, principal identity.Principal, workspaceID, bindingID string) error {
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+func (s *Store) RevokeWorkspaceSyncDevice(ctx context.Context, principal identity.Principal, workspaceID, bindingID string, disableRelay func(context.Context) error) error {
+	return s.withWorkspaceSyncOwnerTx(ctx, principal.UserID, func(tx pgx.Tx) error {
 		if _, err := lockOwnerExecutionControl(ctx, tx, principal.UserID, true); err != nil {
 			return err
 		}
@@ -289,17 +288,22 @@ func (s *Store) RevokeWorkspaceSyncDevice(ctx context.Context, principal identit
 		if err := lockReadyWorkspaceForSyncDevice(ctx, tx, principal.UserID, workspaceID, true); err != nil {
 			return err
 		}
-		var deviceID, installationID string
-		err := tx.QueryRow(ctx, `SELECT i.device_id,b.client_installation_id
+		var deviceID, installationID, bindingState string
+		err := tx.QueryRow(ctx, `SELECT i.device_id,b.client_installation_id,b.state
 FROM workspace_sync_device_bindings b
 JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id
 WHERE b.id=$1 AND b.owner_id=$2 AND b.workspace_id=$3 FOR UPDATE OF b`,
-			bindingID, principal.UserID, workspaceID).Scan(&deviceID, &installationID)
+			bindingID, principal.UserID, workspaceID).Scan(&deviceID, &installationID, &bindingState)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "workspace sync device binding not found")
 		}
 		if err != nil {
 			return fmt.Errorf("find Workspace sync device binding for revocation: %w", err)
+		}
+		if (bindingState == "active" || bindingState == "pending_node") && disableRelay != nil {
+			if err := disableRelay(ctx); err != nil {
+				return fmt.Errorf("disable Workspace sync relay before device revocation: %w", err)
+			}
 		}
 		binding, err := tx.Exec(ctx, `UPDATE workspace_sync_device_bindings SET state='revoking'
 WHERE id=$1 AND owner_id=$2 AND workspace_id=$3 AND state IN ('active','pending_node')`, bindingID, principal.UserID, workspaceID)
@@ -333,7 +337,7 @@ VALUES ($1,'session','workspace.sync_device.revoke',$2)`, principal.UserID, bind
 			return fmt.Errorf("audit workspace sync device revocation: %w", err)
 		}
 		return nil
-	})
+	}, nil, nil)
 }
 
 func (s *Store) ListWorkspaceSyncDeviceBindings(ctx context.Context, principal identity.Principal, workspaceID string) ([]workspace.SyncDeviceBinding, error) {
@@ -578,21 +582,67 @@ WHERE desired_revision>applied_revision ORDER BY owner_id`)
 	return owners, nil
 }
 
+func (s *Store) ListWorkspaceSyncNodeOwners(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT owner_id FROM workspace_sync_node_revisions ORDER BY owner_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list Workspace sync node owners: %w", err)
+	}
+	defer rows.Close()
+	owners := make([]string, 0)
+	for rows.Next() {
+		var ownerID string
+		if err := rows.Scan(&ownerID); err != nil {
+			return nil, fmt.Errorf("read Workspace sync node owner: %w", err)
+		}
+		owners = append(owners, ownerID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read Workspace sync node owners: %w", err)
+	}
+	return owners, nil
+}
+
 func (s *Store) ReconcileWorkspaceSyncNode(ctx context.Context, ownerID string, apply func(context.Context, workspace.SyncNodeDesiredState) error) error {
+	return s.reconcileWorkspaceSyncNode(ctx, ownerID, apply, nil, nil)
+}
+
+func (s *Store) ReconcileWorkspaceSyncNodeWithRelayGate(ctx context.Context, ownerID string,
+	apply func(context.Context, workspace.SyncNodeDesiredState) error,
+	enableRelay func(context.Context, workspace.SyncNodeDesiredState) error,
+	disableRelay func(context.Context) error) error {
+	if enableRelay == nil || disableRelay == nil {
+		return domain.InvalidArgument("relay_gate", "Workspace sync relay gate callbacks are required")
+	}
+	return s.reconcileWorkspaceSyncNode(ctx, ownerID, apply, enableRelay, disableRelay)
+}
+
+func (s *Store) reconcileWorkspaceSyncNode(ctx context.Context, ownerID string,
+	apply func(context.Context, workspace.SyncNodeDesiredState) error,
+	enableRelay func(context.Context, workspace.SyncNodeDesiredState) error,
+	disableRelay func(context.Context) error) error {
 	if !domain.ValidUserID(ownerID) {
 		return domain.InvalidArgument("owner_id", "Workspace sync node owner is invalid")
 	}
 	if apply == nil {
 		return domain.InvalidArgument("apply", "Workspace sync node apply callback is required")
 	}
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+	var enableState workspace.SyncNodeDesiredState
+	return s.withWorkspaceSyncOwnerTx(ctx, ownerID, func(tx pgx.Tx) error {
 		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
 			return err
+		}
+		if err := ensureNoWorkspaceSyncReceiveForOwner(ctx, tx, ownerID); err != nil {
+			return err
+		}
+		if enableRelay != nil {
+			if err := disableRelay(ctx); err != nil {
+				return fmt.Errorf("close Workspace sync relay gate before applying owner state: %w", err)
+			}
 		}
 		var desiredRevision, appliedRevision int64
 		err := tx.QueryRow(ctx, `SELECT desired_revision,applied_revision FROM workspace_sync_node_revisions
 WHERE owner_id=$1 FOR UPDATE`, ownerID).Scan(&desiredRevision, &appliedRevision)
-		if errors.Is(err, pgx.ErrNoRows) || err == nil && desiredRevision == appliedRevision {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
@@ -628,10 +678,18 @@ WHERE owner_id=$1 AND desired_revision=$2 AND applied_revision=$3`, ownerID, des
 			return fmt.Errorf("advance applied Workspace sync node revision: %w", err)
 		}
 		if command.RowsAffected() != 1 {
-			return errors.New("Workspace sync node revision changed during reconciliation")
+			return errors.New("workspace sync node revision changed during reconciliation")
+		}
+		if enableRelay != nil && len(desired.Folders) > 0 {
+			enableState = desired
 		}
 		return nil
-	})
+	}, func(afterCommitCtx context.Context) error {
+		if enableRelay == nil || len(enableState.Folders) == 0 {
+			return nil
+		}
+		return enableRelay(afterCommitCtx, enableState)
+	}, disableRelay)
 }
 
 func workspaceSyncNodeDesiredState(ctx context.Context, tx pgx.Tx, ownerID string, revision int64) (workspace.SyncNodeDesiredState, error) {

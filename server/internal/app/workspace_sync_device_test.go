@@ -48,6 +48,10 @@ func (s *syncNodeEnsurerStub) EnsureWorkspaceSyncNode(_ context.Context, ownerID
 	return workspace.SyncNodeConnection{DeviceID: "NODE-1", RelayAddress: "relay://relay.example.test:22067/?id=RELAY-1"}, nil
 }
 
+func (s *syncNodeEnsurerStub) DisableWorkspaceSyncNodeRelay(context.Context, string) error {
+	return nil
+}
+
 func (s *syncDeviceMemoryStore) CreateWorkspaceSyncDeviceChallenge(_ context.Context, _ identity.Principal, value workspace.SyncDeviceChallenge) error {
 	s.challenge = value
 	return nil
@@ -77,7 +81,7 @@ func (s *syncDeviceMemoryStore) RegisterWorkspaceSyncDevice(_ context.Context, _
 	return s.binding, nil
 }
 
-func (s *syncDeviceMemoryStore) RevokeWorkspaceSyncDevice(context.Context, identity.Principal, string, string) error {
+func (s *syncDeviceMemoryStore) RevokeWorkspaceSyncDevice(context.Context, identity.Principal, string, string, func(context.Context) error) error {
 	return nil
 }
 

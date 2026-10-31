@@ -176,7 +176,7 @@ func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Princip
 	if err != nil {
 		return api.AdminUserRecord{}, err
 	}
-	if command.Status != nil && *command.Status != identity.StatusApproved && a.workspaceSyncReconciler != nil {
+	if (command.Status != nil && *command.Status != identity.StatusApproved || command.Role != nil) && a.workspaceSyncReconciler != nil {
 		if err := a.workspaceSyncReconciler.ReconcileWorkspaceSyncNodeOwner(ctx, id); err != nil {
 			return api.AdminUserRecord{}, domain.NewError(domain.CodeUpstreamError, "workspace sync node could not confirm account revocation")
 		}

@@ -34,13 +34,15 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	workbenchDir := t.TempDir()
 	t.Setenv("T02_TEST_INSTANCE", "test-instance")
 	root := filepath.Join(t.TempDir(), "workspace-sync")
+	postgresRoot := filepath.Join(t.TempDir(), "postgres-data")
 	data := validConfigYAML(workbenchDir) + fmt.Sprintf("workspace_sync_node:\n"+
 		"  enabled: true\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
 		"  relay_public_address: 8.8.8.8:22067\n  relay_bind_address: 172.18.141.222\n"+
 		"  relay_token: %s\n  relay_state_root: %q\n  state_root: %q\n  workspace_root: %q\n"+
+		"  quota_socket_root: %q\n  protected_storage_roots: [%q]\n"+
 		"  relay_container_name: morde-sync-relay\n",
 		strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64),
-		filepath.Join(root, "relay"), filepath.Join(root, "state"), filepath.Join(root, "files"))
+		filepath.Join(root, "relay"), filepath.Join(root, "state"), filepath.Join(root, "files"), filepath.Join(root, "quota"), postgresRoot)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
@@ -49,8 +51,8 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.WorkspaceSyncNode.RelayBindAddress != "172.18.141.222" {
-		t.Fatalf("relay bind address = %q; want 172.18.141.222", cfg.WorkspaceSyncNode.RelayBindAddress)
+	if cfg.WorkspaceSyncNode.RelayBindAddress != "172.18.141.222" || len(cfg.WorkspaceSyncNode.ProtectedStorageRoots) != 1 || cfg.WorkspaceSyncNode.ProtectedStorageRoots[0] != postgresRoot {
+		t.Fatalf("Workspace sync config = %+v", cfg.WorkspaceSyncNode)
 	}
 }
 
@@ -124,7 +126,7 @@ func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 		RelayPublicAddress: "8.8.8.8:22067", RelayBindAddress: "172.18.141.222",
 		RelayToken:     strings.Repeat("c", 64),
 		RelayStateRoot: filepath.Join(root, "relay"), StateRoot: filepath.Join(root, "state"),
-		WorkspaceRoot: filepath.Join(root, "files"), RelayContainerName: "morde-sync-relay",
+		WorkspaceRoot: filepath.Join(root, "files"), QuotaSocketRoot: filepath.Join(root, "quota"), RelayContainerName: "morde-sync-relay",
 	}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("valid Workspace sync node config: %v", err)
@@ -151,8 +153,10 @@ func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 		{name: "missing relay state root", want: "relay_state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = "" }},
 		{name: "missing state root", want: "state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.StateRoot = "" }},
 		{name: "relative workspace root", want: "workspace_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.WorkspaceRoot = "relative/files" }},
+		{name: "missing quota socket root", want: "quota_socket_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.QuotaSocketRoot = "" }},
 		{name: "overlapping node roots", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.WorkspaceRoot = filepath.Join(value.StateRoot, "files") }},
 		{name: "overlapping relay root", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = filepath.Join(value.StateRoot, "relay") }},
+		{name: "overlapping quota socket root", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.QuotaSocketRoot = filepath.Join(value.StateRoot, "quota") }},
 		{name: "unsafe relay name", want: "relay_container_name is invalid", mutate: func(value *WorkspaceSyncNode) { value.RelayContainerName = "../relay" }},
 	}
 	for _, address := range []string{"8.8.8.8:22067"} {
@@ -517,11 +521,12 @@ func validConfig(t *testing.T) Config {
 		Models:       Models{AllowedHosts: []string{"api.openai.com"}},
 		Templates:    Templates{Dir: "templates", Default: "std-a"}, Hosts: Hosts{ReadyTimeout: time.Minute, ReadyPollInterval: time.Second},
 		Capacity: Capacity{CPUMilli: 1000, MemMiB: 2048}, Reconciler: Reconciler{Interval: time.Minute, RenewBefore: time.Minute, ActivityFlushInterval: time.Minute},
-		Storage:          Storage{Driver: "docker", DockerHost: "unix:///var/run/docker.sock", DockerDataDir: "/var/lib/docker", MinFreeBytes: 10 << 30},
-		WorkspaceStorage: WorkspaceStorage{RootDir: t.TempDir(), MaxWorkspaceBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
-		SiteStorage:      SiteStorage{RootDir: t.TempDir(), MaxReleaseBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
-		Gateway:          Gateway{WorkbenchDir: t.TempDir(), PreviewPortMin: 1024, MaxBodyBytes: 1024},
-		MCP:              MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 640}, PortalWeb: PortalWeb{Dir: "web"}, Log: Log{Level: "info", Format: "json"},
+		Storage:           Storage{Driver: "docker", DockerHost: "unix:///var/run/docker.sock", DockerDataDir: "/var/lib/docker", MinFreeBytes: 10 << 30},
+		WorkspaceStorage:  WorkspaceStorage{RootDir: t.TempDir(), MaxWorkspaceBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
+		WorkspaceSyncNode: WorkspaceSyncNode{WorkspaceRoot: filepath.Join(t.TempDir(), "workspace-current")},
+		SiteStorage:       SiteStorage{RootDir: t.TempDir(), MaxReleaseBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
+		Gateway:           Gateway{WorkbenchDir: t.TempDir(), PreviewPortMin: 1024, MaxBodyBytes: 1024},
+		MCP:               MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 640}, PortalWeb: PortalWeb{Dir: "web"}, Log: Log{Level: "info", Format: "json"},
 	}
 }
 

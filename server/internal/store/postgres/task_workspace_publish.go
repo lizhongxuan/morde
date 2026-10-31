@@ -46,6 +46,20 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+		var workspaceOwner, workspaceState string
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state FROM workspaces WHERE id=$1 FOR UPDATE`, value.WorkspaceID).
+			Scan(&workspaceOwner, &workspaceState); err != nil {
+			return storeError("lock Workspace for Task publish reservation", "workspace", err)
+		}
+		if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
+		}
+		if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
+		if err := ensureNoWorkspaceSyncReceive(ctx, tx, value.WorkspaceID, ""); err != nil {
+			return err
+		}
 		if ownerID != value.OwnerID || hostID != value.HostID || executionEpoch != gate.epoch {
 			return missingTaskError()
 		}
@@ -194,11 +208,11 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock
 	return receipt, nil
 }
 
-func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWorkspacePublishCommand, files []workspace.File, manifestSHA string) (app.TaskWorkspacePublishReceipt, error) {
+func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, manifestSHA string) (app.TaskWorkspacePublishReceipt, error) {
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return app.TaskWorkspacePublishReceipt{}, err
 	}
-	actualManifestSHA, err := workspace.ManifestSHA256(files)
+	actualManifestSHA, err := workspace.ManifestTreeSHA256(files, emptyDirectories)
 	if err != nil || actualManifestSHA != manifestSHA {
 		return app.TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest digest changed")
 	}
@@ -274,6 +288,12 @@ FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).Scan(&hostOwner, &hostState, &h
 		if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
+		if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
+		if err := ensureNoWorkspaceSyncReceive(ctx, tx, value.WorkspaceID, ""); err != nil {
+			return err
+		}
 		if currentRevision != value.BaseRevision {
 			return markTaskWorkspacePublishRejected(ctx, tx, value, &receipt, &rejected,
 				domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task checkpoint was confirmed"), app.TaskWorkspacePublishConflict)
@@ -297,18 +317,18 @@ FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, value.
 			return markTaskWorkspacePublishRejected(ctx, tx, value, &receipt, &rejected,
 				domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed before Task publish"), app.TaskWorkspacePublishConflict)
 		}
-		mutations, err := taskWorkspacePublishMutations(ctx, tx, value.WorkspaceID, currentRevision, files)
+		mutations, directoryMutations, err := taskWorkspacePublishMutations(ctx, tx, value.WorkspaceID, currentRevision, files, emptyDirectories)
 		if err != nil {
 			return err
 		}
 		if err := ensureWorkspaceMutationsBlockUsageStored(ctx, tx, value.WorkspaceID, mutations); err != nil {
 			return err
 		}
-		if len(mutations) > 0 {
+		if len(mutations)+len(directoryMutations) > 0 {
 			if _, err := tx.Exec(ctx, `SAVEPOINT task_workspace_publish_apply`); err != nil {
 				return fmt.Errorf("start Task Workspace publish savepoint: %w", err)
 			}
-			if err := applyWorkspaceSyncMutations(ctx, tx, value.WorkspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, mutations); err != nil {
+			if err := applyWorkspaceSyncTreeMutations(ctx, tx, value.WorkspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, mutations, directoryMutations); err != nil {
 				if domain.CodeOf(err) != domain.CodeQuotaExceeded {
 					return err
 				}
@@ -319,8 +339,11 @@ FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, value.
 			}
 		}
 		publishedRevision := currentRevision
-		if len(mutations) > 0 {
+		if len(mutations)+len(directoryMutations) > 0 {
 			publishedRevision++
+		}
+		if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, value.WorkspaceID, publishedRevision); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE tasks SET workspace_checkpoint_revision=$2, updated_at=clock_timestamp() WHERE id=$1`, value.TaskID, publishedRevision); err != nil {
 			return fmt.Errorf("advance Task Workspace checkpoint: %w", err)
@@ -378,16 +401,19 @@ func (s *Store) ReserveTaskWorkspaceBlockUsage(ctx context.Context, workspaceID 
 		if state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
+		if err := ensureNoWorkspaceSyncReceive(ctx, tx, workspaceID, ""); err != nil {
+			return err
+		}
 		return reserveWorkspaceBlockUsage(ctx, tx, workspaceID, ownerID, reservations, maxOwnerBytes)
 	})
 }
 
-func taskWorkspacePublishMutations(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, files []workspace.File) ([]syncMutation, error) {
+func taskWorkspacePublishMutations(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string) ([]syncMutation, []syncDirectoryMutation, error) {
 	rows, err := tx.Query(ctx, `SELECT file_path, size_bytes, sha256, mode, chunks FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
 ORDER BY file_path`, workspaceID, revision)
 	if err != nil {
-		return nil, fmt.Errorf("read current Workspace files for Task publish: %w", err)
+		return nil, nil, fmt.Errorf("read current Workspace files for Task publish: %w", err)
 	}
 	currentFiles := make([]workspace.File, 0)
 	for rows.Next() {
@@ -397,18 +423,18 @@ ORDER BY file_path`, workspaceID, revision)
 		var chunks []byte
 		if err := rows.Scan(&filePath, &size, &digest, &mode, &chunks); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("scan current Workspace file for Task publish: %w", err)
+			return nil, nil, fmt.Errorf("scan current Workspace file for Task publish: %w", err)
 		}
 		file, err := workspaceFileFromRow(filePath, size, digest, mode, chunks)
 		if err != nil {
 			rows.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		currentFiles = append(currentFiles, file)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, fmt.Errorf("iterate current Workspace files for Task publish: %w", err)
+		return nil, nil, fmt.Errorf("iterate current Workspace files for Task publish: %w", err)
 	}
 	rows.Close()
 	currentByPath := fileMapByFoldedPath(currentFiles)
@@ -431,5 +457,49 @@ ORDER BY file_path`, workspaceID, revision)
 			mutations = append(mutations, syncMutation{path: output.Path, file: &file})
 		}
 	}
-	return mutations, nil
+	directoryRows, err := tx.Query(ctx, `SELECT directory_path FROM workspace_revision_empty_directories
+WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
+ORDER BY directory_path`, workspaceID, revision)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read current Workspace directories for Task publish: %w", err)
+	}
+	currentDirectories := make([]string, 0)
+	for directoryRows.Next() {
+		var directory string
+		if err := directoryRows.Scan(&directory); err != nil {
+			directoryRows.Close()
+			return nil, nil, fmt.Errorf("scan current Workspace directory for Task publish: %w", err)
+		}
+		currentDirectories = append(currentDirectories, directory)
+	}
+	if err := directoryRows.Err(); err != nil {
+		directoryRows.Close()
+		return nil, nil, fmt.Errorf("iterate current Workspace directories for Task publish: %w", err)
+	}
+	directoryRows.Close()
+	currentDirectoriesByPath := make(map[string]string, len(currentDirectories))
+	outputDirectoriesByPath := make(map[string]string, len(emptyDirectories))
+	for _, directory := range currentDirectories {
+		currentDirectoriesByPath[strings.ToLower(directory)] = directory
+	}
+	for _, directory := range emptyDirectories {
+		outputDirectoriesByPath[strings.ToLower(directory)] = directory
+	}
+	directoryMutations := make([]syncDirectoryMutation, 0, len(currentDirectories)+len(emptyDirectories))
+	for folded, current := range currentDirectoriesByPath {
+		output, exists := outputDirectoriesByPath[folded]
+		if !exists {
+			directoryMutations = append(directoryMutations, syncDirectoryMutation{path: current, delete: true})
+		} else if output != current {
+			directoryMutations = append(directoryMutations,
+				syncDirectoryMutation{path: current, delete: true},
+				syncDirectoryMutation{path: output})
+		}
+	}
+	for folded, output := range outputDirectoriesByPath {
+		if _, exists := currentDirectoriesByPath[folded]; !exists {
+			directoryMutations = append(directoryMutations, syncDirectoryMutation{path: output})
+		}
+	}
+	return mutations, directoryMutations, nil
 }

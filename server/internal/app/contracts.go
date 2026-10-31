@@ -69,7 +69,7 @@ type HostReplicaService interface {
 	ScopeWorkspace(context.Context, identity.Principal, string, int64) (identity.Principal, error)
 	ListBindings(context.Context, identity.Principal) ([]workspace.Binding, error)
 	CredentialForBinding(context.Context, identity.Principal, string, int64) (string, error)
-	RecordAppliedRevision(context.Context, identity.Principal, string, int64, int64) (workspace.Binding, error)
+	RecordAppliedRevision(context.Context, identity.Principal, string, int64, string, int64) (workspace.Binding, error)
 	ActivateBinding(context.Context, identity.Principal, string, int64) (workspace.Binding, error)
 	CompleteUnbinding(context.Context, identity.Principal, string, int64, int64) (workspace.Binding, error)
 	ReportWorkspaceSyncStatus(context.Context, identity.Principal, workspace.BindingSyncState, []string) (workspace.Binding, error)

@@ -213,7 +213,8 @@ func (h *api) recordHostReplicaAppliedRevision(c *gin.Context) {
 		writeError(c, domain.NewError(domain.CodeWorkspaceConflict, "workspace revision was not fully applied by a completed download session"))
 		return
 	}
-	binding, err := h.deps.HostReplicas.RecordAppliedRevision(c.Request.Context(), principal, principal.ReplicaWorkspaceID, principal.BindingVersion, request.AppliedRevision)
+	binding, err := h.deps.HostReplicas.RecordAppliedRevision(c.Request.Context(), principal, principal.ReplicaWorkspaceID,
+		principal.BindingVersion, request.SessionID, request.AppliedRevision)
 	if err != nil {
 		writeError(c, err)
 		return

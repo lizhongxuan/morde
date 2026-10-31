@@ -100,6 +100,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="morde-backup-test-")
         self.root = Path(self.temp.name)
         self.bundle = create_fixture(self.root)
+        (self.root / "workspace-current").mkdir()
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self.fake_docker = self.bin_dir / "docker"
@@ -130,11 +131,13 @@ class OfflineBackupValidationTests(unittest.TestCase):
         sources = {
             "postgres_data_dir": (self.root / "pg").resolve(),
             "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
             "site_storage_root": (self.root / "sites").resolve(),
         }
         for mount_source in (
             self.root / "pg",
             self.root / "workspaces" / "w1234567",
+            self.root / "workspace-current" / "w1234567",
             self.root,
         ):
             with self.subTest(mount_source=mount_source), patch.object(
@@ -148,10 +151,43 @@ class OfflineBackupValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(BACKUP.BackupError, "writable bind mount overlapping protected storage"):
                     BACKUP.require_no_running_container_mounts(sources)
 
+    def test_backup_gate_rejects_bind_mount_aliases_by_directory_inode(self) -> None:
+        sources = {
+            "postgres_data_dir": (self.root / "pg").resolve(),
+            "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
+            "site_storage_root": (self.root / "sites").resolve(),
+        }
+        cases = (
+            ("alias-current", sources["workspace_current_root"]),
+            ("alias-parent", self.root),
+        )
+        original_stat = Path.stat
+        for alias_name, target in cases:
+            alias = self.root / alias_name
+            alias.mkdir()
+
+            def stat_with_bind_alias(path, *args, _alias=alias, _target=target, **kwargs):
+                if path == _alias:
+                    return original_stat(_target, *args, **kwargs)
+                return original_stat(path, *args, **kwargs)
+
+            with self.subTest(alias=alias_name), patch.object(Path, "stat", stat_with_bind_alias), patch.object(
+                BACKUP,
+                "run",
+                side_effect=[
+                    "0123456789abcdef\n",
+                    json.dumps([{"Type": "bind", "Source": str(alias), "RW": True}]),
+                ],
+            ):
+                with self.assertRaisesRegex(BACKUP.BackupError, "writable bind mount overlapping protected storage"):
+                    BACKUP.require_no_running_container_mounts(sources)
+
     def test_backup_gate_allows_read_only_or_unrelated_container_mounts(self) -> None:
         sources = {
             "postgres_data_dir": (self.root / "pg").resolve(),
             "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
             "site_storage_root": (self.root / "sites").resolve(),
         }
         mounts = [
@@ -172,6 +208,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         sources = {
             "postgres_data_dir": (self.root / "pg").resolve(),
             "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
             "site_storage_root": (self.root / "sites").resolve(),
         }
         cases = (
@@ -205,6 +242,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         sources = {
             "postgres_data_dir": (self.root / "pg").resolve(),
             "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
             "site_storage_root": (self.root / "sites").resolve(),
         }
         mount = {"Type": "volume", "Name": "custom", "Source": "/var/lib/docker/volumes/custom/_data", "RW": True}
@@ -224,6 +262,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         sources = {
             "postgres_data_dir": (self.root / "pg").resolve(),
             "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
             "site_storage_root": (self.root / "sites").resolve(),
         }
         with patch.object(BACKUP, "run", side_effect=["0123456789abcdef\n", "not-json"]):
@@ -242,6 +281,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         sources = {
             "postgres_data_dir": (self.root / "pg").resolve(),
             "workspace_root": (self.root / "workspaces").resolve(),
+            "workspace_current_root": (self.root / "workspace-current").resolve(),
             "site_storage_root": (self.root / "sites").resolve(),
         }
         with (
@@ -254,6 +294,18 @@ class OfflineBackupValidationTests(unittest.TestCase):
         portal_stopped.assert_called_once_with()
         postgres_stopped.assert_called_once_with(Path("env"), Path("compose"))
         mounts_stopped.assert_called_once_with(sources)
+
+    def test_current_root_must_not_overlap_archive_roots(self) -> None:
+        nested_current = self.root / "workspaces" / "current"
+        nested_current.mkdir()
+        args = type("Args", (), {
+            "postgres_data_dir": str(self.root / "pg"),
+            "workspace_root": str(self.root / "workspaces"),
+            "workspace_current_root": str(nested_current),
+            "site_storage_root": str(self.root / "sites"),
+        })()
+        with self.assertRaisesRegex(BACKUP.BackupError, "directories must not overlap"):
+            BACKUP.source_paths(args)
 
     def test_verifies_synthetic_postgres_workspace_and_site_bundle(self) -> None:
         result = self.run_verify()

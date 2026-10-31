@@ -186,9 +186,11 @@ func TestSiteRevisionMaterializerStreamsPinnedRevisionAndVerifiesFiles(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	directoryCursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: 4, After: "empty"})
 	firstCursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: 4, After: files[1].Path})
 	pages := siteManifestPages{
-		"":            {WorkspaceID: siteMaterializerWorkspaceID, Revision: 4, Files: files[:2], NextCursor: &firstCursor},
+		"":            {WorkspaceID: siteMaterializerWorkspaceID, Revision: 4, EmptyDirectories: []string{"empty"}, NextCursor: &directoryCursor},
+		"empty":       {WorkspaceID: siteMaterializerWorkspaceID, Revision: 4, Files: files[:2], NextCursor: &firstCursor},
 		files[1].Path: {WorkspaceID: siteMaterializerWorkspaceID, Revision: 4, Files: files[2:]},
 	}
 	blocks := siteMaterializerBlocks{}

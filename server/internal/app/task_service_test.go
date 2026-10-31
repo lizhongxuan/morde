@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -68,8 +69,9 @@ type taskStoreStub struct {
 
 type taskWorkspaceStoreStub struct {
 	*taskStoreStub
-	value workspace.Workspace
-	files []workspace.File
+	value            workspace.Workspace
+	files            []workspace.File
+	emptyDirectories []string
 }
 
 func (s *taskWorkspaceStoreStub) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
@@ -83,19 +85,34 @@ func (s *taskWorkspaceStoreStub) GetWorkspaceManifestPage(_ context.Context, id 
 	if id != s.value.ID || revision > s.value.Revision || limit < 1 {
 		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace manifest not found")
 	}
+	type item struct {
+		path string
+		file *workspace.File
+	}
+	items := make([]item, 0, len(s.files)+len(s.emptyDirectories))
+	for index := range s.files {
+		file := s.files[index]
+		items = append(items, item{path: file.Path, file: &file})
+	}
+	for _, directory := range s.emptyDirectories {
+		items = append(items, item{path: directory})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].path < items[j].path })
 	start := 0
-	if after != "" {
-		for start < len(s.files) && s.files[start].Path <= after {
-			start++
+	for start < len(items) && items[start].path <= after {
+		start++
+	}
+	end := min(start+int(limit), len(items))
+	page := workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: []workspace.File{}, EmptyDirectories: []string{}}
+	for _, value := range items[start:end] {
+		if value.file != nil {
+			page.Files = append(page.Files, *value.file)
+		} else {
+			page.EmptyDirectories = append(page.EmptyDirectories, value.path)
 		}
 	}
-	end := start + 1
-	if end > len(s.files) {
-		end = len(s.files)
-	}
-	page := workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: append([]workspace.File(nil), s.files[start:end]...)}
-	if end < len(s.files) {
-		cursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: revision, After: s.files[end-1].Path})
+	if end < len(items) {
+		cursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: revision, After: items[end-1].path})
 		page.NextCursor = &cursor
 	}
 	return page, nil
@@ -468,6 +485,34 @@ func TestTaskServicePinsCommittedWorkspaceManifestAndHashesInputRevision(t *test
 	command.InputRevision = nil
 	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.submissions) != 2 {
 		t.Fatalf("missing Workspace revision error=%v submissions=%d", err, len(store.submissions))
+	}
+}
+
+func TestTaskServiceIncludesEmptyDirectoriesInInputDigest(t *testing.T) {
+	store := &taskWorkspaceStoreStub{
+		taskStoreStub:    &taskStoreStub{},
+		value:            workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
+		emptyDirectories: []string{"cache", "docs/empty"},
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(1)
+	command := SubmitTaskCommand{
+		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		ModelID: "model-a", Objective: "inspect the workspace", IdempotencyKey: "workspace-empty-dir-input",
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := workspace.ManifestTreeSHA256(nil, store.emptyDirectories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := hex.DecodeString(expected)
+	if !bytes.Equal(store.submissions[0].Task.ContextDigest, want) {
+		t.Fatalf("Task input digest = %x; want directory-aware %x", store.submissions[0].Task.ContextDigest, want)
 	}
 }
 

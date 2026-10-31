@@ -95,7 +95,8 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 	hostValue, workspaceValue, binding, claimed, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-success")
 	service, _ := taskWorkspacePublishTestService(t, store)
 	file := syncTestFile("reports/result.txt", []byte("published result"))
-	manifestSHA, err := workspace.ManifestSHA256([]workspace.File{file})
+	emptyDirectories := []string{"reports/archive"}
+	manifestSHA, err := workspace.ManifestTreeSHA256([]workspace.File{file}, emptyDirectories)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +111,15 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 	}
 	if _, _, err := store.CreateOperation(ctx, operation, claimed.Lease.Owner); err != nil {
 		t.Fatalf("CreateOperation before pending publish: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, workspaceValue.ID, "legacy-"+workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReserveTaskWorkspacePublish(ctx, command); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("reserve Task Workspace publish during pending legacy import = %v; want workspace busy", err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM workspace_legacy_volumes WHERE workspace_id=$1`, workspaceValue.ID); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("reserve Task Workspace publish during operation = %v; want workspace busy", err)
@@ -138,7 +148,7 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 		t.Fatalf("CreateOperation during pending publish = %v; want workspace busy", err)
 	}
 	reads := 0
-	receipt, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+	receipt, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, emptyDirectories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
 		reads++
 		if digest != file.SHA256 {
 			t.Fatalf("requested output block %q; want %q", digest, file.SHA256)
@@ -149,7 +159,8 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 		t.Fatalf("commit Task Workspace publish = %#v, reads=%d, err=%v", receipt, reads, err)
 	}
 	page, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, receipt.PublishedRevision, "", "", 10)
-	if err != nil || len(page.Files) != 1 || page.Files[0].Path != file.Path || page.Files[0].SHA256 != file.SHA256 {
+	if err != nil || len(page.Files) != 1 || page.Files[0].Path != file.Path || page.Files[0].SHA256 != file.SHA256 ||
+		len(page.EmptyDirectories) != 1 || page.EmptyDirectories[0] != emptyDirectories[0] {
 		t.Fatalf("published Workspace manifest = %#v, err=%v", page, err)
 	}
 	details, err := store.GetTask(ctx, claimed.ID, claimed.OwnerID)
@@ -184,7 +195,7 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 		t.Fatalf("settle operation after Task publish: %v", err)
 	}
 	restartedService, _ := taskWorkspacePublishTestService(t, store)
-	replayed, err := restartedService.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, manifestSHA, func(context.Context, string) ([]byte, error) {
+	replayed, err := restartedService.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, emptyDirectories, manifestSHA, func(context.Context, string) ([]byte, error) {
 		t.Fatal("published receipt replay read Runtime output blocks")
 		return nil, nil
 	})
@@ -257,7 +268,7 @@ func TestTaskWorkspacePublishPersistsCASConflict(t *testing.T) {
 	}
 	file := syncTestFile("reports/result.txt", []byte("same content"))
 	manifestSHA, _ := workspace.ManifestSHA256([]workspace.File{file})
-	_, err := store.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, manifestSHA)
+	_, err := store.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, manifestSHA)
 	if domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("Task publish after PC revision change = %v; want Workspace conflict", err)
 	}
@@ -326,7 +337,7 @@ func TestTaskWorkspacePublishSerializesSameContentAcrossTasks(t *testing.T) {
 		command := command
 		go func() {
 			<-start
-			receipt, publishErr := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, outputManifestSHA,
+			receipt, publishErr := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, outputManifestSHA,
 				func(_ context.Context, digest string) ([]byte, error) {
 					if digest != file.SHA256 {
 						return nil, errors.New("unexpected output block digest")
@@ -361,7 +372,7 @@ func TestTaskWorkspacePublishSerializesSameContentAcrossTasks(t *testing.T) {
 		}
 	}
 	if retryCommand != nil {
-		_, err := service.CommitTaskWorkspacePublish(ctx, *retryCommand, []workspace.File{file}, outputManifestSHA,
+		_, err := service.CommitTaskWorkspacePublish(ctx, *retryCommand, []workspace.File{file}, nil, outputManifestSHA,
 			func(_ context.Context, digest string) ([]byte, error) {
 				if digest != file.SHA256 {
 					return nil, errors.New("unexpected retry output block digest")
@@ -450,7 +461,7 @@ waiting_reason='workspace_input_changed' WHERE id=$1`, claimed.ID); err != nil {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CommitTaskWorkspacePublish(ctx, command, []workspace.File{}, manifestSHA); domain.CodeOf(err) != domain.CodeInvalidState {
+		if _, err := store.CommitTaskWorkspacePublish(ctx, command, []workspace.File{}, nil, manifestSHA); domain.CodeOf(err) != domain.CodeInvalidState {
 			t.Fatalf("publish commit without a Task lease = %v; want lease conflict", err)
 		}
 	})
@@ -469,7 +480,7 @@ func TestTaskWorkspacePublishQuotaRejectionReleasesOperationBarrier(t *testing.T
 	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
 		t.Fatal(err)
 	}
-	_, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, manifestSHA, func(context.Context, string) ([]byte, error) {
+	_, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, manifestSHA, func(context.Context, string) ([]byte, error) {
 		return []byte("over quota"), nil
 	})
 	if domain.CodeOf(err) != domain.CodeQuotaExceeded {

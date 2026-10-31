@@ -14,11 +14,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/syncnodequota"
 )
 
 func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
@@ -54,6 +56,10 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 	runRoot, err := os.MkdirTemp(root, "workspace-sync-e2e-")
 	if err != nil {
 		t.Fatal("create local integration directory")
+	}
+	quotaSocketRoot := filepath.Join(runRoot, "quota-sockets")
+	if err := os.Mkdir(quotaSocketRoot, 0o700); err != nil {
+		t.Fatal("create local quota socket root")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -126,14 +132,28 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 		ImageDigest: nodeImage, RelayImageDigest: relayImage, RelayPublicAddress: relayAddress,
 		RelayBindAddress: relayBindAddress, RelayToken: relayToken,
 		DockerSocket: socket, RelayStateRoot: filepath.Join(root, "relay-state"), StateRoot: filepath.Join(runRoot, "node-state"),
-		WorkspaceRoot: filepath.Join(runRoot, "workspaces"), RelayContainerName: relayName,
+		WorkspaceRoot: filepath.Join(runRoot, "workspaces"), QuotaSocketRoot: quotaSocketRoot, RelayContainerName: relayName,
 		Resources: DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
 	})
 	if err != nil {
 		t.Fatalf("initialize local Docker node supervisor: %v", err)
 	}
+	quotaService := &workspaceSyncQuotaSocketE2ERecorder{
+		ownerID: ownerID, byOperation: make(map[string]string), byReservation: make(map[string]syncnodequota.ReserveRequest),
+		receipts: make(map[string]syncnodequota.Receipt),
+	}
+	quotaSockets, err := NewWorkspaceSyncNodeQuotaSockets(quotaSocketRoot, quotaService)
+	if err != nil {
+		t.Fatalf("initialize local quota socket manager: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := quotaSockets.Close(); err != nil {
+			t.Errorf("close local quota socket manager: %v", err)
+		}
+	})
 	provisioner, err := NewWorkspaceSyncNodeProvisioner(WorkspaceSyncNodeProvisionerOptions{
-		Supervisor: supervisor, Store: store, DataKey: []byte(strings.Repeat("k", 32)),
+		Supervisor: supervisor, Store: store, RelayGate: &workspaceSyncRelayGateStub{}, QuotaSockets: quotaSockets,
+		StartGuard: workspaceSyncNoopStartGuard(), DataKey: []byte(strings.Repeat("k", 32)),
 	})
 	if err != nil {
 		t.Fatalf("initialize local node provisioner: %v", err)
@@ -185,7 +205,7 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 	}
 	folderConfig, err := configureSyncthingFolder(folderRaw, workspace.SyncNodeFolder{
 		WorkspaceID: workspaceID, FolderID: folderID, DeviceIDs: []string{pcID, serverID},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("configure local PC folder: %v", err)
 	}
@@ -217,6 +237,16 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 	if err := waitForFileContent(ctx, filepath.Join(serverFiles, "pc-to-server.txt"), pcToServer); err != nil {
 		t.Fatalf("verify PC-to-server file transfer: %v", err)
 	}
+	quotaRequest, quotaReceipt, err := quotaService.waitForSettled(ctx, "pc-to-server.txt")
+	if err != nil {
+		t.Fatalf("wait for PC-to-server quota settlement: %v", err)
+	}
+	_, operationIDErr := hex.DecodeString(quotaRequest.OperationID)
+	if quotaRequest.WorkspaceID != workspaceID || quotaRequest.FolderID != folderID || quotaRequest.Operation != syncnodequota.OperationUpsert ||
+		quotaRequest.SizeBytes != int64(len(pcToServer)) || len(quotaRequest.OperationID) != 64 || operationIDErr != nil ||
+		quotaReceipt.ResultRevision == nil || *quotaReceipt.ResultRevision != 1 {
+		t.Fatalf("PC-to-server quota receipt = request %#v, receipt %#v", quotaRequest, quotaReceipt)
+	}
 	serverToPC := []byte("Morde server to local PC via private relay\n")
 	if err := os.WriteFile(filepath.Join(serverFiles, "server-to-pc.txt"), serverToPC, 0600); err != nil {
 		t.Fatal("write server test file")
@@ -246,6 +276,92 @@ func TestWorkspaceSyncNodeProvisionerRealSyncthingDockerE2E(t *testing.T) {
 	var remainingDevice syncthingDeviceConfig
 	if err := json.Unmarshal(actualDevices[0], &remainingDevice); err != nil || remainingDevice.DeviceID != serverID {
 		t.Fatalf("server retained unexpected device after revocation: %+v, error = %v", remainingDevice, err)
+	}
+}
+
+type workspaceSyncQuotaSocketE2ERecorder struct {
+	mu            sync.Mutex
+	ownerID       string
+	nextID        uint64
+	revision      int64
+	byOperation   map[string]string
+	byReservation map[string]syncnodequota.ReserveRequest
+	receipts      map[string]syncnodequota.Receipt
+}
+
+func (s *workspaceSyncQuotaSocketE2ERecorder) Reserve(_ context.Context, ownerID string, request syncnodequota.ReserveRequest) (syncnodequota.Receipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ownerID != s.ownerID {
+		return syncnodequota.Receipt{}, fmt.Errorf("unexpected quota owner %q", ownerID)
+	}
+	if reservationID := s.byOperation[request.OperationID]; reservationID != "" {
+		return s.receipts[reservationID], nil
+	}
+	s.nextID++
+	reservationID := fmt.Sprintf("r%07d", s.nextID)
+	receipt := syncnodequota.Receipt{ReservationID: reservationID, State: "reserved", BaseRevision: s.revision}
+	s.byOperation[request.OperationID] = reservationID
+	s.byReservation[reservationID] = request
+	s.receipts[reservationID] = receipt
+	return receipt, nil
+}
+
+func (s *workspaceSyncQuotaSocketE2ERecorder) Settle(_ context.Context, ownerID, reservationID string) (syncnodequota.Receipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ownerID != s.ownerID {
+		return syncnodequota.Receipt{}, fmt.Errorf("unexpected quota owner %q", ownerID)
+	}
+	receipt, ok := s.receipts[reservationID]
+	if !ok {
+		return syncnodequota.Receipt{}, fmt.Errorf("unknown quota reservation %q", reservationID)
+	}
+	if receipt.State == "reserved" {
+		s.revision++
+		revision := s.revision
+		receipt.State = "settled"
+		receipt.ResultRevision = &revision
+		s.receipts[reservationID] = receipt
+	}
+	return receipt, nil
+}
+
+func (s *workspaceSyncQuotaSocketE2ERecorder) Abort(_ context.Context, ownerID, reservationID string) (syncnodequota.Receipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ownerID != s.ownerID {
+		return syncnodequota.Receipt{}, fmt.Errorf("unexpected quota owner %q", ownerID)
+	}
+	receipt, ok := s.receipts[reservationID]
+	if !ok {
+		return syncnodequota.Receipt{}, fmt.Errorf("unknown quota reservation %q", reservationID)
+	}
+	if receipt.State == "reserved" {
+		receipt.State = "aborted"
+		s.receipts[reservationID] = receipt
+	}
+	return receipt, nil
+}
+
+func (s *workspaceSyncQuotaSocketE2ERecorder) waitForSettled(ctx context.Context, filePath string) (syncnodequota.ReserveRequest, syncnodequota.Receipt, error) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		for reservationID, request := range s.byReservation {
+			receipt := s.receipts[reservationID]
+			if request.Path == filePath && receipt.State == "settled" {
+				s.mu.Unlock()
+				return request, receipt, nil
+			}
+		}
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return syncnodequota.ReserveRequest{}, syncnodequota.Receipt{}, ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

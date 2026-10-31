@@ -26,7 +26,7 @@ func TestClientTicketConsumeReturnsInstallationAndRevocationRejectsPendingTicket
 	}
 
 	pendingID := createClientBoundTicket(t, ctx, store, owner.ID, installationID, hostValue.ID)
-	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", audit.ActorSession); err != nil {
+	if err := store.RevokeClientInstallation(ctx, installationID, owner.ID, "127.0.0.1", audit.ActorSession, nil); err != nil {
 		t.Fatalf("revoke client installation: %v", err)
 	}
 	if _, err := store.ConsumeTicket(ctx, pendingID); !errors.Is(err, identity.ErrInvalidCredential) {

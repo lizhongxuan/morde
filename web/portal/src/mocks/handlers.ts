@@ -868,7 +868,9 @@ export const handlers = [
   http.get("/api/workspaces/:workspaceId/sync-progress", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
     const workspace = workspaces.find((item) => item.id === String(params.workspaceId) && workspaceOwners.get(item.id) === user.id);
-    return workspace ? json({ items: [] }) : failure("not_found", "工作区不存在", 404);
+    return workspace ? json({ revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
+      remaining_bytes: Math.max(0, workspace.quota_bytes - workspace.used_bytes),
+      quota_status: workspace.used_bytes > workspace.quota_bytes ? "over_quota" : workspace.used_bytes === workspace.quota_bytes ? "full" : "available", items: [] }) : failure("not_found", "工作区不存在", 404);
   }),
   http.delete("/api/workspaces/:workspaceId", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;

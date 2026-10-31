@@ -10,9 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"morde/server/internal/domain/workspace"
 )
 
 const (
@@ -300,6 +303,101 @@ func (c *SyncthingAPIClient) Connections(ctx context.Context) (json.RawMessage, 
 	return json.RawMessage(body), err
 }
 
+// ConnectedDeviceIDs returns only the IDs that Syncthing currently reports as
+// connected. It deliberately discards all other connection metadata.
+func (c *SyncthingAPIClient) ConnectedDeviceIDs(ctx context.Context) ([]string, error) {
+	body, err := c.request(ctx, http.MethodGet, "/rest/system/connections", nil, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		Connections map[string]struct {
+			Connected *bool `json:"connected"`
+		} `json:"connections"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || response.Connections == nil {
+		return nil, errSyncthingAPIJSON
+	}
+	connected := make([]string, 0, len(response.Connections))
+	for deviceID, state := range response.Connections {
+		if !validSyncthingDeviceID(deviceID) || state.Connected == nil {
+			return nil, errSyncthingAPIJSON
+		}
+		if *state.Connected {
+			connected = append(connected, deviceID)
+		}
+	}
+	sort.Strings(connected)
+	return connected, nil
+}
+
+type syncthingFolderStatus struct {
+	FolderID  string
+	State     string
+	NeedBytes int64
+	NeedFiles int64
+}
+
+// WorkspaceFolderStatuses returns read-only status for the Morde-managed
+// Workspace folders configured on this node. Non-Workspace folders are omitted.
+func (c *SyncthingAPIClient) WorkspaceFolderStatuses(ctx context.Context) ([]syncthingFolderStatus, error) {
+	configured, err := c.GetFolders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	folderIDs := make([]string, 0, len(configured))
+	seen := make(map[string]struct{}, len(configured))
+	for _, raw := range configured {
+		var folder struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &folder); err != nil || !validSyncthingPathSegment(folder.ID) {
+			return nil, errSyncthingAPIJSON
+		}
+		if !workspace.ValidSyncFolderID(folder.ID) {
+			continue
+		}
+		if _, duplicate := seen[folder.ID]; duplicate {
+			return nil, errSyncthingAPIJSON
+		}
+		seen[folder.ID] = struct{}{}
+		folderIDs = append(folderIDs, folder.ID)
+	}
+	sort.Strings(folderIDs)
+
+	statuses := make([]syncthingFolderStatus, 0, len(folderIDs))
+	for _, folderID := range folderIDs {
+		query := url.Values{"folder": []string{folderID}}
+		body, err := c.request(ctx, http.MethodGet, "/rest/db/status", query, nil, true)
+		if err != nil {
+			return nil, err
+		}
+		var response struct {
+			State     *string `json:"state"`
+			NeedBytes *int64  `json:"needBytes"`
+			NeedFiles *int64  `json:"needFiles"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil || response.State == nil ||
+			response.NeedBytes == nil || response.NeedFiles == nil || *response.NeedBytes < 0 || *response.NeedFiles < 0 {
+			return nil, errSyncthingAPIJSON
+		}
+		statuses = append(statuses, syncthingFolderStatus{
+			FolderID: folderID, State: stableSyncthingFolderState(*response.State),
+			NeedBytes: *response.NeedBytes, NeedFiles: *response.NeedFiles,
+		})
+	}
+	return statuses, nil
+}
+
+func stableSyncthingFolderState(value string) string {
+	switch value {
+	case "idle", "scanning", "syncing", "clean", "error", "paused", "stopped", "outofsync", "sync-preparing":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
 // NodeID reads this Syncthing node's device ID from the system status.
 func (c *SyncthingAPIClient) NodeID(ctx context.Context) (string, error) {
 	status, err := c.SystemStatus(ctx)
@@ -408,15 +506,15 @@ func validSyncthingPathSegment(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || strings.ContainsRune("-._~", r)) {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') && !strings.ContainsRune("-._~", r) {
 			return false
 		}
 	}
 	return true
 }
 
-func (c *SyncthingAPIClient) request(ctx context.Context, method, path string, query url.Values, body []byte, expectJSON bool) ([]byte, error) {
+func (c *SyncthingAPIClient) request(ctx context.Context, method, path string, query url.Values, body []byte, expectJSON bool) (result []byte, retErr error) {
 	if ctx == nil {
 		return nil, errors.New("syncthing API request context is required")
 	}
@@ -447,7 +545,7 @@ func (c *SyncthingAPIClient) request(ctx context.Context, method, path string, q
 		}
 		return nil, errSyncthingAPIRequest
 	}
-	defer resp.Body.Close()
+	defer func() { retErr = errors.Join(retErr, resp.Body.Close()) }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("syncthing API returned HTTP %d", resp.StatusCode)
 	}

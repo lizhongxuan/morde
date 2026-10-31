@@ -2,8 +2,10 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -72,6 +74,16 @@ func TestWorkspaceLegacyImportCommitsFilesAndEmptyVolume(t *testing.T) {
 		t.Fatalf("imported changes = %#v, err=%v", changes, err)
 	}
 	assertLegacyImportState(t, ctx, store, snapshot.WorkspaceID, "imported")
+
+	directorySnapshot := createPendingLegacyWorkspace(t, ctx, store, "directory-import")
+	directoryImport, err := commitWorkspaceLegacyVolumeImportWithDirectories(ctx, store, directorySnapshot, nil, []string{"empty/nested"})
+	if err != nil || directoryImport.Revision != 1 {
+		t.Fatalf("import legacy empty directory = %#v, err=%v", directoryImport, err)
+	}
+	var directoryPath string
+	if err := store.pool.QueryRow(ctx, `SELECT directory_path FROM workspace_revision_empty_directories WHERE workspace_id=$1 AND valid_from_revision=1`, directorySnapshot.WorkspaceID).Scan(&directoryPath); err != nil || directoryPath != "empty/nested" {
+		t.Fatalf("imported empty directory = %q, err=%v", directoryPath, err)
+	}
 
 	if _, err := commitWorkspaceLegacyVolumeImport(ctx, store, snapshot, files); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("repeat legacy import error = %v, want workspace conflict", err)
@@ -156,23 +168,100 @@ func TestWorkspaceLegacyImportConcurrentCommitHasOneWinner(t *testing.T) {
 	}
 }
 
+func TestPendingLegacyImportBlockGCReleasesAbandonedReservations(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	snapshot := createPendingLegacyWorkspace(t, ctx, store, "pending-import-gc-reservations")
+	reservations := []app.WorkspaceBlockReservation{
+		{WorkspaceID: snapshot.WorkspaceID, Digest: strings.Repeat("a", 64), ReservedBytes: 11},
+		{WorkspaceID: snapshot.WorkspaceID, Digest: strings.Repeat("b", 64), ReservedBytes: 13},
+	}
+	if err := store.ReserveWorkspaceBlockUsage(ctx, snapshot.WorkspaceID, reservations, 20_000); err != nil {
+		t.Fatal(err)
+	}
+	workspaceValue, err := store.GetWorkspace(ctx, snapshot.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := store.WithPendingLegacyImportWorkspaceBlockGC(ctx, snapshot.WorkspaceID, func(references []workspace.BlockReference) ([]app.WorkspaceBlockRemoval, error) {
+		called = true
+		if len(references) != 0 {
+			t.Fatalf("initial pending Workspace protected references = %#v", references)
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var rows, reservedBytes, ownerReserved int64
+	if err := store.pool.QueryRow(ctx, `SELECT count(*), COALESCE(sum(reserved_bytes),0) FROM workspace_block_usage WHERE workspace_id=$1`, snapshot.WorkspaceID).Scan(&rows, &reservedBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT reserved_bytes FROM workspace_owner_block_usage WHERE owner_id=$1`, workspaceValue.OwnerID).Scan(&ownerReserved); err != nil {
+		t.Fatal(err)
+	}
+	if !called || rows != 0 || reservedBytes != 0 || ownerReserved != 0 {
+		t.Fatalf("recovered importer reservations: callback=%t rows=%d workspace_reserved=%d owner_reserved=%d", called, rows, reservedBytes, ownerReserved)
+	}
+}
+
+func TestPendingLegacyImportBlockGCFailsClosedWithActiveSync(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	snapshot := createPendingLegacyWorkspace(t, ctx, store, "pending-import-gc-active-sync")
+	value, err := store.GetWorkspace(ctx, snapshot.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := newTestSyncSession(t, value, value.OwnerID, []workspace.File{}, []workspace.File{}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, []workspace.TransferBlock{},
+		syncTestIdempotency(value.OwnerID, "workspace.sync.create", "legacy-gc-active:"+session.ID, session.ID)); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = store.WithPendingLegacyImportWorkspaceBlockGC(ctx, snapshot.WorkspaceID, func([]workspace.BlockReference) ([]app.WorkspaceBlockRemoval, error) {
+		called = true
+		return nil, nil
+	})
+	if domain.CodeOf(err) != domain.CodeWorkspaceBusy || called {
+		t.Fatalf("cleanup with active sync = %v callback=%t; want busy without entering callback", err, called)
+	}
+}
+
 func TestWorkspaceLegacyImportRejectsActiveSyncAndWorkspaceStateConflict(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 
-	activeSnapshot := createPendingLegacyWorkspace(t, ctx, store, "active-sync-import")
-	owner, err := store.GetWorkspace(ctx, activeSnapshot.WorkspaceID)
+	owner := createTestUser(t, store, 4, 10_000, 20_000)
+	activeWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "active-sync-import")
+	activeSession := newTestSyncSession(t, activeWorkspace, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, activeSession, []workspace.TransferBlock{}, syncTestIdempotency(owner.ID, "workspace.sync.create", "legacy-active:"+activeSession.ID, activeSession.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, activeWorkspace.ID, "legacy-"+activeWorkspace.ID); err != nil {
+		t.Fatal(err)
+	}
+	activeSnapshot, err := store.GetPendingWorkspaceLegacyVolume(ctx, activeWorkspace.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	activeSession := newTestSyncSession(t, owner, owner.OwnerID, []workspace.File{}, []workspace.File{}, nil)
-	if _, _, err := createTestWorkspaceSyncSession(ctx, store, activeSession, []workspace.TransferBlock{}, syncTestIdempotency(owner.OwnerID, "workspace.sync.create", "legacy-active:"+activeSession.ID, activeSession.ID)); err != nil {
-		t.Fatal(err)
+	if err := store.EnsureWorkspaceLegacyImportReady(ctx, activeSnapshot.WorkspaceID); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("legacy import preflight with active sync = %v, want workspace busy", err)
 	}
 	if _, err := commitWorkspaceLegacyVolumeImport(ctx, store, activeSnapshot, []workspace.File{}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("import with active sync error = %v, want workspace busy", err)
 	}
 	assertLegacyImportState(t, ctx, store, activeSnapshot.WorkspaceID, "pending")
+
+	pendingSnapshot := createPendingLegacyWorkspace(t, ctx, store, "sync-session-blocked-during-import")
+	pendingWorkspace, err := store.GetWorkspace(ctx, pendingSnapshot.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSession := newTestSyncSession(t, pendingWorkspace, pendingWorkspace.OwnerID, []workspace.File{}, []workspace.File{}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, pendingSession, []workspace.TransferBlock{}, syncTestIdempotency(pendingWorkspace.OwnerID, "workspace.sync.create", "legacy-pending:"+pendingSession.ID, pendingSession.ID)); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("create sync session during pending legacy import = %v, want workspace busy", err)
+	}
 
 	stateSnapshot := createPendingLegacyWorkspace(t, ctx, store, "state-conflict-import")
 	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET state = 'deleting' WHERE id = $1`, stateSnapshot.WorkspaceID); err != nil {
@@ -182,6 +271,123 @@ func TestWorkspaceLegacyImportRejectsActiveSyncAndWorkspaceStateConflict(t *test
 		t.Fatalf("import while workspace is deleting error = %v, want workspace busy", err)
 	}
 	assertLegacyImportState(t, ctx, store, stateSnapshot.WorkspaceID, "pending")
+}
+
+func TestWorkspaceLegacyImportWaitsForTaskOperationAdmission(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "legacy-import-task-admission")
+	if _, err := pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`,
+		workspaceValue.ID, "legacy-"+workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='ri_legacy_import_admission' WHERE id=$1`, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	revision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "legacy-import-admission", "read the Workspace")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("legacy import admission manifest")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Workspace task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "legacy-import-admission-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Workspace task: %#v, found=%t, err=%v", claimed, found, err)
+	}
+
+	admissionTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = admissionTx.Rollback(context.Background()) }()
+	if err := admissionTx.QueryRow(ctx, `SELECT id FROM workspaces WHERE id=$1 FOR SHARE`, workspaceValue.ID).Scan(new(string)); err != nil {
+		t.Fatalf("lock Workspace for Task admission: %v", err)
+	}
+	if _, err := admissionTx.Exec(ctx, `INSERT INTO task_operations (
+	id, task_id, operation_key, request_hash, host_id, runtime_generation, control_version, lease_version,
+	status, workspace_id, binding_version, input_revision, workspace_checkpoint_revision
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9,$10,$11,$11)`,
+		mustID(t, domain.NewOperationID), created.Task.ID, "legacy-import-admitted-operation", hashBytes("admitted operation"),
+		hostValue.ID, hostValue.RuntimeGeneration, hostValue.ControlVersion, claimed.Lease.Version,
+		workspaceValue.ID, binding.BindingVersion, revision); err != nil {
+		t.Fatalf("insert admitted Task operation: %v", err)
+	}
+
+	importReady := make(chan error, 1)
+	go func() { importReady <- store.EnsureWorkspaceLegacyImportReady(ctx, workspaceValue.ID) }()
+	waitForPostgresLockWait(t, ctx, pool, "%FOR UPDATE OF w, v%", 1)
+	if err := admissionTx.Commit(ctx); err != nil {
+		t.Fatalf("commit Task admission: %v", err)
+	}
+	select {
+	case err := <-importReady:
+		if domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+			t.Fatalf("legacy import preflight after Task admission = %v; want workspace busy", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("legacy import preflight did not resume after Task admission committed: %v", ctx.Err())
+	}
+}
+
+func TestWorkspaceLegacyImportSerializesDirectReceive(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	pendingWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "pending-import-rejects-receive")
+	authorizeTestWorkspaceSyncReceive(t, ctx, store, owner.ID, pendingWorkspace.ID)
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, pendingWorkspace.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, pendingWorkspace.ID, "legacy-"+pendingWorkspace.ID); err != nil {
+		t.Fatal(err)
+	}
+	request := receiveTestRequest(owner.ID, pendingWorkspace.ID, "from-phone.txt", 1, "pending-import")
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, request); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("reserve direct receive during pending legacy import = %v; want workspace busy", err)
+	}
+
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "receive-before-pending-import")
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, workspaceValue.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	activeRequest := receiveTestRequest(owner.ID, workspaceValue.ID, "from-phone.txt", 1, "receive-before-import")
+	if reservation := reserveTestWorkspaceReceive(t, ctx, store, activeRequest); reservation.State != "reserved" {
+		t.Fatalf("reserve direct receive before pending import = %#v", reservation)
+	}
+	volumeName := "legacy-" + workspaceValue.ID
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, workspaceValue.ID, volumeName); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.GetPendingWorkspaceLegacyVolume(ctx, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureWorkspaceLegacyImportReady(ctx, workspaceValue.ID); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("legacy import preflight during active direct receive = %v; want workspace busy", err)
+	}
+	if _, err := commitWorkspaceLegacyVolumeImport(ctx, store, snapshot, []workspace.File{}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("commit legacy import during active direct receive = %v; want workspace busy", err)
+	}
 }
 
 func TestWorkspaceLegacyImportQuotaFailureAndTransactionRollback(t *testing.T) {
@@ -268,7 +474,11 @@ func assertLegacyImportState(t *testing.T, ctx context.Context, store *Store, wo
 }
 
 func commitWorkspaceLegacyVolumeImport(ctx context.Context, store *Store, value app.LegacyWorkspaceVolume, files []workspace.File) (workspace.Workspace, error) {
-	if _, err := validateLegacyWorkspaceImport(value, files); err != nil {
+	return commitWorkspaceLegacyVolumeImportWithDirectories(ctx, store, value, files, nil)
+}
+
+func commitWorkspaceLegacyVolumeImportWithDirectories(ctx context.Context, store *Store, value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (workspace.Workspace, error) {
+	if _, err := validateLegacyWorkspaceImport(value, files, emptyDirectories); err != nil {
 		return workspace.Workspace{}, err
 	}
 	seen := make(map[string]struct{})
@@ -283,7 +493,7 @@ func commitWorkspaceLegacyVolumeImport(ctx context.Context, store *Store, value 
 			seen[chunk.SHA256] = struct{}{}
 		}
 	}
-	return store.CommitWorkspaceLegacyVolumeImport(ctx, value, files)
+	return store.CommitWorkspaceLegacyVolumeImport(ctx, value, files, emptyDirectories)
 }
 
 func assertWorkspaceStillPending(t *testing.T, ctx context.Context, store *Store, workspaceID string) {
@@ -316,6 +526,27 @@ func TestListPendingWorkspaceLegacyVolumes(t *testing.T) {
 	}
 }
 
+func TestMarkLegacyWorkspaceNeedsCleanupPersistsUntilImport(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	snapshot := createPendingLegacyWorkspace(t, ctx, store, "cleanup-required")
+	reason := `legacy workspace file "large.bin" exceeds the 300 MiB file limit; cleanup is required`
+	if err := store.MarkWorkspaceLegacyVolumeNeedsCleanup(ctx, snapshot.WorkspaceID, reason); err != nil {
+		t.Fatal(err)
+	}
+	values, err := store.ListPendingWorkspaceLegacyVolumes(ctx)
+	if err != nil || len(values) != 1 || values[0].ImportError != reason {
+		t.Fatalf("cleanup-required pending volume = %#v, err=%v", values, err)
+	}
+	if _, err := commitWorkspaceLegacyVolumeImport(ctx, store, snapshot, []workspace.File{}); err != nil {
+		t.Fatal(err)
+	}
+	values, err = store.ListPendingWorkspaceLegacyVolumes(ctx)
+	if err != nil || len(values) != 0 {
+		t.Fatalf("pending volumes after import = %#v, err=%v", values, err)
+	}
+}
+
 func TestWorkspaceLegacyImportRejectsCaseFoldDuplicatePaths(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -334,9 +565,25 @@ func TestValidateLegacyWorkspaceImportEnforcesFileCountLimit(t *testing.T) {
 	files := make([]workspace.File, workspace.MaxSyncFiles+1)
 	_, err := validateLegacyWorkspaceImport(app.LegacyWorkspaceVolume{
 		WorkspaceID: "w123abcd", VolumeName: "legacy-w123abcd", QuotaBytes: 1,
-	}, files)
+	}, files, nil)
 	if domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("file count limit error = %v, want quota exceeded", err)
+	}
+}
+
+func TestValidateLegacyWorkspaceImportEnforcesPerFileLimit(t *testing.T) {
+	remaining := workspace.MaxSyncFileBytes + 1
+	file := workspace.File{Path: "large.bin", SizeBytes: remaining, SHA256: strings.Repeat("a", 64), Mode: 0644}
+	for remaining > 0 {
+		size := min(remaining, workspace.MaxSyncBlockBytes)
+		file.Chunks = append(file.Chunks, workspace.Chunk{SHA256: strings.Repeat("b", 64), SizeBytes: size})
+		remaining -= size
+	}
+	_, err := validateLegacyWorkspaceImport(app.LegacyWorkspaceVolume{
+		WorkspaceID: "w123abcd", VolumeName: "legacy-w123abcd", QuotaBytes: workspace.MaxSyncFileBytes + 1,
+	}, []workspace.File{file}, nil)
+	if domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("single-file limit error = %v, want quota exceeded", err)
 	}
 }
 

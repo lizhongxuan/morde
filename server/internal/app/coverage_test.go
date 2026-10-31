@@ -524,7 +524,7 @@ func TestCoverageConstructorsRejectInvalidDependencies(t *testing.T) {
 	if _, err := NewUserService(nil, hosts); err == nil {
 		t.Fatal("NewUserService() accepted a missing user store")
 	}
-	if _, err := NewWorkspaceService(workspaces, nil, &workspaceCapacityStub{}, auditor, 1); err == nil {
+	if _, err := NewWorkspaceService(workspaces, nil, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, auditor, 1); err == nil {
 		t.Fatal("NewWorkspaceService() accepted a missing volume deleter")
 	}
 	service, deps := newHostServiceTest(t)

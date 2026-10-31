@@ -132,16 +132,18 @@ type WorkspaceStorage struct {
 }
 
 type WorkspaceSyncNode struct {
-	Enabled            bool   `yaml:"enabled"`
-	ImageDigest        string `yaml:"image_digest"`
-	RelayImageDigest   string `yaml:"relay_image_digest"`
-	RelayPublicAddress string `yaml:"relay_public_address"`
-	RelayBindAddress   string `yaml:"relay_bind_address"`
-	RelayToken         string `yaml:"relay_token"`
-	RelayStateRoot     string `yaml:"relay_state_root"`
-	StateRoot          string `yaml:"state_root"`
-	WorkspaceRoot      string `yaml:"workspace_root"`
-	RelayContainerName string `yaml:"relay_container_name"`
+	Enabled               bool     `yaml:"enabled"`
+	ImageDigest           string   `yaml:"image_digest"`
+	RelayImageDigest      string   `yaml:"relay_image_digest"`
+	RelayPublicAddress    string   `yaml:"relay_public_address"`
+	RelayBindAddress      string   `yaml:"relay_bind_address"`
+	RelayToken            string   `yaml:"relay_token"`
+	RelayStateRoot        string   `yaml:"relay_state_root"`
+	StateRoot             string   `yaml:"state_root"`
+	WorkspaceRoot         string   `yaml:"workspace_root"`
+	QuotaSocketRoot       string   `yaml:"quota_socket_root"`
+	RelayContainerName    string   `yaml:"relay_container_name"`
+	ProtectedStorageRoots []string `yaml:"protected_storage_roots"`
 }
 
 type SiteStorage struct {
@@ -212,6 +214,9 @@ func parseConfig(data string) (Config, error) {
 	cfg.MCP.setDefaults()
 	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
+	}
+	if strings.TrimSpace(cfg.WorkspaceSyncNode.WorkspaceRoot) == "" && filepath.IsAbs(cfg.WorkspaceStorage.RootDir) {
+		cfg.WorkspaceSyncNode.WorkspaceRoot = filepath.Join(filepath.Dir(filepath.Clean(cfg.WorkspaceStorage.RootDir)), "workspace-current")
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -423,6 +428,20 @@ func (c Config) validate() error {
 	if pathsOverlap(workspaceRoot, dockerRoot) {
 		return fmt.Errorf("config.workspace_storage.root_dir must be separate from config.storage.docker_data_dir")
 	}
+	if strings.TrimSpace(c.WorkspaceSyncNode.WorkspaceRoot) == "" || !filepath.IsAbs(c.WorkspaceSyncNode.WorkspaceRoot) ||
+		filepath.Clean(c.WorkspaceSyncNode.WorkspaceRoot) != c.WorkspaceSyncNode.WorkspaceRoot || c.WorkspaceSyncNode.WorkspaceRoot == string(filepath.Separator) {
+		return fmt.Errorf("config.workspace_sync_node.workspace_root must be an absolute clean non-root path")
+	}
+	currentRoot := filepath.Clean(c.WorkspaceSyncNode.WorkspaceRoot)
+	for _, protected := range []struct {
+		name string
+		path string
+	}{{"config.workspace_storage.root_dir", workspaceRoot}, {"config.storage.docker_data_dir", dockerRoot},
+		{"config.site_storage.root_dir", c.SiteStorage.RootDir}, {"config.gateway.workbench_dir", c.Gateway.WorkbenchDir}, {"config.portal_web.dir", c.PortalWeb.Dir}} {
+		if protected.path != "" && pathsOverlap(currentRoot, protected.path) {
+			return fmt.Errorf("config.workspace_sync_node.workspace_root must be separate from %s", protected.name)
+		}
+	}
 	if c.WorkspaceSyncNode.Enabled {
 		if _, ok := localDockerSocketPath(c.Storage.DockerHost); !ok {
 			return fmt.Errorf("config.workspace_sync_node requires config.storage.docker_host to use a Unix socket")
@@ -447,7 +466,8 @@ func (c Config) validate() error {
 		for _, field := range []struct {
 			name  string
 			value string
-		}{{"relay_state_root", c.WorkspaceSyncNode.RelayStateRoot}, {"state_root", c.WorkspaceSyncNode.StateRoot}, {"workspace_root", c.WorkspaceSyncNode.WorkspaceRoot}} {
+		}{{"relay_state_root", c.WorkspaceSyncNode.RelayStateRoot}, {"state_root", c.WorkspaceSyncNode.StateRoot},
+			{"workspace_root", c.WorkspaceSyncNode.WorkspaceRoot}, {"quota_socket_root", c.WorkspaceSyncNode.QuotaSocketRoot}} {
 			if strings.TrimSpace(field.value) == "" || !filepath.IsAbs(field.value) || filepath.Clean(field.value) != field.value || field.value == string(filepath.Separator) {
 				return fmt.Errorf("config.workspace_sync_node.%s must be an absolute clean non-root path", field.name)
 			}
@@ -457,14 +477,26 @@ func (c Config) validate() error {
 		}
 		syncStateRoot := filepath.Clean(c.WorkspaceSyncNode.StateRoot)
 		syncWorkspaceRoot := filepath.Clean(c.WorkspaceSyncNode.WorkspaceRoot)
+		syncQuotaSocketRoot := filepath.Clean(c.WorkspaceSyncNode.QuotaSocketRoot)
 		syncRelayStateRoot := filepath.Clean(c.WorkspaceSyncNode.RelayStateRoot)
-		if pathsOverlap(syncStateRoot, syncWorkspaceRoot) || pathsOverlap(syncRelayStateRoot, syncStateRoot) || pathsOverlap(syncRelayStateRoot, syncWorkspaceRoot) {
+		if pathsOverlap(syncStateRoot, syncWorkspaceRoot) || pathsOverlap(syncRelayStateRoot, syncStateRoot) || pathsOverlap(syncRelayStateRoot, syncWorkspaceRoot) ||
+			pathsOverlap(syncQuotaSocketRoot, syncStateRoot) || pathsOverlap(syncQuotaSocketRoot, syncWorkspaceRoot) || pathsOverlap(syncQuotaSocketRoot, syncRelayStateRoot) {
 			return fmt.Errorf("config.workspace_sync_node roots must be separate")
+		}
+		for i, root := range c.WorkspaceSyncNode.ProtectedStorageRoots {
+			if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || root == string(filepath.Separator) {
+				return fmt.Errorf("config.workspace_sync_node.protected_storage_roots[%d] must be an absolute clean non-root path", i)
+			}
+			for _, syncRoot := range []string{syncStateRoot, syncWorkspaceRoot, syncRelayStateRoot, syncQuotaSocketRoot} {
+				if pathsOverlap(root, syncRoot) {
+					return fmt.Errorf("config.workspace_sync_node.protected_storage_roots[%d] must be separate from Workspace sync roots", i)
+				}
+			}
 		}
 		for _, root := range []struct {
 			name string
 			path string
-		}{{"relay_state_root", syncRelayStateRoot}, {"state_root", syncStateRoot}, {"workspace_root", syncWorkspaceRoot}} {
+		}{{"relay_state_root", syncRelayStateRoot}, {"state_root", syncStateRoot}, {"workspace_root", syncWorkspaceRoot}, {"quota_socket_root", syncQuotaSocketRoot}} {
 			for _, protected := range []struct {
 				name string
 				path string

@@ -1,6 +1,7 @@
 [Unit]
 Description=Morde host network policy
 Requires=docker.service morde-network-preload.service
+PartOf=docker.service morde-network-preload.service nftables.service
 After=docker.service morde-network-preload.service
 Before=morde-portal.service
 
@@ -8,7 +9,6 @@ Before=morde-portal.service
 Type=oneshot
 EnvironmentFile=/etc/cloudhost/cloudhost.env
 ExecStart=/opt/cloudhost/network-policy.sh apply
-ExecReload=/opt/cloudhost/network-policy.sh apply
 RemainAfterExit=yes
 
 [Install]

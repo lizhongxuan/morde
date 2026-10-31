@@ -604,7 +604,7 @@ describe("portal mock workspace bindings", () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     await allowHosts(2);
     const workspaceResponse = await createWorkspace("bindable workspace");
-    const workspace = await workspaceResponse.json() as { id: string; revision: number };
+    const workspace = await workspaceResponse.json() as { id: string; revision: number; used_bytes: number; quota_bytes: number };
     const hostResponse = await createHostRequest({ name: "workspace host", workspace_ids: [] });
     const host = await hostResponse.json() as { id: string };
     await wait(950);
@@ -631,7 +631,8 @@ describe("portal mock workspace bindings", () => {
     expect((await staleRetry.json()).error.code).toBe("workspace_conflict");
 
     const progress = await api(`/api/workspaces/${workspace.id}/sync-progress`);
-    expect(await progress.json()).toEqual({ items: [] });
+    expect(await progress.json()).toEqual({ revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
+      remaining_bytes: Math.max(0, workspace.quota_bytes - workspace.used_bytes), quota_status: "available", items: [] });
     const changedReplay = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", { workspace_id: "w-other", expected_revision: 0, expected_binding_version: 0 }), headers });
     expect(changedReplay.status).toBe(409);
     expect((await changedReplay.json()).error.code).toBe("idempotency_conflict");

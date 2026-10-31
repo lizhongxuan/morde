@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -63,6 +65,8 @@ type workspaceSyncFakeEngine struct {
 	relayPublicAddress  string
 	relayHostIP         string
 	relayHostPort       string
+	relayNetworkNames   []string
+	nodeImageLabels     map[string]string
 	networks            map[string]*workspaceSyncFakeNetwork
 	networksByID        map[string]*workspaceSyncFakeNetwork
 	containers          map[string]*workspaceSyncFakeContainer
@@ -82,6 +86,11 @@ func newWorkspaceSyncFakeEngine(image, relayImage, relayName string) *workspaceS
 	return &workspaceSyncFakeEngine{
 		image: image, relayImage: relayImage, relayName: relayName, relayID: strings.Repeat("d", 64),
 		relayToken: workspaceSyncTestRelayToken, relayPublicAddress: "8.8.8.8:22067", relayHostIP: "172.18.141.222", relayHostPort: "22067",
+		relayNetworkNames: []string{dockerWorkspaceSyncRelayNetwork},
+		nodeImageLabels: map[string]string{
+			"org.opencontainers.image.licenses": "MPL-2.0",
+			dockerWorkspaceSyncQuotaHookLabel:   dockerWorkspaceSyncQuotaHook,
+		},
 		networks: make(map[string]*workspaceSyncFakeNetwork), networksByID: make(map[string]*workspaceSyncFakeNetwork),
 		containers: make(map[string]*workspaceSyncFakeContainer), containersByID: make(map[string]*workspaceSyncFakeContainer),
 		lastContainerByName: make(map[string]map[string]any),
@@ -99,12 +108,14 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	switch {
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json"):
 		image := f.image
+		labels := f.nodeImageLabels
 		if path == "/images/"+f.relayImage+"/json" {
 			image = f.relayImage
+			labels = map[string]string{"org.opencontainers.image.licenses": "MPL-2.0"}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"Id": image, "RepoDigests": []string{image},
-			"Config": map[string]any{"Env": []string{"PATH=/usr/bin:/bin"}, "Volumes": nil},
+			"Config": map[string]any{"Env": []string{"PATH=/usr/bin:/bin"}, "Volumes": nil, "Labels": labels},
 		})
 	case r.Method == http.MethodGet && path == "/containers/"+f.relayName+"/json":
 		if f.missingRelay {
@@ -118,6 +129,10 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if f.publicRelay {
 			relayCmd = append(relayCmd, "-pools=relays.syncthing.net")
 		}
+		relayNetworks := make(map[string]any, len(f.relayNetworkNames))
+		for _, name := range f.relayNetworkNames {
+			relayNetworks[name] = map[string]any{}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"Id": f.relayID, "Image": f.relayImage, "Name": "/" + f.relayName,
 			"Config": map[string]any{
@@ -126,14 +141,14 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			},
 			"Mounts": []map[string]any{{"Type": "bind", "Source": f.relayStateRoot, "Destination": "/var/lib/morde-relay", "RW": true}},
 			"HostConfig": map[string]any{
-				"NetworkMode": "morde_workspace_sync_relay", "Privileged": false, "ReadonlyRootfs": true,
+				"NetworkMode": dockerWorkspaceSyncRelayNetwork, "Privileged": false, "ReadonlyRootfs": true,
 				"CapAdd": []string{}, "CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges:true"},
 				"Memory": 256 << 20, "NanoCpus": 250_000_000, "PidsLimit": 64,
 				"RestartPolicy": map[string]string{"Name": "unless-stopped"},
 				"PortBindings":  map[string]any{"22067/tcp": []any{map[string]string{"HostIp": f.relayHostIP, "HostPort": f.relayHostPort}}},
 			},
 			"State":           map[string]any{"Running": true, "Restarting": false, "Paused": false},
-			"NetworkSettings": map[string]any{"Networks": map[string]any{}},
+			"NetworkSettings": map[string]any{"Networks": relayNetworks},
 		})
 	case r.Method == http.MethodPost && path == "/networks/create":
 		var payload map[string]any
@@ -243,7 +258,7 @@ func (f *workspaceSyncFakeEngine) containerInspect(container *workspaceSyncFakeC
 	for _, raw := range mountSpecs {
 		spec := raw.(map[string]any)
 		mounts = append(mounts, map[string]any{
-			"Type": spec["Type"], "Source": spec["Source"], "Destination": spec["Target"], "RW": true,
+			"Type": spec["Type"], "Source": spec["Source"], "Destination": spec["Target"], "RW": spec["ReadOnly"] != true,
 		})
 	}
 	ports := map[string][]map[string]string{dockerWorkspaceSyncAPIPort: nil}
@@ -353,6 +368,10 @@ func newWorkspaceSyncFixture(t *testing.T) *workspaceSyncFixture {
 	engine := newWorkspaceSyncFakeEngine(image, relayImage, relay)
 	relayStateRoot := filepath.Join(root, "relay-state")
 	engine.relayStateRoot = relayStateRoot
+	quotaSocketRoot := filepath.Join(root, "quota-sockets")
+	if err := os.Mkdir(quotaSocketRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewUnstartedServer(engine)
 	_ = server.Listener.Close()
 	server.Listener = listener
@@ -362,7 +381,7 @@ func newWorkspaceSyncFixture(t *testing.T) *workspaceSyncFixture {
 		ImageDigest: image, RelayImageDigest: relayImage, DockerSocket: socket,
 		RelayPublicAddress: "8.8.8.8:22067", RelayBindAddress: "172.18.141.222", RelayToken: workspaceSyncTestRelayToken,
 		RelayStateRoot: relayStateRoot,
-		StateRoot:      filepath.Join(root, "state"), WorkspaceRoot: filepath.Join(root, "current-workspaces"),
+		StateRoot:      filepath.Join(root, "state"), WorkspaceRoot: filepath.Join(root, "current-workspaces"), QuotaSocketRoot: quotaSocketRoot,
 		RelayContainerName: relay,
 		Resources:          DockerWorkspaceSyncNodeResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 250_000_000, PIDsLimit: 64},
 	}
@@ -421,16 +440,18 @@ func TestDockerWorkspaceSyncNodeEnsureCreatesIsolatedNode(t *testing.T) {
 		t.Fatalf("capabilities/security options = %#v / %#v", host["CapDrop"], host["SecurityOpt"])
 	}
 	mounts := host["Mounts"].([]any)
-	if len(mounts) != 2 {
+	if len(mounts) != 3 {
 		t.Fatalf("mounts = %#v", mounts)
 	}
 	wantSources := map[string]string{
 		dockerWorkspaceSyncConfigPath: filepath.Join(mustEvalSymlinks(t, f.stateRoot), ownerHash),
 		dockerWorkspaceSyncFilesPath:  filepath.Join(mustEvalSymlinks(t, f.workRoot), ownerHash),
+		dockerWorkspaceSyncQuotaPath:  filepath.Join(f.options.QuotaSocketRoot, ownerHash),
 	}
 	for _, raw := range mounts {
 		mount := raw.(map[string]any)
-		if mount["Type"] != "bind" || wantSources[mount["Target"].(string)] != mount["Source"] || mount["ReadOnly"] != false {
+		readOnly := mount["Target"] == dockerWorkspaceSyncQuotaPath
+		if mount["Type"] != "bind" || wantSources[mount["Target"].(string)] != mount["Source"] || mount["ReadOnly"] != readOnly {
 			t.Fatalf("mount config = %#v", mount)
 		}
 		delete(wantSources, mount["Target"].(string))
@@ -453,6 +474,142 @@ func TestDockerWorkspaceSyncNodeEnsureCreatesIsolatedNode(t *testing.T) {
 		if _, ok := network.Containers[f.engine.relayID]; ok {
 			t.Fatal("shared relay must not be attached to an account network")
 		}
+	}
+}
+
+func TestDockerWorkspaceSyncNodeObserveMissingNodeDoesNotProvision(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	supervisor := f.supervisor(t)
+	got, err := supervisor.Observe(context.Background(), "u1234567", workspaceSyncTestKeyA)
+	if err != nil {
+		t.Fatalf("Observe() error = %v", err)
+	}
+	if got.Present || got.Running || len(got.ConnectedDeviceIDs) != 0 || len(got.Folders) != 0 {
+		t.Fatalf("Observe() for a missing node = %+v", got)
+	}
+	if _, err := os.Stat(f.stateRoot); !os.IsNotExist(err) {
+		t.Fatalf("Observe() created or changed the state root: stat error = %v", err)
+	}
+	f.engine.mu.Lock()
+	defer f.engine.mu.Unlock()
+	if f.engine.networkCreates != 0 || f.engine.containerCreates != 0 || f.engine.starts != 0 {
+		t.Fatalf("Observe() provisioned Docker resources: networks=%d containers=%d starts=%d",
+			f.engine.networkCreates, f.engine.containerCreates, f.engine.starts)
+	}
+}
+
+func TestDockerWorkspaceSyncNodeObserveRunningNodeReadOnly(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	supervisor := f.supervisor(t)
+	ownerID := "u1234567"
+	if _, err := supervisor.Ensure(context.Background(), ownerID, workspaceSyncTestKeyA); err != nil {
+		t.Fatalf("Ensure() fixture node: %v", err)
+	}
+
+	folderID := "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var apiCalls atomic.Int32
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls.Add(1)
+		if r.Method != http.MethodGet || r.Header.Get("X-API-Key") != workspaceSyncTestKeyA {
+			t.Errorf("Syncthing request = %s %s, want authenticated GET", r.Method, r.URL.String())
+		}
+		switch {
+		case r.URL.Path == "/rest/system/connections":
+			_, _ = io.WriteString(w, `{"connections":{"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA":{"connected":true},"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB":{"connected":false}}}`)
+		case r.URL.Path == "/rest/config/folders":
+			_, _ = io.WriteString(w, `[{"id":"`+folderID+`"},{"id":"other-folder"}]`)
+		case r.URL.Path == "/rest/db/status":
+			if r.URL.Query().Get("folder") != folderID {
+				t.Errorf("folder status query = %q, want %q", r.URL.Query().Get("folder"), folderID)
+			}
+			_, _ = io.WriteString(w, `{"state":"syncing","needBytes":1234,"needFiles":2}`)
+		default:
+			t.Errorf("unexpected Syncthing request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer apiServer.Close()
+	supervisor.syncthingClientFactory = func(_ string, apiKey string) (*SyncthingAPIClient, error) {
+		return NewSyncthingAPIClient(apiServer.URL, apiKey)
+	}
+
+	f.engine.mu.Lock()
+	networkCreates, containerCreates, starts := f.engine.networkCreates, f.engine.containerCreates, f.engine.starts
+	f.engine.mu.Unlock()
+	got, err := supervisor.Observe(context.Background(), ownerID, workspaceSyncTestKeyA)
+	if err != nil {
+		t.Fatalf("Observe() error = %v", err)
+	}
+	if !got.Present || !got.Running || len(got.ConnectedDeviceIDs) != 1 ||
+		got.ConnectedDeviceIDs[0] != "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA" || len(got.Folders) != 1 {
+		t.Fatalf("Observe() = %+v", got)
+	}
+	if got.Folders[0].FolderID != folderID || got.Folders[0].State != "syncing" ||
+		got.Folders[0].NeedBytes != 1234 || got.Folders[0].NeedFiles != 2 {
+		t.Fatalf("folder observation = %+v", got.Folders[0])
+	}
+	if apiCalls.Load() != 3 {
+		t.Fatalf("Syncthing GET count = %d, want 3", apiCalls.Load())
+	}
+	f.engine.mu.Lock()
+	defer f.engine.mu.Unlock()
+	if f.engine.networkCreates != networkCreates || f.engine.containerCreates != containerCreates || f.engine.starts != starts {
+		t.Fatalf("Observe() changed Docker resources: networks=%d containers=%d starts=%d",
+			f.engine.networkCreates, f.engine.containerCreates, f.engine.starts)
+	}
+}
+
+func TestDockerWorkspaceSyncNodeObserveStoppedNodeDoesNotCallAPI(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	supervisor := f.supervisor(t)
+	ownerID := "u1234567"
+	if _, err := supervisor.Ensure(context.Background(), ownerID, workspaceSyncTestKeyA); err != nil {
+		t.Fatalf("Ensure() fixture node: %v", err)
+	}
+	f.engine.stopNode()
+	supervisor.syncthingClientFactory = func(string, string) (*SyncthingAPIClient, error) {
+		t.Fatal("stopped node observation attempted a Syncthing API request")
+		return nil, errors.New("unreachable")
+	}
+
+	got, err := supervisor.Observe(context.Background(), ownerID, workspaceSyncTestKeyA)
+	if err != nil {
+		t.Fatalf("Observe() error = %v", err)
+	}
+	if !got.Present || got.Running || len(got.ConnectedDeviceIDs) != 0 || len(got.Folders) != 0 {
+		t.Fatalf("stopped node observation = %+v", got)
+	}
+}
+
+func TestDockerWorkspaceSyncNodeObserveRejectsWrongOwnerLabelWithoutDetails(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	supervisor := f.supervisor(t)
+	ownerID := "u1234567"
+	if _, err := supervisor.Ensure(context.Background(), ownerID, workspaceSyncTestKeyA); err != nil {
+		t.Fatalf("Ensure() fixture node: %v", err)
+	}
+	f.engine.tamperOwnerLabel()
+	_, err := supervisor.Observe(context.Background(), ownerID, workspaceSyncTestKeyA)
+	if !errors.Is(err, errWorkspaceSyncObservationContract) || strings.Contains(err.Error(), workspaceSyncTestKeyA) ||
+		strings.Contains(err.Error(), f.stateRoot) || strings.Contains(err.Error(), f.workRoot) {
+		t.Fatalf("Observe() error = %v, want a stable redacted contract error", err)
+	}
+}
+
+func TestDockerWorkspaceSyncNodeObserveRedactsSyncthingAPIError(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	supervisor := f.supervisor(t)
+	ownerID := "u1234567"
+	if _, err := supervisor.Ensure(context.Background(), ownerID, workspaceSyncTestKeyA); err != nil {
+		t.Fatalf("Ensure() fixture node: %v", err)
+	}
+	supervisor.syncthingClientFactory = func(_ string, apiKey string) (*SyncthingAPIClient, error) {
+		return nil, fmt.Errorf("raw error with secret %s and path %s", apiKey, f.stateRoot)
+	}
+	_, err := supervisor.Observe(context.Background(), ownerID, workspaceSyncTestKeyA)
+	if !errors.Is(err, errWorkspaceSyncObservationSyncthing) || err.Error() != errWorkspaceSyncObservationSyncthing.Error() ||
+		strings.Contains(err.Error(), workspaceSyncTestKeyA) || strings.Contains(err.Error(), f.stateRoot) {
+		t.Fatalf("Observe() error = %v, want a stable redacted API error", err)
 	}
 }
 
@@ -522,9 +679,13 @@ func TestDockerWorkspaceSyncNodeUsesAccountPrivateAPIAddress(t *testing.T) {
 }
 
 func TestWorkspaceSyncNodeContainerAllowsOnlyPinnedImageLabels(t *testing.T) {
-	imageLabels := map[string]string{"org.opencontainers.image.licenses": "MPL-2.0"}
+	imageLabels := map[string]string{
+		"org.opencontainers.image.licenses": "MPL-2.0",
+		dockerWorkspaceSyncQuotaHookLabel:   dockerWorkspaceSyncQuotaHook,
+	}
 	labels := map[string]string{
 		"org.opencontainers.image.licenses": "MPL-2.0",
+		dockerWorkspaceSyncQuotaHookLabel:   dockerWorkspaceSyncQuotaHook,
 		dockerWorkspaceSyncLabelManaged:     "true",
 		dockerWorkspaceSyncLabelOwner:       "owner-hash",
 		dockerWorkspaceSyncLabelImage:       "sha256:image",
@@ -535,6 +696,21 @@ func TestWorkspaceSyncNodeContainerAllowsOnlyPinnedImageLabels(t *testing.T) {
 	labels["unexpected"] = "value"
 	if validDockerWorkspaceSyncContainerLabels(labels, imageLabels, "owner-hash", "sha256:image") {
 		t.Fatal("unexpected container label was accepted")
+	}
+}
+
+func TestDockerWorkspaceSyncNodeRejectsImageWithoutQuotaHook(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	f.engine.mu.Lock()
+	delete(f.engine.nodeImageLabels, dockerWorkspaceSyncQuotaHookLabel)
+	f.engine.mu.Unlock()
+	if _, err := f.supervisor(t).Ensure(context.Background(), workspaceSyncTestOwnerA, workspaceSyncTestKeyA); err == nil {
+		t.Fatal("node image without the required quota hook was accepted")
+	}
+	f.engine.mu.Lock()
+	defer f.engine.mu.Unlock()
+	if f.engine.networkCreates != 0 || f.engine.containerCreates != 0 {
+		t.Fatal("node resources were created before the quota hook image was rejected")
 	}
 }
 
@@ -612,6 +788,19 @@ func TestDockerWorkspaceSyncNodeMissingRelayFailsClosed(t *testing.T) {
 	defer f.engine.mu.Unlock()
 	if f.engine.networkCreates != 0 || f.engine.containerCreates != 0 {
 		t.Fatalf("created without relay: networks %d, containers %d", f.engine.networkCreates, f.engine.containerCreates)
+	}
+}
+
+func TestDockerWorkspaceSyncNodeRejectsRelayAttachedToAccountNetwork(t *testing.T) {
+	f := newWorkspaceSyncFixture(t)
+	f.engine.relayNetworkNames = append(f.engine.relayNetworkNames, "morde-sync-net-compromised")
+	if _, err := f.supervisor(t).Ensure(context.Background(), workspaceSyncTestOwnerA, workspaceSyncTestKeyA); err == nil {
+		t.Fatal("relay attached to an account network was accepted")
+	}
+	f.engine.mu.Lock()
+	defer f.engine.mu.Unlock()
+	if f.engine.networkCreates != 0 || f.engine.containerCreates != 0 {
+		t.Fatalf("created with a relay attached to an account network: networks %d, containers %d", f.engine.networkCreates, f.engine.containerCreates)
 	}
 }
 

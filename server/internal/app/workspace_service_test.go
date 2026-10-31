@@ -100,6 +100,16 @@ func (s *workspaceContentStub) DeleteWorkspace(id string) error {
 	return s.err
 }
 
+type workspaceCurrentDeleterStub struct {
+	err     error
+	deletes []string
+}
+
+func (s *workspaceCurrentDeleterStub) Delete(_ context.Context, ownerID, workspaceID string) error {
+	s.deletes = append(s.deletes, ownerID+":"+workspaceID)
+	return s.err
+}
+
 type workspaceCapacityStub struct {
 	err   error
 	calls int
@@ -113,8 +123,15 @@ func (s *workspaceCapacityStub) CheckCapacity(context.Context) error {
 func TestWorkspaceServiceCreateUsesIndependentQuotaAndIdempotency(t *testing.T) {
 	store := &workspaceServiceStore{values: make(map[string]workspace.Workspace)}
 	capacity := &workspaceCapacityStub{}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, capacity, &credentialAudit{}, 1<<30)
+	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, capacity, &credentialAudit{}, 1<<30)
 	if err != nil {
+		t.Fatal(err)
+	}
+	var initializedWorkspaceID string
+	if err := service.SetWorkspaceCurrentInitializer(func(_ context.Context, workspaceID string) error {
+		initializedWorkspaceID = workspaceID
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	principal := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleUser, Kind: identity.KindSession}
@@ -125,11 +142,30 @@ func TestWorkspaceServiceCreateUsesIndependentQuotaAndIdempotency(t *testing.T) 
 	if !domain.ValidWorkspaceID(created.ID) || created.OwnerID != principal.UserID || created.Name != "code" || created.State != workspace.StateReady || created.QuotaBytes != 1<<30 || created.UsedBytes != 0 {
 		t.Fatalf("CreateWorkspace() = %#v", created)
 	}
-	if store.values[created.ID].QuotaBytes != 1<<30 || store.createRecord.Operation != "workspace.create" || store.createRecord.Key != "retry-key-workspace-001" || len(store.createRecord.RequestHash) != 32 || store.createRecord.ResourceID != created.ID || capacity.calls != 1 {
-		t.Fatalf("create contract = %#v, workspace=%#v, capacity calls=%d", store.createRecord, store.values[created.ID], capacity.calls)
+	if store.values[created.ID].QuotaBytes != 1<<30 || store.createRecord.Operation != "workspace.create" || store.createRecord.Key != "retry-key-workspace-001" || len(store.createRecord.RequestHash) != 32 || store.createRecord.ResourceID != created.ID || capacity.calls != 1 || initializedWorkspaceID != created.ID {
+		t.Fatalf("create contract = %#v, workspace=%#v, capacity calls=%d, initialized=%q", store.createRecord, store.values[created.ID], capacity.calls, initializedWorkspaceID)
 	}
 	if _, err := service.CreateWorkspace(context.Background(), identity.Principal{UserID: principal.UserID, Kind: identity.KindAPIKey, Role: identity.RoleUser}, CreateWorkspaceCommand{Name: "code"}, "retry-key-workspace-002"); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("API key CreateWorkspace() error = %v", err)
+	}
+}
+
+func TestWorkspaceServiceCreateReportsCurrentDirectoryInitializationFailure(t *testing.T) {
+	store := &workspaceServiceStore{values: make(map[string]workspace.Workspace)}
+	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initializerErr := errors.New("current directory unavailable")
+	if err := service.SetWorkspaceCurrentInitializer(func(context.Context, string) error { return initializerErr }); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	if _, err := service.CreateWorkspace(context.Background(), principal, CreateWorkspaceCommand{Name: "code"}, "retry-key-workspace-initializer"); !errors.Is(err, initializerErr) {
+		t.Fatalf("CreateWorkspace() error = %v, want initializer error", err)
+	}
+	if len(store.values) != 1 {
+		t.Fatalf("Workspace row count after failed materialization = %d, want 1", len(store.values))
 	}
 }
 
@@ -137,7 +173,7 @@ func TestWorkspaceServiceCapacityAndInputValidation(t *testing.T) {
 	capacityErr := domain.NewError(domain.CodeCapacityExceeded, "workspace storage is below its reserve")
 	store := &workspaceServiceStore{values: make(map[string]workspace.Workspace)}
 	capacity := &workspaceCapacityStub{err: capacityErr}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, capacity, &credentialAudit{}, 1<<30)
+	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, capacity, &credentialAudit{}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +203,7 @@ func TestWorkspaceServiceListsGetsAndHidesForeignOrDeleted(t *testing.T) {
 		"w7654321": {ID: "w7654321", OwnerID: "u7654321", Name: "other", State: workspace.StateReady},
 		"w8765432": {ID: "w8765432", OwnerID: "u1234567", State: workspace.StateDeleted},
 	}}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
+	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +229,7 @@ func TestWorkspaceServiceListsReadyOwnedWorkspaceMetadataForDevice(t *testing.T)
 		"w3456789": {ID: "w3456789", OwnerID: "u7654321", Name: "foreign", State: workspace.StateReady, Revision: 5},
 		"w4567890": {ID: "w4567890", OwnerID: "u1234567", Name: "deleted", State: workspace.StateDeleted, Revision: 6},
 	}}
-	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
+	service, err := NewWorkspaceService(store, &workspaceContentStub{}, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,8 +262,9 @@ func TestWorkspaceServiceDeleteClaimsBeforeDeletingBodyAndCanRetry(t *testing.T)
 		"w1234567": {ID: "w1234567", OwnerID: "u1234567", Name: "code", State: workspace.StateReady, Revision: 7},
 	}}
 	content := &workspaceContentStub{err: errors.New("disk unavailable")}
+	current := &workspaceCurrentDeleterStub{err: errors.New("current directory unavailable")}
 	auditor := &credentialAudit{}
-	service, err := NewWorkspaceService(store, content, &workspaceCapacityStub{}, auditor, 1<<30)
+	service, err := NewWorkspaceService(store, content, current, &workspaceCapacityStub{}, auditor, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,12 +276,16 @@ func TestWorkspaceServiceDeleteClaimsBeforeDeletingBodyAndCanRetry(t *testing.T)
 		t.Fatalf("state/calls after failed content delete = %#v, %d, %d", store.values["w1234567"], store.claimCalls, store.completeCalls)
 	}
 	content.err = nil
+	if _, err := service.DeleteWorkspace(context.Background(), principal, "w1234567"); !errors.Is(err, current.err) || store.completeCalls != 0 {
+		t.Fatalf("DeleteWorkspace() without current-directory cleanup error = %v, complete calls=%d", err, store.completeCalls)
+	}
+	current.err = nil
 	deleted, err := service.DeleteWorkspace(context.Background(), principal, "w1234567")
 	if err != nil || deleted.State != workspace.StateDeleted || deleted.DeletedAt == nil || store.claimCalls != 1 || store.completeCalls != 1 {
 		t.Fatalf("retry DeleteWorkspace() = %#v, claim=%d complete=%d, err=%v", deleted, store.claimCalls, store.completeCalls, err)
 	}
-	if len(content.deletes) != 2 || len(auditor.entries) != 1 || auditor.entries[0].Action != audit.ActionWorkspaceDelete {
-		t.Fatalf("content deletes/audit = %#v / %#v", content.deletes, auditor.entries)
+	if len(content.deletes) != 3 || len(current.deletes) != 2 || current.deletes[0] != "u1234567:w1234567" || len(auditor.entries) != 1 || auditor.entries[0].Action != audit.ActionWorkspaceDelete {
+		t.Fatalf("content/current deletes/audit = %#v / %#v / %#v", content.deletes, current.deletes, auditor.entries)
 	}
 }
 
@@ -253,7 +294,7 @@ func TestWorkspaceServiceDeleteDoesNotTouchContentWhenStoreRejectsBoundWorkspace
 		"w1234567": {ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady},
 	}, claimErr: domain.NewError(domain.CodeWorkspaceBusy, "workspace is bound")}
 	content := &workspaceContentStub{}
-	service, err := NewWorkspaceService(store, content, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
+	service, err := NewWorkspaceService(store, content, &workspaceCurrentDeleterStub{}, &workspaceCapacityStub{}, &credentialAudit{}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 )
 
 const manifestDigestVersion = "morde-workspace-manifest/v1\n"
+const manifestTreeDigestVersion = "morde-workspace-manifest/v2\n"
 
 type manifestDigestFileV1 struct {
 	Path      string  `json:"path"`
@@ -37,6 +38,84 @@ func ManifestSHA256(files []File) (string, error) {
 		}
 		return nil
 	})
+}
+
+// ManifestTreeSHA256 identifies files and explicitly tracked empty leaf
+// directories. File-only snapshots retain the historical V1 digest so stored
+// Task contexts remain verifiable across the directory-metadata rollout.
+func ManifestTreeSHA256(files []File, emptyDirectories []string) (string, error) {
+	if len(emptyDirectories) == 0 {
+		return ManifestSHA256(files)
+	}
+	if len(files) > MaxSyncFiles || len(emptyDirectories) > MaxSyncFiles-len(files) {
+		return "", errors.New("workspace manifest exceeds item limit")
+	}
+	orderedFiles := append([]File(nil), files...)
+	sort.Slice(orderedFiles, func(i, j int) bool { return orderedFiles[i].Path < orderedFiles[j].Path })
+	orderedDirectories := append([]string(nil), emptyDirectories...)
+	sort.Strings(orderedDirectories)
+
+	var paths mordesync.ManifestPathValidator
+	for _, directory := range orderedDirectories {
+		if err := ValidateRelativePath(directory); err != nil {
+			return "", err
+		}
+		if err := paths.Add(directory); err != nil {
+			return "", err
+		}
+	}
+	for _, file := range orderedFiles {
+		if err := ValidateFile(file); err != nil {
+			return "", err
+		}
+		if err := paths.Add(file.Path); err != nil {
+			return "", err
+		}
+	}
+
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(manifestTreeDigestVersion))
+	_, _ = hasher.Write([]byte("{\"empty_directories\":["))
+	encodedBytes := len(`{"empty_directories":[],"files":[]}`)
+	for index, directory := range orderedDirectories {
+		encoded, err := json.Marshal(directory)
+		if err != nil {
+			return "", err
+		}
+		if index > 0 {
+			encodedBytes++
+			_, _ = hasher.Write([]byte(","))
+		}
+		encodedBytes += len(encoded)
+		if encodedBytes > MaxSyncManifestBytes {
+			return "", errors.New("workspace manifest exceeds byte limit")
+		}
+		_, _ = hasher.Write(encoded)
+	}
+	_, _ = hasher.Write([]byte("],\"files\":["))
+	for index, file := range orderedFiles {
+		if index > 0 {
+			encodedBytes++
+			_, _ = hasher.Write([]byte(","))
+		}
+		chunks := file.Chunks
+		if chunks == nil {
+			chunks = []Chunk{}
+		}
+		encoded, err := json.Marshal(manifestDigestFileV1{
+			Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, Chunks: chunks,
+		})
+		if err != nil {
+			return "", err
+		}
+		encodedBytes += len(encoded)
+		if encodedBytes > MaxSyncManifestBytes {
+			return "", errors.New("workspace manifest exceeds byte limit")
+		}
+		_, _ = hasher.Write(encoded)
+	}
+	_, _ = hasher.Write([]byte("]}"))
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // ManifestSHA256Stream hashes files yielded in strict lexical path order. The

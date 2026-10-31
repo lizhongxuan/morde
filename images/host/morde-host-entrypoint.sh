@@ -28,7 +28,7 @@ fi
 
 # OpenSandbox creates fresh Docker volumes as root; the pinned AIO image runs gem as 1000:1000.
 gem_gid=1000
-install -d -o root -g "$gem_gid" -m 2770 /home/gem/workspace
+install -d -o root -g "$gem_gid" -m 3770 /home/gem/workspace
 
 # AIO v1.11.0 rewrites several files under /home/gem during gem.sh startup.
 # Preserve the caller's hook privately, then restore profile files at AIO's

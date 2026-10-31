@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -163,6 +164,50 @@ func TestSyncthingAPIClientConfigAndRevocationEndpoints(t *testing.T) {
 	}
 	if calls != 8 {
 		t.Fatalf("request count = %d, want 8", calls)
+	}
+}
+
+func TestSyncthingAPIClientReadOnlyWorkspaceObservation(t *testing.T) {
+	folderID := "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodGet || r.Header.Get("X-API-Key") != testSyncthingAPIKey {
+			t.Errorf("request = %s %s, want authenticated GET", r.Method, r.URL.String())
+		}
+		switch {
+		case r.URL.Path == "/rest/system/connections":
+			_, _ = w.Write([]byte(`{"connections":{"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB":{"connected":false},"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA":{"connected":true}}}`))
+		case r.URL.Path == "/rest/config/folders":
+			_, _ = w.Write([]byte(`[{"id":"` + folderID + `"},{"id":"local-other"}]`))
+		case r.URL.Path == "/rest/db/status":
+			if r.URL.Query().Get("folder") != folderID {
+				t.Errorf("folder query = %q, want %q", r.URL.Query().Get("folder"), folderID)
+			}
+			_, _ = w.Write([]byte(`{"state":"future-state","needBytes":9,"needFiles":3}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewSyncthingAPIClient(server.URL, testSyncthingAPIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected, err := client.ConnectedDeviceIDs(context.Background())
+	if err != nil || len(connected) != 1 || connected[0] != "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA" {
+		t.Fatalf("ConnectedDeviceIDs() = %v, error = %v", connected, err)
+	}
+	folders, err := client.WorkspaceFolderStatuses(context.Background())
+	if err != nil || len(folders) != 1 {
+		t.Fatalf("WorkspaceFolderStatuses() = %v, error = %v", folders, err)
+	}
+	if folders[0].FolderID != folderID || folders[0].State != "unknown" || folders[0].NeedBytes != 9 || folders[0].NeedFiles != 3 {
+		t.Fatalf("WorkspaceFolderStatuses() = %+v", folders[0])
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("request count = %d, want 3", calls.Load())
 	}
 }
 
