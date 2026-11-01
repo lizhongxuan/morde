@@ -46,6 +46,9 @@ func (s *hostService) List(ctx context.Context, principal identity.Principal) ([
 		}
 		result = append(result, value)
 	}
+	if err := s.populateHostRuntimeLiveness(ctx, result); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -81,7 +84,19 @@ func (s *hostService) Get(ctx context.Context, principal identity.Principal, hos
 	if err != nil {
 		return host.Host{}, err
 	}
-	return value, nil
+	values := []host.Host{value}
+	if err := s.populateHostRuntimeLiveness(ctx, values); err != nil {
+		return host.Host{}, err
+	}
+	return values[0], nil
+}
+
+func (s *hostService) populateHostRuntimeLiveness(ctx context.Context, values []host.Host) error {
+	reader, ok := s.hosts.(HostRuntimeLivenessReader)
+	if !ok {
+		return nil
+	}
+	return reader.PopulateHostRuntimeLiveness(ctx, values)
 }
 
 func (s *hostService) BindWorkspace(ctx context.Context, principal identity.Principal, hostID, workspaceID string, expectedRevision *int64, expectedBindingVersion int64, idempotencyKey string) (workspace.Binding, error) {

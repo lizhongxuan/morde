@@ -474,7 +474,7 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 			if test.gateEnableError != nil {
 				store.owners = []string{testWorkspaceSyncOwner}
 				store.pendingOwners = []string{}
-				store.state = workspace.SyncNodeDesiredState{Folders: []workspace.SyncNodeFolder{{
+				store.state = workspace.SyncNodeDesiredState{Revision: 1, Folders: []workspace.SyncNodeFolder{{
 					WorkspaceID: "w1234567", FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DeviceIDs: []string{testWorkspaceSyncDevice},
 				}}}
 			}
@@ -512,7 +512,7 @@ func TestWorkspaceSyncNodeProvisionerStopsOwnerOnProvisioningFailures(t *testing
 				"disable:" + testWorkspaceSyncOwner, "enable:" + testWorkspaceSyncOwner,
 				"disable:" + testWorkspaceSyncOwner,
 			}) {
-				t.Fatalf("relay gate calls after activation failure = %v", gate.calls)
+				t.Fatalf("relay gate calls after activation failure (%v) = %v", err, gate.calls)
 			}
 			if test.gateEnableError != nil {
 				gate.enableError = nil

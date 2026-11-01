@@ -12,6 +12,7 @@ export const portalApi = {
   me: async () => unwrapApiResponse(await api.GET('/api/me')),
   preferences: async () => unwrapApiResponse(await api.GET('/api/me/preferences')),
   savePreferences: async (body: components['schemas']['SaveUserPreferencesRequest']) => unwrapApiResponse(await api.PUT('/api/me/preferences', { body })),
+  execution: async () => unwrapApiResponse(await api.GET('/api/execution')),
   onboardingStatus: async () => unwrapApiResponse(await api.GET('/api/onboarding/status')),
   ensureDefaultHost: async (body: components['schemas']['EnsureDefaultHostRequest'] = {}) => unwrapApiResponse(await api.POST('/api/me/default-host', { body })),
   login: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/login', { body: { name, password } })),
@@ -34,6 +35,8 @@ export const portalApi = {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
   enterHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/enter', { params: { path: { id } } })),
+  hostControl: async (id: string) => unwrapApiResponse(await api.GET('/api/hosts/{id}/control', { params: { path: { id } } })),
+  hostControlAction: async (id: string, body: components['schemas']['ControlActionRequest']) => unwrapApiResponse(await api.POST('/api/hosts/{id}/control/actions', { params: { path: { id } }, body })),
   renewHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/renew', { params: { path: { id } } })),
   releaseHost: async (id: string, confirmProcessTermination: boolean) => unwrapApiResponse(await api.POST('/api/hosts/{id}/release', { params: { path: { id } }, body: { confirm_process_termination: confirmProcessTermination } })),
   restoreHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/restore', { params: { path: { id } } })),
@@ -114,6 +117,9 @@ export const portalApi = {
     params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } },
   })),
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  taskAction: async (id: string, body: components['schemas']['TaskActionRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/actions', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
   submitTask: async (body: components['schemas']['SubmitTaskRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),

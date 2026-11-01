@@ -12,6 +12,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 )
@@ -26,6 +27,11 @@ type TaskService interface {
 	RespondToPendingRequest(context.Context, identity.Principal, string, string, int64, task.PendingDecision, string) error
 	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
+}
+
+type TaskWorkspaceViewDeletionService interface {
+	RequestWorkspaceViewDeletion(context.Context, identity.Principal, string, bool, string) (app.TaskWorkspaceViewDeletion, error)
+	GetWorkspaceViewDeletion(context.Context, identity.Principal, string) (app.TaskWorkspaceViewDeletion, error)
 }
 
 type TaskMCPConnectorGrantService interface {
@@ -59,6 +65,7 @@ type taskSummaryResponse struct {
 
 type taskResponse struct {
 	taskSummaryResponse
+	EventSequence        int64                             `json:"event_sequence"`
 	Result               *string                           `json:"result"`
 	WaitingReason        *string                           `json:"waiting_reason"`
 	Steps                []taskStepResponse                `json:"steps"`
@@ -67,6 +74,7 @@ type taskResponse struct {
 	PendingRequest       *taskPendingRequestResponse       `json:"pending_request"`
 	ClarificationRequest *taskClarificationRequestResponse `json:"clarification_request"`
 	StopRequest          *taskStopRequestResponse          `json:"stop_request"`
+	AssistantMessage     *taskAssistantMessageResponse     `json:"assistant_message"`
 	FinishedAt           *time.Time                        `json:"finished_at"`
 }
 
@@ -78,11 +86,31 @@ type taskStopRequestResponse struct {
 	UnsettledOperationIDs []string               `json:"unsettled_operation_ids"`
 }
 
+type taskAssistantMessageResponse struct {
+	ID             string            `json:"id"`
+	ConversationID string            `json:"conversation_id"`
+	TaskID         string            `json:"task_id"`
+	Role           conversation.Role `json:"role"`
+	Content        string            `json:"content"`
+	Status         string            `json:"status"`
+	CreatedAt      time.Time         `json:"created_at"`
+}
+
 type taskActionResponse struct {
 	TaskID                string      `json:"task_id"`
 	Action                string      `json:"action"`
 	Status                task.Status `json:"status"`
 	UnsettledOperationIDs []string    `json:"unsettled_operation_ids"`
+}
+
+type taskWorkspaceViewDeletionRequest struct {
+	ConfirmDelete bool `json:"confirm_delete"`
+}
+
+type taskWorkspaceViewDeletionResponse struct {
+	RequestID string `json:"request_id"`
+	TaskID    string `json:"task_id"`
+	Status    string `json:"status"`
 }
 
 type taskPendingRequestResponse struct {
@@ -209,10 +237,70 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks", h.submitTask(service))
 	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
+	group.GET("/tasks/:id/workspace-view-deletions", h.getTaskWorkspaceViewDeletion(service))
+	group.POST("/tasks/:id/workspace-view-deletions", h.requestTaskWorkspaceViewDeletion(service))
 	group.POST("/tasks/:id/actions", h.taskAction(service))
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+func (h *api) getTaskWorkspaceViewDeletion(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		deletionService, ok := service.(TaskWorkspaceViewDeletionService)
+		if !ok {
+			writeError(c, domain.NewError(domain.CodeUnsupported, "task Workspace view deletion is unavailable"))
+			return
+		}
+		deletion, err := deletionService.GetWorkspaceViewDeletion(c.Request.Context(), principal, taskID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, taskWorkspaceViewDeletionResponse{RequestID: deletion.ID, TaskID: deletion.TaskID, Status: deletion.Status})
+	}
+}
+
+func (h *api) requestTaskWorkspaceViewDeletion(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		var request taskWorkspaceViewDeletionRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		deletionService, ok := service.(TaskWorkspaceViewDeletionService)
+		if !ok {
+			writeError(c, domain.NewError(domain.CodeUnsupported, "task Workspace view deletion is unavailable"))
+			return
+		}
+		deletion, err := deletionService.RequestWorkspaceViewDeletion(c.Request.Context(), principal, taskID, request.ConfirmDelete, c.GetHeader("Idempotency-Key"))
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		status := http.StatusAccepted
+		if deletion.Status == "applied" {
+			status = http.StatusOK
+		}
+		c.JSON(status, taskWorkspaceViewDeletionResponse{RequestID: deletion.ID, TaskID: deletion.TaskID, Status: deletion.Status})
+	}
 }
 
 func (h *api) revokeTaskMCPConnectorGrant(service TaskService) gin.HandlerFunc {
@@ -500,10 +588,34 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	if err != nil {
 		return taskResponse{}, err
 	}
+	if value.Task.EventSequence < 0 {
+		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
 	response := taskResponse{
-		taskSummaryResponse: summary, Result: stringPointer(value.Task.Result), WaitingReason: stringPointer(value.Task.WaitingReason),
+		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
+		Result: stringPointer(value.Task.Result), WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
 		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt,
+	}
+	if assistant := value.AssistantMessage; assistant != nil {
+		message := assistant.Message
+		if !domain.ValidMessageID(message.ID) || !domain.ValidConversationID(message.ConversationID) ||
+			message.ConversationID != value.Task.ConversationID || message.TaskID != value.Task.ID ||
+			message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
+			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) ||
+			strings.ContainsRune(message.Content, '\x00') || message.CreatedAt.IsZero() {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		status := string(assistant.Status)
+		switch status {
+		case "streaming", "completed", "interrupted":
+		default:
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.AssistantMessage = &taskAssistantMessageResponse{
+			ID: message.ID, ConversationID: message.ConversationID, TaskID: message.TaskID,
+			Role: message.Role, Content: message.Content, Status: status, CreatedAt: message.CreatedAt,
+		}
 	}
 	if pending := value.PendingRequest; pending != nil && pending.Status == task.PendingRequestPending {
 		if value.Task.Status != task.StatusWaitingUser || !domain.ValidPendingRequestID(pending.ID) || pending.TaskID != value.Task.ID || pending.Version < 1 || pending.Kind != "approval" ||

@@ -226,7 +226,8 @@ VALUES ($1,$2,$3)`, workspaceID, principal.UserID, storedFolderID); err != nil {
 			return fmt.Errorf("get workspace sync folder binding: %w", err)
 		}
 		folderUpdate, err := tx.Exec(ctx, `UPDATE workspace_sync_folders SET state='pending_node',updated_at=clock_timestamp()
-WHERE workspace_id=$1 AND state IN ('revoking','revoked')`, workspaceID)
+WHERE workspace_id=$1 AND state IN ('revoking','revoked')
+  AND NOT EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=$1 AND b.state='revoking')`, workspaceID)
 		if err != nil {
 			return fmt.Errorf("reopen Workspace sync folder after device registration: %w", err)
 		}
@@ -291,7 +292,7 @@ func (s *Store) RevokeWorkspaceSyncDevice(ctx context.Context, principal identit
 		var deviceID, installationID, bindingState string
 		err := tx.QueryRow(ctx, `SELECT i.device_id,b.client_installation_id,b.state
 FROM workspace_sync_device_bindings b
-JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id
+JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id AND i.owner_id=b.owner_id AND i.client_installation_id=b.client_installation_id
 WHERE b.id=$1 AND b.owner_id=$2 AND b.workspace_id=$3 FOR UPDATE OF b`,
 			bindingID, principal.UserID, workspaceID).Scan(&deviceID, &installationID, &bindingState)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -376,11 +377,34 @@ func (s *Store) ListWorkspaceSyncDeviceBindings(ctx context.Context, principal i
 	return items, nil
 }
 
+func (s *Store) ListWorkspaceSyncNodeBindings(ctx context.Context, ownerID, workspaceID string) ([]workspace.SyncDeviceBinding, error) {
+	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	rows, err := s.pool.Query(ctx, workspaceSyncDeviceBindingSelect+`WHERE b.owner_id=$1 AND b.workspace_id=$2 AND b.state='active' ORDER BY b.created_at,b.id`, ownerID, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace sync node bindings: %w", err)
+	}
+	defer rows.Close()
+	items := make([]workspace.SyncDeviceBinding, 0)
+	for rows.Next() {
+		item, err := scanWorkspaceSyncDeviceBinding(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read workspace sync node bindings: %w", err)
+	}
+	return items, nil
+}
+
 const workspaceSyncDeviceBindingSelect = `SELECT b.id,b.owner_id,b.workspace_id,b.client_installation_id,
 i.device_id,i.certificate_sha256,f.folder_id,b.state,b.created_at,b.revoked_at
 FROM workspace_sync_device_bindings b
-JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id
-JOIN workspace_sync_folders f ON f.workspace_id=b.workspace_id `
+JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id AND i.owner_id=b.owner_id AND i.client_installation_id=b.client_installation_id
+JOIN workspace_sync_folders f ON f.workspace_id=b.workspace_id AND f.owner_id=b.owner_id `
 
 func scanWorkspaceSyncDeviceBinding(row interface{ Scan(...any) error }) (workspace.SyncDeviceBinding, error) {
 	var value workspace.SyncDeviceBinding
@@ -469,15 +493,15 @@ RETURNING desired_revision`, ownerID).Scan(&revision)
 
 func refreshWorkspaceSyncFolderStates(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) error {
 	_, err := tx.Exec(ctx, `UPDATE workspace_sync_folders f SET state=CASE
+  WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='revoking') THEN 'revoking'
   WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='active') THEN 'active'
   WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='pending_node') THEN 'pending_node'
-  WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='revoking') THEN 'revoking'
   ELSE 'revoked' END,
   updated_at=clock_timestamp()
 WHERE f.owner_id=$1 AND ($2='' OR f.workspace_id=$2) AND f.state IS DISTINCT FROM CASE
+  WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='revoking') THEN 'revoking'
   WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='active') THEN 'active'
   WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='pending_node') THEN 'pending_node'
-  WHEN EXISTS (SELECT 1 FROM workspace_sync_device_bindings b WHERE b.workspace_id=f.workspace_id AND b.state='revoking') THEN 'revoking'
   ELSE 'revoked' END`, ownerID, workspaceID)
 	if err != nil {
 		return fmt.Errorf("refresh Workspace sync folder states: %w", err)
@@ -551,7 +575,7 @@ WHERE s.owner_id=$1 AND ($2='' OR s.workspace_id=$2)
   )
   AND (NOT $4::boolean OR NOT EXISTS (
     SELECT 1 FROM workspace_sync_device_bindings b
-    JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id
+    JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id AND i.owner_id=b.owner_id AND i.client_installation_id=b.client_installation_id
     WHERE b.owner_id=s.owner_id AND b.workspace_id=s.workspace_id
       AND ($3='' OR b.client_installation_id=$3) AND b.state='active' AND i.revoked_at IS NULL
   ))`, ownerID, workspaceID, installationID, preserveOtherBindings)
@@ -696,8 +720,8 @@ func workspaceSyncNodeDesiredState(ctx context.Context, tx pgx.Tx, ownerID strin
 	desired := workspace.SyncNodeDesiredState{OwnerID: ownerID, Revision: revision, Folders: make([]workspace.SyncNodeFolder, 0)}
 	rows, err := tx.Query(ctx, `SELECT f.workspace_id,f.folder_id,i.device_id
 FROM workspace_sync_folders f
-JOIN workspace_sync_device_bindings b ON b.workspace_id=f.workspace_id
-JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id
+JOIN workspace_sync_device_bindings b ON b.workspace_id=f.workspace_id AND b.owner_id=f.owner_id
+JOIN workspace_sync_device_identities i ON i.id=b.device_identity_id AND i.owner_id=b.owner_id AND i.client_installation_id=b.client_installation_id
 WHERE f.owner_id=$1 AND b.state IN ('pending_node','active') AND i.revoked_at IS NULL
 ORDER BY f.workspace_id,i.device_id`, ownerID)
 	if err != nil {

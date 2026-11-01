@@ -1,0 +1,1179 @@
+openapi: 3.1.0
+info:
+  title: Morde Runtime Control API
+  version: 1.0.0
+  description: >-
+    Private Morde-to-morde-runtime protocol. Every request carries the protocol
+    header. JSON objects carry the same protocol_version. Unknown major
+    versions fail closed; additive optional fields and capabilities may be
+    introduced within a major version.
+x-morde-request-body-max-bytes: 1048576
+x-morde-response-body-max-bytes: 8388608
+security:
+  - RuntimeCredential: []
+paths:
+  /runtime/v1/applications:
+    get:
+      operationId: listApplications
+      description: >-
+        Read the fixed Codex and WeChat application catalog. The Runtime checks
+        its Host and control fence before and after probing. Codex output is
+        reduced to a validated version and login enum. WeChat reports the fixed
+        package install operation, which can be polled here; command output,
+        account data, and credentials are never returned.
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: protocol_version
+          in: query
+          required: true
+          schema: { type: string, const: '1.0' }
+        - name: host_id
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/HostID' }
+        - name: runtime_generation
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/RuntimeGeneration' }
+        - name: control_version
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/ControlVersion' }
+      responses:
+        '200':
+          description: Installed application readiness under the exact current Runtime fence.
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
+            Pragma:
+              required: true
+              schema: { type: string, const: no-cache }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Applications' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '413': { $ref: '#/components/responses/ResultTooLarge' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/applications/{app_id}/install:
+    post:
+      operationId: installApplication
+      description: >-
+        Idempotently install the fixed official WeChat x86_64 package. The
+        Runtime rejects arbitrary package names, URLs, commands, and non-amd64
+        hosts. It accepts the asynchronous operation while holding the exact
+        Host fence stable; a later control change is ordered after that commit.
+        Poll its progress through listApplications.
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: app_id
+          in: path
+          required: true
+          schema: { type: string, const: wechat }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationInstallRequest' }
+      responses:
+        '202':
+          description: Application install started, or its idempotent operation was returned.
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
+            Pragma:
+              required: true
+              schema: { type: string, const: no-cache }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationInstallResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/applications/{app_id}/launch:
+    post:
+      operationId: launchApplication
+      description: >-
+        Start only a launcher registered in the fixed application catalog in
+        its dedicated cgroup v2. launch_id is durable and idempotent. Runtime
+        records the operation before starting it and never re-dispatches an
+        uncertain launch. The current catalog contains only WeChat.
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: app_id
+          in: path
+          required: true
+          schema: { type: string, const: wechat }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationLaunchRequest' }
+      responses:
+        '202':
+          description: Launch accepted or its durable idempotent operation returned.
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
+            Pragma:
+              required: true
+              schema: { type: string, const: no-cache }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationLaunchResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/applications/{app_id}/launches/{launch_id}:
+    get:
+      operationId: getApplicationLaunch
+      description: Query a durable application launch operation under its current Host fence.
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: app_id
+          in: path
+          required: true
+          schema: { type: string, const: wechat }
+        - name: launch_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128, pattern: '^launch_[A-Za-z0-9][A-Za-z0-9._:-]*$' }
+        - name: protocol_version
+          in: query
+          required: true
+          schema: { type: string, const: '1.0' }
+        - name: host_id
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/HostID' }
+        - name: runtime_generation
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/RuntimeGeneration' }
+        - name: runtime_instance_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+        - name: control_version
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/ControlVersion' }
+      responses:
+        '200':
+          description: Current durable operation state.
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
+            Pragma:
+              required: true
+              schema: { type: string, const: no-cache }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationLaunchResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '404': { $ref: '#/components/responses/OperationNotFound' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/applications/{app_id}/launches/{launch_id}/stop:
+    post:
+      operationId: stopApplicationLaunch
+      description: >-
+        Stop only the cgroup recorded for this launch. Runtime reports stopped
+        only after cgroup.events confirms populated=0.
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: app_id
+          in: path
+          required: true
+          schema: { type: string, const: wechat }
+        - name: launch_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 128, pattern: '^launch_[A-Za-z0-9][A-Za-z0-9._:-]*$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationLaunchRequest' }
+      responses:
+        '202':
+          description: Stop accepted or the current idempotent operation returned.
+          headers:
+            Cache-Control:
+              required: true
+              schema: { type: string, const: no-store }
+            Pragma:
+              required: true
+              schema: { type: string, const: no-cache }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationLaunchResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '404': { $ref: '#/components/responses/OperationNotFound' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/capabilities:
+    get:
+      operationId: capabilities
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: protocol_version
+          in: query
+          required: true
+          schema: { type: string, const: '1.0' }
+        - name: host_id
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/HostID' }
+        - name: runtime_generation
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/RuntimeGeneration' }
+        - name: control_version
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/ControlVersion' }
+      responses:
+        '200':
+          description: Actual runtime identity and declared capabilities.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Capabilities' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/control:
+    put:
+      operationId: setControl
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetControlRequest' }
+      responses:
+        '200':
+          description: Accepted control state and fence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetControlResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/workspace-bindings:
+    put:
+      operationId: setWorkspaceBindings
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetWorkspaceBindingsRequest' }
+      responses:
+        '200':
+          description: Replaced the complete active Workspace binding snapshot under the current Runtime fence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetWorkspaceBindingsResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/tasks/{task_id}/lease:
+    put:
+      operationId: setTaskLease
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: task_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/TaskID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetTaskLeaseRequest' }
+      responses:
+        '200':
+          description: Accepted task lease and fence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetTaskLeaseResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/tasks/{task_id}/workspace-view:
+    put:
+      operationId: setTaskWorkspaceView
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: task_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/TaskID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetTaskWorkspaceViewRequest' }
+      responses:
+        '200':
+          description: >-
+            Returned the deterministic private view after copying the currently
+            bound Host Workspace and verifying its server manifest SHA-256.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SetTaskWorkspaceViewResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+    delete:
+      operationId: deleteTaskWorkspaceView
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: task_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/TaskID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteTaskWorkspaceViewRequest' }
+      responses:
+        '200':
+          description: >-
+            Deleted the Task's private Workspace data and durably recorded the
+            request tombstone. Replaying the same request ID is idempotent;
+            a live Task lease or unresolved operation is rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeleteTaskWorkspaceViewResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/tasks/{task_id}/workspace-view/manifest:
+    post:
+      operationId: readTaskWorkspaceManifestPage
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: task_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/TaskID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskWorkspaceManifestRequest' }
+      responses:
+        '200':
+          description: Bounded page from the exact registered private Task view.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkspaceManifestResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/tasks/{task_id}/workspace-view/block:
+    post:
+      operationId: readTaskWorkspaceBlock
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: task_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/TaskID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskWorkspaceBlockRequest' }
+      responses:
+        '200':
+          description: One SHA-256-verified block from the exact registered private Task view.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkspaceBlockResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/operations:
+    post:
+      operationId: executeOperation
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecuteRequest' }
+      responses:
+        '200':
+          description: Existing or newly accepted Host-wide operation record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/OperationOrFenceConflict' }
+        '413': { $ref: '#/components/responses/ResultTooLarge' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/operations/{operation_id}:
+    get:
+      operationId: getOperation
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/OperationID' }
+        - name: host_id
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/HostID' }
+        - name: runtime_generation
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/RuntimeGeneration' }
+        - name: runtime_instance_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1 }
+        - name: control_version
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/ControlVersion' }
+        - name: task_id
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/TaskID' }
+        - name: lease_version
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Original operation record; querying never restarts work.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResponse' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '404': { $ref: '#/components/responses/OperationNotFound' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '413': { $ref: '#/components/responses/ResultTooLarge' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/operations/{operation_id}/cancel:
+    post:
+      operationId: cancelOperation
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/OperationID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelOperationRequest' }
+      responses:
+        '200':
+          description: Current operation state after cancellation was requested or confirmed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '404': { $ref: '#/components/responses/OperationNotFound' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+  /runtime/v1/quiesce:
+    post:
+      operationId: quiesce
+      parameters:
+        - $ref: '#/components/parameters/ProtocolHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuiesceRequest' }
+      responses:
+        '200':
+          description: Draining state, unresolved operation IDs, and a one-use receipt only after verified drain.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuiesceResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/AuthenticationFailed' }
+        '409': { $ref: '#/components/responses/FenceOrProtocolRejected' }
+        '503': { $ref: '#/components/responses/RuntimeStateUnavailable' }
+
+components:
+  securitySchemes:
+    RuntimeCredential:
+      type: http
+      scheme: bearer
+      bearerFormat: 256-bit per-host runtime credential
+      description: Private per-Host credential; only sent over verified private TLS.
+  parameters:
+    ProtocolHeader:
+      name: X-Morde-Runtime-Protocol
+      in: header
+      required: true
+      schema: { type: string, const: '1.0' }
+  responses:
+    InvalidRequest:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+    AuthenticationFailed:
+      description: Runtime credential was rejected.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+    FenceOrProtocolRejected:
+      description: Host or runtime fence is stale, or protocol versions are incompatible.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+    OperationOrFenceConflict:
+      description: Operation ID conflicts with a prior request or a fence is stale.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+    OperationNotFound:
+      description: Complete healthy Host-wide registry confirms the operation was never accepted.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+    ResultTooLarge:
+      description: Runtime result exceeds its per-call limit; it is not truncated.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+    RuntimeStateUnavailable:
+      description: Runtime operation store is unavailable; no absence or drain is inferred.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RuntimeError' }
+  schemas:
+    HostID:
+      type: string
+      pattern: '^h[a-z0-9]{7}$'
+    TaskID:
+      type: string
+      pattern: '^q[a-z0-9]{7}$'
+    WorkspaceID:
+      type: string
+      pattern: '^w[a-z0-9]{7}$'
+    OperationID:
+      type: string
+      pattern: '^o[a-z0-9]{7}$'
+    RuntimeGeneration:
+      type: integer
+      minimum: 1
+    ControlVersion:
+      type: integer
+      minimum: 0
+    HostFence:
+      type: object
+      required: [host_id, runtime_generation, runtime_instance_id, control_version]
+      properties:
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+    Capabilities:
+      type: object
+      required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, mode, operation_store_ready, capabilities]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        mode: { $ref: '#/components/schemas/Mode' }
+        operation_store_ready: { type: boolean }
+        capabilities:
+          type: array
+          items: { $ref: '#/components/schemas/Capability' }
+    ApplicationLoginStatus:
+      type: string
+      enum: [logged_in, not_logged_in, unknown, not_applicable]
+    ApplicationStatusItem:
+      type: object
+      additionalProperties: false
+      required: [id, installed, version, login_status, installable, install_request_id, install_operation]
+      properties:
+        id: { type: string, enum: [codex, wechat] }
+        installed: { type: boolean }
+        version:
+          type: string
+          maxLength: 64
+          anyOf:
+            - { const: '' }
+            - { type: string, pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?$' }
+        login_status: { $ref: '#/components/schemas/ApplicationLoginStatus' }
+        installable: { type: boolean }
+        install_request_id:
+          type: string
+          maxLength: 128
+          anyOf:
+            - { const: '' }
+            - { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' }
+          description: Empty when install_operation is null; otherwise the current operation's original request ID.
+        install_operation:
+          anyOf:
+            - { type: 'null' }
+            - { $ref: '#/components/schemas/ApplicationInstallOperation' }
+      allOf:
+        - if:
+            properties:
+              install_operation: { type: 'null' }
+          then:
+            properties:
+              install_request_id: { const: '' }
+          else:
+            properties:
+              install_request_id: { pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' }
+      oneOf:
+        - properties:
+            id: { const: codex }
+            installable: { const: false }
+            install_request_id: { const: '' }
+            install_operation: { type: 'null' }
+            installed: { const: true }
+            version:
+              type: string
+              pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+            login_status: { enum: [logged_in, not_logged_in] }
+        - properties:
+            id: { const: codex }
+            installable: { const: false }
+            install_request_id: { const: '' }
+            install_operation: { type: 'null' }
+            installed: { const: true }
+            version:
+              anyOf:
+                - { const: '' }
+                - { type: string, pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' }
+            login_status: { const: unknown }
+        - properties:
+            id: { const: codex }
+            installable: { const: false }
+            install_request_id: { const: '' }
+            install_operation: { type: 'null' }
+            installed: { const: false }
+            version: { const: '' }
+            login_status: { const: not_applicable }
+        - properties:
+            id: { const: wechat }
+            login_status: { const: not_applicable }
+            installed: { const: false }
+            version: { const: '' }
+        - properties:
+            id: { const: wechat }
+            login_status: { const: unknown }
+            installed: { const: true }
+            version: { const: '4.1.13.26' }
+    ApplicationInstallErrorCode:
+      type: string
+      enum: ['', download_failed, digest_mismatch, invalid_package, install_failed, storage_error, operation_interrupted, architecture_unsupported]
+    ApplicationInstallOperation:
+      type: object
+      additionalProperties: false
+      required: [id, application_id, status, progress_percent, error_code, created_at, updated_at]
+      properties:
+        id: { type: string, minLength: 5, maxLength: 64, pattern: '^app_[a-z0-9]+$' }
+        application_id: { type: string, const: wechat }
+        status:
+          allOf:
+            - { $ref: '#/components/schemas/OperationStatus' }
+            - not: { enum: [cancelling, cancelled, unknown] }
+        progress_percent: { type: integer, minimum: 0, maximum: 100 }
+        error_code: { $ref: '#/components/schemas/ApplicationInstallErrorCode' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      allOf:
+        - if:
+            properties: { status: { const: failed } }
+          then:
+            properties:
+              error_code: { enum: [download_failed, digest_mismatch, invalid_package, install_failed, storage_error, operation_interrupted, architecture_unsupported] }
+          else:
+            properties: { error_code: { const: '' } }
+    ApplicationInstallRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, request_id]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        request_id: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$' }
+    ApplicationInstallResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, operation]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        operation: { $ref: '#/components/schemas/ApplicationInstallOperation' }
+    ApplicationLaunchStatus:
+      type: string
+      enum: [starting, running, stopping, stopped, exited, failed, unknown]
+    ApplicationLaunchErrorCode:
+      type: string
+      enum: ['', not_installed, architecture_unsupported, cgroup_unavailable, launch_failed, stop_unconfirmed, storage_error]
+    ApplicationLaunchOperation:
+      type: object
+      additionalProperties: false
+      required: [id, application_id, status, error_code, created_at, updated_at]
+      properties:
+        id: { type: string, minLength: 8, maxLength: 128, pattern: '^launch_[A-Za-z0-9][A-Za-z0-9._:-]*$' }
+        application_id: { type: string, const: wechat }
+        status: { $ref: '#/components/schemas/ApplicationLaunchStatus' }
+        error_code: { $ref: '#/components/schemas/ApplicationLaunchErrorCode' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      allOf:
+        - if:
+            properties: { status: { const: failed } }
+          then:
+            properties:
+              error_code: { enum: [not_installed, architecture_unsupported, cgroup_unavailable, launch_failed, storage_error] }
+          else:
+            if:
+              properties: { status: { const: unknown } }
+            then:
+              properties:
+                error_code: { enum: ['', stop_unconfirmed] }
+            else:
+              properties:
+                error_code: { const: '' }
+    ApplicationLaunchRequest:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, launch_id]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        launch_id: { type: string, minLength: 8, maxLength: 128, pattern: '^launch_[A-Za-z0-9][A-Za-z0-9._:-]*$' }
+    ApplicationLaunchResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, operation]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        operation: { $ref: '#/components/schemas/ApplicationLaunchOperation' }
+    Applications:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, checked_at, items]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        checked_at:
+          type: string
+          format: date-time
+          description: UTC timestamp when the Runtime probe completed.
+          pattern: 'Z$'
+        items:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/ApplicationStatusItem' }
+    Mode:
+      type: string
+      enum: [blocked, ai, human]
+    Capability:
+      type: string
+      enum:
+        - operation.execute
+        - operation.query
+        - operation.cancel
+        - control.fence
+        - control.quiesce
+        - task_lease.fence
+        - desktop.observe
+        - desktop.input
+        - window.list
+        - window.activate
+        - browser.observe
+        - browser.actions
+        - shell.exec
+        - file.read
+        - file.write
+        - file.list
+        - file.find
+        - file.verify
+    DrainedReceipt:
+      type: object
+      required: [receipt_id, host_id, runtime_generation, runtime_instance_id, blocked_control_version, target_control_version, task_ids, issued_at]
+      properties:
+        receipt_id: { type: string, minLength: 1 }
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1 }
+        blocked_control_version: { $ref: '#/components/schemas/ControlVersion' }
+        target_control_version: { $ref: '#/components/schemas/ControlVersion' }
+        task_ids:
+          type: array
+          items: { $ref: '#/components/schemas/TaskID' }
+        issued_at: { type: string, format: date-time }
+    SetControlRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, mode]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            mode: { $ref: '#/components/schemas/Mode' }
+            drained_receipt: { $ref: '#/components/schemas/DrainedReceipt' }
+    SetControlResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, mode]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            mode: { $ref: '#/components/schemas/Mode' }
+    SetTaskLeaseRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, lease_version, expires_at]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            lease_version: { type: integer, minimum: 1 }
+            workspace_task: { type: boolean, description: True when this lease belongs to a persistent Workspace Task. }
+            expires_at:
+              type: string
+              format: date-time
+              description: Must be later than the runtime's current time and at most 30 seconds ahead, including renewals.
+    SetTaskLeaseResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, task_id, lease_version, expires_at]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            lease_version: { type: integer, minimum: 1 }
+            expires_at: { type: string, format: date-time }
+    WorkspaceBinding:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, binding_version, directory]
+      properties:
+        workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+        binding_version: { type: integer, format: int64, minimum: 1 }
+        directory: { type: string, pattern: '^w[a-z0-9]{7}$' }
+    SetWorkspaceBindingsRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, bindings]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            bindings:
+              type: array
+              maxItems: 64
+              items: { $ref: '#/components/schemas/WorkspaceBinding' }
+    SetWorkspaceBindingsResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, bindings]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            bindings:
+              type: array
+              maxItems: 64
+              items: { $ref: '#/components/schemas/WorkspaceBinding' }
+    SetTaskWorkspaceViewRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          additionalProperties: false
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, manifest_sha256]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1 }
+            input_revision: { type: integer, format: int64, minimum: 0 }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+            manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    SetTaskWorkspaceViewResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, manifest_sha256, view_id]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1 }
+            input_revision: { type: integer, format: int64, minimum: 0 }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+            manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
+    DeleteTaskWorkspaceViewRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          additionalProperties: false
+          required: [protocol_version, task_id, request_id]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            request_id: { type: string, pattern: '^z[a-z0-9]{7}$' }
+    DeleteTaskWorkspaceViewResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, task_id, request_id, deleted]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            request_id: { type: string, pattern: '^z[a-z0-9]{7}$' }
+            deleted: { type: boolean, const: true }
+    TaskWorkspaceManifestRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          additionalProperties: false
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, limit]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1 }
+            input_revision: { type: integer, format: int64, minimum: 0 }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+            input_manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
+            manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            after_path: { type: string, maxLength: 4096 }
+            limit: { type: integer, minimum: 1, maximum: 1000 }
+    TaskWorkspaceBlockRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          additionalProperties: false
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, sha256]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1 }
+            input_revision: { type: integer, format: int64, minimum: 0 }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+            input_manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
+            manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    TaskWorkspaceManifestChunk:
+      type: object
+      additionalProperties: false
+      required: [sha256, size_bytes]
+      properties:
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        size_bytes: { type: integer, format: int64, minimum: 1, maximum: 4194304 }
+    TaskWorkspaceManifestFile:
+      type: object
+      additionalProperties: false
+      required: [path, size_bytes, sha256, mode, chunks]
+      properties:
+        path: { type: string, minLength: 1, maxLength: 4096 }
+        size_bytes: { type: integer, format: int64, minimum: 0, maximum: 5368709120 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        mode: { type: integer, minimum: 0, maximum: 511 }
+        chunks:
+          type: array
+          maxItems: 1280
+          items: { $ref: '#/components/schemas/TaskWorkspaceManifestChunk' }
+    TaskWorkspaceManifestResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, files]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1 }
+            input_revision: { type: integer, format: int64, minimum: 0 }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+            input_manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
+            manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            files:
+              type: array
+              maxItems: 1000
+              items: { $ref: '#/components/schemas/TaskWorkspaceManifestFile' }
+            next_cursor: { type: string, maxLength: 4096 }
+    TaskWorkspaceBlockResponse:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, sha256, size_bytes, data]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1 }
+            input_revision: { type: integer, format: int64, minimum: 0 }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+            input_manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
+            manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            size_bytes: { type: integer, format: int64, minimum: 1, maximum: 4194304 }
+            data:
+              type: string
+              contentEncoding: base64
+              maxLength: 5592408
+    ExecuteRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, task_id, operation_id, lease_version, capability, action, arguments]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            task_id: { $ref: '#/components/schemas/TaskID' }
+            workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+            binding_version: { type: integer, format: int64, minimum: 1, description: Required with workspace_id for file.* and shell.exec; checked against the current active Host binding on every operation. }
+            workspace_view_id: { type: string, pattern: '^v[0-9a-f]{64}$', description: Required for file.* and shell.exec; must match the Task's registered private view. }
+            workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0, description: Required for file.* and shell.exec; must match the registered view's checkpoint. }
+            operation_id: { $ref: '#/components/schemas/OperationID' }
+            lease_version: { type: integer, minimum: 1 }
+            capability: { $ref: '#/components/schemas/Capability' }
+            action: { type: string, minLength: 1 }
+            arguments: { type: object }
+    Operation:
+      type: object
+      required: [host_id, runtime_generation, runtime_instance_id, control_version, task_id, operation_id, lease_version, status]
+      properties:
+        host_id: { $ref: '#/components/schemas/HostID' }
+        runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
+        runtime_instance_id: { type: string, minLength: 1 }
+        control_version: { $ref: '#/components/schemas/ControlVersion' }
+        task_id: { $ref: '#/components/schemas/TaskID' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
+        binding_version: { type: integer, format: int64, minimum: 1 }
+        workspace_view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
+        workspace_checkpoint_revision: { type: integer, format: int64, minimum: 0 }
+        operation_id: { $ref: '#/components/schemas/OperationID' }
+        lease_version: { type: integer, minimum: 1 }
+        capability: { type: string }
+        action: { type: string }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        result: { type: object }
+    OperationStatus:
+      type: string
+      enum: [accepted, running, succeeded, failed, cancelling, cancelled, unknown]
+    OperationResponse:
+      type: object
+      required: [protocol_version, request_fence, operation]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        request_fence: { $ref: '#/components/schemas/HostFence' }
+        operation: { $ref: '#/components/schemas/Operation' }
+    CancelOperationRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+    QuiesceRequest:
+      allOf:
+        - $ref: '#/components/schemas/HostFence'
+        - type: object
+          required: [protocol_version, target_control_version, task_ids]
+          properties:
+            protocol_version: { type: string, const: '1.0' }
+            target_control_version: { $ref: '#/components/schemas/ControlVersion' }
+            task_ids:
+              type: array
+              items: { $ref: '#/components/schemas/TaskID' }
+    QuiesceResponse:
+      type: object
+      required: [protocol_version, status, pending_operation_ids]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        status: { type: string, enum: [draining, drained, failed] }
+        pending_operation_ids:
+          type: array
+          items: { $ref: '#/components/schemas/OperationID' }
+        drained_receipt: { $ref: '#/components/schemas/DrainedReceipt' }
+    RuntimeError:
+      type: object
+      required: [protocol_version, code]
+      properties:
+        protocol_version: { type: string, const: '1.0' }
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - runtime_authentication_failed
+            - fence_rejected
+            - operation_conflict
+            - protocol_incompatible
+            - capability_unavailable
+            - operation_not_found
+            - result_too_large
+            - runtime_state_unavailable
+

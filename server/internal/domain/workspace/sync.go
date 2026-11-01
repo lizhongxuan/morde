@@ -330,6 +330,28 @@ type DeviceSyncProgressSummary struct {
 	RemainingBytes int64                `json:"remaining_bytes"`
 	QuotaStatus    SyncQuotaStatus      `json:"quota_status"`
 	Items          []DeviceSyncProgress `json:"items"`
+	QuotaPauses    []SyncQuotaPause     `json:"quota_pauses"`
+	NodeStatus     *SyncNodeObservation `json:"node_status,omitempty"`
+}
+
+type SyncQuotaPauseState string
+
+const SyncQuotaPauseActive SyncQuotaPauseState = "paused"
+
+type SyncQuotaPauseReason string
+
+const (
+	SyncQuotaPauseWorkspaceExceeded SyncQuotaPauseReason = "workspace_quota_exceeded"
+	SyncQuotaPauseOwnerStorage      SyncQuotaPauseReason = "owner_storage_quota_exceeded"
+)
+
+type SyncQuotaPause struct {
+	State          SyncQuotaPauseState  `json:"state"`
+	Path           string               `json:"path"`
+	Operation      string               `json:"operation"`
+	RequestedBytes int64                `json:"requested_bytes"`
+	ReasonCode     SyncQuotaPauseReason `json:"reason_code"`
+	UpdatedAt      time.Time            `json:"updated_at"`
 }
 
 type SyncQuotaStatus string

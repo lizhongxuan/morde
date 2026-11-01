@@ -48,7 +48,7 @@ func TestRuntimeTaskLeaseUsesShorterTaskOrHostDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	if err := session.SetTaskLease(context.Background(), "q1234567", 1, time.Now().Add(time.Hour)); err != nil {
+	if err := session.SetTaskLease(context.Background(), "q1234567", 1, time.Now().Add(time.Hour), false); err != nil {
 		t.Fatalf("host should accept bounded lease: %v", err)
 	}
 }

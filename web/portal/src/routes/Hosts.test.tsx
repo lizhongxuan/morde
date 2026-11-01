@@ -41,7 +41,7 @@ describe('Hosts', () => {
 
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '进入主机 测试主机' })).toBeEnabled();
+    expect(await screen.findByRole('button', { name: '查看主机 测试主机' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: /暂停主机|恢复主机|管理主机令牌/ })).not.toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '删除主机 测试主机' }));
     expect(screen.getByText(/云端电脑的运行环境和专属资料卷会被删除，正在运行的终端命令及服务会中止/)).toBeInTheDocument();
@@ -67,8 +67,9 @@ describe('Hosts', () => {
 
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '进入主机 他人主机' })).toBeDisabled();
+    expect(await screen.findByRole('button', { name: '查看主机 他人主机' })).toBeDisabled();
     expect(screen.getByText('仅主机所有者可以进入工作环境。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /管理共享成员/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '续期主机 他人主机' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '删除主机 他人主机' })).toBeEnabled();
   });
@@ -140,18 +141,21 @@ describe('Hosts', () => {
     await expect(hosts.mock.results[1]!.value).resolves.toMatchObject({ items: [expect.objectContaining({ state: 'running' })] });
   });
 
-  it('does not expose shared member management in the MVP', async () => {
+  it('loads owner-managed sharing grants only after opening the manager', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
-    const listMembers = vi.spyOn(portalApi, 'hostMembers');
+    const listMembers = vi.spyOn(portalApi, 'hostMembers').mockResolvedValue({ items: [] });
     const invite = vi.spyOn(portalApi, 'inviteHostMember');
     const revoke = vi.spyOn(portalApi, 'revokeHostMember');
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByRole('button', { name: '进入主机 测试主机' })).toBeEnabled();
-    expect(screen.queryByRole('button', { name: /管理共享|邀请并授权|撤销权限/ })).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/对方账号 ID|授予权限/)).not.toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '查看主机 测试主机' })).toBeEnabled();
+    const openManager = screen.getByRole('button', { name: /管理共享成员/ });
+    expect(openManager).toBeInTheDocument();
     expect(listMembers).not.toHaveBeenCalled();
+    await user.click(openManager);
+    await waitFor(() => expect(listMembers).toHaveBeenCalledWith(ownedHost.id));
     expect(invite).not.toHaveBeenCalled();
     expect(revoke).not.toHaveBeenCalled();
   });
@@ -186,5 +190,68 @@ describe('Hosts', () => {
     await user.click(screen.getByRole('button', { name: '打开终端' }));
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${ownedHost.id}?target=terminal`, '_blank');
     expect(ticket).not.toHaveBeenCalled();
+  });
+
+  it('waits for AI tool stop confirmation before completing a Host takeover and resumes with the same request ID', async () => {
+    let firstRequest: Parameters<typeof portalApi.hostControlAction>[1] | undefined;
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    vi.spyOn(portalApi, 'hostControl')
+      .mockResolvedValueOnce({ host_id: ownedHost.id, control_state: 'ai', control_version: 4, active_transition: null })
+      .mockImplementationOnce(async () => ({ host_id: ownedHost.id, control_state: 'taking_over', control_version: 5, active_transition: {
+        request_id: firstRequest!.request_id, action: 'take_over', phase: 'draining', failure_reason: 'operations_pending',
+        expected_control_version: firstRequest!.expected_control_version, blocked_control_version: 5, target_control_version: 6, created_at: '', updated_at: '',
+      } }))
+      .mockResolvedValue({ host_id: ownedHost.id, control_state: 'user', control_version: 6, active_transition: null });
+    const controlAction = vi.spyOn(portalApi, 'hostControlAction')
+      .mockImplementationOnce(async (hostID, body) => {
+        firstRequest = body;
+        return {
+          host_id: hostID, control_state: 'taking_over', control_version: 5,
+          active_transition: {
+            request_id: body.request_id, action: 'take_over', phase: 'draining', failure_reason: 'operations_pending',
+            expected_control_version: body.expected_control_version, blocked_control_version: 5, target_control_version: 6, created_at: '', updated_at: '',
+          }, pending_operation_ids: ['op1234567'],
+        };
+      })
+      .mockResolvedValue({ host_id: ownedHost.id, control_state: 'user', control_version: 6, active_transition: null, pending_operation_ids: [] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('电脑控制：云端 AI 控制')).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '接管操作' }));
+    expect(screen.getByText(/工作台保持只读/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '开始接管' }));
+    await waitFor(() => expect(controlAction).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/尚有 1 项操作等待停止确认/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '继续接管确认' })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: '继续接管确认' }));
+    await waitFor(() => expect(controlAction).toHaveBeenCalledTimes(2));
+    expect(controlAction.mock.calls[1]![1]).toEqual(controlAction.mock.calls[0]![1]);
+    expect(await screen.findByText('接管已完成，现在可以操作电脑。')).toBeInTheDocument();
+    expect(await screen.findByText('电脑控制：你正在操作')).toBeInTheDocument();
+  });
+
+  it('confirms handing control back to AI and refreshes Host and Workspace versions', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{ ...ownedHost, control_state: 'user', control_version: 7 }] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue({ host_id: ownedHost.id, control_state: 'user', control_version: 7, active_transition: null });
+    const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockResolvedValue({
+      host_id: ownedHost.id, control_state: 'ai', control_version: 9, active_transition: null, pending_operation_ids: [],
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    client.setQueryData(['workspaces'], { items: [] });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('电脑控制：你正在操作')).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '交还 AI' }));
+    expect(screen.getByText(/重新读取主机和工作区版本/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '交还给 AI' }));
+    await waitFor(() => expect(controlAction).toHaveBeenCalledWith(ownedHost.id, {
+      action: 'release', request_id: expect.any(String), expected_control_version: 7,
+    }));
+    await waitFor(() => expect(client.getQueryState(['workspaces'])?.isInvalidated).toBe(true));
+    expect(await screen.findByText('已交还 AI，主机和工作区版本已刷新。')).toBeInTheDocument();
   });
 });

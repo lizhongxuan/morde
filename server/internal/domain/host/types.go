@@ -6,6 +6,10 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
+// RuntimeHeartbeatFreshness is the maximum age of a Host Runtime heartbeat
+// accepted by Workspace Task claim and completion gates.
+const RuntimeHeartbeatFreshness = 15 * time.Second
+
 type State string
 
 type ControlState string
@@ -37,29 +41,32 @@ type Ref struct {
 }
 
 type Host struct {
-	ID                   string
-	OwnerID              string
-	Name                 string
-	TemplateID           string
-	RuntimeProfile       string
-	Workspaces           []workspace.Binding
-	SandboxID            string
-	CreateAttemptedAt    *time.Time
-	State                State
-	StateReason          string
-	RuntimeGeneration    int64
-	ControlVersion       int64
-	ControlState         ControlState
-	CPUMilli             int
-	MemMiB               int
-	CPULimitMilli        int
-	MemLimitMiB          int
-	AIOKeyEnc            []byte
-	RuntimeCredentialEnc []byte
-	RuntimeInstanceID    string
-	ExpiresAt            *time.Time
-	LastActiveAt         *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
-	DeletedAt            *time.Time
+	ID                            string
+	OwnerID                       string
+	Name                          string
+	TemplateID                    string
+	RuntimeProfile                string
+	Workspaces                    []workspace.Binding
+	SandboxID                     string
+	CreateAttemptedAt             *time.Time
+	State                         State
+	StateReason                   string
+	RuntimeGeneration             int64
+	WorkspaceRuntimeLivenessKnown bool
+	WorkspaceRuntimeOnline        bool
+	WorkspaceRuntimeLastSeenAt    *time.Time
+	ControlVersion                int64
+	ControlState                  ControlState
+	CPUMilli                      int
+	MemMiB                        int
+	CPULimitMilli                 int
+	MemLimitMiB                   int
+	AIOKeyEnc                     []byte
+	RuntimeCredentialEnc          []byte
+	RuntimeInstanceID             string
+	ExpiresAt                     *time.Time
+	LastActiveAt                  *time.Time
+	CreatedAt                     time.Time
+	UpdatedAt                     time.Time
+	DeletedAt                     *time.Time
 }

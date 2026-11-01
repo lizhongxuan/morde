@@ -4,7 +4,7 @@ import { Link } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 
-export function ChangePassword() {
+export function ChangePassword({ loginPath = '/admin/login' }: { loginPath?: string }) {
   const client = useQueryClient();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -34,7 +34,7 @@ export function ChangePassword() {
       <h1 id="change-password-heading">{changed ? '密码已修改' : '修改密码'}</h1>
       {changed ? <>
         <p className="notice notice-success" role="status">密码已更新，现有登录会话已退出。请使用新密码重新登录。</p>
-        <Link className="button button-primary button-wide" to="/admin/login">前往管理后台登录</Link>
+        <Link className="button button-primary button-wide" to={loginPath}>{loginPath === '/admin/login' ? '前往管理后台登录' : '前往登录'}</Link>
       </> : <>
         <p className="muted">请输入当前密码和新的登录密码。新密码长度为 8–72 个字符。</p>
         <form onSubmit={submit}>

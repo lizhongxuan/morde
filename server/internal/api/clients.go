@@ -18,6 +18,8 @@ type clientLoginRequest struct {
 	Platform              string `json:"platform"`
 	DisplayName           string `json:"display_name"`
 	RenewalInstallationID string `json:"renewal_installation_id"`
+	ClientInstanceID      string `json:"client_instance_id"`
+	AttemptGeneration     int64  `json:"attempt_generation"`
 }
 
 type clientLoginResponse struct {
@@ -59,8 +61,14 @@ func (h *api) clientLogin(c *gin.Context) {
 		writeError(c, domain.InvalidArgument("name", "name and password are required"))
 		return
 	}
+	legacyAndroid := request.Platform == "android" && request.ClientInstanceID == "" && request.AttemptGeneration == 0
+	if !legacyAndroid && (request.ClientInstanceID == "" || request.AttemptGeneration == 0) {
+		writeError(c, domain.NewError(domain.CodeUnsupported, "client login requires the ordered_client_login protocol; update the client"))
+		return
+	}
 	result, err := h.deps.ClientLogin.Login(c.Request.Context(), request.Name, request.Password, request.Platform,
-		request.DisplayName, request.RenewalInstallationID, c.GetHeader("Idempotency-Key"), c.ClientIP())
+		request.DisplayName, request.RenewalInstallationID, c.GetHeader("Idempotency-Key"), c.ClientIP(),
+		app.ClientLoginAttempt{InstanceID: request.ClientInstanceID, Generation: request.AttemptGeneration, LegacyAndroid: legacyAndroid})
 	if err != nil {
 		writeError(c, err)
 		return

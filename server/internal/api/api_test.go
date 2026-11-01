@@ -1773,10 +1773,12 @@ type clientLoginHTTPStub struct {
 	ClientLoginService
 	principal identity.Principal
 	key       string
+	attempt   app.ClientLoginAttempt
 }
 
-func (s *clientLoginHTTPStub) Login(_ context.Context, _, _, _, _, _, key, _ string) (app.ClientLoginResult, error) {
+func (s *clientLoginHTTPStub) Login(_ context.Context, _, _, _, _, _, key, _ string, attempt app.ClientLoginAttempt) (app.ClientLoginResult, error) {
 	s.key = key
+	s.attempt = attempt
 	return app.ClientLoginResult{InstallationID: "i1234567", ClientCredential: "client-secret",
 		ClientExpiresAt: time.Now().Add(time.Hour), SyncCredential: "sync-secret", SyncExpiresAt: time.Now().Add(time.Hour),
 		WebSessionCredential: "web-secret", WebSessionExpiresAt: time.Now().Add(time.Hour),
@@ -1812,11 +1814,21 @@ func TestClientLoginHTTPContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	legacy := requestWithHeader(router, http.MethodPost, "/api/auth/client-login",
+		`{"name":"alice","password":"secret","platform":"desktop","display_name":"laptop"}`, "", "", "Idempotency-Key", "login-legacy-1234")
+	if legacy.Code != http.StatusUnprocessableEntity || stub.key != "" {
+		t.Fatalf("legacy login contract = %d %s; service key=%q", legacy.Code, legacy.Body, stub.key)
+	}
+	legacyAndroid := requestWithHeader(router, http.MethodPost, "/api/auth/client-login",
+		`{"name":"alice","password":"secret","platform":"android","display_name":"phone"}`, "", "", "Idempotency-Key", "android-legacy-1234")
+	if legacyAndroid.Code != http.StatusOK || !stub.attempt.LegacyAndroid || stub.attempt.InstanceID != "" || stub.attempt.Generation != 0 {
+		t.Fatalf("legacy Android login = %d %s, attempt=%+v", legacyAndroid.Code, legacyAndroid.Body, stub.attempt)
+	}
 	started := requestWithHeader(router, http.MethodPost, "/api/auth/client-login",
-		`{"name":"alice","password":"secret","platform":"desktop","display_name":"laptop"}`, "", "", "Idempotency-Key", "login-12345678")
+		`{"name":"alice","password":"secret","platform":"desktop","display_name":"laptop","client_instance_id":"9f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":1}`, "", "", "Idempotency-Key", "login-12345678")
 	if started.Code != http.StatusOK || !strings.Contains(started.Body.String(), `"web_session_credential":"web-secret"`) ||
-		stub.key != "login-12345678" || started.Header().Get("Set-Cookie") != "" {
-		t.Fatalf("login = %d %s, key=%q cookie=%q", started.Code, started.Body, stub.key, started.Header().Get("Set-Cookie"))
+		stub.key != "login-12345678" || stub.attempt.InstanceID != "9f0de095-66ba-49c6-a87b-0c527f4f81a1" || stub.attempt.Generation != 1 || started.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("login = %d %s, key=%q attempt=%+v cookie=%q", started.Code, started.Body, stub.key, stub.attempt, started.Header().Get("Set-Cookie"))
 	}
 	client, _, err := identity.NewCredential(identity.KindClient, testTokenID)
 	if err != nil {

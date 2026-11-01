@@ -61,6 +61,75 @@ describe('typed Portal API client', () => {
     expect(request!.headers.get('Idempotency-Key')).toBe('model-probe-key-001');
   });
 
+  it('sends caller-supplied idempotency keys for approval and clarification actions', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      return Response.json({ task_id: 'q1234567', action: 'respond', status: 'queued', unsettled_operation_ids: [] }, { status: 202 });
+    }));
+
+    await portalApi.respondToTaskApproval('q1234567', 'k1234567', { version: 4, decision: 'approve' }, 'approval-retry-key');
+    await portalApi.answerTaskInput('q1234567', {
+      clarification_id: 'k7654321', clarification_version: 2, answer: 'Use the reports directory.',
+    }, 'clarification-retry-key');
+
+    expect(requests.map((request) => [new URL(request.url).pathname, request.headers.get('Idempotency-Key')])).toEqual([
+      ['/api/tasks/q1234567/approvals/k1234567/responses', 'approval-retry-key'],
+      ['/api/tasks/q1234567/inputs', 'clarification-retry-key'],
+    ]);
+    expect(await requests[0]!.json()).toEqual({ version: 4, decision: 'approve' });
+    expect(await requests[1]!.json()).toEqual({ clarification_id: 'k7654321', clarification_version: 2,
+      answer: 'Use the reports directory.' });
+  });
+
+  it('sends a version-scoped cancellation action with the supplied retry key', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ task_id: 'q1234567', action: 'cancel', status: 'cancelling', unsettled_operation_ids: ['op1234567'] }, { status: 202 });
+    }));
+
+    const response = await portalApi.taskAction('q1234567', { action: 'cancel', expected_status: 'running' }, 'task-stop-retry-key');
+
+    expect(response.status).toBe('cancelling');
+    expect(new URL(request!.url).pathname).toBe('/api/tasks/q1234567/actions');
+    expect(request!.headers.get('Idempotency-Key')).toBe('task-stop-retry-key');
+    expect(await request!.json()).toEqual({ action: 'cancel', expected_status: 'running' });
+  });
+
+  it('reads Host control status and sends version-scoped handoff actions', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (request.method === 'GET') return Response.json({ host_id: 'h1234567', control_state: 'ai', control_version: 3, active_transition: null });
+      return Response.json({ host_id: 'h1234567', control_state: 'user', control_version: 5, active_transition: null, pending_operation_ids: [] });
+    }));
+
+    await expect(portalApi.hostControl('h1234567')).resolves.toMatchObject({ control_state: 'ai', control_version: 3 });
+    await expect(portalApi.hostControlAction('h1234567', {
+      action: 'take_over', request_id: 'host-takeover-retry-01', expected_control_version: 3,
+    })).resolves.toMatchObject({ control_state: 'user', control_version: 5 });
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['GET', '/api/hosts/h1234567/control'],
+      ['POST', '/api/hosts/h1234567/control/actions'],
+    ]);
+    expect(await requests[1]!.json()).toEqual({ action: 'take_over', request_id: 'host-takeover-retry-01', expected_control_version: 3 });
+  });
+
+  it('reads the account Runtime separately from Host state', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ owner_id: 'u1234567', state: 'enabled', epoch: 3, pending_task_count: 1,
+        runtime: { state: 'running', runtime_id: 'rt1234567', runtime_generation: 2, max_concurrent_tasks: 4, active_task_count: 1 }, updated_at: '2026-10-25T00:00:00Z' });
+    }));
+
+    await expect(portalApi.execution()).resolves.toMatchObject({ state: 'enabled', runtime: { state: 'running' } });
+    expect([request!.method, new URL(request!.url).pathname]).toEqual(['GET', '/api/execution']);
+  });
+
   it('requests owner-scoped Site and release pages with bounded cursors', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

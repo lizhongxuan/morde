@@ -8,11 +8,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage/workspacecurrent"
 )
+
+type quotaServiceNoopCapacity struct{}
+
+func (quotaServiceNoopCapacity) CheckCapacityForWrite(ctx context.Context, _ int64) error {
+	return ctx.Err()
+}
 
 func TestDescribeWorkspaceReceiveFileBuildsManifest(t *testing.T) {
 	for _, content := range [][]byte{[]byte("received Workspace file"), {}} {
@@ -84,13 +92,16 @@ func TestWorkspaceSyncFileDeleteRequiresMissingPath(t *testing.T) {
 
 type quotaReceiveTestStore struct {
 	*syncServiceStore
-	reservation     WorkspaceSyncReceiveReservation
-	activeReceives  []WorkspaceSyncReceiveReservation
-	beginAbortCalls int
-	completeCalls   int
-	beginAbortErr   error
-	lockReleaseErr  error
-	lockAttempts    int
+	reservation       WorkspaceSyncReceiveReservation
+	activeReceives    []WorkspaceSyncReceiveReservation
+	beginAbortCalls   int
+	completeCalls     int
+	beginAbortErr     error
+	lockReleaseErr    error
+	lockAttempts      int
+	quotaPauseReason  workspace.SyncQuotaPauseReason
+	quotaPauseAtState string
+	blockReserveErr   error
 }
 
 func (s *quotaReceiveTestStore) ReserveWorkspaceSyncReceive(context.Context, WorkspaceSyncReceiveRequest, string, []byte) (WorkspaceSyncReceiveReservation, error) {
@@ -98,11 +109,23 @@ func (s *quotaReceiveTestStore) ReserveWorkspaceSyncReceive(context.Context, Wor
 }
 
 func (s *quotaReceiveTestStore) ReserveWorkspaceSyncReceiveBlockUsage(context.Context, string, string, string, []WorkspaceBlockReservation, int64) error {
+	if s.blockReserveErr != nil {
+		return s.blockReserveErr
+	}
 	return errors.New("unused")
 }
 
 func (s *quotaReceiveTestStore) GetWorkspaceSyncReceiveReservation(context.Context, string, string) (WorkspaceSyncReceiveReservation, error) {
 	return s.reservation, nil
+}
+
+func (s *quotaReceiveTestStore) RecordWorkspaceSyncReceiveQuotaRejection(_ context.Context, ownerID, reservationID string, reason workspace.SyncQuotaPauseReason) error {
+	if ownerID != s.reservation.OwnerID || reservationID != s.reservation.ID {
+		return domain.NewError(domain.CodeNotFound, "Workspace receive reservation not found")
+	}
+	s.quotaPauseReason = reason
+	s.quotaPauseAtState = s.reservation.State
+	return nil
 }
 
 func (s *quotaReceiveTestStore) CommitWorkspaceSyncReceive(context.Context, string, string, string, *workspace.File, *string) (WorkspaceSyncReceiveReceipt, error) {
@@ -115,6 +138,22 @@ func (s *quotaReceiveTestStore) ListActiveWorkspaceSyncReceiveReservations(conte
 
 func (s *quotaReceiveTestStore) ListActiveWorkspaceSyncReceiveOwners(context.Context) ([]string, error) {
 	return nil, errors.New("unused")
+}
+
+func (*quotaReceiveTestStore) ListWorkspaceCurrentMaterializations(context.Context, string, int32) ([]WorkspaceCurrentMaterialization, error) {
+	return nil, nil
+}
+
+func (*quotaReceiveTestStore) MarkWorkspaceCurrentMaterialized(context.Context, string, int64) error {
+	return nil
+}
+
+func (*quotaReceiveTestStore) BeginWorkspaceCurrentMaterialization(context.Context, string, int64, string) error {
+	return nil
+}
+
+func (*quotaReceiveTestStore) MarkWorkspaceCurrentMaterializedForReceive(context.Context, string, int64, string) error {
+	return nil
 }
 
 func (s *quotaReceiveTestStore) BeginAbortWorkspaceSyncReceive(context.Context, string, string, string) (WorkspaceSyncReceiveReservation, error) {
@@ -157,7 +196,7 @@ func (quotaReceiveTestBlocks) PutBlock(string, string, io.Reader) (int64, error)
 	return 0, errors.New("unused")
 }
 
-func (quotaReceiveTestBlocks) ReservationBytes(int64) (int64, error) { return 0, errors.New("unused") }
+func (quotaReceiveTestBlocks) ReservationBytes(size int64) (int64, error) { return size, nil }
 
 func (quotaReceiveTestBlocks) BlockAllocatedBytes(string, string) (int64, error) {
 	return 0, errors.New("unused")
@@ -183,6 +222,60 @@ func newQuotaReceiveTestStore(t *testing.T) *quotaReceiveTestStore {
 		reservation: WorkspaceSyncReceiveReservation{
 			ID: reservationID, OwnerID: "u1234567", WorkspaceID: "w1234567", State: "reserved",
 		},
+	}
+}
+
+func TestQuotaSettlePersistsOwnerStoragePauseBeforeAborting(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("safe Workspace current file access requires Linux openat2")
+	}
+	ctx := context.Background()
+	store := newQuotaReceiveTestStore(t)
+	content := []byte("quota-blocked")
+	operation := sha256.Sum256([]byte("owner-storage-quota-operation"))
+	requestHash := sha256.Sum256([]byte("owner-storage-quota-request"))
+	store.reservation = WorkspaceSyncReceiveReservation{
+		ID: store.reservation.ID, OwnerID: store.workspace.OwnerID, WorkspaceID: store.workspace.ID,
+		OperationID: hex.EncodeToString(operation[:]), Path: "upload.bin", Operation: WorkspaceSyncReceiveUpsert,
+		TargetBytes: int64(len(content)), BaseRevision: 0, State: "reserved", RequestHash: requestHash[:],
+	}
+	store.blockReserveErr = domain.NewError(domain.CodeQuotaExceeded, "workspace owner physical storage quota would be exceeded")
+	currentRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := workspacecurrent.Open(currentRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := current.Close(); err != nil {
+			t.Errorf("close Workspace current store: %v", err)
+		}
+	})
+	ownerDigest := sha256.Sum256([]byte(store.reservation.OwnerID))
+	filePath := filepath.Join(currentRoot, hex.EncodeToString(ownerDigest[:]), store.reservation.WorkspaceID, store.reservation.Path)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filePath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncService := newQuotaReceiveTestService(t, store)
+	if err := syncService.SetWorkspaceCurrentMaterializer(func(context.Context, string, string, int64, []workspace.File, []string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	quotaService, err := NewWorkspaceSyncQuotaService(syncService, current, quotaServiceNoopCapacity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := quotaService.Settle(ctx, store.reservation.OwnerID, store.reservation.ID); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("settle over owner storage quota = %v; want quota exceeded", err)
+	}
+	if store.quotaPauseReason != workspace.SyncQuotaPauseOwnerStorage || store.quotaPauseAtState != "reserved" || store.reservation.State != "aborted" ||
+		store.beginAbortCalls != 1 || store.completeCalls != 1 {
+		t.Fatalf("quota pause and abort = reason:%q recorded_at:%q final_state:%q begin:%d complete:%d", store.quotaPauseReason, store.quotaPauseAtState, store.reservation.State, store.beginAbortCalls, store.completeCalls)
 	}
 }
 

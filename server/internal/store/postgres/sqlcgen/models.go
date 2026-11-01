@@ -70,6 +70,14 @@ type ClientInstallation struct {
 	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
 }
 
+type ClientLoginAttempt struct {
+	OwnerID          string             `json:"owner_id"`
+	ClientInstanceID pgtype.UUID        `json:"client_instance_id"`
+	Generation       int64              `json:"generation"`
+	InstallationID   string             `json:"installation_id"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ClientLoginRequest struct {
 	OwnerID        string             `json:"owner_id"`
 	KeyHash        []byte             `json:"key_hash"`
@@ -211,6 +219,12 @@ type HostMember struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type HostRuntimeHeartbeat struct {
+	HostID            string             `json:"host_id"`
+	RuntimeGeneration int64              `json:"runtime_generation"`
+	LastSeenAt        pgtype.Timestamptz `json:"last_seen_at"`
 }
 
 type HostSiteDrain struct {
@@ -776,6 +790,17 @@ type TaskWorkspacePublishReceipt struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type TaskWorkspaceViewDeletion struct {
+	RequestID         string             `json:"request_id"`
+	TaskID            string             `json:"task_id"`
+	OwnerID           string             `json:"owner_id"`
+	HostID            string             `json:"host_id"`
+	Status            string             `json:"status"`
+	RequestedAt       pgtype.Timestamptz `json:"requested_at"`
+	AppliedAt         pgtype.Timestamptz `json:"applied_at"`
+	AppliedGeneration pgtype.Int8        `json:"applied_generation"`
+}
+
 type Token struct {
 	ID                   string             `json:"id"`
 	OwnerID              string             `json:"owner_id"`
@@ -883,6 +908,7 @@ type WorkspaceLegacyVolume struct {
 	ImportedAt  pgtype.Timestamptz `json:"imported_at"`
 	VerifiedAt  pgtype.Timestamptz `json:"verified_at"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	ImportError pgtype.Text        `json:"import_error"`
 }
 
 type WorkspaceOwnerBlockUsage struct {
@@ -1009,25 +1035,46 @@ type WorkspaceSyncReceiveBlock struct {
 	ReservedBytes int64  `json:"reserved_bytes"`
 }
 
+type WorkspaceSyncReceiveQuotaRejection struct {
+	OwnerID                string             `json:"owner_id"`
+	WorkspaceID            string             `json:"workspace_id"`
+	OperationID            string             `json:"operation_id"`
+	RequestHash            []byte             `json:"request_hash"`
+	FilePath               string             `json:"file_path"`
+	FoldedPath             string             `json:"folded_path"`
+	Operation              string             `json:"operation"`
+	TargetSize             int64              `json:"target_size"`
+	BaseFilePath           pgtype.Text        `json:"base_file_path"`
+	BaseFileSize           pgtype.Int8        `json:"base_file_size"`
+	BaseFileSha256         pgtype.Text        `json:"base_file_sha256"`
+	BaseFileMode           pgtype.Int4        `json:"base_file_mode"`
+	BaseEmptyDirectoryPath pgtype.Text        `json:"base_empty_directory_path"`
+	ReasonCode             string             `json:"reason_code"`
+	State                  string             `json:"state"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type WorkspaceSyncReceiveReservation struct {
-	ID             string             `json:"id"`
-	OwnerID        string             `json:"owner_id"`
-	WorkspaceID    string             `json:"workspace_id"`
-	OperationID    string             `json:"operation_id"`
-	RequestHash    []byte             `json:"request_hash"`
-	FilePath       string             `json:"file_path"`
-	FoldedPath     string             `json:"folded_path"`
-	Operation      string             `json:"operation"`
-	TargetSize     int64              `json:"target_size"`
-	BaseRevision   int64              `json:"base_revision"`
-	BaseFileSize   pgtype.Int8        `json:"base_file_size"`
-	BaseFileSha256 pgtype.Text        `json:"base_file_sha256"`
-	State          string             `json:"state"`
-	ResultRevision pgtype.Int8        `json:"result_revision"`
-	ResultSha256   pgtype.Text        `json:"result_sha256"`
-	ResultMode     pgtype.Int4        `json:"result_mode"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	ID                     string             `json:"id"`
+	OwnerID                string             `json:"owner_id"`
+	WorkspaceID            string             `json:"workspace_id"`
+	OperationID            string             `json:"operation_id"`
+	RequestHash            []byte             `json:"request_hash"`
+	FilePath               string             `json:"file_path"`
+	FoldedPath             string             `json:"folded_path"`
+	Operation              string             `json:"operation"`
+	TargetSize             int64              `json:"target_size"`
+	BaseRevision           int64              `json:"base_revision"`
+	BaseFileSize           pgtype.Int8        `json:"base_file_size"`
+	BaseFileSha256         pgtype.Text        `json:"base_file_sha256"`
+	State                  string             `json:"state"`
+	ResultRevision         pgtype.Int8        `json:"result_revision"`
+	ResultSha256           pgtype.Text        `json:"result_sha256"`
+	ResultMode             pgtype.Int4        `json:"result_mode"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	BaseEmptyDirectoryPath pgtype.Text        `json:"base_empty_directory_path"`
 }
 
 type WorkspaceSyncSession struct {

@@ -31,7 +31,15 @@ func (s *Store) ReserveWorkspaceSyncReceive(ctx context.Context, request app.Wor
 		return app.WorkspaceSyncReceiveReservation{}, domain.InvalidArgument("workspace_sync_receive", "Workspace receive reservation is invalid")
 	}
 	var reservation app.WorkspaceSyncReceiveReservation
+	quotaRejected := false
+	quotaSuperseded := false
 	err := s.withWorkspaceSyncOwnerTx(ctx, request.OwnerID, func(tx pgx.Tx) error {
+		var previousQuotaState string
+		var rejectedBaseFilePath *string
+		var rejectedBaseFileSize *int64
+		var rejectedBaseFileSHA *string
+		var rejectedBaseFileMode *int32
+		var rejectedBaseDirectory *string
 		var ownerID, state string
 		var revision, usedBytes, quotaBytes, revisionBytes int64
 		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, used_bytes, quota_bytes FROM workspaces WHERE id=$1 FOR UPDATE`, request.WorkspaceID).
@@ -56,6 +64,18 @@ SELECT 1 FROM workspace_legacy_volumes WHERE workspace_id=$1 AND import_state='p
 		if err := requireActiveWorkspaceSyncReceive(ctx, tx, request.OwnerID, request.WorkspaceID, request.FolderID); err != nil {
 			return err
 		}
+		var rejectedHash []byte
+		err := tx.QueryRow(ctx, `SELECT request_hash, state, base_file_path, base_file_size, base_file_sha256, base_file_mode, base_empty_directory_path
+FROM workspace_sync_receive_quota_rejections WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3`,
+			request.OwnerID, request.WorkspaceID, request.OperationID).Scan(&rejectedHash, &previousQuotaState,
+			&rejectedBaseFilePath, &rejectedBaseFileSize, &rejectedBaseFileSHA, &rejectedBaseFileMode, &rejectedBaseDirectory)
+		if err == nil {
+			if !bytes.Equal(rejectedHash, requestHash) {
+				return idempotencyConflict()
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("inspect prior Workspace receive quota rejection: %w", err)
+		}
 		if err := tx.QueryRow(ctx, `SELECT total_bytes FROM workspace_revisions WHERE workspace_id=$1 AND revision=$2`, request.WorkspaceID, revision).Scan(&revisionBytes); err != nil {
 			return storeError("read Workspace revision for receive reservation", "workspace revision", err)
 		}
@@ -66,11 +86,28 @@ SELECT 1 FROM workspace_legacy_volumes WHERE workspace_id=$1 AND import_state='p
 		if err != nil {
 			return err
 		}
+		var retryReservation *app.WorkspaceSyncReceiveReservation
 		if found {
 			if !bytes.Equal(stored.RequestHash, requestHash) || stored.Path != request.Path || stored.Operation != request.Operation || stored.TargetBytes != request.TargetBytes {
 				return idempotencyConflict()
 			}
-			reservation = stored
+			if stored.State != "aborted" {
+				reservation = stored
+				return nil
+			}
+			if previousQuotaState == "paused" {
+				retryReservation = &stored
+			} else if previousQuotaState == "resumed" || previousQuotaState == "superseded" {
+				quotaSuperseded = true
+				return nil
+			} else {
+				reservation = stored
+				return nil
+			}
+		}
+		if previousQuotaState == "resumed" || previousQuotaState == "superseded" {
+			// A later admitted operation on this path supersedes this rejected request.
+			quotaSuperseded = true
 			return nil
 		}
 		if err := ensureNoWorkspaceSyncReceive(ctx, tx, request.WorkspaceID, ""); err != nil {
@@ -106,6 +143,7 @@ SELECT 1 FROM workspace_legacy_volumes WHERE workspace_id=$1 AND import_state='p
 		}
 		var baseSize *int64
 		var baseSHA *string
+		var baseFile *workspace.File
 		var baseDirectory *string
 		if len(baseFiles) > 1 || len(baseDirectories) > 1 || len(baseFiles) > 0 && len(baseDirectories) > 0 {
 			return domain.NewError(domain.CodeInternal, "Workspace contains duplicate case-folded paths")
@@ -125,9 +163,20 @@ SELECT 1 FROM workspace_legacy_volumes WHERE workspace_id=$1 AND import_state='p
 		if len(baseFiles) == 1 {
 			size, digest := baseFiles[0].SizeBytes, baseFiles[0].SHA256
 			baseSize, baseSHA = &size, &digest
+			baseFile = &baseFiles[0]
 		}
 		if len(baseDirectories) == 1 {
 			baseDirectory = &baseDirectories[0]
+		}
+		if previousQuotaState == "paused" && !workspaceSyncReceiveQuotaBaseMatches(baseFile, baseDirectory,
+			rejectedBaseFilePath, rejectedBaseFileSize, rejectedBaseFileSHA, rejectedBaseFileMode, rejectedBaseDirectory) {
+			if _, err := tx.Exec(ctx, `UPDATE workspace_sync_receive_quota_rejections
+SET state='superseded', updated_at=clock_timestamp()
+WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3 AND state='paused'`, request.OwnerID, request.WorkspaceID, request.OperationID); err != nil {
+				return fmt.Errorf("supersede stale Workspace receive quota rejection: %w", err)
+			}
+			quotaSuperseded = true
+			return nil
 		}
 		oldSize := int64(0)
 		if baseSize != nil {
@@ -139,24 +188,64 @@ SELECT 1 FROM workspace_legacy_volumes WHERE workspace_id=$1 AND import_state='p
 		projectedBytes := usedBytes - oldSize
 		if request.Operation == app.WorkspaceSyncReceiveUpsert {
 			if projectedBytes > int64(^uint64(0)>>1)-request.TargetBytes {
-				return domain.NewError(domain.CodeQuotaExceeded, "Workspace storage quota would be exceeded")
+				if err := recordWorkspaceSyncReceiveQuotaRejection(ctx, tx, request.OwnerID, request.WorkspaceID, request.OperationID,
+					requestHash, request.Path, request.Operation, request.TargetBytes, baseFile, baseDirectory, workspace.SyncQuotaPauseWorkspaceExceeded); err != nil {
+					return err
+				}
+				quotaRejected = true
+				return nil
 			}
 			projectedBytes += request.TargetBytes
 		}
 		if projectedBytes > quotaBytes && (usedBytes <= quotaBytes || projectedBytes >= usedBytes) {
+			if request.Operation == app.WorkspaceSyncReceiveUpsert {
+				if err := recordWorkspaceSyncReceiveQuotaRejection(ctx, tx, request.OwnerID, request.WorkspaceID, request.OperationID,
+					requestHash, request.Path, request.Operation, request.TargetBytes, baseFile, baseDirectory, workspace.SyncQuotaPauseWorkspaceExceeded); err != nil {
+					return err
+				}
+				quotaRejected = true
+				return nil
+			}
 			return domain.NewError(domain.CodeQuotaExceeded, "Workspace storage quota would be exceeded")
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO workspace_sync_receive_reservations
+		if _, err := tx.Exec(ctx, `UPDATE workspace_sync_receive_quota_rejections
+SET state='resumed', updated_at=clock_timestamp()
+WHERE owner_id=$1 AND workspace_id=$2 AND folded_path=$3 AND state='paused'`, request.OwnerID, request.WorkspaceID, strings.ToLower(request.Path)); err != nil {
+			return fmt.Errorf("resume prior Workspace receive quota pauses: %w", err)
+		}
+		if retryReservation != nil {
+			var retainedBlocks bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM workspace_sync_receive_blocks WHERE reservation_id=$1 AND workspace_id=$2)`,
+				retryReservation.ID, request.WorkspaceID).Scan(&retainedBlocks); err != nil {
+				return fmt.Errorf("check aborted Workspace receive block associations before retry: %w", err)
+			}
+			if retainedBlocks {
+				return domain.NewError(domain.CodeInternal, "aborted Workspace receive still owns block reservations")
+			}
+			updated, err := tx.Exec(ctx, `UPDATE workspace_sync_receive_reservations
+SET id=$1, base_revision=$2, base_file_size=$3, base_file_sha256=$4, base_empty_directory_path=$5,
+    state='reserved', updated_at=clock_timestamp()
+WHERE id=$6 AND owner_id=$7 AND workspace_id=$8 AND operation_id=$9 AND state='aborted'`,
+				reservationID, revision, baseSize, baseSHA, baseDirectory, retryReservation.ID, request.OwnerID, request.WorkspaceID, request.OperationID)
+			if err != nil {
+				return fmt.Errorf("retry aborted quota-rejected Workspace receive: %w", err)
+			}
+			if updated.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeWorkspaceBusy, "aborted Workspace receive changed before quota retry")
+			}
+		} else {
+			_, err = tx.Exec(ctx, `INSERT INTO workspace_sync_receive_reservations
 (id, owner_id, workspace_id, operation_id, request_hash, file_path, folded_path, operation, target_size,
  base_revision, base_file_size, base_file_sha256, base_empty_directory_path, state)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'reserved')`, reservationID, request.OwnerID, request.WorkspaceID,
-			request.OperationID, requestHash, request.Path, strings.ToLower(request.Path), string(request.Operation), request.TargetBytes,
-			revision, baseSize, baseSHA, baseDirectory)
-		if err != nil {
-			if isUniqueViolation(err) {
-				return domain.NewError(domain.CodeWorkspaceBusy, "Workspace already has an active receive reservation")
+				request.OperationID, requestHash, request.Path, strings.ToLower(request.Path), string(request.Operation), request.TargetBytes,
+				revision, baseSize, baseSHA, baseDirectory)
+			if err != nil {
+				if isUniqueViolation(err) {
+					return domain.NewError(domain.CodeWorkspaceBusy, "Workspace already has an active receive reservation")
+				}
+				return fmt.Errorf("create Workspace receive reservation: %w", err)
 			}
-			return fmt.Errorf("create Workspace receive reservation: %w", err)
 		}
 		updated, err := tx.Exec(ctx, `UPDATE workspace_current_materializations SET applied_revision=-1, updated_at=now()
 WHERE workspace_id=$1 AND desired_revision=$2 AND applied_revision=$2`, request.WorkspaceID, revision)
@@ -174,7 +263,230 @@ WHERE workspace_id=$1 AND desired_revision=$2 AND applied_revision=$2`, request.
 		}
 		return nil
 	}, nil, nil)
-	return reservation, err
+	if err != nil {
+		return app.WorkspaceSyncReceiveReservation{}, err
+	}
+	if quotaSuperseded {
+		return app.WorkspaceSyncReceiveReservation{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace path changed after its synchronization operation was paused")
+	}
+	if quotaRejected {
+		return app.WorkspaceSyncReceiveReservation{}, domain.NewError(domain.CodeQuotaExceeded, "Workspace storage quota would be exceeded")
+	}
+	return reservation, nil
+}
+
+func (s *Store) RecordWorkspaceSyncReceiveQuotaRejection(ctx context.Context, ownerID, reservationID string, reason workspace.SyncQuotaPauseReason) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidPendingRequestID(reservationID) || !validWorkspaceSyncQuotaPauseReason(reason) {
+		return domain.InvalidArgument("workspace_sync_receive", "Workspace receive quota rejection is invalid")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		var workspaceID string
+		if err := tx.QueryRow(ctx, `SELECT workspace_id FROM workspace_sync_receive_reservations WHERE owner_id=$1 AND id=$2`, ownerID, reservationID).
+			Scan(&workspaceID); err != nil {
+			return storeError("find Workspace receive quota rejection", "Workspace receive reservation", err)
+		}
+		var storedOwner string
+		var currentRevision int64
+		if err := tx.QueryRow(ctx, `SELECT owner_id, revision FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&storedOwner, &currentRevision); err != nil {
+			return storeError("lock Workspace for receive quota rejection", "workspace", err)
+		}
+		if storedOwner != ownerID {
+			return domain.NewError(domain.CodeNotFound, "Workspace receive reservation not found")
+		}
+		reservation, found, err := getWorkspaceSyncReceiveReservationByID(ctx, tx, ownerID, workspaceID, reservationID, true)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return domain.NewError(domain.CodeNotFound, "Workspace receive reservation not found")
+		}
+		if reservation.Operation != app.WorkspaceSyncReceiveUpsert ||
+			(reservation.State != "reserved" && reservation.State != "aborting" && reservation.State != "aborted") {
+			return domain.NewError(domain.CodeInvalidState, "Workspace receive reservation cannot be quota rejected")
+		}
+		baseFiles, err := loadWorkspaceRevisionFiles(ctx, tx, workspaceID, reservation.BaseRevision, []string{reservation.Path})
+		if err != nil {
+			return err
+		}
+		baseDirectories, err := loadWorkspaceRevisionEmptyDirectories(ctx, tx, workspaceID, reservation.BaseRevision, []string{reservation.Path})
+		if err != nil {
+			return err
+		}
+		if len(baseFiles) > 1 || len(baseDirectories) > 1 || len(baseFiles) > 0 && len(baseDirectories) > 0 {
+			return domain.NewError(domain.CodeInternal, "Workspace contains duplicate case-folded paths")
+		}
+		var baseFile *workspace.File
+		if len(baseFiles) == 1 {
+			baseFile = &baseFiles[0]
+		}
+		var baseDirectory *string
+		if len(baseDirectories) == 1 {
+			baseDirectory = &baseDirectories[0]
+		}
+		currentFiles, err := loadWorkspaceRevisionFiles(ctx, tx, workspaceID, currentRevision, []string{reservation.Path})
+		if err != nil {
+			return err
+		}
+		currentDirectories, err := loadWorkspaceRevisionEmptyDirectories(ctx, tx, workspaceID, currentRevision, []string{reservation.Path})
+		if err != nil {
+			return err
+		}
+		if len(currentFiles) > 1 || len(currentDirectories) > 1 || len(currentFiles) > 0 && len(currentDirectories) > 0 {
+			return domain.NewError(domain.CodeInternal, "Workspace contains duplicate case-folded paths")
+		}
+		var currentFile *workspace.File
+		if len(currentFiles) == 1 {
+			currentFile = &currentFiles[0]
+		}
+		var currentDirectory *string
+		if len(currentDirectories) == 1 {
+			currentDirectory = &currentDirectories[0]
+		}
+		var anotherActivePathReservation bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_sync_receive_reservations
+WHERE workspace_id=$1 AND folded_path=$2 AND operation_id<>$3 AND state IN ('reserved','aborting')
+)`, workspaceID, strings.ToLower(reservation.Path), reservation.OperationID).Scan(&anotherActivePathReservation); err != nil {
+			return fmt.Errorf("check newer Workspace path receive before quota rejection: %w", err)
+		}
+		var baseFilePath *string
+		var baseFileSize *int64
+		var baseFileSHA *string
+		var baseFileMode *int32
+		if baseFile != nil {
+			path, size, digest, mode := baseFile.Path, baseFile.SizeBytes, baseFile.SHA256, int32(baseFile.Mode)
+			baseFilePath, baseFileSize, baseFileSHA, baseFileMode = &path, &size, &digest, &mode
+		}
+		baseChanged := !workspaceSyncReceiveQuotaBaseMatches(currentFile, currentDirectory,
+			baseFilePath, baseFileSize, baseFileSHA, baseFileMode, baseDirectory)
+		if err := recordWorkspaceSyncReceiveQuotaRejection(ctx, tx, ownerID, workspaceID, reservation.OperationID,
+			reservation.RequestHash, reservation.Path, reservation.Operation, reservation.TargetBytes, baseFile, baseDirectory, reason); err != nil {
+			return err
+		}
+		if baseChanged || anotherActivePathReservation {
+			if _, err := tx.Exec(ctx, `UPDATE workspace_sync_receive_quota_rejections
+SET state='superseded', updated_at=clock_timestamp()
+WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3`, ownerID, workspaceID, reservation.OperationID); err != nil {
+				return fmt.Errorf("supersede stale Workspace receive quota rejection: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) ListWorkspaceSyncQuotaPauses(ctx context.Context, ownerID, workspaceID string) ([]workspace.SyncQuotaPause, error) {
+	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
+		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT file_path, operation, target_size, reason_code, updated_at
+FROM (
+  SELECT DISTINCT ON (folded_path) file_path, operation, target_size, reason_code, updated_at, folded_path
+  FROM workspace_sync_receive_quota_rejections
+  WHERE owner_id=$1 AND workspace_id=$2 AND state='paused'
+  ORDER BY folded_path, updated_at DESC, operation_id DESC
+) latest_pauses
+ORDER BY updated_at DESC, folded_path`, ownerID, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list Workspace receive quota pauses: %w", err)
+	}
+	defer rows.Close()
+	items := make([]workspace.SyncQuotaPause, 0)
+	for rows.Next() {
+		var item workspace.SyncQuotaPause
+		var operation string
+		var reason string
+		if err := rows.Scan(&item.Path, &operation, &item.RequestedBytes, &reason, &item.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan Workspace receive quota pause: %w", err)
+		}
+		item.State = workspace.SyncQuotaPauseActive
+		item.Operation = operation
+		item.ReasonCode = workspace.SyncQuotaPauseReason(reason)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read Workspace receive quota pauses: %w", err)
+	}
+	return items, nil
+}
+
+func recordWorkspaceSyncReceiveQuotaRejection(ctx context.Context, tx pgx.Tx, ownerID, workspaceID, operationID string,
+	requestHash []byte, path string, operation app.WorkspaceSyncReceiveOperation, targetBytes int64,
+	baseFile *workspace.File, baseDirectory *string, reason workspace.SyncQuotaPauseReason,
+) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) || !validPostgresSHA256(operationID) || len(requestHash) != 32 ||
+		workspace.ValidateRelativePath(path) != nil || operation != app.WorkspaceSyncReceiveUpsert || targetBytes < 0 ||
+		targetBytes > workspace.MaxSyncFileBytes || !validWorkspaceSyncQuotaPauseReason(reason) {
+		return domain.InvalidArgument("workspace_sync_receive", "Workspace receive quota rejection fields are invalid")
+	}
+	var baseFilePath *string
+	var baseFileSize *int64
+	var baseFileSHA *string
+	var baseFileMode *int32
+	if baseFile != nil {
+		path, size, digest, mode := baseFile.Path, baseFile.SizeBytes, baseFile.SHA256, int32(baseFile.Mode)
+		baseFilePath, baseFileSize, baseFileSHA, baseFileMode = &path, &size, &digest, &mode
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO workspace_sync_receive_quota_rejections
+(owner_id, workspace_id, operation_id, request_hash, file_path, folded_path, operation, target_size,
+ base_file_path, base_file_size, base_file_sha256, base_file_mode, base_empty_directory_path, reason_code, state)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'paused')
+ON CONFLICT (owner_id, workspace_id, operation_id) DO UPDATE
+SET reason_code=EXCLUDED.reason_code, state='paused', updated_at=clock_timestamp()
+WHERE workspace_sync_receive_quota_rejections.request_hash=EXCLUDED.request_hash
+  AND workspace_sync_receive_quota_rejections.file_path=EXCLUDED.file_path
+  AND workspace_sync_receive_quota_rejections.operation=EXCLUDED.operation
+  AND workspace_sync_receive_quota_rejections.target_size=EXCLUDED.target_size
+  AND workspace_sync_receive_quota_rejections.base_file_path IS NOT DISTINCT FROM EXCLUDED.base_file_path
+  AND workspace_sync_receive_quota_rejections.base_file_size IS NOT DISTINCT FROM EXCLUDED.base_file_size
+  AND workspace_sync_receive_quota_rejections.base_file_sha256 IS NOT DISTINCT FROM EXCLUDED.base_file_sha256
+  AND workspace_sync_receive_quota_rejections.base_file_mode IS NOT DISTINCT FROM EXCLUDED.base_file_mode
+  AND workspace_sync_receive_quota_rejections.base_empty_directory_path IS NOT DISTINCT FROM EXCLUDED.base_empty_directory_path`,
+		ownerID, workspaceID, operationID, requestHash, path, strings.ToLower(path), string(operation), targetBytes,
+		baseFilePath, baseFileSize, baseFileSHA, baseFileMode, baseDirectory, string(reason))
+	if err != nil {
+		return fmt.Errorf("persist Workspace receive quota rejection: %w", err)
+	}
+	var storedHash []byte
+	var storedPath, storedOperation string
+	var storedSize int64
+	var storedBaseFilePath *string
+	var storedBaseFileSize *int64
+	var storedBaseFileSHA *string
+	var storedBaseFileMode *int32
+	var storedBaseDirectory *string
+	var storedReasonCode string
+	if err := tx.QueryRow(ctx, `SELECT request_hash, file_path, operation, target_size, reason_code,
+       base_file_path, base_file_size, base_file_sha256, base_file_mode, base_empty_directory_path
+FROM workspace_sync_receive_quota_rejections WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3`,
+		ownerID, workspaceID, operationID).Scan(&storedHash, &storedPath, &storedOperation, &storedSize, &storedReasonCode,
+		&storedBaseFilePath, &storedBaseFileSize, &storedBaseFileSHA, &storedBaseFileMode, &storedBaseDirectory); err != nil {
+		return fmt.Errorf("verify persisted Workspace receive quota rejection: %w", err)
+	}
+	if !bytes.Equal(storedHash, requestHash) || storedPath != path || storedOperation != string(operation) ||
+		storedSize != targetBytes || storedReasonCode != string(reason) ||
+		!workspaceSyncReceiveQuotaBaseMatches(baseFile, baseDirectory,
+			storedBaseFilePath, storedBaseFileSize, storedBaseFileSHA, storedBaseFileMode, storedBaseDirectory) {
+		return idempotencyConflict()
+	}
+	return nil
+}
+
+func validWorkspaceSyncQuotaPauseReason(reason workspace.SyncQuotaPauseReason) bool {
+	return reason == workspace.SyncQuotaPauseWorkspaceExceeded || reason == workspace.SyncQuotaPauseOwnerStorage
+}
+
+func workspaceSyncReceiveQuotaBaseMatches(file *workspace.File, directory *string, filePath *string, fileSize *int64,
+	fileSHA *string, fileMode *int32, directoryPath *string,
+) bool {
+	if (file == nil) != (filePath == nil) || (file == nil) != (fileSize == nil) ||
+		(file == nil) != (fileSHA == nil) || (file == nil) != (fileMode == nil) ||
+		(directory == nil) != (directoryPath == nil) {
+		return false
+	}
+	if file != nil && (file.Path != *filePath || file.SizeBytes != *fileSize || file.SHA256 != *fileSHA || int32(file.Mode) != *fileMode) {
+		return false
+	}
+	return directory == nil || *directory == *directoryPath
 }
 
 func (s *Store) CommitWorkspaceSyncReceive(ctx context.Context, ownerID, workspaceID, reservationID string, file *workspace.File, directory *string) (app.WorkspaceSyncReceiveReceipt, error) {
@@ -227,6 +539,11 @@ func (s *Store) CommitWorkspaceSyncReceive(ctx context.Context, ownerID, workspa
 		}
 		if reservation.State == "aborting" || reservation.State == "aborted" {
 			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace receive reservation is being aborted or was aborted")
+		}
+		if reservation.State == "reserved" {
+			if err := requireActiveWorkspaceSyncReceiveForWorkspace(ctx, tx, ownerID, workspaceID); err != nil {
+				return err
+			}
 		}
 		if reservation.State != "reserved" || reservation.BaseRevision != currentRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed while the receive reservation was active")
@@ -715,6 +1032,17 @@ WHERE u.id=$1 AND u.status='approved' AND i.revoked_at IS NULL AND i.expires_at>
 		return domain.NewError(domain.CodeForbidden, "Workspace synchronization is not currently authorized")
 	}
 	return nil
+}
+
+func requireActiveWorkspaceSyncReceiveForWorkspace(ctx context.Context, tx pgx.Tx, ownerID, workspaceID string) error {
+	var folderID string
+	if err := tx.QueryRow(ctx, `SELECT folder_id FROM workspace_sync_folders WHERE owner_id=$1 AND workspace_id=$2`, ownerID, workspaceID).Scan(&folderID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeForbidden, "Workspace synchronization is no longer authorized")
+		}
+		return fmt.Errorf("read Workspace sync folder for receive settlement: %w", err)
+	}
+	return requireActiveWorkspaceSyncReceive(ctx, tx, ownerID, workspaceID, folderID)
 }
 
 func ensureNoPendingWorkspaceSyncCommit(ctx context.Context, tx pgx.Tx, workspaceID string) error {

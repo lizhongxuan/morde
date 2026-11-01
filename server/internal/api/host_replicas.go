@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -44,14 +47,99 @@ type hostReplicaSyncStatusRequest struct {
 	Conflicts []string                   `json:"conflicts"`
 }
 
+type hostTaskWorkspaceViewDeletionsResponse struct {
+	RuntimeGeneration int64                               `json:"runtime_generation"`
+	Items             []hostTaskWorkspaceViewDeletionItem `json:"items"`
+}
+
+type hostTaskWorkspaceViewDeletionItem struct {
+	RequestID string `json:"request_id"`
+	TaskID    string `json:"task_id"`
+}
+
+type HostTaskWorkspaceViewDeletionService interface {
+	ListPendingWorkspaceViewDeletions(context.Context, identity.Principal) ([]app.TaskWorkspaceViewDeletion, error)
+	CompleteWorkspaceViewDeletion(context.Context, identity.Principal, string, string) (app.TaskWorkspaceViewDeletion, error)
+}
+
 func (h *api) registerHostReplicaRoutes(engine *gin.Engine) {
 	base := "/api/host-replicas/:host_id/generations/:generation"
 	group := engine.Group(base, h.authenticateHostReplica)
 	group.GET("/workspace-bindings", h.listHostReplicaBindings)
+	group.GET("/task-workspace-view-deletions", h.listTaskWorkspaceViewDeletions)
+	group.POST("/tasks/:task_id/workspace-view-deletions/:request_id/applied", h.completeTaskWorkspaceViewDeletion)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/sync-status", h.authenticateHostReplicaBinding, h.reportHostReplicaWorkspaceSyncStatus)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/applied", h.authenticateHostReplicaBinding, h.recordHostReplicaAppliedRevision)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/activate", h.authenticateHostReplicaBinding, h.activateHostReplicaBinding)
 	group.POST("/workspaces/:workspace_id/bindings/:binding_version/detached", h.authenticateHostReplicaBinding, h.completeHostReplicaUnbinding)
+}
+
+func (h *api) listTaskWorkspaceViewDeletions(c *gin.Context) {
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	service, ok := h.deps.Tasks.(HostTaskWorkspaceViewDeletionService)
+	if !ok {
+		serviceUnavailable(c)
+		return
+	}
+	items, err := service.ListPendingWorkspaceViewDeletions(c.Request.Context(), principal)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	response := hostTaskWorkspaceViewDeletionsResponse{
+		RuntimeGeneration: principal.HostGeneration,
+		Items:             make([]hostTaskWorkspaceViewDeletionItem, 0, len(items)),
+	}
+	for _, item := range items {
+		if !domain.ValidTaskWorkspaceViewDeletionID(item.ID) || !domain.ValidTaskID(item.TaskID) || item.HostID != principal.HostScope || item.Status != "pending" {
+			writeError(c, domain.NewError(domain.CodeInternal, "task Workspace view deletion is inconsistent"))
+			return
+		}
+		response.Items = append(response.Items, hostTaskWorkspaceViewDeletionItem{RequestID: item.ID, TaskID: item.TaskID})
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *api) completeTaskWorkspaceViewDeletion(c *gin.Context) {
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	taskID, ok := safeIDParam(c, "task_id", "task_id", domain.ValidTaskID)
+	if !ok {
+		return
+	}
+	requestID, ok := safeIDParam(c, "request_id", "request_id", domain.ValidTaskWorkspaceViewDeletionID)
+	if !ok {
+		return
+	}
+	var request struct{}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(c, domain.InvalidArgument("request", "request body must be an empty JSON object"))
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeError(c, domain.InvalidArgument("request", "request body must contain exactly one value"))
+		return
+	}
+	service, ok := h.deps.Tasks.(HostTaskWorkspaceViewDeletionService)
+	if !ok {
+		serviceUnavailable(c)
+		return
+	}
+	deletion, err := service.CompleteWorkspaceViewDeletion(c.Request.Context(), principal, taskID, requestID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, hostTaskWorkspaceViewDeletionItem{RequestID: deletion.ID, TaskID: deletion.TaskID})
 }
 
 func (h *api) authenticateHostReplica(c *gin.Context) {

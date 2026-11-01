@@ -182,7 +182,7 @@ func newSocketTestDir(t *testing.T, gid int) string {
 	if err := os.Chown(dir, -1, gid); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o2710); err != nil {
+	if err := os.Chmod(dir, 0o710|os.ModeSetgid); err != nil {
 		t.Fatal(err)
 	}
 	return dir

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	auditdomain "morde/server/internal/domain/audit"
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
@@ -258,6 +260,206 @@ func TestPostgresTaskSubmissionFencesWorkspaceRevisionAndHostBinding(t *testing.
 	}
 	if _, err := store.SubmitTask(ctx, newWorkspaceTask("task-conflicted-binding", revision)); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("task with conflicted Host replica error = %v", err)
+	}
+}
+
+func TestPostgresWorkspaceTaskWaitsForHostAppliedRevisionThenResumes(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-waits-for-host-revision")
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	recordHeartbeat := func() {
+		t.Helper()
+		if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
+			t.Fatalf("record Host Runtime heartbeat: %v", err)
+		}
+	}
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "task-waits-for-host-revision", "update the workspace")
+	submission.Task.WorkspaceID, submission.Task.InputRevision = workspaceValue.ID, &revision
+	submission.Task.ContextDigest = hashBytes("workspace input manifest")
+	accepted, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordHeartbeat()
+	claimed, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute)
+	if err != nil || !found || claimed.ID != accepted.Task.ID {
+		t.Fatalf("ClaimNextTask() = %#v, found=%t, err=%v", claimed, found, err)
+	}
+	file := syncTestFile("task-output.txt", []byte("task output revision"))
+	upload := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, upload, syncTestBlocks(upload.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "task-waiting:output", upload.ID)); err != nil {
+		t.Fatalf("create Workspace output revision: %v", err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, upload.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "task-waiting:output", upload.ID)); err != nil {
+		t.Fatalf("commit Workspace output revision: %v", err)
+	}
+	workspaceValue, err = store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil || workspaceValue.Revision != 1 {
+		t.Fatalf("Workspace after Task output = %#v, err=%v", workspaceValue, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET desired_revision=1 WHERE host_id=$1 AND workspace_id=$2`, hostValue.ID, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET workspace_checkpoint_revision=1 WHERE id=$1`, accepted.Task.ID); err != nil {
+		t.Fatal(err)
+	}
+	complete := app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, Result: "Saved", Event: task.Event{Type: "task.result", Payload: []byte(`{}`)},
+	}
+	waitingEvent, err := store.CommitTaskProgress(ctx, complete)
+	if err != nil || waitingEvent.Type != "task.waiting_user" {
+		t.Fatalf("completion before Host apply = %#v, err=%v; want sync wait", waitingEvent, err)
+	}
+	waiting, err := store.GetTask(ctx, accepted.Task.ID, owner.ID)
+	if err != nil || waiting.Task.Status != task.StatusWaitingUser || waiting.Task.WaitingReason != task.WaitingReasonWorkspaceHostSync || waiting.Task.FinishedAt != nil {
+		t.Fatalf("Task before Host apply = %#v, err=%v", waiting.Task, err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim before Host apply: found=%t, err=%v", found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET applied_revision=1 WHERE host_id=$1 AND workspace_id=$2`, hostValue.ID, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state=$2 WHERE id=$1`, hostValue.ID, string(host.StateStopped)); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim after Host stopped: found=%t, err=%v", found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state=$2 WHERE id=$1`, hostValue.ID, string(host.StateRunning)); err != nil {
+		t.Fatal(err)
+	}
+	recordHeartbeat()
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET state=$3 WHERE host_id=$1 AND workspace_id=$2`,
+		hostValue.ID, workspaceValue.ID, string(workspace.BindingUnbinding)); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim after Workspace binding revocation: found=%t, err=%v", found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET state=$3 WHERE host_id=$1 AND workspace_id=$2`,
+		hostValue.ID, workspaceValue.ID, string(workspace.BindingActive)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE host_runtime_heartbeats
+SET last_seen_at=clock_timestamp() - $2::double precision * interval '1 second'
+WHERE host_id=$1`, hostValue.ID, host.RuntimeHeartbeatFreshness.Seconds()+1); err != nil {
+		t.Fatalf("expire Host Runtime heartbeat: %v", err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim after Host heartbeat expired: found=%t, err=%v", found, err)
+	}
+	recordHeartbeat()
+	resumed, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute)
+	if err != nil || !found || resumed.ID != accepted.Task.ID || resumed.WaitingReason != "" {
+		t.Fatalf("claim after Host apply = %#v, found=%t, err=%v", resumed, found, err)
+	}
+	complete.TaskID, complete.LeaseOwner, complete.LeaseVersion = resumed.ID, resumed.Lease.Owner, resumed.Lease.Version
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET state=$3 WHERE host_id=$1 AND workspace_id=$2`,
+		hostValue.ID, workspaceValue.ID, string(workspace.BindingUnbinding)); err != nil {
+		t.Fatal(err)
+	}
+	revokedEvent, err := store.CommitTaskProgress(ctx, complete)
+	if err != nil || revokedEvent.Type != "task.waiting_user" {
+		t.Fatalf("completion after Workspace permission revoke = %#v, err=%v; want sync wait", revokedEvent, err)
+	}
+	revoked, err := store.GetTask(ctx, accepted.Task.ID, owner.ID)
+	if err != nil || revoked.Task.Status != task.StatusWaitingUser || revoked.Task.FinishedAt != nil {
+		t.Fatalf("Task after Workspace permission revoke = %#v, err=%v", revoked.Task, err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim after Workspace permission revoke: found=%t, err=%v", found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET state=$3 WHERE host_id=$1 AND workspace_id=$2`,
+		hostValue.ID, workspaceValue.ID, string(workspace.BindingActive)); err != nil {
+		t.Fatal(err)
+	}
+	recordHeartbeat()
+	resumed, found, err = store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute)
+	if err != nil || !found || resumed.ID != accepted.Task.ID {
+		t.Fatalf("claim after Workspace permission restore = %#v, found=%t, err=%v", resumed, found, err)
+	}
+	complete.LeaseOwner, complete.LeaseVersion = resumed.Lease.Owner, resumed.Lease.Version
+	if _, err := store.SetWorkspaceBindingSyncStatus(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingSyncConflict, []string{"conflicting-local-file.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	conflictedEvent, err := store.CommitTaskProgress(ctx, complete)
+	if err != nil || conflictedEvent.Type != "task.waiting_user" {
+		t.Fatalf("completion with conflicted Host Workspace = %#v, err=%v; want sync wait", conflictedEvent, err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim while Host Workspace is conflicted: found=%t, err=%v", found, err)
+	}
+	if _, err := store.SetWorkspaceBindingSyncStatus(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingSyncHealthy, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	recordHeartbeat()
+	resumed, found, err = store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute)
+	if err != nil || !found || resumed.ID != accepted.Task.ID {
+		t.Fatalf("claim after Host Workspace conflict resolves = %#v, found=%t, err=%v", resumed, found, err)
+	}
+	complete.LeaseOwner, complete.LeaseVersion = resumed.Lease.Owner, resumed.Lease.Version
+	recordHeartbeat()
+	completedEvent, err := store.CommitTaskProgress(ctx, complete)
+	if err != nil || completedEvent.Type != "task.result" {
+		t.Fatalf("completion after Host apply = %#v, err=%v", completedEvent, err)
+	}
+	completed, err := store.GetTask(ctx, accepted.Task.ID, owner.ID)
+	if err != nil || completed.Task.Status != task.StatusCompleted || completed.Task.WaitingReason != "" || completed.Task.FinishedAt == nil {
+		t.Fatalf("Task after Host apply = %#v, err=%v", completed.Task, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE host_runtime_heartbeats SET last_seen_at=clock_timestamp()+interval '1 hour' WHERE host_id=$1`, hostValue.ID); err != nil {
+		t.Fatalf("seed a later heartbeat timestamp: %v", err)
+	}
+	var futureHeartbeat time.Time
+	if err := pool.QueryRow(ctx, `SELECT last_seen_at FROM host_runtime_heartbeats WHERE host_id=$1`, hostValue.ID).Scan(&futureHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	recordHeartbeat()
+	var sameGenerationHeartbeat time.Time
+	if err := pool.QueryRow(ctx, `SELECT last_seen_at FROM host_runtime_heartbeats WHERE host_id=$1`, hostValue.ID).Scan(&sameGenerationHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if !sameGenerationHeartbeat.Equal(futureHeartbeat) {
+		t.Fatalf("same-generation heartbeat moved backward: got %s, want %s", sameGenerationHeartbeat, futureHeartbeat)
+	}
+	newGeneration := hostValue.RuntimeGeneration + 1
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET runtime_generation=$2 WHERE id=$1`, hostValue.ID, newGeneration); err != nil {
+		t.Fatalf("advance Host Runtime generation: %v", err)
+	}
+	if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, newGeneration); err != nil {
+		t.Fatalf("record new-generation heartbeat: %v", err)
+	}
+	var storedGeneration int64
+	var newGenerationHeartbeat time.Time
+	if err := pool.QueryRow(ctx, `SELECT runtime_generation,last_seen_at FROM host_runtime_heartbeats WHERE host_id=$1`, hostValue.ID).
+		Scan(&storedGeneration, &newGenerationHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if storedGeneration != newGeneration || !newGenerationHeartbeat.Before(futureHeartbeat) {
+		t.Fatalf("new-generation heartbeat = generation %d at %s; want generation %d and timestamp before old generation %s",
+			storedGeneration, newGenerationHeartbeat, newGeneration, futureHeartbeat)
 	}
 }
 
@@ -1011,13 +1213,54 @@ func TestPostgresAssistantTextDeltasAreOrderedLeasedAndFinalizedAtomically(t *te
 	}
 	messageID := mustID(t, domain.NewMessageID)
 	turnID := mustID(t, domain.NewStepID)
-	for _, delta := range []string{"Hello ", "world."} {
-		if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
-			TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
-			MessageID: messageID, TurnID: turnID, Delta: delta,
-		}); err != nil {
-			t.Fatalf("AppendAssistantTextDelta(%q): %v", delta, err)
+	firstDelta := app.AssistantTextDelta{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		MessageID: messageID, TurnID: turnID, Delta: "Hello ",
+	}
+	if _, err := store.AppendAssistantTextDelta(ctx, firstDelta); err != nil {
+		t.Fatalf("AppendAssistantTextDelta(first): %v", err)
+	}
+	var snapshotSequence int64
+	var snapshotContent, snapshotStatus string
+	if err := store.withTaskSnapshot(ctx, func(snapshot pgx.Tx) error {
+		if err := snapshot.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, claimed.ID).Scan(&snapshotSequence); err != nil {
+			return err
 		}
+		if err := snapshot.QueryRow(ctx, `SELECT content, status FROM task_assistant_message_snapshots WHERE task_id=$1`, claimed.ID).
+			Scan(&snapshotContent, &snapshotStatus); err != nil {
+			return err
+		}
+		nextDelta := firstDelta
+		nextDelta.Delta = "world."
+		if _, err := store.AppendAssistantTextDelta(ctx, nextDelta); err != nil {
+			return err
+		}
+		var stillVisibleSequence int64
+		var stillVisibleContent, stillVisibleStatus string
+		if err := snapshot.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, claimed.ID).Scan(&stillVisibleSequence); err != nil {
+			return err
+		}
+		if err := snapshot.QueryRow(ctx, `SELECT content, status FROM task_assistant_message_snapshots WHERE task_id=$1`, claimed.ID).
+			Scan(&stillVisibleContent, &stillVisibleStatus); err != nil {
+			return err
+		}
+		if stillVisibleSequence != snapshotSequence || stillVisibleContent != snapshotContent || stillVisibleStatus != snapshotStatus {
+			return fmt.Errorf("repeatable-read Task snapshot mixed concurrent delta: before=(%d,%q,%q) after=(%d,%q,%q)",
+				snapshotSequence, snapshotContent, snapshotStatus, stillVisibleSequence, stillVisibleContent, stillVisibleStatus)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read Task while a new assistant delta commits: %v", err)
+	}
+	if snapshotSequence != 3 || snapshotContent != "Hello " || snapshotStatus != string(app.AssistantMessageStreaming) {
+		t.Fatalf("concurrent delta snapshot = sequence %d, content %q, status %q", snapshotSequence, snapshotContent, snapshotStatus)
+	}
+	streamingSnapshot, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || streamingSnapshot.AssistantMessage == nil ||
+		streamingSnapshot.AssistantMessage.Status != app.AssistantMessageStreaming ||
+		streamingSnapshot.AssistantMessage.Message.ID != messageID ||
+		streamingSnapshot.AssistantMessage.Message.Content != "Hello world." || streamingSnapshot.Task.EventSequence != 4 {
+		t.Fatalf("streaming task snapshot = %#v, err=%v", streamingSnapshot, err)
 	}
 	step := task.Step{
 		ID: turnID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded,
@@ -1027,13 +1270,44 @@ func TestPostgresAssistantTextDeltasAreOrderedLeasedAndFinalizedAtomically(t *te
 		ID: messageID, ConversationID: created.Conversation.ID, OwnerID: owner.ID,
 		Role: conversation.RoleAssistant, Content: "Hello world.", TaskID: claimed.ID,
 	}
-	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+	progress := app.TaskProgress{
 		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		Status: task.StatusRunning, CurrentStep: turnID, Steps: []task.Step{step},
 		Event:            task.Event{TaskID: claimed.ID, Type: "task.step", Payload: []byte(`{"step_id":"` + turnID + `","status":"succeeded"}`)},
 		AssistantMessage: &finalMessage,
+	}
+	var beforeFinalSequence int64
+	var beforeFinalContent, beforeFinalStatus string
+	if err := store.withTaskSnapshot(ctx, func(snapshot pgx.Tx) error {
+		if err := snapshot.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, claimed.ID).Scan(&beforeFinalSequence); err != nil {
+			return err
+		}
+		if err := snapshot.QueryRow(ctx, `SELECT content, status FROM task_assistant_message_snapshots WHERE task_id=$1`, claimed.ID).
+			Scan(&beforeFinalContent, &beforeFinalStatus); err != nil {
+			return err
+		}
+		if _, err := store.CommitTaskProgress(ctx, progress); err != nil {
+			return err
+		}
+		var stillVisibleSequence int64
+		var stillVisibleContent, stillVisibleStatus string
+		if err := snapshot.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, claimed.ID).Scan(&stillVisibleSequence); err != nil {
+			return err
+		}
+		if err := snapshot.QueryRow(ctx, `SELECT content, status FROM task_assistant_message_snapshots WHERE task_id=$1`, claimed.ID).
+			Scan(&stillVisibleContent, &stillVisibleStatus); err != nil {
+			return err
+		}
+		if stillVisibleSequence != beforeFinalSequence || stillVisibleContent != beforeFinalContent || stillVisibleStatus != beforeFinalStatus {
+			return fmt.Errorf("repeatable-read Task snapshot mixed concurrent final message: before=(%d,%q,%q) after=(%d,%q,%q)",
+				beforeFinalSequence, beforeFinalContent, beforeFinalStatus, stillVisibleSequence, stillVisibleContent, stillVisibleStatus)
+		}
+		return nil
 	}); err != nil {
-		t.Fatalf("commit completed provider response: %v", err)
+		t.Fatalf("read Task while final assistant message commits: %v", err)
+	}
+	if beforeFinalSequence != 4 || beforeFinalContent != "Hello world." || beforeFinalStatus != string(app.AssistantMessageStreaming) {
+		t.Fatalf("pre-final Task snapshot = sequence %d, content %q, status %q", beforeFinalSequence, beforeFinalContent, beforeFinalStatus)
 	}
 	events, err := store.ListTaskEvents(ctx, owner.ID, claimed.ID, 0, 20)
 	if err != nil {
@@ -1079,11 +1353,203 @@ func TestPostgresAssistantTextDeltasAreOrderedLeasedAndFinalizedAtomically(t *te
 	if err != nil || len(messages.Items) != 2 || storedAssistant == nil || storedAssistant.ID != messageID || storedAssistant.Content != finalMessage.Content {
 		t.Fatalf("stored messages = %#v, err=%v", messages.Items, err)
 	}
+	completedSnapshot, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || completedSnapshot.AssistantMessage == nil ||
+		completedSnapshot.AssistantMessage.Status != app.AssistantMessageCompleted ||
+		completedSnapshot.AssistantMessage.Message.ID != messageID ||
+		completedSnapshot.AssistantMessage.Message.Content != finalMessage.Content ||
+		completedSnapshot.AssistantMessage.Message.Sequence != storedAssistant.Sequence ||
+		completedSnapshot.Task.EventSequence != events[len(events)-1].Sequence {
+		t.Fatalf("completed task snapshot = %#v, err=%v", completedSnapshot, err)
+	}
 	if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
 		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version + 1,
 		MessageID: messageID, TurnID: turnID, Delta: "stale",
 	}); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("stale lease delta error = %v, want invalid state", err)
+	}
+}
+
+func TestPostgresAssistantMessageSnapshotsInterruptIncompleteTurns(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+
+	stream := func(key string) (task.Task, string, string) {
+		t.Helper()
+		created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, key, "write a summary"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, found, err := store.ClaimNextTask(ctx, "snapshot-worker", time.Minute)
+		if err != nil || !found || claimed.ID != created.Task.ID {
+			t.Fatalf("ClaimNextTask() = %#v found=%t err=%v", claimed, found, err)
+		}
+		messageID, turnID := mustID(t, domain.NewMessageID), mustID(t, domain.NewStepID)
+		if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
+			TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			MessageID: messageID, TurnID: turnID, Delta: "partial response",
+		}); err != nil {
+			t.Fatalf("AppendAssistantTextDelta(): %v", err)
+		}
+		return claimed, messageID, turnID
+	}
+
+	t.Run("model failure", func(t *testing.T) {
+		claimed, messageID, turnID := stream("snapshot-model-failure")
+		step := task.Step{ID: turnID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepFailed, Title: "Ask the model", Summary: "The model request failed."}
+		if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+			TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			Status: task.StatusFailed, CurrentStep: turnID, Result: "Task stopped: model error",
+			Steps: []task.Step{step}, Event: task.Event{TaskID: claimed.ID, Type: "task.result", Payload: []byte(`{"error":"model"}`)},
+		}); err != nil {
+			t.Fatalf("commit model failure: %v", err)
+		}
+		assertInterruptedSnapshot(t, ctx, store, claimed.ID, owner.ID, messageID, "partial response", task.StatusFailed)
+		assertTaskSnapshotCursorAtLatestEvent(t, ctx, store, claimed.ID, owner.ID)
+	})
+
+	t.Run("budget wait", func(t *testing.T) {
+		claimed, messageID, turnID := stream("snapshot-budget-wait")
+		step := task.Step{ID: turnID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepUnknown, Title: "Ask the model", Summary: "The model response was interrupted."}
+		if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+			TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			Status: task.StatusWaitingUser, CurrentStep: turnID, WaitingReason: "active_time_budget",
+			Steps: []task.Step{step}, Event: task.Event{TaskID: claimed.ID, Type: "task.waiting_user", Payload: []byte(`{"reason":"active_time_budget"}`)},
+		}); err != nil {
+			t.Fatalf("commit budget wait: %v", err)
+		}
+		assertInterruptedSnapshot(t, ctx, store, claimed.ID, owner.ID, messageID, "partial response", task.StatusWaitingUser)
+		assertTaskSnapshotCursorAtLatestEvent(t, ctx, store, claimed.ID, owner.ID)
+	})
+
+	t.Run("cancellation and recovered worker", func(t *testing.T) {
+		claimed, messageID, _ := stream("snapshot-worker-recovery")
+		cancelID := mustID(t, domain.NewTaskActionID)
+		cancelRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "snapshot-cancel", claimed.ID, task.StatusRunning, cancelID)
+		requested, err := store.RequestTaskAction(ctx, cancelRecord, claimed.ID, task.ActionCancel, task.StatusRunning, cancelID)
+		if err != nil || requested.Task.Status != task.StatusCancelling {
+			t.Fatalf("request cancellation = %#v, err=%v", requested, err)
+		}
+		assertInterruptedSnapshot(t, ctx, store, claimed.ID, owner.ID, messageID, "partial response", task.StatusCancelling)
+
+		// A separate task exercises lease recovery while its status remains running.
+		claimed, messageID, _ = stream("snapshot-lease-recovery")
+		if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, claimed.ID); err != nil {
+			t.Fatal(err)
+		}
+		assertInterruptedSnapshot(t, ctx, store, claimed.ID, owner.ID, messageID, "partial response", task.StatusRunning)
+		reclaimed, found, err := store.ClaimNextTask(ctx, "snapshot-recovery-worker", time.Minute)
+		if err != nil || !found || reclaimed.ID != claimed.ID || reclaimed.Lease.Version <= claimed.Lease.Version {
+			t.Fatalf("reclaim task = %#v found=%t err=%v", reclaimed, found, err)
+		}
+		assertInterruptedSnapshot(t, ctx, store, claimed.ID, owner.ID, messageID, "partial response", task.StatusRunning)
+		assertTaskSnapshotCursorAtLatestEvent(t, ctx, store, claimed.ID, owner.ID)
+	})
+}
+
+func TestPostgresAssistantMessageSnapshotSupportsNonStreamingCommit(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "snapshot-non-streaming", "answer a question"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "snapshot-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("ClaimNextTask() = %#v found=%t err=%v", claimed, found, err)
+	}
+	turnID := mustID(t, domain.NewStepID)
+	message := conversation.Message{
+		ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID, OwnerID: owner.ID,
+		Role: conversation.RoleAssistant, Content: "A complete non-streamed answer.", TaskID: claimed.ID,
+	}
+	step := task.Step{ID: turnID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded, Title: "Ask the model", Summary: "Received a complete response."}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: turnID, Steps: []task.Step{step}, AssistantMessage: &message,
+		Event: task.Event{TaskID: claimed.ID, Type: "task.step", Payload: []byte(`{"step_id":"` + turnID + `","status":"succeeded"}`)},
+	}); err != nil {
+		t.Fatalf("commit non-streaming assistant message: %v", err)
+	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || details.AssistantMessage == nil || details.AssistantMessage.Status != app.AssistantMessageCompleted ||
+		details.AssistantMessage.Message.ID != message.ID || details.AssistantMessage.Message.Content != message.Content ||
+		details.AssistantMessage.Message.Sequence < 1 {
+		t.Fatalf("non-streaming task snapshot = %#v, err=%v", details, err)
+	}
+	messages, err := store.ListMessages(ctx, owner.ID, created.Conversation.ID, app.PageRequest{Limit: 20})
+	assistantCount := 0
+	for _, stored := range messages.Items {
+		if stored.Role == conversation.RoleAssistant {
+			assistantCount++
+			if stored.ID != message.ID || stored.Content != message.Content {
+				t.Fatalf("stored non-streaming assistant message = %#v", stored)
+			}
+		}
+	}
+	if err != nil || assistantCount != 1 {
+		t.Fatalf("non-streaming assistant message count = %d, messages=%#v, err=%v", assistantCount, messages.Items, err)
+	}
+}
+
+func TestPostgresAssistantMessageSnapshotBoundsAccumulatedText(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "snapshot-size-bound", "write a summary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "snapshot-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("ClaimNextTask() = %#v found=%t err=%v", claimed, found, err)
+	}
+	messageID, turnID := mustID(t, domain.NewMessageID), mustID(t, domain.NewStepID)
+	delta := strings.Repeat("x", app.MaxAssistantMessageBytes/2)
+	for range 2 {
+		if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
+			TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			MessageID: messageID, TurnID: turnID, Delta: delta,
+		}); err != nil {
+			t.Fatalf("append bounded delta: %v", err)
+		}
+	}
+	if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		MessageID: messageID, TurnID: turnID, Delta: "x",
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("overflowing assistant delta error = %v, want invalid argument", err)
+	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || details.AssistantMessage == nil || len(details.AssistantMessage.Message.Content) != app.MaxAssistantMessageBytes || details.Task.EventSequence != 4 {
+		t.Fatalf("bounded snapshot = %#v, err=%v", details, err)
+	}
+}
+
+func assertInterruptedSnapshot(t *testing.T, ctx context.Context, store *Store, taskID, ownerID, messageID, content string, wantTaskStatus task.Status) {
+	t.Helper()
+	details, err := store.GetTask(ctx, taskID, ownerID)
+	if err != nil || details.Task.Status != wantTaskStatus || details.AssistantMessage == nil ||
+		details.AssistantMessage.Status != app.AssistantMessageInterrupted ||
+		details.AssistantMessage.Message.ID != messageID || details.AssistantMessage.Message.Content != content {
+		t.Fatalf("interrupted task snapshot = %#v, err=%v", details, err)
+	}
+}
+
+func assertTaskSnapshotCursorAtLatestEvent(t *testing.T, ctx context.Context, store *Store, taskID, ownerID string) {
+	t.Helper()
+	details, err := store.GetTask(ctx, taskID, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListTaskEvents(ctx, ownerID, taskID, 0, 100)
+	if err != nil || len(events) == 0 || details.Task.EventSequence != events[len(events)-1].Sequence {
+		t.Fatalf("task snapshot sequence=%d, latest event=%#v, err=%v", details.Task.EventSequence, events, err)
 	}
 }
 
@@ -2513,6 +2979,12 @@ func TestPostgresTaskCompletionCommitsOnlyProvedArtifactsAtomically(t *testing.T
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	recordHeartbeat := func() {
+		t.Helper()
+		if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
+			t.Fatalf("record Host Runtime heartbeat: %v", err)
+		}
+	}
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "completion artifact")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -2559,6 +3031,7 @@ func TestPostgresTaskCompletionCommitsOnlyProvedArtifactsAtomically(t *testing.T
 		Status: task.StatusCompleted, CurrentStep: stepID, Result: "saved", Steps: []task.Step{step},
 		Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"saved"}`)},
 	}
+	recordHeartbeat()
 	for _, mutate := range []struct {
 		name string
 		edit func(*task.Artifact)
@@ -2595,6 +3068,40 @@ VALUES ($1,$2,$3,'Legacy','output/legacy.txt','text/plain',NULL,NULL)`, mustID(t
 		t.Fatalf("remove legacy artifact fixture: %v", err)
 	}
 	completed.Artifacts = []task.Artifact{artifact}
+	if _, err := store.pool.Exec(ctx, `CREATE OR REPLACE FUNCTION f02_expire_task_heartbeat_before_artifact_insert() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE host_runtime_heartbeats
+  SET last_seen_at=clock_timestamp()-interval '1 minute'
+  WHERE host_id=(SELECT host_id FROM tasks WHERE id=NEW.task_id);
+  RETURN NEW;
+END
+$$`); err != nil {
+		t.Fatalf("create stale-heartbeat fixture function: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `CREATE TRIGGER f02_expire_task_heartbeat_before_artifact_insert
+BEFORE INSERT ON task_artifacts
+FOR EACH ROW EXECUTE FUNCTION f02_expire_task_heartbeat_before_artifact_insert()`); err != nil {
+		t.Fatalf("create stale-heartbeat fixture trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS f02_expire_task_heartbeat_before_artifact_insert ON task_artifacts`)
+		_, _ = store.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS f02_expire_task_heartbeat_before_artifact_insert()`)
+	})
+	if _, err := store.CommitTaskProgress(ctx, completed); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("completion after Host heartbeat expired mid-transaction error = %v, want workspace_conflict", err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusRunning || len(details.Artifacts) != 0 {
+		t.Fatalf("stale-heartbeat completion partially committed: status=%q artifacts=%#v err=%v", details.Task.Status, details.Artifacts, err)
+	}
+	if _, err := store.pool.Exec(ctx, `DROP TRIGGER f02_expire_task_heartbeat_before_artifact_insert ON task_artifacts`); err != nil {
+		t.Fatalf("drop stale-heartbeat fixture trigger: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `DROP FUNCTION f02_expire_task_heartbeat_before_artifact_insert()`); err != nil {
+		t.Fatalf("drop stale-heartbeat fixture function: %v", err)
+	}
+	recordHeartbeat()
 	event, err := store.CommitTaskProgress(ctx, completed)
 	if err != nil || event.Type != "task.result" {
 		t.Fatalf("complete with committed Workspace proof: event=%#v err=%v", event, err)
@@ -2782,6 +3289,29 @@ VALUES ($1,$2,'unknown-operation',$3,$4,0,'ri_test',0,$5,$5,'unknown')`, operati
 	details, err := fixture.store.GetTask(fixture.ctx, fixture.taskID, fixture.ownerID)
 	if err != nil || batchItemByID(t, details.BatchItems, fixture.itemID).Attempt != 1 || details.Task.Status != task.StatusFailed {
 		t.Fatalf("unknown operation changed batch state: details=%#v err=%v", details, err)
+	}
+}
+
+func TestPostgresRetryFailedBatchItemRejectsTaskWithWorkspaceViewDeletion(t *testing.T) {
+	fixture := newFailedBatchRetryFixture(t)
+	requestID := mustID(t, domain.NewTaskWorkspaceViewDeletionID)
+	if _, err := fixture.store.pool.Exec(fixture.ctx, `INSERT INTO task_workspace_view_deletions
+(request_id, task_id, owner_id, host_id, status)
+VALUES ($1,$2,$3,$4,'pending')`, requestID, fixture.taskID, fixture.ownerID, fixture.hostID); err != nil {
+		t.Fatalf("seed pending Task Workspace view deletion: %v", err)
+	}
+	key := testIdempotency(fixture.ownerID, "retry-batch-item", "retry-after-view-delete")
+	if err := fixture.store.RetryFailedBatchItem(fixture.ctx, key, fixture.taskID, fixture.itemID); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("retry with pending Workspace view deletion error = %v, want invalid_state", err)
+	}
+	var idempotencyReservations int
+	if err := fixture.store.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM idempotency_keys WHERE owner_id=$1 AND operation=$2 AND key=$3`,
+		key.OwnerID, key.Operation, key.Key).Scan(&idempotencyReservations); err != nil || idempotencyReservations != 0 {
+		t.Fatalf("rejected retry left an idempotency reservation: count=%d err=%v", idempotencyReservations, err)
+	}
+	details, err := fixture.store.GetTask(fixture.ctx, fixture.taskID, fixture.ownerID)
+	if err != nil || details.Task.Status != task.StatusFailed || batchItemByID(t, details.BatchItems, fixture.itemID).Attempt != 1 {
+		t.Fatalf("rejected retry changed Task state: details=%#v err=%v", details, err)
 	}
 }
 

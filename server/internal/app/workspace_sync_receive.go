@@ -53,6 +53,7 @@ type WorkspaceSyncReceiveReceipt struct {
 
 type WorkspaceSyncReceiveStore interface {
 	ReserveWorkspaceSyncReceive(context.Context, WorkspaceSyncReceiveRequest, string, []byte) (WorkspaceSyncReceiveReservation, error)
+	RecordWorkspaceSyncReceiveQuotaRejection(context.Context, string, string, workspace.SyncQuotaPauseReason) error
 	ReserveWorkspaceSyncReceiveBlockUsage(context.Context, string, string, string, []WorkspaceBlockReservation, int64) error
 	GetWorkspaceSyncReceiveReservation(context.Context, string, string) (WorkspaceSyncReceiveReservation, error)
 	CommitWorkspaceSyncReceive(context.Context, string, string, string, *workspace.File, *string) (WorkspaceSyncReceiveReceipt, error)
@@ -92,6 +93,19 @@ func (s *WorkspaceSyncService) ReserveWorkspaceSyncReceive(ctx context.Context, 
 		return WorkspaceSyncReceiveReservation{}, err
 	}
 	return store.ReserveWorkspaceSyncReceive(ctx, request, reservationID, requestHash[:])
+}
+
+// RecordWorkspaceSyncReceiveQuotaRejection preserves a definitive quota
+// rejection for the reservation's operation ID before abort recovery runs.
+func (s *WorkspaceSyncService) RecordWorkspaceSyncReceiveQuotaRejection(ctx context.Context, ownerID, reservationID string, reason workspace.SyncQuotaPauseReason) error {
+	store, err := s.workspaceSyncReceiveStore()
+	if err != nil {
+		return err
+	}
+	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidPendingRequestID(reservationID) || !validWorkspaceSyncQuotaPauseReason(reason) {
+		return domain.InvalidArgument("workspace_sync_receive", "Workspace receive quota rejection is invalid")
+	}
+	return store.RecordWorkspaceSyncReceiveQuotaRejection(ctx, ownerID, reservationID, reason)
 }
 
 // CommitWorkspaceSyncReceive accepts already-written content after the caller
@@ -242,4 +256,8 @@ func (s *WorkspaceSyncService) workspaceSyncReceiveStore() (WorkspaceSyncReceive
 		return nil, errors.New("workspace receive store is unavailable")
 	}
 	return store, nil
+}
+
+func validWorkspaceSyncQuotaPauseReason(reason workspace.SyncQuotaPauseReason) bool {
+	return reason == workspace.SyncQuotaPauseWorkspaceExceeded || reason == workspace.SyncQuotaPauseOwnerStorage
 }

@@ -35,13 +35,14 @@ func TestLoadWorkspaceSyncRelayBindAddress(t *testing.T) {
 	t.Setenv("T02_TEST_INSTANCE", "test-instance")
 	root := filepath.Join(t.TempDir(), "workspace-sync")
 	postgresRoot := filepath.Join(t.TempDir(), "postgres-data")
-	data := validConfigYAML(workbenchDir) + fmt.Sprintf("workspace_sync_node:\n"+
-		"  enabled: true\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
+	blocksRoot := filepath.Join(root, "blocks")
+	data := strings.Replace(validConfigYAML(workbenchDir), "root_dir: /var/lib/morde/workspaces", "root_dir: "+blocksRoot, 1) + fmt.Sprintf("workspace_sync_node:\n"+
+		"  enabled: true\n  data_root: %q\n  image_digest: sha256:%s\n  relay_image_digest: sha256:%s\n"+
 		"  relay_public_address: 8.8.8.8:22067\n  relay_bind_address: 172.18.141.222\n"+
 		"  relay_token: %s\n  relay_state_root: %q\n  state_root: %q\n  workspace_root: %q\n"+
 		"  quota_socket_root: %q\n  protected_storage_roots: [%q]\n"+
 		"  relay_container_name: morde-sync-relay\n",
-		strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64),
+		root, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64),
 		filepath.Join(root, "relay"), filepath.Join(root, "state"), filepath.Join(root, "files"), filepath.Join(root, "quota"), postgresRoot)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
@@ -120,8 +121,9 @@ func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 	cfg := validConfig(t)
 	root := t.TempDir()
+	cfg.WorkspaceStorage.RootDir = filepath.Join(root, "blocks")
 	cfg.WorkspaceSyncNode = WorkspaceSyncNode{
-		Enabled: true, ImageDigest: "morde-syncthing@sha256:" + strings.Repeat("a", 64),
+		Enabled: true, DataRoot: root, ImageDigest: "morde-syncthing@sha256:" + strings.Repeat("a", 64),
 		RelayImageDigest:   "morde-syncthing-relay@sha256:" + strings.Repeat("b", 64),
 		RelayPublicAddress: "8.8.8.8:22067", RelayBindAddress: "172.18.141.222",
 		RelayToken:     strings.Repeat("c", 64),
@@ -154,7 +156,7 @@ func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 		{name: "missing state root", want: "state_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.StateRoot = "" }},
 		{name: "relative workspace root", want: "workspace_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.WorkspaceRoot = "relative/files" }},
 		{name: "missing quota socket root", want: "quota_socket_root must be an absolute clean non-root path", mutate: func(value *WorkspaceSyncNode) { value.QuotaSocketRoot = "" }},
-		{name: "overlapping node roots", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.WorkspaceRoot = filepath.Join(value.StateRoot, "files") }},
+		{name: "overlapping node roots", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.StateRoot = value.WorkspaceRoot }},
 		{name: "overlapping relay root", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.RelayStateRoot = filepath.Join(value.StateRoot, "relay") }},
 		{name: "overlapping quota socket root", want: "roots must be separate", mutate: func(value *WorkspaceSyncNode) { value.QuotaSocketRoot = filepath.Join(value.StateRoot, "quota") }},
 		{name: "unsafe relay name", want: "relay_container_name is invalid", mutate: func(value *WorkspaceSyncNode) { value.RelayContainerName = "../relay" }},
@@ -350,7 +352,7 @@ func TestConfigValidateRejectsInvalidFields(t *testing.T) {
 		{name: "site release quota", want: "site_storage.max_release_bytes, max_owner_bytes and min_free_bytes", mutate: func(c *Config) { c.SiteStorage.MaxReleaseBytes = 0 }},
 		{name: "site owner quota", want: "site_storage.max_release_bytes, max_owner_bytes and min_free_bytes", mutate: func(c *Config) { c.SiteStorage.MaxOwnerBytes = 0 }},
 		{name: "site minimum free space", want: "site_storage.max_release_bytes, max_owner_bytes and min_free_bytes", mutate: func(c *Config) { c.SiteStorage.MinFreeBytes = 0 }},
-		{name: "site root overlaps workspace", want: "must be separate from config.workspace_storage.root_dir", mutate: func(c *Config) { c.SiteStorage.RootDir = filepath.Join(c.WorkspaceStorage.RootDir, "sites") }},
+		{name: "site root overlaps workspace data volume", want: "data_root must be separate from config.site_storage.root_dir", mutate: func(c *Config) { c.SiteStorage.RootDir = filepath.Join(c.WorkspaceStorage.RootDir, "sites") }},
 		{name: "site root overlaps docker data", want: "must be separate from config.storage.docker_data_dir", mutate: func(c *Config) { c.SiteStorage.RootDir = filepath.Join(c.Storage.DockerDataDir, "sites") }},
 		{name: "site root overlaps workbench assets", want: "must be separate from config.gateway.workbench_dir", mutate: func(c *Config) { c.SiteStorage.RootDir = c.Gateway.WorkbenchDir }},
 		{name: "site root overlaps portal assets", want: "must be separate from config.portal_web.dir", mutate: func(c *Config) { c.SiteStorage.RootDir = filepath.Join(mustAbs(t, c.PortalWeb.Dir), "sites") }},
@@ -403,8 +405,10 @@ func TestConfigValidateRejectsSymlinkedSiteRootOverlap(t *testing.T) {
 
 	cfg := validConfig(t)
 	cfg.SiteStorage.RootDir = filepath.Join(alias, "sites")
-	cfg.WorkspaceStorage.RootDir = filepath.Join(real, "sites", "workspaces")
-	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "must be separate from config.workspace_storage.root_dir") {
+	cfg.WorkspaceSyncNode.DataRoot = real
+	cfg.WorkspaceStorage.RootDir = filepath.Join(real, "workspaces")
+	cfg.WorkspaceSyncNode.WorkspaceRoot = filepath.Join(real, "current")
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "data_root must be separate from config.site_storage.root_dir") {
 		t.Fatalf("validate() error = %v, want overlapping symlinked paths rejected", err)
 	}
 }
@@ -511,6 +515,7 @@ func TestLoadTemplatesReportsInvalidFilesAndDuplicateIDs(t *testing.T) {
 
 func validConfig(t *testing.T) Config {
 	t.Helper()
+	workspaceDataRoot := t.TempDir()
 	return Config{
 		Instance: "test", Listen: Listen{API: "127.0.0.1:8080", Gateway: "127.0.0.1:8081", Metrics: "127.0.0.1:8082"},
 		HTTP:         HTTP{ReadHeaderTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second, ShutdownTimeout: time.Second, APIMaxBodyBytes: 1024, MCPMaxBodyBytes: 1024},
@@ -522,8 +527,8 @@ func validConfig(t *testing.T) Config {
 		Templates:    Templates{Dir: "templates", Default: "std-a"}, Hosts: Hosts{ReadyTimeout: time.Minute, ReadyPollInterval: time.Second},
 		Capacity: Capacity{CPUMilli: 1000, MemMiB: 2048}, Reconciler: Reconciler{Interval: time.Minute, RenewBefore: time.Minute, ActivityFlushInterval: time.Minute},
 		Storage:           Storage{Driver: "docker", DockerHost: "unix:///var/run/docker.sock", DockerDataDir: "/var/lib/docker", MinFreeBytes: 10 << 30},
-		WorkspaceStorage:  WorkspaceStorage{RootDir: t.TempDir(), MaxWorkspaceBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
-		WorkspaceSyncNode: WorkspaceSyncNode{WorkspaceRoot: filepath.Join(t.TempDir(), "workspace-current")},
+		WorkspaceStorage:  WorkspaceStorage{RootDir: filepath.Join(workspaceDataRoot, "blocks"), MaxWorkspaceBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
+		WorkspaceSyncNode: WorkspaceSyncNode{DataRoot: workspaceDataRoot, WorkspaceRoot: filepath.Join(workspaceDataRoot, "workspace-current")},
 		SiteStorage:       SiteStorage{RootDir: t.TempDir(), MaxReleaseBytes: 10 << 30, MaxOwnerBytes: 50 << 30, MinFreeBytes: 10 << 30},
 		Gateway:           Gateway{WorkbenchDir: t.TempDir(), PreviewPortMin: 1024, MaxBodyBytes: 1024},
 		MCP:               MCP{Enabled: true, MaxOutputBytes: 1024, ScreenshotMaxWidth: 640}, PortalWeb: PortalWeb{Dir: "web"}, Log: Log{Level: "info", Format: "json"},

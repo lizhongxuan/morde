@@ -4,6 +4,7 @@ import { AuthProvider } from './app/auth';
 import { AdminGuard, RouteGuard } from './app/RouteGuard';
 import { ToastProvider } from './app/toast';
 import { PortalLayout } from './components/PortalLayout';
+import { AccountSettings } from './routes/AccountSettings';
 import { ApiKeys } from './routes/ApiKeys';
 import { Assistant } from './routes/Assistant';
 import { Connections } from './routes/Connections';
@@ -42,6 +43,7 @@ function UserRoutes() {
     <Route path="/login" element={<Login />} />
     <Route path="/register" element={<Register />} />
     <Route path="/download" element={<Downloads />} />
+    <Route path="/settings/password" element={<ChangePassword loginPath="/login" />} />
     <Route element={<RouteGuard />}>
       <Route path="host-entry/:id" element={<HostEntry />} />
       <Route element={<PortalLayout />}>
@@ -54,6 +56,7 @@ function UserRoutes() {
         <Route path="connections" element={<Connections />} />
         <Route path="apikeys" element={<ApiKeys />} />
         <Route path="clients" element={<Clients />} />
+        <Route path="settings" element={<AccountSettings />} />
       </Route>
     </Route>
     <Route path="*" element={<NotFound />} />
@@ -63,7 +66,7 @@ function UserRoutes() {
 function AdminRoutes() {
   return <Routes>
     <Route path="/admin/login" element={<Login defaultTo="/admin/" allowRegister={false} />} />
-    <Route path="/admin/change-password" element={<ChangePassword />} />
+    <Route path="/admin/change-password" element={<ChangePassword loginPath="/admin/login" />} />
     <Route element={<RouteGuard loginPath="/admin/login" />}>
       <Route path="/admin/access-denied" element={<AdminAccessDenied />} />
       <Route element={<AdminGuard deniedTo="/admin/access-denied" />}>

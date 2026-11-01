@@ -115,7 +115,7 @@ export interface paths {
         put?: never;
         /**
          * Log in on a native client
-         * @description Approved accounts sign in with name and password. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set. Reusing one Idempotency-Key for the same request rotates unconfirmed credentials; late earlier responses must be discarded by the client.
+         * @description Approved accounts sign in with name and password. Desktop and iOS clients must first require ordered_client_login from /api/capabilities. Each ordered network attempt has a new Idempotency-Key and a strictly increasing attempt_generation persisted by the client before sending. The service binds client_instance_id to one installation and rejects stale generations. A retry after an unknown result increments the generation; the prior response may then contain a revoked credential and must be discarded. Revoked installations cannot be restored by a late login. For source compatibility only, Android requests that omit both ordered fields continue using the legacy server-ordered path; it is not advertised as a capability and does not fence delayed client intents. Legacy same-key Android retries rotate credentials on the same installation. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set.
          */
         post: operations["clientLogin"];
         delete?: never;
@@ -974,7 +974,7 @@ export interface paths {
         put?: never;
         /**
          * Plan an upload, missing-only download, merge, or live synchronization batch
-         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
+         * @description The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
          */
         post: operations["createWorkspaceSyncSession"];
         delete?: never;
@@ -1161,6 +1161,48 @@ export interface paths {
         get: operations["listHostReplicaBindings"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/host-replicas/{host_id}/generations/{generation}/task-workspace-view-deletions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+            };
+            cookie?: never;
+        };
+        /** Read pending, explicitly confirmed Task Workspace view deletions */
+        get: operations["listHostTaskWorkspaceViewDeletions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/host-replicas/{host_id}/generations/{generation}/tasks/{task_id}/workspace-view-deletions/{request_id}/applied": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                task_id: components["schemas"]["TaskId"];
+                request_id: components["schemas"]["TaskWorkspaceViewDeletionId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge one Task Workspace view deletion performed by the Host */
+        post: operations["completeHostTaskWorkspaceViewDeletion"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1583,6 +1625,26 @@ export interface paths {
         get: operations["getTask"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/workspace-view-deletions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /** Get the confirmation and Host cleanup state for a Task Workspace view */
+        get: operations["getTaskWorkspaceViewDeletion"];
+        put?: never;
+        /** Explicitly request deletion of a stopped Task's private Workspace view */
+        post: operations["requestTaskWorkspaceViewDeletion"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2361,6 +2423,7 @@ export interface components {
         ClientInstallationId: string;
         ConversationId: string;
         TaskId: string;
+        TaskWorkspaceViewDeletionId: string;
         ModelConnectionId: string;
         MCPConnectorId: string;
         MessageId: string;
@@ -2628,6 +2691,15 @@ export interface components {
             runtime_generation: number;
             items: components["schemas"]["HostReplicaBinding"][];
         };
+        HostTaskWorkspaceViewDeletion: {
+            request_id: components["schemas"]["TaskWorkspaceViewDeletionId"];
+            task_id: components["schemas"]["TaskId"];
+        };
+        HostTaskWorkspaceViewDeletions: {
+            /** Format: int64 */
+            runtime_generation: number;
+            items: components["schemas"]["HostTaskWorkspaceViewDeletion"][];
+        };
         HostReplicaAppliedRequest: {
             session_id: string;
             /** Format: int64 */
@@ -2648,6 +2720,9 @@ export interface components {
             state: "creating" | "running" | "stopping" | "stopped" | "failed" | "deleting" | "deleted";
             state_reason: string;
             runtime_generation: number;
+            workspace_runtime_online?: boolean;
+            /** Format: date-time */
+            workspace_runtime_last_seen_at?: string | null;
             control_version: number;
             /** @enum {string} */
             control_state: "ai" | "taking_over" | "user" | "returning";
@@ -2925,7 +3000,10 @@ export interface components {
             direction: "upload" | "download" | "bidirectional";
             /** @enum {string} */
             policy: "fill_missing" | "compare_merge" | "live";
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description For Host replica downloads and bidirectional sync
+             */
             base_revision: number;
             scope?: string[];
             files: components["schemas"]["WorkspaceFile"][];
@@ -3005,6 +3083,40 @@ export interface components {
              */
             quota_status: "available" | "full" | "over_quota";
             items: components["schemas"]["DeviceWorkspaceSyncProgress"][];
+            /** @description Current direct Syncthing receive operations paused by a durable quota rejection. A later admitted operation on the same path clears the active pause; rejected operation IDs remain terminal. */
+            quota_pauses: components["schemas"]["WorkspaceSyncQuotaPause"][];
+            /** @description Read-only owner-node observation filtered to the current Workspace; omitted when observation is not configured. */
+            node_status?: components["schemas"]["WorkspaceSyncNodeObservation"];
+        };
+        WorkspaceSyncQuotaPause: {
+            /** @enum {string} */
+            state: "paused";
+            /** @description Workspace-relative path of the blocked file operation. */
+            path: string;
+            /** @enum {string} */
+            operation: "upsert";
+            /** Format: int64 */
+            requested_bytes: number;
+            /** @enum {string} */
+            reason_code: "workspace_quota_exceeded" | "owner_storage_quota_exceeded";
+            /** Format: date-time */
+            updated_at: string;
+        };
+        WorkspaceSyncNodeObservation: {
+            /** @description Whether the account's managed Syncthing node exists. */
+            present: boolean;
+            /** @description Whether the managed node is running. */
+            running: boolean;
+            connected_device_ids: string[];
+            folders: components["schemas"]["WorkspaceSyncNodeFolderObservation"][];
+        };
+        WorkspaceSyncNodeFolderObservation: {
+            folder_id: string;
+            state: string;
+            /** Format: int64 */
+            need_bytes: number;
+            /** Format: int64 */
+            need_files: number;
         };
         CreateWorkspaceSyncDeviceChallengeRequest: {
             device_id: string;
@@ -3132,6 +3244,16 @@ export interface components {
             platform: "desktop" | "android" | "ios";
             display_name: string;
             renewal_installation_id?: components["schemas"]["ClientInstallationId"];
+            /**
+             * Format: uuid
+             * @description Required for ordered desktop/iOS login. Stable non-secret UUID scoped to this client installation and account. Persist it with the local generation; do not reuse it after logout.
+             */
+            client_instance_id?: string;
+            /**
+             * Format: int64
+             * @description Required for ordered desktop/iOS login. Strictly increasing per client_instance_id. Persist the increment before every network attempt; a generation is consumed even if the response is lost. Android may omit both fields for the non-advertised legacy compatibility path.
+             */
+            attempt_generation?: number;
         };
         ClientLoginResponse: {
             installation_id: components["schemas"]["ClientInstallationId"];
@@ -3388,6 +3510,11 @@ export interface components {
             unsettled_operation_ids: components["schemas"]["OperationId"][];
         };
         Task: components["schemas"]["TaskSummary"] & {
+            /**
+             * Format: int64
+             * @description Event cursor from the same database snapshot as this Task; resume task events after this sequence.
+             */
+            event_sequence: number;
             result: string | null;
             waiting_reason: string | null;
             steps: components["schemas"]["TaskStep"][];
@@ -3426,6 +3553,16 @@ export interface components {
             action: "retry_batch_item" | "pause" | "resume" | "cancel";
             expected_status?: components["schemas"]["TaskStatus"];
             batch_item_id?: components["schemas"]["BatchItemId"];
+        };
+        TaskWorkspaceViewDeletionRequest: {
+            /** @constant */
+            confirm_delete: true;
+        };
+        TaskWorkspaceViewDeletion: {
+            request_id: components["schemas"]["TaskWorkspaceViewDeletionId"];
+            task_id: components["schemas"]["TaskId"];
+            /** @enum {string} */
+            status: "pending" | "applied";
         };
         TaskInputRequest: {
             clarification_id: components["schemas"]["ClarificationId"];
@@ -3696,7 +3833,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. */
+                        /** @description An absent feature is unavailable or not yet declared. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
@@ -3909,6 +4046,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["Error"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Error"];
         };
@@ -5591,6 +5729,66 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listHostTaskWorkspaceViewDeletions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Pending deletion requests for this Host generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostTaskWorkspaceViewDeletions"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    completeHostTaskWorkspaceViewDeletion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                task_id: components["schemas"]["TaskId"];
+                request_id: components["schemas"]["TaskWorkspaceViewDeletionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Deletion receipt persisted for the current Host generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostTaskWorkspaceViewDeletion"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     reportHostReplicaWorkspaceSyncStatus: {
         parameters: {
             query?: never;
@@ -6297,6 +6495,72 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskWorkspaceViewDeletion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current persisted deletion state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkspaceViewDeletion"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    requestTaskWorkspaceViewDeletion: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskWorkspaceViewDeletionRequest"];
+            };
+        };
+        responses: {
+            /** @description Previously requested deletion is already confirmed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkspaceViewDeletion"];
+                };
+            };
+            /** @description Deletion is queued until the Host confirms cleanup */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkspaceViewDeletion"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

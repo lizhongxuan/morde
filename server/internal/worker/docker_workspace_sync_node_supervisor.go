@@ -38,10 +38,16 @@ const (
 	dockerWorkspaceSyncLabelImage     = "morde.workspace-sync.image-digest"
 	dockerWorkspaceSyncQuotaHookLabel = "org.morde.syncthing.workspace-quota-hook"
 	dockerWorkspaceSyncQuotaHook      = "f02-v1"
+	dockerWorkspaceSyncSourceRevision = "org.opencontainers.image.revision"
+	dockerWorkspaceSyncPatchDigest    = "org.morde.syncthing.patch-sha256"
+	dockerWorkspaceSyncGoVersion      = "org.morde.syncthing.go-version"
 )
 
 var (
 	dockerWorkspaceSyncImageDigest       = regexp.MustCompile(`^(?:[a-zA-Z0-9][a-zA-Z0-9._:/-]*@)?sha256:[a-f0-9]{64}$`)
+	dockerWorkspaceSyncSourceRevisionRE  = regexp.MustCompile(`^[a-f0-9]{40}$`)
+	dockerWorkspaceSyncPatchDigestRE     = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	dockerWorkspaceSyncGoVersionRE       = regexp.MustCompile(`^go[0-9]+\.[0-9]+\.[0-9]+$`)
 	dockerWorkspaceSyncContainerID       = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	dockerWorkspaceSyncRelayName         = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 	workspaceSyncRelayTokenPattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
@@ -286,10 +292,23 @@ func existingWorkspaceSyncRoot(path string) (string, error) {
 		return "", errors.New("workspace sync root is unavailable")
 	}
 	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil || !filepath.IsAbs(resolved) {
+	if err != nil || !filepath.IsAbs(resolved) || !workspaceSyncRootParentsSafe(resolved) {
 		return "", errors.New("workspace sync root is unavailable")
 	}
 	return resolved, nil
+}
+
+func workspaceSyncRootParentsSafe(path string) bool {
+	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
+		info, err := os.Lstat(parent)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+			info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+			return false
+		}
+		if parent == string(filepath.Separator) {
+			return true
+		}
+	}
 }
 
 func (s *DockerWorkspaceSyncNodeSupervisor) relayConfig() workspaceSyncRelayConfig {
@@ -326,7 +345,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 	if err != nil {
 		return DockerWorkspaceSyncNode{}, err
 	}
-	relay, err := s.inspectRelay(ctx)
+	relay, err := s.inspectRelay(ctx, imageLabels)
 	if err != nil {
 		return DockerWorkspaceSyncNode{}, err
 	}
@@ -393,7 +412,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) Ensure(ctx context.Context, ownerID,
 		}
 	}
 
-	currentRelay, relayErr := s.inspectRelay(ctx)
+	currentRelay, relayErr := s.inspectRelay(ctx, imageLabels)
 	if relayErr != nil || currentRelay.ID != relayID {
 		return DockerWorkspaceSyncNode{}, errors.New("dedicated workspace sync relay changed during startup")
 	}
@@ -447,11 +466,12 @@ func (s *DockerWorkspaceSyncNodeSupervisor) prepareOwnerPaths(ownerHash string) 
 			return "", "", "", errors.New("workspace sync root is unavailable")
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+			info.Mode().Perm()&0o022 != 0 || !workspaceSyncQuotaPathOwnedBy(info, os.Geteuid()) {
 			return "", "", "", errors.New("workspace sync root is incompatible")
 		}
 		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil || !filepath.IsAbs(resolved) {
+		if err != nil || !filepath.IsAbs(resolved) || !workspaceSyncRootParentsSafe(resolved) {
 			return "", "", "", errors.New("workspace sync root is incompatible")
 		}
 		canonical = append(canonical, resolved)
@@ -475,7 +495,12 @@ func (s *DockerWorkspaceSyncNodeSupervisor) prepareOwnerPaths(ownerHash string) 
 			return "", "", "", errors.New("workspace sync owner directory is unavailable")
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		trustedOwner := err == nil && workspaceSyncQuotaPathOwnedBy(info, os.Geteuid())
+		if !trustedOwner && err == nil && os.Geteuid() == 0 && s.uid != 0 {
+			trustedOwner = workspaceSyncQuotaPathOwnedBy(info, s.uid)
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+			info.Mode().Perm()&0o022 != 0 || !trustedOwner {
 			return "", "", "", errors.New("workspace sync owner directory is incompatible")
 		}
 		if os.Geteuid() == 0 {
@@ -487,7 +512,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) prepareOwnerPaths(ownerHash string) 
 			return "", "", "", errors.New("workspace sync owner directory permissions are unavailable")
 		}
 	}
-	if err := os.Mkdir(quotaSocketPath, 0o2710); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(quotaSocketPath, 0o710|os.ModeSetgid); err != nil && !errors.Is(err, os.ErrExist) {
 		return "", "", "", errors.New("workspace sync quota socket owner directory is unavailable")
 	}
 	quotaInfo, err := os.Lstat(quotaSocketPath)
@@ -495,7 +520,7 @@ func (s *DockerWorkspaceSyncNodeSupervisor) prepareOwnerPaths(ownerHash string) 
 		return "", "", "", errors.New("workspace sync quota socket owner directory is unsafe")
 	}
 	if quotaInfo.Mode().Perm() != 0o710 || quotaInfo.Mode()&os.ModeSetgid == 0 {
-		if err := os.Chmod(quotaSocketPath, 0o2710); err != nil {
+		if err := os.Chmod(quotaSocketPath, 0o710|os.ModeSetgid); err != nil {
 			return "", "", "", errors.New("workspace sync quota socket owner directory permissions are unavailable")
 		}
 	}
@@ -530,6 +555,9 @@ func (s *DockerWorkspaceSyncNodeSupervisor) validateImage(ctx context.Context) (
 	}
 	if image.Config.Labels[dockerWorkspaceSyncQuotaHookLabel] != dockerWorkspaceSyncQuotaHook {
 		return nil, nil, errors.New("workspace sync image is missing the required Morde quota hook")
+	}
+	if !validWorkspaceSyncImageProvenance(image.Config.Labels) {
+		return nil, nil, errors.New("workspace sync image is missing valid source provenance labels")
 	}
 	for _, value := range image.Config.Env {
 		key, _, ok := strings.Cut(value, "=")
@@ -907,7 +935,7 @@ type dockerPortBinding struct {
 	HostPort string `json:"HostPort"`
 }
 
-func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context) (dockerWorkspaceSyncRelayInspect, error) {
+func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context, nodeImageLabels map[string]string) (dockerWorkspaceSyncRelayInspect, error) {
 	var relay dockerWorkspaceSyncRelayInspect
 	if err := s.requestJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(s.options.RelayContainerName)+"/json", nil, http.StatusOK, &relay); err != nil {
 		return dockerWorkspaceSyncRelayInspect{}, errors.New("dedicated workspace sync relay is unavailable")
@@ -915,11 +943,15 @@ func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context) (d
 	var image struct {
 		ID          string   `json:"Id"`
 		RepoDigests []string `json:"RepoDigests"`
+		Config      *struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
 	}
 	if err := s.requestJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(s.options.RelayImageDigest)+"/json", nil, http.StatusOK, &image); err != nil ||
+		image.Config == nil || !matchingWorkspaceSyncImageProvenance(nodeImageLabels, image.Config.Labels) ||
 		!workspaceSyncImageMatches(s.options.RelayImageDigest, image.ID, image.RepoDigests) ||
 		(relay.Config.Image != s.options.RelayImageDigest && relay.Image != s.options.RelayImageDigest) {
-		return dockerWorkspaceSyncRelayInspect{}, errors.New("dedicated workspace sync relay image digest is unavailable")
+		return dockerWorkspaceSyncRelayInspect{}, errors.New("dedicated workspace sync relay image digest or source provenance is invalid")
 	}
 	if !dockerWorkspaceSyncContainerID.MatchString(relay.ID) || relay.Name != "/"+s.options.RelayContainerName ||
 		!validWorkspaceSyncRelay(relay, s.options.RelayStateRoot, s.options.RelayToken, s.options.RelayPublicAddress, s.options.RelayBindAddress) || relay.State == nil ||
@@ -928,6 +960,19 @@ func (s *DockerWorkspaceSyncNodeSupervisor) inspectRelay(ctx context.Context) (d
 		return dockerWorkspaceSyncRelayInspect{}, errors.New("dedicated workspace sync relay is not running")
 	}
 	return relay, nil
+}
+
+func validWorkspaceSyncImageProvenance(labels map[string]string) bool {
+	return dockerWorkspaceSyncSourceRevisionRE.MatchString(labels[dockerWorkspaceSyncSourceRevision]) &&
+		dockerWorkspaceSyncPatchDigestRE.MatchString(labels[dockerWorkspaceSyncPatchDigest]) &&
+		dockerWorkspaceSyncGoVersionRE.MatchString(labels[dockerWorkspaceSyncGoVersion])
+}
+
+func matchingWorkspaceSyncImageProvenance(node, relay map[string]string) bool {
+	return validWorkspaceSyncImageProvenance(node) && validWorkspaceSyncImageProvenance(relay) &&
+		node[dockerWorkspaceSyncSourceRevision] == relay[dockerWorkspaceSyncSourceRevision] &&
+		node[dockerWorkspaceSyncPatchDigest] == relay[dockerWorkspaceSyncPatchDigest] &&
+		node[dockerWorkspaceSyncGoVersion] == relay[dockerWorkspaceSyncGoVersion]
 }
 
 func validWorkspaceSyncRelay(relay dockerWorkspaceSyncRelayInspect, relayStateRoot, relayToken, relayPublicAddress, relayBindAddress string) bool {

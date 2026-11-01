@@ -175,12 +175,12 @@ func TestSyncthingAPIClientReadOnlyWorkspaceObservation(t *testing.T) {
 		if r.Method != http.MethodGet || r.Header.Get("X-API-Key") != testSyncthingAPIKey {
 			t.Errorf("request = %s %s, want authenticated GET", r.Method, r.URL.String())
 		}
-		switch {
-		case r.URL.Path == "/rest/system/connections":
+		switch r.URL.Path {
+		case "/rest/system/connections":
 			_, _ = w.Write([]byte(`{"connections":{"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB":{"connected":false},"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA":{"connected":true}}}`))
-		case r.URL.Path == "/rest/config/folders":
+		case "/rest/config/folders":
 			_, _ = w.Write([]byte(`[{"id":"` + folderID + `"},{"id":"local-other"}]`))
-		case r.URL.Path == "/rest/db/status":
+		case "/rest/db/status":
 			if r.URL.Query().Get("folder") != folderID {
 				t.Errorf("folder query = %q, want %q", r.URL.Query().Get("folder"), folderID)
 			}
@@ -208,6 +208,26 @@ func TestSyncthingAPIClientReadOnlyWorkspaceObservation(t *testing.T) {
 	}
 	if calls.Load() != 3 {
 		t.Fatalf("request count = %d, want 3", calls.Load())
+	}
+}
+
+func TestSyncthingAPIClientSystemLogs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/rest/system/log" || r.Header.Get("X-API-Key") != testSyncthingAPIKey {
+			t.Errorf("SystemLogs request = %s %s, want authenticated GET", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[{"when":"2026-11-01T00:00:00Z","message":"relay disconnected"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewSyncthingAPIClient(server.URL, testSyncthingAPIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := client.SystemLogs(context.Background())
+	if err != nil || !json.Valid(logs) || !strings.Contains(string(logs), "relay disconnected") {
+		t.Fatalf("SystemLogs() = %s, err=%v", logs, err)
 	}
 }
 

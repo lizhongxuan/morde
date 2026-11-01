@@ -133,6 +133,7 @@ type WorkspaceStorage struct {
 
 type WorkspaceSyncNode struct {
 	Enabled               bool     `yaml:"enabled"`
+	DataRoot              string   `yaml:"data_root"`
 	ImageDigest           string   `yaml:"image_digest"`
 	RelayImageDigest      string   `yaml:"relay_image_digest"`
 	RelayPublicAddress    string   `yaml:"relay_public_address"`
@@ -217,6 +218,9 @@ func parseConfig(data string) (Config, error) {
 	}
 	if strings.TrimSpace(cfg.WorkspaceSyncNode.WorkspaceRoot) == "" && filepath.IsAbs(cfg.WorkspaceStorage.RootDir) {
 		cfg.WorkspaceSyncNode.WorkspaceRoot = filepath.Join(filepath.Dir(filepath.Clean(cfg.WorkspaceStorage.RootDir)), "workspace-current")
+	}
+	if strings.TrimSpace(cfg.WorkspaceSyncNode.DataRoot) == "" && filepath.IsAbs(cfg.WorkspaceStorage.RootDir) {
+		cfg.WorkspaceSyncNode.DataRoot = filepath.Dir(filepath.Clean(cfg.WorkspaceStorage.RootDir))
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -433,6 +437,9 @@ func (c Config) validate() error {
 		return fmt.Errorf("config.workspace_sync_node.workspace_root must be an absolute clean non-root path")
 	}
 	currentRoot := filepath.Clean(c.WorkspaceSyncNode.WorkspaceRoot)
+	if strings.TrimSpace(c.SiteStorage.RootDir) == "" || !filepath.IsAbs(c.SiteStorage.RootDir) || filepath.Clean(c.SiteStorage.RootDir) == string(filepath.Separator) {
+		return fmt.Errorf("config.site_storage.root_dir must be an absolute non-root path")
+	}
 	for _, protected := range []struct {
 		name string
 		path string
@@ -440,6 +447,41 @@ func (c Config) validate() error {
 		{"config.site_storage.root_dir", c.SiteStorage.RootDir}, {"config.gateway.workbench_dir", c.Gateway.WorkbenchDir}, {"config.portal_web.dir", c.PortalWeb.Dir}} {
 		if protected.path != "" && pathsOverlap(currentRoot, protected.path) {
 			return fmt.Errorf("config.workspace_sync_node.workspace_root must be separate from %s", protected.name)
+		}
+	}
+	dataRoot := filepath.Clean(c.WorkspaceSyncNode.DataRoot)
+	if strings.TrimSpace(c.WorkspaceSyncNode.DataRoot) == "" || !filepath.IsAbs(c.WorkspaceSyncNode.DataRoot) || dataRoot == string(filepath.Separator) || dataRoot != c.WorkspaceSyncNode.DataRoot {
+		return fmt.Errorf("config.workspace_sync_node.data_root must be an absolute clean non-root path")
+	}
+	sharedDataRoots := []struct {
+		name string
+		path string
+	}{{"workspace blocks", workspaceRoot}, {"workspace current", currentRoot}}
+	seenDataRoots := make(map[string]string, 4)
+	for _, root := range sharedDataRoots {
+		if filepath.Dir(root.path) != dataRoot {
+			return fmt.Errorf("config.workspace_sync_node.data_root must be the direct parent of %s", root.name)
+		}
+		if previous, exists := seenDataRoots[root.path]; exists {
+			return fmt.Errorf("config.workspace_sync_node data roots must be separate: %s and %s", previous, root.name)
+		}
+		seenDataRoots[root.path] = root.name
+	}
+	for _, protected := range []struct {
+		name string
+		path string
+	}{{"config.storage.docker_data_dir", dockerRoot}, {"config.site_storage.root_dir", c.SiteStorage.RootDir},
+		{"config.gateway.workbench_dir", c.Gateway.WorkbenchDir}, {"config.portal_web.dir", c.PortalWeb.Dir}} {
+		if protected.path != "" && pathsOverlap(dataRoot, protected.path) {
+			return fmt.Errorf("config.workspace_sync_node.data_root must be separate from %s", protected.name)
+		}
+	}
+	for i, root := range c.WorkspaceSyncNode.ProtectedStorageRoots {
+		if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || root == string(filepath.Separator) {
+			return fmt.Errorf("config.workspace_sync_node.protected_storage_roots[%d] must be an absolute clean non-root path", i)
+		}
+		if pathsOverlap(dataRoot, root) {
+			return fmt.Errorf("config.workspace_sync_node.data_root must be separate from protected storage roots")
 		}
 	}
 	if c.WorkspaceSyncNode.Enabled {
@@ -482,6 +524,19 @@ func (c Config) validate() error {
 		if pathsOverlap(syncStateRoot, syncWorkspaceRoot) || pathsOverlap(syncRelayStateRoot, syncStateRoot) || pathsOverlap(syncRelayStateRoot, syncWorkspaceRoot) ||
 			pathsOverlap(syncQuotaSocketRoot, syncStateRoot) || pathsOverlap(syncQuotaSocketRoot, syncWorkspaceRoot) || pathsOverlap(syncQuotaSocketRoot, syncRelayStateRoot) {
 			return fmt.Errorf("config.workspace_sync_node roots must be separate")
+		}
+		dataRoots := append(sharedDataRoots, []struct {
+			name string
+			path string
+		}{{"node state", syncStateRoot}, {"relay state", syncRelayStateRoot}}...)
+		for _, root := range dataRoots[2:] {
+			if filepath.Dir(root.path) != dataRoot {
+				return fmt.Errorf("config.workspace_sync_node.data_root must be the direct parent of %s", root.name)
+			}
+			if previous, exists := seenDataRoots[root.path]; exists {
+				return fmt.Errorf("config.workspace_sync_node data roots must be separate: %s and %s", previous, root.name)
+			}
+			seenDataRoots[root.path] = root.name
 		}
 		for i, root := range c.WorkspaceSyncNode.ProtectedStorageRoots {
 			if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || root == string(filepath.Separator) {

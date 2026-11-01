@@ -33,7 +33,7 @@ func (h *api) capabilities(c *gin.Context) {
 		VerifyClient(context.Context, string) (identity.Principal, error)
 	})
 	if h.deps.ClientLogin != nil && clientVerifier {
-		features = append(features, "client_login", "client_installations")
+		features = append(features, "ordered_client_login", "client_installations")
 	}
 	if h.deps.ModelConnections != nil && clientVerifier {
 		features = append(features, "available_models")
@@ -41,7 +41,11 @@ func (h *api) capabilities(c *gin.Context) {
 	if h.deps.ModelGateway != nil && clientVerifier {
 		features = append(features, "model_gateway")
 	}
-	if h.deps.ExecutionControl != nil && h.deps.Tasks != nil {
+	taskAPIAvailable := h.deps.Tasks != nil && h.deps.Conversations != nil
+	if taskAPIAvailable {
+		features = append(features, "task_api")
+	}
+	if h.deps.ExecutionControl != nil && taskAPIAvailable {
 		features = append(features, "cloud_tasks")
 	}
 	c.Header("Cache-Control", "no-store")

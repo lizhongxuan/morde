@@ -97,7 +97,7 @@ func TestRuntimeOperationRunnerExecutesAndQueriesOverPinnedRuntimeHTTP(t *testin
 	const taskID = "q1234567"
 	const operationID = "o1234567"
 	leaseExpiry := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
-	if err := session.SetTaskLease(ctx, taskID, 1, leaseExpiry); err != nil {
+	if err := session.SetTaskLease(ctx, taskID, 1, leaseExpiry, false); err != nil {
 		t.Fatalf("set runtime lease: %v", err)
 	}
 

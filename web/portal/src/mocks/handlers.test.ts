@@ -330,6 +330,36 @@ describe("portal mock Host sharing", () => {
   });
 });
 
+describe("portal mock Host control", () => {
+  it("keeps the Host fenced while tools stop, resumes the same request, and refreshes the returned version", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
+    const created = await createHostRequest({ name: "控制切换测试", workspace_ids: [] });
+    const host = await created.json() as { id: string };
+    await wait(950);
+    await api("/api/hosts"); // Materialize the mock Host as running.
+
+    const initial = await api(`/api/hosts/${host.id}/control`);
+    expect(await initial.json()).toMatchObject({ host_id: host.id, control_state: "ai", control_version: 0, active_transition: null });
+    const takeOver = { action: "take_over", request_id: "host-control-retry-001", expected_control_version: 0 };
+    const pending = await api(`/api/hosts/${host.id}/control/actions`, json("POST", takeOver));
+    expect(pending.status).toBe(202);
+    expect(await pending.json()).toMatchObject({ control_state: "taking_over", control_version: 1, pending_operation_ids: [`op-${host.id}`] });
+    expect(await (await api(`/api/hosts/${host.id}/control`)).json()).toMatchObject({ control_state: "taking_over", active_transition: { request_id: takeOver.request_id, failure_reason: "operations_pending" } });
+
+    const completedTakeOver = await api(`/api/hosts/${host.id}/control/actions`, json("POST", takeOver));
+    expect(completedTakeOver.status).toBe(200);
+    expect(await completedTakeOver.json()).toMatchObject({ control_state: "user", control_version: 2, active_transition: null, pending_operation_ids: [] });
+    expect(await (await api(`/api/hosts/${host.id}/control/actions`, json("POST", takeOver))).json()).toMatchObject({ control_state: "user", control_version: 2 });
+
+    const release = { action: "release", request_id: "host-control-release-001", expected_control_version: 2 };
+    expect((await api(`/api/hosts/${host.id}/control/actions`, json("POST", release))).status).toBe(202);
+    const completedRelease = await api(`/api/hosts/${host.id}/control/actions`, json("POST", release));
+    expect(completedRelease.status).toBe(200);
+    expect(await completedRelease.json()).toMatchObject({ control_state: "ai", control_version: 4 });
+  });
+});
+
 describe("portal mock admin workspaces", () => {
   it("returns workspace metadata only to admins", async () => {
     const admin = createApiClient();
@@ -361,17 +391,21 @@ describe("portal mock durable tasks", () => {
   it("persists a queued Task, replays an exact retry, and protects conversation ownership", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const headers = { "content-type": "application/json", "Idempotency-Key": "task-submit-retry-001" };
-    const body = { model_id: "pmodel01", objective: "你好" };
+    const body = { model_id: "pmodel01", objective: "你好", host_id: "h1234567", workspace_id: "w1234567", input_revision: 5 };
     const first = await api("/api/tasks", { ...json("POST", body), headers });
     expect(first.status).toBe(202);
     const saved = await first.json() as { id: string; conversation_id: string; status: string };
-    expect(saved).toMatchObject({ conversation_id: expect.any(String), status: "queued" });
+    expect(saved).toMatchObject({
+      conversation_id: expect.any(String), status: "queued", host_id: "h1234567", workspace_id: "w1234567", input_revision: 5,
+    });
     const replay = await api("/api/tasks", { ...json("POST", body), headers });
     expect(replay.status).toBe(202);
     expect(await replay.json()).toMatchObject({ id: saved.id, conversation_id: saved.conversation_id });
     const history = await api(`/api/conversations/${saved.conversation_id}/messages`);
     expect(await history.json()).toMatchObject({ items: [{ content: "你好", role: "user", task_id: saved.id }] });
-    expect(await (await api(`/api/tasks/${saved.id}`)).json()).toMatchObject({ id: saved.id, status: "queued" });
+    expect(await (await api(`/api/tasks/${saved.id}`)).json()).toMatchObject({
+      id: saved.id, status: "queued", host_id: "h1234567", workspace_id: "w1234567", input_revision: 5,
+    });
     expect(await (await api("/api/conversations")).json()).toMatchObject({ items: [{ id: saved.conversation_id, title: "你好" }] });
     const member = createApiClient();
     await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
@@ -384,6 +418,33 @@ describe("portal mock durable tasks", () => {
     const restored = await api(`/api/conversations/${saved.conversation_id}/messages`);
     expect((await restored.json()).items).toHaveLength(1);
     expect((await (await api(`/api/tasks/${saved.id}`)).json()).status).toBe("queued");
+  });
+
+  it("records a pending cancellation, replays the same action, and rejects stale status", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const taskResponse = await api("/api/tasks", {
+      ...json("POST", { model_id: "pmodel01", objective: "停止任务测试" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "task-stop-submit-01" },
+    });
+    const task = await taskResponse.json() as { id: string };
+    const actionBody = { action: "cancel", expected_status: "queued" };
+    const headers = { "content-type": "application/json", "Idempotency-Key": "task-stop-action-01" };
+
+    const response = await api(`/api/tasks/${task.id}/actions`, { ...json("POST", actionBody), headers });
+    expect(response.status).toBe(202);
+    const accepted = await response.json();
+    expect(accepted).toMatchObject({ task_id: task.id, action: "cancel", status: "cancelling", unsettled_operation_ids: [] });
+    expect(await (await api(`/api/tasks/${task.id}`)).json()).toMatchObject({
+      status: "cancelling", stop_request: { action: "cancel", status: "pending", unsettled_operation_ids: [] },
+    });
+    const replay = await api(`/api/tasks/${task.id}/actions`, { ...json("POST", actionBody), headers });
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toEqual(accepted);
+    const stale = await api(`/api/tasks/${task.id}/actions`, {
+      ...json("POST", actionBody), headers: { ...headers, "Idempotency-Key": "task-stop-action-02" },
+    });
+    expect(stale.status).toBe(409);
+    expect((await stale.json()).error).toMatchObject({ code: "conflict" });
   });
 });
 
@@ -632,7 +693,7 @@ describe("portal mock workspace bindings", () => {
 
     const progress = await api(`/api/workspaces/${workspace.id}/sync-progress`);
     expect(await progress.json()).toEqual({ revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
-      remaining_bytes: Math.max(0, workspace.quota_bytes - workspace.used_bytes), quota_status: "available", items: [] });
+      remaining_bytes: Math.max(0, workspace.quota_bytes - workspace.used_bytes), quota_status: "available", items: [], quota_pauses: [] });
     const changedReplay = await api(`/api/hosts/${host.id}/workspace-bindings`, { ...json("POST", { workspace_id: "w-other", expected_revision: 0, expected_binding_version: 0 }), headers });
     expect(changedReplay.status).toBe(409);
     expect((await changedReplay.json()).error.code).toBe("idempotency_conflict");

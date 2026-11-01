@@ -24,10 +24,12 @@ func (workspaceSyncQuotaSocketServiceStub) Abort(_ context.Context, _ string, re
 }
 
 func TestWorkspaceSyncQuotaSocketsCreatesOwnerPrivateEndpoints(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "quota-sockets")
-	if err := os.Mkdir(root, 0o750); err != nil {
+	tempRoot, err := os.MkdirTemp("/tmp", "mq-")
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(tempRoot) })
+	root := tempRoot
 	ctx, cancel := context.WithCancel(context.Background())
 	manager := &WorkspaceSyncNodeQuotaSockets{
 		root: root, groupID: os.Getegid(), service: workspaceSyncQuotaSocketServiceStub{},

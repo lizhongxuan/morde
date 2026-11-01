@@ -1,0 +1,84 @@
+{
+  "contract": "Morde client API v1",
+  "capabilities": {
+    "unsupported": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "1",
+      "hub_version": null,
+      "event_version": null,
+      "minimum_client_version": null,
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models"],
+      "default_max_request_bytes": 1048576
+    },
+    "queued_task_api": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "1",
+      "hub_version": null,
+      "event_version": null,
+      "minimum_client_version": null,
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "task_api"],
+      "default_max_request_bytes": 1048576
+    },
+    "cloud_execution": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "1",
+      "hub_version": null,
+      "event_version": null,
+      "minimum_client_version": null,
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "task_api", "cloud_tasks"],
+      "default_max_request_bytes": 1048576
+    },
+    "unsupported_version": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "2",
+      "hub_version": null,
+      "event_version": null,
+      "minimum_client_version": "2.0.0",
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "task_api"],
+      "default_max_request_bytes": 1048576
+    }
+  },
+  "errors": [
+    {"name": "unauthenticated", "status": 401, "client_message": "登录已失效，请重新登录", "body": {"error": {"code": "unauthenticated", "message": "authentication required", "details": {}}}},
+    {"name": "forbidden", "status": 403, "client_message": "没有执行此操作的权限", "body": {"error": {"code": "forbidden", "message": "forbidden", "details": {}}}},
+    {"name": "not_found", "status": 404, "client_message": "请求的内容不存在", "body": {"error": {"code": "not_found", "message": "not found", "details": {}}}},
+    {"name": "event_cursor_expired", "status": 409, "client_message": "任务事件已过期，正在刷新最新状态", "body": {"error": {"code": "event_cursor_expired", "message": "event cursor expired; fetch a fresh snapshot", "details": {}}}},
+    {"name": "unsupported", "status": 422, "client_message": "当前运行规格不支持此操作", "body": {"error": {"code": "unsupported", "message": "operation unsupported", "details": {}}}},
+    {"name": "host_not_ready", "status": 503, "retry_after": "5", "client_message": "主机尚未就绪，请稍后重试（5 秒后可重试）", "body": {"error": {"code": "host_not_ready", "message": "host is not ready", "details": {}}}},
+    {"name": "upstream_timeout", "status": 504, "client_message": "主机响应超时，请稍后重试", "body": {"error": {"code": "upstream_timeout", "message": "upstream timeout", "details": {}}}}
+  ],
+  "error_codes": [
+    "invalid_argument", "unauthenticated", "forbidden", "account_pending", "account_rejected", "account_disabled",
+    "not_found", "conflict", "quota_exceeded", "capacity_exceeded", "workspace_busy", "workspace_conflict",
+    "transfer_expired", "invalid_state", "idempotency_conflict", "event_cursor_expired", "unsupported",
+    "request_too_large", "result_too_large", "rate_limited", "internal", "upstream_error", "host_not_ready", "upstream_timeout"
+  ],
+  "task_snapshot": {
+    "id": "q1234567",
+    "status": "running",
+    "event_sequence": 8,
+    "assistant_message": {
+      "id": "m1234567",
+      "conversation_id": "c1234567",
+      "task_id": "q1234567",
+      "role": "assistant",
+      "content": "Hello ",
+      "status": "streaming",
+      "created_at": "2026-11-01T00:00:00Z"
+    }
+  },
+  "assistant_message_statuses": ["streaming", "completed", "interrupted"],
+  "task_event_frames": {
+    "assistant_delta": "id: 7\nevent: task.message\ndata: {\"task_id\":\"q1234567\",\"sequence\":7,\"type\":\"task.message\",\"created_at\":\"2026-11-01T00:00:00Z\",\"payload\":{\"role\":\"assistant\",\"message_id\":\"m1234567\",\"turn_id\":\"s1234567\",\"delta\":\"Hello \"}}\n\n",
+    "snapshot_required": "id: 8\nevent: task.snapshot_required\ndata: {\"sequence\":8}\n\n"
+  },
+  "non_json_error": {
+    "status": 502,
+    "content_type": "text/html",
+    "body": "<!doctype html><title>Bad Gateway</title>"
+  },
+  "network_error": {
+    "name": "TypeError",
+    "message": "Failed to fetch"
+  }
+}

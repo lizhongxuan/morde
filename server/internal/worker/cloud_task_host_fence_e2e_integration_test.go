@@ -460,7 +460,7 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare Task workspace view under released Host fence: %v", err)
 	}
-	if err := newSession.SetTaskLease(ctx, newTaskID, 1, time.Now().UTC().Add(10*time.Second)); err != nil {
+	if err := newSession.SetTaskLease(ctx, newTaskID, 1, time.Now().UTC().Add(10*time.Second), newTask.WorkspaceID != ""); err != nil {
 		t.Fatalf("set lease under released Host fence: %v", err)
 	}
 	_, err = newSession.Execute(ctx, newTaskID, newOperationID, 1, "file.write", "write",

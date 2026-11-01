@@ -13,12 +13,14 @@ const settingLinks = [
   { to: '/connections', label: '模型连接', icon: '↔' },
   { to: '/clients', label: '客户端', icon: '▤' },
   { to: '/apikeys', label: 'API Key', icon: '⌘' },
+  { to: '/settings', label: '账户设置', icon: '◉' },
 ];
 
 const titles: Record<string, string> = {
   '/assistant': 'AI 助手', '/hosts': '云端电脑',
   '/hosts/new': '创建电脑', '/workspaces': '工作区', '/connections': '模型连接',
   '/clients': '客户端', '/apikeys': 'API Key',
+  '/settings': '账户设置',
   '/notifications': '通知', '/download': '下载 Morde Desktop',
 };
 

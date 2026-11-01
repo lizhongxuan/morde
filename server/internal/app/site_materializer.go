@@ -119,7 +119,7 @@ func (m *SiteRevisionMaterializer) Materialize(ctx context.Context, release site
 				return errors.New("workspace revision page identity or size is invalid")
 			}
 			if _, err := workspace.ManifestTreeSHA256(page.Files, page.EmptyDirectories); err != nil {
-				return errors.New("workspace revision page paths are invalid")
+				return fmt.Errorf("workspace revision page paths are invalid: %w", err)
 			}
 			pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
 			for _, file := range page.Files {

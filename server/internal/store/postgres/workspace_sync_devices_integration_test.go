@@ -425,8 +425,8 @@ func TestWorkspaceSyncDeviceRevocationClosesInstallationBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	var reopenedFolderState string
-	if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&reopenedFolderState); err != nil || reopenedFolderState != "pending_node" {
-		t.Fatalf("folder state after pairing a replacement device = %q, want pending_node: %v", reopenedFolderState, err)
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&reopenedFolderState); err != nil || reopenedFolderState != "revoking" {
+		t.Fatalf("folder state after pairing during a pending revocation = %q, want revoking: %v", reopenedFolderState, err)
 	}
 	if err := store.RevokeClientInstallation(ctx, principal.ClientInstallationID, owner.ID, "", audit.ActorSession, nil); err != nil {
 		t.Fatal(err)

@@ -378,6 +378,7 @@ func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing
 			name:  "invalid path",
 			fs:    legacyInvalidPathFS{},
 			quota: 10,
+			want:  "cleanup is required",
 		},
 		{
 			name: "symlink",
@@ -386,6 +387,7 @@ func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing
 				"link.txt": {Data: []byte("ok.txt"), Mode: fs.ModeSymlink | 0777, ModTime: legacyImportTime},
 			},
 			quota: 10,
+			want:  "cleanup is required",
 		},
 		{
 			name: "special item",
@@ -394,6 +396,7 @@ func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing
 				"pipe":   {Mode: fs.ModeNamedPipe | 0600, ModTime: legacyImportTime},
 			},
 			quota: 10,
+			want:  "cleanup is required",
 		},
 		{
 			name: "case collision",
@@ -402,6 +405,7 @@ func TestWorkspaceLegacyImportRejectsUnsafeVolumesBeforeWritingBlocks(t *testing
 				"a.txt": legacyMapFile([]byte("two"), 0644),
 			},
 			quota: 10,
+			want:  "cleanup is required",
 		},
 		{
 			name:  "quota exceeded",

@@ -52,7 +52,11 @@ func (s *Store) GetHost(ctx context.Context, id string) (host.Host, error) {
 	if err != nil {
 		return host.Host{}, storeError("get host", "host", err)
 	}
-	return hostDomainWithBindings(ctx, s.q, row)
+	value, err := hostDomainWithBindings(ctx, s.q, row)
+	if err != nil {
+		return host.Host{}, err
+	}
+	return value, nil
 }
 
 func hostDomainWithBindings(ctx context.Context, queries *sqlcgen.Queries, row sqlcgen.Host) (host.Host, error) {
@@ -87,6 +91,50 @@ func (s *Store) ListHostsByOwner(ctx context.Context, ownerID string) ([]host.Ho
 		return nil, err
 	}
 	return values, nil
+}
+
+// PopulateHostRuntimeLiveness adds the current generation's heartbeat status to Host API results.
+func (s *Store) PopulateHostRuntimeLiveness(ctx context.Context, hosts []host.Host) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(hosts))
+	byID := make(map[string]int, len(hosts))
+	for i := range hosts {
+		ids = append(ids, hosts[i].ID)
+		byID[hosts[i].ID] = i
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT h.id, heartbeat.last_seen_at,
+       COALESCE(h.state='running' AND h.deleted_at IS NULL AND heartbeat.last_seen_at >
+         clock_timestamp() - $2::double precision * interval '1 second', false)
+FROM hosts AS h
+LEFT JOIN host_runtime_heartbeats AS heartbeat
+  ON heartbeat.host_id=h.id AND heartbeat.runtime_generation=h.runtime_generation
+WHERE h.id=ANY($1::text[])`, ids, host.RuntimeHeartbeatFreshness.Seconds())
+	if err != nil {
+		return fmt.Errorf("read Host Runtime liveness: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var lastSeen pgtype.Timestamptz
+		var online bool
+		if err := rows.Scan(&id, &lastSeen, &online); err != nil {
+			return fmt.Errorf("scan Host Runtime liveness: %w", err)
+		}
+		index, exists := byID[id]
+		if !exists {
+			return fmt.Errorf("Host Runtime liveness returned an unexpected Host")
+		}
+		hosts[index].WorkspaceRuntimeOnline = online
+		hosts[index].WorkspaceRuntimeLastSeenAt = timePointer(lastSeen)
+		hosts[index].WorkspaceRuntimeLivenessKnown = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read Host Runtime liveness rows: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) populateHostWorkspaceBindings(ctx context.Context, hosts []host.Host) error {
@@ -500,10 +548,11 @@ func storeError(operation, resource string, err error) error {
 }
 
 var (
-	_ app.HostStore            = (*Store)(nil)
-	_ app.WorkspaceStore       = (*Store)(nil)
-	_ app.UserStore            = (*Store)(nil)
-	_ app.TokenStore           = (*Store)(nil)
-	_ app.AuditStore           = (*Store)(nil)
-	_ app.ModelConnectionStore = (*Store)(nil)
+	_ app.HostStore                 = (*Store)(nil)
+	_ app.HostRuntimeLivenessReader = (*Store)(nil)
+	_ app.WorkspaceStore            = (*Store)(nil)
+	_ app.UserStore                 = (*Store)(nil)
+	_ app.TokenStore                = (*Store)(nil)
+	_ app.AuditStore                = (*Store)(nil)
+	_ app.ModelConnectionStore      = (*Store)(nil)
 )

@@ -3,6 +3,9 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -49,6 +52,14 @@ type ClientInfo struct {
 
 const clientTokenTTL = 30 * 24 * time.Hour
 
+var clientInstanceIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+type ClientLoginAttempt struct {
+	InstanceID    string
+	Generation    int64
+	LegacyAndroid bool
+}
+
 type ClientLoginService struct {
 	store                   ClientLoginStore
 	credentials             *CredentialService
@@ -62,7 +73,7 @@ func NewClientLoginService(store ClientLoginStore, credentials *CredentialServic
 	return &ClientLoginService{store: store, credentials: credentials, workspaceSyncReconciler: workspaceSyncReconciler}, nil
 }
 
-func (s *ClientLoginService) Login(ctx context.Context, name, password, platform, displayName, renewalID, idempotencyKey, ip string) (ClientLoginResult, error) {
+func (s *ClientLoginService) Login(ctx context.Context, name, password, platform, displayName, renewalID, idempotencyKey, ip string, attempt ClientLoginAttempt) (ClientLoginResult, error) {
 	displayName = strings.TrimSpace(displayName)
 	if platform != "desktop" && platform != "android" && platform != "ios" {
 		return ClientLoginResult{}, domain.InvalidArgument("platform", "unsupported client platform")
@@ -75,6 +86,15 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 	}
 	if !idempotencyKeyPattern.MatchString(idempotencyKey) {
 		return ClientLoginResult{}, domain.InvalidArgument("idempotency_key", "idempotency key is invalid")
+	}
+	if attempt.LegacyAndroid {
+		if platform != "android" || attempt.InstanceID != "" || attempt.Generation != 0 {
+			return ClientLoginResult{}, domain.InvalidArgument("client_login_attempt", "legacy login compatibility is Android-only")
+		}
+	} else if attempt.InstanceID == "" || attempt.Generation < 1 {
+		return ClientLoginResult{}, domain.NewError(domain.CodeUnsupported, "client login requires the ordered_client_login protocol; update the client")
+	} else if !clientInstanceIDPattern.MatchString(attempt.InstanceID) {
+		return ClientLoginResult{}, domain.InvalidArgument("client_instance_id", "client instance id must be a UUID")
 	}
 	user, err := s.credentials.authenticatePassword(ctx, name, password, ip)
 	if err != nil {
@@ -94,8 +114,12 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 	expiresAt := now.Add(clientTokenTTL)
 	installation := identity.ClientInstallation{ID: id, OwnerID: user.ID, DisplayName: displayName, Platform: platform, ExpiresAt: expiresAt}
 	keyHash := sha256.Sum256([]byte(idempotencyKey))
-	requestHash := sha256.Sum256([]byte(platform + "\x00" + displayName + "\x00" + renewalID))
-	value, issued, err := s.store.LoginClient(ctx, installation, keyHash[:], requestHash[:], renewalID, ip, func(installationID string) (ClientIssuedTokens, error) {
+	requestMaterial := platform + "\x00" + displayName + "\x00" + renewalID
+	if !attempt.LegacyAndroid {
+		requestMaterial += "\x00" + strings.ToLower(attempt.InstanceID) + "\x00" + strconv.FormatInt(attempt.Generation, 10)
+	}
+	requestHash := sha256.Sum256([]byte(requestMaterial))
+	value, issued, err := s.store.LoginClient(ctx, installation, strings.ToLower(attempt.InstanceID), attempt.Generation, attempt.LegacyAndroid, keyHash[:], requestHash[:], renewalID, ip, func(installationID string) (ClientIssuedTokens, error) {
 		client, clientCredential, issueErr := newClientToken(user.ID, installationID, identity.KindClient, expiresAt)
 		if issueErr != nil {
 			return ClientIssuedTokens{}, issueErr
@@ -116,6 +140,9 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 		return result, nil
 	})
 	if err != nil {
+		if errors.Is(err, identity.ErrInvalidCredential) {
+			return ClientLoginResult{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
+		}
 		return ClientLoginResult{}, err
 	}
 	result := ClientLoginResult{InstallationID: value.ID, ClientCredential: issued.ClientCredential, ClientExpiresAt: issued.Client.ExpiresAt,

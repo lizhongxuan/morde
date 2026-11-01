@@ -11,6 +11,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -159,6 +160,47 @@ func TestWorkspaceSyncReceiveRequiresBoundFolderID(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncReceiveCommitWaitsForDeviceRevocation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-receive-revocation")
+	principalA := syncDeviceTestPrincipal(t, store, owner.ID)
+	bindingA := registerTestWorkspaceSyncDevice(t, store, principalA, value.ID,
+		"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA", "receive-revocation-a")
+	applyWorkspaceSyncNodeState(t, store, owner.ID)
+	principalB := syncDeviceTestPrincipal(t, store, owner.ID)
+	registerTestWorkspaceSyncDevice(t, store, principalB, value.ID,
+		"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB", "receive-revocation-b")
+	applyWorkspaceSyncNodeState(t, store, owner.ID)
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	request := receiveTestRequest(owner.ID, value.ID, "inflight.txt", 1, "receive-revocation")
+	request.FolderID = bindingA.FolderID
+	reservation := reserveTestWorkspaceReceive(t, ctx, store, request)
+	portalToken := clientTestToken(t, owner.ID, "", identity.KindSession, nil)
+	if _, err := store.CreateToken(ctx, portalToken); err != nil {
+		t.Fatal(err)
+	}
+	portalPrincipal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portalToken.ID}
+	if err := store.RevokeWorkspaceSyncDevice(ctx, portalPrincipal, value.ID, bindingA.ID, func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var folderState string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM workspace_sync_folders WHERE workspace_id=$1`, value.ID).Scan(&folderState); err != nil || folderState != "revoking" {
+		t.Fatalf("folder state while another device revokes = %q, err=%v; want revoking", folderState, err)
+	}
+	file := syncTestFile(request.Path, []byte("x"))
+	if _, err := store.CommitWorkspaceSyncReceive(ctx, owner.ID, value.ID, reservation.ID, &file, nil); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("receive settlement after device revocation = %v; want forbidden", err)
+	}
+	current, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil || current.Revision != 0 {
+		t.Fatalf("Workspace revision after revoked receive = %d, err=%v; want 0", current.Revision, err)
+	}
+}
+
 func TestWorkspaceSyncReceiveReservesExactProjectedQuota(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -176,6 +218,183 @@ func TestWorkspaceSyncReceiveReservesExactProjectedQuota(t *testing.T) {
 	reserveTestWorkspaceReceive(t, ctx, store, receiveTestRequest(owner.ID, within.ID, "exact.txt", 10, "quota-exact"))
 	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, receiveTestRequest(owner.ID, over.ID, "over.txt", 11, "quota-over")); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("reserve above Workspace quota = %v; want quota exceeded", err)
+	}
+}
+
+func TestWorkspaceSyncReceiveOverQuotaNonUpsertsReturnQuotaExceeded(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-receive-over-quota-non-upserts")
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=10, used_bytes=11 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_revisions SET total_bytes=11 WHERE workspace_id=$1 AND revision=0`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	directory := receiveTestRequest(owner.ID, value.ID, "new-empty-directory", 0, "over-quota-directory")
+	directory.Operation = app.WorkspaceSyncReceiveDirectoryUpsert
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, directory); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("empty directory operation above quota = %v; want quota exceeded", err)
+	}
+	deletion := receiveTestDeleteRequest(owner.ID, value.ID, "missing-file.txt", "over-quota-missing-delete")
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, deletion); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("non-reducing deletion above quota = %v; want quota exceeded", err)
+	}
+	pauses, err := store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 0 {
+		t.Fatalf("non-upsert operations created quota pauses = %#v, err=%v; want none", pauses, err)
+	}
+}
+
+func TestWorkspaceSyncReceiveQuotaRetryReevaluatesSameOperation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-receive-quota-pause")
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=10 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	request := receiveTestRequest(owner.ID, value.ID, "results/report.csv", 11, "quota-pause-first-attempt")
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, request); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("reserve over-quota path = %v; want quota exceeded", err)
+	}
+	pauses, err := store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 1 || pauses[0].State != workspace.SyncQuotaPauseActive || pauses[0].Path != request.Path ||
+		pauses[0].Operation != string(request.Operation) || pauses[0].RequestedBytes != request.TargetBytes ||
+		pauses[0].ReasonCode != workspace.SyncQuotaPauseWorkspaceExceeded {
+		t.Fatalf("persisted Workspace quota pause = %#v, err=%v", pauses, err)
+	}
+	secondRequest := receiveTestRequest(owner.ID, value.ID, request.Path, 12, "quota-pause-second-attempt")
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, secondRequest); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("second over-quota operation on paused path = %v; want quota exceeded", err)
+	}
+	pauses, err = store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 1 || pauses[0].RequestedBytes != secondRequest.TargetBytes {
+		t.Fatalf("latest Workspace quota pause per path = %#v, err=%v; want the newest operation only", pauses, err)
+	}
+
+	// The same operation becomes admissible after its quota is restored.
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET quota_bytes=20 WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	reservation := reserveTestWorkspaceReceive(t, ctx, store, request)
+	if reservation.State != "reserved" {
+		t.Fatalf("retry same operation after quota increase = %#v; want reserved", reservation)
+	}
+	replay := reserveTestWorkspaceReceive(t, ctx, store, request)
+	if replay.ID != reservation.ID || replay.State != "reserved" {
+		t.Fatalf("idempotent replay after quota admission = %#v; want reservation %s", replay, reservation.ID)
+	}
+	pauses, err = store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 0 {
+		t.Fatalf("active Workspace quota pauses after admitted retry = %#v, err=%v; want none", pauses, err)
+	}
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, secondRequest); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("late replay of superseded operation after path resumed = %v; want Workspace conflict", err)
+	}
+}
+
+func TestWorkspaceSyncReceiveQuotaBaseMatchesRejectsChangedPathState(t *testing.T) {
+	file := &workspace.File{Path: "report.txt", SizeBytes: 7, SHA256: strings.Repeat("a", 64), Mode: 0640}
+	filePath, fileSize, fileSHA, fileMode := file.Path, file.SizeBytes, file.SHA256, int32(file.Mode)
+	fileDirectory := "reports"
+	cases := []struct {
+		name      string
+		file      *workspace.File
+		directory *string
+		want      bool
+	}{
+		{name: "same file", file: file, want: true},
+		{name: "changed path", file: &workspace.File{Path: "renamed.txt", SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode}},
+		{name: "changed size", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes + 1, SHA256: file.SHA256, Mode: file.Mode}},
+		{name: "changed content", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes, SHA256: strings.Repeat("b", 64), Mode: file.Mode}},
+		{name: "changed permissions", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: 0600}},
+		{name: "replaced by directory", directory: &fileDirectory},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := workspaceSyncReceiveQuotaBaseMatches(tt.file, tt.directory, &filePath, &fileSize, &fileSHA, &fileMode, nil); got != tt.want {
+				t.Fatalf("workspaceSyncReceiveQuotaBaseMatches() = %t; want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSyncReceivePhysicalQuotaPauseIsPersisted(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-receive-owner-quota-pause")
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	request := receiveTestRequest(owner.ID, value.ID, "data.bin", 7, "owner-quota-pause")
+	reservation := reserveTestWorkspaceReceive(t, ctx, store, request)
+	if err := store.RecordWorkspaceSyncReceiveQuotaRejection(ctx, owner.ID, reservation.ID, workspace.SyncQuotaPauseWorkspaceExceeded); err != nil {
+		t.Fatalf("persist initial Workspace quota rejection: %v", err)
+	}
+	if err := store.RecordWorkspaceSyncReceiveQuotaRejection(ctx, owner.ID, reservation.ID, workspace.SyncQuotaPauseOwnerStorage); err != nil {
+		t.Fatalf("update rejection to owner physical quota: %v", err)
+	}
+	pauses, err := store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 1 || pauses[0].ReasonCode != workspace.SyncQuotaPauseOwnerStorage || pauses[0].Path != request.Path {
+		t.Fatalf("persisted owner physical quota pause = %#v, err=%v", pauses, err)
+	}
+	otherOwner := createTestUser(t, store, 3, 10_000, 20_000)
+	foreign, err := store.ListWorkspaceSyncQuotaPauses(ctx, otherOwner.ID, value.ID)
+	if err != nil || len(foreign) != 0 {
+		t.Fatalf("foreign-owner Workspace quota pauses = %#v, err=%v; want none", foreign, err)
+	}
+	if _, err := store.BeginAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, reservation.ID); err != nil {
+		t.Fatalf("begin abort after owner quota rejection: %v", err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+		t.Fatalf("restore base revision after owner quota rejection: %v", err)
+	}
+	if err := store.CompleteAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, reservation.ID); err != nil {
+		t.Fatalf("complete abort after owner quota rejection: %v", err)
+	}
+	retry := reserveTestWorkspaceReceive(t, ctx, store, request)
+	if retry.State != "reserved" || retry.ID == reservation.ID {
+		t.Fatalf("retry aborted owner-quota reservation = %#v; want a fresh reservation ID", retry)
+	}
+	pauses, err = store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 0 {
+		t.Fatalf("active owner quota pauses after retry = %#v, err=%v; want none", pauses, err)
+	}
+	if err := store.RecordWorkspaceSyncReceiveQuotaRejection(ctx, owner.ID, retry.ID, workspace.SyncQuotaPauseOwnerStorage); err != nil {
+		t.Fatalf("record a second owner quota rejection: %v", err)
+	}
+	if _, err := store.BeginAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, retry.ID); err != nil {
+		t.Fatalf("begin second owner quota abort: %v", err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+		t.Fatalf("restore base revision after second owner quota rejection: %v", err)
+	}
+	if err := store.CompleteAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, retry.ID); err != nil {
+		t.Fatalf("complete second owner quota abort: %v", err)
+	}
+	superseding := receiveTestRequest(owner.ID, value.ID, request.Path, 8, "owner-quota-superseding-operation")
+	reserveTestWorkspaceReceive(t, ctx, store, superseding)
+	// A delayed physical-quota callback for the aborted operation must not
+	// resurrect its pause after a newer same-path receive has started.
+	if err := store.RecordWorkspaceSyncReceiveQuotaRejection(ctx, owner.ID, retry.ID, workspace.SyncQuotaPauseOwnerStorage); err != nil {
+		t.Fatalf("record late rejection for superseded receive: %v", err)
+	}
+	pauses, err = store.ListWorkspaceSyncQuotaPauses(ctx, owner.ID, value.ID)
+	if err != nil || len(pauses) != 0 {
+		t.Fatalf("late rejection resurrected stale Workspace quota pause = %#v, err=%v; want none", pauses, err)
+	}
+	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, request); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("replay aborted quota operation after same-path operation resumed = %v; want Workspace conflict", err)
 	}
 }
 

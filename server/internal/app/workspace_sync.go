@@ -69,6 +69,19 @@ type WorkspaceSyncService struct {
 	materializeCurrent WorkspaceCurrentMaterializer
 	currentRevision    WorkspaceCurrentRevisionReader
 	verifyCurrent      WorkspaceCurrentManifestVerifier
+	nodeObserver       WorkspaceSyncNodeObserver
+}
+
+type WorkspaceSyncNodeObserver interface {
+	ObserveWorkspaceSyncNode(context.Context, string) (workspace.SyncNodeObservation, error)
+}
+
+type workspaceSyncNodeBindingReader interface {
+	ListWorkspaceSyncNodeBindings(context.Context, string, string) ([]workspace.SyncDeviceBinding, error)
+}
+
+type workspaceSyncQuotaPauseReader interface {
+	ListWorkspaceSyncQuotaPauses(context.Context, string, string) ([]workspace.SyncQuotaPause, error)
 }
 
 func NewWorkspaceSyncService(store WorkspaceSyncStore, blocks WorkspaceBlockStore, maxManifestBytes, maxOwnerBytes int64) (*WorkspaceSyncService, error) {
@@ -102,6 +115,14 @@ func (s *WorkspaceSyncService) SetWorkspaceCurrentManifestVerifier(verifier Work
 		return errors.New("workspace current manifest verifier is required")
 	}
 	s.verifyCurrent = verifier
+	return nil
+}
+
+func (s *WorkspaceSyncService) SetWorkspaceSyncNodeObserver(observer WorkspaceSyncNodeObserver) error {
+	if s == nil || observer == nil {
+		return errors.New("workspace sync node observer is required")
+	}
+	s.nodeObserver = observer
 	return nil
 }
 
@@ -610,12 +631,58 @@ func (s *WorkspaceSyncService) ListDeviceSyncProgress(ctx context.Context, princ
 	if err != nil {
 		return workspace.DeviceSyncProgressSummary{}, err
 	}
-	return workspace.DeviceSyncProgressSummary{
+	progress := workspace.DeviceSyncProgressSummary{
 		Revision: value.Revision, UsedBytes: value.UsedBytes, QuotaBytes: value.QuotaBytes,
 		RemainingBytes: max(int64(0), value.QuotaBytes-value.UsedBytes),
 		QuotaStatus:    workspace.SyncQuotaStatusForUsage(value.UsedBytes, value.QuotaBytes),
-		Items:          items,
-	}, nil
+		Items:          items, QuotaPauses: []workspace.SyncQuotaPause{},
+	}
+	pauseReader, ok := s.store.(workspaceSyncQuotaPauseReader)
+	if !ok {
+		return workspace.DeviceSyncProgressSummary{}, domain.NewError(domain.CodeInternal, "workspace sync quota pause state is unavailable")
+	}
+	progress.QuotaPauses, err = pauseReader.ListWorkspaceSyncQuotaPauses(ctx, value.OwnerID, workspaceID)
+	if err != nil {
+		return workspace.DeviceSyncProgressSummary{}, err
+	}
+	if progress.QuotaPauses == nil {
+		progress.QuotaPauses = []workspace.SyncQuotaPause{}
+	}
+	if s.nodeObserver != nil {
+		observation, err := s.nodeObserver.ObserveWorkspaceSyncNode(ctx, value.OwnerID)
+		if err != nil {
+			return workspace.DeviceSyncProgressSummary{}, err
+		}
+		reader, ok := s.store.(workspaceSyncNodeBindingReader)
+		if !ok {
+			return workspace.DeviceSyncProgressSummary{}, domain.NewError(domain.CodeInternal, "workspace sync device state is unavailable")
+		}
+		bindings, err := reader.ListWorkspaceSyncNodeBindings(ctx, value.OwnerID, workspaceID)
+		if err != nil {
+			return workspace.DeviceSyncProgressSummary{}, err
+		}
+		allowedDevices, allowedFolders := make(map[string]struct{}), make(map[string]struct{})
+		for _, binding := range bindings {
+			allowedDevices[binding.DeviceID] = struct{}{}
+			allowedFolders[binding.FolderID] = struct{}{}
+		}
+		filtered := workspace.SyncNodeObservation{
+			Present: observation.Present, Running: observation.Running,
+			ConnectedDeviceIDs: []string{}, Folders: []workspace.SyncNodeFolderObservation{},
+		}
+		for _, deviceID := range observation.ConnectedDeviceIDs {
+			if _, ok := allowedDevices[deviceID]; ok {
+				filtered.ConnectedDeviceIDs = append(filtered.ConnectedDeviceIDs, deviceID)
+			}
+		}
+		for _, folder := range observation.Folders {
+			if _, ok := allowedFolders[folder.FolderID]; ok {
+				filtered.Folders = append(filtered.Folders, folder)
+			}
+		}
+		progress.NodeStatus = &filtered
+	}
+	return progress, nil
 }
 
 func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID, idempotencyKey string) (workspace.SyncSession, error) {
@@ -776,6 +843,14 @@ func (s *WorkspaceSyncService) PutSyncBlock(ctx context.Context, principal ident
 		reader = reauthorizeSyncReader{reader: body, authorize: func() error {
 			return s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID)
 		}}
+	} else if principal.Kind == identity.KindHostReplica {
+		reader = authorizedSyncReader{reader: body, withAccess: func(read func() error) error {
+			return s.store.WithWorkspaceSyncHostSessionAccess(ctx, principal, workspaceID, sessionID, read)
+		}}
+	} else if principal.Kind == identity.KindSession {
+		reader = authorizedSyncReader{reader: body, withAccess: func(read func() error) error {
+			return s.store.WithWorkspaceSyncSessionAccess(ctx, principal, workspaceID, sessionID, read)
+		}}
 	}
 	n, err := s.blocks.PutBlock(workspaceID, digest, reader)
 	if err != nil {
@@ -918,6 +993,16 @@ func (s *WorkspaceSyncService) StreamSyncBlock(ctx context.Context, principal id
 	}
 	total := int64(len(data))
 	writeChunk := func(chunk []byte) error {
+		if principal.Kind == identity.KindHostReplica {
+			return s.store.WithWorkspaceSyncHostSessionAccess(ctx, principal, workspaceID, sessionID, func() error {
+				return write(total, chunk)
+			})
+		}
+		if principal.Kind == identity.KindSession {
+			return s.store.WithWorkspaceSyncSessionAccess(ctx, principal, workspaceID, sessionID, func() error {
+				return write(total, chunk)
+			})
+		}
 		if principal.Kind != identity.KindDevice {
 			return write(total, chunk)
 		}
@@ -1030,6 +1115,23 @@ func (r reauthorizeSyncReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return r.reader.Read(p)
+}
+
+type authorizedSyncReader struct {
+	reader     io.Reader
+	withAccess func(func() error) error
+}
+
+func (r authorizedSyncReader) Read(p []byte) (int, error) {
+	var readBytes int
+	var readErr error
+	if err := r.withAccess(func() error {
+		readBytes, readErr = r.reader.Read(p)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return readBytes, readErr
 }
 
 func (s *WorkspaceSyncService) authorizeSession(ctx context.Context, principal identity.Principal, value workspace.Workspace, workspaceID, sessionID string) (workspace.SyncSession, error) {

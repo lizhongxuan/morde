@@ -6,7 +6,7 @@
 
 F02 中继由 Morde 自行托管，转发 Syncthing 加密节点流量，不加入公共 relay pool。Compose 使用独立的 `CH_WORKSPACE_SYNC_RELAY_TOKEN` 限制只有持有共享 token 的节点能加入；生成 32 字节随机 token（例如 `openssl rand -hex 32`），只保存在 root 持有、权限 `0600` 的 `/etc/cloudhost/cloudhost.env`，不要提交到仓库。桌面端通过设备登记响应取得 relay 的公网静态 URI；服务端账号节点使用 `CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS` 对应的主机 IPv4 连接同一个 relay，避免依赖云公网 NAT 回环。`CH_WORKSPACE_SYNC_RELAY_PUBLIC_ADDRESS` 必须是静态公网 IPv4 字面量和 TCP 22067，不能用 DNS 主机名；`CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS` 必须是可从账号 Docker bridge 路由到的具体主机 IPv4，不能用 `0.0.0.0` 或回环地址。nftables 按该主机 bind IPv4 的原始目的地址和原始 TCP 端口精确允许账号节点访问 relay，其他新建连接默认拒绝。每次 `preload` / `apply` 都清空动态接口白名单；Portal 启动时重放数据库中的所有账号配置，单账号在配置已应用并提交 `applied_revision` 后才重新开放 relay。设备、安装、账号状态/角色、凭据变更和自然到期撤权都先在 owner execution-control 锁内关闭接口，再提交授权变化。主机防火墙和云安全组仅开放 relay 入站 TCP 22067。Relay 使用关闭 IP masquerading 的专用 bridge，不接入账号 bridge，也不提供节点 API 通道。桌面端公网 relay 入口、设备/Workspace folder 配置及撤权屏障通过验收前，保持 workspace-sync profile 和同步 capability 关闭。Portal 使用的 bind address 与 Compose 实际发布地址必须一致；Supervisor 会逐项比对 Docker inspect 结果。
 
-Syncthing 节点与 relay 镜像只在本机生成，不需要推送外部 registry。构建脚本固定并核对 Syncthing commit、Morde patch SHA-256 和 Go 1.27.1，检查配额 hook 源码与调用点，并只给节点镜像加 `f02-v1` hook 标记；Portal 拒绝缺少此标记的节点镜像。不要复用先前未包含该 hook 标记的本地镜像。创建 relay 状态目录时设为 `65532:65532` 所有、`0700` 权限；例如 `sudo install -d -o 65532 -g 65532 -m 0700 /srv/morde-workspace-sync-relay`。使用受控的 F02 Syncthing 源码 worktree 构建：
+Syncthing 节点与 relay 镜像只在本机生成，不需要推送外部 registry。构建脚本固定并核对 Syncthing commit、Morde patch SHA-256 和 Go 1.27.1，检查配额 hook 源码与调用点，并只给节点镜像加 `f02-v1` hook 标记；Portal 拒绝缺少此标记的节点镜像。不要复用先前未包含该 hook 标记的本地镜像。创建 relay 状态目录时设为 `65532:65532` 所有、`0700` 权限；共享卷已挂载后，例如 `sudo install -d -o 65532 -g 65532 -m 0700 /srv/morde-workspace-sync/relay`。未挂载共享卷时不要在挂载点底层创建同名子目录。使用受控的 F02 Syncthing 源码 worktree 构建：
 
 ```sh
 SYNCTHING_SOURCE_DIR="/path/to/local/syncthing-f02-worktree" IMAGE_PLATFORM=linux/amd64 images/workspace-sync/build.sh
@@ -14,7 +14,7 @@ SYNCTHING_SOURCE_DIR="/path/to/local/syncthing-f02-worktree" IMAGE_PLATFORM=linu
 
 构建脚本拒绝非本机 Docker endpoint、使用 `GOPROXY=off`，并输出两个镜像 tag 与内容 ID。将节点和 relay 内容 ID 分别填入 `CH_WORKSPACE_SYNC_NODE_IMAGE_ID`、`CH_WORKSPACE_SYNC_RELAY_IMAGE_ID`；将输出的 relay tag 填入 `CH_WORKSPACE_SYNC_RELAY_IMAGE`。再设置节点数据根目录和 relay 对外地址。Compose profile 仍须在 T04 的真实设备共享、relay 互通和撤权屏障验收后才可启动；当前没有进行这些部署操作。
 
-1. 在目标机本地准备 `/etc/cloudhost/cloudhost.env`（root 持有、0600），按 `.env.example` 填写真实值。PostgreSQL 密码与 DSN 一致；Portal 和 OpenSandbox 使用同一 API Key。`CH_DOCKER_DATA_DIR` 必须与 Docker Engine `/info` 返回的 `DockerRootDir` 相同，`CH_DOCKER_MIN_FREE_BYTES` 默认 10 GiB。低于此余量会阻止新建 Host；已运行 Host 和 PostgreSQL 仍可能继续占用空间。即使 `workspace_sync_node.enabled: false`，也必须先把 `CH_WORKSPACE_SYNC_CURRENT_FILES_DIR` 准备为独立文件系统挂载点，并设为 Portal 账户所有、权限 `0700`；它不能与系统、Workspace block、Docker、Site 或 PostgreSQL 共用文件系统。安装脚本会把该 mount 绑定到 Portal 服务生命周期，缺少挂载时拒绝安装或启动。
+1. 在目标机本地准备 `/etc/cloudhost/cloudhost.env`（root 持有、0600），按 `.env.example` 填写真实值。PostgreSQL 密码与 DSN 一致；Portal 和 OpenSandbox 使用同一 API Key。`CH_DOCKER_DATA_DIR` 必须与 Docker Engine `/info` 返回的 `DockerRootDir` 相同，`CH_DOCKER_MIN_FREE_BYTES` 默认 10 GiB。低于此余量会阻止新建 Host；已运行 Host 和 PostgreSQL 仍可能继续占用空间。Workspace sync 使用一个独立、固定容量且非 thin-provisioned 的数据文件系统，挂载到 `CH_WORKSPACE_SYNC_DATA_ROOT_DIR`；块库、当前目录、节点状态和 relay 状态是该挂载下彼此分离的直接子目录。即使 `workspace_sync_node.enabled: false`，共享卷仍必须挂载，块库与当前目录仍须在其上；数据卷必须与系统、Docker、Site、PostgreSQL 分离。挂载根由 Portal 账户持有、权限 `0700`，未挂载时其底层目录不得预建数据子目录。安装脚本仅验证挂载和目录拓扑，无法证明底层虚拟盘不是超配 thin pool。
 2. 若没有自有域名，可用目标机公网 IPv4 构造测试地址：`portal.<IPv4>.sslip.io` 和 `<IPv4>.nip.io`。分别设置为 `CH_PORTAL_DOMAIN` 与 `CH_HOST_SUFFIX`，`CH_CADDY_PORTAL_ADDRESS` 设为门户域名，`CH_CADDY_HOST_ADDRESS` 设为 `*.<IPv4>.nip.io`；设 `CH_SCHEME=https`、`CH_COOKIE_SECURE=true`。将两个 `CH_CADDY_*_TLS` 值分别设为多行 Caddy 配置 `tls {`、下一行缩进写 `on_demand`、最后一行 `}`。Caddy 按需申请每个具体主机名的证书，Portal 只授权门户自身和运行中的 Host/允许端口预览域名。公网入口须允许 TCP 80/443。动态 DNS 服务会公开目标 IP，适合临时验收；正式公网使用建议改成自有域名。临时域名不支持通配符证书。
 3. 生成两份独立的 32 字节随机密钥到 `CH_DATA_KEY_FILE`、`CH_COOKIE_KEY_FILE`，权限 0600、属主为 Portal 专用用户。已有密钥保留，替换会使现有密文/Cookie 失效。
 4. 在现有 `/etc/docker/daemon.json` 的 runsc runtime 中固定 `runtimeArgs` 为 `["--net-raw=false", "--allow-packet-socket-write=false"]`，保留其他 Docker 配置并 reload Docker。安装受保护的配置与网络检查脚本：
@@ -35,23 +35,29 @@ SYNCTHING_SOURCE_DIR="/path/to/local/syncthing-f02-worktree" IMAGE_PLATFORM=linu
 每个 Host 还会创建一个独立的 `runtime-<host_id>` Docker named volume，挂载到 `/var/lib/morde-runtime`，用于运行端状态；入口将其初始化为 `root:root`、`0700`。OpenSandbox 新建 Workspace 卷默认是 root-owned，Morde entrypoint 启动时将 Workspace 根初始化为 `root:1000`、`2770`（setgid），确保固定 AIO UID/GID 1000 可读写；运行端原子创建的文件以 `0660` 提交，用户组可继续编辑。删除 Host 或清理失败 Sandbox 时，先确认 Sandbox 已清理，再回收 runtime 卷；Workspace 是否保留不影响 runtime 卷回收。当前 OpenSandbox Docker 后端会忽略 PVC `storage` 请求，因此模板发出的 `1Gi` 只是请求值，不是硬配额；Docker named volume 的用量仍受宿主 Docker 数据盘容量影响。运行端 operation store 已在本地实现，但尚未随精确 Morde 镜像在目标机验收。
 Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退避重启；AIO 和桌面进程继续运行，Host 健康检查在 Runtime readiness 恢复前保持失败。该机制只恢复 Runtime 控制面进程，不会恢复尚未登记的 PTY / GUI 会话，也不会把未知操作结果标成成功。
 
-6. 在仓库根目录切换到 root shell，指定现有专用服务账户并启动基础服务。执行前先把 `CH_WORKSPACE_SYNC_CURRENT_FILES_DIR` 配置为独立且有硬容量上限的活动挂载，并由服务账户持有、权限 `0700`；即使同步功能关闭，Portal 也会把这里作为 Workspace 当前目录投影。`cloudhost.env` 遵循 systemd 的 EnvironmentFile 语法；不要用 Bash `source` 执行它，尤其是多行 Caddy 配置。下面的读取器只提取单行路径和本地服务地址，不读取或打印密码、API Key：
+6. 在仓库根目录切换到 root shell，指定现有专用服务账户并启动基础服务。执行前先把有硬容量上限的专用数据文件系统挂载到 `CH_WORKSPACE_SYNC_DATA_ROOT_DIR`，并让挂载根归服务账户所有、权限为 `0700`。该卷承载 `blocks/`、`current/`、`nodes/` 和 `relay/`；各目录不得另挂子卷。即使同步功能关闭，Portal 仍从同一卷读写块库和 Workspace 当前目录。`cloudhost.env` 遵循 systemd 的 EnvironmentFile 语法；不要用 Bash `source` 执行它，尤其是多行 Caddy 配置。下面的读取器只提取单行路径和本地服务地址，不读取或打印密码、API Key：
 
    ```sh
    set -e
    PORTAL_USER='填写已有的 Portal 服务账户名'
    REPO_ROOT=$(pwd -P)
+   CH_WORKSPACE_SYNC_DATA_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_DATA_ROOT_DIR)
    CH_WORKSPACE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_STORAGE_ROOT_DIR)
    CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_CURRENT_FILES_DIR)
+   CH_WORKSPACE_SYNC_NODE_STATE_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_NODE_STATE_DIR)
+   CH_WORKSPACE_SYNC_RELAY_STATE_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_RELAY_STATE_DIR)
    CH_SITE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_SITE_STORAGE_ROOT_DIR)
    CH_DOCKER_HOST=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_DOCKER_HOST)
    CH_OSB_URL=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_OSB_URL)
    CH_OSB_CONFIG_FILE=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_OSB_CONFIG_FILE)
    export CH_DOCKER_HOST CH_OSB_URL CH_OSB_CONFIG_FILE
-   mountpoint -q -- "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" || { printf 'Workspace current-files path must already be mounted: %s\n' "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" >&2; exit 1; }
-   for dir in "$CH_WORKSPACE_STORAGE_ROOT_DIR" "$CH_SITE_STORAGE_ROOT_DIR"; do
+   mountpoint -q -- "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR" || { printf 'Workspace shared data path must already be mounted: %s\n' "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR" >&2; exit 1; }
+   chown "$PORTAL_USER:$(id -gn "$PORTAL_USER")" "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR"
+   chmod 0700 "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR"
+   for dir in "$CH_WORKSPACE_STORAGE_ROOT_DIR" "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" "$CH_WORKSPACE_SYNC_NODE_STATE_DIR" "$CH_SITE_STORAGE_ROOT_DIR"; do
      if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then install -d -o "$PORTAL_USER" -g "$(id -gn "$PORTAL_USER")" -m 0700 "$dir"; fi
    done
+   if [ ! -e "$CH_WORKSPACE_SYNC_RELAY_STATE_DIR" ] && [ ! -L "$CH_WORKSPACE_SYNC_RELAY_STATE_DIR" ]; then install -d -o 65532 -g 65532 -m 0700 "$CH_WORKSPACE_SYNC_RELAY_STATE_DIR"; fi
    docker compose --env-file /etc/cloudhost/cloudhost.env -f deploy/single/docker-compose.yml up -d
    /opt/cloudhost/network-policy.sh check
    portal_once() {
@@ -75,9 +81,9 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
 
    `site_storage.root_dir` 与 Workspace、Docker 数据根及 Portal 静态目录必须分离，并由 Portal 服务账户私有持有。`CH_SITE_STORAGE_MAX_RELEASE_BYTES` 限制单个版本，`CH_SITE_STORAGE_MAX_OWNER_BYTES` 限制每位用户的累计发布物；未物化候选按固定 Workspace revision 字节数预留，物化产物持续计入。当前启动只初始化并验证不可变发布物存储；发布 API、执行沙箱与站点路由尚未开放。
 
-   `workspace_sync_node.workspace_root` 是普通 Workspace 当前目录，默认在 `workspace_storage.root_dir` 同级的 `workspace-current`。MVP 中它是 PostgreSQL revision 与块库的可重建投影：私有 `.morde-revisions` marker 会在 Portal 启动对账时发现目录缺失或数据库恢复到不同 revision，并重建目录。`backup.py` 仍备份 PostgreSQL 与块库，不备份当前目录；这个恢复合同只适用于直接 Syncthing 写入关闭的 MVP。开放 Syncthing 直写前，必须把当前目录与持久接收账本纳入一致备份/恢复，并完成并发写屏障，因此当前 workspace-sync capability 保持关闭。`MaxOwnerBytes` 只核算不可变块，`MinFreeBytes` 不是持续磁盘预留；Syncthing 接收文件会先写入 current，物化还会额外使用 `.morde-staging`。Portal 启用 Workspace sync 时会拒绝 system、Docker data、Site、block root 与 current/node/relay state root 共享文件系统；这是启动时设备号检查，不验证卷容量、thin-pool 未超配或 current/staging 的持久容量预留，也未覆盖运行中卸载。开放直写前，block root 与含 current、接收临时文件、staging、Syncthing 节点与 relay 状态的文件系统都必须有经核验的硬容量边界，并与系统、PostgreSQL、Docker 数据空间隔离；Portal systemd 安装脚本在 `workspace_sync_node.enabled: true` 时要求 block/current/node/relay root 各自是独立、无符号链接、已挂载且 mount unit active 的文件系统，并生成 `BindsTo` 和 `After` 依赖；每次 Portal 启动前还会比对配置根目录与当前 unit 依赖，防止只改 YAML 后漏掉挂载绑定。**即使 `workspace_sync_node.enabled: false`，Portal 仍维护当前目录投影，因此 current root 也必须挂在专用文件系统上，与系统、Workspace 块、Docker、Site 和 PostgreSQL 文件系统隔离；安装脚本始终为该 mount 生成 `BindsTo`/`After` 并在启动前核对，Portal 启动时还会核对配置根与环境变量一致、从 Linux mountinfo 确认 current root 是当前挂载点，再检查设备号。**启用同步或更改任何同步根后，先重跑安装脚本再启动 Portal；挂载维护必须通过 systemd 管理。该启动门禁不能验证卷硬容量、thin-pool 未超配、运行中被非 systemd 卸载或一致备份；未完成 Ubuntu 联验前继续保持 sync 关闭。
+   `workspace_sync_node.workspace_root` 是普通 Workspace 当前目录，`workspace_storage.root_dir` 是不可变块库；两者和 `.morde-staging`、同步接收临时文件、节点索引、relay 状态统一放在 `workspace_sync_node.data_root` 下的独立直接子目录。MVP 中当前目录是 PostgreSQL revision 与块库的可重建投影，私有 `.morde-revisions` marker 会在 Portal 启动对账时发现目录缺失或数据库恢复到不同 revision，并重建目录。`backup.py` 仍备份 PostgreSQL 与块库，不备份当前目录；这个恢复合同只适用于直接 Syncthing 写入关闭的 MVP。用户已选择“共享硬上限”：用一个独立、固定容量且非 thin-provisioned 的文件系统限制全部 Workspace 同步数据；它必须与系统、Docker、Site、PostgreSQL 分离。Portal 启动和 systemd 安装门禁要求数据根是活动 mount，并要求 blocks/current 以及启用同步时的 nodes/relay 是彼此独立的直接子目录、没有嵌套挂载且同属该文件系统；Portal 服务仅绑定这一个 mount。接收新文件前，服务端按共享卷 `MinFreeBytes` 余量及本次文件大小做容量准入，空间不足时拒绝新的写入 reservation；删除仍允许。底层文件系统容量是所有数据的最终硬上限。该门禁只能验证挂载拓扑和当时的可用空间，不能证明云盘底层无 thin overcommit，也不能把并发准入转换为容量预留；同时写入仍由文件系统硬上限兜底。一个账号仍受现有逻辑块额度约束，但共享卷满时不保证每个账号都能同时用满逻辑额度。升级或更改根目录后重跑安装脚本；挂载维护必须通过 systemd 管理。当前 Ubuntu 尚未准备该固定容量卷，未完成真实容量及接收验收前继续保持 `workspace-sync` 关闭。
 
-   升级旧版本时，先为 `CH_WORKSPACE_SYNC_CURRENT_FILES_DIR` 准备独立、有硬容量上限的活动挂载，并确认挂载根由 Portal 账户持有且为 `0700`；旧部署没有此变量或仍指向普通目录时，必须先完成挂载和环境文件更新。随后停止旧 Portal 和旧 Host 的写入，再执行 `migrate up`。导入器只读取未被任何 Docker 容器引用的旧卷；需移除引用该卷的旧 Host 容器，同时保留 named volume 本身，并确认容器内没有需要保留的非卷数据。逐个运行 `.local/bin/portal workspace import-legacy --workspace <workspace-id> --config deploy/single/portal.yaml`。导入成功前不要删除旧卷；导入后再执行 `workspace verify`。Portal 会在仍有待导入旧卷时拒绝启动，并提示待处理 Workspace。全新安装没有待迁移的旧卷，可直接运行下面的 verify。
+   升级旧版本时，先为 `CH_WORKSPACE_SYNC_DATA_ROOT_DIR` 准备独立、固定容量的活动挂载，并确认挂载根由 Portal 账户持有且为 `0700`；块库、当前目录、节点与 relay 状态必须是其彼此独立的直接子目录。旧部署没有这些变量或仍把根指向普通目录时，必须先完成挂载和环境文件更新。旧版若把 block/current/node/relay 分别放在其他数据根，须先停止 Portal、同步节点与 relay，在新共享卷上离线复制数据并核对完整性；本流程不自动搬动这些数据，原目录需保留到备份和恢复核验完成。随后停止旧 Portal 和旧 Host 的写入，再执行 `migrate up`。导入器只读取未被任何 Docker 容器引用的旧卷；需移除引用该卷的旧 Host 容器，同时保留 named volume 本身，并确认容器内没有需要保留的非卷数据。逐个运行 `.local/bin/portal workspace import-legacy --workspace <workspace-id> --config deploy/single/portal.yaml`。导入成功前不要删除旧卷；导入后再执行 `workspace verify`。Portal 会在仍有待导入旧卷时拒绝启动，并提示待处理 Workspace。全新安装没有待迁移的旧卷，可直接运行下面的 verify。
 
    `portal workspace verify` 会只读核对数据库所有历史 Workspace revision 引用的正文块，以及块目录里的哈希、大小和路径；发现缺块、损坏或未知残留时失败并保留原文件。它是完整性检查，不会创建备份，也不能替代数据库与正文块的一致备份 / 恢复演练。
 7. 登录门户，创建主机并进入工作台，验证浏览器、终端和文件；在 API Key 页创建平台 Key，按 `examples/agent/codex/config.toml` 接入 MCP。预览为私有，用户先进入主机再打开预览链接。删除主机默认保留工作目录；自动空闲释放当前禁用，用户显式释放计算资源时保留 Host、Workspace 和 runtime 数据。

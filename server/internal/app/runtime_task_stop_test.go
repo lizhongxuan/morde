@@ -23,7 +23,7 @@ func TestRuntimeControlStopTaskOperationRequiresExactRuntimeFenceAndHandlesNotFo
 	defer session.Close()
 	claimed := task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", Status: task.StatusCancelling}
 	expiresAt := time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
-	if err := session.SetTaskLease(ctx, claimed.ID, 1, expiresAt); err != nil {
+	if err := session.SetTaskLease(ctx, claimed.ID, 1, expiresAt, claimed.WorkspaceID != ""); err != nil {
 		t.Fatal(err)
 	}
 	arguments := json.RawMessage(`{}`)

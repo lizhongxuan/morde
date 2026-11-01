@@ -54,15 +54,19 @@ func (s *Store) CreateWorkspaceBinding(ctx context.Context, value workspace.Bind
 	var created workspace.Binding
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var ownerID, hostState string
-		err := tx.QueryRow(ctx, `SELECT owner_id, state FROM hosts WHERE id=$1 FOR UPDATE`, value.HostID).Scan(&ownerID, &hostState)
+		err := tx.QueryRow(ctx, `SELECT owner_id, state FROM hosts WHERE id=$1 FOR UPDATE`, value.HostID).
+			Scan(&ownerID, &hostState)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		}
 		if err != nil {
 			return fmt.Errorf("lock host for workspace binding: %w", err)
 		}
-		if ownerID != value.OwnerID || hostState == "deleting" || hostState == "deleted" {
+		if ownerID != value.OwnerID {
 			return domain.NewError(domain.CodeNotFound, "host not found")
+		}
+		if hostState != string(host.StateRunning) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to bind a workspace")
 		}
 		// Portal and Runtime snapshots include detached bindings, so cap persisted rows too.
 		var bindingCount int
@@ -134,25 +138,36 @@ func (s *Store) transitionWorkspaceBinding(ctx context.Context, expectedGenerati
 		desiredRevision < 0 || appliedRevision < 0 || appliedRevision > desiredRevision {
 		return workspace.Binding{}, domain.InvalidArgument("workspace_binding", "workspace binding transition is invalid")
 	}
+	var ownerID string
+	if expectedGeneration > 0 {
+		if err := s.pool.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1`, hostID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+			return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "host not found")
+		} else if err != nil {
+			return workspace.Binding{}, fmt.Errorf("read Host owner before binding activation: %w", err)
+		}
+		if !domain.ValidUserID(ownerID) {
+			return workspace.Binding{}, domain.NewError(domain.CodeInternal, "Host owner identity is invalid")
+		}
+	}
 
 	var updated workspace.Binding
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var hostState string
+	applyTransition := func(tx pgx.Tx) error {
+		var hostOwner, hostState string
 		var hostGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
-			Scan(&hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
+			Scan(&hostOwner, &hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock host before binding transition: %w", err)
 		}
+		if expectedGeneration > 0 && hostOwner != ownerID {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica authentication required")
+		}
 		if expectedGeneration > 0 && hostGeneration != expectedGeneration {
 			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
 		}
-		if expectedGeneration > 0 && hostState != string(host.StateRunning) {
-			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to activate a workspace binding")
-		}
-		if to == workspace.BindingPreparing && hostState != "running" {
-			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to bind a workspace")
+		if hostState != string(host.StateRunning) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to change a workspace binding")
 		}
 		var currentWorkspaceState string
 		var currentWorkspaceRevision int64
@@ -214,7 +229,13 @@ WHERE host_id=$1 AND workspace_id=$2 AND binding_version=$3 AND state=$4
 		}
 		updated = workspaceBindingDomain(row)
 		return nil
-	})
+	}
+	var err error
+	if expectedGeneration > 0 {
+		err = s.withApprovedWorkspaceSyncOwnerTx(ctx, ownerID, applyTransition)
+	} else {
+		err = s.WithTx(ctx, applyTransition)
+	}
 	if err != nil {
 		return workspace.Binding{}, err
 	}
@@ -225,16 +246,34 @@ func (s *Store) CompleteWorkspaceBindingUnbind(ctx context.Context, hostID, work
 	if !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) || expectedVersion <= 0 || expectedGeneration < 1 || checkpointRevision < 0 {
 		return workspace.Binding{}, domain.InvalidArgument("workspace_binding", "workspace unbind checkpoint is invalid")
 	}
+	var ownerID string
+	if err := s.pool.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1`, hostID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "host not found")
+	} else if err != nil {
+		return workspace.Binding{}, fmt.Errorf("read Host owner before completing workspace unbind: %w", err)
+	}
+	if !domain.ValidUserID(ownerID) {
+		return workspace.Binding{}, domain.NewError(domain.CodeInternal, "Host owner identity is invalid")
+	}
 	var updated workspace.Binding
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+	err := s.withApprovedWorkspaceSyncOwnerTx(ctx, ownerID, func(tx pgx.Tx) error {
+		var hostState string
+		var hostOwner string
 		var hostGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).Scan(&hostGeneration); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
+			Scan(&hostOwner, &hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock host before completing workspace unbind: %w", err)
 		}
+		if hostOwner != ownerID {
+			return domain.NewError(domain.CodeNotFound, "host not found")
+		}
 		if hostGeneration != expectedGeneration {
 			return domain.NewError(domain.CodeUnauthenticated, "host replica authentication required")
+		}
+		if hostState != string(host.StateRunning) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to complete workspace unbind")
 		}
 		var workspaceState string
 		var workspaceRevision int64
@@ -310,18 +349,33 @@ func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, host
 		!workspace.ValidSessionID(sessionID) || revision < 0 {
 		return workspace.Binding{}, domain.InvalidArgument("workspace_binding", "workspace applied revision receipt is invalid")
 	}
+	var ownerID string
+	if err := s.pool.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1`, hostID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+		return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "host not found")
+	} else if err != nil {
+		return workspace.Binding{}, fmt.Errorf("read Host owner before applied revision receipt: %w", err)
+	}
+	if !domain.ValidUserID(ownerID) {
+		return workspace.Binding{}, domain.NewError(domain.CodeInternal, "Host owner identity is invalid")
+	}
 	var updated workspace.Binding
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var hostOwner string
+	err := s.withApprovedWorkspaceSyncOwnerTx(ctx, ownerID, func(tx pgx.Tx) error {
+		var hostOwner, hostState string
 		var currentGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT owner_id, runtime_generation FROM hosts WHERE id=$1 FOR SHARE`, hostID).
-			Scan(&hostOwner, &currentGeneration); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR SHARE`, hostID).
+			Scan(&hostOwner, &hostState, &currentGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock Host before applied revision receipt: %w", err)
 		}
+		if hostOwner != ownerID {
+			return domain.NewError(domain.CodeNotFound, "host not found")
+		}
 		if currentGeneration != hostGeneration {
 			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
+		}
+		if hostState != string(host.StateRunning) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to report an applied workspace revision")
 		}
 		var workspaceState string
 		var workspaceRevision int64
@@ -356,6 +410,9 @@ func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, host
 		expectedReplicaID := fmt.Sprintf("host:%s:g%d:%s:b%d", hostID, hostGeneration, workspaceID, expectedVersion)
 		if row.OwnerID != current.OwnerID || row.OwnerID != hostOwner || row.ReplicaID != expectedReplicaID {
 			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		if row.BaseRevision > current.AppliedRevision {
+			return domain.NewError(domain.CodeWorkspaceConflict, "workspace sync session skipped a revision that the Host has not applied")
 		}
 		validDirection := row.Direction == string(workspace.SyncDownload) || row.Direction == string(workspace.SyncBidirectional)
 		validPolicy := row.Policy == string(workspace.SyncFillMissing) || row.Policy == string(workspace.SyncLive)
@@ -410,18 +467,32 @@ func (s *Store) setWorkspaceBindingSyncStatus(ctx context.Context, hostID string
 		workspace.ValidateBindingSyncStatus(state, conflicts) != nil {
 		return workspace.Binding{}, domain.InvalidArgument("sync_status", "workspace sync status is invalid")
 	}
+	var ownerID string
+	if expectedGeneration > 0 {
+		if err := s.pool.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1`, hostID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+			return workspace.Binding{}, domain.NewError(domain.CodeNotFound, "host not found")
+		} else if err != nil {
+			return workspace.Binding{}, fmt.Errorf("read Host owner before sync status update: %w", err)
+		}
+		if !domain.ValidUserID(ownerID) {
+			return workspace.Binding{}, domain.NewError(domain.CodeInternal, "Host owner identity is invalid")
+		}
+	}
 	if conflicts == nil {
 		conflicts = []string{}
 	}
 	var updated workspace.Binding
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var hostState string
+	applyStatus := func(tx pgx.Tx) error {
+		var hostOwner, hostState string
 		var hostGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
-			Scan(&hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE`, hostID).
+			Scan(&hostOwner, &hostState, &hostGeneration); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		} else if err != nil {
 			return fmt.Errorf("lock host before workspace sync status: %w", err)
+		}
+		if expectedGeneration > 0 && hostOwner != ownerID {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica authentication required")
 		}
 		if expectedGeneration > 0 && hostGeneration != expectedGeneration {
 			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
@@ -469,7 +540,13 @@ WHERE host_id=$1 AND workspace_id=$2 AND binding_version=$3 AND state='active'`,
 		}
 		updated = workspaceBindingDomain(row)
 		return nil
-	})
+	}
+	var err error
+	if expectedGeneration > 0 {
+		err = s.withApprovedWorkspaceSyncOwnerTx(ctx, ownerID, applyStatus)
+	} else {
+		err = s.WithTx(ctx, applyStatus)
+	}
 	if err != nil {
 		return workspace.Binding{}, err
 	}

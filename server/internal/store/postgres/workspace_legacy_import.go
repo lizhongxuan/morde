@@ -163,6 +163,9 @@ FOR UPDATE OF v, w`, value.WorkspaceID).Scan(
 		if err := ensureWorkspaceLegacyImportHasNoActiveWork(ctx, tx, value.WorkspaceID); err != nil {
 			return err
 		}
+		if files == nil {
+			files = []workspace.File{}
+		}
 		encodedFiles, err := json.Marshal(files)
 		if err != nil {
 			return fmt.Errorf("encode legacy workspace files for block usage check: %w", err)

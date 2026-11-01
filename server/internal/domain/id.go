@@ -32,6 +32,7 @@ func NewMCPConnectorID() (string, error)                 { return newID('k') }
 func NewWorkspaceSyncDeviceBindingID() (string, error)   { return newID('d') }
 func NewWorkspaceSyncDeviceChallengeID() (string, error) { return newID('n') }
 func NewWorkspaceSyncDeviceIdentityID() (string, error)  { return newID('e') }
+func NewTaskWorkspaceViewDeletionID() (string, error)    { return newID('z') }
 
 func newID(prefix byte) (string, error) {
 	var id [8]byte
@@ -66,6 +67,7 @@ func ValidMCPConnectorID(id string) bool                 { return validID(id, 'k
 func ValidWorkspaceSyncDeviceBindingID(id string) bool   { return validID(id, 'd') }
 func ValidWorkspaceSyncDeviceChallengeID(id string) bool { return validID(id, 'n') }
 func ValidWorkspaceSyncDeviceIdentityID(id string) bool  { return validID(id, 'e') }
+func ValidTaskWorkspaceViewDeletionID(id string) bool    { return validID(id, 'z') }
 
 func validID(id string, prefix byte) bool {
 	if len(id) != 8 || id[0] != prefix {

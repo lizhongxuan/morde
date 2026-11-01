@@ -370,7 +370,7 @@ func (s *Store) CurrentRevision(ownerID, workspaceID string) (int64, bool, error
 }
 
 // MatchesManifest checks the published tree against an immutable Workspace manifest.
-func (s *Store) MatchesManifest(ctx context.Context, ownerID, workspaceID string, files []workspace.File, emptyDirectories []string) (bool, error) {
+func (s *Store) MatchesManifest(ctx context.Context, ownerID, workspaceID string, files []workspace.File, emptyDirectories []string) (matched bool, retErr error) {
 	if s == nil || s.dead.Load() {
 		return false, ErrClosed
 	}
@@ -382,6 +382,18 @@ func (s *Store) MatchesManifest(ctx context.Context, ownerID, workspaceID string
 	}
 	ownerDigest := sha256.Sum256([]byte(ownerID))
 	ownerHash := hex.EncodeToString(ownerDigest[:])
+	lock, err := acquireLock(ctx, filepath.Join(s.rootPath, ".morde-locks", ownerHash+"-"+workspaceID+".lock"))
+	if err != nil {
+		return false, fmt.Errorf("lock workspace current manifest verification: %w", err)
+	}
+	defer func() {
+		if err := releaseLock(lock); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("release workspace current manifest lock: %w", err))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	ownerRoot := filepath.Join(s.rootPath, ownerHash)
 	if info, err := os.Lstat(ownerRoot); errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -423,6 +435,9 @@ func (s *Store) MatchesManifest(ctx context.Context, ownerID, workspaceID string
 		if actual.EmptyDirectories[i] != want {
 			return false, nil
 		}
+	}
+	if err := removeStaleStages(filepath.Join(s.rootPath, ".morde-staging"), ownerHash+"-"+workspaceID+"-"); err != nil {
+		return false, fmt.Errorf("recover verified Workspace current staging: %w", err)
 	}
 	return true, nil
 }

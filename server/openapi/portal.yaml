@@ -72,7 +72,7 @@ paths:
                   minimum_client_version: { type: [string, 'null'] }
                   supported_features:
                     type: array
-                    description: An absent feature is unavailable or not yet declared.
+                    description: An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
                     items: { type: string }
                   default_max_request_bytes: { type: integer, format: int64, minimum: 1 }
         '503': { $ref: '#/components/responses/Error' }
@@ -262,7 +262,7 @@ paths:
       tags: [Clients]
       operationId: clientLogin
       summary: Log in on a native client
-      description: Approved accounts sign in with name and password. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set. Reusing one Idempotency-Key for the same request rotates unconfirmed credentials; late earlier responses must be discarded by the client.
+      description: Approved accounts sign in with name and password. Desktop and iOS clients must first require ordered_client_login from /api/capabilities. Each ordered network attempt has a new Idempotency-Key and a strictly increasing attempt_generation persisted by the client before sending. The service binds client_instance_id to one installation and rejects stale generations. A retry after an unknown result increments the generation; the prior response may then contain a revoked credential and must be discarded. Revoked installations cannot be restored by a late login. For source compatibility only, Android requests that omit both ordered fields continue using the legacy server-ordered path; it is not advertised as a capability and does not fence delayed client intents. Legacy same-key Android retries rotate credentials on the same installation. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set.
       security: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -281,6 +281,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/RateLimited' }
         default: { $ref: '#/components/responses/Error' }
   /api/auth/client-web-session:
@@ -1461,7 +1462,7 @@ paths:
       tags: [Workspaces]
       operationId: createWorkspaceSyncSession
       summary: Plan an upload, missing-only download, merge, or live synchronization batch
-      description: The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
+      description: The client submits its scoped manifest. The service pins the base revision and returns required chunks and conflicts. For Host replica downloads or bidirectional sessions, base_revision cannot exceed the Host binding's applied_revision. Newly planned uploads reject any file larger than 314572800 bytes with 413; unchanged existing files remain readable and are not re-uploaded by this rule. A session is resumable and idempotent; omitted files never imply deletion.
       security:
         - portalSession: []
         - bearerToken: []
@@ -1750,6 +1751,73 @@ paths:
               schema: { $ref: '#/components/schemas/HostReplicaBindings' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/host-replicas/{host_id}/generations/{generation}/task-workspace-view-deletions:
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/HostId' }
+      - name: generation
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+    get:
+      tags: [Workspaces]
+      operationId: listHostTaskWorkspaceViewDeletions
+      summary: Read pending, explicitly confirmed Task Workspace view deletions
+      security:
+        - hostReplicaBootstrap: []
+      responses:
+        '200':
+          description: Pending deletion requests for this Host generation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostTaskWorkspaceViewDeletions' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/host-replicas/{host_id}/generations/{generation}/tasks/{task_id}/workspace-view-deletions/{request_id}/applied:
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/HostId' }
+      - name: generation
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+      - name: task_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: request_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskWorkspaceViewDeletionId' }
+    post:
+      tags: [Workspaces]
+      operationId: completeHostTaskWorkspaceViewDeletion
+      summary: Acknowledge one Task Workspace view deletion performed by the Host
+      security:
+        - hostReplicaBootstrap: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: Deletion receipt persisted for the current Host generation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostTaskWorkspaceViewDeletion' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/host-replicas/{host_id}/generations/{generation}/workspaces/{workspace_id}/bindings/{binding_version}/sync-status:
     parameters:
@@ -2363,6 +2431,52 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
         '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/workspace-view-deletions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Tasks]
+      operationId: getTaskWorkspaceViewDeletion
+      summary: Get the confirmation and Host cleanup state for a Task Workspace view
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current persisted deletion state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkspaceViewDeletion' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Tasks]
+      operationId: requestTaskWorkspaceViewDeletion
+      summary: Explicitly request deletion of a stopped Task's private Workspace view
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskWorkspaceViewDeletionRequest' }
+      responses:
+        '202':
+          description: Deletion is queued until the Host confirms cleanup
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkspaceViewDeletion' }
+        '200':
+          description: Previously requested deletion is already confirmed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkspaceViewDeletion' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/mcp-connectors/{connector_id}:
     parameters:
@@ -3644,6 +3758,7 @@ components:
     ClientInstallationId: { type: string, pattern: '^i[a-z0-9]{7}$' }
     ConversationId: { type: string, pattern: '^c[a-z0-9]{7}$' }
     TaskId: { type: string, pattern: '^q[a-z0-9]{7}$' }
+    TaskWorkspaceViewDeletionId: { type: string, pattern: '^z[a-z0-9]{7}$' }
     ModelConnectionId: { type: string, pattern: '^p[a-z0-9]{7}$' }
     MCPConnectorId: { type: string, pattern: '^k[a-z0-9]{7}$' }
     MessageId: { type: string, pattern: '^m[a-z0-9]{7}$' }
@@ -3991,6 +4106,23 @@ components:
         runtime_generation: { type: integer, format: int64, minimum: 1 }
         items: { type: array, maxItems: 64, items: { $ref: '#/components/schemas/HostReplicaBinding' } }
       additionalProperties: false
+    HostTaskWorkspaceViewDeletion:
+      type: object
+      required: [request_id, task_id]
+      properties:
+        request_id: { $ref: '#/components/schemas/TaskWorkspaceViewDeletionId' }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+      additionalProperties: false
+    HostTaskWorkspaceViewDeletions:
+      type: object
+      required: [runtime_generation, items]
+      properties:
+        runtime_generation: { type: integer, format: int64, minimum: 1 }
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/HostTaskWorkspaceViewDeletion' }
+      additionalProperties: false
     HostReplicaAppliedRequest:
       type: object
       required: [session_id, applied_revision]
@@ -4020,6 +4152,8 @@ components:
         state: { type: string, enum: [creating, running, stopping, stopped, failed, deleting, deleted] }
         state_reason: { type: string }
         runtime_generation: { type: integer, minimum: 0 }
+        workspace_runtime_online: { type: boolean }
+        workspace_runtime_last_seen_at: { type: [string, 'null'], format: date-time }
         control_version: { type: integer, minimum: 0 }
         control_state: { type: string, enum: [ai, taking_over, user, returning] }
         url: { type: string, format: uri }
@@ -4330,7 +4464,7 @@ components:
       properties:
         direction: { type: string, enum: [upload, download, bidirectional] }
         policy: { type: string, enum: [fill_missing, compare_merge, live] }
-        base_revision: { type: integer, format: int64, minimum: 0 }
+        base_revision: { type: integer, format: int64, minimum: 0, description: For Host replica downloads and bidirectional sync, this must not exceed the Host binding's applied_revision. }
         scope:
           type: array
           maxItems: 10000
@@ -4406,7 +4540,7 @@ components:
       additionalProperties: false
     DeviceWorkspaceSyncProgressSummary:
       type: object
-      required: [revision, used_bytes, quota_bytes, remaining_bytes, quota_status, items]
+      required: [revision, used_bytes, quota_bytes, remaining_bytes, quota_status, items, quota_pauses]
       properties:
         revision: { type: integer, format: int64, minimum: 0 }
         used_bytes: { type: integer, format: int64, minimum: 0 }
@@ -4416,6 +4550,46 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/DeviceWorkspaceSyncProgress' }
+        quota_pauses:
+          type: array
+          description: Current direct Syncthing receive operations paused by a durable quota rejection. A later admitted operation on the same path clears the active pause; rejected operation IDs remain terminal.
+          items: { $ref: '#/components/schemas/WorkspaceSyncQuotaPause' }
+        node_status:
+          allOf: [{ $ref: '#/components/schemas/WorkspaceSyncNodeObservation' }]
+          description: Read-only owner-node observation filtered to the current Workspace; omitted when observation is not configured.
+      additionalProperties: false
+    WorkspaceSyncQuotaPause:
+      type: object
+      required: [state, path, operation, requested_bytes, reason_code, updated_at]
+      properties:
+        state: { type: string, enum: [paused] }
+        path: { type: string, minLength: 1, maxLength: 4096, description: Workspace-relative path of the blocked file operation. }
+        operation: { type: string, enum: [upsert] }
+        requested_bytes: { type: integer, format: int64, minimum: 0 }
+        reason_code: { type: string, enum: [workspace_quota_exceeded, owner_storage_quota_exceeded] }
+        updated_at: { type: string, format: date-time }
+      additionalProperties: false
+    WorkspaceSyncNodeObservation:
+      type: object
+      required: [present, running, connected_device_ids, folders]
+      properties:
+        present: { type: boolean, description: Whether the account's managed Syncthing node exists. }
+        running: { type: boolean, description: Whether the managed node is running. }
+        connected_device_ids:
+          type: array
+          items: { type: string, minLength: 63, maxLength: 63 }
+        folders:
+          type: array
+          items: { $ref: '#/components/schemas/WorkspaceSyncNodeFolderObservation' }
+      additionalProperties: false
+    WorkspaceSyncNodeFolderObservation:
+      type: object
+      required: [folder_id, state, need_bytes, need_files]
+      properties:
+        folder_id: { type: string, pattern: '^morde-[a-f0-9]{32}$' }
+        state: { type: string, minLength: 1, maxLength: 64 }
+        need_bytes: { type: integer, format: int64, minimum: 0 }
+        need_files: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
     CreateWorkspaceSyncDeviceChallengeRequest:
       type: object
@@ -4531,6 +4705,8 @@ components:
         platform: { type: string, enum: [desktop, android, ios] }
         display_name: { type: string, minLength: 1, maxLength: 100 }
         renewal_installation_id: { $ref: '#/components/schemas/ClientInstallationId' }
+        client_instance_id: { type: string, format: uuid, description: Required for ordered desktop/iOS login. Stable non-secret UUID scoped to this client installation and account. Persist it with the local generation; do not reuse it after logout. }
+        attempt_generation: { type: integer, format: int64, minimum: 1, description: Required for ordered desktop/iOS login. Strictly increasing per client_instance_id. Persist the increment before every network attempt; a generation is consumed even if the response is lost. Android may omit both fields for the non-advertised legacy compatibility path. }
     ClientLoginResponse:
       type: object
       additionalProperties: false
@@ -4823,12 +4999,25 @@ components:
         status: { type: string, enum: [pending, completed] }
         safe_after: { type: string, format: date-time }
         unsettled_operation_ids: { type: array, items: { $ref: '#/components/schemas/OperationId' } }
+    TaskAssistantMessage:
+      type: object
+      description: The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text.
+      required: [id, conversation_id, task_id, role, content, status, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/MessageId' }
+        conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        role: { type: string, const: assistant }
+        content: { type: string, maxLength: 32768 }
+        status: { type: string, enum: [streaming, completed, interrupted] }
+        created_at: { type: string, format: date-time }
     Task:
       allOf:
         - { $ref: '#/components/schemas/TaskSummary' }
         - type: object
-          required: [result, waiting_reason, steps, batch_items, artifacts, pending_request, clarification_request, stop_request, finished_at]
+          required: [event_sequence, result, waiting_reason, steps, batch_items, artifacts, pending_request, clarification_request, stop_request, assistant_message, finished_at]
           properties:
+            event_sequence: { type: integer, format: int64, minimum: 0, description: Event cursor from the same database snapshot as this Task; resume task events after this sequence. }
             result: { type: [string, 'null'] }
             waiting_reason: { type: [string, 'null'] }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
@@ -4837,6 +5026,7 @@ components:
             pending_request: { oneOf: [{ $ref: '#/components/schemas/TaskPendingRequest' }, { type: 'null' }] }
             clarification_request: { oneOf: [{ $ref: '#/components/schemas/TaskClarificationRequest' }, { type: 'null' }] }
             stop_request: { oneOf: [{ $ref: '#/components/schemas/TaskStopRequest' }, { type: 'null' }] }
+            assistant_message: { oneOf: [{ $ref: '#/components/schemas/TaskAssistantMessage' }, { type: 'null' }] }
             finished_at: { type: [string, 'null'], format: date-time }
     TaskPage:
       type: object
@@ -4882,6 +5072,20 @@ components:
         expected_status: { $ref: '#/components/schemas/TaskStatus' }
         batch_item_id: { $ref: '#/components/schemas/BatchItemId' }
       description: retry_batch_item requires batch_item_id only; pause, resume and cancel require expected_status only.
+    TaskWorkspaceViewDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [confirm_delete]
+      properties:
+        confirm_delete: { type: boolean, const: true }
+    TaskWorkspaceViewDeletion:
+      type: object
+      required: [request_id, task_id, status]
+      properties:
+        request_id: { $ref: '#/components/schemas/TaskWorkspaceViewDeletionId' }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        status: { type: string, enum: [pending, applied] }
+      additionalProperties: false
     TaskInputRequest:
       type: object
       additionalProperties: false

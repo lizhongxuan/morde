@@ -19,6 +19,8 @@ const (
 	StatusCancelled   Status = "cancelled"
 )
 
+const WaitingReasonWorkspaceHostSync = "workspace_host_sync"
+
 type FileDeliveryIntent string
 
 const (

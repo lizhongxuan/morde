@@ -19,7 +19,7 @@ import (
 func TestPostgresAgentCheckpointFencingAndIdempotency(t *testing.T) {
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
-	login, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "checkpoint-login-1", "127.0.0.1")
+	login, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "checkpoint-login-1", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestPostgresAgentCheckpointFencingAndIdempotency(t *testing.T) {
 func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) {
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
-	login, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "checkpoint-page-login", "127.0.0.1")
+	login, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "checkpoint-page-login", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}

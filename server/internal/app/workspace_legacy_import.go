@@ -75,6 +75,10 @@ func legacyWorkspaceCleanupRequired(message string) error {
 	return &legacyWorkspaceCleanupRequiredError{message: message}
 }
 
+func legacyWorkspaceStructureCleanupRequired(message string) error {
+	return legacyWorkspaceCleanupRequired(message + "; cleanup is required and the source Docker volume was retained")
+}
+
 func NewWorkspaceLegacyImportService(store WorkspaceLegacyImportStore, source LegacyWorkspaceVolumeSource, blocks WorkspaceLegacyImportBlockStore, maxOwnerBytes int64) (*WorkspaceLegacyImportService, error) {
 	if store == nil || source == nil || blocks == nil || maxOwnerBytes <= 0 {
 		return nil, errors.New("legacy workspace import dependencies and owner quota are required")
@@ -300,8 +304,11 @@ func (s *WorkspaceLegacyImportService) writeLegacyBlocks(ctx context.Context, le
 
 func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) ([]legacySourceFile, []string, error) {
 	root, err := fs.Stat(volumeFS, ".")
-	if err != nil || !root.IsDir() {
-		return nil, nil, errors.New("legacy workspace volume root is unavailable")
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat legacy workspace volume root: %w", err)
+	}
+	if !root.IsDir() {
+		return nil, nil, legacyWorkspaceStructureCleanupRequired("legacy workspace volume root is not a directory")
 	}
 	sources := make([]legacySourceFile, 0)
 	pathCase := make(map[string]string)
@@ -321,12 +328,12 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 		}
 		if name == "." {
 			if !entry.IsDir() {
-				return errors.New("legacy workspace volume root is not a directory")
+				return legacyWorkspaceStructureCleanupRequired("legacy workspace volume root is not a directory")
 			}
 			return nil
 		}
 		if err := workspace.ValidateRelativePath(name); err != nil {
-			return fmt.Errorf("legacy workspace path %q is invalid: %w", name, err)
+			return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace path %q is invalid: %v", name, err))
 		}
 		entryCount++
 		if entryCount > maxLegacyWorkspaceEntries {
@@ -338,19 +345,19 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 		}
 		mode := info.Mode()
 		if mode&fs.ModeSymlink != 0 || (!mode.IsDir() && !mode.IsRegular()) {
-			return fmt.Errorf("legacy workspace path %q is not a regular file or directory", name)
+			return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace path %q is not a regular file or directory", name))
 		}
 		if mode.IsRegular() && info.Size() > workspace.MaxSyncFileBytes {
 			return legacyWorkspaceCleanupRequired(fmt.Sprintf("legacy workspace file %q is %d bytes, exceeding the 300 MiB file limit; cleanup is required and the source Docker volume was retained", name, info.Size()))
 		}
 		folded := strings.ToLower(name)
 		if previous, ok := pathCase[folded]; ok && previous != name {
-			return fmt.Errorf("legacy workspace paths %q and %q collide by case", previous, name)
+			return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace paths %q and %q collide by case", previous, name))
 		}
 		pathCase[folded] = name
 		for parent := path.Dir(folded); parent != "."; parent = path.Dir(parent) {
 			if previous, ok := files[parent]; ok {
-				return fmt.Errorf("legacy workspace file %q is a parent of %q", previous, name)
+				return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace file %q is a parent of %q", previous, name))
 			}
 			ancestorDirs[parent] = struct{}{}
 		}
@@ -359,22 +366,22 @@ func scanLegacyWorkspace(ctx context.Context, volumeFS fs.FS, quotaBytes int64) 
 		dirChildren[parentKey]++
 		if mode.IsDir() {
 			if _, isFile := files[folded]; isFile {
-				return fmt.Errorf("legacy workspace path %q is both a file and directory", name)
+				return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace path %q is both a file and directory", name))
 			}
 			dirChildren[folded] = 0
 			return nil
 		}
 		if _, isDir := dirChildren[folded]; isDir {
-			return fmt.Errorf("legacy workspace path %q is both a file and directory", name)
+			return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace path %q is both a file and directory", name))
 		}
 		if _, isParent := ancestorDirs[folded]; isParent {
-			return fmt.Errorf("legacy workspace file %q conflicts with a child path", name)
+			return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace file %q conflicts with a child path", name))
 		}
 		if fileCount >= workspace.MaxSyncFiles {
 			return legacyWorkspaceCleanupRequired("legacy workspace exceeds the file count limit; cleanup is required and the source Docker volume was retained")
 		}
 		if info.Size() < 0 || totalBytes > int64(^uint64(0)>>1)-info.Size() {
-			return errors.New("legacy workspace file sizes overflow int64")
+			return legacyWorkspaceStructureCleanupRequired(fmt.Sprintf("legacy workspace file %q has an invalid size", name))
 		}
 		if totalBytes > quotaBytes-info.Size() {
 			return legacyWorkspaceCleanupRequired(fmt.Sprintf("legacy workspace file %q makes total size exceed its configured quota; cleanup is required and the source Docker volume was retained", name))

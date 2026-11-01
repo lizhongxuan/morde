@@ -142,18 +142,21 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	if configuredRoot := os.Getenv("CH_WORKSPACE_SYNC_DATA_ROOT_DIR"); configuredRoot != "" && configuredRoot != cfg.WorkspaceSyncNode.DataRoot {
+		return fmt.Errorf("config.workspace_sync_node.data_root must match CH_WORKSPACE_SYNC_DATA_ROOT_DIR")
+	}
 	if configuredRoot := os.Getenv("CH_WORKSPACE_SYNC_CURRENT_FILES_DIR"); configuredRoot != "" && configuredRoot != cfg.WorkspaceSyncNode.WorkspaceRoot {
 		return fmt.Errorf("config.workspace_sync_node.workspace_root must match CH_WORKSPACE_SYNC_CURRENT_FILES_DIR")
 	}
 	if cfg.WorkspaceSyncNode.Enabled {
 		if err := storage.CheckWorkspaceSyncStorageIsolation(
-			cfg.WorkspaceStorage.RootDir, cfg.WorkspaceSyncNode.WorkspaceRoot, cfg.Storage.DockerDataDir, cfg.SiteStorage.RootDir,
+			cfg.WorkspaceSyncNode.DataRoot, cfg.WorkspaceStorage.RootDir, cfg.WorkspaceSyncNode.WorkspaceRoot, cfg.Storage.DockerDataDir, cfg.SiteStorage.RootDir,
 			cfg.WorkspaceSyncNode.StateRoot, cfg.WorkspaceSyncNode.RelayStateRoot, cfg.WorkspaceSyncNode.ProtectedStorageRoots,
 		); err != nil {
 			return fmt.Errorf("validate workspace sync filesystem isolation: %w", err)
 		}
 	} else if err := storage.CheckWorkspaceCurrentStorageIsolation(
-		cfg.WorkspaceStorage.RootDir, cfg.WorkspaceSyncNode.WorkspaceRoot, cfg.Storage.DockerDataDir, cfg.SiteStorage.RootDir,
+		cfg.WorkspaceSyncNode.DataRoot, cfg.WorkspaceStorage.RootDir, cfg.WorkspaceSyncNode.WorkspaceRoot, cfg.Storage.DockerDataDir, cfg.SiteStorage.RootDir,
 		cfg.WorkspaceSyncNode.ProtectedStorageRoots,
 	); err != nil {
 		return fmt.Errorf("validate Workspace current-filesystem isolation: %w", err)
@@ -355,7 +358,7 @@ func serve(ctx context.Context, configPath string) error {
 	var workspaceSyncNodeOwnerReconciler app.WorkspaceSyncNodeOwnerReconciler
 	var workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
 	if cfg.WorkspaceSyncNode.Enabled {
-		quotaService, err := app.NewWorkspaceSyncQuotaService(workspaceSync, workspaceCurrent)
+		quotaService, err := app.NewWorkspaceSyncQuotaService(workspaceSync, workspaceCurrent, workspaceCapacity)
 		if err != nil {
 			return fmt.Errorf("initialize Workspace sync quota service: %w", err)
 		}
@@ -409,6 +412,9 @@ func serve(ctx context.Context, configPath string) error {
 		}()
 		workspaceSyncNodeEnsurer = workspaceSyncNodeProvisioner
 		workspaceSyncNodeOwnerReconciler = workspaceSyncNodeProvisioner
+		if err := workspaceSync.SetWorkspaceSyncNodeObserver(workspaceSyncNodeProvisioner); err != nil {
+			return fmt.Errorf("configure Workspace sync node observer: %w", err)
+		}
 	}
 	credentials, err := app.NewCredentialService(store, store, store, countedAudit, app.CredentialOptions{
 		SessionTTL: cfg.Security.SessionTTL, TicketTTL: cfg.Security.TicketTTL,

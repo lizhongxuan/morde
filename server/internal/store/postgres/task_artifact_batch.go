@@ -155,8 +155,8 @@ RETURNING id, task_id, item_key, input, status, result, error, created_at, updat
 }
 
 // RetryFailedBatchItem queues a failed batch item for a new attempt. The task
-// row lock serializes retries with different idempotency keys; the idempotency
-// record, task reset, item reset, and both events commit as one transaction.
+// row lock serializes retries with different idempotency keys and with private
+// view deletion requests; the idempotency record, resets, and events commit atomically.
 func (s *Store) RetryFailedBatchItem(ctx context.Context, idempotency app.IdempotencyRecord, taskID, batchItemID string) error {
 	if !domain.ValidTaskID(taskID) || !domain.ValidBatchItemID(batchItemID) {
 		return domain.InvalidArgument("batch_item", "task and batch item ids are invalid")
@@ -193,6 +193,13 @@ func (s *Store) RetryFailedBatchItem(ctx context.Context, idempotency app.Idempo
 		}
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
+		}
+		var viewDeletionRequested bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_workspace_view_deletions WHERE task_id=$1)`, taskID).Scan(&viewDeletionRequested); err != nil {
+			return fmt.Errorf("check Task Workspace view deletion before batch retry: %w", err)
+		}
+		if viewDeletionRequested {
+			return domain.NewError(domain.CodeInvalidState, "task Workspace view deletion has been requested and cannot be retried")
 		}
 		if _, replay, err := reserveIdempotency(ctx, tx, idempotency, taskID, batchItemID); err != nil {
 			return err

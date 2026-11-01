@@ -230,6 +230,18 @@ LIMIT 1`, result.OwnerID, hostID).Scan(&unsettledTaskID)
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("check task operations before host release: %w", err)
 		}
+		var pendingViewDeletionTaskID string
+		err = tx.QueryRow(ctx, `SELECT task_id FROM task_workspace_view_deletions
+WHERE host_id=$1 AND owner_id=$2 AND status='pending' LIMIT 1`, hostID, result.OwnerID).Scan(&pendingViewDeletionTaskID)
+		if err == nil {
+			conflict := domain.NewError(domain.CodeConflict, "Host has a pending Task Workspace view deletion; keep it available until the Host acknowledges cleanup")
+			conflict.Details["reason"] = "host_release_task_workspace_view_deletion_pending"
+			conflict.Details["task_id"] = pendingViewDeletionTaskID
+			return conflict
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("check pending Task Workspace view deletions before Host release: %w", err)
+		}
 		if err := tx.QueryRow(ctx, `
 SELECT EXISTS (
   SELECT 1 FROM mcp_runtime_operations

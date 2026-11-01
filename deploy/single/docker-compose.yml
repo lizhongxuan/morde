@@ -77,7 +77,7 @@ services:
       - "${CH_WORKSPACE_SYNC_RELAY_BIND_ADDRESS:-127.0.0.1}:${CH_WORKSPACE_SYNC_RELAY_PORT:-22067}:22067/tcp"
     volumes:
       - type: bind
-        source: ${CH_WORKSPACE_SYNC_RELAY_STATE_DIR:-/srv/morde-workspace-sync-relay}
+        source: ${CH_WORKSPACE_SYNC_RELAY_STATE_DIR:-/srv/morde-workspace-sync/relay}
         target: /var/lib/morde-relay
         bind:
           create_host_path: false

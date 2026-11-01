@@ -331,6 +331,57 @@ func TestTaskResponseIncludesBatchAttemptAndArtifactAssociation(t *testing.T) {
 	}
 }
 
+func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
+	current := apiTestTask()
+	current.Status = task.StatusRunning
+	current.EventSequence = 8
+	message := conversation.Message{
+		ID: "m1234567", ConversationID: current.ConversationID, OwnerID: current.OwnerID,
+		Role: conversation.RoleAssistant, Content: "Partial answer", TaskID: current.ID, CreatedAt: time.Now().UTC(),
+	}
+	value := app.TaskDetails{
+		Task: current,
+		AssistantMessage: &app.AssistantMessageSnapshot{
+			Message: message, Status: app.AssistantMessageStreaming,
+		},
+	}
+	view, err := toTaskResponse(value)
+	if err != nil || view.AssistantMessage == nil || view.AssistantMessage.ID != message.ID ||
+		view.AssistantMessage.Content != message.Content || view.AssistantMessage.Status != "streaming" ||
+		view.EventSequence != current.EventSequence {
+		t.Fatalf("assistant message snapshot response = %#v, err=%v", view.AssistantMessage, err)
+	}
+	data, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body["assistant_message"], &snapshot); err != nil ||
+		snapshot.ID != message.ID || snapshot.Status != "streaming" {
+		t.Fatalf("assistant_message JSON = %s, err=%v", body["assistant_message"], err)
+	}
+
+	invalid := value
+	invalidMessage := message
+	invalidMessage.TaskID = "q8765432"
+	invalid.AssistantMessage = &app.AssistantMessageSnapshot{Message: invalidMessage, Status: app.AssistantMessageStreaming}
+	if _, err := toTaskResponse(invalid); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("mismatched assistant Task error = %v, want internal", err)
+	}
+	invalid = value
+	invalid.AssistantMessage = &app.AssistantMessageSnapshot{Message: message, Status: app.AssistantMessageStatus("unknown")}
+	if _, err := toTaskResponse(invalid); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("unknown assistant snapshot status error = %v, want internal", err)
+	}
+}
+
 func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 	now := time.Now().UTC()
 	value := app.TaskDetails{
@@ -417,6 +468,35 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 	if !kinds["subagent"] || !kinds["clarification"] || body.ClarificationRequest == nil ||
 		body.ClarificationRequest.ID != clarificationID || body.ClarificationRequest.Question != "Which environment?" {
 		t.Fatalf("GET task omitted child/clarification contract: %#v", body)
+	}
+}
+
+func TestGetTaskIncludesSnapshotEventSequence(t *testing.T) {
+	taskValue := apiTestTask()
+	taskValue.EventSequence = 42
+	service := &taskServiceStub{getDetails: &app.TaskDetails{Task: taskValue}}
+	engine := taskAPIRouter(service, nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskValue.ID, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET task status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		EventSequence int64 `json:"event_sequence"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.EventSequence != taskValue.EventSequence {
+		t.Fatalf("event_sequence=%d, want %d", body.EventSequence, taskValue.EventSequence)
+	}
+
+	taskValue.EventSequence = -1
+	service.getDetails.Task = taskValue
+	response = httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/"+taskValue.ID, nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("negative event_sequence status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

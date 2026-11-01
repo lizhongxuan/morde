@@ -11,11 +11,11 @@ vi.mock('../app/api', async (importOriginal) => {
   return { ...original, portalApi: { ...original.portalApi, changePassword: vi.fn() } };
 });
 
-function renderPage() {
+function renderPage(initialEntry = '/admin/change-password', loginPath = '/admin/login') {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
   client.setQueryData(['auth', 'me'], { id: 'uadmin01', name: 'admin', role: 'super_admin' });
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/admin/change-password']}><Routes>
-    <Route path="/admin/change-password" element={<ChangePassword />} />
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[initialEntry]}><Routes>
+    <Route path={initialEntry} element={<ChangePassword loginPath={loginPath} />} />
   </Routes></MemoryRouter></QueryClientProvider>);
   return client;
 }
@@ -49,6 +49,18 @@ describe('change password page', () => {
     expect(await screen.findByRole('heading', { name: '密码已修改' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '前往管理后台登录' })).toHaveAttribute('href', '/admin/login');
     expect(client.getQueryData(['auth', 'me'])).toBeNull();
+  });
+
+  it('directs a PC user to the user login after changing the password', async () => {
+    const input = userEvent.setup();
+    vi.spyOn(portalApi, 'changePassword').mockResolvedValue(undefined);
+    renderPage('/settings/password', '/login');
+    await input.type(screen.getByLabelText('当前密码'), 'old-password');
+    await input.type(screen.getByLabelText('新密码'), 'new-password-1');
+    await input.type(screen.getByLabelText('确认新密码'), 'new-password-1');
+    await input.click(screen.getByRole('button', { name: '修改密码' }));
+
+    expect(await screen.findByRole('link', { name: '前往登录' })).toHaveAttribute('href', '/login');
   });
 
   it('keeps the form and reports server errors', async () => {

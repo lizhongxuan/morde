@@ -75,6 +75,7 @@ type TaskService struct {
 	executionAuthorizer TaskExecutionAuthorizer
 	models              ConfiguredModelCatalog
 	actions             TaskActionRequester
+	viewDeletions       TaskWorkspaceViewDeletionStore
 }
 
 func NewTaskService(store TaskStore, authorizer TaskAuthorizer, models ConfiguredModelCatalog) (*TaskService, error) {
@@ -83,7 +84,8 @@ func NewTaskService(store TaskStore, authorizer TaskAuthorizer, models Configure
 		return nil, domain.NewError(domain.CodeInvalidArgument, "task service dependencies are required")
 	}
 	actions, _ := store.(TaskActionRequester)
-	return &TaskService{store: store, authorizer: authorizer, executionAuthorizer: executionAuthorizer, models: models, actions: actions}, nil
+	viewDeletions, _ := store.(TaskWorkspaceViewDeletionStore)
+	return &TaskService{store: store, authorizer: authorizer, executionAuthorizer: executionAuthorizer, models: models, actions: actions, viewDeletions: viewDeletions}, nil
 }
 
 func (s *TaskService) workspaceInputSnapshot(ctx context.Context, ownerID, hostID, workspaceID string, requestedRevision *int64) (*int64, []byte, error) {

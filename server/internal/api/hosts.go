@@ -23,22 +23,24 @@ type hostListResponse struct {
 }
 
 type hostResponse struct {
-	ID                string                     `json:"id"`
-	Name              string                     `json:"name"`
-	OwnerID           string                     `json:"owner_id"`
-	TemplateID        string                     `json:"template_id"`
-	Isolation         string                     `json:"isolation"`
-	State             host.State                 `json:"state"`
-	StateReason       string                     `json:"state_reason"`
-	RuntimeGeneration int64                      `json:"runtime_generation"`
-	ControlVersion    int64                      `json:"control_version"`
-	ControlState      host.ControlState          `json:"control_state"`
-	URL               string                     `json:"url"`
-	Workspaces        []workspaceBindingResponse `json:"workspaces"`
-	Resources         resourcesResponse          `json:"resources"`
-	ExpiresAt         *time.Time                 `json:"expires_at"`
-	LastActiveAt      *time.Time                 `json:"last_active_at"`
-	CreatedAt         time.Time                  `json:"created_at"`
+	ID                         string                     `json:"id"`
+	Name                       string                     `json:"name"`
+	OwnerID                    string                     `json:"owner_id"`
+	TemplateID                 string                     `json:"template_id"`
+	Isolation                  string                     `json:"isolation"`
+	State                      host.State                 `json:"state"`
+	StateReason                string                     `json:"state_reason"`
+	RuntimeGeneration          int64                      `json:"runtime_generation"`
+	WorkspaceRuntimeOnline     *bool                      `json:"workspace_runtime_online,omitempty"`
+	WorkspaceRuntimeLastSeenAt *time.Time                 `json:"workspace_runtime_last_seen_at,omitempty"`
+	ControlVersion             int64                      `json:"control_version"`
+	ControlState               host.ControlState          `json:"control_state"`
+	URL                        string                     `json:"url"`
+	Workspaces                 []workspaceBindingResponse `json:"workspaces"`
+	Resources                  resourcesResponse          `json:"resources"`
+	ExpiresAt                  *time.Time                 `json:"expires_at"`
+	LastActiveAt               *time.Time                 `json:"last_active_at"`
+	CreatedAt                  time.Time                  `json:"created_at"`
 }
 
 type workspaceRef struct {
@@ -501,7 +503,8 @@ func (h *api) hostView(item host.Host) (hostResponse, error) {
 		if !domain.ValidWorkspaceID(workspaceItem.ID) || !domain.ValidUserID(workspaceItem.OwnerID) || binding.HostID != item.ID || binding.OwnerID != item.OwnerID ||
 			workspaceItem.Name == "" || workspaceItem.Revision < 0 || workspaceItem.UsedBytes < 0 || !validWorkspaceState(workspaceItem.State) ||
 			!domain.ValidWorkspaceID(binding.Directory) || !validWorkspaceBindingState(binding.State) || binding.BindingVersion < 1 ||
-			binding.DesiredRevision < 0 || binding.AppliedRevision < 0 {
+			binding.DesiredRevision < 0 || binding.AppliedRevision < 0 ||
+			workspace.ValidateBindingSyncStatus(binding.SyncState, binding.SyncConflicts) != nil {
 			return hostResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		if _, exists := seenWorkspaceIDs[workspaceItem.ID]; exists {
@@ -519,21 +522,29 @@ func (h *api) hostView(item host.Host) (hostResponse, error) {
 			},
 			Directory: binding.Directory, State: binding.State, BindingVersion: binding.BindingVersion,
 			DesiredRevision: binding.DesiredRevision, AppliedRevision: binding.AppliedRevision,
+			SyncState: binding.SyncState, SyncConflicts: append([]string{}, binding.SyncConflicts...),
 		})
 	}
+	var workspaceRuntimeOnline *bool
+	if item.WorkspaceRuntimeLivenessKnown {
+		online := item.WorkspaceRuntimeOnline
+		workspaceRuntimeOnline = &online
+	}
 	return hostResponse{
-		ID:                item.ID,
-		Name:              item.Name,
-		OwnerID:           item.OwnerID,
-		TemplateID:        item.TemplateID,
-		Isolation:         item.RuntimeProfile,
-		State:             item.State,
-		StateReason:       item.StateReason,
-		RuntimeGeneration: item.RuntimeGeneration,
-		ControlVersion:    item.ControlVersion,
-		ControlState:      item.ControlState,
-		URL:               h.hostURL(item.ID),
-		Workspaces:        workspaces,
+		ID:                         item.ID,
+		Name:                       item.Name,
+		OwnerID:                    item.OwnerID,
+		TemplateID:                 item.TemplateID,
+		Isolation:                  item.RuntimeProfile,
+		State:                      item.State,
+		StateReason:                item.StateReason,
+		RuntimeGeneration:          item.RuntimeGeneration,
+		WorkspaceRuntimeOnline:     workspaceRuntimeOnline,
+		WorkspaceRuntimeLastSeenAt: item.WorkspaceRuntimeLastSeenAt,
+		ControlVersion:             item.ControlVersion,
+		ControlState:               item.ControlState,
+		URL:                        h.hostURL(item.ID),
+		Workspaces:                 workspaces,
 		Resources: resourcesResponse{
 			CPUMilli:      item.CPUMilli,
 			MemMiB:        item.MemMiB,

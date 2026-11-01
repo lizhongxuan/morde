@@ -117,6 +117,13 @@ func (s *hostReplicaService) ListBindings(ctx context.Context, principal identit
 	if err := s.verifyPrincipal(ctx, principal); err != nil {
 		return nil, err
 	}
+	liveness, ok := s.hosts.(HostReplicaLivenessStore)
+	if !ok {
+		return nil, domain.NewError(domain.CodeInternal, "Host Runtime liveness store is unavailable")
+	}
+	if err := liveness.RecordHostReplicaHeartbeat(ctx, principal.HostScope, principal.HostGeneration); err != nil {
+		return nil, fmt.Errorf("record Host Runtime heartbeat: %w", err)
+	}
 	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, principal.HostScope)
 	if err != nil {
 		return nil, err

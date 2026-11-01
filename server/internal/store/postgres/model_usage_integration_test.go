@@ -162,7 +162,7 @@ func TestPostgresModelGatewayHTTPSettlesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientLogin, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "model-http-login-01", "127.0.0.1")
+	clientLogin, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "model-http-login-01", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func modelUsageFixture(t *testing.T) (*Store, identity.Principal, app.ModelCallR
 	t.Helper()
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
-	login, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "model-login-0001", "127.0.0.1")
+	login, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "model-login-0001", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}

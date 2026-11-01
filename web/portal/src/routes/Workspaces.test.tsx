@@ -12,7 +12,7 @@ vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567' } }) })
 
 const workspace: components['schemas']['Workspace'] = { id: 'w1234567', name: '项目工作区', revision: 2, used_bytes: 4096, quota_bytes: 1024 * 1024, state: 'ready', created_at: '', updated_at: '' };
 const host: components['schemas']['Host'] = {
-  id: 'h1234567', name: '开发电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '',
+  id: 'h1234567', name: '开发电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', workspace_runtime_online: true, url: '',
   workspaces: [], resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
 };
 const binding: components['schemas']['WorkspaceBinding'] = {
@@ -26,7 +26,7 @@ const deviceProgress: components['schemas']['DeviceWorkspaceSyncProgress'] = {
   download_actions_total: 3, download_actions_done: 2, updated_at: '2026-10-24T00:00:00Z',
 };
 const deviceProgressSummary = { revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
-  remaining_bytes: workspace.quota_bytes - workspace.used_bytes, quota_status: 'available' as const };
+  remaining_bytes: workspace.quota_bytes - workspace.used_bytes, quota_status: 'available' as const, quota_pauses: [] };
 
 function renderWorkspaces() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });

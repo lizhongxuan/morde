@@ -14,6 +14,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/execution"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
@@ -126,8 +127,13 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err != nil {
 			return err
 		}
+		assistantMessage, err := readAssistantMessageSnapshot(ctx, tx, row)
+		if err != nil {
+			return err
+		}
 		result = app.TaskDetails{
-			Task: rowTaskDomain(row), ScheduleObservation: scheduleObservation, Steps: mapRows(steps, taskStepDomain),
+			Task: rowTaskDomain(row), AssistantMessage: assistantMessage,
+			ScheduleObservation: scheduleObservation, Steps: mapRows(steps, taskStepDomain),
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
 			PendingRequest: pendingRequest, ClarificationRequests: clarifications,
 			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs,
@@ -269,6 +275,9 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 		if err := insertTaskEvent(ctx, tx, event); err != nil {
 			return err
 		}
+		if err := appendAssistantMessageSnapshot(ctx, tx, delta); err != nil {
+			return err
+		}
 		if err := tx.QueryRow(ctx, `SELECT created_at FROM task_events WHERE task_id=$1 AND sequence=$2`, delta.TaskID, sequence).Scan(&event.CreatedAt); err != nil {
 			return fmt.Errorf("read assistant text event time: %w", err)
 		}
@@ -276,6 +285,125 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 		return nil
 	})
 	return result, err
+}
+
+func readAssistantMessageSnapshot(ctx context.Context, tx pgx.Tx, taskRow sqlcgen.Task) (*app.AssistantMessageSnapshot, error) {
+	var messageID, turnID, content, rawStatus string
+	var sequence pgtype.Int8
+	var createdAt time.Time
+	err := tx.QueryRow(ctx, `SELECT message_id, turn_id, content, status, message_sequence, created_at
+FROM task_assistant_message_snapshots WHERE task_id=$1`, taskRow.ID).
+		Scan(&messageID, &turnID, &content, &rawStatus, &sequence, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read assistant message snapshot: %w", err)
+	}
+	status := app.AssistantMessageStatus(rawStatus)
+	switch status {
+	case app.AssistantMessageStreaming, app.AssistantMessageCompleted, app.AssistantMessageInterrupted:
+	default:
+		return nil, domain.NewError(domain.CodeInvalidState, "assistant message snapshot status is invalid")
+	}
+	// A task may be stopped outside CommitTaskProgress (for example, a user
+	// cancellation), or its worker lease may expire before another worker
+	// claims it. Never expose unfinished text as live in either case.
+	if status == app.AssistantMessageStreaming {
+		var activeLease bool
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(status='running' AND lease_expires_at > clock_timestamp(), false)
+FROM tasks WHERE id=$1`, taskRow.ID).Scan(&activeLease); err != nil {
+			return nil, fmt.Errorf("check assistant message task lease: %w", err)
+		}
+		if taskRow.Status != string(task.StatusRunning) || !activeLease {
+			status = app.AssistantMessageInterrupted
+		}
+	}
+	message := conversation.Message{
+		ID: messageID, ConversationID: taskRow.ConversationID, OwnerID: taskRow.OwnerID,
+		Role: conversation.RoleAssistant, Content: content, TaskID: taskRow.ID,
+		ModelID: taskRow.ModelID, SourceKind: "task", CreatedAt: createdAt,
+	}
+	if sequence.Valid {
+		message.Sequence = sequence.Int64
+	}
+	return &app.AssistantMessageSnapshot{Message: message, Status: status}, nil
+}
+
+func appendAssistantMessageSnapshot(ctx context.Context, tx pgx.Tx, delta app.AssistantTextDelta) error {
+	var messageID, turnID, content, status string
+	err := tx.QueryRow(ctx, `SELECT message_id, turn_id, content, status
+FROM task_assistant_message_snapshots WHERE task_id=$1 FOR UPDATE`, delta.TaskID).
+		Scan(&messageID, &turnID, &content, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err := tx.Exec(ctx, `INSERT INTO task_assistant_message_snapshots
+(task_id, message_id, turn_id, content, status)
+VALUES ($1,$2,$3,$4,'streaming')`, delta.TaskID, delta.MessageID, delta.TurnID, delta.Delta)
+		if err != nil {
+			return fmt.Errorf("create assistant message snapshot: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock assistant message snapshot: %w", err)
+	}
+	if messageID == delta.MessageID {
+		if turnID != delta.TurnID || status != string(app.AssistantMessageStreaming) {
+			return domain.NewError(domain.CodeInvalidState, "assistant message snapshot identity is already finalized")
+		}
+		if len(content)+len(delta.Delta) > app.MaxAssistantMessageBytes {
+			return domain.InvalidArgument("text_delta", "assistant message exceeds the size limit")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_assistant_message_snapshots
+SET content=content || $2, updated_at=clock_timestamp()
+WHERE task_id=$1 AND message_id=$3 AND turn_id=$4 AND status='streaming'`,
+			delta.TaskID, delta.Delta, delta.MessageID, delta.TurnID); err != nil {
+			return fmt.Errorf("append assistant message snapshot: %w", err)
+		}
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE task_assistant_message_snapshots
+SET message_id=$2, turn_id=$3, content=$4, status='streaming', message_sequence=NULL,
+created_at=clock_timestamp(), updated_at=clock_timestamp()
+WHERE task_id=$1`, delta.TaskID, delta.MessageID, delta.TurnID, delta.Delta); err != nil {
+		return fmt.Errorf("replace assistant message snapshot: %w", err)
+	}
+	return nil
+}
+
+func completeAssistantMessageSnapshot(ctx context.Context, tx pgx.Tx, taskID, turnID string, message conversation.Message) error {
+	var sequence int64
+	var createdAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT sequence, created_at FROM conversation_messages
+WHERE id=$1 AND conversation_id=$2 AND owner_id=$3 AND task_id=$4`,
+		message.ID, message.ConversationID, message.OwnerID, taskID).Scan(&sequence, &createdAt); err != nil {
+		return fmt.Errorf("read completed assistant message metadata: %w", err)
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO task_assistant_message_snapshots
+(task_id, message_id, turn_id, content, status, message_sequence, created_at, updated_at)
+VALUES ($1,$2,$3,$4,'completed',$5,$6,clock_timestamp())
+ON CONFLICT (task_id) DO UPDATE SET message_id=EXCLUDED.message_id, turn_id=EXCLUDED.turn_id,
+content=EXCLUDED.content, status='completed', message_sequence=EXCLUDED.message_sequence,
+created_at=EXCLUDED.created_at, updated_at=clock_timestamp()`,
+		taskID, message.ID, turnID, message.Content, sequence, createdAt)
+	if err != nil {
+		return fmt.Errorf("complete assistant message snapshot: %w", err)
+	}
+	return nil
+}
+
+func interruptAssistantMessageSnapshot(ctx context.Context, tx pgx.Tx, taskID, turnID string, allStreaming bool) error {
+	query := `UPDATE task_assistant_message_snapshots SET status='interrupted', updated_at=clock_timestamp()
+WHERE task_id=$1 AND status='streaming'`
+	args := []any{taskID}
+	if !allStreaming {
+		query += ` AND turn_id=$2`
+		args = append(args, turnID)
+	}
+	if _, err := tx.Exec(ctx, query, args...); err != nil {
+		return fmt.Errorf("interrupt assistant message snapshot: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ClaimNextTask(ctx context.Context, worker string, leaseDuration time.Duration) (task.Task, bool, error) {
@@ -307,7 +435,18 @@ func (s *Store) claimNextTask(ctx context.Context, worker string, leaseDuration 
 		var taskEpoch int64
 		err := tx.QueryRow(ctx, `
 SELECT t.owner_id, t.execution_epoch FROM tasks AS t
-WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()))
+WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
+  (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
+    SELECT 1 FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
+    WHERE wb.host_id=t.host_id AND wb.workspace_id=t.workspace_id
+      AND wb.state='active'
+      AND wb.sync_state='healthy'
+      AND wb.desired_revision>=t.workspace_checkpoint_revision AND wb.applied_revision>=t.workspace_checkpoint_revision
+      AND w.state='ready' AND w.deleted_at IS NULL AND w.revision=t.workspace_checkpoint_revision
+      AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=t.host_id AND h.owner_id=t.owner_id AND h.state='running' AND h.deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
+          AND hb.last_seen_at > clock_timestamp() - $2::double precision * interval '1 second'))
+  )))
   AND t.execution_location='server'
   AND ($1::integer = 0 OR (
     SELECT count(*) FROM tasks AS active_task
@@ -328,7 +467,7 @@ WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_
       AND h.state<>'deleted' AND h.deleted_at IS NULL
   ))
 ORDER BY t.created_at, t.id
-LIMIT 1`, maxActivePerOwner).Scan(&ownerID, &taskEpoch)
+LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&ownerID, &taskEpoch)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -359,7 +498,18 @@ LIMIT 1`, maxActivePerOwner).Scan(&ownerID, &taskEpoch)
 		err = tx.QueryRow(ctx, `
 SELECT t.id, COALESCE(t.host_id,''), t.lease_version FROM tasks AS t
 WHERE t.owner_id=$1 AND t.execution_epoch=$2
-  AND (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()))
+  AND (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
+    (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
+      SELECT 1 FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
+      WHERE wb.host_id=t.host_id AND wb.workspace_id=t.workspace_id
+        AND wb.state='active'
+        AND wb.sync_state='healthy'
+        AND wb.desired_revision>=t.workspace_checkpoint_revision AND wb.applied_revision>=t.workspace_checkpoint_revision
+        AND w.state='ready' AND w.deleted_at IS NULL AND w.revision=t.workspace_checkpoint_revision
+        AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=t.host_id AND h.owner_id=t.owner_id AND h.state='running' AND h.deleted_at IS NULL
+          AND EXISTS (SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
+            AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'))
+    )))
   AND t.execution_location='server'
   AND EXISTS (
     SELECT 1 FROM owner_execution_controls AS ec
@@ -371,7 +521,7 @@ WHERE t.owner_id=$1 AND t.execution_epoch=$2
       AND h.state<>'deleted' AND h.deleted_at IS NULL
   ))
 ORDER BY t.created_at, t.id
-LIMIT 1 FOR UPDATE SKIP LOCKED`, ownerID, gate.epoch).Scan(&id, &hostID, &oldVersion)
+LIMIT 1 FOR UPDATE SKIP LOCKED`, ownerID, gate.epoch, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&id, &hostID, &oldVersion)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -412,6 +562,15 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 			}
 			return nil
 		}
+		if taskRow.Status == string(task.StatusWaitingUser) && taskRow.WaitingReason == task.WaitingReasonWorkspaceHostSync {
+			ready, err := workspaceTaskHostSyncReady(ctx, tx, taskRow)
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return nil
+			}
+		}
 		found = true
 		if oldVersion == int64(^uint64(0)>>1) {
 			return domain.NewError(domain.CodeInvalidState, "task lease version is exhausted")
@@ -422,6 +581,11 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_operations SET lease_version=$2, updated_at=clock_timestamp() WHERE task_id=$1 AND status='unknown'`, id, newVersion); err != nil {
 			return fmt.Errorf("adopt unknown operations: %w", err)
+		}
+		if oldVersion > 0 {
+			if err := interruptAssistantMessageSnapshot(ctx, tx, id, "", true); err != nil {
+				return err
+			}
 		}
 		var operationKeys []string
 		rows, err := tx.Query(ctx, `SELECT operation_key FROM task_operations WHERE task_id=$1 AND status='unknown' AND lease_version=$2 ORDER BY operation_key`, id, newVersion)
@@ -442,7 +606,7 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 		}
 		rows.Close()
 		var eventSequence int64
-		err = tx.QueryRow(ctx, `UPDATE tasks SET status='running', lease_owner=$2, lease_version=$3,
+		err = tx.QueryRow(ctx, `UPDATE tasks SET status='running', waiting_reason='', lease_owner=$2, lease_version=$3,
 lease_expires_at=clock_timestamp()+($4::bigint * interval '1 millisecond'),
 runtime_lease_safe_after=GREATEST(COALESCE(runtime_lease_safe_after, '-infinity'::timestamptz), clock_timestamp()+($4::bigint * interval '1 millisecond')),
 updated_at=clock_timestamp(),
@@ -612,6 +776,51 @@ WHERE id=$1 AND owner_id=$2 FOR SHARE`, installationID.String, value.OwnerID).Sc
 	return true, nil
 }
 
+func workspaceTaskHostSyncReady(ctx context.Context, tx pgx.Tx, value sqlcgen.Task) (bool, error) {
+	if !value.HostID.Valid || !value.WorkspaceID.Valid || !value.WorkspaceCheckpointRevision.Valid {
+		return false, nil
+	}
+	var hostRunning bool
+	var runtimeGeneration int64
+	if err := tx.QueryRow(ctx, `SELECT state='running' AND deleted_at IS NULL, runtime_generation FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, value.HostID.String, value.OwnerID).
+		Scan(&hostRunning, &runtimeGeneration); errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("check target Host before resuming Workspace Task: %w", err)
+	}
+	if !hostRunning {
+		return false, nil
+	}
+	var workspaceReady bool
+	var workspaceRevision int64
+	if err := tx.QueryRow(ctx, `SELECT state='ready' AND deleted_at IS NULL, revision FROM workspaces WHERE id=$1 FOR SHARE`, value.WorkspaceID.String).
+		Scan(&workspaceReady, &workspaceRevision); errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lock Workspace before resuming Workspace Task: %w", err)
+	}
+	var bindingState, syncState string
+	var desiredRevision, appliedRevision int64
+	if err := tx.QueryRow(ctx, `SELECT state, sync_state, desired_revision, applied_revision FROM workspace_bindings
+WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, value.HostID.String, value.WorkspaceID.String).
+		Scan(&bindingState, &syncState, &desiredRevision, &appliedRevision); errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lock Host Workspace binding before resuming Task: %w", err)
+	}
+	var heartbeatFresh bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM host_runtime_heartbeats hb
+  WHERE hb.host_id=$1 AND hb.runtime_generation=$2
+    AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'
+)`, value.HostID.String, runtimeGeneration, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&heartbeatFresh); err != nil {
+		return false, fmt.Errorf("check Host Runtime heartbeat before resuming Workspace Task: %w", err)
+	}
+	return workspaceReady && workspaceRevision == value.WorkspaceCheckpointRevision.Int64 && bindingState == string(workspace.BindingActive) &&
+		syncState == string(workspace.BindingSyncHealthy) &&
+		desiredRevision >= value.WorkspaceCheckpointRevision.Int64 && appliedRevision >= value.WorkspaceCheckpointRevision.Int64 && heartbeatFresh, nil
+}
+
 func requestTaskCancellationForAuthorization(ctx context.Context, tx pgx.Tx, taskID, ownerID string) error {
 	var status task.Status
 	var leaseVersion int64
@@ -745,6 +954,7 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 		}
 	}
 	var result task.Event
+	var authorizationDenied bool
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		if message := progress.AssistantMessage; message != nil {
 			// AppendMessage locks the conversation first; use the same order so
@@ -825,6 +1035,86 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			(progress.Usage.ModelTokens != nil && *progress.Usage.ModelTokens > currentTask.Budget.ModelTokens) {
 			return domain.NewError(domain.CodeQuotaExceeded, "task budget exceeded")
 		}
+		var workspaceRuntimeGeneration int64
+		if progress.Status == task.StatusCompleted && current.WorkspaceID.Valid {
+			authorized, err := requireCurrentTaskAuthorization(ctx, tx, current)
+			if err != nil {
+				return err
+			}
+			if !authorized {
+				if err := requestTaskCancellationForAuthorization(ctx, tx, progress.TaskID, current.OwnerID); err != nil {
+					return err
+				}
+				authorizationDenied = true
+				return nil
+			}
+			if !current.WorkspaceCheckpointRevision.Valid || !current.HostID.Valid {
+				return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace checkpoint is unavailable")
+			}
+			var hostReady bool
+			err = tx.QueryRow(ctx, `SELECT h.state='running' AND h.deleted_at IS NULL AND EXISTS (
+  SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
+    AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'
+), h.runtime_generation FROM hosts AS h WHERE h.id=$1 AND h.owner_id=$2 FOR SHARE`,
+				current.HostID.String, current.OwnerID, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&hostReady, &workspaceRuntimeGeneration)
+			if errors.Is(err, pgx.ErrNoRows) {
+				err = nil
+			}
+			if err != nil {
+				return fmt.Errorf("lock target Host before task completion: %w", err)
+			}
+			var revision int64
+			err = tx.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1 FOR SHARE`, current.WorkspaceID.String).Scan(&revision)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeWorkspaceConflict, "Workspace was removed after this task input was confirmed")
+			}
+			if err != nil {
+				return fmt.Errorf("read Workspace before task completion: %w", err)
+			}
+			if revision != current.WorkspaceCheckpointRevision.Int64 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task checkpoint was confirmed")
+			}
+			appliedRevision, desiredRevision := int64(-1), int64(-1)
+			var bindingActive, bindingHealthy bool
+			err = tx.QueryRow(ctx, `SELECT applied_revision, desired_revision, state='active', sync_state='healthy' FROM workspace_bindings
+WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.WorkspaceID.String).
+				Scan(&appliedRevision, &desiredRevision, &bindingActive, &bindingHealthy)
+			if errors.Is(err, pgx.ErrNoRows) {
+				err = nil
+			}
+			if err != nil {
+				return fmt.Errorf("read target Host Workspace binding receipt: %w", err)
+			}
+			var heartbeatFresh bool
+			err = tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM host_runtime_heartbeats hb
+  WHERE hb.host_id=$1 AND hb.runtime_generation=$2
+    AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'
+)`, current.HostID.String, workspaceRuntimeGeneration, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&heartbeatFresh)
+			if err != nil {
+				return fmt.Errorf("recheck Host Runtime heartbeat before task completion: %w", err)
+			}
+			if !hostReady || !heartbeatFresh || !bindingActive || !bindingHealthy || desiredRevision < current.WorkspaceCheckpointRevision.Int64 || appliedRevision < current.WorkspaceCheckpointRevision.Int64 {
+				progress.Status = task.StatusWaitingUser
+				progress.WaitingReason = task.WaitingReasonWorkspaceHostSync
+				progress.Result = current.Result
+				progress.Artifacts = nil
+				progress.Event.Type = "task.waiting_user"
+				for i := range progress.Steps {
+					if progress.Steps[i].ID == progress.CurrentStep {
+						progress.Steps[i].Status = task.StepWaitingUser
+						progress.Steps[i].Summary = "Waiting for the target Host to apply the saved Workspace revision."
+					}
+				}
+				eventPayload, err = json.Marshal(map[string]any{
+					"status": string(task.StatusWaitingUser), "reason": task.WaitingReasonWorkspaceHostSync,
+					"required_revision": current.WorkspaceCheckpointRevision.Int64, "applied_revision": appliedRevision,
+				})
+				if err != nil {
+					return fmt.Errorf("encode Workspace Host sync wait event: %w", err)
+				}
+			}
+		}
 		observationOutcome, observationConfigured, err := commitScheduleObservation(ctx, tx, progress)
 		if err != nil {
 			return err
@@ -875,22 +1165,6 @@ WHERE task_steps.task_id=EXCLUDED.task_id AND task_steps.sequence=EXCLUDED.seque
 			}
 		}
 		if progress.Status == task.StatusCompleted {
-			if current.WorkspaceID.Valid {
-				if !current.WorkspaceCheckpointRevision.Valid {
-					return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace checkpoint is unavailable")
-				}
-				var revision int64
-				err := tx.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1 FOR SHARE`, current.WorkspaceID.String).Scan(&revision)
-				if errors.Is(err, pgx.ErrNoRows) {
-					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace was removed after this task input was confirmed")
-				}
-				if err != nil {
-					return fmt.Errorf("read Workspace before task completion: %w", err)
-				}
-				if revision != current.WorkspaceCheckpointRevision.Int64 {
-					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task checkpoint was confirmed")
-				}
-			}
 			var unsettledChild bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (
 SELECT 1 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
@@ -908,18 +1182,37 @@ WHERE s.task_id=$1 AND s.parent_session_id IS NOT NULL AND st.status IN ('queued
 			}
 		}
 		finished := progress.Status == task.StatusCompleted || progress.Status == task.StatusFailed || progress.Status == task.StatusCancelled
+		workspaceCompletionHeartbeatRequired := progress.Status == task.StatusCompleted && current.WorkspaceID.Valid
 		var sequence int64
-		err = tx.QueryRow(ctx, `UPDATE tasks SET status=$4, current_step=$5, result=$6, waiting_reason=$7,
+		err = tx.QueryRow(ctx, `WITH completion_clock AS MATERIALIZED (
+  -- Align the final Host freshness check with the completion timestamp.
+  SELECT clock_timestamp() AS checked_at
+)
+UPDATE tasks SET status=$4, current_step=$5, result=$6, waiting_reason=$7,
 usage_active_seconds=$8, usage_tool_calls=$9,
 usage_model_tokens=CASE WHEN execution_location='server' THEN usage_model_tokens ELSE $10 END,
 lease_owner=CASE WHEN $4='running' THEN lease_owner ELSE '' END,
 lease_expires_at=CASE WHEN $4='running' THEN lease_expires_at ELSE NULL END,
-finished_at=CASE WHEN $11 THEN clock_timestamp() WHEN $4='running' THEN NULL ELSE finished_at END,
+finished_at=CASE WHEN $11 AND $12::boolean THEN completion_clock.checked_at WHEN $11 THEN clock_timestamp() WHEN $4='running' THEN NULL ELSE finished_at END,
 event_seq=event_seq+1, updated_at=clock_timestamp()
-WHERE id=$1 AND lease_owner=$2 AND lease_version=$3 RETURNING event_seq`,
+
+FROM completion_clock
+WHERE id=$1 AND lease_owner=$2 AND lease_version=$3
+  AND (NOT $12::boolean OR EXISTS (
+    SELECT 1 FROM hosts h JOIN host_runtime_heartbeats hb
+      ON hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
+    WHERE h.id=$13::text AND h.owner_id=$14::text AND h.runtime_generation=$15::bigint
+      AND h.state='running' AND h.deleted_at IS NULL
+      AND hb.last_seen_at > completion_clock.checked_at - $16::double precision * interval '1 second'
+  ))
+RETURNING event_seq`,
 			progress.TaskID, progress.LeaseOwner, progress.LeaseVersion, string(progress.Status), progress.CurrentStep,
 			progress.Result, progress.WaitingReason, progress.Usage.ActiveSeconds, progress.Usage.ToolCalls,
-			taskUsageTokens(progress.Usage.ModelTokens), finished).Scan(&sequence)
+			taskUsageTokens(progress.Usage.ModelTokens), finished, workspaceCompletionHeartbeatRequired,
+			current.HostID.String, current.OwnerID, workspaceRuntimeGeneration, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&sequence)
+		if errors.Is(err, pgx.ErrNoRows) && workspaceCompletionHeartbeatRequired {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Host Runtime heartbeat expired before Workspace Task completion")
+		}
 		if err != nil {
 			return fmt.Errorf("commit task progress: %w", err)
 		}
@@ -949,11 +1242,30 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending')`, clarification.ID, clarification.TaskID, c
 		if err := insertTaskEvent(ctx, tx, progress.Event); err != nil {
 			return err
 		}
+		if progress.AssistantMessage == nil {
+			if progress.Status != task.StatusRunning {
+				if err := interruptAssistantMessageSnapshot(ctx, tx, progress.TaskID, "", true); err != nil {
+					return err
+				}
+			} else {
+				for _, step := range progress.Steps {
+					if step.ID == progress.CurrentStep && (step.Status == task.StepFailed || step.Status == task.StepUnknown || step.Status == task.StepWaitingUser) {
+						if err := interruptAssistantMessageSnapshot(ctx, tx, progress.TaskID, step.ID, false); err != nil {
+							return err
+						}
+						break
+					}
+				}
+			}
+		}
 		if message := progress.AssistantMessage; message != nil {
 			if message.OwnerID != current.OwnerID || message.ConversationID != current.ConversationID {
 				return domain.InvalidArgument("assistant_message", "assistant message does not belong to the task")
 			}
 			if err := insertMessage(ctx, tx, *message); err != nil {
+				return err
+			}
+			if err := completeAssistantMessageSnapshot(ctx, tx, progress.TaskID, progress.CurrentStep, *message); err != nil {
 				return err
 			}
 			messagePayload, err := json.Marshal(map[string]any{
@@ -984,6 +1296,9 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 		result = task.Event{TaskID: progress.TaskID, Sequence: sequence, Type: progress.Event.Type, Payload: eventPayload, CreatedAt: createdAt}
 		return nil
 	})
+	if err == nil && authorizationDenied {
+		return task.Event{}, taskLeaseConflict()
+	}
 	return result, err
 }
 

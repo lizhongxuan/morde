@@ -39,6 +39,7 @@ type TaskListRequest struct {
 
 type TaskDetails struct {
 	Task                  task.Task
+	AssistantMessage      *AssistantMessageSnapshot
 	ScheduleObservation   *schedule.ObservationSpec
 	Steps                 []task.Step
 	BatchItems            []task.BatchItem
@@ -47,6 +48,22 @@ type TaskDetails struct {
 	ClarificationRequests []task.ClarificationRequest
 	StopRequest           *task.StopRequest
 	StopOperationIDs      []string
+}
+
+type AssistantMessageStatus string
+
+const (
+	AssistantMessageStreaming   AssistantMessageStatus = "streaming"
+	AssistantMessageCompleted   AssistantMessageStatus = "completed"
+	AssistantMessageInterrupted AssistantMessageStatus = "interrupted"
+)
+
+// AssistantMessageSnapshot is the latest assistant model turn for a Task.
+// Streaming text survives event-cursor expiry; the final conversation message
+// replaces the streamed text under the same message ID.
+type AssistantMessageSnapshot struct {
+	Message conversation.Message   `json:"message"`
+	Status  AssistantMessageStatus `json:"status"`
 }
 
 type TaskActionResult struct {
@@ -157,6 +174,18 @@ type TaskEventPage struct {
 	Status          task.Status
 	CurrentSequence int64
 	Items           []task.Event
+}
+
+type TaskWorkspaceViewDeletion struct {
+	ID, TaskID, HostID string
+	Status             string
+}
+
+type TaskWorkspaceViewDeletionStore interface {
+	RequestTaskWorkspaceViewDeletion(context.Context, IdempotencyRecord, string) (TaskWorkspaceViewDeletion, error)
+	GetTaskWorkspaceViewDeletion(context.Context, string, string) (TaskWorkspaceViewDeletion, error)
+	ListPendingTaskWorkspaceViewDeletions(context.Context, string, string, int64) ([]TaskWorkspaceViewDeletion, error)
+	CompleteTaskWorkspaceViewDeletion(context.Context, string, string, int64, string, string) (TaskWorkspaceViewDeletion, error)
 }
 
 // TaskStore owns atomic task submission, per-task event sequencing and worker leases.

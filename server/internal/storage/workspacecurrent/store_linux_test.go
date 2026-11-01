@@ -136,7 +136,8 @@ func TestMatchesManifestDetectsCurrentProjectionDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	ownerDigest := sha256.Sum256([]byte("u1234567"))
-	target := filepath.Join(root, hex.EncodeToString(ownerDigest[:]), "w1234567")
+	ownerHash := hex.EncodeToString(ownerDigest[:])
+	target := filepath.Join(root, ownerHash, "w1234567")
 	assertMatch := func(want bool) {
 		t.Helper()
 		matches, err := store.MatchesManifest(context.Background(), "u1234567", "w1234567", []workspace.File{file}, directories)
@@ -144,7 +145,17 @@ func TestMatchesManifestDetectsCurrentProjectionDrift(t *testing.T) {
 			t.Fatalf("MatchesManifest() = %t, %v; want %t", matches, err, want)
 		}
 	}
+	staleStage := filepath.Join(root, ".morde-staging", ownerHash+"-w1234567-stale")
+	if err := os.Mkdir(staleStage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staleStage, "old-revision.txt"), []byte("stale"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	assertMatch(true)
+	if _, err := os.Lstat(staleStage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verified manifest left stale staging tree behind: %v", err)
+	}
 
 	filePath := filepath.Join(target, filepath.FromSlash(file.Path))
 	if err := os.Rename(filePath, filepath.Join(filepath.Dir(filePath), "renamed.txt")); err != nil {

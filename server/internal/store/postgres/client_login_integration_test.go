@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
@@ -29,6 +31,27 @@ type clientLoginHTTPAuth struct {
 }
 
 type clientLoginHTTPAdmin struct{ api.AdminService }
+
+var clientLoginTestSequence = struct {
+	sync.Mutex
+	values map[string]int64
+}{values: make(map[string]int64)}
+
+func clientLoginForTest(ctx context.Context, clients *app.ClientLoginService, name, password, platform, displayName, renewalID, key, ip string) (app.ClientLoginResult, error) {
+	sequenceKey := fmt.Sprintf("%p:%s:%s", clients, strings.ToLower(name), platform)
+	clientLoginTestSequence.Lock()
+	clientLoginTestSequence.values[sequenceKey]++
+	generation := clientLoginTestSequence.values[sequenceKey]
+	clientLoginTestSequence.Unlock()
+	instanceID := "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	if platform == "ios" {
+		instanceID = "8f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	} else if platform == "android" {
+		instanceID = "7f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	}
+	return clients.Login(ctx, name, password, platform, displayName, renewalID, key, ip,
+		app.ClientLoginAttempt{InstanceID: instanceID, Generation: generation})
+}
 
 func (clientLoginHTTPAdmin) ListUsers(context.Context, identity.Principal, *identity.AccountStatus) ([]api.AdminUserRecord, error) {
 	return []api.AdminUserRecord{}, nil
@@ -71,7 +94,7 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	ctx := context.Background()
 	login := func(key, renewalID string) app.ClientLoginResult {
 		t.Helper()
-		result, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", renewalID, key, "192.0.2.1")
+		result, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "laptop", renewalID, key, "192.0.2.1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,7 +108,7 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM tokens WHERE owner_id=$1 AND kind='session' AND client_installation_id IS NULL`, owner.ID).Scan(&ordinarySessions); err != nil || ordinarySessions != 0 {
 		t.Fatalf("client login created %d ordinary Portal sessions: %v", ordinarySessions, err)
 	}
-	if _, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "different laptop", "", "login-key-0001", "192.0.2.1"); domain.CodeOf(err) != domain.CodeConflict {
+	if _, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "different laptop", "", "login-key-0001", "192.0.2.1"); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("idempotency key reuse for changed request = %v", err)
 	}
 	clientPrincipal, err := credentials.VerifyClient(ctx, first.ClientCredential)
@@ -100,22 +123,27 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	if err != nil || webPrincipal.ClientInstallationID != first.InstallationID || webPrincipal.Role != identity.RoleUser {
 		t.Fatalf("Web session verification = %#v, %v", webPrincipal, err)
 	}
-	replay := login("login-key-0001", "")
-	if replay.InstallationID != first.InstallationID || replay.ClientCredential == first.ClientCredential {
-		t.Fatalf("idempotent replay failed to rotate secret: %#v", replay)
+	// Simulate a response lost after the server committed. The next attempt gets a
+	// fresh key and generation, rotates the same installation, and invalidates A.
+	recovered := login("login-key-0002", "")
+	if recovered.InstallationID != first.InstallationID || recovered.ClientCredential == first.ClientCredential {
+		t.Fatalf("lost-response recovery changed installation or reused credentials: %#v", recovered)
 	}
 	if _, err := credentials.VerifyClient(ctx, first.ClientCredential); err == nil {
-		t.Fatal("old Client credential survived retry")
+		t.Fatal("old Client credential survived lost-response recovery")
 	}
-	renewed := login("login-key-0002", first.InstallationID)
+	renewed := login("login-key-0003", first.InstallationID)
 	if renewed.InstallationID != first.InstallationID {
 		t.Fatalf("renewal created duplicate installation: %s", renewed.InstallationID)
 	}
-	lateRetry := login("login-key-0001", "")
-	if lateRetry.InstallationID != first.InstallationID {
-		t.Fatalf("old idempotency key created a duplicate installation: %s", lateRetry.InstallationID)
+	// An older request arriving after B cannot rotate credentials or revive the
+	// earlier Client token, even if it has a new Idempotency-Key.
+	_, err = clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-key-stale-0001", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: "9f0de095-66ba-49c6-a87b-0c527f4f81a1", Generation: 2})
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("stale generation login = %v; want conflict", err)
 	}
-	current, err := credentials.VerifyClient(ctx, lateRetry.ClientCredential)
+	current, err := credentials.VerifyClient(ctx, renewed.ClientCredential)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +162,7 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT actor_kind FROM audit_logs WHERE action='client.revoke' AND target=$1`, first.InstallationID).Scan(&actorKind); err != nil || actorKind != "session" {
 		t.Fatalf("Web revocation actor = %q, %v", actorKind, err)
 	}
-	for _, raw := range []string{lateRetry.ClientCredential, lateRetry.SyncCredential, web.Credential} {
+	for _, raw := range []string{renewed.ClientCredential, renewed.SyncCredential, web.Credential} {
 		kind, _, _, err := identity.ParseCredential(raw)
 		if err != nil {
 			t.Fatal(err)
@@ -155,6 +183,11 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	if _, err := clients.WebSession(ctx, current); err == nil {
 		t.Fatal("revoked installation renewed a Web session")
 	}
+	_, err = clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-after-logout-0001", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: "9f0de095-66ba-49c6-a87b-0c527f4f81a1", Generation: 5})
+	if domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("login stream restored a logged-out installation = %v; want unauthenticated", err)
+	}
 	items, err := store.ListClientInstallations(ctx, owner.ID)
 	if err != nil || len(items) != 1 || items[0].RevokedAt == nil {
 		t.Fatalf("installation list = %#v, %v", items, err)
@@ -164,7 +197,7 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 func TestClientLoginCredentialRotationCancelsDeviceSyncSession(t *testing.T) {
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
-	first, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-rotate-0001", "192.0.2.1")
+	first, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "laptop", "", "login-rotate-0001", "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +220,7 @@ func TestClientLoginCredentialRotationCancelsDeviceSyncSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rotated, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", first.InstallationID, "login-rotate-0002", "192.0.2.1")
+	rotated, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "laptop", first.InstallationID, "login-rotate-0002", "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +246,7 @@ func TestClientLoginCredentialRotationCancelsDeviceSyncSession(t *testing.T) {
 func TestClientLoginMobileAndCrossAccountRenewal(t *testing.T) {
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
-	result, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "login-mobile-001", "192.0.2.1")
+	result, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "login-mobile-001", "192.0.2.1")
 	if err != nil || result.ClientCredential == "" || result.SyncCredential != "" || result.WebSessionCredential != "" {
 		t.Fatalf("mobile login = %#v, %v", result, err)
 	}
@@ -245,14 +278,14 @@ func TestClientLoginMobileAndCrossAccountRenewal(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, `UPDATE users SET password_hash=$2 WHERE id=$1`, other.ID, string(hash)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clients.Login(ctx, other.Name, "client-password-123", "ios", "phone", result.InstallationID, "login-mobile-002", "192.0.2.2"); domain.CodeOf(err) != domain.CodeNotFound {
+	if _, err := clientLoginForTest(ctx, clients, other.Name, "client-password-123", "ios", "phone", result.InstallationID, "login-mobile-002", "192.0.2.2"); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("cross-account renewal = %v", err)
 	}
 	items, err := store.ListClientInstallations(ctx, other.ID)
 	if err != nil || len(items) != 0 {
 		t.Fatalf("cross-account installation rows = %#v, %v", items, err)
 	}
-	otherLogin, err := clients.Login(ctx, other.Name, "client-password-123", "ios", "other phone", "", "login-mobile-003", "192.0.2.2")
+	otherLogin, err := clientLoginForTest(ctx, clients, other.Name, "client-password-123", "ios", "other phone", "", "login-mobile-003", "192.0.2.2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +312,7 @@ func TestClientLoginMobileAndCrossAccountRenewal(t *testing.T) {
 	if _, err := credentials.VerifyClient(ctx, otherLogin.ClientCredential); err != nil {
 		t.Fatalf("other account's installation was affected: %v", err)
 	}
-	android, err := clients.Login(ctx, owner.Name, "client-password-123", "android", "android", "", "login-mobile-004", "192.0.2.1")
+	android, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "android", "android", "", "login-mobile-004", "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +329,7 @@ func TestClientLoginRejectsInvalidAccountAndPasswordWithoutInstallation(t *testi
 	store, _, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
 	login := func(key, password string) error {
-		_, err := clients.Login(ctx, owner.Name, password, "desktop", "laptop", "", key, "192.0.2.1")
+		_, err := clientLoginForTest(ctx, clients, owner.Name, password, "desktop", "laptop", "", key, "192.0.2.1")
 		return err
 	}
 	if err := login("login-wrong-0001", "bad password"); domain.CodeOf(err) != domain.CodeUnauthenticated {
@@ -328,6 +361,229 @@ func TestClientLoginRejectsInvalidAccountAndPasswordWithoutInstallation(t *testi
 	}
 }
 
+func TestLegacyAndroidClientLoginCompatibilityKeepsInstallation(t *testing.T) {
+	store, _, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	login := func(displayName, renewalID, key string) app.ClientLoginResult {
+		t.Helper()
+		result, err := clients.Login(ctx, owner.Name, "client-password-123", "android", displayName, renewalID, key,
+			"192.0.2.1", app.ClientLoginAttempt{LegacyAndroid: true})
+		if err != nil {
+			t.Fatalf("legacy Android login: %v", err)
+		}
+		return result
+	}
+	first := login("phone", "", "android-login-0001")
+	// Old Android retries the same idempotency key after a lost response. It
+	// historically rotates credentials on the same installation.
+	replayed := login("phone", "", "android-login-0001")
+	if replayed.InstallationID != first.InstallationID || replayed.ClientCredential == first.ClientCredential {
+		t.Fatalf("legacy Android same-key retry did not retain/rotate installation: first=%+v replay=%+v", first, replayed)
+	}
+	renewed := login("phone renamed", first.InstallationID, "android-login-0002")
+	if renewed.InstallationID != first.InstallationID || renewed.ClientCredential == replayed.ClientCredential {
+		t.Fatalf("legacy Android renewal did not retain installation and rotate credentials: replay=%+v renewed=%+v", replayed, renewed)
+	}
+	items, err := store.ListClientInstallations(ctx, owner.ID)
+	if err != nil || len(items) != 1 || items[0].ID != first.InstallationID || items[0].DisplayName != "phone renamed" {
+		t.Fatalf("legacy Android installations = %#v, %v", items, err)
+	}
+	var generation int64
+	var boundInstallation string
+	if err := store.pool.QueryRow(ctx, `SELECT generation,installation_id FROM client_login_attempts WHERE owner_id=$1`, owner.ID).
+		Scan(&generation, &boundInstallation); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 3 || boundInstallation != first.InstallationID {
+		t.Fatalf("legacy Android ordered compatibility state = generation %d installation %q", generation, boundInstallation)
+	}
+}
+
+func TestClientTaskSubmissionIsVisibleToDesktopAndIOSInstallations(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	iosLogin, err := clients.Login(ctx, owner.Name, "client-password-123", "ios", "phone", "", "ios-task-login-0001", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: "5f0de095-66ba-49c6-a87b-0c527f4f81a1", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pcLogin, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "pc-task-login-0001", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: "6f0de095-66ba-49c6-a87b-0c527f4f81a1", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	iosPrincipal, err := credentials.VerifyClient(ctx, iosLogin.ClientCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pcPrincipal, err := credentials.VerifySession(ctx, pcLogin.WebSessionCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionControl, err := app.NewExecutionControlService(store, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := executionControl.Status(ctx, pcPrincipal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executionControl.Enable(ctx, pcPrincipal, control.Epoch, "cross-client-execution-enable-0001"); err != nil {
+		t.Fatalf("enable owner execution before cross-client task submission: %v", err)
+	}
+	tasks, err := app.NewTaskService(store, credentials, taskChatConfiguredModelCatalog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := app.SubmitTaskCommand{ModelID: "p1234567", Objective: "MVP cross-client task", IdempotencyKey: "cross-client-task-0001"}
+	submitted, err := tasks.Submit(ctx, iosPrincipal, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := tasks.Submit(ctx, iosPrincipal, command)
+	if err != nil || !replayed.Replayed || replayed.Task.ID != submitted.Task.ID {
+		t.Fatalf("iOS lost-response retry = %#v, err=%v; first = %#v", replayed, err, submitted)
+	}
+	for _, client := range []struct {
+		name      string
+		principal identity.Principal
+	}{
+		{name: "iOS", principal: iosPrincipal},
+		{name: "desktop", principal: pcPrincipal},
+	} {
+		details, err := tasks.Get(ctx, client.principal, submitted.Task.ID)
+		if err != nil || details.Task.ConversationID != submitted.Conversation.ID || details.Task.Objective != command.Objective || details.Task.EventSequence < 1 {
+			t.Fatalf("%s task snapshot = %#v, err=%v", client.name, details.Task, err)
+		}
+		page, err := tasks.List(ctx, client.principal, app.TaskListRequest{Page: app.PageRequest{Limit: 10}})
+		if err != nil || len(page.Items) != 1 || page.Items[0].ID != submitted.Task.ID {
+			t.Fatalf("%s task list = %#v, err=%v", client.name, page.Items, err)
+		}
+	}
+	conversations, err := app.NewConversationService(store, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range []struct {
+		name      string
+		principal identity.Principal
+	}{
+		{name: "iOS", principal: iosPrincipal},
+		{name: "desktop", principal: pcPrincipal},
+	} {
+		messages, err := conversations.ListMessages(ctx, client.principal, submitted.Conversation.ID, app.PageRequest{Limit: 10})
+		if err != nil || len(messages.Items) != 1 || messages.Items[0].TaskID != submitted.Task.ID || messages.Items[0].Content != command.Objective {
+			t.Fatalf("%s conversation messages = %#v, err=%v", client.name, messages.Items, err)
+		}
+	}
+}
+
+func TestClientLoginRejectsLateGenerationAfterNewerRetry(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	instanceID := "4f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	login := func(key string, generation int64, renewalID string) app.ClientLoginResult {
+		t.Helper()
+		result, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", renewalID, key, "192.0.2.1",
+			app.ClientLoginAttempt{InstanceID: instanceID, Generation: generation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	first := login("login-order-0001", 1, "")
+	// B (generation 3) commits before delayed A (generation 2), as can happen
+	// when A times out and B is sent from a restarted client.
+	newer := login("login-order-0003", 3, first.InstallationID)
+	if _, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", first.InstallationID,
+		"login-order-0002", "192.0.2.1", app.ClientLoginAttempt{InstanceID: instanceID, Generation: 2}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("late generation A = %v; want conflict", err)
+	}
+	if _, err := credentials.VerifyClient(ctx, first.ClientCredential); err == nil {
+		t.Fatal("generation 1 credential remained active after generation 3")
+	}
+	if _, err := credentials.VerifyClient(ctx, newer.ClientCredential); err != nil {
+		t.Fatalf("late generation A revoked B's credential: %v", err)
+	}
+	items, err := store.ListClientInstallations(ctx, owner.ID)
+	if err != nil || len(items) != 1 || items[0].ID != first.InstallationID {
+		t.Fatalf("ordered login created duplicate installations: %#v, %v", items, err)
+	}
+}
+
+func TestClientLoginRacingRevocationCannotRestoreInstallation(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	instanceID := "5f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	first, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-revoke-race-0001", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: instanceID, Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	loginResult := make(chan app.ClientLoginResult, 1)
+	loginError := make(chan error, 1)
+	revokeError := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		result, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", first.InstallationID,
+			"login-revoke-race-0002", "192.0.2.1", app.ClientLoginAttempt{InstanceID: instanceID, Generation: 2})
+		loginResult <- result
+		loginError <- err
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		revokeError <- store.RevokeClientInstallation(ctx, first.InstallationID, owner.ID, "192.0.2.2", audit.ActorSession, nil)
+	}()
+	close(start)
+	wg.Wait()
+	login := <-loginResult
+	loginErr := <-loginError
+	if revokeErr := <-revokeError; revokeErr != nil {
+		t.Fatalf("installation revocation failed: %v", revokeErr)
+	}
+	if loginErr != nil && domain.CodeOf(loginErr) != domain.CodeUnauthenticated {
+		t.Fatalf("racing login = %v; want success before revocation or rejection after it", loginErr)
+	}
+	if active, err := store.ActiveClientInstallation(ctx, first.InstallationID, owner.ID); err != nil || active {
+		t.Fatalf("installation active after racing revoke: active=%v err=%v", active, err)
+	}
+	credentialsToCheck := []string{first.ClientCredential, login.ClientCredential, first.SyncCredential, login.SyncCredential, first.WebSessionCredential, login.WebSessionCredential}
+	for _, raw := range credentialsToCheck {
+		if raw == "" {
+			continue
+		}
+		kind, _, _, err := identity.ParseCredential(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var verifyErr error
+		switch kind {
+		case identity.KindClient:
+			_, verifyErr = credentials.VerifyClient(ctx, raw)
+		case identity.KindDevice:
+			_, verifyErr = credentials.VerifyDevice(ctx, raw)
+		case identity.KindSession:
+			_, verifyErr = credentials.VerifySession(ctx, raw)
+		}
+		if verifyErr == nil {
+			t.Fatalf("%s credential remained active after racing revocation", kind)
+		}
+	}
+	items, err := store.ListClientInstallations(ctx, owner.ID)
+	if err != nil || len(items) != 1 || items[0].RevokedAt == nil {
+		t.Fatalf("racing revoke left another installation: %#v, %v", items, err)
+	}
+}
+
 func TestClientLoginConcurrentRetryAndAuditFailureRollsBack(t *testing.T) {
 	store, _, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
@@ -338,7 +594,7 @@ func TestClientLoginConcurrentRetryAndAuditFailureRollsBack(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-concurrent-1", "192.0.2.1")
+			result, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "laptop", "", "login-concurrent-1", "192.0.2.1")
 			results <- result
 			errors <- err
 		}()
@@ -346,13 +602,24 @@ func TestClientLoginConcurrentRetryAndAuditFailureRollsBack(t *testing.T) {
 	wg.Wait()
 	close(results)
 	close(errors)
+	succeeded, conflicted := 0, 0
 	for err := range errors {
-		if err != nil {
-			t.Fatal(err)
+		if err == nil {
+			succeeded++
+		} else if domain.CodeOf(err) == domain.CodeConflict {
+			conflicted++
+		} else {
+			t.Fatalf("concurrent same-key login error = %v", err)
 		}
+	}
+	if succeeded != 1 || conflicted != 1 {
+		t.Fatalf("same-key attempts: succeeded=%d conflicted=%d; want one of each", succeeded, conflicted)
 	}
 	var installationID string
 	for result := range results {
+		if result.InstallationID == "" {
+			continue
+		}
 		if installationID != "" && result.InstallationID != installationID {
 			t.Fatalf("concurrent retry duplicated installations: %s / %s", installationID, result.InstallationID)
 		}
@@ -365,7 +632,7 @@ func TestClientLoginConcurrentRetryAndAuditFailureRollsBack(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, `ALTER TABLE audit_logs ADD CONSTRAINT reject_client_login_for_test CHECK (action <> 'client.login') NOT VALID`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clients.Login(ctx, owner.Name, "client-password-123", "android", "phone", "", "login-rollback-1", "192.0.2.1"); err == nil {
+	if _, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "android", "phone", "", "login-rollback-1", "192.0.2.1"); err == nil {
 		t.Fatal("audit failure did not fail login")
 	}
 	items, err = store.ListClientInstallations(ctx, owner.ID)
@@ -420,7 +687,7 @@ func TestClientLoginHTTPPostgresSessionFenceAndLogout(t *testing.T) {
 		router.ServeHTTP(res, req)
 		return res
 	}
-	loginBody := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"desktop","display_name":"laptop"}`
+	loginBody := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"desktop","display_name":"laptop","client_instance_id":"2f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":1}`
 	login := request(http.MethodPost, "/api/auth/client-login", loginBody, "", "", "", "http-login-001")
 	if login.Code != http.StatusOK || login.Header().Get("Set-Cookie") != "" {
 		t.Fatalf("client login = %d %s", login.Code, login.Body)
@@ -472,7 +739,11 @@ func TestClientLoginHTTPPostgresSessionFenceAndLogout(t *testing.T) {
 	if res := request(http.MethodGet, "/api/clients", "", "", renewed.Credential, "", ""); res.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked Web session accessed user route = %d %s", res.Code, res.Body)
 	}
-	iosBody := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"ios","display_name":"phone"}`
+	lateDesktopLogin := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"desktop","display_name":"laptop","client_instance_id":"2f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":2}`
+	if res := request(http.MethodPost, "/api/auth/client-login", lateDesktopLogin, "", "", "", "http-login-late-01"); res.Code != http.StatusUnauthorized {
+		t.Fatalf("late login restored logged-out installation = %d %s", res.Code, res.Body)
+	}
+	iosBody := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"ios","display_name":"phone","client_instance_id":"3f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":1}`
 	iosLogin := request(http.MethodPost, "/api/auth/client-login", iosBody, "", "", "", "http-login-ios-01")
 	var ios struct {
 		Credential     string `json:"client_credential"`

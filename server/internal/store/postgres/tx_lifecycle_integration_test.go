@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -71,6 +73,303 @@ func TestPostgresHostReplicaBindingChangesRequireCurrentRunningGeneration(t *tes
 	statusAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, statusWorkspace.ID)
 	if err != nil || statusAfter.SyncState != workspace.BindingSyncHealthy || len(statusAfter.SyncConflicts) != 0 {
 		t.Fatalf("Host status changed binding after rejection = %#v, err=%v", statusAfter, err)
+	}
+}
+
+func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
+	t.Run("create binding", func(t *testing.T) {
+		store, _ := newTemporaryStore(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		owner := createTestUser(t, store, 3, 20_000, 40_000)
+		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-create-binding")
+
+		err := stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
+			`%SELECT owner_id, state FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
+				_, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+					OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+					State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+				})
+				return err
+			})
+		if domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+			t.Fatalf("create binding after Host release commit error = %v, want workspace busy", err)
+		}
+		if _, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID); domain.CodeOf(err) != domain.CodeNotFound {
+			t.Fatalf("binding persisted after rejected create: error = %v", err)
+		}
+	})
+
+	t.Run("unbind transition", func(t *testing.T) {
+		store, _ := newTemporaryStore(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		owner := createTestUser(t, store, 3, 20_000, 40_000)
+		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-unbind-transition")
+		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
+			`%SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
+				_, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+					workspace.BindingActive, workspace.BindingUnbinding, binding.DesiredRevision, binding.AppliedRevision)
+				return err
+			})
+		if domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+			t.Fatalf("unbind transition after Host release commit error = %v, want workspace busy", err)
+		}
+		current, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if err != nil || current.State != workspace.BindingActive || current.BindingVersion != binding.BindingVersion {
+			t.Fatalf("binding changed after rejected unbind transition: %#v, err=%v", current, err)
+		}
+	})
+
+	t.Run("applied revision", func(t *testing.T) {
+		store, _ := newTemporaryStore(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		owner := createTestUser(t, store, 3, 20_000, 40_000)
+		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-applied-revision")
+
+		file := syncTestFile("receipt.txt", []byte("applied revision receipt"))
+		upload := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+		if _, _, err := createTestWorkspaceSyncSession(ctx, store, upload, syncTestBlocks(upload.UploadFiles),
+			syncTestIdempotency(owner.ID, "workspace.sync.create", "release-wait-applied:upload", upload.ID)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, upload.ID,
+			syncTestIdempotency(owner.ID, "workspace.sync.commit", "release-wait-applied:upload", upload.ID)); err != nil {
+			t.Fatal(err)
+		}
+		workspaceValue, err := store.GetWorkspace(ctx, workspaceValue.ID)
+		if err != nil || workspaceValue.Revision != 1 {
+			t.Fatalf("workspace after upload = %#v, err=%v", workspaceValue, err)
+		}
+		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		completeHostWorkspaceDownloadForTest(t, store, ctx, owner.ID, hostValue, binding,
+			workspaceValue.ID, 0, workspaceValue.Revision)
+		if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET applied_revision=0 WHERE host_id=$1 AND workspace_id=$2 AND binding_version=$3`,
+			hostValue.ID, workspaceValue.ID, binding.BindingVersion); err != nil {
+			t.Fatalf("prepare pending applied receipt: %v", err)
+		}
+		replicaID := fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
+		var sessionID string
+		if err := store.pool.QueryRow(ctx, `SELECT id FROM workspace_sync_sessions WHERE workspace_id=$1 AND replica_id=$2 AND target_revision=1 AND state='completed' ORDER BY created_at DESC LIMIT 1`,
+			workspaceValue.ID, replicaID).Scan(&sessionID); err != nil {
+			t.Fatalf("find completed Host download receipt: %v", err)
+		}
+
+		commitWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "deactivated-host-commit")
+		commitBinding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: commitWorkspace, Directory: commitWorkspace.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: commitWorkspace.Revision,
+		})
+		if err != nil {
+			t.Fatalf("create binding for deactivated Host commit: %v", err)
+		}
+		unbindWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "deactivated-host-unbind")
+		unbindBinding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: unbindWorkspace, Directory: unbindWorkspace.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: unbindWorkspace.Revision,
+		})
+		if err != nil {
+			t.Fatalf("create binding for deactivated Host unbind: %v", err)
+		}
+		unbindBinding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, unbindWorkspace.ID, unbindBinding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, unbindBinding.DesiredRevision, unbindBinding.AppliedRevision)
+		if err != nil {
+			t.Fatalf("activate binding for deactivated Host unbind: %v", err)
+		}
+		unbindBinding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, unbindWorkspace.ID, unbindBinding.BindingVersion,
+			workspace.BindingActive, workspace.BindingUnbinding, unbindBinding.DesiredRevision, unbindBinding.AppliedRevision)
+		if err != nil {
+			t.Fatalf("begin unbind for deactivated Host: %v", err)
+		}
+		commitSession := newTestSyncSession(t, commitWorkspace, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+		commitSession.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, commitWorkspace.ID, commitBinding.BindingVersion)
+		commitSession.Direction = workspace.SyncDownload
+		commitKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "deactivated-host-commit:"+commitSession.ID, commitSession.ID)
+		if _, _, err := createTestWorkspaceSyncSession(ctx, store, commitSession, nil,
+			syncTestIdempotency(owner.ID, "workspace.sync.create", "deactivated-host-create:"+commitSession.ID, commitSession.ID)); err != nil {
+			t.Fatalf("create pending Host sync session: %v", err)
+		}
+		if _, err := store.ReserveWorkspaceSyncCommit(ctx, commitWorkspace.ID, commitSession.ID, commitKey); err != nil {
+			t.Fatalf("reserve pending Host commit: %v", err)
+		}
+		portalSession := newTestSyncSession(t, commitWorkspace, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+		portalKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "deactivated-portal-commit:"+portalSession.ID, portalSession.ID)
+		if _, _, err := createTestWorkspaceSyncSession(ctx, store, portalSession, nil,
+			syncTestIdempotency(owner.ID, "workspace.sync.create", "deactivated-portal-create:"+portalSession.ID, portalSession.ID)); err != nil {
+			t.Fatalf("create pending Portal sync session: %v", err)
+		}
+
+		err = stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
+			`%SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR SHARE%`, func() error {
+				_, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration,
+					workspaceValue.ID, binding.BindingVersion, sessionID, workspaceValue.Revision)
+				return err
+			})
+		if domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+			t.Fatalf("applied receipt after Host release commit error = %v, want workspace busy", err)
+		}
+		current, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if err != nil || current.State != workspace.BindingPreparing || current.BindingVersion != binding.BindingVersion || current.AppliedRevision != 0 {
+			t.Fatalf("binding advanced after rejected applied receipt: %#v, err=%v", current, err)
+		}
+
+		owner.Status = identity.StatusDisabled
+		if _, err := store.UpdateUser(ctx, "system", identity.StatusApproved, owner); err != nil {
+			t.Fatalf("disable Workspace owner: %v", err)
+		}
+		if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host heartbeat after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, err := store.CompleteWorkspaceBindingUnbind(ctx, hostValue.ID, unbindWorkspace.ID,
+			unbindBinding.BindingVersion, hostValue.RuntimeGeneration, unbindWorkspace.Revision); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host unbind completion after owner deactivation = %v, want unauthenticated", err)
+		}
+		unbindAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, unbindWorkspace.ID)
+		if err != nil || unbindAfter.State != workspace.BindingUnbinding || unbindAfter.BindingVersion != unbindBinding.BindingVersion {
+			t.Fatalf("binding advanced after owner deactivation: %#v, err=%v", unbindAfter, err)
+		}
+		if _, _, err := store.CommitWorkspaceSyncSession(ctx, commitWorkspace.ID, commitSession.ID, commitKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host sync commit after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, _, err := store.CommitWorkspaceSyncSession(ctx, commitWorkspace.ID, portalSession.ID, portalKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Portal sync commit after owner deactivation = %v, want unauthenticated", err)
+		}
+		committedSession, err := store.GetWorkspaceSyncSession(ctx, commitWorkspace.ID, commitSession.ID)
+		if err != nil || committedSession.State == workspace.SyncCompleted {
+			t.Fatalf("Host sync session completed after owner deactivation: %#v, err=%v", committedSession, err)
+		}
+		digest := strings.Repeat("a", 64)
+		if err := store.AckWorkspaceSyncBlock(ctx, commitWorkspace.ID, commitSession.ID, digest, 0, 40_000); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host upload acknowledgement after owner deactivation = %v, want unauthenticated", err)
+		}
+		if err := store.AckWorkspaceSyncDownloadBlock(ctx, commitWorkspace.ID, commitSession.ID, digest); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host download acknowledgement after owner deactivation = %v, want unauthenticated", err)
+		}
+		if err := store.AckWorkspaceSyncDownloadAction(ctx, commitWorkspace.ID, commitSession.ID, "receipt.txt", workspace.ChangeDelete, "", 0); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host download action acknowledgement after owner deactivation = %v, want unauthenticated", err)
+		}
+		if err := store.AckWorkspaceSyncBlock(ctx, commitWorkspace.ID, portalSession.ID, digest, 0, 40_000); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Portal upload acknowledgement after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, err := store.ReserveWorkspaceSyncCommit(ctx, commitWorkspace.ID, commitSession.ID, commitKey); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host commit reservation after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, _, err := store.CancelWorkspaceSyncSession(ctx, commitWorkspace.ID, commitSession.ID,
+			syncTestIdempotency(owner.ID, "workspace.sync.cancel", "deactivated-host-cancel", commitSession.ID)); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host session cancellation after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, hostValue.RuntimeGeneration,
+			workspaceValue.ID, binding.BindingVersion, workspace.BindingSyncConflict, []string{"receipt.txt"}); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host sync status after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, err := store.ActivateWorkspaceBindingForHost(ctx, hostValue.ID, hostValue.RuntimeGeneration,
+			workspaceValue.ID, binding.BindingVersion, binding.DesiredRevision, binding.AppliedRevision); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("Host binding activation after owner deactivation = %v, want unauthenticated", err)
+		}
+		if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration,
+			workspaceValue.ID, binding.BindingVersion, sessionID, workspaceValue.Revision); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Fatalf("applied receipt after owner deactivation = %v, want unauthenticated", err)
+		}
+		current, err = store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if err != nil || current.AppliedRevision != 0 {
+			t.Fatalf("binding advanced after owner deactivation: %#v, err=%v", current, err)
+		}
+	})
+
+	t.Run("complete unbind", func(t *testing.T) {
+		store, _ := newTemporaryStore(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		owner := createTestUser(t, store, 3, 20_000, 40_000)
+		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-complete-unbind")
+		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+			workspace.BindingActive, workspace.BindingUnbinding, binding.DesiredRevision, binding.AppliedRevision)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
+			`%SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
+				_, err := store.CompleteWorkspaceBindingUnbind(ctx, hostValue.ID, workspaceValue.ID,
+					binding.BindingVersion, hostValue.RuntimeGeneration, workspaceValue.Revision)
+				return err
+			})
+		if domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+			t.Fatalf("complete unbind after Host release commit error = %v, want workspace busy", err)
+		}
+		current, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		if err != nil || current.State != workspace.BindingUnbinding || current.BindingVersion != binding.BindingVersion {
+			t.Fatalf("binding changed after rejected complete unbind: %#v, err=%v", current, err)
+		}
+	})
+}
+
+func stopHostAfterWorkspaceMutationWait(t *testing.T, store *Store, ctx context.Context, hostID, queryPattern string,
+	mutate func() error) error {
+	t.Helper()
+	blocker, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin Host release lock fixture: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	var lockedHostID string
+	if err := blocker.QueryRow(ctx, `SELECT id FROM hosts WHERE id=$1 FOR UPDATE`, hostID).Scan(&lockedHostID); err != nil {
+		t.Fatalf("lock Host for release race fixture: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- mutate() }()
+	waitForPostgresLockWait(t, ctx, store.pool, queryPattern, 1)
+	if tag, err := blocker.Exec(ctx, `UPDATE hosts SET state='stopping', state_reason='user_release', updated_at=now() WHERE id=$1 AND state='running'`, hostID); err != nil {
+		t.Fatalf("commit Host stopping state in release race fixture: %v", err)
+	} else if tag.RowsAffected() != 1 {
+		t.Fatalf("Host stopping fixture changed %d rows, want 1", tag.RowsAffected())
+	}
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatalf("commit Host release state: %v", err)
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		t.Fatalf("Workspace mutation did not finish after Host release commit: %v", ctx.Err())
+		return ctx.Err()
 	}
 }
 

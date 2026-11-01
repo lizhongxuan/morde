@@ -85,6 +85,20 @@ type SyncNodeConnection struct {
 	RelayAddress string
 }
 
+type SyncNodeObservation struct {
+	Present            bool                        `json:"present"`
+	Running            bool                        `json:"running"`
+	ConnectedDeviceIDs []string                    `json:"connected_device_ids"`
+	Folders            []SyncNodeFolderObservation `json:"folders"`
+}
+
+type SyncNodeFolderObservation struct {
+	FolderID  string `json:"folder_id"`
+	State     string `json:"state"`
+	NeedBytes int64  `json:"need_bytes"`
+	NeedFiles int64  `json:"need_files"`
+}
+
 type SyncNodeDesiredState struct {
 	OwnerID  string
 	Revision int64

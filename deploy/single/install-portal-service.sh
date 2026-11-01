@@ -24,6 +24,19 @@ workspace_sync_current_root_from_config() {
   ' "$repo_root/deploy/single/portal.yaml"
 }
 
+workspace_sync_data_root_from_config() {
+  awk '
+    $0 == "workspace_sync_node:" { in_sync=1; next }
+    in_sync && /^[^[:space:]]/ { in_sync=0 }
+    in_sync && $1 == "data_root:" {
+      sub(/^[[:space:]]*data_root:[[:space:]]*/, "")
+      gsub(/^["\047]|["\047]$/, "")
+      print
+      exit
+    }
+  ' "$repo_root/deploy/single/portal.yaml"
+}
+
 check_workspace_sync_current_root_config() {
   local configured_root
   configured_root=$(workspace_sync_current_root_from_config)
@@ -34,22 +47,61 @@ check_workspace_sync_current_root_config() {
   [[ $configured_root == "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" ]] || die 'portal.yaml workspace_root must match CH_WORKSPACE_SYNC_CURRENT_FILES_DIR'
 }
 
+check_workspace_sync_data_root_config() {
+  local configured_root
+  configured_root=$(workspace_sync_data_root_from_config)
+  [[ -n ${CH_WORKSPACE_SYNC_DATA_ROOT_DIR:-} && -n $configured_root ]] || die 'Workspace shared data root is missing from config or environment'
+  if [[ $configured_root == '${CH_WORKSPACE_SYNC_DATA_ROOT_DIR}' ]]; then
+    configured_root=$CH_WORKSPACE_SYNC_DATA_ROOT_DIR
+  fi
+  [[ $configured_root == "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR" ]] || die 'portal.yaml data_root must match CH_WORKSPACE_SYNC_DATA_ROOT_DIR'
+}
+
 sync_mount_units=()
 workspace_sync_mount_units() {
-  local path device mount_unit
-  local -A sync_devices=()
+  local path mount_unit
   sync_mount_units=()
   command -v mountpoint >/dev/null && command -v systemd-escape >/dev/null || die 'mountpoint and systemd-escape are required for Workspace sync'
-  for path in "$@"; do
-    [[ $path == /* && -d $path && ! -L $path && $(realpath -e -- "$path") == "$path" ]] || die 'Workspace sync roots must be existing absolute directories without symlinks'
-    mountpoint -q -- "$path" || die "Workspace sync root is not a dedicated mount point: $path"
-    device=$(stat -c '%d' "$path")
-    [[ ! ${sync_devices[$device]+present} ]] || die 'Workspace sync roots must use separate filesystems'
-    sync_devices[$device]=$path
-    mount_unit=$(systemd-escape --path --suffix=mount "$path") || die "could not resolve the mount unit for $path"
-    [[ $mount_unit == *.mount && $mount_unit != */* && $mount_unit != *' '* ]] || die "invalid systemd mount unit for $path"
-    systemctl is-active --quiet "$mount_unit" || die "Workspace sync mount unit is not active: $mount_unit"
-    sync_mount_units+=("$mount_unit")
+  [[ $# == 1 ]] || die 'Workspace sync requires exactly one shared data mount'
+  path=$1
+  [[ $path == /* && -d $path && ! -L $path && $(realpath -e -- "$path") == "$path" ]] || die 'Workspace shared data root must be an existing absolute directory without symlinks'
+  mountpoint -q -- "$path" || die "Workspace shared data root is not a dedicated mount point: $path"
+  mount_unit=$(systemd-escape --path --suffix=mount "$path") || die "could not resolve the mount unit for $path"
+  [[ $mount_unit == *.mount && $mount_unit != */* && $mount_unit != *' '* ]] || die "invalid systemd mount unit for $path"
+  systemctl is-active --quiet "$mount_unit" || die "Workspace shared data mount unit is not active: $mount_unit"
+  sync_mount_units+=("$mount_unit")
+}
+
+validate_workspace_sync_data_layout() {
+  local data_root=${CH_WORKSPACE_SYNC_DATA_ROOT_DIR:-}
+  local root_device path path_device protected portal_runtime_uid
+  [[ -n $data_root ]] || die 'Workspace shared data root is missing from the environment'
+  if [[ $EUID == 0 && -n ${portal_user:-} ]]; then
+    portal_runtime_uid=$(id -u "$portal_user") || die 'could not inspect Portal service account UID'
+  else
+    portal_runtime_uid=$(id -u) || die 'could not inspect Portal process UID'
+  fi
+  root_device=$(stat -c '%d' "$data_root") || die 'could not inspect Workspace shared data filesystem'
+  local -a data_roots=("${CH_WORKSPACE_STORAGE_ROOT_DIR:-}" "${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:-}")
+  if [[ $(workspace_sync_enabled_from_config) == true ]]; then
+    data_roots+=("${CH_WORKSPACE_SYNC_NODE_STATE_DIR:-}" "${CH_WORKSPACE_SYNC_RELAY_STATE_DIR:-}")
+  fi
+  local -A seen_roots=()
+  for path in "${data_roots[@]}"; do
+    [[ $path == "$data_root"/* && $(dirname -- "$path") == "$data_root" && -d $path && ! -L $path && $(realpath -e -- "$path") == "$path" ]] || die "Workspace data root must be a real direct child of $data_root: $path"
+    [[ ! ${seen_roots[$path]+present} ]] || die "Workspace data roots must use separate directories: $path"
+    seen_roots[$path]=1
+    ! mountpoint -q -- "$path" || die "Workspace data root must not be a nested mount: $path"
+    path_device=$(stat -c '%d' "$path") || die "could not inspect Workspace data root: $path"
+    [[ $path_device == "$root_device" ]] || die "Workspace data root is not on the shared data filesystem: $path"
+  done
+  if [[ $(workspace_sync_enabled_from_config) == true ]]; then
+    [[ $(stat -c '%u:%a' "$CH_WORKSPACE_SYNC_NODE_STATE_DIR") == "$portal_runtime_uid:700" ]] || die 'Workspace node-state root must be mode 0700 and owned by the Portal service account'
+    [[ $(stat -c '%u:%a' "$CH_WORKSPACE_SYNC_RELAY_STATE_DIR") == '65532:700' ]] || die 'Workspace relay-state root must be mode 0700 and owned by UID 65532'
+  fi
+  for protected in / "${CH_DOCKER_DATA_DIR:-}" "${CH_SITE_STORAGE_ROOT_DIR:-}" "${CH_POSTGRES_DATA_DIR:-}"; do
+    [[ -n $protected && -d $protected ]] || die "Workspace shared data isolation path is unavailable: $protected"
+    [[ $(stat -c '%d' "$protected") != "$root_device" ]] || die "Workspace shared data filesystem must be separate from $protected"
   done
 }
 
@@ -58,13 +110,11 @@ check_workspace_sync_mount_bindings() {
   enabled=$(workspace_sync_enabled_from_config)
   [[ $enabled == true || $enabled == false ]] || die 'workspace_sync_node.enabled must be a literal true or false'
   check_workspace_sync_current_root_config
+  check_workspace_sync_data_root_config
   bindings=$(systemctl show --property=BindsTo --value morde-portal.service) || die 'could not inspect Portal mount dependencies'
   ordered=$(systemctl show --property=After --value morde-portal.service) || die 'could not inspect Portal mount ordering'
-  local -a roots=("${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:-}")
-  if [[ $enabled == true ]]; then
-    roots=("${CH_WORKSPACE_STORAGE_ROOT_DIR:-}" "${CH_WORKSPACE_SYNC_CURRENT_FILES_DIR:-}" "${CH_WORKSPACE_SYNC_NODE_STATE_DIR:-}" "${CH_WORKSPACE_SYNC_RELAY_STATE_DIR:-}")
-  fi
-  workspace_sync_mount_units "${roots[@]}"
+  workspace_sync_mount_units "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR"
+  validate_workspace_sync_data_layout
   for mount_unit in "${sync_mount_units[@]}"; do
     case " $bindings " in *" $mount_unit "*) ;; *) die "Portal unit is not bound to Workspace sync mount $mount_unit; rerun install-portal-service.sh" ;; esac
     case " $ordered " in *" $mount_unit "*) ;; *) die "Portal unit does not order after Workspace sync mount $mount_unit; rerun install-portal-service.sh" ;; esac
@@ -114,24 +164,25 @@ while IFS= read -r -d '' value; do env_values+=("$value"); done < <(
   python3 "$repo_root/deploy/single/read-env-values.py" --null "$env_file" \
     CH_DATA_KEY_FILE CH_COOKIE_KEY_FILE CH_WORKSPACE_STORAGE_ROOT_DIR \
     CH_SITE_STORAGE_ROOT_DIR CH_DOCKER_DATA_DIR CH_POSTGRES_DATA_DIR \
-    CH_WORKSPACE_SYNC_CURRENT_FILES_DIR CH_DOCKER_HOST CH_OSB_URL CH_OSB_CONFIG_FILE
+    CH_WORKSPACE_SYNC_DATA_ROOT_DIR CH_WORKSPACE_SYNC_CURRENT_FILES_DIR CH_DOCKER_HOST CH_OSB_URL CH_OSB_CONFIG_FILE
 )
-((${#env_values[@]} == 10)) || die 'could not read the required non-secret environment values'
+((${#env_values[@]} == 11)) || die 'could not read the required non-secret environment values'
 CH_DATA_KEY_FILE=${env_values[0]}
 CH_COOKIE_KEY_FILE=${env_values[1]}
 CH_WORKSPACE_STORAGE_ROOT_DIR=${env_values[2]}
 CH_SITE_STORAGE_ROOT_DIR=${env_values[3]}
 CH_DOCKER_DATA_DIR=${env_values[4]}
 CH_POSTGRES_DATA_DIR=${env_values[5]}
-CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=${env_values[6]}
-CH_DOCKER_HOST=${env_values[7]}
-CH_OSB_URL=${env_values[8]}
-CH_OSB_CONFIG_FILE=${env_values[9]}
+CH_WORKSPACE_SYNC_DATA_ROOT_DIR=${env_values[6]}
+CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=${env_values[7]}
+CH_DOCKER_HOST=${env_values[8]}
+CH_OSB_URL=${env_values[9]}
+CH_OSB_CONFIG_FILE=${env_values[10]}
 
 workspace_sync_enabled=$(workspace_sync_enabled_from_config)
 [[ $workspace_sync_enabled == true || $workspace_sync_enabled == false ]] || die 'workspace_sync_node.enabled must be a literal true or false'
 check_workspace_sync_current_root_config
-sync_roots=("$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR")
+check_workspace_sync_data_root_config
 if [[ $workspace_sync_enabled == true ]]; then
   sync_values=()
   while IFS= read -r -d '' value; do sync_values+=("$value"); done < <(
@@ -139,14 +190,11 @@ if [[ $workspace_sync_enabled == true ]]; then
       CH_WORKSPACE_SYNC_NODE_STATE_DIR CH_WORKSPACE_SYNC_RELAY_STATE_DIR
   )
   ((${#sync_values[@]} == 2)) || die 'could not read the Workspace sync data roots'
-  sync_roots=("$CH_WORKSPACE_STORAGE_ROOT_DIR" "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" "${sync_values[0]}" "${sync_values[1]}")
+  CH_WORKSPACE_SYNC_NODE_STATE_DIR=${sync_values[0]}
+  CH_WORKSPACE_SYNC_RELAY_STATE_DIR=${sync_values[1]}
 fi
-workspace_sync_mount_units "${sync_roots[@]}"
-current_device=$(stat -c '%d' "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR")
-for path in / "$CH_WORKSPACE_STORAGE_ROOT_DIR" "$CH_DOCKER_DATA_DIR" "$CH_SITE_STORAGE_ROOT_DIR" "$CH_POSTGRES_DATA_DIR"; do
-  [[ -n $path && -d $path ]] || die "Workspace current-files isolation path is unavailable: $path"
-  [[ $(stat -c '%d' "$path") != "$current_device" ]] || die "Workspace current-files root must use a filesystem separate from $path"
-done
+workspace_sync_mount_units "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR"
+validate_workspace_sync_data_layout
 sync_mount_units_text=${sync_mount_units[*]:-}
 sync_mount_binding=
 if ((${#sync_mount_units[@]})); then
@@ -160,6 +208,7 @@ for key in CH_DATA_KEY_FILE CH_COOKIE_KEY_FILE; do
   file=${!key:-}
   [[ $file == /* && -f $file && ! -L $file && $(stat -c '%u:%a:%s' "$file") == "$portal_uid:600:32" ]] || die "$key must be an absolute 32-byte mode 0600 file owned by $portal_user"
 done
+[[ -d $CH_WORKSPACE_SYNC_DATA_ROOT_DIR && ! -L $CH_WORKSPACE_SYNC_DATA_ROOT_DIR && $(stat -c '%u:%a' "$CH_WORKSPACE_SYNC_DATA_ROOT_DIR") == "$portal_uid:700" ]] || die 'CH_WORKSPACE_SYNC_DATA_ROOT_DIR must be a mode 0700 directory owned by the Portal service account'
 for key in CH_WORKSPACE_STORAGE_ROOT_DIR CH_SITE_STORAGE_ROOT_DIR CH_WORKSPACE_SYNC_CURRENT_FILES_DIR; do
   path=${!key:-}
   [[ $path == /* && -d $path && ! -L $path && $(stat -c '%u:%a' "$path") == "$portal_uid:700" ]] || die "$key must be a mode 0700 directory owned by $portal_user"

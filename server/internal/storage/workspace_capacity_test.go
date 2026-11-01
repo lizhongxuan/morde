@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"morde/server/internal/domain"
@@ -53,35 +55,58 @@ func TestWorkspaceCapacityHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestWorkspaceSyncStorageRequiresDedicatedFilesystems(t *testing.T) {
-	root := t.TempDir()
+func TestWorkspaceSyncStorageRequiresDedicatedSharedVolumeMount(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace-sync")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"blocks", "current", "nodes", "relay"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	err := CheckWorkspaceSyncStorageIsolation(
-		filepath.Join(root, "blocks"), filepath.Join(root, "current"), filepath.Join(root, "docker"), filepath.Join(root, "site"),
+		root, filepath.Join(root, "blocks"), filepath.Join(root, "current"), filepath.Join(root, "docker"), filepath.Join(root, "site"),
 		filepath.Join(root, "nodes"), filepath.Join(root, "relay"), []string{filepath.Join(root, "postgres")},
 	)
 	if err == nil {
-		t.Fatal("Workspace sync storage on the shared filesystem was accepted")
+		t.Fatal("Workspace sync data without a dedicated active mount was accepted")
 	}
 }
 
 func TestWorkspaceCurrentStorageRemainsIsolatedWhenSyncIsDisabled(t *testing.T) {
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), "workspace-sync")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"blocks", "current"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	err := CheckWorkspaceCurrentStorageIsolation(
-		filepath.Join(root, "blocks"), filepath.Join(root, "current"), filepath.Join(root, "docker"), filepath.Join(root, "site"),
+		root, filepath.Join(root, "blocks"), filepath.Join(root, "current"), filepath.Join(root, "docker"), filepath.Join(root, "site"),
 		[]string{filepath.Join(root, "postgres")},
 	)
 	if err == nil {
-		t.Fatal("Workspace current files on the shared filesystem were accepted")
+		t.Fatal("Workspace data without a dedicated active mount was accepted")
 	}
 }
 
-func TestWorkspaceSyncRootsCannotShareFilesystem(t *testing.T) {
-	devices := map[uint64]string{1: "Workspace blocks"}
-	if err := addWorkspaceSyncFilesystemDevice(devices, 2, "Workspace current files"); err != nil {
-		t.Fatalf("record distinct current filesystem: %v", err)
+func TestWorkspaceSyncRootsMayShareDataFilesystem(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Workspace mount isolation checks require Linux mountinfo")
 	}
-	if err := addWorkspaceSyncFilesystemDevice(devices, 2, "Workspace node state"); err == nil {
-		t.Fatal("Workspace current and node roots sharing one filesystem were accepted")
+	root := t.TempDir()
+	for _, name := range []string{"blocks", "current", "nodes", "relay"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"blocks", "current", "nodes", "relay"} {
+		if _, err := requireWorkspaceSyncDataDirectory(root, filepath.Join(root, name), name); err != nil {
+			t.Fatalf("shared-volume directory %q rejected: %v", name, err)
+		}
 	}
 }
 

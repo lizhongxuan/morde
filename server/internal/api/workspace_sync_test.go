@@ -238,6 +238,7 @@ func TestWorkspaceSyncManifestAndChangesForwardPrincipalAndBounds(t *testing.T) 
 func TestWorkspaceSyncProgressIsPortalOnlyAndOmitsFileDetails(t *testing.T) {
 	service := &workspaceSyncServiceStub{progress: workspace.DeviceSyncProgressSummary{
 		Revision: 7, UsedBytes: 1234, QuotaBytes: 1 << 30, RemainingBytes: (1 << 30) - 1234, QuotaStatus: workspace.SyncQuotaAvailable,
+		QuotaPauses: []workspace.SyncQuotaPause{},
 		Items: []workspace.DeviceSyncProgress{{
 			WorkspaceID: testWorkspaceID, DeviceID: "t7654321", SessionID: "p1234567",
 			Direction: workspace.SyncDownload, State: workspace.SyncApplying, Stage: workspace.SyncStageApply,
@@ -253,7 +254,7 @@ func TestWorkspaceSyncProgressIsPortalOnlyAndOmitsFileDetails(t *testing.T) {
 	}
 	var body workspace.DeviceSyncProgressSummary
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body.Revision != 7 || body.UsedBytes != 1234 || body.QuotaBytes != 1<<30 ||
-		body.RemainingBytes != (1<<30)-1234 || body.QuotaStatus != workspace.SyncQuotaAvailable || len(body.Items) != 1 || body.Items[0].DownloadActionsDone != 2 {
+		body.RemainingBytes != (1<<30)-1234 || body.QuotaStatus != workspace.SyncQuotaAvailable || len(body.Items) != 1 || body.Items[0].DownloadActionsDone != 2 || len(body.QuotaPauses) != 0 {
 		t.Fatalf("progress response = %#v, err=%v", body, err)
 	}
 	for _, omitted := range []string{"file_path", "conflicts", "manifest"} {

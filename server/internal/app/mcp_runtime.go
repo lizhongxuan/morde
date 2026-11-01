@@ -230,7 +230,7 @@ func (e *MCPRuntimeToolExecutor) Execute(ctx context.Context, principal identity
 	if err != nil {
 		return MCPRuntimeToolResult{}, err
 	}
-	if err := session.SetTaskLease(ctx, operation.RuntimeTaskID, operation.LeaseVersion, operation.LeaseExpiresAt); err != nil {
+	if err := session.SetTaskLease(ctx, operation.RuntimeTaskID, operation.LeaseVersion, operation.LeaseExpiresAt, false); err != nil {
 		return MCPRuntimeToolResult{}, err
 	}
 	if operation.Status == task.OperationPrepared {
@@ -407,7 +407,7 @@ func (e *MCPRuntimeToolExecutor) keepMCPRuntimeLease(ctx context.Context, cancel
 			cancel()
 			return
 		}
-		if err := session.SetTaskLease(ctx, operation.RuntimeTaskID, operation.LeaseVersion, renewed.LeaseExpiresAt); err != nil {
+		if err := session.SetTaskLease(ctx, operation.RuntimeTaskID, operation.LeaseVersion, renewed.LeaseExpiresAt, false); err != nil {
 			select {
 			case leaseLost <- struct{}{}:
 			default:

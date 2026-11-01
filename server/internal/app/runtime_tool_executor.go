@@ -450,7 +450,7 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	// The runtime lease mirrors the task's durable worker lease. The operation
 	// is sent only after the current Host fence, authorization, and persisted
 	// operation row have all been checked again.
-	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
+	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
 		return AgentToolResult{}, err
 	}
 	var inputRevision *int64
@@ -571,7 +571,7 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
 	}
-	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
+	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	if terminal {
@@ -679,7 +679,7 @@ func (e *RuntimeToolExecutor) keepRuntimeTaskLease(ctx context.Context, cancelOp
 		if expiresAt.Equal(lastExpiry) {
 			continue
 		}
-		if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, expiresAt); err != nil {
+		if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, expiresAt, current.WorkspaceID != ""); err != nil {
 			cancelOperation()
 			e.cancelRuntimeOperation(session, operationID)
 			return
@@ -897,7 +897,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 				persisted.ControlVersion != fence.ControlVersion {
 				return unknownAgentVerification("The unknown verification operation belongs to a different lease or Host fence.")
 			}
-			if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
+			if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
 				return unknownAgentVerification("The runtime task lease could not be synchronized for reconciliation.")
 			}
 			return e.reconcileFileVerificationOperation(ctx, session, current, fence, stepID, operationKey, persisted, group)
@@ -923,7 +923,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 	if current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 		return unknownAgentVerification("The task lease is no longer active.")
 	}
-	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
+	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
 		return unknownAgentVerification("The runtime task lease could not be synchronized.")
 	}
 	if _, err := e.store.UpdateOperation(ctx, OperationUpdate{

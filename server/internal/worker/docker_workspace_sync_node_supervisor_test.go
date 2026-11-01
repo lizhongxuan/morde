@@ -89,6 +89,9 @@ func newWorkspaceSyncFakeEngine(image, relayImage, relayName string) *workspaceS
 		relayNetworkNames: []string{dockerWorkspaceSyncRelayNetwork},
 		nodeImageLabels: map[string]string{
 			"org.opencontainers.image.licenses": "MPL-2.0",
+			dockerWorkspaceSyncSourceRevision:   strings.Repeat("a", 40),
+			dockerWorkspaceSyncPatchDigest:      strings.Repeat("b", 64),
+			dockerWorkspaceSyncGoVersion:        "go1.27.1",
 			dockerWorkspaceSyncQuotaHookLabel:   dockerWorkspaceSyncQuotaHook,
 		},
 		networks: make(map[string]*workspaceSyncFakeNetwork), networksByID: make(map[string]*workspaceSyncFakeNetwork),
@@ -111,7 +114,12 @@ func (f *workspaceSyncFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		labels := f.nodeImageLabels
 		if path == "/images/"+f.relayImage+"/json" {
 			image = f.relayImage
-			labels = map[string]string{"org.opencontainers.image.licenses": "MPL-2.0"}
+			labels = map[string]string{
+				"org.opencontainers.image.licenses": "MPL-2.0",
+				dockerWorkspaceSyncSourceRevision:   f.nodeImageLabels[dockerWorkspaceSyncSourceRevision],
+				dockerWorkspaceSyncPatchDigest:      f.nodeImageLabels[dockerWorkspaceSyncPatchDigest],
+				dockerWorkspaceSyncGoVersion:        f.nodeImageLabels[dockerWorkspaceSyncGoVersion],
+			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"Id": image, "RepoDigests": []string{image},
@@ -251,7 +259,7 @@ func (f *workspaceSyncFakeEngine) containerInspect(container *workspaceSyncFakeC
 	config := map[string]any{
 		"Image": payload["Image"], "User": payload["User"],
 		"Env":    imageEnv,
-		"Labels": payload["Labels"], "ExposedPorts": payload["ExposedPorts"],
+		"Labels": dockerWorkspaceSyncTestContainerLabels(f.nodeImageLabels, payload["Labels"].(map[string]any)), "ExposedPorts": payload["ExposedPorts"],
 	}
 	mountSpecs := host["Mounts"].([]any)
 	mounts := make([]map[string]any, 0, len(mountSpecs))
@@ -277,6 +285,17 @@ func (f *workspaceSyncFakeEngine) containerInspect(container *workspaceSyncFakeC
 		"Mounts":          mounts,
 		"NetworkSettings": map[string]any{"Ports": ports, "Networks": networks},
 	}
+}
+
+func dockerWorkspaceSyncTestContainerLabels(image map[string]string, container map[string]any) map[string]any {
+	labels := make(map[string]any, len(image)+len(container))
+	for key, value := range image {
+		labels[key] = value
+	}
+	for key, value := range container {
+		labels[key] = value
+	}
+	return labels
 }
 
 func (f *workspaceSyncFakeEngine) stopNode() {
@@ -513,12 +532,12 @@ func TestDockerWorkspaceSyncNodeObserveRunningNodeReadOnly(t *testing.T) {
 		if r.Method != http.MethodGet || r.Header.Get("X-API-Key") != workspaceSyncTestKeyA {
 			t.Errorf("Syncthing request = %s %s, want authenticated GET", r.Method, r.URL.String())
 		}
-		switch {
-		case r.URL.Path == "/rest/system/connections":
+		switch r.URL.Path {
+		case "/rest/system/connections":
 			_, _ = io.WriteString(w, `{"connections":{"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA":{"connected":true},"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB":{"connected":false}}}`)
-		case r.URL.Path == "/rest/config/folders":
+		case "/rest/config/folders":
 			_, _ = io.WriteString(w, `[{"id":"`+folderID+`"},{"id":"other-folder"}]`)
-		case r.URL.Path == "/rest/db/status":
+		case "/rest/db/status":
 			if r.URL.Query().Get("folder") != folderID {
 				t.Errorf("folder status query = %q, want %q", r.URL.Query().Get("folder"), folderID)
 			}

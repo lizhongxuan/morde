@@ -61,7 +61,7 @@ func (m *WorkspaceSyncNodeQuotaSockets) EnsureOwner(ctx context.Context, ownerID
 	}
 	ownerHash := sha256.Sum256([]byte(ownerID))
 	ownerDir := filepath.Join(m.root, hex.EncodeToString(ownerHash[:]))
-	if err := os.Mkdir(ownerDir, 0o2710); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(ownerDir, 0o710|os.ModeSetgid); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("create Workspace sync quota owner directory: %w", err)
 	}
 	info, err := os.Lstat(ownerDir)
@@ -71,7 +71,7 @@ func (m *WorkspaceSyncNodeQuotaSockets) EnsureOwner(ctx context.Context, ownerID
 	if err := os.Chown(ownerDir, -1, m.groupID); err != nil {
 		return fmt.Errorf("set Workspace sync quota owner directory group: %w", err)
 	}
-	if err := os.Chmod(ownerDir, 0o2710); err != nil {
+	if err := os.Chmod(ownerDir, 0o710|os.ModeSetgid); err != nil {
 		return fmt.Errorf("protect Workspace sync quota owner directory: %w", err)
 	}
 	info, err = os.Lstat(ownerDir)

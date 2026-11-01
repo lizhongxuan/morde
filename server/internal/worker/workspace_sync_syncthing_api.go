@@ -303,6 +303,12 @@ func (c *SyncthingAPIClient) Connections(ctx context.Context) (json.RawMessage, 
 	return json.RawMessage(body), err
 }
 
+// SystemLogs returns recent Syncthing log entries for bounded diagnostics.
+func (c *SyncthingAPIClient) SystemLogs(ctx context.Context) (json.RawMessage, error) {
+	body, err := c.request(ctx, http.MethodGet, "/rest/system/log", nil, nil, true)
+	return json.RawMessage(body), err
+}
+
 // ConnectedDeviceIDs returns only the IDs that Syncthing currently reports as
 // connected. It deliberately discards all other connection metadata.
 func (c *SyncthingAPIClient) ConnectedDeviceIDs(ctx context.Context) ([]string, error) {

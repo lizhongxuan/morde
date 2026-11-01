@@ -84,7 +84,7 @@ type TokenService interface {
 }
 
 type ClientLoginService interface {
-	Login(context.Context, string, string, string, string, string, string, string) (app.ClientLoginResult, error)
+	Login(context.Context, string, string, string, string, string, string, string, app.ClientLoginAttempt) (app.ClientLoginResult, error)
 	WebSession(context.Context, identity.Principal) (app.ClientWebSessionResult, error)
 	Logout(context.Context, identity.Principal, string) error
 	LogoutWebSession(context.Context, identity.Principal, string) error

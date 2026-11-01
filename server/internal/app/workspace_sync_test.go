@@ -29,6 +29,8 @@ type syncServiceStore struct {
 	blocks                                   map[string][]workspace.TransferBlock
 	changes                                  []workspace.Change
 	progress                                 []workspace.DeviceSyncProgress
+	quotaPauses                              []workspace.SyncQuotaPause
+	nodeBindings                             []workspace.SyncDeviceBinding
 	progressOwner, progressWorkspace         string
 	blockLockBusy, blockReadLockBusy         bool
 	blockLockAcquires, blockReadLockAcquires int
@@ -38,6 +40,12 @@ type syncServiceStore struct {
 	onCreate                                 func()
 	onChangesPage                            func()
 	hostGeneration                           int64
+	syncHostRevoked                          bool
+	hostSessionAccessCalls                   int
+	revokeHostAfterAccess                    int
+	syncSessionRevoked                       bool
+	sessionAccessCalls                       int
+	revokeSessionAfterAccess                 int
 	syncDeviceRevoked                        bool
 	usageFinalizeCalls                       int
 }
@@ -166,7 +174,7 @@ func (s *syncServiceStore) GetWorkspaceBinding(_ context.Context, hostID, worksp
 }
 
 func (s *syncServiceStore) CheckWorkspaceSyncHostReplicaAccess(_ context.Context, principal identity.Principal) error {
-	if principal.Kind != identity.KindHostReplica || s.binding.HostID != principal.HostScope || s.binding.Workspace.ID != principal.ReplicaWorkspaceID ||
+	if s.syncHostRevoked || principal.Kind != identity.KindHostReplica || s.binding.HostID != principal.HostScope || s.binding.Workspace.ID != principal.ReplicaWorkspaceID ||
 		s.binding.OwnerID != principal.UserID || s.binding.BindingVersion != principal.BindingVersion || s.hostGeneration != principal.HostGeneration ||
 		(s.binding.State != workspace.BindingPreparing && s.binding.State != workspace.BindingActive && s.binding.State != workspace.BindingUnbinding) {
 		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
@@ -174,9 +182,51 @@ func (s *syncServiceStore) CheckWorkspaceSyncHostReplicaAccess(_ context.Context
 	return nil
 }
 
+func (s *syncServiceStore) WithWorkspaceSyncHostSessionAccess(ctx context.Context, principal identity.Principal, workspaceID, sessionID string, write func() error) error {
+	if err := s.CheckWorkspaceSyncHostReplicaAccess(ctx, principal); err != nil {
+		return err
+	}
+	session, ok := s.sessions[sessionID]
+	if !ok || session.WorkspaceID != workspaceID || session.OwnerID != principal.UserID || session.ReplicaID != syncReplicaID(principal) {
+		return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	if session.State == workspace.SyncCancelled || session.State == workspace.SyncExpired || session.State == workspace.SyncFailed {
+		return domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
+	}
+	if err := write(); err != nil {
+		return err
+	}
+	s.hostSessionAccessCalls++
+	if s.revokeHostAfterAccess > 0 && s.hostSessionAccessCalls >= s.revokeHostAfterAccess {
+		s.syncHostRevoked = true
+	}
+	return nil
+}
+
 func (s *syncServiceStore) CheckWorkspaceSyncDeviceAccess(_ context.Context, _ identity.Principal, _ string) error {
 	if s.syncDeviceRevoked {
 		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return nil
+}
+
+func (s *syncServiceStore) WithWorkspaceSyncSessionAccess(_ context.Context, principal identity.Principal, workspaceID, sessionID string, write func() error) error {
+	if s.syncSessionRevoked || principal.Kind != identity.KindSession || principal.UserID != s.workspace.OwnerID {
+		return domain.NewError(domain.CodeUnauthenticated, "session is no longer active")
+	}
+	session, ok := s.sessions[sessionID]
+	if !ok || session.WorkspaceID != workspaceID || session.OwnerID != principal.UserID || session.ReplicaID != "session:"+principal.UserID {
+		return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	if session.State == workspace.SyncCancelled || session.State == workspace.SyncExpired || session.State == workspace.SyncFailed {
+		return domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
+	}
+	if err := write(); err != nil {
+		return err
+	}
+	s.sessionAccessCalls++
+	if s.revokeSessionAfterAccess > 0 && s.sessionAccessCalls >= s.revokeSessionAfterAccess {
+		s.syncSessionRevoked = true
 	}
 	return nil
 }
@@ -289,6 +339,28 @@ func (s *syncServiceStore) GetWorkspaceSyncSession(_ context.Context, workspaceI
 func (s *syncServiceStore) ListDeviceWorkspaceSyncProgress(_ context.Context, ownerID, workspaceID string) ([]workspace.DeviceSyncProgress, error) {
 	s.progressOwner, s.progressWorkspace = ownerID, workspaceID
 	return append([]workspace.DeviceSyncProgress(nil), s.progress...), nil
+}
+
+func (s *syncServiceStore) ListWorkspaceSyncQuotaPauses(_ context.Context, ownerID, workspaceID string) ([]workspace.SyncQuotaPause, error) {
+	if ownerID != s.workspace.OwnerID || workspaceID != s.workspace.ID {
+		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return append([]workspace.SyncQuotaPause(nil), s.quotaPauses...), nil
+}
+
+func (s *syncServiceStore) ListWorkspaceSyncNodeBindings(_ context.Context, ownerID, workspaceID string) ([]workspace.SyncDeviceBinding, error) {
+	if ownerID != s.workspace.OwnerID || workspaceID != s.workspace.ID {
+		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return append([]workspace.SyncDeviceBinding(nil), s.nodeBindings...), nil
+}
+
+type workspaceSyncNodeObserverStub struct {
+	observation workspace.SyncNodeObservation
+}
+
+func (s workspaceSyncNodeObserverStub) ObserveWorkspaceSyncNode(context.Context, string) (workspace.SyncNodeObservation, error) {
+	return s.observation, nil
 }
 
 func (s *syncServiceStore) ListWorkspaceSyncTransferBlocks(_ context.Context, _, sessionID string) ([]workspace.TransferBlock, error) {
@@ -831,6 +903,48 @@ func TestWorkspaceSyncDeviceBlockStreamStopsAtRevocationBoundary(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncHostBlockStreamStopsAtRevocationBoundary(t *testing.T) {
+	store := newSyncServiceStore()
+	store.hostGeneration = 3
+	blocks := newSyncBlockMemory()
+	content := bytes.Repeat([]byte("x"), 2*workspaceSyncStreamChunkBytes+17)
+	file := syncServiceFile("notes.txt", content)
+	if _, err := blocks.PutBlock(store.workspace.ID, file.SHA256, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	store.workspace.Revision = 1
+	store.snapshots[1] = []workspace.File{file}
+	store.binding = workspace.Binding{
+		HostID: "h1234567", OwnerID: store.workspace.OwnerID, Workspace: store.workspace,
+		Directory: store.workspace.ID, State: workspace.BindingActive, BindingVersion: 4,
+		DesiredRevision: store.workspace.Revision,
+	}
+	principal := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindHostReplica,
+		HostScope: store.binding.HostID, HostGeneration: store.hostGeneration,
+		ReplicaWorkspaceID: store.workspace.ID, BindingVersion: store.binding.BindingVersion,
+	}
+	store.revokeHostAfterAccess = 1
+	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{},
+	}, "host-download-stream-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCalls := 0
+	err = service.StreamSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, file.SHA256, func(_ int64, _ []byte) error {
+		writeCalls++
+		return nil
+	})
+	if domain.CodeOf(err) != domain.CodeNotFound || writeCalls != 1 {
+		t.Fatalf("Host stream at revocation boundary = %v, chunks sent %d; want one authorized chunk then denied", err, writeCalls)
+	}
+}
+
 type revokeAfterFirstRead struct {
 	*bytes.Reader
 	revoked bool
@@ -871,6 +985,68 @@ func TestWorkspaceSyncDeviceUploadStopsAfterRevocation(t *testing.T) {
 	}
 	if _, exists := blocks.data[file.SHA256]; exists {
 		t.Fatal("partially authorized upload published a block")
+	}
+}
+
+func TestWorkspaceSyncHostUploadStopsAfterRevocation(t *testing.T) {
+	store := newSyncServiceStore()
+	store.hostGeneration = 3
+	store.binding = workspace.Binding{
+		HostID: "h1234567", OwnerID: store.workspace.OwnerID, Workspace: store.workspace,
+		Directory: store.workspace.ID, State: workspace.BindingActive, BindingVersion: 4,
+		DesiredRevision: store.workspace.Revision,
+	}
+	blocks := newSyncBlockMemory()
+	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("x"), 2*workspaceSyncStreamChunkBytes+17)
+	file := syncServiceFile("upload.txt", content)
+	principal := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindHostReplica,
+		HostScope: store.binding.HostID, HostGeneration: store.hostGeneration,
+		ReplicaWorkspaceID: store.workspace.ID, BindingVersion: store.binding.BindingVersion,
+	}
+	session, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncBidirectional, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{file},
+	}, "host-upload-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.revokeHostAfterAccess = 1
+	if _, err := service.PutSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, file.SHA256, bytes.NewReader(content)); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("upload after mid-transfer Host revocation = %v; want not found", err)
+	}
+	if _, exists := blocks.data[file.SHA256]; exists {
+		t.Fatal("partially authorized Host upload published a block")
+	}
+}
+
+func TestWorkspaceSyncSessionUploadStopsAfterRevocation(t *testing.T) {
+	store := newSyncServiceStore()
+	blocks := newSyncBlockMemory()
+	service, err := NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("x"), 2*workspaceSyncStreamChunkBytes+17)
+	file := syncServiceFile("upload.txt", content)
+	principal := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567",
+	}
+	session, err := service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{file},
+	}, "session-upload-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.revokeSessionAfterAccess = 1
+	if _, err := service.PutSyncBlock(context.Background(), principal, store.workspace.ID, session.ID, file.SHA256, bytes.NewReader(content)); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("upload after mid-transfer session revocation = %v; want unauthenticated", err)
+	}
+	if _, exists := blocks.data[file.SHA256]; exists {
+		t.Fatal("partially authorized session upload published a block")
 	}
 }
 
@@ -955,6 +1131,54 @@ func TestWorkspaceSyncProgressIsPortalOwnerOnlyAndSanitized(t *testing.T) {
 		if principal.Kind == identity.KindSession && store.progressOwner != before {
 			t.Fatal("foreign workspace owner reached the progress query")
 		}
+	}
+}
+
+func TestWorkspaceSyncProgressIncludesMachineReadableQuotaPauses(t *testing.T) {
+	store := newSyncServiceStore()
+	store.quotaPauses = []workspace.SyncQuotaPause{{
+		State: workspace.SyncQuotaPauseActive, Path: "reports/result.csv", Operation: string(WorkspaceSyncReceiveUpsert),
+		RequestedBytes: 512, ReasonCode: workspace.SyncQuotaPauseWorkspaceExceeded, UpdatedAt: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC),
+	}}
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	progress, err := service.ListDeviceSyncProgress(context.Background(), principal, store.workspace.ID)
+	if err != nil || len(progress.QuotaPauses) != 1 || progress.QuotaPauses[0].State != workspace.SyncQuotaPauseActive ||
+		progress.QuotaPauses[0].Path != "reports/result.csv" || progress.QuotaPauses[0].RequestedBytes != 512 ||
+		progress.QuotaPauses[0].ReasonCode != workspace.SyncQuotaPauseWorkspaceExceeded {
+		t.Fatalf("Workspace quota pauses = %#v, %v", progress.QuotaPauses, err)
+	}
+}
+
+func TestWorkspaceSyncProgressFiltersLiveNodeStatusToWorkspaceBindings(t *testing.T) {
+	store := newSyncServiceStore()
+	store.nodeBindings = []workspace.SyncDeviceBinding{{
+		OwnerID: store.workspace.OwnerID, WorkspaceID: store.workspace.ID, DeviceID: "allowed-device", FolderID: "morde-allowed",
+		State: workspace.SyncDeviceBindingActive,
+	}}
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetWorkspaceSyncNodeObserver(workspaceSyncNodeObserverStub{observation: workspace.SyncNodeObservation{
+		Present: true, Running: true,
+		ConnectedDeviceIDs: []string{"allowed-device", "other-workspace-device"},
+		Folders: []workspace.SyncNodeFolderObservation{
+			{FolderID: "morde-allowed", State: "syncing", NeedBytes: 12, NeedFiles: 1},
+			{FolderID: "morde-other", State: "idle"},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	progress, err := service.ListDeviceSyncProgress(context.Background(), principal, store.workspace.ID)
+	if err != nil || progress.NodeStatus == nil || !progress.NodeStatus.Present || !progress.NodeStatus.Running ||
+		!reflect.DeepEqual(progress.NodeStatus.ConnectedDeviceIDs, []string{"allowed-device"}) || len(progress.NodeStatus.Folders) != 1 ||
+		progress.NodeStatus.Folders[0].FolderID != "morde-allowed" || progress.NodeStatus.Folders[0].NeedBytes != 12 {
+		t.Fatalf("Workspace node status = %#v, %v", progress.NodeStatus, err)
 	}
 }
 

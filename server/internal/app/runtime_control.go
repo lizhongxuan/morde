@@ -304,13 +304,13 @@ func (s *RuntimeSession) StopApplication(ctx context.Context, appID, launchID st
 	return s.client.StopApplication(ctx, appID, s.Fence, launchID)
 }
 
-func (s *RuntimeSession) SetTaskLease(ctx context.Context, taskID string, leaseVersion int64, expiresAt time.Time) error {
+func (s *RuntimeSession) SetTaskLease(ctx context.Context, taskID string, leaseVersion int64, expiresAt time.Time, workspaceTask bool) error {
 	if s == nil || s.client == nil {
 		return domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
 	}
 	expiresAt = boundedRuntimeLeaseExpiry(time.Now().UTC(), expiresAt.UTC())
 	_, err := s.client.SetTaskLease(ctx, taskID, runtimeclient.SetTaskLeaseRequest{
-		HostFence: s.Fence, LeaseVersion: leaseVersion, ExpiresAt: expiresAt,
+		HostFence: s.Fence, LeaseVersion: leaseVersion, WorkspaceTask: workspaceTask, ExpiresAt: expiresAt,
 	})
 	return err
 }

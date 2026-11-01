@@ -8,6 +8,9 @@ type Workspace = components["schemas"]["Workspace"];
 type WorkspaceRef = components["schemas"]["WorkspaceRef"];
 type WorkspaceBinding = components["schemas"]["WorkspaceBinding"];
 type Host = Omit<components["schemas"]["Host"], "workspaces"> & { sandbox_id?: string | null; workspaces: WorkspaceBinding[] };
+type ControlTransition = components["schemas"]["ControlTransition"];
+type ControlActionRequest = components["schemas"]["ControlActionRequest"];
+type ControlActionResponse = components["schemas"]["ControlActionResponse"];
 type HostMember = { user_id: string; permissions: HostMemberPermission[]; created_at: string };
 type ModelConnection = components["schemas"]["ModelConnection"];
 type Conversation = components["schemas"]["Conversation"];
@@ -41,6 +44,7 @@ let conversationOwners = new Map<string, string>();
 let tasks = new Map<string, Task>();
 const taskSubmitReplays = new Map<string, { request: string; response: Task }>();
 const taskMessageReplays = new Map<string, { request: string; response: { message: ConversationMessage; task: Task } }>();
+const taskActionReplays = new Map<string, { request: string; response: components["schemas"]["TaskActionResponse"] }>();
 let userPreferences = new Map<string, UserPreferences>();
 let notifications: Notification[] = [];
 let clients: ClientInstallation[] = [];
@@ -48,6 +52,8 @@ const clientOwners = new Map<string, string>();
 let notificationOwners = new Map<string, string>();
 const workspaceCreateReplays = new Map<string, { request: string; response: Workspace }>();
 const hostCreateReplays = new Map<string, { request: string; response: Host }>();
+const hostControlTransitions = new Map<string, ControlTransition>();
+const hostControlActionReplays = new Map<string, { request: string; response: ControlActionResponse }>();
 const workspaceBindReplays = new Map<string, { request: string; response: WorkspaceBinding }>();
 const workspaceUnbindReplays = new Map<string, { request: string; response: WorkspaceBinding }>();
 const workspaceUnbindingStartedAt = new Map<string, number>();
@@ -217,6 +223,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   tasks = new Map();
   taskSubmitReplays.clear();
   taskMessageReplays.clear();
+  taskActionReplays.clear();
   userPreferences = new Map();
   notifications = [];
   clients = [{ id: "cli_demo01", platform: "desktop", display_name: "Morde 演示电脑", expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(), revoked: false, created_at: now(), last_used_at: null } as ClientInstallation];
@@ -225,6 +232,8 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   notificationOwners = new Map();
   workspaceCreateReplays.clear();
   hostCreateReplays.clear();
+  hostControlTransitions.clear();
+  hostControlActionReplays.clear();
   workspaceBindReplays.clear();
   workspaceUnbindReplays.clear();
   workspaceUnbindingStartedAt.clear();
@@ -377,12 +386,14 @@ function createTaskMessage(user: User, conversation: Conversation, modelID: stri
   const budget = request.budget as { active_seconds: number; tool_calls: number; model_tokens: number } | undefined;
   const task: Task = {
     id: id("q"), owner_id: user.id, host_id: typeof request.host_id === "string" ? request.host_id : undefined,
+    workspace_id: typeof request.workspace_id === "string" ? request.workspace_id : undefined,
+    input_revision: typeof request.input_revision === "number" && Number.isSafeInteger(request.input_revision) ? request.input_revision : undefined,
     execution_location: "server", conversation_id: conversation.id, model_id: modelID, objective: content,
-    status: "queued", current_step: null,
+    status: "queued", event_sequence: 0, current_step: null,
     budget: budget ?? { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
     usage: { active_seconds: 0, tool_calls: 0, model_tokens: null }, created_at: timestamp, updated_at: timestamp,
     result: null, waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null,
-    clarification_request: null, stop_request: null, finished_at: null,
+    clarification_request: null, stop_request: null, assistant_message: null, finished_at: null,
   };
   const message: ConversationMessage = {
     id: id("m"), conversation_id: conversation.id, role: "user", content, task_id: task.id, created_at: timestamp,
@@ -705,6 +716,71 @@ export const handlers = [
     persistAssistantState();
     return json(host, 201);
   }),
+  http.get("/api/hosts/:hostId/control", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const host = findHost(String(params.hostId), user);
+    if (!host || host.owner_id !== user.id || host.state !== "running") return failure("not_found", "主机不存在", 404);
+    return json({
+      host_id: host.id,
+      control_state: host.control_state,
+      control_version: host.control_version,
+      active_transition: hostControlTransitions.get(host.id) ?? null,
+    });
+  }),
+  http.post("/api/hosts/:hostId/control/actions", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const host = findHost(String(params.hostId), user);
+    if (!host || host.owner_id !== user.id || host.state !== "running") return failure("not_found", "主机不存在", 404);
+    const body = await request.json().catch(() => null) as Partial<ControlActionRequest> | null;
+    if (!body || Object.keys(body).sort().join(",") !== "action,expected_control_version,request_id" ||
+      (body.action !== "take_over" && body.action !== "release") || typeof body.request_id !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.request_id) || !Number.isSafeInteger(body.expected_control_version) || (body.expected_control_version ?? -1) < 0) {
+      return failure("invalid_argument", "主机控制请求无效", 400);
+    }
+    const command = body as ControlActionRequest;
+    const requestBody = JSON.stringify(command);
+    const replayKey = `${user.id}\u0000${host.id}\u0000${command.request_id}`;
+    const prior = hostControlActionReplays.get(replayKey);
+    if (prior) {
+      if (prior.request !== requestBody) return failure("idempotency_conflict", "请求编号已用于不同的控制操作", 409);
+      return json({ ...prior.response });
+    }
+
+    const active = hostControlTransitions.get(host.id);
+    if (active) {
+      if (active.request_id !== command.request_id || active.action !== command.action || active.expected_control_version !== command.expected_control_version) {
+        return failure("conflict", "已有主机控制切换正在进行", 409);
+      }
+      host.control_state = command.action === "take_over" ? "user" : "ai";
+      host.control_version = active.target_control_version;
+      hostControlTransitions.delete(host.id);
+      const response: ControlActionResponse = {
+        host_id: host.id, control_state: host.control_state, control_version: host.control_version,
+        active_transition: null, pending_operation_ids: [],
+      };
+      hostControlActionReplays.set(replayKey, { request: requestBody, response });
+      persistAssistantState();
+      return json({ ...response });
+    }
+
+    if (host.control_version !== command.expected_control_version || (command.action === "take_over" ? host.control_state !== "ai" : host.control_state !== "user")) {
+      return failure("conflict", "主机控制版本或状态已变化", 409, { control_version: host.control_version, control_state: host.control_state });
+    }
+    const blockedVersion = host.control_version + 1;
+    const transition: ControlTransition = {
+      request_id: command.request_id, action: command.action, phase: "draining", failure_reason: "operations_pending",
+      expected_control_version: command.expected_control_version, blocked_control_version: blockedVersion,
+      target_control_version: blockedVersion + 1, created_at: now(), updated_at: now(),
+    };
+    host.control_state = command.action === "take_over" ? "taking_over" : "returning";
+    host.control_version = blockedVersion;
+    hostControlTransitions.set(host.id, transition);
+    const response: ControlActionResponse = {
+      host_id: host.id, control_state: host.control_state, control_version: host.control_version,
+      active_transition: transition, pending_operation_ids: [`op-${host.id}`],
+    };
+    return json({ ...response }, 202);
+  }),
   http.get("/api/hosts/:hostId", ({ params, cookies }) => {
     const host = findHost(String(params.hostId), sessionUser(cookies)!);
     return host ? json(materializeHost(host)) : failure("not_found", "主机不存在", 404);
@@ -870,7 +946,7 @@ export const handlers = [
     const workspace = workspaces.find((item) => item.id === String(params.workspaceId) && workspaceOwners.get(item.id) === user.id);
     return workspace ? json({ revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
       remaining_bytes: Math.max(0, workspace.quota_bytes - workspace.used_bytes),
-      quota_status: workspace.used_bytes > workspace.quota_bytes ? "over_quota" : workspace.used_bytes === workspace.quota_bytes ? "full" : "available", items: [] }) : failure("not_found", "工作区不存在", 404);
+      quota_status: workspace.used_bytes > workspace.quota_bytes ? "over_quota" : workspace.used_bytes === workspace.quota_bytes ? "full" : "available", items: [], quota_pauses: [] }) : failure("not_found", "工作区不存在", 404);
   }),
   http.delete("/api/workspaces/:workspaceId", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -886,7 +962,16 @@ export const handlers = [
     return json(item, 202);
   }),
   http.get("/api/capabilities", () => json({ service_instance_id: "00000000-0000-4000-8000-000000000001", api_version: "1",
-    hub_version: null, event_version: null, minimum_client_version: null, supported_features: ["password_login"], default_max_request_bytes: 1048576 })),
+    hub_version: null, event_version: null, minimum_client_version: null, supported_features: ["password_login", "task_api"], default_max_request_bytes: 1048576 })),
+  http.get("/api/execution", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    const ownerTasks = Array.from(tasks.values()).filter((task) => task.owner_id === user.id);
+    return json({
+      owner_id: user.id, state: "disabled", epoch: 1,
+      pending_task_count: ownerTasks.filter((task) => task.status === "queued" || task.status === "running" || task.status === "waiting_user" || task.status === "paused").length,
+      runtime: { state: "stopped", runtime_generation: 0, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: now(),
+    });
+  }),
   http.get("/api/conversations", ({ cookies }) => {
     const user = sessionUser(cookies)!;
     return json({ items: conversations.filter((item) => conversationOwners.get(item.id) === user.id)
@@ -957,6 +1042,38 @@ export const handlers = [
     taskMessageReplays.set(replayKey, { request: requestText, response: result });
     persistAssistantState();
     return json(result, 202);
+  }),
+  http.post("/api/tasks/:taskID/actions", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const taskID = String(params.taskID);
+    const task = tasks.get(taskID);
+    if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
+    const body = await request.json().catch(() => null) as { action?: unknown; expected_status?: unknown } | null;
+    if (!body || Object.keys(body).some((field) => field !== "action" && field !== "expected_status")
+      || body.action !== "cancel" || typeof body.expected_status !== "string") {
+      return failure("invalid_argument", "停止请求无效", 400);
+    }
+    const replayKey = `${user.id}:${key}`;
+    const requestText = JSON.stringify({ taskID, ...body });
+    const replay = taskActionReplays.get(replayKey);
+    if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    if (!["queued", "running", "waiting_user", "paused"].includes(body.expected_status)) {
+      return failure("invalid_argument", "当前任务状态不能停止", 400);
+    }
+    if (task.status !== body.expected_status) return failure("conflict", "任务状态已变化", 409);
+    const timestamp = now();
+    task.status = "cancelling";
+    task.stop_request = { id: id("s"), action: "cancel", status: "pending", safe_after: timestamp, unsettled_operation_ids: [] };
+    task.updated_at = timestamp;
+    task.event_sequence += 1;
+    const response: components["schemas"]["TaskActionResponse"] = {
+      task_id: taskID, action: "cancel", status: "cancelling", unsettled_operation_ids: [],
+    };
+    taskActionReplays.set(replayKey, { request: requestText, response });
+    persistAssistantState();
+    return json(response, 202);
   }),
   http.get("/api/tasks/:taskID", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;

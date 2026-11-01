@@ -7,8 +7,10 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
@@ -35,6 +37,125 @@ func (s *Store) CheckWorkspaceSyncDeviceAccess(ctx context.Context, principal id
 			return err
 		}
 		return requireActiveWorkspaceSyncDeviceBinding(ctx, tx, access)
+	})
+}
+
+func (s *Store) WithWorkspaceSyncHostSessionAccess(ctx context.Context, principal identity.Principal, workspaceID, sessionID string, write func() error) error {
+	if principal.Kind != identity.KindHostReplica || !domain.ValidUserID(principal.UserID) ||
+		!domain.ValidHostID(principal.HostScope) || principal.HostGeneration < 1 ||
+		!domain.ValidWorkspaceID(workspaceID) || principal.ReplicaWorkspaceID != workspaceID || principal.BindingVersion < 1 ||
+		principal.TokenID != "" || len(principal.HostIDs) != 0 || len(principal.WorkspaceIDs) != 0 || len(principal.Scopes) != 0 ||
+		!workspace.ValidSessionID(sessionID) || write == nil {
+		return domain.NewError(domain.CodeUnauthenticated, "host replica authentication required")
+	}
+	expectedReplicaID := fmt.Sprintf("host:%s:g%d:%s:b%d", principal.HostScope, principal.HostGeneration, workspaceID, principal.BindingVersion)
+	return s.withApprovedWorkspaceSyncOwnerReadTx(ctx, principal.UserID, func(tx pgx.Tx) error {
+		replica, ok := parseHostSyncReplicaID(expectedReplicaID)
+		if !ok {
+			return domain.NewError(domain.CodeUnauthenticated, "host replica workspace binding is invalid")
+		}
+		if err := lockWorkspaceSyncHostSessionAccess(ctx, tx, principal.UserID, workspaceID, sessionID, replica, false); err != nil {
+			return err
+		}
+		return write()
+	})
+}
+
+func lockWorkspaceSyncHostSessionAccess(ctx context.Context, tx pgx.Tx, ownerID, workspaceID, sessionID string, replica hostSyncReplicaID, forUpdate bool) error {
+	lockClause := "FOR SHARE"
+	if forUpdate {
+		lockClause = "FOR UPDATE"
+	}
+	var hostOwner, hostState string
+	var generation int64
+	var deletedAt pgtype.Timestamptz
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT owner_id, state, runtime_generation, deleted_at FROM hosts WHERE id=$1 %s`, lockClause), replica.hostID).
+		Scan(&hostOwner, &hostState, &generation, &deletedAt); errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	} else if err != nil {
+		return fmt.Errorf("lock Host workspace access: %w", err)
+	}
+	if hostOwner != ownerID || generation != replica.generation || deletedAt.Valid ||
+		(hostState != string(host.StateCreating) && hostState != string(host.StateRunning)) {
+		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	}
+	var workspaceOwner, workspaceState string
+	var workspaceDeleted pgtype.Timestamptz
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT owner_id, state, deleted_at FROM workspaces WHERE id=$1 %s`, lockClause), workspaceID).
+		Scan(&workspaceOwner, &workspaceState, &workspaceDeleted); errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	} else if err != nil {
+		return fmt.Errorf("lock Workspace for Host sync access: %w", err)
+	}
+	if workspaceOwner != ownerID || workspaceState != string(workspace.StateReady) || workspaceDeleted.Valid {
+		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	var bindingOwner, bindingState string
+	var bindingVersion int64
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT owner_id, state, binding_version FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 %s`, lockClause),
+		replica.hostID, workspaceID).Scan(&bindingOwner, &bindingState, &bindingVersion); errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	} else if err != nil {
+		return fmt.Errorf("lock Workspace binding for Host sync access: %w", err)
+	}
+	if bindingOwner != ownerID || bindingVersion != replica.bindingVersion ||
+		(bindingState != string(workspace.BindingPreparing) && bindingState != string(workspace.BindingActive) &&
+			bindingState != string(workspace.BindingUnbinding)) {
+		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
+	}
+	var sessionOwner, replicaID, sessionState string
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT owner_id, replica_id, state FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 %s`, lockClause),
+		workspaceID, sessionID).Scan(&sessionOwner, &replicaID, &sessionState); errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	} else if err != nil {
+		return fmt.Errorf("lock Host workspace sync session: %w", err)
+	}
+	if sessionOwner != ownerID || replicaID != fmt.Sprintf("host:%s:g%d:%s:b%d", replica.hostID, replica.generation, workspaceID, replica.bindingVersion) {
+		return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	if sessionState == string(workspace.SyncCancelled) || sessionState == string(workspace.SyncExpired) || sessionState == string(workspace.SyncFailed) {
+		return domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
+	}
+	return nil
+}
+
+func (s *Store) WithWorkspaceSyncSessionAccess(ctx context.Context, principal identity.Principal, workspaceID, sessionID string, write func() error) error {
+	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		(principal.Role != identity.RoleUser && !principal.Role.IsAdmin()) || principal.HostScope != "" || len(principal.HostIDs) != 0 || len(principal.Scopes) != 0 ||
+		!domain.ValidWorkspaceID(workspaceID) || !workspace.ValidSessionID(sessionID) || write == nil {
+		return domain.NewError(domain.CodeUnauthenticated, "session authentication required")
+	}
+	return s.withApprovedWorkspaceSyncOwnerReadTx(ctx, principal.UserID, func(tx pgx.Tx) error {
+		var active bool
+		if err := tx.QueryRow(ctx, `SELECT kind='session' AND revoked_at IS NULL AND expires_at>clock_timestamp()
+FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, principal.TokenID, principal.UserID).Scan(&active); err != nil || !active {
+			return domain.NewError(domain.CodeUnauthenticated, "session is no longer active")
+		}
+		var workspaceOwner, workspaceState string
+		var workspaceDeleted pgtype.Timestamptz
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, deleted_at FROM workspaces WHERE id=$1 FOR SHARE`, workspaceID).
+			Scan(&workspaceOwner, &workspaceState, &workspaceDeleted); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		} else if err != nil {
+			return fmt.Errorf("lock Workspace for session sync access: %w", err)
+		}
+		if workspaceOwner != principal.UserID || workspaceState != string(workspace.StateReady) || workspaceDeleted.Valid {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		var sessionOwner, replicaID, sessionState string
+		if err := tx.QueryRow(ctx, `SELECT owner_id, replica_id, state FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR SHARE`,
+			workspaceID, sessionID).Scan(&sessionOwner, &replicaID, &sessionState); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		} else if err != nil {
+			return fmt.Errorf("lock session Workspace sync session: %w", err)
+		}
+		if sessionOwner != principal.UserID || replicaID != "session:"+principal.UserID {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		if sessionState == string(workspace.SyncCancelled) || sessionState == string(workspace.SyncExpired) || sessionState == string(workspace.SyncFailed) {
+			return domain.NewError(domain.CodeTransferExpired, "workspace sync session is no longer active")
+		}
+		return write()
 	})
 }
 

@@ -30,6 +30,16 @@ type HostStore interface {
 	TouchHosts(context.Context, []string, time.Time) error
 }
 
+// HostReplicaLivenessStore records authenticated Host Runtime poll activity.
+type HostReplicaLivenessStore interface {
+	RecordHostReplicaHeartbeat(context.Context, string, int64) error
+}
+
+// HostRuntimeLivenessReader adds current Host Runtime status to API responses.
+type HostRuntimeLivenessReader interface {
+	PopulateHostRuntimeLiveness(context.Context, []host.Host) error
+}
+
 type OrphanHostVolumeCleanupStore interface {
 	EnsureOrphanHostVolumeCleanup(context.Context, string, string, string, string, int64, bool) (bool, error)
 	ListOrphanHostVolumeCleanups(context.Context, string) ([]string, error)
@@ -119,6 +129,8 @@ type WorkspaceSyncStore interface {
 	GetWorkspace(context.Context, string) (workspace.Workspace, error)
 	GetWorkspaceBinding(context.Context, string, string) (workspace.Binding, error)
 	CheckWorkspaceSyncHostReplicaAccess(context.Context, identity.Principal) error
+	WithWorkspaceSyncHostSessionAccess(context.Context, identity.Principal, string, string, func() error) error
+	WithWorkspaceSyncSessionAccess(context.Context, identity.Principal, string, string, func() error) error
 	CheckWorkspaceSyncDeviceAccess(context.Context, identity.Principal, string) error
 	WithWorkspaceSyncDeviceSessionAccess(context.Context, identity.Principal, string, string, func() error) error
 	TryWorkspaceBlockStoreLock(context.Context, string) (LeaderLock, bool, error)
@@ -204,7 +216,7 @@ type TokenStore interface {
 
 // ClientLoginStore commits installation credentials and audit as one operation.
 type ClientLoginStore interface {
-	LoginClient(context.Context, identity.ClientInstallation, []byte, []byte, string, string, func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error)
+	LoginClient(context.Context, identity.ClientInstallation, string, int64, bool, []byte, []byte, string, string, func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error)
 	IssueClientWebSession(context.Context, identity.Principal, identity.Token) error
 	ListClientInstallations(context.Context, string) ([]identity.ClientInstallation, error)
 	GetClientInstallation(context.Context, string) (identity.ClientInstallation, error)

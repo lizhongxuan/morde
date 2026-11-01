@@ -407,7 +407,11 @@ func validCredentialMetricKind(kind string) bool {
 }
 
 func hostReplicaCredentialRoute(method, path string) bool {
-	return deviceCredentialRoute(method, path) && path != "/api/workspaces/:id/sync-progress"
+	if deviceCredentialRoute(method, path) && path != "/api/workspaces/:id/sync-progress" {
+		return true
+	}
+	return (method == http.MethodGet && path == "/api/host-replicas/:host_id/generations/:generation/task-workspace-view-deletions") ||
+		(method == http.MethodPost && path == "/api/host-replicas/:host_id/generations/:generation/tasks/:task_id/workspace-view-deletions/:request_id/applied")
 }
 
 func deviceCredentialRoute(method, path string) bool {
@@ -439,6 +443,7 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/me", "/api/clients", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
 			"/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
+			"/api/tasks/:id/workspace-view-deletions",
 			"/api/notifications", "/api/available-models":
 			return true
 		}
@@ -447,6 +452,7 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/auth/client-web-session", "/api/auth/client-logout":
 			return true
 		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
+			"/api/tasks/:id/workspace-view-deletions",
 			"/api/tasks/:id/inputs", "/api/tasks/:id/approvals/:approval_id/responses":
 			return true
 		case "/api/workspaces/:id/sync-device-challenges", "/api/workspaces/:id/sync-devices":

@@ -3,7 +3,9 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -30,6 +32,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/storage"
 	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 	"morde/server/internal/worker"
@@ -81,7 +84,7 @@ func TestWorkspaceSyncPostgresQuotaUDSDockerAndHostE2E(t *testing.T) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		t.Fatalf("create integration root: %v", err)
 	}
-	runRoot, err := os.MkdirTemp(root, "workspace-sync-postgres-e2e-")
+	runRoot, err := os.MkdirTemp("/tmp", "w-")
 	if err != nil {
 		t.Fatalf("create integration directory: %v", err)
 	}
@@ -126,7 +129,7 @@ func TestWorkspaceSyncPostgresQuotaUDSDockerAndHostE2E(t *testing.T) {
 	pcName = fmt.Sprintf("morde-f02-pc-%d", time.Now().UnixNano())
 	nodeName = "morde-sync-" + ownerHashHex[:32]
 	networkName = "morde-sync-net-" + ownerHashHex[:32]
-	quotaSocketRoot := filepath.Join(runRoot, "quota-sockets")
+	quotaSocketRoot := filepath.Join(runRoot, "q")
 	pcState := filepath.Join(runRoot, "pc-state")
 	pcFiles := filepath.Join(runRoot, "pc-files")
 	currentRoot := filepath.Join(runRoot, "current")
@@ -222,7 +225,11 @@ func TestWorkspaceSyncPostgresQuotaUDSDockerAndHostE2E(t *testing.T) {
 	principal := syncDeviceTestPrincipal(t, store, owner.ID)
 	deviceBinding := registerTestWorkspaceSyncDevice(t, store, principal, workspaceValue.ID, pcID, "f02-postgres-e2e:"+pcID)
 
-	quotaService, err := app.NewWorkspaceSyncQuotaService(syncService, current)
+	capacity, err := storage.NewWorkspaceCapacity(blockRoot, 1)
+	if err != nil {
+		t.Fatalf("create shared-volume capacity checker: %v", err)
+	}
+	quotaService, err := app.NewWorkspaceSyncQuotaService(syncService, current, capacity)
 	if err != nil {
 		t.Fatalf("create production quota service: %v", err)
 	}
@@ -252,9 +259,10 @@ func TestWorkspaceSyncPostgresQuotaUDSDockerAndHostE2E(t *testing.T) {
 		}
 		return nil
 	})
+	dataKey := []byte(strings.Repeat("k", 32))
 	provisioner, err := worker.NewWorkspaceSyncNodeProvisioner(worker.WorkspaceSyncNodeProvisionerOptions{
 		Supervisor: supervisor, Store: store, RelayGate: relayGate,
-		QuotaSockets: quotaSockets, StartGuard: startGuard, DataKey: []byte(strings.Repeat("k", 32)),
+		QuotaSockets: quotaSockets, StartGuard: startGuard, DataKey: dataKey,
 	})
 	if err != nil {
 		t.Fatalf("create production Syncthing provisioner: %v", err)
@@ -298,7 +306,27 @@ func TestWorkspaceSyncPostgresQuotaUDSDockerAndHostE2E(t *testing.T) {
 		t.Fatalf("share Workspace folder with server: %v", err)
 	}
 	if err := f02WaitForSyncthingConnection(ctx, pcAPI, connection.DeviceID, true); err != nil {
-		t.Fatalf("wait for private relay connection: %v", err)
+		nodeAPIKey := f02WorkspaceSyncNodeAPIKey(dataKey, owner.ID)
+		nodeStateCtx, nodeStateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		nodePeerState := f02WorkspaceSyncNodePeerState(nodeStateCtx, provisioner, owner.ID, pcID)
+		nodeStateCancel()
+		logSecrets := []string{relayToken, pcAPIKey, nodeAPIKey}
+		pcConnectionsCtx, pcConnectionsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pcConnections := f02SyncthingConnectionSnapshot(pcConnectionsCtx, "PC", pcAPI, logSecrets...)
+		pcConnectionsCancel()
+		nodeConnectionsCtx, nodeConnectionsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		nodeConnections := f02WorkspaceSyncNodeConnectionSnapshot(nodeConnectionsCtx, nodeName, networkName, nodeAPIKey, logSecrets...)
+		nodeConnectionsCancel()
+		pcLogsCtx, pcLogsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pcLogs := f02SyncthingSystemLogs(pcLogsCtx, "PC", pcAPI, logSecrets...)
+		pcLogsCancel()
+		nodeLogsCtx, nodeLogsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		nodeLogs := f02WorkspaceSyncNodeSystemLogs(nodeLogsCtx, nodeName, networkName, nodeAPIKey, logSecrets...)
+		nodeLogsCancel()
+		relayLogs := "[relay] Docker logging is disabled by the isolation contract; process output is not retained"
+		diagnostics := fmt.Sprintf("PC connections:\n%s\nCloud node connections:\n%s\nPC/node Syncthing logs:\n%s\n%s\n%s",
+			pcConnections, nodeConnections, pcLogs, nodeLogs, relayLogs)
+		t.Fatalf("wait for private relay connection: %v\nCloud node peer state: %s\n%s", err, nodePeerState, diagnostics)
 	}
 
 	pcFile := []byte("PC to production quota UDS, PostgreSQL, and current projection\n")
@@ -442,6 +470,97 @@ func f02WorkspaceSyncDockerCommand(ctx context.Context, args ...string) ([]byte,
 	return output, nil
 }
 
+func f02SyncthingSystemLogs(ctx context.Context, name string, client *worker.SyncthingAPIClient, secrets ...string) string {
+	logs, err := client.SystemLogs(ctx)
+	if err != nil {
+		return fmt.Sprintf("[%s Syncthing logs] collection failed: %v", name, err)
+	}
+	value := string(logs)
+	for _, secret := range secrets {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[redacted]")
+		}
+	}
+	if len(value) > 16<<10 {
+		value = value[len(value)-(16<<10):]
+	}
+	return fmt.Sprintf("[%s Syncthing logs]\n%s", name, strings.TrimSpace(value))
+}
+
+func f02SyncthingConnectionSnapshot(ctx context.Context, name string, client *worker.SyncthingAPIClient, secrets ...string) string {
+	connections, err := client.Connections(ctx)
+	if err != nil {
+		return fmt.Sprintf("[%s Syncthing connections] collection failed: %v", name, err)
+	}
+	value := string(connections)
+	for _, secret := range secrets {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[redacted]")
+		}
+	}
+	if len(value) > 16<<10 {
+		value = value[len(value)-(16<<10):]
+	}
+	return fmt.Sprintf("[%s Syncthing connections]\n%s", name, strings.TrimSpace(value))
+}
+
+func f02WorkspaceSyncNodeConnectionSnapshot(ctx context.Context, nodeName, networkName, apiKey string, secrets ...string) string {
+	client, err := f02WorkspaceSyncNodeAPIClient(ctx, nodeName, networkName, apiKey)
+	if err != nil {
+		return fmt.Sprintf("[cloud node Syncthing connections] %v", err)
+	}
+	return f02SyncthingConnectionSnapshot(ctx, "cloud node", client, secrets...)
+}
+
+func f02WorkspaceSyncNodeSystemLogs(ctx context.Context, nodeName, networkName, apiKey string, secrets ...string) string {
+	client, err := f02WorkspaceSyncNodeAPIClient(ctx, nodeName, networkName, apiKey)
+	if err != nil {
+		return fmt.Sprintf("[cloud node Syncthing logs] %v", err)
+	}
+	return f02SyncthingSystemLogs(ctx, "cloud node", client, secrets...)
+}
+
+func f02WorkspaceSyncNodeAPIClient(ctx context.Context, nodeName, networkName, apiKey string) (*worker.SyncthingAPIClient, error) {
+	inspectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	format := fmt.Sprintf("{{(index .NetworkSettings.Networks %q).IPAddress}}", networkName)
+	output, err := f02WorkspaceSyncDockerCommand(inspectCtx, "inspect", "--format", format, nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("container address unavailable: %w", err)
+	}
+	address := net.ParseIP(strings.TrimSpace(string(output)))
+	if address == nil || address.To4() == nil || !address.IsPrivate() || address.IsLoopback() || address.IsUnspecified() {
+		return nil, errors.New("container address is invalid")
+	}
+	client, err := worker.NewSyncthingAPIClient("http://"+net.JoinHostPort(address.String(), "8384"), apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("API configuration failed: %w", err)
+	}
+	return client, nil
+}
+
+func f02WorkspaceSyncNodeAPIKey(dataKey []byte, ownerID string) string {
+	// Keep this derivation aligned with WorkspaceSyncNodeProvisioner.apiKey so failure logs redact it.
+	mac := hmac.New(sha256.New, dataKey)
+	_, _ = mac.Write([]byte("morde.workspace-sync-node-api.v1\x00" + ownerID))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func f02WorkspaceSyncNodePeerState(ctx context.Context, provisioner *worker.WorkspaceSyncNodeProvisioner, ownerID, deviceID string) string {
+	observation, err := provisioner.ObserveWorkspaceSyncNode(ctx, ownerID)
+	if err != nil {
+		return fmt.Sprintf("observation failed: %v", err)
+	}
+	peerConnected := false
+	for _, connectedDeviceID := range observation.ConnectedDeviceIDs {
+		if connectedDeviceID == deviceID {
+			peerConnected = true
+			break
+		}
+	}
+	return fmt.Sprintf("present=%t running=%t peer_connected=%t", observation.Present, observation.Running, peerConnected)
+}
+
 func f02WaitForSyncthingAPI(ctx context.Context, client *worker.SyncthingAPIClient) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -460,23 +579,31 @@ func f02WaitForSyncthingAPI(ctx context.Context, client *worker.SyncthingAPIClie
 func f02WaitForSyncthingConnection(ctx context.Context, client *worker.SyncthingAPIClient, deviceID string, connected bool) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+	lastObservation := "no connection status received"
 	for {
 		raw, err := client.Connections(ctx)
 		if err == nil {
 			var state struct {
 				Connections map[string]struct {
 					Connected bool `json:"connected"`
+					Paused    bool `json:"paused"`
 				} `json:"connections"`
 			}
 			if json.Unmarshal(raw, &state) == nil && state.Connections != nil {
-				if connection, ok := state.Connections[deviceID]; ok && connection.Connected == connected {
+				connection, ok := state.Connections[deviceID]
+				if ok {
+					lastObservation = fmt.Sprintf("peer connected=%t paused=%t", connection.Connected, connection.Paused)
+				} else {
+					lastObservation = "peer missing from connection status"
+				}
+				if ok && connection.Connected == connected {
 					return nil
 				}
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("%w (last Syncthing status: %s)", ctx.Err(), lastObservation)
 		case <-ticker.C:
 		}
 	}

@@ -17,18 +17,29 @@ import (
 )
 
 type WorkspaceSyncQuotaService struct {
-	sync    *WorkspaceSyncService
-	current *workspacecurrent.Store
+	sync     *WorkspaceSyncService
+	current  *workspacecurrent.Store
+	capacity WorkspaceSyncWriteCapacityChecker
 }
 
-func NewWorkspaceSyncQuotaService(syncService *WorkspaceSyncService, current *workspacecurrent.Store) (*WorkspaceSyncQuotaService, error) {
-	if syncService == nil || current == nil {
-		return nil, errors.New("workspace sync quota service requires the sync service and current-file store")
+// WorkspaceSyncWriteCapacityChecker rejects receive writes that would consume the shared-volume reserve.
+type WorkspaceSyncWriteCapacityChecker interface {
+	CheckCapacityForWrite(context.Context, int64) error
+}
+
+func NewWorkspaceSyncQuotaService(syncService *WorkspaceSyncService, current *workspacecurrent.Store, capacity WorkspaceSyncWriteCapacityChecker) (*WorkspaceSyncQuotaService, error) {
+	if syncService == nil || current == nil || capacity == nil {
+		return nil, errors.New("workspace sync quota service requires the sync service, current-file store, and shared-volume capacity checker")
 	}
-	return &WorkspaceSyncQuotaService{sync: syncService, current: current}, nil
+	return &WorkspaceSyncQuotaService{sync: syncService, current: current, capacity: capacity}, nil
 }
 
 func (s *WorkspaceSyncQuotaService) Reserve(ctx context.Context, ownerID string, request syncnodequota.ReserveRequest) (syncnodequota.Receipt, error) {
+	if request.Operation == syncnodequota.OperationUpsert || request.Operation == syncnodequota.OperationDirectoryUpsert {
+		if err := s.capacity.CheckCapacityForWrite(ctx, request.SizeBytes); err != nil {
+			return syncnodequota.Receipt{}, err
+		}
+	}
 	reservation, err := s.sync.ReserveWorkspaceSyncReceive(ctx, WorkspaceSyncReceiveRequest{
 		OwnerID: ownerID, WorkspaceID: request.WorkspaceID, FolderID: request.FolderID, OperationID: request.OperationID,
 		Path: request.Path, Operation: WorkspaceSyncReceiveOperation(request.Operation), TargetBytes: request.SizeBytes,
@@ -86,7 +97,21 @@ func (s *WorkspaceSyncQuotaService) Settle(ctx context.Context, ownerID, reserva
 		err = domain.NewError(domain.CodeInvalidState, "workspace receive operation is invalid")
 	}
 	if err != nil {
-		if domain.CodeOf(err) == domain.CodeQuotaExceeded || domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+		if domain.CodeOf(err) == domain.CodeQuotaExceeded {
+			recordErr := s.sync.RecordWorkspaceSyncReceiveQuotaRejection(ctx, ownerID, reservationID, workspace.SyncQuotaPauseOwnerStorage)
+			if recordErr != nil {
+				pending := domain.NewError(domain.CodeWorkspaceBusy, "workspace receive quota rejection is awaiting durable recovery")
+				pending.Err = recordErr
+				return syncnodequota.Receipt{}, pending
+			}
+			if abortErr := s.sync.AbortWorkspaceSyncReceive(ctx, ownerID, reservationID); abortErr != nil {
+				pending := domain.NewError(domain.CodeWorkspaceBusy, "workspace receive quota rejection is awaiting durable recovery")
+				pending.Err = abortErr
+				return syncnodequota.Receipt{}, pending
+			}
+			return syncnodequota.Receipt{}, err
+		}
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
 			if abortErr := s.sync.AbortWorkspaceSyncReceive(ctx, ownerID, reservationID); abortErr != nil {
 				return syncnodequota.Receipt{}, errors.Join(err, fmt.Errorf("restore Workspace after rejected receive: %w", abortErr))
 			}
@@ -95,6 +120,13 @@ func (s *WorkspaceSyncQuotaService) Settle(ctx context.Context, ownerID, reserva
 	}
 	result, err := s.sync.CommitWorkspaceSyncReceive(ctx, ownerID, reservation.WorkspaceID, reservationID, file, directory)
 	if err != nil {
+		if domain.CodeOf(err) == domain.CodeForbidden {
+			if abortErr := s.sync.AbortWorkspaceSyncReceive(ctx, ownerID, reservationID); abortErr != nil {
+				pending := domain.NewError(domain.CodeWorkspaceBusy, "revoked Workspace receive is awaiting recovery")
+				pending.Err = errors.Join(err, abortErr)
+				return syncnodequota.Receipt{}, pending
+			}
+		}
 		return syncnodequota.Receipt{}, err
 	}
 	if result.ReservationID != reservationID || result.State != "settled" {

@@ -214,7 +214,7 @@ export function Workspaces() {
             const conflicts = binding.sync_conflicts;
             return <div className="workspace-host-status" key={`${host.id}-${binding.workspace.id}`}>
               <small>{host.owner_id !== user?.id ? '主机应用状态不可见' : `应用：${bindingStateLabel[binding.state] || binding.state}`}</small>
-              <small>同步：{workspaceSyncLabel(item, binding)}</small>
+              <small>同步：{workspaceSyncLabel(item, host, binding)}</small>
               {binding.sync_state === 'conflict' && <div className="workspace-host-sync-conflict notice notice-warning" role="status">
                 <strong>Host 工作区同步冲突</strong>
                 {conflicts.slice(0, 5).map((path, index) => <small key={`${path}-${index}`}>{path}</small>)}
@@ -230,7 +230,7 @@ export function Workspaces() {
               if (progressWorkspaceID === item.id) void deviceProgress.refetch();
               else setProgressWorkspaceID(item.id);
             }}>设备进度</button>
-            {bindings.filter(({ host }) => host.owner_id === user?.id).map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={host.id} aria-label={`打开主机 ${host.name || host.id}`} disabled={!canOpenWorkspaceHost(item, host, binding)} title={!canOpenWorkspaceHost(item, host, binding) ? '主机运行且工作区当前版本已应用后才能打开' : undefined} onClick={() => void openHost(host)}>打开主机</button>)}
+            {bindings.filter(({ host }) => host.owner_id === user?.id).map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={host.id} aria-label={`打开主机 ${host.name || host.id}`} disabled={!canOpenWorkspaceHost(item, host, binding)} title={!canOpenWorkspaceHost(item, host, binding) ? 'Host Runtime 在线且工作区当前版本已应用后才能打开' : undefined} onClick={() => void openHost(host)}>打开主机</button>)}
             {bindings.filter(({ host, binding }) => host.owner_id === user?.id && host.state === 'running' && binding.state !== 'unbinding').map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={`unbind-${host.id}`} aria-label={`解绑工作区 ${item.name || item.id} 与主机 ${host.name || host.id}`} disabled={unbind.isPending} onClick={() => setSelectedBinding({ host, binding })}>解绑</button>)}
             {item.state === 'ready' && <div className="workspace-bind-actions">
               {hosts.isPending ? <small className="muted">正在读取主机…</small> : hosts.isError ? <small className="muted">主机状态不可用，暂不能绑定</small> : availableHosts.length ? <>
@@ -273,19 +273,26 @@ const syncStageLabel: Record<components['schemas']['DeviceWorkspaceSyncProgress'
   scan: '扫描', compare: '比较', transfer: '传输', verify: '校验', apply: '应用', complete: '完成',
 };
 
-function workspaceSyncLabel(workspace: Workspace, binding: Binding) {
+function workspaceSyncLabel(workspace: Workspace, host: Host, binding: Binding) {
   if (binding.sync_state === 'conflict') return '检测到冲突';
   if (binding.state === 'failed') return '同步失败';
+  if (binding.state === 'detached') return '未绑定';
+  if (host.workspace_runtime_online !== true) {
+    if (binding.state === 'preparing') return `Host Runtime 未在线确认 · 等待应用 v${binding.desired_revision}`;
+    if (binding.state === 'unbinding') return 'Host Runtime 未在线确认 · 等待解绑';
+    return binding.applied_revision >= 0
+      ? `Host Runtime 未在线确认 · 最近确认 v${binding.applied_revision}`
+      : 'Host Runtime 未在线确认 · 尚无应用确认';
+  }
   if (binding.state === 'preparing') return `正在应用 v${binding.desired_revision}`;
   if (binding.state === 'unbinding') return '正在解绑';
-  if (binding.state === 'detached') return '未绑定';
   if (binding.applied_revision !== binding.desired_revision) return `同步中 v${binding.applied_revision}/${binding.desired_revision}`;
   if (binding.applied_revision !== workspace.revision) return `待同步：主机 v${binding.applied_revision} / 工作区 v${workspace.revision}`;
   return `已同步 v${binding.applied_revision}`;
 }
 
 function canOpenWorkspaceHost(workspace: Workspace, host: Host, binding: Binding) {
-  return host.state === 'running' && binding.state === 'active'
+  return host.state === 'running' && host.workspace_runtime_online === true && binding.state === 'active'
     && binding.applied_revision === binding.desired_revision
     && binding.applied_revision === workspace.revision;
 }

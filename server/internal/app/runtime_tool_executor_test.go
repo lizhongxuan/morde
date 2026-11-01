@@ -989,7 +989,7 @@ func TestRuntimeToolExecutorRejectsWorkspaceRevisionChangedAfterTaskSubmission(t
 			t.Fatal(err)
 		}
 		defer session.Close()
-		if err := session.SetTaskLease(context.Background(), current.ID, current.Lease.Version, *current.Lease.ExpiresAt); err != nil {
+		if err := session.SetTaskLease(context.Background(), current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
 			t.Fatal(err)
 		}
 		_, err = fixture.executor.operations.Execute(context.Background(), session, current.ID, "o1234567", current.Lease.Version,

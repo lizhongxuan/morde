@@ -12,6 +12,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
@@ -893,6 +894,56 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 	unchanged, err := store.GetWorkspaceSyncSession(ctx, value.ID, session.ID)
 	if err != nil || unchanged.State != workspace.SyncCancelled {
 		t.Fatalf("Host session state after cancellation = %#v, err=%v", unchanged, err)
+	}
+}
+
+func TestHostWorkspaceSyncRejectsBaseAheadOfAppliedRevision(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "host-sync-base-ahead")
+
+	file := syncTestFile("already-saved.txt", []byte("revision one"))
+	upload := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, upload, syncTestBlocks(upload.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "host-base-ahead:owner-create", upload.ID)); err != nil {
+		t.Fatalf("create Workspace revision: %v", err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, upload.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "host-base-ahead:owner-commit", upload.ID)); err != nil {
+		t.Fatalf("commit Workspace revision: %v", err)
+	}
+	value, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil || value.Revision != 1 {
+		t.Fatalf("Workspace revision after upload = %#v, err=%v", value, err)
+	}
+
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	if err := store.MarkCreateAttempt(ctx, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionHost(ctx, hostValue.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, 1,
+		workspace.BindingPreparing, workspace.BindingActive, value.Revision, 0)
+	if err != nil {
+		t.Fatalf("activate Host binding before it applies revision: %v", err)
+	}
+
+	session := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
+	session.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, value.ID, binding.BindingVersion)
+	session.Direction = workspace.SyncDownload
+	session.Policy = workspace.SyncLive
+	session.BaseRevision = value.Revision
+	session.DownloadActions = workspace.DownloadActionsForTreePlan(nil, nil, nil, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "host-base-ahead:download", session.ID)); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("create Host download from unapplied revision error = %v, want workspace conflict", err)
+	}
+	current, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
+	if err != nil || current.AppliedRevision != 0 {
+		t.Fatalf("Host applied revision after rejected plan = %#v, err=%v", current, err)
 	}
 }
 

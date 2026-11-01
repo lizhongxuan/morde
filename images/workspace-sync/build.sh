@@ -32,15 +32,6 @@ require_source_pattern lib/config/folderconfiguration.go 'MordeQuotaSocket'
 require_source_pattern lib/config/folderconfiguration.go 'MordeWorkspaceID'
 require_source_pattern lib/config/folderconfiguration.go 'MordeMaxSingleFileBytes'
 
-while IFS= read -r -d '' ignored_path; do
-    case "$ignored_path" in
-        *.go)
-            printf 'Refusing ignored Go source that is not covered by the Syncthing patch digest: %s\n' "$ignored_path" >&2
-            exit 1
-            ;;
-    esac
-done < <(git -C "$source_dir" ls-files --others --ignored --exclude-standard -z)
-
 case "$image_platform" in
     linux/amd64) image_arch=amd64 ;;
     linux/arm64) image_arch=arm64 ;;
@@ -97,9 +88,39 @@ fi
 node_tag="${WORKSPACE_SYNC_NODE_IMAGE_TAG:-local/morde-workspace-sync-node:$source_key}"
 relay_tag="${WORKSPACE_SYNC_RELAY_IMAGE_TAG:-local/morde-workspace-sync-relay:$source_key}"
 build_dir="$(mktemp -d "${TMPDIR:-/tmp}/morde-workspace-sync-images.XXXXXX")"
-trap 'rm -rf "$build_dir"' EXIT
+generated_assets="$source_dir/lib/api/auto/gui.files.go"
+had_generated_assets=0
+cleanup_build() {
+    if ((had_generated_assets)); then
+        cp -p "$build_dir/gui.files.previous" "$generated_assets"
+    else
+        rm -f -- "$generated_assets"
+    fi
+    rm -rf -- "$build_dir"
+}
+trap cleanup_build EXIT
 
 mkdir -p "$build_dir/node" "$build_dir/relay"
+if [[ -e "$generated_assets" || -L "$generated_assets" ]]; then
+    if [[ ! -f "$generated_assets" || -L "$generated_assets" ]]; then
+        printf 'Refusing unexpected generated GUI asset path: %s\n' "$generated_assets" >&2
+        exit 1
+    fi
+    cp -p "$generated_assets" "$build_dir/gui.files.previous"
+    had_generated_assets=1
+fi
+GOTOOLCHAIN=local GOPROXY=off go -C "$source_dir" generate ./lib/api/auto
+
+while IFS= read -r -d '' ignored_path; do
+    case "$ignored_path" in
+        lib/api/auto/gui.files.go) ;;
+        *.go)
+            printf 'Refusing ignored Go source that is not covered by the Syncthing patch digest: %s\n' "$ignored_path" >&2
+            exit 1
+            ;;
+    esac
+done < <(git -C "$source_dir" ls-files --others --ignored --exclude-standard -z)
+
 cp "$source_dir/LICENSE" "$build_dir/node/LICENSE"
 cp "$source_dir/LICENSE" "$build_dir/relay/LICENSE"
 

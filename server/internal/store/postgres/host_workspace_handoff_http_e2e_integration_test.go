@@ -412,6 +412,10 @@ func (hostWorkspaceAppliedTestManager) SetWorkspaceBindings(context.Context, con
 	return contract.SetWorkspaceBindingsResponse{}, nil
 }
 
+func (hostWorkspaceAppliedTestManager) DeleteTaskWorkspaceView(context.Context, string, contract.DeleteTaskWorkspaceViewRequest) (contract.DeleteTaskWorkspaceViewResponse, error) {
+	return contract.DeleteTaskWorkspaceViewResponse{}, errors.New("unexpected Task Workspace view deletion in Host handoff test")
+}
+
 func createHostHandoffTestHost(t *testing.T, ctx context.Context, store *Store, sealer *app.Sealer, ownerID string,
 	capacity app.Capacity, workspaceIDs []string) (host.Host, string) {
 	t.Helper()
