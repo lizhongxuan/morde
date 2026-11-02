@@ -36,11 +36,32 @@ const (
 	ActionClientDeny                   Action = "client.deny"
 	ActionClientLogin                  Action = "client.login"
 	ActionClientWebSession             Action = "client.web_session"
+	ActionClientScheduleGrant          Action = "client.schedule_grant"
 	ActionClientRevoke                 Action = "client.revoke"
 	ActionWorkspaceDelete              Action = "workspace.delete"
 	ActionUserCreate                   Action = "user.create"
 	ActionUserUpdate                   Action = "user.update"
 	ActionPersonalDataQuotaUpdate      Action = "personal_data.quota.update"
+	ActionAdminControlRuleCreate       Action = "admin.control.rule.create"
+	ActionAdminControlRuleUpdate       Action = "admin.control.rule.update"
+	ActionAdminControlRuleDelete       Action = "admin.control.rule.delete"
+	ActionAdminControlRuleFire         Action = "admin.control.rule.fire"
+	ActionAdminControlEvaluate         Action = "admin.control.evaluate"
+	ActionAdminControlNotifyTest       Action = "admin.control.notify_test"
+	ActionRecordConsentRead            Action = "record.consent.read"
+	ActionRecordConsentUpdate          Action = "record.consent.update"
+	ActionRecordQuotaRead              Action = "record.quota.read"
+	ActionRecordQuotaUpdate            Action = "record.quota.update"
+	ActionRecordGrantUpdate            Action = "record.grant.update"
+	ActionRecordSettingsRead           Action = "record.settings.read"
+	ActionRecordAccessRead             Action = "record.access.read"
+	ActionRecordList                   Action = "record.list"
+	ActionRecordRead                   Action = "record.read"
+	ActionRecordAttachmentsRead        Action = "record.attachments.read"
+	ActionRecordAttachmentRead         Action = "record.attachment.read"
+	ActionRecordExport                 Action = "record.export"
+	ActionRecordDelete                 Action = "record.delete"
+	ActionRecordDeleteComplete         Action = "record.delete.complete"
 	ActionMCPCall                      Action = "mcp.call"
 	ActionMCPConnectorCreate           Action = "mcp.connector.create"
 	ActionMCPConnectorUpdate           Action = "mcp.connector.update"
@@ -59,8 +80,14 @@ func (a Action) Valid() bool {
 		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter, ActionHostControl, ActionHostResourcesUpdate, ActionHostApplicationInstall, ActionHostApplicationLaunch, ActionHostApplicationStop, ActionHostMemberInvite, ActionHostMemberRevoke, ActionExecutionControl, ActionHostRelease, ActionHostRestore, ActionModelBudgetUpdate, ActionModelUsageReconcile,
 		ActionModelConnectionCreate, ActionModelConnectionUpdate, ActionModelConnectionDelete, ActionModelConnectionCheck,
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
-		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientRevoke,
-		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionMCPCall,
+		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientScheduleGrant, ActionClientRevoke,
+		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate,
+		ActionAdminControlRuleCreate, ActionAdminControlRuleUpdate, ActionAdminControlRuleDelete,
+		ActionAdminControlRuleFire, ActionAdminControlEvaluate, ActionAdminControlNotifyTest, ActionMCPCall,
+		ActionRecordConsentRead, ActionRecordConsentUpdate, ActionRecordQuotaRead, ActionRecordQuotaUpdate,
+		ActionRecordGrantUpdate, ActionRecordSettingsRead, ActionRecordAccessRead, ActionRecordList,
+		ActionRecordRead, ActionRecordAttachmentsRead, ActionRecordAttachmentRead, ActionRecordExport,
+		ActionRecordDelete, ActionRecordDeleteComplete,
 		ActionMCPConnectorCreate, ActionMCPConnectorUpdate, ActionMCPConnectorEnable,
 		ActionMCPConnectorDisable, ActionMCPConnectorCredentialRotate, ActionMCPConnectorDelete,
 		ActionSystemLost, ActionOrphanDeleted, ActionSystemRenew:

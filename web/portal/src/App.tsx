@@ -25,6 +25,10 @@ import { AdminUsers } from './routes/admin/AdminUsers';
 import { AdminOverview } from './routes/admin/AdminOverview';
 import { AdminModels } from './routes/admin/AdminModels';
 import { AdminUsage } from './routes/admin/AdminUsage';
+import { AdminQuality } from './routes/admin/AdminQuality';
+import { AdminActivity } from './routes/admin/AdminActivity';
+import { AdminControls } from './routes/admin/AdminControls';
+import { AdminRecords } from './routes/admin/AdminRecords';
 import { AdminHostDetail } from './routes/admin/AdminHostDetail';
 import { AdminUserDetail } from './routes/admin/AdminUserDetail';
 import { AdminWorkspaces } from './routes/admin/AdminWorkspaces';
@@ -75,9 +79,13 @@ function AdminRoutes() {
         <Route path="/admin" element={<AdminLayout />}>
           <Route index element={<AdminOverview />} />
           <Route path="users" element={<AdminUsers />} />
+          <Route path="users/:id/records" element={<AdminRecords />} />
           <Route path="users/:id" element={<AdminUserDetail />} />
           <Route path="models" element={<AdminModels />} />
           <Route path="usage" element={<AdminUsage />} />
+          <Route path="quality" element={<AdminQuality />} />
+          <Route path="activity" element={<AdminActivity />} />
+          <Route path="controls" element={<AdminControls />} />
           <Route path="hosts" element={<AdminHosts />} />
           <Route path="hosts/:id" element={<AdminHostDetail />} />
           <Route path="workspaces" element={<AdminWorkspaces />} />

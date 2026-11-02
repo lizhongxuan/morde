@@ -729,6 +729,22 @@ func requireCurrentTaskAuthorization(ctx context.Context, tx pgx.Tx, value sqlcg
 	if err != nil {
 		return false, fmt.Errorf("check task authorization account: %w", err)
 	}
+	if value.AuthKind == string(identity.KindScheduleTask) {
+		if !scheduleTaskScopeStringsValid(value.AuthScopes) || !schedule.ValidRunID(value.AuthTokenID) ||
+			value.AuthClientInstallationID.Valid {
+			return false, nil
+		}
+		var linked bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM schedule_runs r
+  JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+  WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND s.host_id=$4
+)`, value.AuthTokenID, value.OwnerID, value.ID, value.HostID.String).Scan(&linked)
+		if err != nil {
+			return false, fmt.Errorf("check scheduled Task run link: %w", err)
+		}
+		return linked, nil
+	}
 	var kind string
 	var installationID pgtype.Text
 	var expiresAt time.Time
@@ -1005,7 +1021,7 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 				return domain.NewError(domain.CodeInvalidState, "cloud dsh skill authorization or identity changed")
 			}
 			var authorizationValid bool
-			if err := tx.QueryRow(ctx, `SELECT auth_expires_at > clock_timestamp() FROM tasks WHERE id=$1`, progress.TaskID).Scan(&authorizationValid); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT auth_kind='schedule_task' OR auth_expires_at > clock_timestamp() FROM tasks WHERE id=$1`, progress.TaskID).Scan(&authorizationValid); err != nil {
 				return fmt.Errorf("check cloud dsh skill authorization expiry: %w", err)
 			}
 			if !authorizationValid {

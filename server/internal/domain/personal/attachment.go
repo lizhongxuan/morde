@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	MaxAttachmentChunkBytes          int64 = 4 << 20
-	DefaultMaxAttachmentBytes        int64 = 300 << 20
+	MaxAttachmentChunkBytes   int64 = 4 << 20
+	DefaultMaxAttachmentBytes int64 = 300 << 20
 	// MaxAttachmentBytes keeps chunk indexes within int32.
 	MaxAttachmentBytes               int64 = (1<<31 - 1) * MaxAttachmentChunkBytes
 	PersonalAttachmentUploadIDPrefix       = "pu_"

@@ -9,7 +9,7 @@ import (
 type Purpose string
 
 const (
-	PurposeFullRecord          Purpose = "full_record"
+	PurposeFullRecord           Purpose = "full_record"
 	PurposeTrainingContribution Purpose = "training_contribution"
 )
 

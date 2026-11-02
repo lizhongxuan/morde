@@ -200,6 +200,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me/record-consents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read independent full-record and training-sample consents */
+        get: operations["listMyRecordConsents"];
+        /**
+         * Set one independent record-capture consent
+         * @description Consent is always account-owner controlled. Withdrawing a purpose rejects and clears its queued payloads; it does not delete already stored records.
+         */
+        put: operations["setMyRecordConsent"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/me/password": {
         parameters: {
             query?: never;
@@ -2480,6 +2501,210 @@ export interface paths {
         patch: operations["setAdminPersonalDataQuota"];
         trace?: never;
     };
+    "/api/admin/users/{id}/record-settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a user's record consent, quota, and all administrator grants
+         * @description Requires a super administrator session. This does not return record content or attachments.
+         */
+        get: operations["getAdminRecordSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read this administrator's own record capabilities and the user's consent state
+         * @description Returns only the caller's own grants, never other administrators' grants or quota values.
+         */
+        get: operations["getAdminRecordAccess"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Compare-and-set record retention and storage quota
+         * @description Requires a super administrator session. Current usage is preserved; updates below used plus reserved bytes are rejected. The update is audited in the same database transaction.
+         */
+        put: operations["setAdminRecordQuota"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Grant or revoke one record capability for an active administrator
+         * @description Requires a super administrator session. Grants do not enable user consent. Changes are audited in the same database transaction.
+         */
+        put: operations["setAdminRecordGrant"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List consented record and sample metadata
+         * @description Requires the caller's view grant and current enabled consent for each returned purpose. Payloads and attachments are never included.
+         */
+        get: operations["listAdminUserRecords"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one record body with the view capability
+         * @description Requires the caller's view grant and the current enabled consent. Returns only valid JSON that passes the secret-format check; denied payloads are not returned.
+         */
+        get: operations["getAdminUserRecord"];
+        put?: never;
+        post?: never;
+        /**
+         * Request deletion of a record using the delete capability
+         * @description Creates an idempotent deletion tombstone. The record and dedicated attachments are removed asynchronously; the request and completion are audited without content.
+         */
+        delete: operations["requestAdminUserRecordDelete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        /** List attachment metadata with attachment capability */
+        get: operations["listAdminUserRecordAttachments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}/attachments/{attachment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+                attachment_id: components["schemas"]["RecordAttachmentId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download one attachment with attachment capability
+         * @description Requires both view and attachment grants plus current consent. Content is an attachment with nosniff and private no-store headers.
+         */
+        get: operations["downloadAdminUserRecordAttachment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Export one record after a strict JSON and secret-format check
+         * @description Requires the caller's export grant and current enabled consent. The export must be valid JSON, may not contain known credential fields, common credential formats, or Vault markers, and is returned with a safe generated filename. Use local synthetic records for acceptance.
+         */
+        get: operations["exportAdminUserRecord"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/capacity": {
         parameters: {
             query?: never;
@@ -2608,6 +2833,103 @@ export interface paths {
         get: operations["getAdminPlaces"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List notify-only threshold rules and local notifications
+         * @description Rules can only create notifications in the local database receiver. Global signup, sync, allowance, and device controls are not exposed.
+         */
+        get: operations["getAdminControls"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create a local notification threshold rule */
+        post: operations["createAdminControlRule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/rules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Compare-and-set a local notification threshold rule */
+        put: operations["updateAdminControlRule"];
+        post?: never;
+        /** Delete a threshold rule using its current version */
+        delete: operations["deleteAdminControlRule"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/evaluate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Manually evaluate enabled account-count rules
+         * @description Evaluation records local notifications only and is idempotent for already-fired rules.
+         */
+        post: operations["evaluateAdminControls"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/notify-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Write a test event to the local notification receiver
+         * @description This does not send email, network traffic, or external notifications.
+         */
+        post: operations["adminControlNotifyTest"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4456,6 +4778,20 @@ export interface components {
             days: 7 | 30 | 90;
             available: boolean;
             unavailable_reason?: string;
+            /**
+             * Format: int64
+             * @description Count of unexpired samples with currently enabled
+             */
+            sample_count: number;
+            /**
+             * Format: int64
+             * @description Failed tasks by updated_at in the selected window.
+             */
+            failed_tasks: number;
+            /** Format: int64 */
+            failed_hub_operations: number;
+            /** Format: int64 */
+            unknown_hub_operations: number;
         };
         AdminPlaces: {
             /** @enum {integer} */
@@ -4503,6 +4839,194 @@ export interface components {
             action: string;
             /** Format: int64 */
             count: number;
+        };
+        AdminControls: {
+            rules: components["schemas"]["AdminControlRule"][];
+            /** Format: int64 */
+            accounts_total: number;
+            next_threshold: number | null;
+            notify_configured: boolean;
+            notifications: components["schemas"]["AdminControlNotification"][];
+        };
+        AdminControlRule: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            threshold: number;
+            enabled: boolean;
+            note: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_fired_at: string | null;
+            /** Format: int64 */
+            fired_accounts: number;
+            /** Format: int64 */
+            version: number;
+        };
+        AdminControlNotification: {
+            /** @enum {string} */
+            kind: "rule_fired" | "test";
+            /** Format: int64 */
+            rule_id: number | null;
+            /** Format: int64 */
+            accounts_total: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        AdminControlEvaluation: {
+            /** Format: int64 */
+            accounts_total: number;
+            fired: components["schemas"]["AdminControlRule"][];
+        };
+        AdminControlNotifyTest: {
+            /** @constant */
+            sent: true;
+            /** @constant */
+            configured: true;
+            /** Format: date-time */
+            created_at: string;
+        };
+        /** @enum {string} */
+        RecordPurpose: "full_record" | "training_contribution";
+        /** @enum {string} */
+        RecordCapability: "view" | "attachment" | "export" | "delete";
+        RecordId: string;
+        RecordAttachmentId: string;
+        RecordConsent: {
+            owner_id: components["schemas"]["UserId"];
+            purpose: components["schemas"]["RecordPurpose"];
+            enabled: boolean;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        RecordConsents: {
+            items: components["schemas"]["RecordConsent"][];
+        };
+        SetRecordConsentRequest: {
+            purpose: components["schemas"]["RecordPurpose"];
+            enabled: boolean;
+        };
+        RecordQuota: {
+            owner_id: components["schemas"]["UserId"];
+            /** Format: int32 */
+            retention_days: number;
+            /** Format: int64 */
+            limit_bytes: number;
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            reserved_bytes: number;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        RecordAdminGrant: {
+            owner_id: components["schemas"]["UserId"];
+            admin_id: components["schemas"]["UserId"];
+            capability: components["schemas"]["RecordCapability"];
+            granted: boolean;
+            granted_by: components["schemas"]["UserId"];
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        AdminRecordSettings: {
+            owner_id: components["schemas"]["UserId"];
+            consents: components["schemas"]["RecordConsent"][];
+            quota: components["schemas"]["RecordQuota"];
+            grants: components["schemas"]["RecordAdminGrant"][];
+        };
+        AdminRecordAccess: {
+            capabilities: components["schemas"]["RecordCapability"][];
+            consents: components["schemas"]["RecordConsent"][];
+        };
+        SetAdminRecordQuotaRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            /** Format: int32 */
+            retention_days: number;
+            /** Format: int64 */
+            limit_bytes: number;
+        };
+        SetAdminRecordGrantRequest: {
+            admin_id: components["schemas"]["UserId"];
+            capability: components["schemas"]["RecordCapability"];
+            granted: boolean;
+        };
+        RecordMetadata: {
+            id: components["schemas"]["RecordId"];
+            owner_id: components["schemas"]["UserId"];
+            purpose: components["schemas"]["RecordPurpose"];
+            /** @enum {string} */
+            kind: "turn" | "sample";
+            /** Format: int64 */
+            consent_version: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: int64 */
+            payload_bytes: number;
+            /** Format: int64 */
+            attachment_bytes: number;
+            /** Format: int32 */
+            attachment_count: number;
+            /** @enum {string} */
+            state: "active";
+        };
+        RecordPage: {
+            items: components["schemas"]["RecordMetadata"][];
+            next_before: string;
+        };
+        RecordContent: {
+            metadata: components["schemas"]["RecordMetadata"];
+            /** @description Valid JSON record payload with known secret formats and Vault markers rejected. */
+            payload: unknown;
+        };
+        RecordAttachment: {
+            id: components["schemas"]["RecordAttachmentId"];
+            record_id: components["schemas"]["RecordId"];
+            file_name: string;
+            media_type: string;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
+        };
+        RecordAttachmentPage: {
+            items: components["schemas"]["RecordAttachment"][];
+        };
+        RecordDeleteTombstone: {
+            id: string;
+            owner_id: components["schemas"]["UserId"];
+            record_id: components["schemas"]["RecordId"];
+            /** @enum {string} */
+            state: "pending" | "failed" | "completed";
+            /** Format: int32 */
+            attempts: number;
+            /** Format: date-time */
+            requested_at: string;
+            /** Format: date-time */
+            completed_at?: string;
+        };
+        CreateAdminControlRuleRequest: {
+            /** Format: int64 */
+            threshold: number;
+            note?: string;
+        };
+        UpdateAdminControlRuleRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            /** Format: int64 */
+            threshold?: number;
+            enabled?: boolean;
+            note?: string;
+            /** @default false */
+            rearm: boolean;
         };
         AdminUsageSummary: {
             /** Format: int64 */
@@ -5074,6 +5598,55 @@ export interface operations {
                     "application/json": components["schemas"]["Me"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyRecordConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current consent state; both purposes default to disabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordConsents"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setMyRecordConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetRecordConsentRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated consent state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordConsent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             default: components["responses"]["Error"];
         };
@@ -8984,6 +9557,288 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getAdminRecordSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record capture settings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRecordSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminRecordAccess: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current caller record access */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRecordAccess"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setAdminRecordQuota: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAdminRecordQuotaRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated record quota */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordQuota"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setAdminRecordGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAdminRecordGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated capability grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordAdminGrant"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserRecords: {
+        parameters: {
+            query?: {
+                purpose?: components["schemas"]["RecordPurpose"];
+                before_id?: components["schemas"]["RecordId"];
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of record metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminUserRecord: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record metadata and JSON payload */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordContent"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    requestAdminUserRecordDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion tombstone */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordDeleteTombstone"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserRecordAttachments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Attachment metadata only */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordAttachmentPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    downloadAdminUserRecordAttachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+                attachment_id: components["schemas"]["RecordAttachmentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dedicated record attachment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    exportAdminUserRecord: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Safe JSON attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     getCapacity: {
         parameters: {
             query?: never;
@@ -9152,6 +10007,163 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminControls: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rule configuration and aggregate account count */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControls"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createAdminControlRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAdminControlRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Created threshold rule */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlRule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminControlRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminControlRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated threshold rule */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlRule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteAdminControlRule: {
+        parameters: {
+            query: {
+                expected_version: number;
+            };
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rule deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    evaluateAdminControls: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Evaluation result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlEvaluation"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    adminControlNotifyTest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local notification test result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlNotifyTest"];
+                };
+            };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];

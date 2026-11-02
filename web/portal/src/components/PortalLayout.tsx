@@ -39,7 +39,6 @@ export function PortalLayout() {
     <a className="skip-link" href="#main-content">跳到主要内容</a>
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
       <Link to="/" className="morde-brand"><span className="morde-brand-mark">M</span><span><strong>Morde</strong><small>把工作继续做完</small></span></Link>
-      <Link to="/workspaces" className="morde-space-chip"><span aria-hidden="true">◈</span><span>我的工作空间</span></Link>
       <nav className="morde-navigation" aria-label="工作导航">
         <span className="morde-nav-heading">工作</span>
         {primaryLinks.map(({ to, label, icon, end }) => <NavLink className="morde-nav-link" to={to} end={end} key={to}><span className="morde-nav-icon" aria-hidden="true">{icon}</span><span>{label}</span></NavLink>)}

@@ -10,17 +10,25 @@ import (
 )
 
 type adminQualityActivityStoreStub struct {
-	activity AdminActivity
-	err      error
-	calls    int
-	from     time.Time
-	to       time.Time
+	activity     AdminActivity
+	quality      AdminQuality
+	err          error
+	calls        int
+	qualityCalls int
+	from         time.Time
+	to           time.Time
 }
 
 func (s *adminQualityActivityStoreStub) GetAdminActivity(_ context.Context, from, to time.Time) (AdminActivity, error) {
 	s.calls++
 	s.from, s.to = from, to
 	return s.activity, s.err
+}
+
+func (s *adminQualityActivityStoreStub) GetAdminQuality(_ context.Context, from, to time.Time) (AdminQuality, error) {
+	s.qualityCalls++
+	s.from, s.to = from, to
+	return s.quality, s.err
 }
 
 func TestAdminQualityActivityAuthorizesBoundsAndReportsUnavailableSources(t *testing.T) {
@@ -53,8 +61,13 @@ func TestAdminQualityActivityAuthorizesBoundsAndReportsUnavailableSources(t *tes
 		}
 	}
 	quality, err := service.Quality(context.Background(), admin, 30)
-	if err != nil || quality.Available || quality.Days != 30 || quality.UnavailableReason == "" || store.calls != 0 {
-		t.Fatalf("Quality = %#v err=%v store calls=%d", quality, err, store.calls)
+	if err != nil || quality.Available || quality.Days != 30 || quality.UnavailableReason == "" || store.qualityCalls != 1 || store.calls != 0 {
+		t.Fatalf("Quality = %#v err=%v quality calls=%d activity calls=%d", quality, err, store.qualityCalls, store.calls)
+	}
+	store.quality = AdminQuality{SampleCount: 2, FailedTasks: 3, FailedHubOperations: 4, UnknownHubOperations: 1}
+	quality, err = service.Quality(context.Background(), admin, 7)
+	if err != nil || !quality.Available || quality.SampleCount != 2 || quality.FailedTasks != 3 || quality.FailedHubOperations != 4 || quality.UnknownHubOperations != 1 {
+		t.Fatalf("quality metadata = %#v err=%v", quality, err)
 	}
 	places, err := service.Places(context.Background(), admin, 90)
 	if err != nil || places.Available || places.Days != 90 || places.UnavailableReason == "" || store.calls != 0 {

@@ -174,11 +174,112 @@ WHERE p.owner_id=$1 AND p.object_type=$2 AND p.object_id=$3`, owner.ID, personal
 	}
 }
 
+func TestPostgresGoalUsesPersonalQuotaVersionAndOwnerLedger(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 4000, 8192)
+	other := createTestUser(t, store, 3, 4000, 8192)
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	otherPrincipal := createPersonalReadSessionPrincipal(t, store, other.ID)
+
+	foreignMaterial := personalObjectMutationForTest(t, other.ID, "library-foreign-1", personal.ObjectTypeLibraryItem, "library_private", 0,
+		`{"name":"Private","kind":"artifact"}`, false)
+	if _, err := store.ApplyPersonalMutation(ctx, otherPrincipal, foreignMaterial); err != nil {
+		t.Fatal(err)
+	}
+	foreignGoal := personalObjectMutationForTest(t, owner.ID, "goal-foreign-1", personal.ObjectTypeGoal, "g_owner_1", 0,
+		`{"title":"Learn Go","status":"active","steps":[],"related_material_ids":["library_private"]}`, false)
+	if _, err := store.ApplyPersonalMutation(ctx, principal, foreignGoal); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("goal referencing another account's material error = %v, want invalid_argument", err)
+	}
+
+	material := personalObjectMutationForTest(t, owner.ID, "library-owner-1", personal.ObjectTypeLibraryItem, "library_own", 0,
+		`{"name":"My notes","kind":"artifact"}`, false)
+	if _, err := store.ApplyPersonalMutation(ctx, principal, material); err != nil {
+		t.Fatal(err)
+	}
+	goalBody := `{"title":"Learn Go","status":"active","steps":[{"id":"step_1","title":"Read the tour","status":"in_progress"}],"related_material_ids":["library_own"]}`
+	create := personalObjectMutationForTest(t, owner.ID, "goal-create-001", personal.ObjectTypeGoal, "g_owner_1", 0, goalBody, false)
+	created, err := store.ApplyPersonalMutation(ctx, principal, create)
+	if err != nil || created.ResultRevision != 1 || created.AccountChangeSequence != 2 {
+		t.Fatalf("create goal = %+v, %v", created, err)
+	}
+	if _, err := store.GetPersonalObject(ctx, otherPrincipal, personal.ObjectTypeGoal, "g_owner_1"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account read goal error = %v, want not_found", err)
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, owner.ID, "goal-stale-001", personal.ObjectTypeGoal,
+		"g_owner_1", 0, goalBody, false)); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("stale goal update error = %v, want conflict", err)
+	}
+
+	var used int64
+	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE personal_data_quotas SET quota_bytes=used_bytes WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	oversizedGoal := `{"title":"Learn Go","description":"` + strings.Repeat("x", 1024) + `","status":"active","steps":[{"id":"step_1","title":"Read the tour","status":"in_progress"}],"related_material_ids":["library_own"]}`
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, owner.ID, "goal-grow-001", personal.ObjectTypeGoal,
+		"g_owner_1", 1, oversizedGoal, false)); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("over-quota goal growth error = %v, want quota_exceeded", err)
+	}
+	var revision int64
+	var savedBody []byte
+	if err := store.pool.QueryRow(ctx, `SELECT v.revision,p.body::text FROM personal_objects p
+JOIN account_object_versions v USING (service_instance_id,owner_id,object_type,object_id)
+WHERE p.owner_id=$1 AND p.object_type=$2 AND p.object_id=$3`, owner.ID, personal.ObjectTypeGoal, "g_owner_1").Scan(&revision, &savedBody); err != nil || revision != 1 || strings.Contains(string(savedBody), "description") {
+		t.Fatalf("rejected goal growth saved body=%s revision=%d err=%v", savedBody, revision, err)
+	}
+	var unchangedUsed int64
+	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&unchangedUsed); err != nil || unchangedUsed != used {
+		t.Fatalf("quota usage after rejected growth = %d, want %d, err=%v", unchangedUsed, used, err)
+	}
+
+	shrink := `{"title":"Learn Go","status":"active","steps":[{"id":"step_1","title":"Read the tour","status":"done"}],"related_material_ids":["library_own"]}`
+	updated, err := store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, owner.ID, "goal-shrink-001", personal.ObjectTypeGoal,
+		"g_owner_1", 1, shrink, false))
+	if err != nil || updated.ResultRevision != 2 || updated.AccountChangeSequence != 3 {
+		t.Fatalf("shrink goal = %+v, %v", updated, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&unchangedUsed); err != nil || unchangedUsed >= used {
+		t.Fatalf("quota usage after goal shrink = %d, want below %d, err=%v", unchangedUsed, used, err)
+	}
+	deleted, err := store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, owner.ID, "goal-delete-001", personal.ObjectTypeGoal,
+		"g_owner_1", 2, "", true))
+	if err != nil || deleted.ResultRevision != 3 || deleted.AccountChangeSequence != 4 {
+		t.Fatalf("delete goal = %+v, %v", deleted, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&unchangedUsed); err != nil || unchangedUsed == 0 {
+		t.Fatalf("quota usage after goal delete = %d, want retained library item usage, err=%v", unchangedUsed, err)
+	}
+	if _, err := store.GetPersonalObject(ctx, principal, personal.ObjectTypeGoal, "g_owner_1"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("deleted goal read error = %v, want not_found", err)
+	}
+}
+
 func personalMutationForTest(t *testing.T, ownerID, mutationID string, revision int64, body string, deleted bool) personal.Mutation {
 	t.Helper()
 	mutation := personal.Mutation{
 		OwnerID: ownerID, MutationID: mutationID, ObjectType: personal.ObjectTypeProfile,
 		ObjectID: personal.ProfileObjectID, BaseRevision: revision, Delete: deleted,
+	}
+	if body != "" {
+		mutation.Body = []byte(body)
+	}
+	hash, err := personal.HashMutationContent(mutation)
+	if err != nil {
+		t.Fatalf("hash personal mutation: %v", err)
+	}
+	mutation.RequestHash = hash
+	return mutation
+}
+
+func personalObjectMutationForTest(t *testing.T, ownerID, mutationID, objectType, objectID string, revision int64, body string, deleted bool) personal.Mutation {
+	t.Helper()
+	mutation := personal.Mutation{
+		OwnerID: ownerID, MutationID: mutationID, ObjectType: objectType, ObjectID: objectID,
+		BaseRevision: revision, Delete: deleted,
 	}
 	if body != "" {
 		mutation.Body = []byte(body)

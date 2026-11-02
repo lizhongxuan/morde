@@ -4,6 +4,7 @@ import { errorDetails, portalApi } from '../../app/api';
 
 type QualityDays = 7 | 30 | 90;
 type QualityData = Awaited<ReturnType<typeof portalApi.adminQuality>>;
+const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 
 function QualityError({ error, retry }: { error: unknown; retry: () => void }) {
   return <div className="error-card" role="alert">
@@ -15,8 +16,14 @@ function QualityError({ error, retry }: { error: unknown; retry: () => void }) {
 function QualityAvailability({ data }: { data: QualityData }) {
   return <section className="admin-detail-section" aria-labelledby="admin-quality-source-heading">
     <h2 id="admin-quality-source-heading">质量与风险数据源</h2>
+    <div className="admin-detail-facts">
+      <article><span>当前授权训练样本</span><strong>{formatNumber(data.sample_count)}</strong><p className="muted">仅计当前同意版本下未过期的样本。</p></article>
+      <article><span>失败 Task</span><strong>{formatNumber(data.failed_tasks)}</strong></article>
+      <article><span>失败 Hub 操作</span><strong>{formatNumber(data.failed_hub_operations)}</strong></article>
+      <article><span>未知结果 Hub 操作</span><strong>{formatNumber(data.unknown_hub_operations)}</strong></article>
+    </div>
     {data.available
-      ? <div className="admin-detail-facts"><article><span>数据源状态</span><strong>可用</strong><p className="muted">管理接口目前只提供来源状态，未返回指标明细；不会从普通会话推导质量数据。</p></article></div>
+      ? <p className="muted">已获准样本只统计数量；接口未计算质量评分或读取样本正文。</p>
       : <div className="empty-card compact" role="status"><h3>当前不可用</h3><p>{data.unavailable_reason || '服务端未提供不可用原因。'}</p><p className="muted">未授权样本不会被读取，普通会话正文不会作为替代数据。</p></div>}
   </section>;
 }

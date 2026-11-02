@@ -218,6 +218,8 @@ type TokenStore interface {
 type ClientLoginStore interface {
 	LoginClient(context.Context, identity.ClientInstallation, string, int64, bool, []byte, []byte, string, string, func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error)
 	IssueClientWebSession(context.Context, identity.Principal, identity.Token) error
+	IssueClientScheduleGrant(context.Context, identity.Principal, identity.Token) error
+	RevokeClientScheduleGrants(context.Context, identity.Principal) error
 	ListClientInstallations(context.Context, string) ([]identity.ClientInstallation, error)
 	GetClientInstallation(context.Context, string) (identity.ClientInstallation, error)
 	RevokeClientInstallation(context.Context, string, string, string, audit.ActorKind, func(context.Context) error) error

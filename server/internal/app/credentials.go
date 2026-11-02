@@ -65,6 +65,14 @@ type CredentialService struct {
 	defaultHosts            DefaultHostEnsurer
 	workspaceSyncController WorkspaceSyncNodeOwnerReconciler
 	hub                     HubRevocationCloser
+	scheduledTasks          ScheduledTaskActionAuthorizer
+}
+
+// ScheduledTaskActionAuthorizer is implemented by the schedule store. The
+// internal schedule-task authorization can act only for a Task attached to
+// the referenced ScheduleRun.
+type ScheduledTaskActionAuthorizer interface {
+	AuthorizeScheduledTaskAction(context.Context, string, string, string, identity.Scope) error
 }
 
 type DefaultHostEnsurer interface {
@@ -96,10 +104,11 @@ func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, w
 	if len(controllers) == 1 {
 		workspaceSyncController = controllers[0]
 	}
+	scheduledTasks, _ := tokens.(ScheduledTaskActionAuthorizer)
 	return &CredentialService{
 		users: users, hosts: hosts, tokens: tokens, audit: writer,
 		options: options, dummyHash: dummyHash,
-		defaultHosts: defaultHosts, workspaceSyncController: workspaceSyncController,
+		defaultHosts: defaultHosts, workspaceSyncController: workspaceSyncController, scheduledTasks: scheduledTasks,
 		limiter: loginLimiter{attempts: make(map[string]loginAttempt)},
 	}, nil
 }
@@ -272,15 +281,67 @@ func (s *CredentialService) VerifyClient(ctx context.Context, raw string) (ident
 	return s.verify(ctx, raw, identity.KindClient)
 }
 
+// ValidateScheduleAuthorization rechecks the persisted management credential
+// before a due occurrence can be committed. Postgres repeats this check while
+// holding the schedule and credential rows to close revocation races.
+func (s *CredentialService) ValidateScheduleAuthorization(ctx context.Context, ownerID string, authorization task.Authorization) error {
+	if !domain.ValidUserID(ownerID) || !domain.ValidTokenID(authorization.TokenID) {
+		return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
+	}
+	kind := identity.Kind(authorization.Kind)
+	if kind != identity.KindSession && kind != identity.KindClient {
+		return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
+	}
+	token, err := s.tokens.GetTokenByID(ctx, authorization.TokenID)
+	if err != nil || token.OwnerID != ownerID || token.Kind != kind || token.RevokedAt != nil || !token.ExpiresAt.After(time.Now()) {
+		return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
+	}
+	if kind == identity.KindClient {
+		scopes := make([]identity.Scope, 0, len(authorization.Scopes))
+		for _, scope := range authorization.Scopes {
+			scopes = append(scopes, identity.Scope(scope))
+		}
+		if !domain.ValidClientInstallationID(authorization.ClientInstallationID) ||
+			token.ClientInstallationID != authorization.ClientInstallationID || !identity.IsScheduleGrantScopeSet(scopes) ||
+			!identity.IsScheduleGrantScopeSet(token.Scopes) || !s.clientInstallationActive(ctx, authorization.ClientInstallationID, ownerID) {
+			return domain.NewError(domain.CodeUnauthenticated, "schedule grant is unavailable")
+		}
+	} else if token.ClientInstallationID != authorization.ClientInstallationID || len(token.Scopes) != 0 || len(authorization.Scopes) != 0 {
+		return domain.NewError(domain.CodeUnauthenticated, "schedule session is unavailable")
+	}
+	user, err := s.users.GetUserByID(ctx, ownerID)
+	if err != nil || user.Status != identity.StatusApproved {
+		return domain.NewError(domain.CodeUnauthenticated, "schedule owner is unavailable")
+	}
+	return nil
+}
+
 type TaskAuthorizer interface {
 	AuthorizeTaskAction(context.Context, string, identity.Kind, string, string, []identity.Scope, identity.Scope) error
 }
 
 func (s *CredentialService) AuthorizeTaskAction(ctx context.Context, ownerID string, kind identity.Kind, tokenID, hostID string, approvedScopes []identity.Scope, required identity.Scope) error {
+	if kind == identity.KindScheduleTask {
+		if !identity.IsScheduleTaskExecutionScopeSet(approvedScopes) || s.scheduledTasks == nil {
+			return domain.NewError(domain.CodeUnauthenticated, "scheduled task authorization is unavailable")
+		}
+		return s.scheduledTasks.AuthorizeScheduledTaskAction(ctx, ownerID, tokenID, hostID, required)
+	}
 	return s.authorizeHostAction(ctx, ownerID, ownerID, kind, tokenID, hostID, approvedScopes, required)
 }
 
 func (s *CredentialService) AuthorizeTaskExecution(ctx context.Context, principal identity.Principal, hostID string, required identity.Scope) (task.Authorization, error) {
+	if principal.Kind == identity.KindScheduleTask {
+		if !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+			!identity.IsScheduleTaskExecutionScopeSet(principal.Scopes) || !principal.HasScope(required) || s.scheduledTasks == nil {
+			return task.Authorization{}, domain.NewError(domain.CodeForbidden, "scheduled task execution is not authorized")
+		}
+		if err := s.scheduledTasks.AuthorizeScheduledTaskAction(ctx, principal.UserID, principal.TokenID, hostID, required); err != nil {
+			return task.Authorization{}, err
+		}
+		return task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
+			Scopes: authorizationSnapshot(principal).Scopes, Version: 1}, nil
+	}
 	if err := validateTaskPrincipal(principal); err != nil {
 		return task.Authorization{}, err
 	}
@@ -378,7 +439,7 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 
 func clientTaskScope(required identity.Scope) bool {
 	switch required {
-	case identity.ScopeTaskRead, identity.ScopeTaskSubmit, identity.ScopeTaskControl, identity.ScopeScheduleRead,
+	case identity.ScopeTaskRead, identity.ScopeTaskSubmit, identity.ScopeTaskControl, identity.ScopeScheduleRead, identity.ScopeScheduleManage,
 		identity.ScopeComputerObserve, identity.ScopeComputerOperate:
 		return true
 	default:
@@ -443,7 +504,8 @@ func (s *CredentialService) verify(ctx context.Context, raw string, want identit
 	if want == identity.KindDevice && (token.ClientInstallationID == "" || !validDeviceToken(token)) {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
-	if want == identity.KindClient && (token.ClientInstallationID == "" || len(token.Scopes) != 0 || len(token.HostIDs) != 0 || len(token.WorkspaceIDs) != 0) {
+	if want == identity.KindClient && (token.ClientInstallationID == "" || len(token.HostIDs) != 0 || len(token.WorkspaceIDs) != 0 ||
+		(len(token.Scopes) != 0 && !identity.IsScheduleGrantScopeSet(token.Scopes))) {
 		return identity.Principal{}, identity.ErrInvalidCredential
 	}
 	if (want == identity.KindClient || want == identity.KindDevice || want == identity.KindSession && token.ClientInstallationID != "") &&

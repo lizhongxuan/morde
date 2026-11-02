@@ -46,13 +46,16 @@ describe('Workbench MVP navigation', () => {
 
     expect(await screen.findByRole('button', { name: '桌面' })).toBeVisible();
     expect(screen.getByRole('button', { name: '终端' })).toBeVisible();
-    expect(screen.getByRole('button', { name: '文件' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Workspace' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '主机文件' })).toBeVisible();
     expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
-    fireEvent.click(screen.getByRole('button', { name: '文件' }));
+    fireEvent.click(screen.getByRole('button', { name: '主机文件' }));
     expect(screen.getByText('请先接管电脑后使用文件。')).toBeVisible();
     expect(screen.queryByLabelText('当前路径')).not.toBeInTheDocument();
     expect(screen.queryByText(/Codex|微信|QQ|飞书/)).not.toBeInTheDocument();
     await waitFor(() => expect(gatewayApi.host).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole('button', { name: 'Workspace' }));
+    expect(await screen.findByText('此主机没有绑定工作区。')).toBeVisible();
     appApi.forEach((call) => expect(call).not.toHaveBeenCalled());
   });
 });
@@ -99,7 +102,7 @@ describe('Workbench control conflicts', () => {
     expect(screen.queryByRole('button', { name: '交回 AI' })).not.toBeInTheDocument();
     expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=true');
 
-    fireEvent.click(screen.getByRole('button', { name: '文件' }));
+    fireEvent.click(screen.getByRole('button', { name: '主机文件' }));
     expect(screen.getByRole('alert')).toHaveTextContent('控制状态暂不可用：connection lost');
     expect(screen.queryByLabelText('当前路径')).not.toBeInTheDocument();
 

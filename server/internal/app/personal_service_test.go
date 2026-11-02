@@ -113,7 +113,6 @@ func TestPersonalMutationServiceValidatesBeforeStore(t *testing.T) {
 	}{
 		{PersonalMutationCommand{MutationID: "short", ObjectType: personal.ObjectTypeProfile, ObjectID: personal.ProfileObjectID, Body: []byte(`{"name":"Muse","avatar":"dragon"}`)}, domain.CodeInvalidArgument},
 		{PersonalMutationCommand{MutationID: "mutation-123", ObjectType: personal.ObjectTypeProfile, ObjectID: personal.ProfileObjectID, Body: []byte(`[]`)}, domain.CodeInvalidArgument},
-		{PersonalMutationCommand{MutationID: "mutation-123", ObjectType: "goal", ObjectID: personal.ProfileObjectID, Body: []byte(`{"name":"Muse","avatar":"dragon"}`)}, domain.CodeUnsupported},
 	} {
 		if _, err := service.ApplyPersonalMutation(context.Background(), principal, test.command); domain.CodeOf(err) != test.code {
 			t.Errorf("invalid command error = %v, want %q", err, test.code)
@@ -121,6 +120,25 @@ func TestPersonalMutationServiceValidatesBeforeStore(t *testing.T) {
 	}
 	if store.calls != 0 {
 		t.Fatalf("invalid command reached store %d times", store.calls)
+	}
+}
+
+func TestPersonalMutationServiceAcceptsGoalObject(t *testing.T) {
+	store := &personalMutationStoreStub{}
+	service, err := NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession}
+	command := PersonalMutationCommand{
+		MutationID: "goal-create-1", ObjectType: personal.ObjectTypeGoal, ObjectID: "g_1",
+		Body: []byte(`{"title":"Learn Go","status":"active","steps":[]}`),
+	}
+	if _, err := service.ApplyPersonalMutation(context.Background(), principal, command); err != nil {
+		t.Fatalf("Goal mutation rejected: %v", err)
+	}
+	if store.calls != 1 || store.mutation.OwnerID != principal.UserID || store.mutation.ObjectType != personal.ObjectTypeGoal || store.mutation.ObjectID != "g_1" {
+		t.Fatalf("store received %d calls and mutation %+v", store.calls, store.mutation)
 	}
 }
 
@@ -201,6 +219,21 @@ func TestPersonalServiceGetPersonalObjectAcceptsMemoryObject(t *testing.T) {
 	}
 }
 
+func TestPersonalServiceGetPersonalObjectAcceptsGoal(t *testing.T) {
+	store := &personalMutationStoreStub{}
+	service, err := NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	if _, err := service.GetPersonalObject(context.Background(), principal, personal.ObjectTypeGoal, "g_1"); err != nil {
+		t.Fatalf("Goal read rejected: %v", err)
+	}
+	if store.readCalls != 1 || store.objectType != personal.ObjectTypeGoal || store.objectID != "g_1" {
+		t.Fatalf("store read = %d calls for %s/%s", store.readCalls, store.objectType, store.objectID)
+	}
+}
+
 func TestPersonalServiceGetPersonalObjectRejectsUnsupportedOrInvalidInput(t *testing.T) {
 	store := &personalMutationStoreStub{}
 	service, err := NewPersonalMutationService(store)
@@ -213,7 +246,7 @@ func TestPersonalServiceGetPersonalObjectRejectsUnsupportedOrInvalidInput(t *tes
 		objectID   string
 		wantCode   domain.ErrorCode
 	}{
-		{objectType: "goal", objectID: personal.ProfileObjectID, wantCode: domain.CodeUnsupported},
+		{objectType: "unknown", objectID: personal.ProfileObjectID, wantCode: domain.CodeUnsupported},
 		{objectType: personal.ObjectTypeProfile, objectID: "other", wantCode: domain.CodeInvalidArgument},
 	} {
 		if _, err := service.GetPersonalObject(context.Background(), principal, test.objectType, test.objectID); domain.CodeOf(err) != test.wantCode {

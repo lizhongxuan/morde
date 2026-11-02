@@ -1,7 +1,17 @@
 import { http, HttpResponse } from "msw";
 
 const now = () => new Date().toISOString();
-const host = { id: "h1234567", name: "本地测试主机", portal_origin: "http://127.0.0.1:5183", state: "running", url: "http://h1234567.localhost", expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString() };
+const workspaceID = "w1234567";
+const workspacePath = `/home/gem/workspace/${workspaceID}`;
+const overQuotaWorkspaceID = "w7654321";
+const overQuotaWorkspacePath = `/home/gem/workspace/${overQuotaWorkspaceID}`;
+const host = {
+  id: "h1234567", name: "本地测试主机", portal_origin: "http://127.0.0.1:5183", state: "running", url: "http://h1234567.localhost", expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(),
+  workspaces: [
+    { workspace: { id: workspaceID, name: "本地 Workspace", revision: 4, used_bytes: 30, quota_bytes: 5 * 1024 ** 3, state: "ready" }, directory: workspaceID, state: "active", binding_version: 1, desired_revision: 4, applied_revision: 4, sync_state: "healthy", sync_conflicts: [] },
+    { workspace: { id: overQuotaWorkspaceID, name: "超配额演示", revision: 2, used_bytes: 2, quota_bytes: 1, state: "ready" }, directory: overQuotaWorkspaceID, state: "active", binding_version: 1, desired_revision: 2, applied_revision: 2, sync_state: "healthy", sync_conflicts: [] },
+  ],
+};
 const control = {
   host_id: host.id,
   control_state: "ai" as "ai" | "taking_over" | "user" | "returning",
@@ -29,10 +39,13 @@ let controlPolls = 0;
 let terminalSessionUrl: string | null = null;
 let terminalSessionSerial = 0;
 const failedControlRequests = new Set<string>();
+let initializedHost = false;
 const files = new Map<string, Blob>([
   ["/home/gem/workspace/README.md", new Blob(["# 欢迎使用\n\n这是本地 mock 工作目录。\n"])],
+  [`${workspacePath}/README.md`, new Blob(["# 本地 Workspace\n\n此文件由本机 MSW 提供。\n"])],
+  [`${overQuotaWorkspacePath}/should-not-display.txt`, new Blob(["此文件只用于验证超配额时不展示。\n"])],
 ]);
-const directories = new Set(["/", "/home", "/home/gem", "/home/gem/workspace"]);
+const directories = new Set(["/", "/home", "/home/gem", "/home/gem/workspace", workspacePath, overQuotaWorkspacePath]);
 const json = (body: object, status = 200) => HttpResponse.json(body, { status });
 const aio = (data: unknown, success = true, message = "ok") => json({ success, message, data });
 const terminalHtml = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>本地合成终端</title><body><label for="command">命令</label><input id="command" autocomplete="off" autofocus><pre id="output" role="log" aria-live="polite"></pre><script>const input=document.querySelector('#command');const output=document.querySelector('#output');input.addEventListener('keydown',event=>{if(event.key!=='Enter')return;const command=input.value.trim();if(!command)return;output.textContent += '$ '+command+'\\n'+(command==='echo local-terminal-ok'?'local-terminal-ok':'本地演示仅支持 echo local-terminal-ok')+'\\n';input.value='';});</script></body></html>`;
@@ -221,7 +234,14 @@ const e2eNoVncHandlers = import.meta.env.VITE_WORKBENCH_E2E === "1" ? [
 
 export const handlers = [
   ...e2eNoVncHandlers,
-  http.get("/__ch/api/host", () => { resetControl(); resetApplications(); return json(host); }),
+  http.get("/__ch/api/host", () => {
+    if (!initializedHost) {
+      resetControl();
+      resetApplications();
+      initializedHost = true;
+    }
+    return json(host);
+  }),
   http.get("/__ch/api/applications", () => {
     const operation = applications.items[1]!.install_operation;
     if (operation?.status === "accepted" || operation?.status === "running") {

@@ -30,7 +30,7 @@ func TestValidateMutation(t *testing.T) {
 		{"non-ascii mutation id", func(value *Mutation) { value.MutationID = "mutation-你好" }},
 		{"object type", func(value *Mutation) { value.ObjectType = "Profile" }},
 		{"object type separator", func(value *Mutation) { value.ObjectType = "profile--data" }},
-		{"unsupported object type", func(value *Mutation) { value.ObjectType = "goal" }},
+		{"unsupported object type", func(value *Mutation) { value.ObjectType = "unknown" }},
 		{"object id", func(value *Mutation) { value.ObjectID = "bad/id" }},
 		{"non-default profile id", func(value *Mutation) { value.ObjectID = "other" }},
 		{"object id too long", func(value *Mutation) { value.ObjectID = strings.Repeat("a", 129) }},
@@ -116,6 +116,16 @@ func TestValidateMutationAcceptsAllowlistedMemoryAndRejectsUnknownContent(t *tes
 		if err := ValidateMutation(mutation); err == nil {
 			t.Errorf("memory body accepted an unknown field: %s", body)
 		}
+	}
+}
+
+func TestScheduleMutationMustUseScheduleAPI(t *testing.T) {
+	value := Mutation{
+		OwnerID: "u1234567", MutationID: "schedule-edit-1", ObjectType: ObjectTypeSchedule,
+		ObjectID: "j1234567", BaseRevision: 0, Body: json.RawMessage(`{"status":"disabled"}`),
+	}
+	if err := ValidateMutation(value); err == nil {
+		t.Fatal("generic personal mutation accepted a schedule write")
 	}
 }
 

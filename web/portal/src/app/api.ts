@@ -150,6 +150,34 @@ export const portalApi = {
   adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
   adminActivity: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/activity', { params: { query: { days } } })),
   adminPlaces: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/places', { params: { query: { days } } })),
+  adminControls: async () => unwrapApiResponse(await api.GET('/api/admin/controls')),
+  createAdminControlRule: async (body: components['schemas']['CreateAdminControlRuleRequest']) => unwrapApiResponse(await api.POST('/api/admin/controls/rules', { body })),
+  updateAdminControlRule: async (id: number, body: operations['updateAdminControlRule']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/admin/controls/rules/{id}', { params: { path: { id } }, body })),
+  deleteAdminControlRule: async (id: number, expectedVersion: number) => unwrapApiResponse(await api.DELETE('/api/admin/controls/rules/{id}', { params: { path: { id }, query: { expected_version: expectedVersion } } })),
+  evaluateAdminControls: async () => unwrapApiResponse(await api.POST('/api/admin/controls/evaluate')),
+  adminControlNotifyTest: async () => unwrapApiResponse(await api.POST('/api/admin/controls/notify-test')),
+  recordConsents: async () => unwrapApiResponse(await api.GET('/api/me/record-consents')),
+  setRecordConsent: async (body: components['schemas']['SetRecordConsentRequest']) => unwrapApiResponse(await api.PUT('/api/me/record-consents', { body })),
+  adminRecordSettings: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/record-settings', { params: { path: { id } } })),
+  adminRecordAccess: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/record-access', { params: { path: { id } } })),
+  updateRecordQuota: async (id: string, body: components['schemas']['SetAdminRecordQuotaRequest']) => unwrapApiResponse(await api.PUT('/api/admin/users/{id}/record-quota', { params: { path: { id } }, body })),
+  updateRecordGrant: async (id: string, body: components['schemas']['SetAdminRecordGrantRequest']) => unwrapApiResponse(await api.PUT('/api/admin/users/{id}/record-grants', { params: { path: { id } }, body })),
+  adminRecords: async (id: string, query: NonNullable<operations['listAdminUserRecords']['parameters']['query']> = {}) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/records', { params: { path: { id }, query } })),
+  adminRecord: async (id: string, recordID: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/records/{record_id}', { params: { path: { id, record_id: recordID } } })),
+  adminRecordAttachments: async (id: string, recordID: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/records/{record_id}/attachments', { params: { path: { id, record_id: recordID } } })),
+  adminRecordAttachment: async (id: string, recordID: string, attachmentID: string): Promise<Blob> => {
+    const path = `/api/admin/users/${encodeURIComponent(id)}/records/${encodeURIComponent(recordID)}/attachments/${encodeURIComponent(attachmentID)}`;
+    const response = await requestFetch(path);
+    if (!response.ok) await throwResponseError(response);
+    return response.blob();
+  },
+  adminRecordExport: async (id: string, recordID: string): Promise<Blob> => {
+    const path = `/api/admin/users/${encodeURIComponent(id)}/records/${encodeURIComponent(recordID)}/export`;
+    const response = await requestFetch(path);
+    if (!response.ok) await throwResponseError(response);
+    return response.blob();
+  },
+  deleteAdminRecord: async (id: string, recordID: string) => unwrapApiResponse(await api.DELETE('/api/admin/users/{id}/records/{record_id}', { params: { path: { id, record_id: recordID } } })),
   adminStats: async () => unwrapApiResponse(await api.GET('/api/admin/stats')),
   adminHosts: async () => unwrapApiResponse(await api.GET('/api/admin/hosts')),
   adminHostResources: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/hosts/{id}/resources', { params: { path: { id } } })),

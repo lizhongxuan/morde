@@ -54,7 +54,7 @@ func TestAdminQualityActivityRoutesAuthorizeValidateAndReturnAggregates(t *testi
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 
 	quality := requestWithCookie(router, http.MethodGet, "/api/admin/quality?days=30", cookie, "")
-	if quality.Code != http.StatusOK || quality.Body.String() != `{"days":30,"available":false,"unavailable_reason":"no consented sample source"}` || activity.days != 30 {
+	if quality.Code != http.StatusOK || quality.Body.String() != `{"days":30,"available":false,"unavailable_reason":"no consented sample source","sample_count":0,"failed_tasks":0,"failed_hub_operations":0,"unknown_hub_operations":0}` || activity.days != 30 {
 		t.Fatalf("quality = %d %s days=%d", quality.Code, quality.Body, activity.days)
 	}
 	response := requestWithCookie(router, http.MethodGet, "/api/admin/activity?days=7", cookie, "")

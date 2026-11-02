@@ -8,6 +8,9 @@ const links = [
   { to: '/admin/users', label: '用户', icon: '♧' },
   { to: '/admin/models', label: '平台模型', icon: '◇' },
   { to: '/admin/usage', label: '用量与统计', icon: '▤' },
+  { to: '/admin/quality', label: '质量与风险', icon: '◇' },
+  { to: '/admin/activity', label: '活动', icon: '≋' },
+  { to: '/admin/controls', label: '规则与通知', icon: '⚙' },
   { to: '/admin/hosts', label: '云端电脑', icon: '▣' },
   { to: '/admin/workspaces', label: '工作区', icon: '▱' },
   { to: '/admin/audit', label: '审计', icon: '≡' },
@@ -15,7 +18,7 @@ const links = [
 
 const titles: Record<string, string> = {
   '/admin': '总览', '/admin/': '总览', '/admin/users': '用户', '/admin/hosts': '云端电脑',
-  '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/workspaces': '工作区', '/admin/audit': '审计',
+  '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/quality': '质量与风险', '/admin/activity': '活动', '/admin/controls': '规则与通知', '/admin/workspaces': '工作区', '/admin/audit': '审计',
 };
 
 export function AdminLayout() {

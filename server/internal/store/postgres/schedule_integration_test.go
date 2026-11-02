@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -63,7 +64,7 @@ func TestPostgresScheduleOccurrenceAtomicallyCreatesTaskGraphAndDeduplicatesConc
 			run = result.run
 		}
 	}
-	if committedCount != 1 || run.TaskID == nil || run.Status != schedule.RunQueued ||
+	if committedCount != 1 || run.TaskID == nil || run.Status != schedule.RunQueued || run.ScheduleVersion != value.Version ||
 		len(run.NotificationEvents) != 1 || run.NotificationEvents[0] != schedule.NotifyFailed {
 		t.Fatalf("concurrent commit result = committed %d times, run=%#v", committedCount, run)
 	}
@@ -87,8 +88,10 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 		t.Fatal(err)
 	}
 	assertAccountChangeLog(t, ctx, store, owner.ID,
+		expectedAccountChange{objectType: "schedule", objectID: value.ID, revision: value.Version},
 		expectedAccountChange{objectType: "conversation", objectID: conversationID, revision: 1},
 		expectedAccountChange{objectType: "message", objectID: messageID, revision: 1},
+		expectedAccountChange{objectType: "schedule", objectID: value.ID, revision: value.Version + 1},
 	)
 	var authKind string
 	var executionEpoch int64
@@ -99,9 +102,10 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 		t.Fatalf("scheduled task authorization/epoch = %s/%d, want session/%d", authKind, executionEpoch, value.ExecutionEpoch)
 	}
 	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
-	if err != nil || loaded.Status != schedule.StatusCompleted || loaded.LastRun == nil || loaded.LastRun.ID != run.ID {
+	if err != nil || loaded.Status != schedule.StatusCompleted || loaded.Version != value.Version+1 || loaded.LastRun == nil || loaded.LastRun.ID != run.ID {
 		t.Fatalf("completed schedule = %#v, %v", loaded, err)
 	}
+	assertScheduleSyncRevision(t, store, owner.ID, value.ID, loaded.Version, 4)
 	runsPage, err := store.ListScheduleRuns(ctx, owner.ID, value.ID, nil, app.PageRequest{Limit: 10})
 	if err != nil || len(runsPage.Items) != 1 || runsPage.Items[0].TaskID == nil || *runsPage.Items[0].TaskID != *run.TaskID {
 		t.Fatalf("schedule run history = %#v, %v", runsPage, err)
@@ -345,18 +349,160 @@ func TestPostgresScheduleEnableDisableUsesOptimisticVersionAndRecomputesNextRun(
 	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
 		[]schedule.NotificationEvent{schedule.NotifyWaitingUser})
 	disabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "schedule-disable-key"), value.ID,
-		schedule.StatusDisabled, value.Version)
+		schedule.StatusDisabled, value.Version, value.Authorization)
 	if err != nil || disabled.Status != schedule.StatusDisabled || disabled.Version != value.Version+1 || disabled.NextCheckAt != nil || disabled.NextOccurrenceKey != "" {
 		t.Fatalf("disabled schedule = %#v, %v", disabled, err)
 	}
 	enabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "schedule-enable-key"), value.ID,
-		schedule.StatusEnabled, disabled.Version)
+		schedule.StatusEnabled, disabled.Version, value.Authorization)
 	if err != nil || enabled.Status != schedule.StatusEnabled || enabled.Version != disabled.Version+1 || enabled.NextCheckAt == nil || enabled.NextOccurrenceKey == "" {
 		t.Fatalf("re-enabled schedule = %#v, %v", enabled, err)
 	}
 	if _, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "schedule-stale-key"), value.ID,
-		schedule.StatusDisabled, value.Version); domain.CodeOf(err) != domain.CodeConflict {
+		schedule.StatusDisabled, value.Version, value.Authorization); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("stale schedule version error = %v", err)
+	}
+}
+
+func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	timing := schedule.Timing{
+		Kind: schedule.TimingDaily, StartsOn: time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"),
+		LocalTime: "10:00", TimeZone: "UTC",
+	}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	assertScheduleSyncRevision(t, store, owner.ID, value.ID, value.Version, 1)
+
+	value.Objective = "updated scheduled objective"
+	updated, err := store.UpdateSchedule(ctx, owner.ID, value, value.Version)
+	if err != nil || updated.Version != value.Version+1 {
+		t.Fatalf("update schedule definition = %#v, %v", updated, err)
+	}
+	assertScheduleSyncRevision(t, store, owner.ID, updated.ID, updated.Version, 2)
+
+	disabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, updated.ID, "sync-disable-key"), updated.ID,
+		schedule.StatusDisabled, updated.Version, updated.Authorization)
+	if err != nil || disabled.Version != updated.Version+1 {
+		t.Fatalf("disable schedule definition = %#v, %v", disabled, err)
+	}
+	assertScheduleSyncRevision(t, store, owner.ID, disabled.ID, disabled.Version, 3)
+
+	enabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, disabled.ID, "sync-enable-key"), disabled.ID,
+		schedule.StatusEnabled, disabled.Version, disabled.Authorization)
+	if err != nil || enabled.Version != disabled.Version+1 {
+		t.Fatalf("enable schedule definition = %#v, %v", enabled, err)
+	}
+	assertScheduleSyncRevision(t, store, owner.ID, enabled.ID, enabled.Version, 4)
+
+	changes, err := store.GetPersonalChanges(ctx, principal, 0, nil, 10)
+	if err != nil || len(changes.Items) != 4 || changes.ThroughSequence != 4 {
+		t.Fatalf("schedule definition changes = %+v, %v", changes, err)
+	}
+	for i, wantRevision := range []int64{1, 2, 3, 4} {
+		change := changes.Items[i]
+		if change.ObjectType != "schedule" || change.ObjectID != enabled.ID || change.Revision != wantRevision || change.Operation != "upsert" {
+			t.Fatalf("schedule definition change %d = %+v", i, change)
+		}
+	}
+
+	snapshot, err := store.GetPersonalSnapshotBatch(ctx, principal, nil, 10)
+	if err != nil || len(snapshot.Items) != 1 || snapshot.Items[0].ObjectType != "schedule" ||
+		snapshot.Items[0].ObjectID != enabled.ID || snapshot.Items[0].Revision != enabled.Version {
+		t.Fatalf("schedule snapshot = %+v, %v", snapshot, err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(snapshot.Items[0].Body, &body); err != nil {
+		t.Fatalf("decode schedule snapshot body: %v", err)
+	}
+	var objective string
+	if err := json.Unmarshal(body["objective"], &objective); err != nil || objective != enabled.Objective {
+		t.Fatalf("schedule snapshot objective = %q, %v; body=%s", objective, err, snapshot.Items[0].Body)
+	}
+	for _, forbidden := range []string{"auth_kind", "auth_token_id", "auth_scopes", "client_installation_id", "authorization", "execution_epoch", "next_run_at"} {
+		if _, exists := body[forbidden]; exists {
+			t.Fatalf("schedule sync body leaked %q: %s", forbidden, snapshot.Items[0].Body)
+		}
+	}
+	var duplicateBodies int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM personal_objects WHERE owner_id=$1 AND object_type='schedule' AND object_id=$2`, owner.ID, enabled.ID).Scan(&duplicateBodies); err != nil || duplicateBodies != 0 {
+		t.Fatalf("schedule duplicated in personal_objects = %d, %v", duplicateBodies, err)
+	}
+}
+
+func TestPostgresScheduleDefinitionChangeRollbackAndOwnerIsolation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	ownerA := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	ownerB := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	principalA := createPersonalReadSessionPrincipal(t, store, ownerA.ID)
+	principalB := createPersonalReadSessionPrincipal(t, store, ownerB.ID)
+	hostA := createRunningControlHost(t, ctx, store, ownerA.ID, "ai", 0)
+	hostB := createRunningControlHost(t, ctx, store, ownerB.ID, "ai", 0)
+	timing := schedule.Timing{Kind: schedule.TimingDaily,
+		StartsOn: time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"), LocalTime: "10:00", TimeZone: "UTC"}
+	scheduleA, _ := createPostgresSchedule(t, ctx, store, ownerA.ID, hostA.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	scheduleB, _ := createPostgresSchedule(t, ctx, store, ownerB.ID, hostB.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+
+	if _, err := store.pool.Exec(ctx, `UPDATE account_change_counters SET last_sequence=9223372036854775807 WHERE owner_id=$1`, ownerA.ID); err != nil {
+		t.Fatal(err)
+	}
+	changed := scheduleA
+	changed.Objective = "must roll back"
+	if _, err := store.UpdateSchedule(ctx, ownerA.ID, changed, scheduleA.Version); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("schedule update with exhausted change sequence error = %v, want invalid_state", err)
+	}
+	rolledBack, err := store.GetSchedule(ctx, ownerA.ID, scheduleA.ID)
+	if err != nil || rolledBack.Version != scheduleA.Version || rolledBack.Objective != scheduleA.Objective {
+		t.Fatalf("schedule mutation survived sync-log failure = %#v, %v", rolledBack, err)
+	}
+	assertScheduleSyncRevision(t, store, ownerA.ID, scheduleA.ID, scheduleA.Version, int64(9223372036854775807))
+
+	snapshotA, err := store.GetPersonalSnapshotBatch(ctx, principalA, nil, 10)
+	if err != nil || len(snapshotA.Items) != 1 || snapshotA.Items[0].ObjectID != scheduleA.ID {
+		t.Fatalf("owner A schedule snapshot = %+v, %v", snapshotA, err)
+	}
+	snapshotB, err := store.GetPersonalSnapshotBatch(ctx, principalB, nil, 10)
+	if err != nil || len(snapshotB.Items) != 1 || snapshotB.Items[0].ObjectID != scheduleB.ID {
+		t.Fatalf("owner B schedule snapshot = %+v, %v", snapshotB, err)
+	}
+	changesA, err := store.GetPersonalChanges(ctx, principalA, 0, nil, 10)
+	if err != nil || len(changesA.Items) != 1 || changesA.Items[0].ObjectID != scheduleA.ID {
+		t.Fatalf("owner A schedule changes = %+v, %v", changesA, err)
+	}
+	changesB, err := store.GetPersonalChanges(ctx, principalB, 0, nil, 10)
+	if err != nil || len(changesB.Items) != 1 || changesB.Items[0].ObjectID != scheduleB.ID {
+		t.Fatalf("owner B schedule changes = %+v, %v", changesB, err)
+	}
+	if _, err := store.GetSchedule(ctx, ownerA.ID, scheduleB.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("cross-owner schedule read error = %v, want not_found", err)
+	}
+}
+
+func assertScheduleSyncRevision(t *testing.T, store *Store, ownerID, scheduleID string, wantRevision, wantSequence int64) {
+	t.Helper()
+	var revision, sequence, logRevision int64
+	var operation string
+	if err := store.pool.QueryRow(context.Background(), `SELECT revision FROM account_object_versions
+WHERE owner_id=$1 AND object_type='schedule' AND object_id=$2 AND NOT is_deleted`, ownerID, scheduleID).Scan(&revision); err != nil {
+		t.Fatalf("read schedule sync revision: %v", err)
+	}
+	if err := store.pool.QueryRow(context.Background(), `SELECT last_sequence FROM account_change_counters WHERE owner_id=$1`, ownerID).Scan(&sequence); err != nil {
+		t.Fatalf("read account change sequence: %v", err)
+	}
+	if err := store.pool.QueryRow(context.Background(), `SELECT revision,operation FROM account_change_log
+WHERE owner_id=$1 AND object_type='schedule' AND object_id=$2 ORDER BY change_sequence DESC LIMIT 1`, ownerID, scheduleID).Scan(&logRevision, &operation); err != nil {
+		t.Fatalf("read schedule change log: %v", err)
+	}
+	if revision != wantRevision || logRevision != wantRevision || sequence != wantSequence || operation != "upsert" {
+		t.Fatalf("schedule sync state revision=%d log_revision=%d sequence=%d operation=%q, want revision=%d sequence=%d upsert",
+			revision, logRevision, sequence, operation, wantRevision, wantSequence)
 	}
 }
 

@@ -20,6 +20,34 @@ type adminHubOperationKey struct {
 	status string
 }
 
+// GetAdminQuality reads only status, timestamp, consent version and record metadata.
+func (s *Store) GetAdminQuality(ctx context.Context, from, to time.Time) (app.AdminQuality, error) {
+	result := app.AdminQuality{}
+	if from.IsZero() || to.IsZero() || !to.After(from) || to.Sub(from) > 90*24*time.Hour {
+		return result, fmt.Errorf("invalid admin quality time range")
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT
+  count(*) FILTER (WHERE status='failed'),
+  count(*) FILTER (WHERE status='unknown')
+FROM task_hub_operations WHERE created_at >= $1 AND created_at < $2`, from, to).
+		Scan(&result.FailedHubOperations, &result.UnknownHubOperations); err != nil {
+		return app.AdminQuality{}, fmt.Errorf("summarize admin Hub risk statuses: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE status='failed' AND updated_at >= $1 AND updated_at < $2`, from, to).
+		Scan(&result.FailedTasks); err != nil {
+		return app.AdminQuality{}, fmt.Errorf("summarize admin failed tasks: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM record_entries r
+JOIN record_consents c ON c.owner_id=r.owner_id AND c.purpose=r.purpose
+WHERE r.purpose='training_contribution' AND r.item_kind='sample' AND r.state='active'
+  AND r.created_at >= $1 AND r.created_at < $2 AND r.expires_at > $2
+  AND c.enabled AND c.version=r.consent_version`, from, to).
+		Scan(&result.SampleCount); err != nil {
+		return app.AdminQuality{}, fmt.Errorf("count current-consent training samples: %w", err)
+	}
+	return result, nil
+}
+
 // GetAdminActivity intentionally reads only bounded aggregation dimensions and
 // timestamps; payloads, account/installation identifiers, IPs and hashes are
 // never part of these queries or the returned app types.

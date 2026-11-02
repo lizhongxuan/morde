@@ -11,6 +11,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/schedule"
 )
 
 func (s *Store) SaveAgentCheckpoint(ctx context.Context, value app.StoredAgentCheckpoint) (bool, error) {
@@ -47,16 +48,17 @@ func (s *Store) SaveAgentCheckpoint(ctx context.Context, value app.StoredAgentCh
 		var taskThrough int64
 		var taskDigest []byte
 		var authKind, tokenID, installationID string
-		err = tx.QueryRow(ctx, `SELECT checkpoint_through_seq,checkpoint_digest,auth_kind,auth_token_id,COALESCE(auth_client_installation_id,'')
+		var authScopes []string
+		err = tx.QueryRow(ctx, `SELECT checkpoint_through_seq,checkpoint_digest,auth_kind,auth_token_id,auth_scopes,COALESCE(auth_client_installation_id,'')
 FROM tasks
 WHERE id=$1 AND owner_id=$2 AND status='running' AND execution_location='server' AND execution_epoch=$3
   AND lease_owner=$4 AND lease_version=$5 AND lease_expires_at>clock_timestamp()
 		AND agent_instance_id=$6 AND agent_generation=$7 AND agent_session_id=$8
-  AND auth_version=$9 AND auth_expires_at>clock_timestamp()
+  AND auth_version=$9 AND (auth_kind='schedule_task' OR auth_expires_at>clock_timestamp())
   AND agent_engine_version=$10 AND agent_profile_version=$11
 FOR UPDATE`, fence.TaskID, fence.OwnerID, gate.epoch, fence.LeaseOwner, fence.LeaseVersion,
 			fence.AgentInstanceID, fence.AgentGeneration, rootSessionID, fence.AuthorizationVersion,
-			fence.EngineVersion, fence.ProfileVersion).Scan(&taskThrough, &taskDigest, &authKind, &tokenID, &installationID)
+			fence.EngineVersion, fence.ProfileVersion).Scan(&taskThrough, &taskDigest, &authKind, &tokenID, &authScopes, &installationID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
 		}
@@ -72,7 +74,7 @@ FOR UPDATE`, fence.TaskID, fence.OwnerID, gate.epoch, fence.LeaseOwner, fence.Le
 		}); err != nil {
 			return err
 		}
-		if err := checkAgentCheckpointAuthorization(ctx, tx, fence.OwnerID, authKind, tokenID, installationID); err != nil {
+		if err := checkAgentCheckpointAuthorization(ctx, tx, fence.OwnerID, fence.TaskID, authKind, tokenID, authScopes, installationID); err != nil {
 			return err
 		}
 		var parentSessionID string
@@ -274,7 +276,21 @@ SELECT EXISTS(SELECT 1 FROM lineage WHERE session_id=$4 AND parent_session_id IS
 	return belongs, nil
 }
 
-func checkAgentCheckpointAuthorization(ctx context.Context, tx pgx.Tx, ownerID, kind, tokenID, installationID string) error {
+func checkAgentCheckpointAuthorization(ctx context.Context, tx pgx.Tx, ownerID, taskID, kind, tokenID string, scopes []string, installationID string) error {
+	if kind == string(identity.KindScheduleTask) {
+		if !scheduleTaskScopeStringsValid(scopes) || !schedule.ValidRunID(tokenID) || installationID != "" {
+			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
+		}
+		var linked bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM schedule_runs r JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+  WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3
+)`, tokenID, ownerID, taskID).Scan(&linked)
+		if err != nil || !linked {
+			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
+		}
+		return nil
+	}
 	if kind == string(identity.KindClient) {
 		if !domain.ValidClientInstallationID(installationID) {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint installation is unavailable")

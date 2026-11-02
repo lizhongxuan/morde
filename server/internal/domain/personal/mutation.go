@@ -50,6 +50,9 @@ func ValidateMutation(value Mutation) error {
 	if err := ValidateObjectIdentifier(value.ObjectType, value.ObjectID); err != nil {
 		return err
 	}
+	if value.ObjectType == ObjectTypeSchedule {
+		return domain.NewError(domain.CodeUnsupported, "schedule mutations require the schedule API")
+	}
 	if value.BaseRevision < 0 {
 		return domain.InvalidArgument("base_revision", "personal object base revision is invalid")
 	}

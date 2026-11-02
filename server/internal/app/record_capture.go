@@ -27,6 +27,7 @@ func NewRecordCaptureService(store RecordCaptureStore) (*RecordCaptureService, e
 	return &RecordCaptureService{store: store}, nil
 }
 
+// Capture returns an empty queue item without error when that purpose is disabled.
 func (s *RecordCaptureService) Capture(ctx context.Context, principal identity.Principal, input record.CaptureInput) (record.QueueItem, error) {
 	if err := authorizeRecordOwner(principal); err != nil {
 		return record.QueueItem{}, err

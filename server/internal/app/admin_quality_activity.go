@@ -9,9 +9,13 @@ import (
 )
 
 type AdminQuality struct {
-	Days              int    `json:"days"`
-	Available         bool   `json:"available"`
-	UnavailableReason string `json:"unavailable_reason,omitempty"`
+	Days                 int    `json:"days"`
+	Available            bool   `json:"available"`
+	UnavailableReason    string `json:"unavailable_reason,omitempty"`
+	SampleCount          int64  `json:"sample_count"`
+	FailedTasks          int64  `json:"failed_tasks"`
+	FailedHubOperations  int64  `json:"failed_hub_operations"`
+	UnknownHubOperations int64  `json:"unknown_hub_operations"`
 }
 
 type AdminPlaces struct {
@@ -54,6 +58,7 @@ type AdminActivity struct {
 }
 
 type AdminQualityActivityStore interface {
+	GetAdminQuality(context.Context, time.Time, time.Time) (AdminQuality, error)
 	GetAdminActivity(context.Context, time.Time, time.Time) (AdminActivity, error)
 }
 
@@ -68,14 +73,29 @@ func NewAdminQualityActivityService(store AdminQualityActivityStore) (*AdminQual
 	return &AdminQualityActivityService{store: store}, nil
 }
 
-func (s *AdminQualityActivityService) Quality(_ context.Context, principal identity.Principal, days int) (AdminQuality, error) {
+func (s *AdminQualityActivityService) Quality(ctx context.Context, principal identity.Principal, days int) (AdminQuality, error) {
 	if err := authorizeAdmin(principal); err != nil {
 		return AdminQuality{}, err
 	}
 	if err := validateAdminQualityActivityDays(days); err != nil {
 		return AdminQuality{}, err
 	}
-	return AdminQuality{Days: days, UnavailableReason: "consented quality sample source is not configured"}, nil
+	to := time.Now().UTC()
+	today := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, 1-days)
+	quality, err := s.store.GetAdminQuality(ctx, from, to)
+	if err != nil {
+		return AdminQuality{}, err
+	}
+	if quality.SampleCount < 0 || quality.FailedTasks < 0 || quality.FailedHubOperations < 0 || quality.UnknownHubOperations < 0 {
+		return AdminQuality{}, domain.NewError(domain.CodeInternal, "admin quality receipt is invalid")
+	}
+	quality.Days = days
+	quality.Available = quality.SampleCount > 0
+	if !quality.Available {
+		quality.UnavailableReason = "no unexpired sample has a matching active training-consent version"
+	}
+	return quality, nil
 }
 
 func (s *AdminQualityActivityService) Activity(ctx context.Context, principal identity.Principal, days int) (AdminActivity, error) {

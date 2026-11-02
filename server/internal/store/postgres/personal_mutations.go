@@ -35,7 +35,7 @@ func (s *Store) ApplyPersonalMutation(ctx context.Context, principal identity.Pr
 	var receipt personal.MutationReceipt
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		var applyErr error
-			receipt, applyErr = applyPersonalMutationInTx(ctx, tx, principal, mutation, "")
+		receipt, applyErr = applyPersonalMutationInTx(ctx, tx, principal, mutation, "")
 		return applyErr
 	})
 	if err != nil {
@@ -84,11 +84,11 @@ func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identit
 	} else if found {
 		return replay, nil
 	}
-		var storedObjectID string
-		var previousObjectBytes int64
-		objectErr := tx.QueryRow(ctx, `SELECT object_id, COALESCE(octet_length(body::text),0) FROM personal_objects
+	var storedObjectID string
+	var previousObjectBytes int64
+	objectErr := tx.QueryRow(ctx, `SELECT object_id, COALESCE(octet_length(body::text),0) FROM personal_objects
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR UPDATE`,
-			instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&storedObjectID, &previousObjectBytes)
+		instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&storedObjectID, &previousObjectBytes)
 	objectExists := objectErr == nil
 	if objectErr != nil && !errors.Is(objectErr, pgx.ErrNoRows) {
 		return personal.MutationReceipt{}, fmt.Errorf("lock personal object: %w", objectErr)
@@ -113,6 +113,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	}
 	if !objectExists && mutation.Delete {
 		return personal.MutationReceipt{}, domain.NewError(domain.CodeNotFound, "personal object not found")
+	}
+	if mutation.ObjectType == personal.ObjectTypeGoal && !mutation.Delete {
+		if err := validatePersonalGoalMaterialOwnershipInTx(ctx, tx, instanceID, mutation.OwnerID, mutation.Body); err != nil {
+			return personal.MutationReceipt{}, err
+		}
 	}
 	if err := validatePersonalAttachmentReferenceInTx(ctx, tx, instanceID, mutation.OwnerID, mutation, allowedNewAttachmentID); err != nil {
 		return personal.MutationReceipt{}, err
@@ -187,6 +192,32 @@ VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8)`, instanceID, mutation.OwnerID, mutation.
 		return personal.MutationReceipt{}, fmt.Errorf("write personal mutation receipt: %w", err)
 	}
 	return receipt, nil
+}
+
+func validatePersonalGoalMaterialOwnershipInTx(ctx context.Context, tx pgx.Tx, instanceID, ownerID string, body []byte) error {
+	var value struct {
+		RelatedMaterialIDs []string `json:"related_material_ids"`
+	}
+	if err := json.Unmarshal(body, &value); err != nil {
+		return domain.InvalidArgument("body", "goal body is invalid")
+	}
+	if len(value.RelatedMaterialIDs) == 0 {
+		return nil
+	}
+	var owned int64
+	if err := tx.QueryRow(ctx, `SELECT count(*)
+FROM unnest($3::text[]) AS materials(material_id)
+JOIN personal_objects p ON p.service_instance_id=$1::uuid AND p.owner_id=$2
+	AND p.object_type='library_item' AND p.object_id=materials.material_id AND p.body IS NOT NULL
+JOIN account_object_versions v ON v.service_instance_id=p.service_instance_id AND v.owner_id=p.owner_id
+  AND v.object_type=p.object_type AND v.object_id=p.object_id AND NOT v.is_deleted`,
+		instanceID, ownerID, value.RelatedMaterialIDs).Scan(&owned); err != nil {
+		return fmt.Errorf("check goal material ownership: %w", err)
+	}
+	if owned != int64(len(value.RelatedMaterialIDs)) {
+		return domain.InvalidArgument("body.related_material_ids", "goal materials must be available to this account")
+	}
+	return nil
 }
 
 func loadPersonalMutationReceipt(ctx context.Context, tx pgx.Tx, instanceID string, mutation personal.Mutation) (personal.MutationReceipt, bool, error) {
@@ -292,7 +323,7 @@ func validatePersonalAttachmentReferenceInTx(ctx context.Context, tx pgx.Tx, ins
 
 func personalAttachmentUsageBytesInTx(ctx context.Context, tx pgx.Tx, instanceID, ownerID string) (int64, error) {
 	var usedBytes int64
-	err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(attachment.size_bytes),0)
+	err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(attachment.size_bytes),0)::bigint
 FROM (
   SELECT DISTINCT upload.attachment_id, upload.size_bytes
   FROM personal_objects object

@@ -12,7 +12,7 @@ type RecordConsentStore interface {
 	ListRecordConsents(context.Context, identity.Principal) ([]record.Consent, error)
 	SetRecordConsent(context.Context, identity.Principal, record.Purpose, bool) (record.Consent, error)
 	GetRecordQuota(context.Context, identity.Principal, string) (record.Quota, error)
-	SetRecordQuota(context.Context, identity.Principal, string, int32, int64) (record.Quota, error)
+	SetRecordQuota(context.Context, identity.Principal, string, int64, int32, int64) (record.Quota, error)
 }
 
 type RecordConsentService struct {
@@ -50,7 +50,7 @@ func (s *RecordConsentService) Quota(ctx context.Context, principal identity.Pri
 	if ownerID == "" {
 		ownerID = principal.UserID
 	}
-	if ownerID != principal.UserID && !(principal.Role == identity.RoleSuperAdmin && principal.Kind == identity.KindSession) {
+	if ownerID != principal.UserID && (principal.Role != identity.RoleSuperAdmin || principal.Kind != identity.KindSession) {
 		return record.Quota{}, domain.NewError(domain.CodeForbidden, "record quota access is denied")
 	}
 	if !domain.ValidUserID(ownerID) {
@@ -59,15 +59,15 @@ func (s *RecordConsentService) Quota(ctx context.Context, principal identity.Pri
 	return s.store.GetRecordQuota(ctx, principal, ownerID)
 }
 
-func (s *RecordConsentService) SetQuota(ctx context.Context, principal identity.Principal, ownerID string, retentionDays int32, limitBytes int64) (record.Quota, error) {
+func (s *RecordConsentService) SetQuota(ctx context.Context, principal identity.Principal, ownerID string, expectedVersion int64, retentionDays int32, limitBytes int64) (record.Quota, error) {
 	if principal.Role != identity.RoleSuperAdmin || principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) {
 		return record.Quota{}, domain.NewError(domain.CodeForbidden, "record quota management is denied")
 	}
-	if !domain.ValidUserID(ownerID) || retentionDays < 1 || retentionDays > record.MaxRetentionDays ||
+	if !domain.ValidUserID(ownerID) || expectedVersion < 1 || retentionDays < 1 || retentionDays > record.MaxRetentionDays ||
 		limitBytes < 1 || limitBytes > record.MaxQuotaBytes {
 		return record.Quota{}, domain.InvalidArgument("record_quota", "record quota settings are invalid")
 	}
-	return s.store.SetRecordQuota(ctx, principal, ownerID, retentionDays, limitBytes)
+	return s.store.SetRecordQuota(ctx, principal, ownerID, expectedVersion, retentionDays, limitBytes)
 }
 
 func authorizeRecordOwner(principal identity.Principal) error {

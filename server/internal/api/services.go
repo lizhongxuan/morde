@@ -10,6 +10,7 @@ import (
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/notification"
+	"morde/server/internal/domain/record"
 	sitedomain "morde/server/internal/domain/site"
 	"morde/server/internal/domain/template"
 	"morde/server/internal/domain/workspace"
@@ -126,6 +127,39 @@ type AdminQualityActivityService interface {
 	Quality(context.Context, identity.Principal, int) (app.AdminQuality, error)
 	Activity(context.Context, identity.Principal, int) (app.AdminActivity, error)
 	Places(context.Context, identity.Principal, int) (app.AdminPlaces, error)
+}
+
+type AdminPersonalDataQuotaService interface {
+	GetAdminPersonalDataQuota(context.Context, identity.Principal, string) (app.PersonalDataQuota, error)
+	SetAdminPersonalDataQuota(context.Context, identity.Principal, string, int64, int64, int64) (app.PersonalDataQuota, error)
+}
+
+type AdminControlsService interface {
+	List(context.Context, identity.Principal) (app.AdminControls, error)
+	Create(context.Context, identity.Principal, int64, string) (app.AdminControlRule, error)
+	Update(context.Context, identity.Principal, app.UpdateAdminControlRuleCommand) (app.AdminControlRule, error)
+	Delete(context.Context, identity.Principal, int64, int64) error
+	Evaluate(context.Context, identity.Principal) (app.AdminControlEvaluation, error)
+	NotifyTest(context.Context, identity.Principal) (app.AdminControlNotifyTest, error)
+}
+
+type RecordConsentService interface {
+	List(context.Context, identity.Principal) ([]record.Consent, error)
+	Set(context.Context, identity.Principal, record.Purpose, bool) (record.Consent, error)
+	Quota(context.Context, identity.Principal, string) (record.Quota, error)
+	SetQuota(context.Context, identity.Principal, string, int64, int32, int64) (record.Quota, error)
+}
+
+type RecordAccessService interface {
+	SetGrant(context.Context, identity.Principal, string, string, record.AdminCapability, bool) (record.AdminGrant, error)
+	AdminSettings(context.Context, identity.Principal, string) (app.RecordAdminSettings, error)
+	AccessSettings(context.Context, identity.Principal, string) (app.RecordAdminAccess, error)
+	List(context.Context, identity.Principal, string, record.Query) (record.Page, error)
+	Read(context.Context, identity.Principal, string, string) (record.Content, error)
+	Export(context.Context, identity.Principal, string, string) (record.Content, error)
+	ListAttachments(context.Context, identity.Principal, string, string) ([]record.AttachmentMetadata, error)
+	ReadAttachment(context.Context, identity.Principal, string, string, string) (record.AttachmentContent, error)
+	Delete(context.Context, identity.Principal, string, string) (record.DeleteTombstone, error)
 }
 
 type HubPresenceReader interface {

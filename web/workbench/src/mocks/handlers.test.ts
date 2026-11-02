@@ -66,6 +66,25 @@ describe("workbench mock file handlers", () => {
     });
   });
 
+  it("provides a bound Workspace and its Host directory for the local browser flow", async () => {
+    const response = await resolveHandler("GET", "/__ch/api/host", new Request(`${baseUrl}/__ch/api/host`));
+    const body = await response.json() as { workspaces: Array<{ workspace: { id: string; quota_bytes: number; used_bytes: number }; directory: string; sync_state: string; sync_conflicts: string[] }> };
+    const workspace = body.workspaces[0]!;
+    const listing = await listPath(`/home/gem/workspace/${workspace.workspace.id}`);
+    const overQuotaWorkspace = body.workspaces[1]!;
+    const overQuotaListing = await listPath(`/home/gem/workspace/${overQuotaWorkspace.workspace.id}`);
+
+    expect(workspace).toMatchObject({
+      workspace: { id: "w1234567", quota_bytes: 5 * 1024 ** 3 },
+      directory: "w1234567", sync_state: "healthy", sync_conflicts: [],
+    });
+    expect(listing.data.files).toContainEqual(expect.objectContaining({
+      name: "README.md", path: "/home/gem/workspace/w1234567/README.md", is_directory: false,
+    }));
+    expect(overQuotaWorkspace.workspace.used_bytes).toBeGreaterThan(overQuotaWorkspace.workspace.quota_bytes);
+    expect(overQuotaListing.data.files).toContainEqual(expect.objectContaining({ name: "should-not-display.txt" }));
+  });
+
   it("accepts WeChat install requests idempotently and exposes the operation for polling", async () => {
     const requestId = `mock-install-${Date.now()}`;
     const request = () => new Request(`${baseUrl}/__ch/api/applications/wechat/install`, {

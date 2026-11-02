@@ -4,6 +4,7 @@ import { errorDetails, portalApi } from '../../app/api';
 
 type ActivityDays = 7 | 30 | 90;
 type ActivityData = Awaited<ReturnType<typeof portalApi.adminActivity>>;
+type PlacesData = Awaited<ReturnType<typeof portalApi.adminPlaces>>;
 
 const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 
@@ -40,6 +41,15 @@ function ActivityByDay({ data }: { data: ActivityData }) {
   </section>;
 }
 
+function PlacesAvailability({ data }: { data: PlacesData }) {
+  return <section className="admin-detail-section" aria-labelledby="admin-places-heading">
+    <h2 id="admin-places-heading">活动地点</h2>
+    {data.available
+      ? <p className="muted">聚合位置来源可用；当前接口没有返回地点明细。</p>
+      : <div className="empty-card compact" role="status"><p>{data.unavailable_reason || '当前没有合规的聚合位置数据源。'}</p><p className="muted">不采集设备定位，也不根据 IP 推断地点。</p></div>}
+  </section>;
+}
+
 function ActivityBreakdown({ data }: { data: ActivityData }) {
   return <>
     <section className="admin-detail-section" aria-labelledby="admin-hub-activity-heading">
@@ -71,6 +81,7 @@ function ActivityBreakdown({ data }: { data: ActivityData }) {
 export function AdminActivity() {
   const [days, setDays] = useState<ActivityDays>(7);
   const query = useQuery({ queryKey: ['admin', 'activity', days], queryFn: () => portalApi.adminActivity(days) });
+  const placesQuery = useQuery({ queryKey: ['admin', 'places', days], queryFn: () => portalApi.adminPlaces(days) });
 
   return <section className="admin-content">
     <div className="page-heading"><div><p className="eyebrow">管理数据</p><h1>活动</h1><p className="muted">仅展示按事件类别和日期汇总的计数，不显示用户标识、地址或事件内容。</p></div></div>
@@ -89,6 +100,9 @@ export function AdminActivity() {
           </section>
           <ActivityByDay data={query.data} />
           <ActivityBreakdown data={query.data} />
+          {placesQuery.isPending ? <section className="admin-detail-section"><h2>活动地点</h2><div className="loading-card" role="status">正在加载位置汇总…</div></section>
+            : placesQuery.isError ? <section className="admin-detail-section"><h2>活动地点</h2><ActivityError error={placesQuery.error} retry={() => void placesQuery.refetch()} /></section>
+              : <PlacesAvailability data={placesQuery.data} />}
         </>}
   </section>;
 }

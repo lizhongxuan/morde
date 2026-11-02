@@ -12,6 +12,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/schedule"
 )
 
 func (s *Store) ReserveModelCall(ctx context.Context, request app.ModelCallReservation) error {
@@ -191,6 +192,7 @@ func checkTaskModelFence(ctx context.Context, tx pgx.Tx, fence app.ModelTaskFenc
 		return domain.NewError(domain.CodeUnauthenticated, "task execution authorization is unavailable")
 	}
 	var status, location, leaseOwner, agentID, sessionID, engineVersion, profileVersion, taskModel, authKind, tokenID, installationID string
+	var authScopes []string
 	var leaseVersion, generation, authVersion, through, executionEpoch int64
 	var leaseValid, authValid bool
 	var checkpointDigest []byte
@@ -198,14 +200,15 @@ func checkTaskModelFence(ctx context.Context, tx pgx.Tx, fence app.ModelTaskFenc
 	err := tx.QueryRow(ctx, `SELECT status,execution_location,lease_owner,lease_version,
  agent_instance_id,agent_generation,agent_session_id,agent_engine_version,agent_profile_version,auth_version,
  checkpoint_through_seq,checkpoint_digest,model_id,
- auth_kind,auth_token_id,COALESCE(auth_client_installation_id,''),execution_epoch,host_id,workspace_id
+ auth_kind,auth_token_id,auth_scopes,COALESCE(auth_client_installation_id,''),execution_epoch,host_id,workspace_id
  FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, fence.TaskID, fence.OwnerID).Scan(&status, &location, &leaseOwner, &leaseVersion,
 		&agentID, &generation, &sessionID, &engineVersion, &profileVersion, &authVersion, &through, &checkpointDigest, &taskModel,
-		&authKind, &tokenID, &installationID, &executionEpoch, &hostID, &workspaceID)
+		&authKind, &tokenID, &authScopes, &installationID, &executionEpoch, &hostID, &workspaceID)
 	if err != nil {
 		return domain.NewError(domain.CodeUnauthenticated, "task model execution fence is unavailable")
 	}
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at>clock_timestamp(),false),COALESCE(auth_expires_at>clock_timestamp(),false)
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at>clock_timestamp(),false),
+COALESCE(auth_kind='schedule_task' OR auth_expires_at>clock_timestamp(),false)
  FROM tasks WHERE id=$1`, fence.TaskID).Scan(&leaseValid, &authValid); err != nil {
 		return fmt.Errorf("check task model execution expiry: %w", err)
 	}
@@ -290,6 +293,19 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		}
 	}
 	switch authKind {
+	case string(identity.KindScheduleTask):
+		if !scheduleTaskScopeStringsValid(authScopes) || !schedule.ValidRunID(tokenID) || installationID != "" || hostID == nil {
+			return domain.NewError(domain.CodeUnauthenticated, "scheduled Task authorization is unavailable")
+		}
+		var linked bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM schedule_runs r JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+  WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND s.host_id=$4
+)`, tokenID, fence.OwnerID, fence.TaskID, *hostID).Scan(&linked)
+		if err != nil || !linked {
+			return domain.NewError(domain.CodeUnauthenticated, "scheduled Task authorization is unavailable")
+		}
+		return nil
 	case string(identity.KindClient):
 		if !domain.ValidClientInstallationID(installationID) {
 			return domain.NewError(domain.CodeUnauthenticated, "task installation is unavailable")

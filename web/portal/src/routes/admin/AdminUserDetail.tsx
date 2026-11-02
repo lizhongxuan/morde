@@ -310,7 +310,7 @@ export function AdminUserDetail() {
 
   return <section>
     <Link className="back-link" to="/admin/users">‹ 返回用户列表</Link>
-    <div className="page-heading detail-heading"><div><p className="eyebrow">用户详情</p><h2>{user.name}</h2><p className="muted mono">{user.id}</p></div><span className={`status status-${user.status === 'approved' ? 'ready' : 'disabled'}`}>{user.status === 'approved' ? '登录正常' : user.status === 'disabled' ? '已禁用登录' : user.status === 'pending' ? '等待审核' : '审核未通过'}</span></div>
+    <div className="page-heading detail-heading"><div><p className="eyebrow">用户详情</p><h2>{user.name}</h2><p className="muted mono">{user.id}</p></div><div className="inline-actions"><Link className="button button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}/records`}>记录与样本</Link><span className={`status status-${user.status === 'approved' ? 'ready' : 'disabled'}`}>{user.status === 'approved' ? '登录正常' : user.status === 'disabled' ? '已禁用登录' : user.status === 'pending' ? '等待审核' : '审核未通过'}</span></div></div>
     <div className="admin-detail-facts">
       <article><span>角色</span><strong>{user.role === 'super_admin' ? '超级管理员' : user.role === 'admin' ? '管理员' : '普通用户'}</strong></article>
       <article><span>云端电脑 / 上限</span><strong>{ownedHosts.length} / {user.quota.hosts} 台</strong></article>

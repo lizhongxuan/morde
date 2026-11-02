@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -46,6 +47,50 @@ type clientInfoResponse struct {
 func (h *api) registerClients(group *gin.RouterGroup) {
 	group.GET("/clients", h.listClients)
 	group.DELETE("/clients/:id", h.revokeClient)
+	group.POST("/auth/client-schedule-grant", h.issueClientScheduleGrant)
+	group.DELETE("/auth/client-schedule-grant", h.revokeClientScheduleGrant)
+}
+
+type clientScheduleGrantService interface {
+	IssueScheduleGrant(context.Context, identity.Principal) (app.ClientScheduleGrantResult, error)
+	RevokeScheduleGrant(context.Context, identity.Principal) error
+}
+
+func (h *api) issueClientScheduleGrant(c *gin.Context) {
+	principal, ok := principalFrom(c)
+	if !ok || principal.Kind != identity.KindClient || len(principal.Scopes) != 0 {
+		unauthenticated(c)
+		return
+	}
+	service, ok := h.deps.ClientLogin.(clientScheduleGrantService)
+	if !ok {
+		serviceUnavailable(c)
+		return
+	}
+	result, err := service.IssueScheduleGrant(c.Request.Context(), principal)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"credential": result.Credential, "expires_at": result.ExpiresAt})
+}
+
+func (h *api) revokeClientScheduleGrant(c *gin.Context) {
+	principal, ok := principalFrom(c)
+	if !ok || principal.Kind != identity.KindClient || len(principal.Scopes) != 0 {
+		unauthenticated(c)
+		return
+	}
+	service, ok := h.deps.ClientLogin.(clientScheduleGrantService)
+	if !ok {
+		serviceUnavailable(c)
+		return
+	}
+	if err := service.RevokeScheduleGrant(c.Request.Context(), principal); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 func (h *api) clientLogin(c *gin.Context) {

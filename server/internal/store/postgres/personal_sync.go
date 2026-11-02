@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/personal"
+	"morde/server/internal/domain/schedule"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -52,7 +54,7 @@ FROM account_object_versions v
 LEFT JOIN personal_objects p ON p.service_instance_id=v.service_instance_id AND p.owner_id=v.owner_id
   AND p.object_type=v.object_type AND p.object_id=v.object_id
 WHERE v.service_instance_id=$1::uuid AND v.owner_id=$2
-  AND v.object_type=ANY($3::text[]) AND NOT v.is_deleted
+  AND v.object_type=ANY($3::text[]) AND v.object_type<>'schedule' AND NOT v.is_deleted
   AND (v.object_type,v.object_id) > ($4,$5)
 ORDER BY v.object_type,v.object_id
 LIMIT $6`, instanceID, principal.UserID, personal.PersonalSyncObjectTypes(), afterType, afterID, limit+1)
@@ -67,16 +69,54 @@ LIMIT $6`, instanceID, principal.UserID, personal.PersonalSyncObjectTypes(), aft
 			if err := rows.Scan(&item.ObjectType, &item.ObjectID, &item.Revision, &body); err != nil {
 				return fmt.Errorf("scan personal snapshot object: %w", err)
 			}
-			if item.Revision < 1 || len(body) == 0 || !json.Valid(body) ||
-				personal.ValidateObjectIdentifier(item.ObjectType, item.ObjectID) != nil ||
-				personal.ValidateObjectBody(item.ObjectType, item.ObjectID, body) != nil {
-				return domain.NewError(domain.CodeInternal, "personal snapshot object is invalid")
-			}
 			item.Body = append(json.RawMessage(nil), body...)
 			items = append(items, item)
 		}
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("iterate personal snapshot: %w", err)
+		}
+		scheduleRows, err := tx.Query(ctx, `SELECT `+scheduleColumns+`
+FROM schedules s WHERE s.owner_id=$1 AND ('schedule',s.id) > ($2,$3)
+ORDER BY s.id LIMIT $4`, principal.UserID, afterType, afterID, limit+1)
+		if err != nil {
+			return fmt.Errorf("query schedule snapshot: %w", err)
+		}
+		for scheduleRows.Next() {
+			value, err := scanSchedule(scheduleRows)
+			if err != nil {
+				scheduleRows.Close()
+				return fmt.Errorf("scan schedule snapshot: %w", err)
+			}
+			definition := schedule.NewSyncDefinition(value)
+			body, err := json.Marshal(definition)
+			if err != nil {
+				scheduleRows.Close()
+				return fmt.Errorf("encode schedule snapshot: %w", err)
+			}
+			items = append(items, personal.Object{
+				ObjectType: "schedule", ObjectID: value.ID, Revision: value.Version, Body: body,
+			})
+		}
+		if err := scheduleRows.Err(); err != nil {
+			scheduleRows.Close()
+			return fmt.Errorf("iterate schedule snapshot: %w", err)
+		}
+		scheduleRows.Close()
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].ObjectType != items[j].ObjectType {
+				return items[i].ObjectType < items[j].ObjectType
+			}
+			return items[i].ObjectID < items[j].ObjectID
+		})
+		if len(items) > int(limit+1) {
+			items = items[:limit+1]
+		}
+		for _, item := range items {
+			if item.Revision < 1 || len(item.Body) == 0 || !json.Valid(item.Body) ||
+				personal.ValidateObjectIdentifier(item.ObjectType, item.ObjectID) != nil ||
+				personal.ValidateObjectBody(item.ObjectType, item.ObjectID, item.Body) != nil {
+				return domain.NewError(domain.CodeInternal, "personal snapshot object is invalid")
+			}
 		}
 		hasMore := int32(len(items)) > limit
 		if hasMore {

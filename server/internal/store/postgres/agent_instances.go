@@ -115,9 +115,9 @@ func (s *Store) StartAgentInstance(ctx context.Context, request app.AgentInstanc
 					}
 					var deadline time.Time
 					err := tx.QueryRow(ctx, `UPDATE task_agent_instances i
-SET lease_expires_at=LEAST(i.lease_expires_at,t.lease_expires_at,t.auth_expires_at),updated_at=clock_timestamp()
+SET lease_expires_at=LEAST(i.lease_expires_at,t.lease_expires_at,COALESCE(t.auth_expires_at,'infinity'::timestamptz)),updated_at=clock_timestamp()
 FROM tasks t WHERE i.task_id=t.id AND i.task_id=$1 AND i.agent_generation=$2 AND i.lease_expires_at>clock_timestamp()
- AND t.lease_expires_at>clock_timestamp() AND t.auth_expires_at>clock_timestamp() RETURNING i.lease_expires_at`,
+ AND t.lease_expires_at>clock_timestamp() AND (t.auth_kind='schedule_task' OR t.auth_expires_at>clock_timestamp()) RETURNING i.lease_expires_at`,
 						request.Fence.TaskID, current.Generation).Scan(&deadline)
 					if err == nil {
 						result = app.AgentInstanceLease{Fence: previous.Fence, RuntimeFence: copyAccountAgentRuntimeFence(runtimeFence),
@@ -291,7 +291,7 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3`, fence.TaskID, fence.O
 		resultRow, err := tx.Exec(ctx, `UPDATE task_agent_instances i SET lease_expires_at=$3,updated_at=clock_timestamp()
 FROM tasks t WHERE i.task_id=t.id AND i.task_id=$1 AND i.agent_generation=$2
   AND i.lease_expires_at>clock_timestamp() AND t.lease_expires_at>clock_timestamp()
-  AND t.auth_expires_at>clock_timestamp() AND $3::timestamptz>clock_timestamp()`, fence.TaskID, fence.AgentGeneration, expiresAt)
+  AND (t.auth_kind='schedule_task' OR t.auth_expires_at>clock_timestamp()) AND $3::timestamptz>clock_timestamp()`, fence.TaskID, fence.AgentGeneration, expiresAt)
 		if err != nil {
 			return fmt.Errorf("renew agent lease: %w", err)
 		}
@@ -783,21 +783,22 @@ func lockAuthorizedAgentTask(ctx context.Context, tx pgx.Tx, fence app.AgentInst
 	}
 	var current agentTaskLock
 	var authKind, tokenID, installationID string
+	var authScopes []string
 	err = tx.QueryRow(ctx, `SELECT COALESCE(host_id,''),agent_instance_id,agent_generation,agent_session_id,agent_engine_version,
-agent_profile_version,checkpoint_through_seq,checkpoint_digest,auth_kind,auth_token_id,COALESCE(auth_client_installation_id,'') FROM tasks
+agent_profile_version,checkpoint_through_seq,checkpoint_digest,auth_kind,auth_token_id,auth_scopes,COALESCE(auth_client_installation_id,'') FROM tasks
 WHERE id=$1 AND owner_id=$2 AND status='running' AND execution_location='server' AND execution_epoch=$3
  AND lease_owner=$4 AND lease_version=$5 AND lease_expires_at>clock_timestamp()
- AND auth_version=$6 AND auth_expires_at>clock_timestamp() FOR UPDATE`, fence.TaskID, fence.OwnerID, gate.epoch,
+ AND auth_version=$6 AND (auth_kind='schedule_task' OR auth_expires_at>clock_timestamp()) FOR UPDATE`, fence.TaskID, fence.OwnerID, gate.epoch,
 		fence.LeaseOwner, fence.LeaseVersion, fence.AuthorizationVersion).Scan(&current.HostID, &current.InstanceID, &current.Generation,
 		&current.SessionID, &current.EngineVersion, &current.ProfileVersion, &current.CheckpointThrough, &current.CheckpointDigest,
-		&authKind, &tokenID, &installationID)
+		&authKind, &tokenID, &authScopes, &installationID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return agentTaskLock{}, domain.NewError(domain.CodeUnauthenticated, "agent task authorization is unavailable")
 	}
 	if err != nil {
 		return agentTaskLock{}, fmt.Errorf("lock agent task: %w", err)
 	}
-	if err := checkAgentCheckpointAuthorization(ctx, tx, fence.OwnerID, authKind, tokenID, installationID); err != nil {
+	if err := checkAgentCheckpointAuthorization(ctx, tx, fence.OwnerID, fence.TaskID, authKind, tokenID, authScopes, installationID); err != nil {
 		return agentTaskLock{}, err
 	}
 	return current, nil
@@ -805,8 +806,10 @@ WHERE id=$1 AND owner_id=$2 AND status='running' AND execution_location='server'
 
 func agentLeaseDeadline(ctx context.Context, tx pgx.Tx, taskID string, duration time.Duration) (time.Time, error) {
 	var deadline time.Time
-	err := tx.QueryRow(ctx, `SELECT LEAST(clock_timestamp()+($2::bigint * interval '1 millisecond'),lease_expires_at,auth_expires_at)
-FROM tasks WHERE id=$1 AND lease_expires_at>clock_timestamp() AND auth_expires_at>clock_timestamp()`, taskID, duration.Milliseconds()).Scan(&deadline)
+	err := tx.QueryRow(ctx, `SELECT LEAST(clock_timestamp()+($2::bigint * interval '1 millisecond'),lease_expires_at,
+COALESCE(auth_expires_at,'infinity'::timestamptz))
+FROM tasks WHERE id=$1 AND lease_expires_at>clock_timestamp()
+ AND (auth_kind='schedule_task' OR auth_expires_at>clock_timestamp())`, taskID, duration.Milliseconds()).Scan(&deadline)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, domain.NewError(domain.CodeUnauthenticated, "agent task lease or authorization has expired")
 	}

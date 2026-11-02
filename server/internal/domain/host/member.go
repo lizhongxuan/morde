@@ -9,11 +9,12 @@ const (
 	PermissionDesktopControl  Permission = "desktop:control"
 	PermissionTerminalControl Permission = "terminal:control"
 	PermissionMCPControl      Permission = "mcp:control"
+	PermissionWorkspaceFileRead Permission = "workspace:file:read"
 )
 
 func (p Permission) Valid() bool {
 	switch p {
-	case PermissionDesktopView, PermissionDesktopControl, PermissionTerminalControl, PermissionMCPControl:
+	case PermissionDesktopView, PermissionDesktopControl, PermissionTerminalControl, PermissionMCPControl, PermissionWorkspaceFileRead:
 		return true
 	default:
 		return false

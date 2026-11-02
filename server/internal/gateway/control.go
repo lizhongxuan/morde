@@ -165,20 +165,23 @@ type hostResponse struct {
 }
 
 type workspaceRef struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Revision  int64           `json:"revision"`
-	UsedBytes int64           `json:"used_bytes"`
-	State     workspace.State `json:"state"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Revision   int64           `json:"revision"`
+	UsedBytes  int64           `json:"used_bytes"`
+	QuotaBytes int64           `json:"quota_bytes"`
+	State      workspace.State `json:"state"`
 }
 
 type workspaceBindingResponse struct {
-	Workspace       workspaceRef           `json:"workspace"`
-	Directory       string                 `json:"directory"`
-	State           workspace.BindingState `json:"state"`
-	BindingVersion  int64                  `json:"binding_version"`
-	DesiredRevision int64                  `json:"desired_revision"`
-	AppliedRevision int64                  `json:"applied_revision"`
+	Workspace       workspaceRef               `json:"workspace"`
+	Directory       string                     `json:"directory"`
+	State           workspace.BindingState     `json:"state"`
+	BindingVersion  int64                      `json:"binding_version"`
+	DesiredRevision int64                      `json:"desired_revision"`
+	AppliedRevision int64                      `json:"applied_revision"`
+	SyncState       workspace.BindingSyncState `json:"sync_state"`
+	SyncConflicts   []string                   `json:"sync_conflicts"`
 }
 
 type resourcesResponse struct {
@@ -198,10 +201,11 @@ func hostResponseFrom(value host.Host, domains config.Domains) hostResponse {
 		workspaces = append(workspaces, workspaceBindingResponse{
 			Workspace: workspaceRef{
 				ID: binding.Workspace.ID, Name: binding.Workspace.Name, Revision: binding.Workspace.Revision,
-				UsedBytes: binding.Workspace.UsedBytes, State: binding.Workspace.State,
+				UsedBytes: binding.Workspace.UsedBytes, QuotaBytes: binding.Workspace.QuotaBytes, State: binding.Workspace.State,
 			},
 			Directory: binding.Directory, State: binding.State, BindingVersion: binding.BindingVersion,
 			DesiredRevision: binding.DesiredRevision, AppliedRevision: binding.AppliedRevision,
+			SyncState: binding.SyncState, SyncConflicts: append([]string{}, binding.SyncConflicts...),
 		})
 	}
 	return hostResponse{

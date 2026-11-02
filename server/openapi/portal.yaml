@@ -347,6 +347,44 @@ paths:
               schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
+  /api/me/record-consents:
+    get:
+      tags: [Portal]
+      operationId: listMyRecordConsents
+      summary: Read independent full-record and training-sample consents
+      security:
+        - portalSession: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: Current consent state; both purposes default to disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordConsents' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Portal]
+      operationId: setMyRecordConsent
+      summary: Set one independent record-capture consent
+      description: Consent is always account-owner controlled. Withdrawing a purpose rejects and clears its queued payloads; it does not delete already stored records.
+      security:
+        - portalSession: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetRecordConsentRequest' }
+      responses:
+        '200':
+          description: Updated consent state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordConsent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
   /api/me/password:
     post:
       tags: [Auth]
@@ -1300,7 +1338,7 @@ paths:
         - name: revision
           in: query
           required: false
-          schema: { type: integer, format: int64, minimum: 1 }
+          schema: { type: integer, format: int64, minimum: 0 }
         - name: prefix
           in: query
           required: false
@@ -2730,6 +2768,254 @@ paths:
         '204': { description: Installation and its credentials revoked }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/goals:
+    get:
+      tags: [Personal Data]
+      operationId: listGoals
+      summary: List the current account's goals
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { name: cursor, in: query, schema: { type: string, maxLength: 1024 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Owner-scoped goals
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GoalPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Personal Data]
+      operationId: createGoal
+      summary: Create a goal in the personal-object ledger
+      description: The client supplies a stable ID so an Idempotency-Key retry addresses the same object. The goal body, material references, quota, revision, and account change entry commit atomically.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoalCreateRequest' }
+      responses:
+        '201':
+          description: Goal created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalMutationReceipt' }
+        '200':
+          description: Idempotent replay of the original mutation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalMutationReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/goals/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/GoalId' }
+    get:
+      tags: [Personal Data]
+      operationId: getGoal
+      summary: Read one current-account goal
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Goal body and revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalObject' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Personal Data]
+      operationId: updateGoal
+      summary: Replace a goal body with an optimistic revision check
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoalMutationRequest' }
+      responses:
+        '200':
+          description: Body-free mutation receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalMutationReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Personal Data]
+      operationId: deleteGoal
+      summary: Delete a goal using its current revision
+      description: Deletion creates a tombstone; old offline retries cannot recreate the goal.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoalDeleteRequest' }
+      responses:
+        '200':
+          description: Body-free mutation receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalMutationReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/schedules:
+    get:
+      tags: [Schedules]
+      operationId: listSchedules
+      summary: List schedules owned by the current account
+      description: Schedule-scoped Client grants can access this API; execution authorization remains server-side.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ScheduleStatus' } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 1024 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Schedule page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchedulePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Schedules]
+      operationId: createSchedule
+      summary: Create and enable a schedule
+      description: Requires an enabled Owner execution gate and an Idempotency-Key. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleCreateRequest' }
+      responses:
+        '201':
+          description: Created schedule
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/schedules/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ScheduleId' }
+    get:
+      tags: [Schedules]
+      operationId: getSchedule
+      summary: Read one current-account schedule
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Schedule definition and current run summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Schedules]
+      operationId: updateSchedule
+      summary: Update a schedule definition at the expected version
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SchedulePatchRequest' }
+      responses:
+        '200':
+          description: Updated schedule
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/schedules/{id}/actions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ScheduleId' }
+    post:
+      tags: [Schedules]
+      operationId: updateScheduleStatus
+      summary: Enable or disable a schedule
+      description: Requires an Idempotency-Key and expected_version. Disabling does not cancel the current run unless current_run_action is cancel.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleActionRequest' }
+      responses:
+        '200':
+          description: Updated schedule and current run state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/schedules/{id}/runs:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ScheduleId' }
+    get:
+      tags: [Schedules]
+      operationId: listScheduleRuns
+      summary: List run history for a schedule
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { name: cursor, in: query, schema: { type: string, maxLength: 1024 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Schedule run history page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleRunPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/personal-data/{type}/{id}:
     parameters:
       - name: type
@@ -3681,6 +3967,214 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/record-settings:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+    get:
+      tags: [Admin]
+      operationId: getAdminRecordSettings
+      summary: Read a user's record consent, quota, and all administrator grants
+      description: Requires a super administrator session. This does not return record content or attachments.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Record capture settings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRecordSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/record-access:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+    get:
+      tags: [Admin]
+      operationId: getAdminRecordAccess
+      summary: Read this administrator's own record capabilities and the user's consent state
+      description: Returns only the caller's own grants, never other administrators' grants or quota values.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Current caller record access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRecordAccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/record-quota:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+    put:
+      tags: [Admin]
+      operationId: setAdminRecordQuota
+      summary: Compare-and-set record retention and storage quota
+      description: Requires a super administrator session. Current usage is preserved; updates below used plus reserved bytes are rejected. The update is audited in the same database transaction.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetAdminRecordQuotaRequest' }
+      responses:
+        '200':
+          description: Updated record quota
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordQuota' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/record-grants:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+    put:
+      tags: [Admin]
+      operationId: setAdminRecordGrant
+      summary: Grant or revoke one record capability for an active administrator
+      description: Requires a super administrator session. Grants do not enable user consent. Changes are audited in the same database transaction.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetAdminRecordGrantRequest' }
+      responses:
+        '200':
+          description: Updated capability grant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordAdminGrant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/records:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+    get:
+      tags: [Admin]
+      operationId: listAdminUserRecords
+      summary: List consented record and sample metadata
+      description: Requires the caller's view grant and current enabled consent for each returned purpose. Payloads and attachments are never included.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: purpose, in: query, schema: { $ref: '#/components/schemas/RecordPurpose' } }
+        - { name: before_id, in: query, schema: { $ref: '#/components/schemas/RecordId' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Page of record metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/records/{record_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+      - { name: record_id, in: path, required: true, schema: { $ref: '#/components/schemas/RecordId' } }
+    get:
+      tags: [Admin]
+      operationId: getAdminUserRecord
+      summary: Read one record body with the view capability
+      description: Requires the caller's view grant and the current enabled consent. Returns only valid JSON that passes the secret-format check; denied payloads are not returned.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Record metadata and JSON payload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordContent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Admin]
+      operationId: requestAdminUserRecordDelete
+      summary: Request deletion of a record using the delete capability
+      description: Creates an idempotent deletion tombstone. The record and dedicated attachments are removed asynchronously; the request and completion are audited without content.
+      security: [{ portalSession: [] }]
+      responses:
+        '202':
+          description: Deletion tombstone
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordDeleteTombstone' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/records/{record_id}/attachments:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+      - { name: record_id, in: path, required: true, schema: { $ref: '#/components/schemas/RecordId' } }
+    get:
+      tags: [Admin]
+      operationId: listAdminUserRecordAttachments
+      summary: List attachment metadata with attachment capability
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Attachment metadata only
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordAttachmentPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/records/{record_id}/attachments/{attachment_id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+      - { name: record_id, in: path, required: true, schema: { $ref: '#/components/schemas/RecordId' } }
+      - { name: attachment_id, in: path, required: true, schema: { $ref: '#/components/schemas/RecordAttachmentId' } }
+    get:
+      tags: [Admin]
+      operationId: downloadAdminUserRecordAttachment
+      summary: Download one attachment with attachment capability
+      description: Requires both view and attachment grants plus current consent. Content is an attachment with nosniff and private no-store headers.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Dedicated record attachment bytes
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/records/{record_id}/export:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/UserId' } }
+      - { name: record_id, in: path, required: true, schema: { $ref: '#/components/schemas/RecordId' } }
+    get:
+      tags: [Admin]
+      operationId: exportAdminUserRecord
+      summary: Export one record after a strict JSON and secret-format check
+      description: Requires the caller's export grant and current enabled consent. The export must be valid JSON, may not contain known credential fields, common credential formats, or Vault markers, and is returned with a safe generated filename. Use local synthetic records for acceptance.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Safe JSON attachment
+          content:
+            application/json:
+              schema: {}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/admin/capacity:
     get:
       tags: [Admin]
@@ -3801,6 +4295,115 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AdminPlaces' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/controls:
+    get:
+      tags: [Admin]
+      operationId: getAdminControls
+      summary: List notify-only threshold rules and local notifications
+      description: Rules can only create notifications in the local database receiver. Global signup, sync, allowance, and device controls are not exposed.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Rule configuration and aggregate account count
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminControls' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/controls/rules:
+    post:
+      tags: [Admin]
+      operationId: createAdminControlRule
+      summary: Create a local notification threshold rule
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAdminControlRuleRequest' }
+      responses:
+        '201':
+          description: Created threshold rule
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminControlRule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/controls/rules/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    put:
+      tags: [Admin]
+      operationId: updateAdminControlRule
+      summary: Compare-and-set a local notification threshold rule
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAdminControlRuleRequest' }
+      responses:
+        '200':
+          description: Updated threshold rule
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminControlRule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Admin]
+      operationId: deleteAdminControlRule
+      summary: Delete a threshold rule using its current version
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: expected_version, in: query, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        '204': { description: Rule deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/controls/evaluate:
+    post:
+      tags: [Admin]
+      operationId: evaluateAdminControls
+      summary: Manually evaluate enabled account-count rules
+      description: Evaluation records local notifications only and is idempotent for already-fired rules.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Evaluation result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminControlEvaluation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/controls/notify-test:
+    post:
+      tags: [Admin]
+      operationId: adminControlNotifyTest
+      summary: Write a test event to the local notification receiver
+      description: This does not send email, network traffic, or external notifications.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Local notification test result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminControlNotifyTest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
@@ -6110,11 +6713,15 @@ components:
       additionalProperties: false
     AdminQuality:
       type: object
-      required: [days, available]
+      required: [days, available, sample_count, failed_tasks, failed_hub_operations, unknown_hub_operations]
       properties:
         days: { type: integer, enum: [7, 30, 90] }
         available: { type: boolean }
         unavailable_reason: { type: string }
+        sample_count: { type: integer, format: int64, minimum: 0, description: Count of unexpired samples with currently enabled, matching training-consent version. }
+        failed_tasks: { type: integer, format: int64, minimum: 0, description: Failed tasks by updated_at in the selected window. }
+        failed_hub_operations: { type: integer, format: int64, minimum: 0 }
+        unknown_hub_operations: { type: integer, format: int64, minimum: 0 }
       additionalProperties: false
     AdminPlaces:
       type: object
@@ -6166,6 +6773,226 @@ components:
       properties:
         action: { type: string }
         count: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    AdminControls:
+      type: object
+      required: [rules, accounts_total, next_threshold, notify_configured, notifications]
+      properties:
+        rules: { type: array, items: { $ref: '#/components/schemas/AdminControlRule' } }
+        accounts_total: { type: integer, format: int64, minimum: 0 }
+        next_threshold: { type: [integer, 'null'], minimum: 1 }
+        notify_configured: { type: boolean }
+        notifications: { type: array, items: { $ref: '#/components/schemas/AdminControlNotification' } }
+      additionalProperties: false
+    AdminControlRule:
+      type: object
+      required: [id, threshold, enabled, note, created_at, last_fired_at, fired_accounts, version]
+      properties:
+        id: { type: integer, format: int64, minimum: 1 }
+        threshold: { type: integer, format: int64, minimum: 1 }
+        enabled: { type: boolean }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+        last_fired_at: { type: [string, 'null'], format: date-time }
+        fired_accounts: { type: integer, format: int64, minimum: 0 }
+        version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    AdminControlNotification:
+      type: object
+      required: [kind, rule_id, accounts_total, created_at]
+      properties:
+        kind: { type: string, enum: [rule_fired, test] }
+        rule_id: { type: [integer, 'null'], format: int64, minimum: 1 }
+        accounts_total: { type: integer, format: int64, minimum: 0 }
+        created_at: { type: string, format: date-time }
+      additionalProperties: false
+    AdminControlEvaluation:
+      type: object
+      required: [accounts_total, fired]
+      properties:
+        accounts_total: { type: integer, format: int64, minimum: 0 }
+        fired: { type: array, items: { $ref: '#/components/schemas/AdminControlRule' } }
+      additionalProperties: false
+    AdminControlNotifyTest:
+      type: object
+      required: [sent, configured, created_at]
+      properties:
+        sent: { type: boolean, const: true }
+        configured: { type: boolean, const: true }
+        created_at: { type: string, format: date-time }
+      additionalProperties: false
+    RecordPurpose:
+      type: string
+      enum: [full_record, training_contribution]
+    RecordCapability:
+      type: string
+      enum: [view, attachment, export, delete]
+    RecordId:
+      type: string
+      pattern: '^v[a-z0-9]{7}$'
+    RecordAttachmentId:
+      type: string
+      pattern: '^g[a-z0-9]{7}$'
+    RecordConsent:
+      type: object
+      required: [owner_id, purpose, enabled, version]
+      properties:
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        purpose: { $ref: '#/components/schemas/RecordPurpose' }
+        enabled: { type: boolean }
+        version: { type: integer, format: int64, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+      additionalProperties: false
+    RecordConsents:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/RecordConsent' }
+      additionalProperties: false
+    SetRecordConsentRequest:
+      type: object
+      required: [purpose, enabled]
+      properties:
+        purpose: { $ref: '#/components/schemas/RecordPurpose' }
+        enabled: { type: boolean }
+      additionalProperties: false
+    RecordQuota:
+      type: object
+      required: [owner_id, retention_days, limit_bytes, used_bytes, reserved_bytes, version, updated_at]
+      properties:
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        retention_days: { type: integer, format: int32, minimum: 1, maximum: 3650 }
+        limit_bytes: { type: integer, format: int64, minimum: 1 }
+        used_bytes: { type: integer, format: int64, minimum: 0 }
+        reserved_bytes: { type: integer, format: int64, minimum: 0 }
+        version: { type: integer, format: int64, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+      additionalProperties: false
+    RecordAdminGrant:
+      type: object
+      required: [owner_id, admin_id, capability, granted, granted_by, version, updated_at]
+      properties:
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        admin_id: { $ref: '#/components/schemas/UserId' }
+        capability: { $ref: '#/components/schemas/RecordCapability' }
+        granted: { type: boolean }
+        granted_by: { $ref: '#/components/schemas/UserId' }
+        version: { type: integer, format: int64, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+      additionalProperties: false
+    AdminRecordSettings:
+      type: object
+      required: [owner_id, consents, quota, grants]
+      properties:
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        consents: { type: array, items: { $ref: '#/components/schemas/RecordConsent' } }
+        quota: { $ref: '#/components/schemas/RecordQuota' }
+        grants: { type: array, items: { $ref: '#/components/schemas/RecordAdminGrant' } }
+      additionalProperties: false
+    AdminRecordAccess:
+      type: object
+      required: [capabilities, consents]
+      properties:
+        capabilities:
+          type: array
+          items: { $ref: '#/components/schemas/RecordCapability' }
+        consents: { type: array, items: { $ref: '#/components/schemas/RecordConsent' } }
+      additionalProperties: false
+    SetAdminRecordQuotaRequest:
+      type: object
+      required: [expected_version, retention_days, limit_bytes]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+        retention_days: { type: integer, format: int32, minimum: 1, maximum: 3650 }
+        limit_bytes: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    SetAdminRecordGrantRequest:
+      type: object
+      required: [admin_id, capability, granted]
+      properties:
+        admin_id: { $ref: '#/components/schemas/UserId' }
+        capability: { $ref: '#/components/schemas/RecordCapability' }
+        granted: { type: boolean }
+      additionalProperties: false
+    RecordMetadata:
+      type: object
+      required: [id, owner_id, purpose, kind, consent_version, created_at, expires_at, payload_bytes, attachment_bytes, attachment_count, state]
+      properties:
+        id: { $ref: '#/components/schemas/RecordId' }
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        purpose: { $ref: '#/components/schemas/RecordPurpose' }
+        kind: { type: string, enum: [turn, sample] }
+        consent_version: { type: integer, format: int64, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        payload_bytes: { type: integer, format: int64, minimum: 0 }
+        attachment_bytes: { type: integer, format: int64, minimum: 0 }
+        attachment_count: { type: integer, format: int32, minimum: 0 }
+        state: { type: string, enum: [active] }
+      additionalProperties: false
+    RecordPage:
+      type: object
+      required: [items, next_before]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RecordMetadata' } }
+        next_before: { type: string, pattern: '^(|v[a-z0-9]{7})$' }
+      additionalProperties: false
+    RecordContent:
+      type: object
+      required: [metadata, payload]
+      properties:
+        metadata: { $ref: '#/components/schemas/RecordMetadata' }
+        payload: { description: Valid JSON record payload with known secret formats and Vault markers rejected. }
+      additionalProperties: false
+    RecordAttachment:
+      type: object
+      required: [id, record_id, file_name, media_type, size_bytes, sha256]
+      properties:
+        id: { $ref: '#/components/schemas/RecordAttachmentId' }
+        record_id: { $ref: '#/components/schemas/RecordId' }
+        file_name: { type: string, minLength: 1, maxLength: 255 }
+        media_type: { type: string, minLength: 1, maxLength: 128 }
+        size_bytes: { type: integer, format: int64, minimum: 1 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      additionalProperties: false
+    RecordAttachmentPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RecordAttachment' } }
+      additionalProperties: false
+    RecordDeleteTombstone:
+      type: object
+      required: [id, owner_id, record_id, state, attempts, requested_at]
+      properties:
+        id: { type: string, pattern: '^l[a-z0-9]{7}$' }
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        record_id: { $ref: '#/components/schemas/RecordId' }
+        state: { type: string, enum: [pending, failed, completed] }
+        attempts: { type: integer, format: int32, minimum: 0 }
+        requested_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+      additionalProperties: false
+    CreateAdminControlRuleRequest:
+      type: object
+      required: [threshold]
+      properties:
+        threshold: { type: integer, format: int64, minimum: 1 }
+        note: { type: string, maxLength: 500 }
+      additionalProperties: false
+    UpdateAdminControlRuleRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+        threshold: { type: integer, format: int64, minimum: 1 }
+        enabled: { type: boolean }
+        note: { type: string, maxLength: 500 }
+        rearm: { type: boolean, default: false }
       additionalProperties: false
     AdminUsageSummary:
       type: object

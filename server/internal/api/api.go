@@ -62,13 +62,18 @@ type Deps struct {
 	Devices               deviceService
 	PersonalData          personalDataService
 	PersonalSync          personalSyncService
-	PersonalDataQuota     *app.PersonalDataQuotaService
+	Goals                 goalRoutesService
+	Schedules             scheduleRoutesService
+	PersonalDataQuota     AdminPersonalDataQuotaService
 	PersonalAttachments   *app.PersonalAttachmentService
 	PersonalHistoryImport *app.PersonalHistoryImportService
 	Onboarding            OnboardingManager
 	Admin                 AdminService
 	AdminConsole          AdminConsoleService
 	AdminQualityActivity  AdminQualityActivityService
+	AdminControls         AdminControlsService
+	RecordConsents        RecordConsentService
+	RecordAccess          RecordAccessService
 	AdminHostResources    AdminHostResourcesService
 	AdminWorkspaces       AdminWorkspaceService
 	AdminAudit            AdminAuditWriter
@@ -165,6 +170,12 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	registerDeviceRoutes(group, deps.Devices)
 	registerPersonalDataRoutes(group, deps.PersonalData)
 	registerPersonalSyncRoutes(group, deps.PersonalSync)
+	if deps.Goals != nil {
+		registerGoalRoutes(group, deps.Goals)
+	}
+	if deps.Schedules != nil {
+		registerScheduleRoutes(group, deps.Schedules)
+	}
 	personalDataGroup := group.Group("/personal-data")
 	RegisterPersonalAttachmentRoutes(personalDataGroup, deps.PersonalAttachments)
 	RegisterPersonalHistoryImportRoutes(personalDataGroup, deps.PersonalHistoryImport)
@@ -176,6 +187,8 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerModelGateway(group)
 	h.registerAdmin(group)
 	h.registerAdminQualityActivity(group)
+	h.registerAdminControls(group)
+	h.registerAdminRecords(group)
 	h.registerAdminPersonalDataQuota(group)
 	h.registerAdminModelUsage(group)
 	engine.NoRoute(h.noRoute)
@@ -199,6 +212,9 @@ func (h *api) limitBody(c *gin.Context) {
 	case c.Request.Method == http.MethodPut && c.FullPath() == "/api/personal-data/uploads/:upload_id/chunks/:sequence":
 		limit = personalAttachmentChunkLimit
 	case (c.Request.Method == http.MethodPut || c.Request.Method == http.MethodDelete) && c.FullPath() == "/api/personal-data/:type/:id":
+		limit = personal.MaxMutationBodyBytes + 4096
+	case (c.Request.Method == http.MethodPost || c.Request.Method == http.MethodPatch || c.Request.Method == http.MethodDelete) &&
+		(c.FullPath() == "/api/goals" || c.FullPath() == "/api/goals/:id"):
 		limit = personal.MaxMutationBodyBytes + 4096
 	case c.Request.Method == http.MethodPost && (strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-device-challenges") ||
 		strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-devices")):
@@ -328,6 +344,11 @@ func (h *api) authenticate(c *gin.Context) {
 	}
 	if principal.Kind == identity.KindClient && !clientCredentialRoute(c.Request.Method, c.FullPath()) {
 		writeError(c, domain.NewError(domain.CodeForbidden, "client credential is limited to user actions"))
+		c.Abort()
+		return
+	}
+	if principal.Kind == identity.KindClient && len(principal.Scopes) != 0 && !clientScheduleGrantRoute(c.Request.Method, c.FullPath()) {
+		writeError(c, domain.NewError(domain.CodeForbidden, "schedule grant is limited to schedule management"))
 		c.Abort()
 		return
 	}
@@ -476,17 +497,23 @@ func clientCredentialRoute(method, path string) bool {
 			"/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
 			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id",
 			"/api/personal-data/attachments/:attachment_id",
+			"/api/goals", "/api/goals/:id",
+			"/api/schedules", "/api/schedules/:id", "/api/schedules/:id/runs",
 			"/api/sync/snapshot", "/api/sync/changes",
 			"/api/notifications", "/api/available-models":
 			return true
 		}
 	case http.MethodPost:
 		switch path {
-		case "/api/auth/client-web-session", "/api/auth/client-logout":
+		case "/api/auth/client-web-session", "/api/auth/client-logout", "/api/auth/client-schedule-grant":
 			return true
 		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
 			"/api/tasks/:id/workspace-view-deletions",
 			"/api/tasks/:id/inputs", "/api/tasks/:id/approvals/:approval_id/responses":
+			return true
+		case "/api/schedules", "/api/schedules/:id/actions":
+			return true
+		case "/api/goals":
 			return true
 		case "/api/workspaces/:id/sync-device-challenges", "/api/workspaces/:id/sync-devices":
 			return true
@@ -498,14 +525,29 @@ func clientCredentialRoute(method, path string) bool {
 			return true
 		}
 	case http.MethodPut:
-		return path == "/api/personal-data/:type/:id" || path == "/api/personal-data/uploads/:upload_id/chunks/:sequence"
+		return path == "/api/personal-data/:type/:id" || path == "/api/personal-data/uploads/:upload_id/chunks/:sequence" ||
+			path == "/api/schedules/:id"
 	case http.MethodPatch:
-		return path == "/api/devices/:id"
+		return path == "/api/devices/:id" || path == "/api/goals/:id"
 	case http.MethodDelete:
 		return path == "/api/clients/:id" || path == "/api/devices/:id" || path == "/api/personal-data/:type/:id" ||
+			path == "/api/goals/:id" || path == "/api/auth/client-schedule-grant" ||
 			path == "/api/personal-data/uploads/:upload_id"
 	}
 	return false
+}
+
+func clientScheduleGrantRoute(method, path string) bool {
+	switch method {
+	case http.MethodGet:
+		return path == "/api/schedules" || path == "/api/schedules/:id" || path == "/api/schedules/:id/runs"
+	case http.MethodPost:
+		return path == "/api/schedules" || path == "/api/schedules/:id/actions"
+	case http.MethodPut:
+		return path == "/api/schedules/:id"
+	default:
+		return false
+	}
 }
 
 func registerAuthFailureCounter(reg prometheus.Registerer) (*prometheus.CounterVec, error) {

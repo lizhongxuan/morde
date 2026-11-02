@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/personal"
@@ -235,6 +236,68 @@ WHERE u.service_instance_id=$1::uuid AND u.owner_id=$2 AND u.upload_id=$3`,
 	if err := pool.QueryRow(ctx, `SELECT q.state FROM personal_data_quota_reservations q
 WHERE q.service_instance_id=$1::uuid AND q.owner_id=$2 AND q.upload_id=$3`, instanceID, owner.ID, created.UploadID).Scan(&quotaState); err != nil || quotaState != "committed" {
 		t.Fatalf("settled quota state=%q err=%v", quotaState, err)
+	}
+}
+
+func TestPostgresPersonalAttachmentCommitAfterQuotaReductionReleasesReservation(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	if !requirePersonalAttachmentSchema(t, ctx, pool) {
+		return
+	}
+	owner := createTestUser(t, store, 2, 2000, 4096)
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	createPersonalLibraryItemForAttachmentTest(t, store, principal, "library-item_1")
+	content := []byte("quota reduced during upload")
+	digest := sha256.Sum256(content)
+	service, err := app.NewPersonalAttachmentService(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreatePersonalAttachmentUpload(ctx, principal, app.PersonalAttachmentUploadCommand{
+		IdempotencyKey: "attachment-reduced-create", ObjectID: "library-item_1", BaseRevision: 1,
+		SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), MediaType: "application/octet-stream",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkDigest := hex.EncodeToString(digest[:])
+	if _, err := service.PutPersonalAttachmentChunk(ctx, principal, app.PersonalAttachmentChunkCommand{
+		UploadID: created.UploadID, Sequence: 0, SizeBytes: int64(len(content)), SHA256: chunkDigest, Body: bytes.NewReader(content),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var usedBefore int64
+	if err := pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&usedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE personal_data_quotas SET quota_bytes=used_bytes WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CommitPersonalAttachment(ctx, principal, created.UploadID, "attachment-reduced-commit"); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("commit after quota reduction = %v, want quota_exceeded", err)
+	}
+	var uploadState, reservationState string
+	var reservationReleased bool
+	var usedAfter, reservedAfter int64
+	if err := pool.QueryRow(ctx, `SELECT u.state,u.reservation_released,r.state,q.used_bytes,q.reserved_bytes
+FROM personal_attachment_uploads u
+JOIN personal_data_quota_reservations r ON r.service_instance_id=u.service_instance_id
+  AND r.owner_id=u.owner_id AND r.upload_id=u.upload_id
+JOIN personal_data_quotas q ON q.service_instance_id=u.service_instance_id AND q.owner_id=u.owner_id
+WHERE u.owner_id=$1 AND u.upload_id=$2`, owner.ID, created.UploadID).Scan(
+		&uploadState, &reservationReleased, &reservationState, &usedAfter, &reservedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if uploadState != string(personal.AttachmentUploadCancelled) || !reservationReleased || reservationState != "released" ||
+		usedAfter != usedBefore || reservedAfter != 0 {
+		t.Fatalf("quota rejection left upload=%s ack=%t reservation=%s used=%d reserved=%d; want cancelled/released/%d/0",
+			uploadState, reservationReleased, reservationState, usedAfter, reservedAfter, usedBefore)
+	}
+	var attachmentID string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(body->>'attachment_id','') FROM personal_objects
+WHERE owner_id=$1 AND object_type=$2 AND object_id='library-item_1'`, owner.ID, personal.ObjectTypeLibraryItem).Scan(&attachmentID); err != nil || attachmentID != "" {
+		t.Fatalf("quota-rejected commit changed library reference to %q: %v", attachmentID, err)
 	}
 }
 

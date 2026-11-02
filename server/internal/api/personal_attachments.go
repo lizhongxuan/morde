@@ -206,7 +206,7 @@ func RegisterPersonalAttachmentRoutes(group *gin.RouterGroup, service personalAt
 			writeError(c, err)
 			return
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 		c.Header("Content-Type", metadata.MediaType)
 		c.Header("Content-Length", strconv.FormatInt(metadata.SizeBytes, 10))
 		c.Header("Cache-Control", "private, no-store")

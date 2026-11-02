@@ -14,6 +14,7 @@ export type GatewayHost = {
       name: string;
       revision: number;
       used_bytes: number;
+      quota_bytes: number;
       state: 'ready' | 'deleting' | 'deleted';
     };
     directory: string;
@@ -21,6 +22,8 @@ export type GatewayHost = {
     binding_version: number;
     desired_revision: number;
     applied_revision: number;
+    sync_state: 'healthy' | 'conflict';
+    sync_conflicts: string[];
   }>;
 };
 

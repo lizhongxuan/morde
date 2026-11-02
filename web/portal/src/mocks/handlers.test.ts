@@ -90,6 +90,77 @@ describe("admin console mock routes", () => {
     expect(auditText).not.toContain("local-test-secret");
   });
 
+  it("serves only aggregate activity and explicit unavailable quality/place states", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const quality = await api("/api/admin/quality?days=30");
+    expect(await quality.json()).toMatchObject({ days: 30, available: false });
+    const activity = await api("/api/admin/activity?days=7");
+    const body = await activity.text();
+    expect(JSON.parse(body)).toMatchObject({ days: 7, by_day: expect.any(Array), hub_operations: [], task_events: [], audit_events: [] });
+    expect(body).not.toMatch(/owner_id|installation_id|payload|ip|user_agent|hash|address/i);
+    const places = await api("/api/admin/places");
+    expect(await places.json()).toMatchObject({ available: false });
+    expect((await api("/api/admin/activity?days=8")).status).toBe(400);
+  });
+
+  it("evaluates notify-only rules into the local receiver and enforces versions", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const created = await api("/api/admin/controls/rules", json("POST", { threshold: 3, note: "本地增长检查" }));
+    expect(created.status).toBe(201);
+    const rule = await created.json() as { id: number; version: number };
+    const fired = await api("/api/admin/controls/evaluate", json("POST", {}));
+    expect(await fired.json()).toMatchObject({ accounts_total: 3, fired: [{ id: rule.id, last_fired_at: expect.any(String) }] });
+    expect((await (await api("/api/admin/controls/evaluate", json("POST", {}))).json()).fired).toEqual([]);
+    expect((await api(`/api/admin/controls/rules/${rule.id}`, json("PUT", { expected_version: rule.version, enabled: false }))).status).toBe(409);
+    const inbox = await api("/api/admin/controls/notify-test", json("POST", {}));
+    expect(await inbox.json()).toMatchObject({ sent: true, configured: true });
+    const state = await api("/api/admin/controls");
+    expect(await state.json()).toMatchObject({ notifications: [{ kind: "test" }, { kind: "rule_fired", rule_id: rule.id }], notify_configured: true });
+    const audit = await api("/api/admin/audit");
+    expect(await audit.text()).toMatch(/admin\.control\.(rule\.create|rule\.fire|evaluate|notify_test)/);
+  });
+
+  it("keeps record consent off by default and separates owner consent from admin grants", async () => {
+    const owner = createApiClient();
+    await owner("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    const initialConsent = await owner("/api/me/record-consents");
+    expect(await initialConsent.json()).toMatchObject({ items: [
+      { purpose: "full_record", enabled: false, version: 0 },
+      { purpose: "training_contribution", enabled: false, version: 0 },
+    ] });
+    const consent = await owner("/api/me/record-consents", json("PUT", { purpose: "full_record", enabled: true }));
+    expect(await consent.json()).toMatchObject({ purpose: "full_record", enabled: true, version: 1 });
+
+    const superAdmin = createApiClient();
+    await superAdmin("/api/auth/login", json("POST", { name: "admin", password: "admin" }));
+    expect((await superAdmin("/api/admin/users/umember1/record-settings")).status).toBe(403);
+    await superAdmin("/api/me/password", json("POST", { current_password: "admin", new_password: "local-only-password" }));
+    await superAdmin("/api/auth/login", json("POST", { name: "admin", password: "local-only-password" }));
+
+    const settings = await superAdmin("/api/admin/users/umember1/record-settings");
+    expect(await settings.json()).toMatchObject({ owner_id: "umember1", quota: { version: 1, retention_days: 30 } });
+    const updatedQuota = await superAdmin("/api/admin/users/umember1/record-quota", json("PUT", {
+      expected_version: 1, retention_days: 60, limit_bytes: 2 * 1024 ** 3,
+    }));
+    expect(await updatedQuota.json()).toMatchObject({ version: 2, retention_days: 60 });
+    expect((await superAdmin("/api/admin/users/umember1/record-quota", json("PUT", {
+      expected_version: 1, retention_days: 90, limit_bytes: 3 * 1024 ** 3,
+    }))).status).toBe(409);
+    expect((await superAdmin("/api/admin/users/umember1/record-grants", json("PUT", {
+      admin_id: "u1a2b3c4", capability: "view", granted: true,
+    }))).status).toBe(200);
+
+    const administrator = createApiClient();
+    await administrator("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    expect((await administrator("/api/admin/users/umember1/record-settings")).status).toBe(403);
+    expect(await (await administrator("/api/admin/users/umember1/record-access")).json()).toMatchObject({
+      capabilities: ["view"], consents: expect.arrayContaining([expect.objectContaining({ purpose: "full_record", enabled: true, version: 1 })]),
+    });
+    expect(await (await administrator("/api/admin/users/umember1/records?purpose=full_record")).json()).toEqual({ items: [], next_before: "" });
+    const audit = await administrator("/api/admin/audit?action=record");
+    expect(await audit.text()).toMatch(/record\.(consent|quota|grant|access|list)/);
+  });
+
   it("rejects non-admin console reads and shared model writes", async () => {
     await api("/api/auth/login", json("POST", { name: "member", password: "member" }));
     expect((await api("/api/admin/overview")).status).toBe(403);

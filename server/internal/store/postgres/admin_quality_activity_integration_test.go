@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/record"
 )
 
 func TestAdminActivityQueriesAggregateOnlyAllowedMetadata(t *testing.T) {
@@ -114,5 +115,68 @@ VALUES ('audit-actor-id-secret-sentinel','system','auth.login','audit-target-sec
 	}
 	if len(empty.ByDay) != 0 || len(empty.HubOperations) != 0 || len(empty.TaskEvents) != 0 || len(empty.AuditEvents) != 0 {
 		t.Fatalf("empty activity result must use empty collections: %#v", empty)
+	}
+}
+
+func TestAdminQualityCountsOnlyCurrentConsentSamplesAndRiskMetadata(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	installationID := mustID(t, domain.NewClientInstallationID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO client_installations (id,owner_id,display_name,platform,expires_at)
+VALUES ($1,$2,'Quality target','desktop',clock_timestamp()+interval '1 day')`, installationID, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "admin-quality-query", "synthetic fixture"))
+	if err != nil {
+		t.Fatalf("submit fixture task: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	from, to := now.Add(-48*time.Hour), now.Add(time.Second)
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status='failed',updated_at=$2 WHERE id=$1`, created.Task.ID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("set failed task metadata: %v", err)
+	}
+	operationKeys := []string{"quality-operation-0", "quality-operation-1"}
+	for index, status := range []string{"failed", "unknown"} {
+		if _, err := store.pool.Exec(ctx, `INSERT INTO task_hub_operations (
+task_id,owner_id,operation_key,tool_name,target_installation_id,action,task_authorization_version,target_grant_version,lease_version,
+request_hash,result_hash,status,created_at,updated_at)
+VALUES ($1,$2,$3,'morde_hub_files',$4,'files',1,1,1,$5,$6,$7,$8,$8)`,
+			created.Task.ID, owner.ID, operationKeys[index], installationID,
+			hashBytes("quality-request"), hashBytes("quality-result"), status, now.Add(-time.Hour)); err != nil {
+			t.Fatalf("insert Hub risk metadata %s: %v", status, err)
+		}
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO record_consents (owner_id,purpose,enabled,version)
+VALUES ($1,'training_contribution',true,3)`, owner.ID); err != nil {
+		t.Fatalf("insert training consent: %v", err)
+	}
+	for index, value := range []struct {
+		version   int64
+		expiresAt time.Time
+	}{
+		{version: 3, expiresAt: now.Add(24 * time.Hour)},
+		{version: 2, expiresAt: now.Add(24 * time.Hour)},
+		{version: 3, expiresAt: now.Add(-time.Hour)},
+	} {
+		id, err := record.NewRecordID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO record_entries
+(id,owner_id,purpose,item_kind,consent_version,captured_at,created_at,expires_at,payload_bytes,attachment_bytes,attachment_count,state)
+VALUES ($1,$2,'training_contribution','sample',$3,$4,$4,$5,32,0,0,'active')`,
+			id, owner.ID, value.version, now.Add(-time.Hour), value.expiresAt); err != nil {
+			t.Fatalf("insert sample fixture %d: %v", index, err)
+		}
+	}
+
+	quality, err := store.GetAdminQuality(ctx, from, to)
+	if err != nil {
+		t.Fatalf("query admin quality metadata: %v", err)
+	}
+	if quality.SampleCount != 1 || quality.FailedTasks != 1 ||
+		quality.FailedHubOperations != 1 || quality.UnknownHubOperations != 1 {
+		t.Fatalf("quality summary = %#v; want one current-consent sample and each risk status", quality)
 	}
 }

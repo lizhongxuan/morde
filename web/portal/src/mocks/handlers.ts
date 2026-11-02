@@ -23,6 +23,22 @@ type AdminWorkspace = components["schemas"]["AdminWorkspace"];
 type VisibleAdminWorkspace = Omit<Workspace, "state"> & { state: "ready" | "deleting" };
 type ModelAccountBudget = { owner_id: string; configured: boolean; token_limit: number; max_concurrent: number; used_tokens: number; in_flight: number; has_unknown: boolean };
 type PersonalDataQuota = components["schemas"]["AdminPersonalDataQuota"];
+type AdminControlRule = components["schemas"]["AdminControlRule"];
+type AdminControlNotification = components["schemas"]["AdminControlNotification"];
+type RecordCapability = components["schemas"]["RecordCapability"];
+type RecordConsent = components["schemas"]["RecordConsent"];
+type RecordQuota = components["schemas"]["RecordQuota"];
+type RecordAdminGrant = components["schemas"]["RecordAdminGrant"];
+
+const defaultPersonalDataQuota = {
+  used_bytes: 0,
+  reserved_bytes: 0,
+  quota_bytes: 5_368_709_120,
+  max_attachment_bytes: 314_572_800,
+  version: 1,
+  default_quota_bytes: 5_368_709_120,
+  default_max_attachment_bytes: 314_572_800,
+} satisfies PersonalDataQuota;
 
 const defaultHostResources = { cpu_milli: 1000, mem_mib: 2048 };
 const demoUser: User = { id: "u1a2b3c4", name: "demo", role: "admin", status: "approved", must_change_password: false, quota: { hosts: 1, cpu_milli: 4000, mem_mib: 8192 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 }, default_host_resources: defaultHostResources };
@@ -53,6 +69,12 @@ let clients: ClientInstallation[] = [];
 const clientOwners = new Map<string, string>();
 const modelBudgets = new Map<string, ModelAccountBudget>();
 const personalDataQuotas = new Map<string, PersonalDataQuota>();
+const recordConsents = new Map<string, RecordConsent[]>();
+const recordQuotas = new Map<string, RecordQuota>();
+const recordGrants = new Map<string, RecordAdminGrant[]>();
+let adminControlRules: AdminControlRule[] = [];
+let adminControlNotifications: AdminControlNotification[] = [];
+let nextAdminControlRuleId = 1;
 let notificationOwners = new Map<string, string>();
 const workspaceCreateReplays = new Map<string, { request: string; response: Workspace }>();
 const hostCreateReplays = new Map<string, { request: string; response: Host }>();
@@ -235,6 +257,12 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   clientOwners.set(clients[0]!.id, demoUser.id);
   modelBudgets.clear();
   personalDataQuotas.clear();
+  recordConsents.clear();
+  recordQuotas.clear();
+  recordGrants.clear();
+  adminControlRules = [];
+  adminControlNotifications = [];
+  nextAdminControlRuleId = 1;
   notificationOwners = new Map();
   workspaceCreateReplays.clear();
   hostCreateReplays.clear();
@@ -492,6 +520,27 @@ function userWithUsage(user: User) {
 
 function recordMockAudit(actor: User, action: string, target: string, detail: Record<string, unknown>) {
   auditLogs.unshift({ id: Date.now(), at: now(), actor_id: actor.id, actor_kind: "user", action, target, detail, ip: "127.0.0.1" });
+}
+
+function recordConsentState(ownerID: string): RecordConsent[] {
+  const stored = recordConsents.get(ownerID);
+  if (stored) return stored;
+  const initial: RecordConsent[] = [
+    { owner_id: ownerID, purpose: "full_record", enabled: false, version: 0 },
+    { owner_id: ownerID, purpose: "training_contribution", enabled: false, version: 0 },
+  ];
+  recordConsents.set(ownerID, initial);
+  return initial;
+}
+
+function recordQuotaState(ownerID: string): RecordQuota {
+  return recordQuotas.get(ownerID) ?? {
+    owner_id: ownerID, retention_days: 30, limit_bytes: 1_073_741_824, used_bytes: 0, reserved_bytes: 0, version: 1, updated_at: now(),
+  };
+}
+
+function hasControlCharacters(value: string) {
+  return Array.from(value).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
 }
 
 function adminPage(request: Request, defaultLimit = 25) {
@@ -1263,6 +1312,123 @@ export const handlers = [
     const from = new Date(Date.now() - days * 86_400_000).toISOString();
     return json({ days, from, to, summary: { calls: 0, settled_calls: 0, unknown_calls: 0, input_tokens: 0, output_tokens: 0, active_accounts: 0 }, by_day: [], by_model: [] });
   }),
+  http.get("/api/admin/quality", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const values = new URL(request.url).searchParams.getAll("days");
+    const days = Number(values[0] ?? 7);
+    if (values.length > 1 || ![7, 30, 90].includes(days)) return failure("invalid_argument", "统计区间必须为 7、30 或 90 天", 400);
+    return json({ days, available: false, unavailable_reason: "没有启用已单独同意的质量样本数据源。" });
+  }),
+  http.get("/api/admin/activity", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const values = new URL(request.url).searchParams.getAll("days");
+    const days = Number(values[0] ?? 7);
+    if (values.length > 1 || ![7, 30, 90].includes(days)) return failure("invalid_argument", "统计区间必须为 7、30 或 90 天", 400);
+    const to = new Date();
+    const from = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate() + 1 - days));
+    const by_day = Array.from({ length: days }, (_, index) => {
+      const date = new Date(from.getTime() + index * 86_400_000).toISOString().slice(0, 10);
+      return { date, hub_operations: 0, task_events: 0, audit_events: 0 };
+    });
+    return json({ days, from: from.toISOString(), to: to.toISOString(), by_day, hub_operations: [], task_events: [], audit_events: [] });
+  }),
+  http.get("/api/admin/places", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const values = new URL(request.url).searchParams.getAll("days");
+    const days = Number(values[0] ?? 7);
+    if (values.length > 1 || ![7, 30, 90].includes(days)) return failure("invalid_argument", "统计区间必须为 7、30 或 90 天", 400);
+    return json({ days, available: false, unavailable_reason: "没有合规的聚合位置数据源；不会根据 IP 推断地点。" });
+  }),
+  http.get("/api/admin/controls", ({ cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const rules = [...adminControlRules].sort((left, right) => left.threshold - right.threshold || left.id - right.id);
+    return json({
+      rules,
+      accounts_total: users.length,
+      next_threshold: rules.find((rule) => rule.enabled && rule.last_fired_at === null)?.threshold ?? null,
+      notify_configured: true,
+      notifications: adminControlNotifications.slice(0, 20),
+    });
+  }),
+  http.post("/api/admin/controls/rules", async ({ request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const body = await request.json().catch(() => null) as { threshold?: unknown; note?: unknown } | null;
+    const note = typeof body?.note === "string" ? body.note.trim() : "";
+    if (!body || !Number.isSafeInteger(body.threshold) || Number(body.threshold) < 1 ||
+      (body.note !== undefined && typeof body.note !== "string") || Array.from(note).length > 256 || hasControlCharacters(note)) {
+      return failure("invalid_argument", "通知规则无效", 400);
+    }
+    const rule: AdminControlRule = {
+      id: nextAdminControlRuleId++, threshold: Number(body.threshold), enabled: true, note, created_at: now(),
+      last_fired_at: null, fired_accounts: 0, version: 1,
+    };
+    adminControlRules.push(rule);
+    recordMockAudit(actor, "admin.control.rule.create", `rule:${rule.id}`, { threshold: rule.threshold, version: rule.version });
+    return json(rule as unknown as Record<string, unknown>, 201);
+  }),
+  http.put("/api/admin/controls/rules/:ruleId", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const rule = adminControlRules.find((item) => item.id === Number(params.ruleId));
+    if (!rule) return failure("not_found", "通知规则不存在", 404);
+    const body = await request.json().catch(() => null) as { expected_version?: unknown; threshold?: unknown; enabled?: unknown; note?: unknown; rearm?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 1 ||
+      (body.threshold !== undefined && (!Number.isSafeInteger(body.threshold) || Number(body.threshold) < 1)) ||
+      (body.enabled !== undefined && typeof body.enabled !== "boolean") ||
+      (body.note !== undefined && typeof body.note !== "string") ||
+      (body.rearm !== undefined && typeof body.rearm !== "boolean") ||
+      (body.threshold === undefined && body.enabled === undefined && body.note === undefined && body.rearm !== true)) {
+      return failure("invalid_argument", "通知规则更新无效", 400);
+    }
+    if (Number(body.expected_version) !== rule.version) return failure("conflict", "通知规则版本已变化，请刷新后重试", 409);
+    const note = typeof body.note === "string" ? body.note.trim() : rule.note;
+    if (Array.from(note).length > 256 || hasControlCharacters(note)) return failure("invalid_argument", "通知规则备注无效", 400);
+    const before = rule.version;
+    if (body.threshold !== undefined) rule.threshold = Number(body.threshold);
+    if (body.enabled !== undefined) rule.enabled = body.enabled;
+    if (body.note !== undefined) rule.note = note;
+    if (body.rearm) { rule.last_fired_at = null; rule.fired_accounts = 0; }
+    rule.version++;
+    recordMockAudit(actor, "admin.control.rule.update", `rule:${rule.id}`, { previous_version: before, version: rule.version, threshold: rule.threshold, enabled: rule.enabled });
+    return json(rule as unknown as Record<string, unknown>);
+  }),
+  http.delete("/api/admin/controls/rules/:ruleId", ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const rule = adminControlRules.find((item) => item.id === Number(params.ruleId));
+    if (!rule) return failure("not_found", "通知规则不存在", 404);
+    const versions = new URL(request.url).searchParams.getAll("expected_version");
+    if (versions.length !== 1 || !/^[1-9]\d*$/u.test(versions[0]!)) return failure("invalid_argument", "版本号无效", 400);
+    if (Number(versions[0]) !== rule.version) return failure("conflict", "通知规则版本已变化，请刷新后重试", 409);
+    adminControlRules = adminControlRules.filter((item) => item.id !== rule.id);
+    recordMockAudit(actor, "admin.control.rule.delete", `rule:${rule.id}`, { threshold: rule.threshold, version: rule.version });
+    return empty();
+  }),
+  http.post("/api/admin/controls/evaluate", ({ cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const accountsTotal = users.length;
+    const fired = adminControlRules.filter((rule) => rule.enabled && rule.last_fired_at === null && rule.threshold <= accountsTotal);
+    for (const rule of fired) {
+      rule.last_fired_at = now();
+      rule.fired_accounts = accountsTotal;
+      rule.version++;
+      adminControlNotifications.unshift({ kind: "rule_fired", rule_id: rule.id, accounts_total: accountsTotal, created_at: rule.last_fired_at });
+      recordMockAudit(actor, "admin.control.rule.fire", `rule:${rule.id}`, { threshold: rule.threshold, accounts_total: accountsTotal, version: rule.version });
+    }
+    recordMockAudit(actor, "admin.control.evaluate", "rules", { accounts_total: accountsTotal, fired: fired.length });
+    return json({ accounts_total: accountsTotal, fired });
+  }),
+  http.post("/api/admin/controls/notify-test", ({ cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const createdAt = now();
+    adminControlNotifications.unshift({ kind: "test", rule_id: null, accounts_total: users.length, created_at: createdAt });
+    recordMockAudit(actor, "admin.control.notify_test", "local-receiver", { channel: "local_database", accounts_total: users.length });
+    return json({ sent: true, configured: true, created_at: createdAt });
+  }),
   http.get("/api/admin/stats", ({ cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
     const counts = { total: users.length, approved: 0, pending: 0, rejected: 0, disabled: 0 };
@@ -1336,31 +1502,14 @@ export const handlers = [
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
     const ownerID = String(params.userId);
     if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
-    const existing = personalDataQuotas.get(ownerID);
-    return json(existing ?? {
-      used_bytes: 0,
-      reserved_bytes: 0,
-      quota_bytes: 5 * 1024 ** 3,
-      max_attachment_bytes: 300 * 1024 ** 2,
-      version: 1,
-      default_quota_bytes: 5 * 1024 ** 3,
-      default_max_attachment_bytes: 300 * 1024 ** 2,
-    });
+    return json(personalDataQuotas.get(ownerID) ?? defaultPersonalDataQuota);
   }),
   http.patch("/api/admin/users/:userId/personal-data-quota", async ({ params, request, cookies }) => {
     const actor = sessionUser(cookies)!;
     if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
     const ownerID = String(params.userId);
     if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
-    const current = personalDataQuotas.get(ownerID) ?? {
-      used_bytes: 0,
-      reserved_bytes: 0,
-      quota_bytes: 5 * 1024 ** 3,
-      max_attachment_bytes: 300 * 1024 ** 2,
-      version: 1,
-      default_quota_bytes: 5 * 1024 ** 3,
-      default_max_attachment_bytes: 300 * 1024 ** 2,
-    };
+    const current = personalDataQuotas.get(ownerID) ?? defaultPersonalDataQuota;
     const body = await request.json().catch(() => null) as { expected_version?: unknown; quota_bytes?: unknown; max_attachment_bytes?: unknown } | null;
     if (!body || !Number.isSafeInteger(body.expected_version) || !Number.isSafeInteger(body.quota_bytes) || Number(body.quota_bytes) < 1 ||
       !Number.isSafeInteger(body.max_attachment_bytes) || Number(body.max_attachment_bytes) < 1 || Number(body.max_attachment_bytes) > 9007199250546688) {
@@ -1380,6 +1529,142 @@ export const handlers = [
       version: updated.version,
     });
     return json(updated);
+  }),
+  http.get("/api/me/record-consents", ({ cookies }) => {
+    const actor = sessionUser(cookies)!;
+    return json({ items: recordConsentState(actor.id) });
+  }),
+  http.put("/api/me/record-consents", async ({ request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    const body = await request.json().catch(() => null) as { purpose?: unknown; enabled?: unknown } | null;
+    if (!body || Object.keys(body).some((key) => key !== "purpose" && key !== "enabled") ||
+      (body.purpose !== "full_record" && body.purpose !== "training_contribution") || typeof body.enabled !== "boolean") {
+      return failure("invalid_argument", "记录同意请求无效", 400);
+    }
+    const consent = recordConsentState(actor.id).find((item) => item.purpose === body.purpose)!;
+    consent.enabled = body.enabled;
+    consent.version++;
+    consent.updated_at = now();
+    recordMockAudit(actor, "record.consent.update", actor.id, { purpose: consent.purpose, enabled: consent.enabled, version: consent.version });
+    return json(consent as unknown as Record<string, unknown>);
+  }),
+  http.get("/api/admin/users/:userId/record-settings", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (actor.role !== "super_admin") return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    recordMockAudit(actor, "record.settings.read", ownerID, { capability: "settings" });
+    return json({ owner_id: ownerID, consents: recordConsentState(ownerID), quota: recordQuotaState(ownerID), grants: recordGrants.get(ownerID) ?? [] });
+  }),
+  http.get("/api/admin/users/:userId/record-access", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    const grants = (recordGrants.get(ownerID) ?? []).filter((item) => item.admin_id === actor.id && item.granted);
+    recordMockAudit(actor, "record.access.read", ownerID, { capability: "self_grants" });
+    return json({ capabilities: grants.map((item) => item.capability), consents: recordConsentState(ownerID) });
+  }),
+  http.put("/api/admin/users/:userId/record-quota", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (actor.role !== "super_admin") return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    const body = await request.json().catch(() => null) as { expected_version?: unknown; retention_days?: unknown; limit_bytes?: unknown } | null;
+    if (!body || Object.keys(body).some((key) => !["expected_version", "retention_days", "limit_bytes"].includes(key)) ||
+      !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 1 ||
+      !Number.isSafeInteger(body.retention_days) || Number(body.retention_days) < 1 || Number(body.retention_days) > 3650 ||
+      !Number.isSafeInteger(body.limit_bytes) || Number(body.limit_bytes) < 1) {
+      return failure("invalid_argument", "记录额度无效", 400);
+    }
+    const current = recordQuotaState(ownerID);
+    if (Number(body.expected_version) !== current.version) return failure("conflict", "记录额度版本已变化，请刷新后重试", 409);
+    if (Number(body.limit_bytes) < current.used_bytes + current.reserved_bytes) return failure("conflict", "记录额度不能低于已使用和已预留容量", 409);
+    const updated: RecordQuota = { ...current, retention_days: Number(body.retention_days), limit_bytes: Number(body.limit_bytes), version: current.version + 1, updated_at: now() };
+    recordQuotas.set(ownerID, updated);
+    recordMockAudit(actor, "record.quota.update", ownerID, { retention_days: updated.retention_days, limit_bytes: updated.limit_bytes, version: updated.version });
+    return json(updated as unknown as Record<string, unknown>);
+  }),
+  http.put("/api/admin/users/:userId/record-grants", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (actor.role !== "super_admin") return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    const body = await request.json().catch(() => null) as { admin_id?: unknown; capability?: unknown; granted?: unknown } | null;
+    if (!body || Object.keys(body).some((key) => !["admin_id", "capability", "granted"].includes(key)) || typeof body.admin_id !== "string" ||
+      !["view", "attachment", "export", "delete"].includes(String(body.capability)) || typeof body.granted !== "boolean") {
+      return failure("invalid_argument", "记录访问授权无效", 400);
+    }
+    const admin = users.find((user) => user.id === body.admin_id);
+    if (!admin || !isAdmin(admin) || admin.status !== "approved" || admin.id === ownerID) return failure("invalid_argument", "目标账号必须是已通过的其他管理员", 400);
+    const grants = recordGrants.get(ownerID) ?? [];
+    const capability = body.capability as RecordCapability;
+    let grant = grants.find((item) => item.admin_id === admin.id && item.capability === capability);
+    if (grant) {
+      grant.granted = body.granted;
+      grant.granted_by = actor.id;
+      grant.version++;
+      grant.updated_at = now();
+    } else {
+      grant = { owner_id: ownerID, admin_id: admin.id, capability, granted: body.granted, granted_by: actor.id, version: 1, updated_at: now() };
+      grants.push(grant);
+      recordGrants.set(ownerID, grants);
+    }
+    recordMockAudit(actor, "record.grant.update", ownerID, { admin_id: admin.id, capability, granted: grant.granted, version: grant.version });
+    return json(grant as unknown as Record<string, unknown>);
+  }),
+  http.get("/api/admin/users/:userId/records", ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    if (!(recordGrants.get(ownerID) ?? []).some((item) => item.admin_id === actor.id && item.capability === "view" && item.granted)) return failure("forbidden", "没有查看记录的授权", 403);
+    const query = new URL(request.url).searchParams;
+    const purposes = query.getAll("purpose");
+    const limits = query.getAll("limit");
+    const beforeIDs = query.getAll("before_id");
+    const limit = Number(limits[0] ?? 50);
+    if (purposes.length > 1 || (purposes.length === 1 && !["full_record", "training_contribution"].includes(purposes[0]!)) ||
+      limits.length > 1 || !Number.isInteger(limit) || limit < 1 || limit > 100 || beforeIDs.length > 1 ||
+      (beforeIDs[0] && !/^r[a-zA-Z0-9]{6,63}$/u.test(beforeIDs[0]))) return failure("invalid_argument", "记录分页参数无效", 400);
+    recordMockAudit(actor, "record.list", ownerID, { purpose: purposes[0] ?? "all", limit });
+    return json({ items: [], next_before: "" });
+  }),
+  http.get("/api/admin/users/:userId/records/:recordId/attachments", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    if (!(recordGrants.get(ownerID) ?? []).some((item) => item.admin_id === actor.id && item.capability === "attachment" && item.granted)) return failure("forbidden", "没有查看附件的授权", 403);
+    return json({ items: [] });
+  }),
+  http.get("/api/admin/users/:userId/records/:recordId/attachments/:attachmentId", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!(recordGrants.get(ownerID) ?? []).some((item) => item.admin_id === actor.id && item.capability === "attachment" && item.granted)) return failure("forbidden", "没有查看附件的授权", 403);
+    return failure("not_found", "附件不存在", 404);
+  }),
+  http.get("/api/admin/users/:userId/records/:recordId/export", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!(recordGrants.get(ownerID) ?? []).some((item) => item.admin_id === actor.id && item.capability === "export" && item.granted)) return failure("forbidden", "没有导出记录的授权", 403);
+    return failure("not_found", "记录不存在", 404);
+  }),
+  http.get("/api/admin/users/:userId/records/:recordId", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!(recordGrants.get(ownerID) ?? []).some((item) => item.admin_id === actor.id && item.capability === "view" && item.granted)) return failure("forbidden", "没有查看记录的授权", 403);
+    return failure("not_found", "记录不存在", 404);
+  }),
+  http.delete("/api/admin/users/:userId/records/:recordId", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!(recordGrants.get(ownerID) ?? []).some((item) => item.admin_id === actor.id && item.capability === "delete" && item.granted)) return failure("forbidden", "没有删除记录的授权", 403);
+    return failure("not_found", "记录不存在", 404);
   }),
   http.get("/api/admin/model-usage/unknown", ({ cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);

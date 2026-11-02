@@ -299,6 +299,26 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize admin console: %w", err)
 	}
+	adminControls, err := app.NewAdminControlsService(store)
+	if err != nil {
+		return fmt.Errorf("initialize admin controls: %w", err)
+	}
+	recordConsents, err := app.NewRecordConsentService(store)
+	if err != nil {
+		return fmt.Errorf("initialize record consents: %w", err)
+	}
+	recordAccess, err := app.NewRecordAccessService(store)
+	if err != nil {
+		return fmt.Errorf("initialize record access: %w", err)
+	}
+	recordCapture, err := app.NewRecordCaptureService(store)
+	if err != nil {
+		return fmt.Errorf("initialize record capture: %w", err)
+	}
+	adminQualityActivity, err := app.NewAdminQualityActivityService(store)
+	if err != nil {
+		return fmt.Errorf("initialize admin quality and activity: %w", err)
+	}
 	aioClient := aio.New(nil)
 	volumes, err := newVolumeDeleter(cfg.Storage)
 	if err != nil {
@@ -436,6 +456,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize task service: %w", err)
 	}
+	schedules, err := app.NewScheduleService(store, credentials, modelConnections)
+	if err != nil {
+		return fmt.Errorf("initialize schedule service: %w", err)
+	}
 	conversations, err := app.NewConversationService(store, credentials)
 	if err != nil {
 		return fmt.Errorf("initialize conversation service: %w", err)
@@ -493,6 +517,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	goalService, err := app.NewGoalService(personalDataService, store)
+	if err != nil {
+		return fmt.Errorf("initialize goal service: %w", err)
+	}
 	personalSyncService, err := app.NewPersonalSyncService(store, dataKey)
 	if err != nil {
 		return err
@@ -524,6 +552,13 @@ func serve(ctx context.Context, configPath string) error {
 	workerSuffix, err := domain.NewOperationID()
 	if err != nil {
 		return fmt.Errorf("generate task worker identity: %w", err)
+	}
+	recordWorker, err := worker.NewRecordCaptureWorker(worker.RecordCaptureWorkerOptions{
+		Capture: recordCapture, Access: recordAccess, WorkerID: workerSuffix + "-record",
+		PollInterval: time.Second, BatchSize: 50, Logger: logger,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize record worker: %w", err)
 	}
 	var executionControlService *app.ExecutionControlService
 	var taskWorker *worker.TaskWorker
@@ -577,8 +612,11 @@ func serve(ctx context.Context, configPath string) error {
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
+		Goals: goalService, Schedules: schedules,
 		PersonalDataQuota: personalDataQuotaService, PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
-		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
+		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
+		RecordConsents: recordConsents, RecordAccess: recordAccess,
+		AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
 		AdminAudit: auditService,
 		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
@@ -615,6 +653,12 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	scheduleWorker, err := worker.NewScheduleWorker(worker.ScheduleWorkerOptions{
+		Service: schedules, PollInterval: time.Second, BatchSize: 100, Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
 	if workspaceSyncNodeProvisioner != nil {
 		if err := workspaceSyncNodeProvisioner.ReconcileWorkspaceSyncNodesOnStartup(ctx); err != nil {
 			logger.Warn("Workspace sync startup reconciliation incomplete; affected relay gates remain closed", zap.Error(err))
@@ -627,7 +671,7 @@ func serve(ctx context.Context, configPath string) error {
 	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
 	defer stopPersonalCleanup()
 	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, logger)
-	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, recordWorker, scheduleWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
 func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService, logger *zap.Logger) {
@@ -1140,7 +1184,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -1165,6 +1209,10 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	go func() { taskStopWorkerDone <- taskStopWorker.Run(workerCtx) }()
 	notificationWorkerDone := make(chan error, 1)
 	go func() { notificationWorkerDone <- notificationWorker.Run(workerCtx) }()
+	recordWorkerDone := make(chan error, 1)
+	go func() { recordWorkerDone <- recordWorker.Run(workerCtx) }()
+	scheduleWorkerDone := make(chan error, 1)
+	go func() { scheduleWorkerDone <- scheduleWorker.Run(workerCtx) }()
 	var taskWorkerDone chan error
 	var cancelTaskWorker context.CancelFunc
 	if taskWorker != nil {
@@ -1198,6 +1246,12 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			runErr = errors.New("cloud task worker stopped unexpectedly")
 		} else {
 			runErr = fmt.Errorf("cloud task worker stopped unexpectedly: %w", err)
+		}
+	case err := <-scheduleWorkerDone:
+		if err == nil {
+			runErr = errors.New("schedule worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("schedule worker stopped unexpectedly: %w", err)
 		}
 	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -1240,6 +1294,12 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	}
 	if err := <-notificationWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop notification worker: %w", err)
+	}
+	if err := <-recordWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+		runErr = fmt.Errorf("stop record worker: %w", err)
+	}
+	if err := <-scheduleWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+		runErr = fmt.Errorf("stop schedule worker: %w", err)
 	}
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := runtime.FlushActivity(flushCtx); err != nil {

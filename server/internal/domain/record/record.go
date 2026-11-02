@@ -1,7 +1,12 @@
 package record
 
 import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"math/big"
 	"mime"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -15,6 +20,8 @@ const (
 	ItemTurn   ItemKind = "turn"
 	ItemSample ItemKind = "sample"
 )
+
+var secretContentPattern = regexp.MustCompile(`(?i)(\{\{\s*vault:|\bvault(?:\s*[:=]|://)|password\s*[:=]\s*\S+|passwd\s*[:=]\s*\S+|token\s*[:=]\s*\S+|api[_-]?key\s*[:=]\s*\S+|secret\s*[:=]\s*\S+|authorization\s*[:=]\s*\S+|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer[[:space:]]+[A-Za-z0-9._~+/-]{12,}|\bsk-(proj-)?[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[baprs]-[A-Za-z0-9-]{16,}|\bAKIA[0-9A-Z]{16}\b|\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b)`)
 
 func (kind ItemKind) Valid() bool { return kind == ItemTurn || kind == ItemSample }
 
@@ -39,9 +46,9 @@ type AttachmentInput struct {
 }
 
 type CaptureInput struct {
-	Purpose    Purpose
-	Kind       ItemKind
-	Payload    []byte
+	Purpose     Purpose
+	Kind        ItemKind
+	Payload     []byte
 	Attachments []AttachmentInput
 }
 
@@ -56,8 +63,15 @@ func ValidateCapture(value CaptureInput) error {
 	if !value.Purpose.Valid() || !value.Kind.Valid() {
 		return domain.InvalidArgument("record_capture", "record purpose or item kind is invalid")
 	}
+	if (value.Purpose == PurposeFullRecord && value.Kind != ItemTurn) ||
+		(value.Purpose == PurposeTrainingContribution && value.Kind != ItemSample) {
+		return domain.InvalidArgument("record_capture", "record item kind does not match its purpose")
+	}
 	if len(value.Payload) == 0 || int64(len(value.Payload)) > MaxCapturePayloadBytes {
 		return domain.NewError(domain.CodeRequestTooLarge, "record payload is empty or exceeds the allowed size")
+	}
+	if ContainsSensitiveContent(value.Payload) {
+		return domain.InvalidArgument("record_capture", "record content contains secret-like data")
 	}
 	if len(value.Attachments) > MaxCaptureAttachments {
 		return domain.NewError(domain.CodeRequestTooLarge, "record attachment count exceeds the allowed limit")
@@ -71,6 +85,10 @@ func ValidateCapture(value CaptureInput) error {
 		if size < 1 || size > MaxCaptureAttachmentBytes || total > MaxCaptureTotalBytes-size {
 			return domain.NewError(domain.CodeRequestTooLarge, "record attachment size exceeds the allowed limit")
 		}
+		// shortcut: scan raw bytes only; add format-aware decoding before accepting binary capture types with encoded secrets.
+		if ContainsSensitiveContent(attachment.Content) {
+			return domain.InvalidArgument("record_attachment", "attachment contains secret-like data")
+		}
 		total += size
 	}
 	if total > MaxCaptureTotalBytes {
@@ -79,8 +97,51 @@ func ValidateCapture(value CaptureInput) error {
 	return nil
 }
 
+// ContainsSensitiveContent blocks common credential fields, formats, and Vault placeholders.
+func ContainsSensitiveContent(content []byte) bool {
+	if secretContentPattern.Match(content) {
+		return true
+	}
+	var value any
+	return json.Unmarshal(content, &value) == nil && recordJSONContainsSensitiveValue(value)
+}
+
+func recordJSONContainsSensitiveValue(value any) bool {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, item := range value {
+			name := strings.Map(func(r rune) rune {
+				if r >= 'A' && r <= 'Z' {
+					r += 'a' - 'A'
+				}
+				if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+					return r
+				}
+				return -1
+			}, key)
+			if strings.Contains(name, "secret") || strings.Contains(name, "password") || strings.Contains(name, "passwd") ||
+				strings.Contains(name, "token") || strings.Contains(name, "credential") || strings.Contains(name, "authorization") ||
+				strings.Contains(name, "apikey") || strings.Contains(name, "privatekey") || strings.Contains(name, "accesskey") || strings.Contains(name, "vault") {
+				return true
+			}
+			if recordJSONContainsSensitiveValue(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range value {
+			if recordJSONContainsSensitiveValue(item) {
+				return true
+			}
+		}
+	case string:
+		return secretContentPattern.MatchString(value)
+	}
+	return false
+}
+
 func validFileName(value string) bool {
-	return value != "" && len(value) <= 255 && utf8.ValidString(value) && strings.TrimSpace(value) == value &&
+	return value != "" && value != "." && value != ".." && len(value) <= 255 && utf8.ValidString(value) && strings.TrimSpace(value) == value &&
 		!strings.ContainsAny(value, "/\\\x00") && strings.IndexFunc(value, isControl) < 0
 }
 
@@ -130,7 +191,7 @@ type RecordMetadata struct {
 	OwnerID         string
 	Purpose         Purpose
 	Kind            ItemKind
-	ConsentVersion int64
+	ConsentVersion  int64
 	CreatedAt       time.Time
 	ExpiresAt       time.Time
 	PayloadBytes    int64
@@ -200,10 +261,29 @@ type DeleteTombstone struct {
 	UpdatedAt   time.Time
 }
 
-func ValidRecordID(id string) bool { return validRecordID(id, 'v') }
-func ValidQueueItemID(id string) bool { return validRecordID(id, 'j') }
+func ValidRecordID(id string) bool     { return validRecordID(id, 'v') }
+func ValidQueueItemID(id string) bool  { return validRecordID(id, 'j') }
 func ValidAttachmentID(id string) bool { return validRecordID(id, 'g') }
-func ValidTombstoneID(id string) bool { return validRecordID(id, 'l') }
+func ValidTombstoneID(id string) bool  { return validRecordID(id, 'l') }
+
+func NewRecordID() (string, error)     { return newRecordID('v') }
+func NewQueueItemID() (string, error)  { return newRecordID('j') }
+func NewAttachmentID() (string, error) { return newRecordID('g') }
+func NewTombstoneID() (string, error)  { return newRecordID('l') }
+
+func newRecordID(prefix byte) (string, error) {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	value := [8]byte{prefix}
+	max := big.NewInt(int64(len(alphabet)))
+	for index := 1; index < len(value); index++ {
+		number, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", fmt.Errorf("generate record ID: %w", err)
+		}
+		value[index] = alphabet[number.Int64()]
+	}
+	return string(value[:]), nil
+}
 
 func validRecordID(id string, prefix byte) bool {
 	if len(id) != 8 || id[0] != prefix {

@@ -1,13 +1,15 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
-	"morde/server/internal/domain/personal"
 )
 
 func TestPostgresPersonalHistoryImportIsAtomicIdempotentAndTaskFree(t *testing.T) {
@@ -24,49 +26,30 @@ func TestPostgresPersonalHistoryImportIsAtomicIdempotentAndTaskFree(t *testing.T
 	owner := createTestUser(t, store, 2, 2000, 4096)
 	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
 	createPersonalLibraryItemForAttachmentTest(t, store, principal, "library-item_1")
-	attachmentID, err := personal.NewPersonalAttachmentID()
+	content := []byte("history import attachment")
+	digest := sha256.Sum256(content)
+	service, err := app.NewPersonalAttachmentService(store, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := store.GetPersonalObject(ctx, principal, personal.ObjectTypeLibraryItem, "library-item_1")
+	createdUpload, err := service.CreatePersonalAttachmentUpload(ctx, principal, app.PersonalAttachmentUploadCommand{
+		IdempotencyKey: "history-attachment-create", ObjectID: "library-item_1", BaseRevision: 1,
+		SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), MediaType: "application/octet-stream",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var itemBody map[string]json.RawMessage
-	if err := json.Unmarshal(item.Body, &itemBody); err != nil {
+	if _, err := service.PutPersonalAttachmentChunk(ctx, principal, app.PersonalAttachmentChunkCommand{
+		UploadID: createdUpload.UploadID, Sequence: 0, SizeBytes: int64(len(content)),
+		SHA256: hex.EncodeToString(digest[:]), Body: bytes.NewReader(content),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	itemBody["attachment_id"], _ = json.Marshal(attachmentID)
-	itemBody["size_bytes"], _ = json.Marshal(int64(0))
-	itemBody["mime"], _ = json.Marshal("application/octet-stream")
-	updatedItemBody, err := json.Marshal(itemBody)
+	receipt, err := service.CommitPersonalAttachment(ctx, principal, createdUpload.UploadID, "history-attachment-commit")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutation := personal.Mutation{
-		OwnerID: owner.ID, MutationID: "library-history-attachment-001", ObjectType: personal.ObjectTypeLibraryItem,
-		ObjectID: "library-item_1", BaseRevision: item.Revision, Body: updatedItemBody,
-	}
-	mutation.RequestHash, err = personal.HashMutationContent(mutation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.ApplyPersonalMutation(ctx, principal, mutation); err != nil {
-		t.Fatal(err)
-	}
-	attachmentUpload := newPersonalAttachmentUploadForTest(t, owner.ID, "library-item_1", item.Revision+1, nil)
-	createdUpload, err := store.CreatePersonalAttachmentUpload(ctx, principal, attachmentUpload, "history-attachment-create")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.ActivatePersonalAttachmentUpload(ctx, principal, createdUpload.UploadID, "history-reservation-001"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE personal_attachment_uploads SET state='committed',attachment_id=$3,
-commit_idempotency_key='history-attachment-commit',result_revision=$4,change_sequence=$4
-WHERE owner_id=$1 AND upload_id=$2`, owner.ID, createdUpload.UploadID, attachmentID, item.Revision+1); err != nil {
-		t.Fatal(err)
-	}
+	attachmentID := receipt.AttachmentID
 	input := conversation.HistoryImport{
 		SourceID: "test-export", DeviceAccountID: "device-account-1", SourceConversationID: "source-chat-1", Title: "Imported",
 		Messages: []conversation.HistoryMessage{

@@ -15,8 +15,8 @@ const user: components['schemas']['AdminUser'] = {
 };
 
 const initialQuota: components['schemas']['AdminPersonalDataQuota'] = {
-  used_bytes: 1024, reserved_bytes: 2048, quota_bytes: 5 * 1024 ** 3, max_attachment_bytes: 300 * 1024 ** 2,
-  version: 3, default_quota_bytes: 5 * 1024 ** 3, default_max_attachment_bytes: 300 * 1024 ** 2,
+  used_bytes: 1024, reserved_bytes: 2048, quota_bytes: 5_368_709_120, max_attachment_bytes: 314_572_800,
+  version: 3, default_quota_bytes: 5_368_709_120, default_max_attachment_bytes: 314_572_800,
 };
 
 function renderPage() {
@@ -46,9 +46,9 @@ describe('admin user personal-data quota', () => {
 
     expect(await screen.findByRole('heading', { name: 'alice' })).toBeInTheDocument();
     expect(await screen.findByText('个人数据额度')).toBeInTheDocument();
-    expect(screen.getByText('已用').closest('article')).toHaveTextContent('1.0 KiB');
-    expect(screen.getByText('预留').closest('article')).toHaveTextContent('2.0 KiB');
-    expect(screen.getByText('默认额度').closest('article')).toHaveTextContent('5.0 GiB');
+    expect(screen.getByText('已用').closest('article')).toHaveTextContent('1,024 B');
+    expect(screen.getByText('预留').closest('article')).toHaveTextContent('2,048 B');
+    expect(screen.getByText('默认额度').closest('article')).toHaveTextContent('5,368,709,120 B');
 
     await input.clear(screen.getByLabelText('个人数据总额度（字节）'));
     await input.type(screen.getByLabelText('个人数据总额度（字节）'), String(updated.quota_bytes));

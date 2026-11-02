@@ -77,7 +77,7 @@ func (h *api) getWorkspaceManifest(service WorkspaceSyncService) gin.HandlerFunc
 			return
 		}
 
-		revision, err := optionalWorkspaceSyncInt(c, "revision", 0, 1, int64(^uint64(0)>>1))
+		revision, err := optionalWorkspaceSyncInt(c, "revision", 0, 0, int64(^uint64(0)>>1))
 		if err != nil {
 			writeError(c, err)
 			return

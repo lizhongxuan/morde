@@ -98,6 +98,16 @@ button, a, input, textarea { accent-color: var(--primary); }
 
 .tab-panel-files { overflow: auto; }
 .tab-panel-files > .file-manager { min-height: 100%; padding: 18px; }
+.tab-panel-workspace { overflow: auto; }
+.workspace-browser { min-height: 100%; padding: 18px; }
+.workspace-browser-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: #fbfcfe; }
+.workspace-browser-toolbar .field-label { margin: 0; }
+.workspace-browser-toolbar select { min-width: 180px; min-height: 38px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }
+.workspace-sync-status { margin-bottom: 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.workspace-sync-status p { margin: 0 0 6px; color: var(--muted); font-size: .9rem; }
+.workspace-sync-status p:last-of-type { margin-bottom: 0; }
+.workspace-sync-status ul { margin: 8px 0 0; padding-left: 22px; color: var(--danger); overflow-wrap: anywhere; }
+.workspace-browser-path { color: var(--muted); font-size: .88rem; }
 .file-manager { height: 100%; overflow: auto; padding: 4px; }
 .file-toolbar, .file-actions, .inline-form, .path-form { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; }
 .file-toolbar, .file-actions { margin-bottom: 12px; }
@@ -148,4 +158,5 @@ button, a, input, textarea { accent-color: var(--primary); }
   .host-name { max-width: 100%; }
   .file-layout { grid-template-columns: 1fr; }
   .file-toolbar, .file-actions { align-items: stretch; flex-direction: column; }
+  .workspace-browser-toolbar { align-items: stretch; flex-direction: column; }
 }

@@ -215,6 +215,10 @@ func TestWorkspaceSyncManifestAndChangesForwardPrincipalAndBounds(t *testing.T) 
 		service.manifestRevision != 4 || service.manifestPrefix != "src" || service.manifestCursor != "abc" || service.manifestLimit != 99 {
 		t.Fatalf("manifest call = %#v", service)
 	}
+	initialManifest := workspaceSyncRequest(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/manifest?revision=0", nil, "", "Bearer "+apiKeyCredential(), nil)
+	if initialManifest.Code != http.StatusOK || service.manifestRevision != 0 {
+		t.Fatalf("initial manifest revision status = %d, revision = %d, body = %s", initialManifest.Code, service.manifestRevision, initialManifest.Body)
+	}
 
 	changes := workspaceSyncRequest(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/changes?after=cursor-1&wait_seconds=3&limit=17", nil, "", "Bearer "+apiKeyCredential(), nil)
 	if changes.Code != http.StatusOK {

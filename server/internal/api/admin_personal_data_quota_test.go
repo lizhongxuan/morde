@@ -94,8 +94,9 @@ func TestAdminPersonalDataQuotaAPIReadsUpdatesAuditsAndRejectsUnauthorized(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	getCallsBeforeDenied := quotaService.getCalls
 	denied := requestWithCookie(userRouter, http.MethodGet, "/api/admin/users/"+testUserID+"/personal-data-quota", cookie, "")
-	if denied.Code != http.StatusForbidden || quotaService.getCalls != 1 {
+	if denied.Code != http.StatusForbidden || quotaService.getCalls != getCallsBeforeDenied {
 		t.Fatalf("non-admin quota read = %d %s calls=%d", denied.Code, denied.Body, quotaService.getCalls)
 	}
 }

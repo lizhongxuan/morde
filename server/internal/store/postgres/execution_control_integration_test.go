@@ -70,6 +70,11 @@ WHERE id=$1`, runningTask.Task.ID); err != nil {
 	if scheduleStatus != string(schedule.StatusDisabled) || scheduleVersion != scheduled.Version+1 || nextKey != "" || nextCheck.Valid {
 		t.Fatalf("schedule after stop-all = %s version %d cursor %q check %#v", scheduleStatus, scheduleVersion, nextKey, nextCheck)
 	}
+	var changeSequence int64
+	if err := store.pool.QueryRow(ctx, `SELECT last_sequence FROM account_change_counters WHERE owner_id=$1`, owner.ID).Scan(&changeSequence); err != nil {
+		t.Fatal(err)
+	}
+	assertScheduleSyncRevision(t, store, owner.ID, scheduled.ID, scheduleVersion, changeSequence)
 
 	for _, id := range []string{queuedTask.Task.ID, runningTask.Task.ID} {
 		var status string

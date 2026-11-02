@@ -10,12 +10,15 @@ import (
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/schedule"
 )
 
 const (
 	ObjectTypeMemory           = "memory"
 	ObjectTypeSoul             = "soul"
 	ObjectTypeDiary            = "diary"
+	ObjectTypeGoal             = "goal"
+	ObjectTypeSchedule         = "schedule"
 	ObjectTypeFeedPost         = "feed_post"
 	ObjectTypeFeedPreferences  = "feed_preferences"
 	ObjectTypeIdeaMark         = "idea_mark"
@@ -29,6 +32,8 @@ var personalSyncObjectTypes = [...]string{
 	ObjectTypeMemory,
 	ObjectTypeSoul,
 	ObjectTypeDiary,
+	ObjectTypeGoal,
+	ObjectTypeSchedule,
 	ObjectTypeFeedPost,
 	ObjectTypeFeedPreferences,
 	ObjectTypeIdeaMark,
@@ -46,7 +51,7 @@ func PersonalSyncObjectTypes() []string {
 // IsPersonalSyncObjectType reports whether the type is included in personal sync.
 func IsPersonalSyncObjectType(objectType string) bool {
 	switch objectType {
-	case ObjectTypeProfile, ObjectTypeMemory, ObjectTypeSoul, ObjectTypeDiary,
+	case ObjectTypeProfile, ObjectTypeMemory, ObjectTypeSoul, ObjectTypeDiary, ObjectTypeGoal, ObjectTypeSchedule,
 		ObjectTypeFeedPost, ObjectTypeFeedPreferences, ObjectTypeIdeaMark,
 		ObjectTypeLibraryItem, ObjectTypeSkillSetting, ObjectTypeConnectorSetting:
 		return true
@@ -72,6 +77,9 @@ func ValidateObjectIdentifier(objectType, objectID string) error {
 			return domain.InvalidArgument("object_id", "profile object id is invalid")
 		}
 		return nil
+	}
+	if objectType == ObjectTypeSchedule && !schedule.ValidID(objectID) {
+		return domain.InvalidArgument("object_id", "schedule id is invalid")
 	}
 
 	valid := true
@@ -102,6 +110,14 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 	}
 	if !utf8.Valid(body) {
 		return invalidPersonalBody()
+	}
+	if objectType == ObjectTypeSchedule {
+		var value schedule.SyncDefinition
+		if !decodePersonalObject(body, &value, "status", "host_id", "model_id", "objective", "timing", "budget", "misfire_policy", "notification_events", "observation") ||
+			schedule.ValidateSyncDefinition(objectID, value) != nil {
+			return invalidPersonalBody()
+		}
+		return nil
 	}
 	if objectType == ObjectTypeProfile {
 		if !decodePersonalObject(body, &profileBody{}, "name", "avatar", "emoji", "color", "description", "style") {
@@ -142,6 +158,47 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 		}
 		if !decodePersonalObject(body, &value, "date", "content") || !validDate(value.Date) || !validText(value.Content, 1, 65536) {
 			return invalidPersonalBody()
+		}
+	case ObjectTypeGoal:
+		var value struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			Status      string `json:"status"`
+			Steps       []struct {
+				ID     string `json:"id"`
+				Title  string `json:"title"`
+				Status string `json:"status"`
+				Note   string `json:"note"`
+			} `json:"steps"`
+			RelatedMaterialIDs []string `json:"related_material_ids"`
+		}
+		if !decodePersonalObject(body, &value, "title", "description", "status", "steps", "related_material_ids") ||
+			!validText(value.Title, 1, 200) || strings.TrimSpace(value.Title) != value.Title ||
+			runeLength(value.Description) > 4096 || (value.Status != "active" && value.Status != "paused" && value.Status != "done" && value.Status != "cancelled") ||
+			value.Steps == nil || len(value.Steps) > 100 || len(value.RelatedMaterialIDs) > 100 {
+			return invalidPersonalBody()
+		}
+		stepIDs := make(map[string]struct{}, len(value.Steps))
+		for _, step := range value.Steps {
+			if !validOpaqueID(step.ID) || !validText(step.Title, 1, 200) || strings.TrimSpace(step.Title) != step.Title ||
+				runeLength(step.Note) > 2000 ||
+				(step.Status != "pending" && step.Status != "in_progress" && step.Status != "done" && step.Status != "blocked" && step.Status != "skipped") {
+				return invalidPersonalBody()
+			}
+			if _, exists := stepIDs[step.ID]; exists {
+				return invalidPersonalBody()
+			}
+			stepIDs[step.ID] = struct{}{}
+		}
+		materialIDs := make(map[string]struct{}, len(value.RelatedMaterialIDs))
+		for _, materialID := range value.RelatedMaterialIDs {
+			if !validOpaqueID(materialID) {
+				return invalidPersonalBody()
+			}
+			if _, exists := materialIDs[materialID]; exists {
+				return invalidPersonalBody()
+			}
+			materialIDs[materialID] = struct{}{}
 		}
 	case ObjectTypeFeedPost:
 		var value struct {

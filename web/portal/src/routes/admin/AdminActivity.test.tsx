@@ -16,12 +16,15 @@ const activityData: ActivityData = {
     { date: '2026-10-28', hub_operations: 2, task_events: 1, audit_events: 1 },
   ],
   hub_operations: [{ action: 'files', status: 'succeeded', count: 6 }],
-  task_events: [{ type: 'created', count: 4 }],
+  task_events: [{ type: 'task.status', count: 4 }],
   audit_events: [{ action: 'admin.user_update', count: 3 }],
 };
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  vi.spyOn(portalApi, 'adminPlaces').mockImplementation(async (days) => ({
+    days: days ?? 7, available: false, unavailable_reason: '没有合规的聚合位置数据源。',
+  }));
   return render(<QueryClientProvider client={client}><AdminActivity /></QueryClientProvider>);
 }
 
@@ -33,14 +36,16 @@ describe('admin activity', () => {
     renderPage();
 
     expect(await screen.findByRole('heading', { name: '活动' })).toBeInTheDocument();
+    expect(await screen.findByRole('cell', { name: 'files' })).toBeInTheDocument();
     expect(screen.getByText('统计区间：2026-10-27 至 2026-11-02')).toBeInTheDocument();
     const facts = screen.getByRole('heading', { name: '活动概览' }).closest('section')!.querySelector<HTMLElement>('.admin-detail-facts')!;
     expect(within(facts).getByText('Hub 操作').closest('article')).toHaveTextContent('6');
     expect(within(facts).getByText('Task 事件').closest('article')).toHaveTextContent('4');
     expect(within(facts).getByText('审计事件').closest('article')).toHaveTextContent('3');
     expect(screen.getByRole('cell', { name: 'files' }).closest('tr')).toHaveTextContent('succeeded');
-    expect(screen.getByRole('cell', { name: 'created' }).closest('tr')).toHaveTextContent('4');
+    expect(screen.getByRole('cell', { name: 'task.status' }).closest('tr')).toHaveTextContent('4');
     expect(screen.getByRole('cell', { name: 'admin.user_update' }).closest('tr')).toHaveTextContent('3');
+    expect(await screen.findByText('没有合规的聚合位置数据源。')).toBeInTheDocument();
     expect(screen.queryByText(/user_id|installation_id|address|hash|secret/i)).not.toBeInTheDocument();
     expect(request).toHaveBeenCalledWith(7);
   });
@@ -48,7 +53,7 @@ describe('admin activity', () => {
   it('uses the selected period and shows empty states for absent aggregates', async () => {
     const user = userEvent.setup();
     const request = vi.spyOn(portalApi, 'adminActivity').mockImplementation(async (days) => ({
-      ...activityData, days, from: '2026-10-04', to: '2026-11-02', by_day: [], hub_operations: [], task_events: [], audit_events: [],
+      ...activityData, days: days ?? 7, from: '2026-10-04', to: '2026-11-02', by_day: [], hub_operations: [], task_events: [], audit_events: [],
     }));
     renderPage();
 

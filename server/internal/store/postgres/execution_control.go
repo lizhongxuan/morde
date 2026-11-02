@@ -192,10 +192,34 @@ func (s *Store) setExecutionControl(ctx context.Context, record app.IdempotencyR
 }
 
 func disableOwnerSchedules(ctx context.Context, tx pgx.Tx, ownerID string) error {
-	if _, err := tx.Exec(ctx, `UPDATE schedules SET status='disabled',version=version+1,
+	rows, err := tx.Query(ctx, `UPDATE schedules SET status='disabled',version=version+1,
 next_occurrence_key='',next_run_at=NULL,next_check_at=NULL,updated_at=clock_timestamp()
-WHERE owner_id=$1 AND status='enabled'`, ownerID); err != nil {
+WHERE owner_id=$1 AND status='enabled' RETURNING id,version`, ownerID)
+	if err != nil {
 		return fmt.Errorf("disable owner schedules: %w", err)
+	}
+	type changedSchedule struct {
+		id      string
+		version int64
+	}
+	changed := make([]changedSchedule, 0)
+	for rows.Next() {
+		var value changedSchedule
+		if err := rows.Scan(&value.id, &value.version); err != nil {
+			rows.Close()
+			return fmt.Errorf("read disabled owner schedule: %w", err)
+		}
+		changed = append(changed, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate disabled owner schedules: %w", err)
+	}
+	rows.Close()
+	for _, value := range changed {
+		if err := recordScheduleDefinitionChange(ctx, tx, ownerID, value.id, value.version); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -10,12 +10,14 @@ import {
 import { ApiError } from '../api/client';
 import FileManager from '../components/FileManager';
 import TopBar from '../components/TopBar';
+import WorkspaceBrowser from '../components/WorkspaceBrowser';
 
-type Tab = 'browser' | 'terminal' | 'files' | 'vscode';
+type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
 const primaryTabs: { id: Tab; label: string }[] = [
   { id: 'browser', label: '桌面' },
   { id: 'terminal', label: '终端' },
-  { id: 'files', label: '文件' },
+  { id: 'workspace', label: 'Workspace' },
+  { id: 'files', label: '主机文件' },
   { id: 'vscode', label: 'VS Code' },
 ];
 
@@ -61,6 +63,7 @@ export default function Workbench() {
   const browserConnectedRef = useRef(false);
   const controlRequestRef = useRef<GatewayControlRequest | null>(null);
   const terminalRequestRef = useRef(false);
+  const terminalReplacementRef = useRef(false);
 
   const applyControl = useCallback((value: GatewayControl) => {
     setControl(value);
@@ -130,7 +133,7 @@ export default function Workbench() {
   const terminalAvailable = !controlLoading && !controlError && !controlActionPending && control?.control_state === 'user';
 
   useEffect(() => {
-    if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalRequestRef.current) return;
+    if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalRequestRef.current || terminalReplacementRef.current) return;
     let current = true;
     terminalRequestRef.current = true;
     setTerminalRequestPending(true);
@@ -199,6 +202,7 @@ export default function Workbench() {
 
   async function createNewTerminalSession() {
     if (terminalRequestRef.current || !window.confirm('新终端不会停止原终端中的命令。请先保存工作；原会话可能继续运行并占用资源。确定新建吗？')) return;
+    terminalReplacementRef.current = true;
     terminalRequestRef.current = true;
     setTerminalSession(null);
     setTerminalError('');
@@ -215,6 +219,7 @@ export default function Workbench() {
     } catch (error) {
       setTerminalError(messageOf(error));
     } finally {
+      terminalReplacementRef.current = false;
       terminalRequestRef.current = false;
       setTerminalRequestPending(false);
     }
@@ -571,6 +576,11 @@ export default function Workbench() {
                   : controlError
                     ? <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
                     : <p className="panel-loading" role="status">请先接管电脑后使用文件。</p>}
+              </div>
+            )}
+            {loaded.has('workspace') && (
+              <div className="tab-panel tab-panel-workspace" aria-hidden={visibleActive !== 'workspace'} inert={visibleActive !== 'workspace'}>
+                <WorkspaceBrowser host={host} active={visibleActive === 'workspace'} canRead={vscodeAvailable} />
               </div>
             )}
             {loaded.has('vscode') && (

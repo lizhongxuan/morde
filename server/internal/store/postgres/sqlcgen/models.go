@@ -59,6 +59,27 @@ type AccountObjectVersion struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AdminControlNotification struct {
+	ID            int64              `json:"id"`
+	Kind          string             `json:"kind"`
+	RuleID        pgtype.Int8        `json:"rule_id"`
+	AccountsTotal int64              `json:"accounts_total"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type AdminControlRule struct {
+	ID            int64              `json:"id"`
+	Threshold     int64              `json:"threshold"`
+	Enabled       bool               `json:"enabled"`
+	Note          string             `json:"note"`
+	Version       int64              `json:"version"`
+	CreatedBy     string             `json:"created_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	LastFiredAt   pgtype.Timestamptz `json:"last_fired_at"`
+	FiredAccounts int64              `json:"fired_accounts"`
+}
+
 type AuditLog struct {
 	ID        int64              `json:"id"`
 	At        pgtype.Timestamptz `json:"at"`
@@ -140,6 +161,16 @@ type ConversationMessage struct {
 	SourceExchangeID        string             `json:"source_exchange_id"`
 	RequestedConversationID string             `json:"requested_conversation_id"`
 	Sequence                int64              `json:"sequence"`
+}
+
+type ConversationMessageAttachment struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ConversationID    string             `json:"conversation_id"`
+	MessageID         string             `json:"message_id"`
+	UploadID          string             `json:"upload_id"`
+	AttachmentID      string             `json:"attachment_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
 type DeviceAuthorization struct {
@@ -428,6 +459,78 @@ type OwnerExecutionControl struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type PersonalAttachmentChunk struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	UploadID          string             `json:"upload_id"`
+	Sequence          int32              `json:"sequence"`
+	SizeBytes         int64              `json:"size_bytes"`
+	Sha256            string             `json:"sha256"`
+	Body              []byte             `json:"body"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type PersonalAttachmentUpload struct {
+	ServiceInstanceID    pgtype.UUID        `json:"service_instance_id"`
+	OwnerID              string             `json:"owner_id"`
+	UploadID             string             `json:"upload_id"`
+	AttachmentID         pgtype.Text        `json:"attachment_id"`
+	ObjectType           string             `json:"object_type"`
+	ObjectID             string             `json:"object_id"`
+	BaseRevision         int64              `json:"base_revision"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Sha256               string             `json:"sha256"`
+	MediaType            string             `json:"media_type"`
+	RequestHash          []byte             `json:"request_hash"`
+	IdempotencyKey       string             `json:"idempotency_key"`
+	State                string             `json:"state"`
+	ReservationID        pgtype.Text        `json:"reservation_id"`
+	ReservationReleased  bool               `json:"reservation_released"`
+	CommitIdempotencyKey pgtype.Text        `json:"commit_idempotency_key"`
+	ResultRevision       pgtype.Int8        `json:"result_revision"`
+	ChangeSequence       pgtype.Int8        `json:"change_sequence"`
+	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PersonalDataQuota struct {
+	ServiceInstanceID  pgtype.UUID        `json:"service_instance_id"`
+	OwnerID            string             `json:"owner_id"`
+	UsedBytes          int64              `json:"used_bytes"`
+	ReservedBytes      int64              `json:"reserved_bytes"`
+	QuotaBytes         int64              `json:"quota_bytes"`
+	MaxAttachmentBytes int64              `json:"max_attachment_bytes"`
+	Version            int64              `json:"version"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PersonalDataQuotaReservation struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ReservationID     string             `json:"reservation_id"`
+	UploadID          string             `json:"upload_id"`
+	SizeBytes         int64              `json:"size_bytes"`
+	State             string             `json:"state"`
+	ExpiresAt         pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PersonalHistoryImportMapping struct {
+	ServiceInstanceID       pgtype.UUID        `json:"service_instance_id"`
+	OwnerID                 string             `json:"owner_id"`
+	SourceID                string             `json:"source_id"`
+	DeviceAccountID         string             `json:"device_account_id"`
+	SourceConversationID    string             `json:"source_conversation_id"`
+	SourceMessageID         string             `json:"source_message_id"`
+	RequestedConversationID string             `json:"requested_conversation_id"`
+	CanonicalConversationID string             `json:"canonical_conversation_id"`
+	CanonicalMessageID      pgtype.Text        `json:"canonical_message_id"`
+	ContentHash             []byte             `json:"content_hash"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+}
+
 type PersonalMutationReceipt struct {
 	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
 	OwnerID           string             `json:"owner_id"`
@@ -448,6 +551,116 @@ type PersonalObject struct {
 	Body              []byte             `json:"body"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecordAdminGrant struct {
+	OwnerID    string             `json:"owner_id"`
+	AdminID    string             `json:"admin_id"`
+	Capability string             `json:"capability"`
+	Granted    bool               `json:"granted"`
+	GrantedBy  string             `json:"granted_by"`
+	Version    int64              `json:"version"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecordAttachment struct {
+	ID        string             `json:"id"`
+	RecordID  string             `json:"record_id"`
+	OwnerID   string             `json:"owner_id"`
+	FileName  string             `json:"file_name"`
+	MediaType string             `json:"media_type"`
+	Content   []byte             `json:"content"`
+	SizeBytes int64              `json:"size_bytes"`
+	Sha256    string             `json:"sha256"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type RecordCaptureQueue struct {
+	ID                     string             `json:"id"`
+	OwnerID                string             `json:"owner_id"`
+	Purpose                string             `json:"purpose"`
+	ItemKind               string             `json:"item_kind"`
+	ConsentVersion         int64              `json:"consent_version"`
+	CapturedByInstallation pgtype.Text        `json:"captured_by_installation"`
+	CapturedAt             pgtype.Timestamptz `json:"captured_at"`
+	ExpiresAt              pgtype.Timestamptz `json:"expires_at"`
+	Payload                []byte             `json:"payload"`
+	ReservedBytes          int64              `json:"reserved_bytes"`
+	State                  string             `json:"state"`
+	LeaseOwner             pgtype.Text        `json:"lease_owner"`
+	LeaseExpiresAt         pgtype.Timestamptz `json:"lease_expires_at"`
+	LeaseVersion           int64              `json:"lease_version"`
+	Attempts               int32              `json:"attempts"`
+	FailureCode            string             `json:"failure_code"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	RecordID               pgtype.Text        `json:"record_id"`
+}
+
+type RecordCaptureQueueAttachment struct {
+	ID          string `json:"id"`
+	QueueItemID string `json:"queue_item_id"`
+	FileName    string `json:"file_name"`
+	MediaType   string `json:"media_type"`
+	Content     []byte `json:"content"`
+	SizeBytes   int64  `json:"size_bytes"`
+	Sha256      string `json:"sha256"`
+}
+
+type RecordConsent struct {
+	OwnerID   string             `json:"owner_id"`
+	Purpose   string             `json:"purpose"`
+	Enabled   bool               `json:"enabled"`
+	Version   int64              `json:"version"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecordDeleteTombstone struct {
+	ID          string             `json:"id"`
+	OwnerID     string             `json:"owner_id"`
+	RecordID    string             `json:"record_id"`
+	RequestedBy string             `json:"requested_by"`
+	State       string             `json:"state"`
+	Attempts    int32              `json:"attempts"`
+	FailureCode string             `json:"failure_code"`
+	RequestedAt pgtype.Timestamptz `json:"requested_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecordEntry struct {
+	ID              string             `json:"id"`
+	OwnerID         string             `json:"owner_id"`
+	Purpose         string             `json:"purpose"`
+	ItemKind        string             `json:"item_kind"`
+	ConsentVersion  int64              `json:"consent_version"`
+	CapturedAt      pgtype.Timestamptz `json:"captured_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	PayloadBytes    int64              `json:"payload_bytes"`
+	AttachmentBytes int64              `json:"attachment_bytes"`
+	AttachmentCount int32              `json:"attachment_count"`
+	State           string             `json:"state"`
+}
+
+type RecordQuota struct {
+	OwnerID       string             `json:"owner_id"`
+	RetentionDays int32              `json:"retention_days"`
+	LimitBytes    int64              `json:"limit_bytes"`
+	UsedBytes     int64              `json:"used_bytes"`
+	ReservedBytes int64              `json:"reserved_bytes"`
+	Version       int64              `json:"version"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RecordSampleBody struct {
+	RecordID string `json:"record_id"`
+	Body     []byte `json:"body"`
+}
+
+type RecordTurnBody struct {
+	RecordID string `json:"record_id"`
+	Body     []byte `json:"body"`
 }
 
 type RetiredInstantChatConversation struct {
@@ -473,31 +686,32 @@ type RetiredInstantChatExchange struct {
 }
 
 type Schedule struct {
-	ID                    string             `json:"id"`
-	OwnerID               string             `json:"owner_id"`
-	Version               int64              `json:"version"`
-	Status                string             `json:"status"`
-	ExecutionEpoch        int64              `json:"execution_epoch"`
-	HostID                string             `json:"host_id"`
-	ModelID               string             `json:"model_id"`
-	Objective             string             `json:"objective"`
-	Timing                []byte             `json:"timing"`
-	BudgetActiveSeconds   int32              `json:"budget_active_seconds"`
-	BudgetToolCalls       int32              `json:"budget_tool_calls"`
-	BudgetModelTokens     int32              `json:"budget_model_tokens"`
-	AuthKind              string             `json:"auth_kind"`
-	AuthTokenID           string             `json:"auth_token_id"`
-	AuthScopes            []string           `json:"auth_scopes"`
-	MisfirePolicy         string             `json:"misfire_policy"`
-	NotificationEvents    []string           `json:"notification_events"`
-	NextOccurrenceKey     string             `json:"next_occurrence_key"`
-	NextRunAt             pgtype.Timestamptz `json:"next_run_at"`
-	NextCheckAt           pgtype.Timestamptz `json:"next_check_at"`
-	CreatedAt             pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
-	ObservationSpec       []byte             `json:"observation_spec"`
-	ObservationConfigHash string             `json:"observation_config_hash"`
-	BaselineFingerprint   string             `json:"baseline_fingerprint"`
+	ID                       string             `json:"id"`
+	OwnerID                  string             `json:"owner_id"`
+	Version                  int64              `json:"version"`
+	Status                   string             `json:"status"`
+	ExecutionEpoch           int64              `json:"execution_epoch"`
+	HostID                   string             `json:"host_id"`
+	ModelID                  string             `json:"model_id"`
+	Objective                string             `json:"objective"`
+	Timing                   []byte             `json:"timing"`
+	BudgetActiveSeconds      int32              `json:"budget_active_seconds"`
+	BudgetToolCalls          int32              `json:"budget_tool_calls"`
+	BudgetModelTokens        int32              `json:"budget_model_tokens"`
+	AuthKind                 string             `json:"auth_kind"`
+	AuthTokenID              string             `json:"auth_token_id"`
+	AuthScopes               []string           `json:"auth_scopes"`
+	MisfirePolicy            string             `json:"misfire_policy"`
+	NotificationEvents       []string           `json:"notification_events"`
+	NextOccurrenceKey        string             `json:"next_occurrence_key"`
+	NextRunAt                pgtype.Timestamptz `json:"next_run_at"`
+	NextCheckAt              pgtype.Timestamptz `json:"next_check_at"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	ObservationSpec          []byte             `json:"observation_spec"`
+	ObservationConfigHash    string             `json:"observation_config_hash"`
+	BaselineFingerprint      string             `json:"baseline_fingerprint"`
+	AuthClientInstallationID pgtype.Text        `json:"auth_client_installation_id"`
 }
 
 type ScheduleRun struct {
@@ -728,6 +942,23 @@ type TaskEvent struct {
 	EventType string             `json:"event_type"`
 	Payload   []byte             `json:"payload"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type TaskHubOperation struct {
+	TaskID                   string             `json:"task_id"`
+	OwnerID                  string             `json:"owner_id"`
+	OperationKey             string             `json:"operation_key"`
+	ToolName                 string             `json:"tool_name"`
+	TargetInstallationID     string             `json:"target_installation_id"`
+	Action                   string             `json:"action"`
+	TaskAuthorizationVersion int64              `json:"task_authorization_version"`
+	TargetGrantVersion       int64              `json:"target_grant_version"`
+	LeaseVersion             int64              `json:"lease_version"`
+	RequestHash              []byte             `json:"request_hash"`
+	ResultHash               []byte             `json:"result_hash"`
+	Status                   string             `json:"status"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TaskMcpConnectorGrant struct {

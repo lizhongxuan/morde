@@ -1028,8 +1028,25 @@ func TestHostResponseOmitsInternalKeyAndRetiredFields(t *testing.T) {
 	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "aio_key_enc") || strings.Contains(string(encoded), "public_ports") ||
 		strings.Contains(string(encoded), "size_mib") || !strings.Contains(string(encoded), `"workspaces":[{"workspace":`) ||
 		!strings.Contains(string(encoded), `"binding_version":1`) ||
+		!strings.Contains(string(encoded), `"sync_conflicts":[]`) ||
 		!strings.Contains(string(encoded), `"portal_origin":"https://portal.example.test"`) {
 		t.Fatalf("host response JSON = %s", encoded)
+	}
+}
+
+func TestHostResponseIncludesWorkspaceSyncMetadata(t *testing.T) {
+	value := hostResponseFrom(host.Host{Workspaces: []workspace.Binding{{
+		Workspace: workspace.Workspace{ID: "w1234567", QuotaBytes: 5 << 30},
+		SyncState: workspace.BindingSyncConflict, SyncConflicts: []string{"src/main.go"},
+	}}}, config.Domains{})
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"quota_bytes":5368709120`, `"sync_state":"conflict"`, `"sync_conflicts":["src/main.go"]`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("host response JSON %s does not contain %s", encoded, want)
+		}
 	}
 }
 
