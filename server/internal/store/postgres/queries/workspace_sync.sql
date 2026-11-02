@@ -121,10 +121,11 @@ INSERT INTO workspace_sync_sessions (
   base_revision, target_revision, pinned_revision, planned_bytes, confirmed_bytes,
   files, upload_files, download_files, scope, deleted_paths, upload_deleted_paths,
   download_deleted_paths, empty_directories, upload_empty_directories, download_empty_directories,
-  deleted_directories, upload_deleted_directories, download_deleted_directories, ack_cursor, conflicts
+  deleted_directories, upload_deleted_directories, download_deleted_directories, ack_cursor, conflicts,
+  task_id, task_hub_operation_key
 )
 VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
 )
 RETURNING *;
 

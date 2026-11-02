@@ -163,12 +163,24 @@ func (s *Store) GetSchedule(ctx context.Context, ownerID, id string) (schedule.S
 	return loadSchedule(ctx, s.pool, ownerID, id)
 }
 
-func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, value schedule.Schedule, expectedVersion int64) (schedule.Schedule, error) {
-	if !domain.ValidUserID(ownerID) || value.OwnerID != ownerID || expectedVersion < 1 || !schedule.ValidID(value.ID) {
+func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, record app.IdempotencyRecord, value schedule.Schedule, expectedVersion int64) (schedule.Schedule, error) {
+	if !domain.ValidUserID(ownerID) || value.OwnerID != ownerID || record.OwnerID != ownerID || record.Operation != "schedule.update" ||
+		record.ResourceID != value.ID || expectedVersion < 1 || !schedule.ValidID(value.ID) {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule update fields are invalid")
 	}
 	var result schedule.Schedule
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		stored, replay, err := reserveIdempotency(ctx, tx, record, value.ID, "")
+		if err != nil {
+			return err
+		}
+		if replay {
+			if stored.ResourceID != value.ID {
+				return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different schedule")
+			}
+			result, err = loadSchedule(ctx, tx, ownerID, stored.ResourceID)
+			return err
+		}
 		gate, err := lockOwnerExecutionControl(ctx, tx, ownerID, false)
 		if err != nil {
 			return err
@@ -213,12 +225,12 @@ func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, value schedu
 		if err != nil {
 			return err
 		}
-		return applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, ownerID, nextContentBytes-previousContentBytes)
+		if err := applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, ownerID, nextContentBytes-previousContentBytes); err != nil {
+			return err
+		}
+		result, err = loadSchedule(ctx, tx, ownerID, value.ID)
+		return err
 	})
-	if err != nil {
-		return schedule.Schedule{}, err
-	}
-	result, err = loadSchedule(ctx, s.pool, ownerID, value.ID)
 	return result, err
 }
 
@@ -459,7 +471,8 @@ func (s *Store) CommitScheduleOccurrence(ctx context.Context, commit app.Schedul
 			return err
 		}
 		if value.Status != schedule.StatusEnabled || value.Version != commit.ExpectedVersion || value.ExecutionEpoch != gate.epoch ||
-			value.NextOccurrenceKey == "" || value.NextCheckAt == nil || commit.Occurrence.CheckAt.Before(*value.NextCheckAt) {
+			value.NextOccurrenceKey == "" || value.NextOccurrenceKey != commit.Occurrence.Key || value.NextCheckAt == nil ||
+			!value.NextCheckAt.Equal(commit.Occurrence.CheckAt) || !sameTime(value.NextRunAt, commit.Occurrence.ScheduledAt) {
 			return nil
 		}
 		var due bool

@@ -16,6 +16,8 @@ type ModelConnection = components["schemas"]["ModelConnection"];
 type Conversation = components["schemas"]["Conversation"];
 type ConversationMessage = components["schemas"]["ConversationMessage"];
 type Task = components["schemas"]["Task"];
+type Schedule = components["schemas"]["Schedule"];
+type ScheduleCreateRequest = components["schemas"]["ScheduleCreateRequest"];
 type UserPreferences = components["schemas"]["UserPreferences"];
 type Notification = components["schemas"]["Notification"];
 type ClientInstallation = components["schemas"]["ClientInstallation"];
@@ -29,6 +31,8 @@ type RecordCapability = components["schemas"]["RecordCapability"];
 type RecordConsent = components["schemas"]["RecordConsent"];
 type RecordQuota = components["schemas"]["RecordQuota"];
 type RecordAdminGrant = components["schemas"]["RecordAdminGrant"];
+type AdminInvite = components["schemas"]["AdminInvite"];
+type AdminNudgePolicy = components["schemas"]["AdminNudgePolicy"];
 
 const defaultPersonalDataQuota = {
   used_bytes: 0,
@@ -56,6 +60,7 @@ let hostMembers = new Map<string, HostMember[]>();
 const hostResourceVersions = new Map<string, number>();
 let apiKeys: Array<Record<string, unknown>> = [];
 let modelConnections: ModelConnection[] = [];
+let schedules: Array<{ ownerID: string; value: Schedule }> = [];
 let conversations: Conversation[] = [];
 let conversationMessages: ConversationMessage[] = [];
 let conversationOwners = new Map<string, string>();
@@ -84,6 +89,9 @@ const workspaceBindReplays = new Map<string, { request: string; response: Worksp
 const workspaceUnbindReplays = new Map<string, { request: string; response: WorkspaceBinding }>();
 const workspaceUnbindingStartedAt = new Map<string, number>();
 const users: User[] = [demoUser, memberUser, initialAdmin];
+let inviteCodes = new Map<string, string>();
+let inviteRelations: Array<{ inviter_id: string; invitee_id: string; created_at: string }> = [];
+let adminNudgePolicy: AdminNudgePolicy = { enabled: false, url: "", text_zh: "", text_en: "", version: 1, updated_at: null };
 const passwords = new Map<string, string>();
 const loginAccounts = new Map<string, { user: User; password: string }>();
 const sessions = new Map<string, { userId: string; name: string }>();
@@ -242,6 +250,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaces = [];
   workspaceOwners.clear();
   apiKeys = [];
+  schedules = [];
   modelConnections = [{ id: "pmodel01", name: "团队示例模型", base_url: "https://models.example.invalid/v1", model_name: "morde-demo", shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false }, checked_at: now(), created_at: now(), updated_at: now() }];
   conversations = [];
   conversationMessages = [];
@@ -272,6 +281,9 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaceUnbindReplays.clear();
   workspaceUnbindingStartedAt.clear();
   users.splice(0, users.length, demoUser, memberUser, initialAdmin);
+  inviteCodes = new Map([["0123456789abcdef0123456789abcdef", demoUser.id]]);
+  inviteRelations = [];
+  adminNudgePolicy = { enabled: false, url: "", text_zh: "", text_en: "", version: 1, updated_at: null };
   passwords.clear();
   loginAccounts.clear();
   loginAccounts.set("demo", { user: demoUser, password: "demo" });
@@ -461,7 +473,7 @@ const unauthenticated = () => failure("unauthenticated", "请先登录", 401);
 // Keep this first so protected handlers cannot run before the session check.
 const sessionGuard = http.all("/api/*", ({ request, cookies }) => {
   const path = new URL(request.url).pathname;
-  if (path === "/api/capabilities" || path === "/api/auth/login" || path === "/api/auth/register" || path === "/api/auth/logout") return;
+  if (path === "/api/capabilities" || path === "/api/nudges" || path === "/api/auth/login" || path === "/api/auth/register" || path === "/api/auth/logout") return;
   const user = sessionUser(cookies);
   if (!user) return unauthenticated();
   if (user.must_change_password && !(path === "/api/me" || path === "/api/me/password")) {
@@ -572,13 +584,18 @@ function hostsByState() {
 export const handlers = [
   sessionGuard,
   http.post("/api/auth/register", async ({ request }) => {
-    const body = await request.json().catch(() => ({})) as { name?: string; password?: string };
+    const body = await request.json().catch(() => ({})) as { name?: string; password?: string; invite_code?: unknown };
     const name = body.name?.trim();
     if (!name || name.length < 3 || name.length > 64 || !body.password || body.password.length < 8 || body.password.length > 72) return failure("invalid_argument", "用户名或密码无效", 400);
+    if (body.invite_code !== undefined && typeof body.invite_code !== "string") return failure("invalid_argument", "邀请码无效", 400);
+    const inviteCode = typeof body.invite_code === "string" ? body.invite_code.trim().toLowerCase() : "";
+    const inviterID = inviteCode ? inviteCodes.get(inviteCode) : undefined;
+    if (inviteCode && (!/^[a-f0-9]{32}$/.test(inviteCode) || !inviterID || users.find((user) => user.id === inviterID)?.status !== "approved")) return failure("invalid_argument", "邀请码无效", 400);
     if (name.toLowerCase() === "admin" || loginAccounts.has(name) || users.some((user) => user.name === name)) return failure("conflict", "用户名已被使用", 409);
     const user: User = { id: id("u"), name, role: "user", status: "pending", must_change_password: false,
       quota: { ...demoUser.quota }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 }, default_host_resources: { ...defaultHostResources } };
     users.push(user);
+    if (inviterID) inviteRelations.push({ inviter_id: inviterID, invitee_id: user.id, created_at: now() });
     passwords.set(user.id, body.password);
     return json({ user }, 201);
   }),
@@ -611,6 +628,17 @@ export const handlers = [
     return empty({ "Set-Cookie": `${sessionCookieName}=; Path=/; Max-Age=0; SameSite=Lax` });
   }),
   http.get("/api/me", ({ cookies }) => json(userWithUsage(sessionUser(cookies)!))),
+  http.get("/api/me/invite-code", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    let code = Array.from(inviteCodes).find(([, ownerID]) => ownerID === user.id)?.[0];
+    if (!code) {
+      do { code = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join(""); }
+      while (inviteCodes.has(code));
+      inviteCodes.set(code, user.id);
+    }
+    return json({ code });
+  }),
+  http.get("/api/nudges", () => json(adminNudgePolicy.enabled ? adminNudgePolicy : { ...adminNudgePolicy, url: "", text_zh: "", text_en: "" })),
   http.post("/api/me/password", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
     if (user.name !== "admin" || user.role !== "super_admin") return failure("forbidden", "只有超级管理员可以修改此密码", 403);
@@ -674,6 +702,67 @@ export const handlers = [
     return json({ created, host: selected ? { id: selected.id, name: selected.name, state: selected.state } : null, status: onboardingStatusFor(user) });
   }),
   http.get("/api/templates", () => json({ items: templates })),
+  http.get("/api/available-models", () => json({ items: modelConnections.filter((model) => model.checked_at && model.capabilities.text)
+    .map(({ id: modelID, name, model_name, capabilities }) => ({ id: modelID, name, model_name, capabilities })) })),
+  http.get("/api/personal-data/quota", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    return json({ owner_id: user.id, used_bytes: 0, reserved_bytes: 0, quota_bytes: defaultPersonalDataQuota.quota_bytes,
+      max_attachment_bytes: defaultPersonalDataQuota.max_attachment_bytes, remaining_bytes: defaultPersonalDataQuota.quota_bytes, version: 1 });
+  }),
+  http.get("/api/sync/snapshot", ({ cookies }) => {
+    sessionUser(cookies)!;
+    return json({ watermark: 0, items: [], next_cursor: null });
+  }),
+  http.get("/api/sync/changes", ({ request, cookies }) => {
+    sessionUser(cookies)!;
+    const after = Number(new URL(request.url).searchParams.get("after_sequence"));
+    if (!Number.isSafeInteger(after) || after < 0) return failure("invalid_argument", "变更游标无效", 400);
+    return json({ items: [], through_sequence: after, next_after_sequence: after, has_more: false });
+  }),
+  http.get("/api/me/records", ({ cookies }) => {
+    sessionUser(cookies)!;
+    return json({ items: [], next_before: "" });
+  }),
+  http.get("/api/me/record-captures", ({ cookies }) => {
+    sessionUser(cookies)!;
+    return json({ items: [], next_before: "" });
+  }),
+  http.post("/api/personal-data/history/import", async ({ request, cookies }) => {
+    sessionUser(cookies)!;
+    const body = await request.json().catch(() => null) as components["schemas"]["PersonalHistoryImportRequest"] | null;
+    if (!body || !body.source_id || !body.device_account_id || !body.source_conversation_id || !Array.isArray(body.messages) ||
+      body.messages.length < 1 || body.messages.length > 200 || body.messages.some((message) => !message.source_message_id ||
+        (message.role !== "user" && message.role !== "assistant") || !message.content)) {
+      return failure("invalid_argument", "历史导入内容无效", 400);
+    }
+    const conversationID = body.target_conversation_id ?? id("c");
+    return json({ conversation_id: conversationID, title: body.title ?? body.source_conversation_id, replay: false,
+      messages: body.messages.map((message, index) => ({ source_message_id: message.source_message_id, message_id: id("m"),
+        conversation_id: conversationID, role: message.role, content: message.content, sequence: index + 1,
+        attachment_ids: message.attachment_ids ?? [], replay: false })) });
+  }),
+  http.get("/api/goals", () => json({ items: [], next_cursor: null })),
+  http.get("/api/schedules", ({ cookies }) => json({
+    items: schedules.filter((item) => item.ownerID === sessionUser(cookies)!.id).map((item) => item.value), next_cursor: "",
+  })),
+  http.post("/api/schedules", async ({ request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const body = await request.json().catch(() => null) as ScheduleCreateRequest | null;
+    if (!body || !body.host_id || !body.model_id || !body.objective || !body.timing || !body.budget) {
+      return failure("invalid_argument", "计划定义无效", 400);
+    }
+    const timestamp = now();
+    const value: Schedule = {
+      id: id("j"), version: 1, status: "enabled", host_id: body.host_id, model_id: body.model_id,
+      objective: body.objective, timing: body.timing, budget: body.budget, misfire_policy: body.misfire_policy ?? "skip",
+      notification_events: body.notification_events ?? ["completed", "failed", "waiting_user"],
+      observation: body.observation ?? null,
+      next_run_at: body.timing.kind === "once" ? body.timing.run_at : new Date(Date.now() + 60_000).toISOString(),
+      last_run: null, current_run: null, created_at: timestamp, updated_at: timestamp,
+    };
+    schedules.push({ ownerID: user.id, value });
+    return json({ ...value }, 201);
+  }),
   http.get("/api/hosts", ({ cookies }) => { const user = sessionUser(cookies)!; completeDeletions(); return json({ items: hosts.filter((host) => host.owner_id === user.id).map(materializeHost) }); }),
   http.get("/api/shared-hosts", ({ cookies }) => {
     const user = sessionUser(cookies)!;
@@ -692,7 +781,7 @@ export const handlers = [
     if (!host) return failure("not_found", "主机不存在", 404);
     const body = await request.json().catch(() => null) as { user_id?: unknown; permissions?: unknown } | null;
     if (!body || typeof body.user_id !== "string" || !/^u[a-z0-9]{7}$/.test(body.user_id) || body.user_id === user.id) return failure("invalid_argument", "用户编号无效", 400);
-    const allowedPermissions = new Set<HostMemberPermission>(["desktop:view", "desktop:control", "terminal:control", "mcp:control"]);
+    const allowedPermissions = new Set<HostMemberPermission>(["desktop:view", "desktop:control", "terminal:control", "mcp:control", "workspace:file:read"]);
     if (!Array.isArray(body.permissions) || !body.permissions.length || !body.permissions.every((permission): permission is HostMemberPermission => typeof permission === "string" && allowedPermissions.has(permission as HostMemberPermission))) return failure("invalid_argument", "共享权限无效", 400);
     const target = users.find((item) => item.id === body.user_id) ?? (memberUser.id === body.user_id ? memberUser : undefined);
     if (!target || target.status !== "approved") return failure("not_found", "用户不存在", 404);
@@ -729,16 +818,17 @@ export const handlers = [
     const targets = search.getAll("target");
     if (search.size > 1 || targets.length > 1) return failure("invalid_argument", "入口类型无效", 400);
     const target = targets[0] ?? "desktop";
-    if (target !== "desktop" && target !== "terminal") return failure("invalid_argument", "入口类型无效", 400);
+    if (target !== "desktop" && target !== "terminal" && target !== "workspace") return failure("invalid_argument", "入口类型无效", 400);
     const member = hostMembers.get(host?.id ?? "")?.find((item) => item.user_id === user.id);
     const authorized = host && (host.owner_id === user.id || (target === "desktop"
       ? member?.permissions.some((permission) => permission === "desktop:view" || permission === "desktop:control")
-      : member?.permissions.includes("terminal:control")));
+      : target === "terminal" ? member?.permissions.includes("terminal:control") : member?.permissions.includes("workspace:file:read")));
     if (!host || !authorized || host.state === "deleting") return failure("not_found", "主机不存在", 404);
     if (materializeHost(host).state !== "running") return failure("invalid_state", "主机尚未运行", 409);
     const url = new URL("/__ch/auth", `https://${host.id}.hosts.mock.invalid`);
     url.searchParams.set("t", `mock-${host.id}-${Date.now()}`);
     if (target === "terminal") url.searchParams.set("next", "/__ch/terminal/");
+    if (target === "workspace") url.searchParams.set("next", "/__ch/wb/?tab=workspace");
     return json({ url: url.href, expires_at: new Date(Date.now() + 60_000).toISOString() });
   }),
   http.post("/api/hosts", async ({ request, cookies }) => {
@@ -1289,6 +1379,65 @@ export const handlers = [
     completeDeletions();
     const workspace = workspaces.filter(isVisibleAdminWorkspace).find((item) => item.id === String(params.workspaceId));
     return workspace ? json(adminWorkspaceView(workspace)) : failure("not_found", "工作区不存在", 404);
+  }),
+  http.get("/api/admin/settings", ({ cookies }) => isAdmin(sessionUser(cookies)!) ? json({
+    registration_review_required: true,
+    automatic_new_user_model_budget: false,
+    automatic_invitation_reward: false,
+    automatic_contribution_reward: false,
+    default_personal_data_quota_bytes: 5 * 1024 ** 3,
+    default_personal_attachment_bytes: 300 * 1024 ** 2,
+  }) : failure("forbidden", "没有执行此操作的权限", 403)),
+  http.get("/api/admin/invites", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const query = new URL(request.url).searchParams;
+    const searches = query.getAll("search");
+    const page = adminPage(request);
+    const search = searches[0]?.trim() ?? "";
+    if (!page || searches.length > 1 || search.length > 128 || /[\r\n\0]/.test(search)) return failure("invalid_argument", "邀请查询参数无效", 400);
+    const items: AdminInvite[] = inviteRelations.flatMap((relation) => {
+      const inviter = users.find((user) => user.id === relation.inviter_id);
+      const invitee = users.find((user) => user.id === relation.invitee_id);
+      if (!inviter || !invitee) return [];
+      const match = [inviter.id, inviter.name, invitee.id, invitee.name].some((value) => value.toLowerCase().includes(search.toLowerCase()));
+      if (!match) return [];
+      return [{ inviter_id: inviter.id, inviter_name: inviter.name, invitee_id: invitee.id, invitee_name: invitee.name,
+        invitee_status: invitee.status, created_at: relation.created_at,
+        inviter_invitees: inviteRelations.filter((item) => item.inviter_id === inviter.id).length }];
+    }).sort((left, right) => right.created_at.localeCompare(left.created_at) || left.invitee_id.localeCompare(right.invitee_id));
+    return json({ items: items.slice(page.offset, page.offset + page.limit), total: items.length,
+      total_inviters: new Set(items.map((item) => item.inviter_id)).size, ...page });
+  }),
+  http.get("/api/admin/sites", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const page = adminPage(request);
+    if (!page) return failure("invalid_argument", "分页参数无效", 400);
+    return json({ items: [], summary: { sites: 0, active_sites: 0, releases: 0, healthy_releases: 0 },
+      integrations: { demo: "not_configured", github_stats: "not_configured", traffic: "not_collected" }, total: 0, ...page });
+  }),
+  http.get("/api/admin/nudges", ({ cookies }) => isAdmin(sessionUser(cookies)!) ? json(adminNudgePolicy) : failure("forbidden", "没有执行此操作的权限", 403)),
+  http.put("/api/admin/nudges", async ({ request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const body = await request.json().catch(() => null) as { expected_version?: unknown; enabled?: unknown; url?: unknown; text_zh?: unknown; text_en?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 1 || typeof body.enabled !== "boolean" ||
+      typeof body.url !== "string" || typeof body.text_zh !== "string" || typeof body.text_en !== "string") return failure("invalid_argument", "运营提示无效", 400);
+    if (Number(body.expected_version) !== adminNudgePolicy.version) return failure("conflict", "运营提示版本已变化，请刷新后重试", 409);
+    const url = body.url.trim();
+    const textZH = body.text_zh.trim();
+    const textEN = body.text_en.trim();
+    const empty = !body.enabled && !url && !textZH && !textEN;
+    let validGitHubURL = false;
+    try {
+      const parsed = new URL(url);
+      validGitHubURL = parsed.protocol === "https:" && ["github.com", "www.github.com"].includes(parsed.hostname) &&
+        !parsed.username && !parsed.password && !parsed.search && !parsed.hash && parsed.pathname.replaceAll("/", "") !== "";
+    } catch { /* Invalid URLs are rejected below. */ }
+    const validText = [textZH, textEN].every((value) => Array.from(value).length <= 240 && !/[\r\n\0]/.test(value));
+    if (!validText || !(empty || (validGitHubURL && (!body.enabled || textZH || textEN)))) return failure("invalid_argument", "运营提示需要 GitHub 链接和不超过 240 字的中英文说明", 400);
+    adminNudgePolicy = { enabled: body.enabled, url, text_zh: textZH, text_en: textEN, version: adminNudgePolicy.version + 1, updated_at: now() };
+    recordMockAudit(actor, "admin.nudge.policy.update", "admin:nudge-policy", { version: adminNudgePolicy.version, enabled: adminNudgePolicy.enabled });
+    return json(adminNudgePolicy);
   }),
   http.get("/api/admin/overview", ({ cookies }) => {
     const actor = sessionUser(cookies)!;

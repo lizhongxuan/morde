@@ -25,6 +25,42 @@ func TestTimingValidationRequiresIANAZoneAndExplicitOnceOffset(t *testing.T) {
 	}
 }
 
+func TestEveryNHoursTimingValidationAndElapsedCadence(t *testing.T) {
+	for _, hours := range []int{1, 168} {
+		if err := (Timing{Kind: TimingEveryNHours, IntervalHours: hours, TimeZone: "America/New_York"}).Validate(); err != nil {
+			t.Fatalf("Validate(interval_hours=%d) = %v", hours, err)
+		}
+	}
+	for _, timing := range []Timing{
+		{Kind: TimingEveryNHours, IntervalHours: 0, TimeZone: "UTC"},
+		{Kind: TimingEveryNHours, IntervalHours: 169, TimeZone: "UTC"},
+		{Kind: TimingEveryNHours, IntervalHours: 1, StartsOn: "2026-03-08", TimeZone: "UTC"},
+	} {
+		if err := timing.Validate(); err == nil {
+			t.Fatalf("Validate(%#v) unexpectedly succeeded", timing)
+		}
+	}
+
+	createdAt := mustTime(t, "2026-03-08T06:59:30Z")
+	timing := Timing{Kind: TimingEveryNHours, IntervalHours: 2, TimeZone: "America/New_York"}
+	first, err := FirstOccurrence(timing, createdAt)
+	if err != nil || !first.CheckAt.Equal(mustTime(t, "2026-03-08T07:00:30Z")) {
+		t.Fatalf("first every-N-hours occurrence = %#v, %v", first, err)
+	}
+	next, err := NextOccurrence(timing, first.Key)
+	if err != nil || !next.CheckAt.Equal(mustTime(t, "2026-03-08T09:00:30Z")) {
+		t.Fatalf("next every-N-hours occurrence = %#v, %v; want exactly two elapsed hours later", next, err)
+	}
+	if next.Key != "every_n_hours:2026-03-08T09:00:30Z" {
+		t.Fatalf("next every-N-hours key = %q", next.Key)
+	}
+
+	latest, coalesced, err := LatestDue(timing, first, mustTime(t, "2026-03-08T13:00:30Z"))
+	if err != nil || latest.Key != "every_n_hours:2026-03-08T13:00:30Z" || coalesced != 3 {
+		t.Fatalf("LatestDue() = %#v, %d, %v", latest, coalesced, err)
+	}
+}
+
 func TestFirstOccurrenceUsesEarlierInstantForDSTFold(t *testing.T) {
 	value, err := FirstOccurrence(Timing{
 		Kind: TimingDaily, StartsOn: "2026-11-01", LocalTime: "01:30", TimeZone: "America/New_York",
@@ -59,6 +95,21 @@ func TestWeeklyFirstOccurrenceUsesISOWeekdaysAndLatestDueCoalesces(t *testing.T)
 	latest, coalesced, err := LatestDue(timing, first, mustTime(t, "2026-10-28T10:00:00Z"))
 	if err != nil || latest.Key != "2026-10-28T09:00" || coalesced != 3 {
 		t.Fatalf("latest/coalesced = %#v/%d, %v", latest, coalesced, err)
+	}
+}
+
+func TestWeeklyWorkdaysUseMondayThroughFridayISOWeekdays(t *testing.T) {
+	timing := Timing{Kind: TimingWeekly, StartsOn: "2026-10-23", LocalTime: "09:00", TimeZone: "UTC", Weekdays: []int{1, 2, 3, 4, 5}}
+	first, err := FirstOccurrence(timing, mustTime(t, "2026-10-23T10:00:00Z"))
+	if err != nil || first.Key != "2026-10-26T09:00" {
+		t.Fatalf("first workday occurrence = %#v, %v; want Monday after the elapsed Friday slot", first, err)
+	}
+
+	for _, want := range []string{"2026-10-27T09:00", "2026-10-28T09:00", "2026-10-29T09:00", "2026-10-30T09:00", "2026-11-02T09:00"} {
+		first, err = NextOccurrence(timing, first.Key)
+		if err != nil || first.Key != want {
+			t.Fatalf("next workday occurrence = %#v, %v; want %s", first, err, want)
+		}
 	}
 }
 

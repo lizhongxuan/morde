@@ -55,6 +55,11 @@ func TestValidateCreateSyncSessionEnforcesManifestLimitsAndPaths(t *testing.T) {
 	if err := ValidateCreateSyncSession(invalid, 4); err == nil {
 		t.Fatal("accepted manifest over quota")
 	}
+	invalid = valid
+	invalid.TaskID = "qabc1234"
+	if err := ValidateCreateSyncSession(invalid, 1024); err == nil {
+		t.Fatal("accepted a Task sync association without its operation key")
+	}
 }
 
 func TestValidateSyncManifestIncludesEmptyDirectoriesWithoutChargingFileQuota(t *testing.T) {

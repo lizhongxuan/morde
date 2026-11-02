@@ -201,15 +201,17 @@ type Conflict struct {
 }
 
 type CreateSyncSession struct {
-	Direction          SyncDirection `json:"direction"`
-	Policy             SyncPolicy    `json:"policy"`
-	BaseRevision       int64         `json:"base_revision"`
-	Scope              []string      `json:"scope,omitempty"`
-	Files              []File        `json:"files"`
-	EmptyDirectories   []string      `json:"empty_directories,omitempty"`
-	DeletedPaths       []string      `json:"deleted_paths,omitempty"`
-	DeletedDirectories []string      `json:"deleted_directories,omitempty"`
-	AckCursor          *string       `json:"ack_cursor,omitempty"`
+	Direction           SyncDirection `json:"direction"`
+	Policy              SyncPolicy    `json:"policy"`
+	BaseRevision        int64         `json:"base_revision"`
+	TaskID              string        `json:"task_id,omitempty"`
+	TaskHubOperationKey string        `json:"task_hub_operation_key,omitempty"`
+	Scope               []string      `json:"scope,omitempty"`
+	Files               []File        `json:"files"`
+	EmptyDirectories    []string      `json:"empty_directories,omitempty"`
+	DeletedPaths        []string      `json:"deleted_paths,omitempty"`
+	DeletedDirectories  []string      `json:"deleted_directories,omitempty"`
+	AckCursor           *string       `json:"ack_cursor,omitempty"`
 }
 
 type TransferBlock struct {
@@ -279,6 +281,8 @@ type SyncSession struct {
 	WorkspaceID                string           `json:"workspace_id"`
 	OwnerID                    string           `json:"-"`
 	ReplicaID                  string           `json:"-"`
+	TaskID                     string           `json:"-"`
+	TaskHubOperationKey        string           `json:"-"`
 	Direction                  SyncDirection    `json:"direction"`
 	Policy                     SyncPolicy       `json:"policy"`
 	State                      SyncState        `json:"state"`
@@ -885,6 +889,9 @@ func ValidateRelativePath(value string) error {
 func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 	if !value.Direction.Valid() || !value.Policy.Valid() || value.BaseRevision < 0 {
 		return errors.New("sync direction, policy, or base revision is invalid")
+	}
+	if (value.TaskID == "") != (value.TaskHubOperationKey == "") {
+		return errors.New("task sync association requires both task_id and task_hub_operation_key")
 	}
 	if len(value.Files)+len(value.EmptyDirectories) > MaxSyncFiles || len(value.Scope) > MaxSyncScopeItems ||
 		len(value.DeletedPaths) > MaxSyncFiles || len(value.DeletedDirectories) > MaxSyncFiles ||

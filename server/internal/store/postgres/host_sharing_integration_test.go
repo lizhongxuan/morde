@@ -20,13 +20,13 @@ func TestHostSharingPersistenceAndTicketActor(t *testing.T) {
 	created := createTestHost(t, ctx, store, owner.ID, capacity, nil)
 	grant := host.Member{
 		HostID: created.ID, OwnerID: owner.ID, UserID: member.ID,
-		Permissions: []host.Permission{host.PermissionDesktopView},
+		Permissions: []host.Permission{host.PermissionWorkspaceFileRead},
 	}
 	if value, err := store.UpsertHostMember(ctx, grant); err != nil || value.UserID != member.ID || value.RevokedAt != nil {
 		t.Fatalf("upsert host member = %#v, %v", value, err)
 	}
 	access, err := store.GetHostActorAccess(ctx, created.ID, member.ID)
-	if err != nil || access.OwnerID != owner.ID || access.Disabled || len(access.Permissions) != 1 || access.Permissions[0] != host.PermissionDesktopView {
+	if err != nil || access.OwnerID != owner.ID || access.Disabled || len(access.Permissions) != 1 || access.Permissions[0] != host.PermissionWorkspaceFileRead {
 		t.Fatalf("member access = %#v, %v", access, err)
 	}
 	shared, err := store.ListSharedHosts(ctx, member.ID)

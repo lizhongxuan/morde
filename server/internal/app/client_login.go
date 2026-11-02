@@ -129,7 +129,7 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 		requestMaterial += "\x00" + strings.ToLower(attempt.InstanceID) + "\x00" + strconv.FormatInt(attempt.Generation, 10)
 	}
 	requestHash := sha256.Sum256([]byte(requestMaterial))
-	value, issued, err := s.store.LoginClient(ctx, installation, strings.ToLower(attempt.InstanceID), attempt.Generation, attempt.LegacyAndroid, keyHash[:], requestHash[:], renewalID, ip, func(installationID string) (ClientIssuedTokens, error) {
+	value, issued, err := s.store.LoginClient(ctx, installation, user, strings.ToLower(attempt.InstanceID), attempt.Generation, attempt.LegacyAndroid, keyHash[:], requestHash[:], renewalID, ip, func(installationID string) (ClientIssuedTokens, error) {
 		client, clientCredential, issueErr := newClientToken(user.ID, installationID, identity.KindClient, expiresAt)
 		if issueErr != nil {
 			return ClientIssuedTokens{}, issueErr

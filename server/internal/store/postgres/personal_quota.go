@@ -14,8 +14,10 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/personal"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 const personalDataQuotaReservationIDPrefix = "pq_"
@@ -48,9 +50,9 @@ func (s *Store) GetAdminPersonalDataQuota(ctx context.Context, principal identit
 	return value, nil
 }
 
-func (s *Store) SetAdminPersonalDataQuota(ctx context.Context, principal identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64) (app.PersonalDataQuota, error) {
+func (s *Store) SetAdminPersonalDataQuota(ctx context.Context, principal identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64, ip string) (app.PersonalDataQuota, error) {
 	if !domain.ValidUserID(ownerID) || expectedVersion < 1 || quotaBytes < 1 || maxAttachmentBytes < 1 ||
-		maxAttachmentBytes > personal.MaxAttachmentBytes {
+		maxAttachmentBytes > personal.MaxAttachmentBytes || len(ip) > 64 {
 		return app.PersonalDataQuota{}, domain.InvalidArgument("personal_data_quota", "personal data quota limits or version are invalid")
 	}
 	var value app.PersonalDataQuota
@@ -91,6 +93,20 @@ RETURNING owner_id,used_bytes,reserved_bytes,quota_bytes,max_attachment_bytes,ve
 			instanceID, ownerID, expectedVersion, quotaBytes, maxAttachmentBytes).Scan(
 			&value.OwnerID, &value.UsedBytes, &value.ReservedBytes, &value.QuotaBytes, &value.MaxAttachmentBytes, &value.Version); err != nil {
 			return fmt.Errorf("update personal data quota: %w", err)
+		}
+		entry, err := auditParams(audit.Entry{
+			ActorID: principal.UserID, ActorKind: audit.ActorSession, Action: audit.ActionPersonalDataQuotaUpdate,
+			Target: ownerID, IP: ip, Detail: map[string]any{
+				"quota_bytes_before": current.QuotaBytes, "quota_bytes_after": value.QuotaBytes,
+				"max_attachment_bytes_before": current.MaxAttachmentBytes, "max_attachment_bytes_after": value.MaxAttachmentBytes,
+				"expected_version": expectedVersion, "version": value.Version,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := sqlcgen.New(tx).CreateAuditLog(ctx, entry); err != nil {
+			return fmt.Errorf("audit personal data quota update: %w", err)
 		}
 		return nil
 	})

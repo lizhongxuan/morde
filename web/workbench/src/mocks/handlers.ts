@@ -46,6 +46,19 @@ const files = new Map<string, Blob>([
   [`${overQuotaWorkspacePath}/should-not-display.txt`, new Blob(["此文件只用于验证超配额时不展示。\n"])],
 ]);
 const directories = new Set(["/", "/home", "/home/gem", "/home/gem/workspace", workspacePath, overQuotaWorkspacePath]);
+const workspaceSnapshot = new Map<string, Blob>([
+  ["README.md", new Blob(["# 本地 Workspace\n\n这是固定 revision 的只读快照。\n"])],
+  ["src/main.go", new Blob(["package main\n"])],
+  ["notes & plans/hello world.txt", new Blob(["路径包含空格和符号。\n"])],
+]);
+const workspaceManifestFiles = [...workspaceSnapshot].map(([path, content]) => ({
+  path,
+  size_bytes: content.size,
+  sha256: "a".repeat(64),
+  mode: 420,
+  chunks: [{ sha256: "a".repeat(64), size_bytes: content.size }],
+}));
+const workspaceEmptyDirectories = ["empty", "src/empty"];
 const json = (body: object, status = 200) => HttpResponse.json(body, { status });
 const aio = (data: unknown, success = true, message = "ok") => json({ success, message, data });
 const terminalHtml = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>本地合成终端</title><body><label for="command">命令</label><input id="command" autocomplete="off" autofocus><pre id="output" role="log" aria-live="polite"></pre><script>const input=document.querySelector('#command');const output=document.querySelector('#output');input.addEventListener('keydown',event=>{if(event.key!=='Enter')return;const command=input.value.trim();if(!command)return;output.textContent += '$ '+command+'\\n'+(command==='echo local-terminal-ok'?'local-terminal-ok':'本地演示仅支持 echo local-terminal-ok')+'\\n';input.value='';});</script></body></html>`;
@@ -234,6 +247,65 @@ const e2eNoVncHandlers = import.meta.env.VITE_WORKBENCH_E2E === "1" ? [
 
 export const handlers = [
   ...e2eNoVncHandlers,
+  http.get("/__ch/api/workspaces", () => json({ items: host.workspaces })),
+  http.get("/__ch/api/workspaces/:workspace_id/manifest", ({ request, params }) => {
+    const binding = host.workspaces.find((item) => item.workspace.id === params.workspace_id);
+    if (!binding) return json({ error: { code: "not_found", message: "Workspace 不存在" } }, 404);
+    const url = new URL(request.url);
+    const revision = Number(url.searchParams.get("revision"));
+    if (binding.workspace.used_bytes > binding.workspace.quota_bytes || revision !== binding.applied_revision
+      || binding.applied_revision !== binding.desired_revision || binding.sync_state !== "healthy") {
+      return json({ error: { code: "workspace_conflict", message: "Workspace revision 尚未在 Host 应用" } }, 409);
+    }
+    const prefix = url.searchParams.get("prefix") ?? "";
+    const cursor = url.searchParams.get("cursor");
+    const limit = Number(url.searchParams.get("limit") ?? 500);
+    const offset = cursor === null ? 0 : /^mock-(\d+)$/.test(cursor) ? Number(cursor.slice(5)) : -1;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000 || offset < 0
+      || (prefix && (prefix.startsWith("/") || prefix.split("/").some((part) => !part || part === "." || part === "..")))) {
+      return json({ error: { code: "invalid_argument", message: "manifest 参数无效" } }, 400);
+    }
+    const inPrefix = (path: string) => !prefix || path === prefix || path.startsWith(`${prefix}/`);
+    const matchingFiles = workspaceManifestFiles.filter((file) => inPrefix(file.path));
+    const matchingDirectories = workspaceEmptyDirectories.filter(inPrefix);
+    const pageFiles = matchingFiles.slice(offset, offset + limit);
+    const nextOffset = offset + pageFiles.length;
+    return json({
+      workspace_id: binding.workspace.id,
+      revision,
+      files: pageFiles,
+      empty_directories: offset === 0 ? matchingDirectories : [],
+      next_cursor: nextOffset < matchingFiles.length ? `mock-${nextOffset}` : null,
+    });
+  }),
+  http.get("/__ch/api/workspaces/:workspace_id/files/:filePath", async ({ request, params }) => {
+    const binding = host.workspaces.find((item) => item.workspace.id === params.workspace_id);
+    if (!binding) return json({ error: { code: "not_found", message: "Workspace 不存在" } }, 404);
+    const url = new URL(request.url);
+    const revision = Number(url.searchParams.get("revision"));
+    if (binding.workspace.used_bytes > binding.workspace.quota_bytes || revision !== binding.applied_revision
+      || binding.applied_revision !== binding.desired_revision || binding.sync_state !== "healthy") {
+      return json({ error: { code: "workspace_conflict", message: "Workspace revision 尚未在 Host 应用" } }, 409);
+    }
+    let relativePath: string;
+    try {
+      relativePath = decodeURIComponent(new URL(request.url).pathname.split("/files/").at(-1) ?? "");
+    } catch {
+      return json({ error: { code: "invalid_argument", message: "文件路径无效" } }, 400);
+    }
+    if (!relativePath || relativePath.startsWith("/") || relativePath.includes("\\")
+      || relativePath.split("/").some((part) => !part || part === "." || part === "..")) {
+      return json({ error: { code: "invalid_argument", message: "文件路径无效" } }, 400);
+    }
+    const content = workspaceSnapshot.get(relativePath);
+    if (!content) return json({ error: { code: "not_found", message: "Workspace 文件不存在" } }, 404);
+    return new HttpResponse(content, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(relativePath.split("/").at(-1) ?? "download")}`,
+      },
+    });
+  }),
   http.get("/__ch/api/host", () => {
     if (!initializedHost) {
       resetControl();

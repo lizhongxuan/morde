@@ -328,6 +328,15 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 		if err != nil {
 			return err
 		}
+		if value.TaskID != "" {
+			if deviceAccess == nil {
+				return domain.NewError(domain.CodeForbidden, "Task-linked workspace sync requires a device replica")
+			}
+			if err := lockTaskHubOperationWorkspaceSyncCreateTx(ctx, tx, value.OwnerID, value.TaskID, value.TaskHubOperationKey,
+				value.WorkspaceID, deviceAccess.installationID, value.BaseRevision, value.Scope); err != nil {
+				return err
+			}
+		}
 		var hostOwner, hostState string
 		var hostGeneration int64
 		var hostDeletedAt pgtype.Timestamptz
@@ -455,6 +464,12 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 		row, err := q.CreateWorkspaceSyncSession(ctx, params)
 		if err != nil {
 			return fmt.Errorf("create workspace sync session: %w", err)
+		}
+		if value.TaskID != "" {
+			if err := associateTaskHubOperationWorkspaceSyncSessionTx(ctx, tx, value.OwnerID, value.TaskID, value.TaskHubOperationKey,
+				value.WorkspaceID, deviceAccess.installationID, value.ID); err != nil {
+				return err
+			}
 		}
 		for _, block := range blocks {
 			if !validTransferBlock(block) {
@@ -980,6 +995,11 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		if err != nil {
 			return err
 		}
+		if deviceAccess != nil {
+			if err := lockTaskHubOperationWorkspaceSyncCommitTx(ctx, tx, workspaceID, sessionID, deviceAccess.installationID); err != nil {
+				return err
+			}
+		}
 		if hostScoped {
 			var ownerID, state string
 			var generation int64
@@ -1062,6 +1082,9 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			}
 			if result.State == workspace.SyncCompleted {
 				if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, workspaceID, result.TargetRevision); err != nil {
+					return err
+				}
+				if err := reconcileTaskHubOperationWorkspaceSyncCommitTx(ctx, tx, workspaceID, sessionID, result.TargetRevision); err != nil {
 					return err
 				}
 			}
@@ -1232,15 +1255,26 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			return err
 		}
 		if len(mutations) > 0 || len(directoryMutations) > 0 {
-			var activeTaskOperation bool
+			var blockedByTaskFence bool
+			linkedTaskID, linkedOperationKey := "", ""
+			if row.TaskID.Valid {
+				linkedTaskID = row.TaskID.String
+			}
+			if row.TaskHubOperationKey.Valid {
+				linkedOperationKey = row.TaskHubOperationKey.String
+			}
 			if err := tx.QueryRow(ctx, `SELECT
 EXISTS (SELECT 1 FROM task_operations WHERE workspace_id=$1 AND status IN ('prepared','dispatched','unknown')) OR
 EXISTS (SELECT 1 FROM task_mcp_connector_operations o JOIN tasks t ON t.id=o.task_id
-  WHERE t.workspace_id=$1 AND o.status IN ('dispatched','unknown'))`, workspaceID).Scan(&activeTaskOperation); err != nil {
-				return fmt.Errorf("check admitted task operations before Workspace revision commit: %w", err)
+			WHERE t.workspace_id=$1 AND o.status IN ('dispatched','unknown')) OR
+EXISTS (SELECT 1 FROM task_workspace_publish_receipts WHERE workspace_id=$1 AND state='pending') OR
+EXISTS (SELECT 1 FROM task_hub_operations o WHERE o.workspace_id=$1 AND o.action='file.put'
+  AND o.status IN ('prepared','dispatched','unknown') AND o.sync_stage IN ('pending','local_applied','sync_pending')
+  AND NOT ($2::text<>'' AND o.task_id=$2 AND o.operation_key=$3))`, workspaceID, linkedTaskID, linkedOperationKey).Scan(&blockedByTaskFence); err != nil {
+				return fmt.Errorf("check Task fences before Workspace revision commit: %w", err)
 			}
-			if activeTaskOperation {
-				return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an in-flight task operation; retry synchronization after it settles")
+			if blockedByTaskFence {
+				return domain.NewError(domain.CodeWorkspaceBusy, "Workspace has an in-flight Task operation or publish; retry synchronization after it settles")
 			}
 		}
 		if _, err := tx.Exec(ctx, `SAVEPOINT workspace_sync_apply`); err != nil {
@@ -1304,6 +1338,9 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 		}
 		if result.State == workspace.SyncCompleted {
 			if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, workspaceID, targetRevision); err != nil {
+				return err
+			}
+			if err := reconcileTaskHubOperationWorkspaceSyncCommitTx(ctx, tx, workspaceID, sessionID, targetRevision); err != nil {
 				return err
 			}
 		}
@@ -1416,8 +1453,14 @@ func validateSyncSession(value workspace.SyncSession) error {
 		value.PlannedBytes < 0 || value.ConfirmedBytes < 0 || value.ConfirmedBytes > value.PlannedBytes {
 		return domain.InvalidArgument("sync_session", "workspace sync session fields are invalid")
 	}
+	if value.TaskID != "" && (!domain.ValidTaskID(value.TaskID) || len(value.TaskHubOperationKey) == 0 || len(value.TaskHubOperationKey) > 512 ||
+		strings.TrimSpace(value.TaskHubOperationKey) != value.TaskHubOperationKey || strings.ContainsRune(value.TaskHubOperationKey, '\x00') ||
+		!strings.HasPrefix(value.ReplicaID, "device:")) {
+		return domain.InvalidArgument("sync_session", "Task-linked workspace sync fields are invalid")
+	}
 	if err := workspace.ValidateCreateSyncSession(workspace.CreateSyncSession{
 		Direction: value.Direction, Policy: value.Policy, BaseRevision: value.BaseRevision, Scope: value.Scope,
+		TaskID: value.TaskID, TaskHubOperationKey: value.TaskHubOperationKey,
 		Files: value.Files, EmptyDirectories: value.EmptyDirectories,
 		DeletedPaths: value.DeletedPaths, DeletedDirectories: value.DeletedDirectories, AckCursor: value.AckCursor,
 	}, 0); err != nil {
@@ -1652,6 +1695,8 @@ func workspaceSyncSessionParams(value workspace.SyncSession) (sqlcgen.CreateWork
 		UploadDeletedDirectories:   nonNilStrings(value.UploadDeletedDirectories),
 		DownloadDeletedDirectories: nonNilStrings(value.DownloadDeletedDirectories),
 		AckCursor:                  ack, Conflicts: conflicts,
+		TaskID:              pgtype.Text{String: value.TaskID, Valid: value.TaskID != ""},
+		TaskHubOperationKey: pgtype.Text{String: value.TaskHubOperationKey, Valid: value.TaskHubOperationKey != ""},
 	}, nil
 }
 
@@ -1682,6 +1727,12 @@ func syncSessionDomain(ctx context.Context, q *sqlcgen.Queries, row sqlcgen.Work
 		value.Conflicts = []workspace.Conflict{}
 	}
 	value.ID, value.WorkspaceID, value.OwnerID, value.ReplicaID = row.ID, row.WorkspaceID, row.OwnerID, row.ReplicaID
+	if row.TaskID.Valid {
+		value.TaskID = row.TaskID.String
+	}
+	if row.TaskHubOperationKey.Valid {
+		value.TaskHubOperationKey = row.TaskHubOperationKey.String
+	}
 	value.Direction, value.Policy, value.State, value.Stage = workspace.SyncDirection(row.Direction), workspace.SyncPolicy(row.Policy), workspace.SyncState(row.State), workspace.SyncStage(row.Stage)
 	value.BaseRevision, value.TargetRevision, value.PinnedRevision = row.BaseRevision, row.TargetRevision, row.PinnedRevision
 	value.PlannedBytes, value.ConfirmedBytes = row.PlannedBytes, row.ConfirmedBytes

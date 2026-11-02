@@ -16,10 +16,16 @@ import (
 	"morde/server/internal/domain/record"
 )
 
+const maxRecordCaptureAttempts int32 = 5
+
 type RecordCaptureQueue interface {
 	Claim(context.Context, string, time.Time, time.Duration, int32) ([]record.QueueItem, error)
 	Commit(context.Context, string, string, int64) (record.RecordMetadata, error)
 	Fail(context.Context, string, string, int64, string) error
+}
+
+type RecordCaptureRecoveryQueue interface {
+	RecoverCloudDSHCaptures(context.Context, int32) error
 }
 
 type RecordDeleteQueue interface {
@@ -109,6 +115,11 @@ func (w *RecordCaptureWorker) processSafely(ctx context.Context) (err error) {
 	if _, err := w.access.ProcessDeletes(ctx, w.batchSize); err != nil {
 		w.logger.Warn("record deletion processing failed; will retry", zap.String("error_type", fmt.Sprintf("%T", err)))
 	}
+	if recovery, ok := w.capture.(RecordCaptureRecoveryQueue); ok {
+		if err := recovery.RecoverCloudDSHCaptures(ctx, w.batchSize); err != nil {
+			return err
+		}
+	}
 	items, err := w.capture.Claim(ctx, w.workerID, time.Now().UTC(), 2*time.Minute, w.batchSize)
 	if err != nil {
 		return err
@@ -123,7 +134,7 @@ func (w *RecordCaptureWorker) processSafely(ctx context.Context) (err error) {
 			continue
 		}
 		if _, commitErr := w.capture.Commit(ctx, item.ID, w.workerID, item.LeaseVersion); commitErr != nil {
-			if recordCaptureFailureIsPermanent(commitErr) && ctx.Err() == nil {
+			if (recordCaptureFailureIsPermanent(commitErr) || item.Attempts >= maxRecordCaptureAttempts) && ctx.Err() == nil {
 				if failErr := w.capture.Fail(ctx, item.ID, w.workerID, item.LeaseVersion, "commit_failed"); failErr != nil {
 					commitErr = errors.Join(commitErr, failErr)
 				}

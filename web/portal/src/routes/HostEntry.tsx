@@ -2,15 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router';
 import { errorDetails, portalApi } from '../app/api';
 
-type EntryTarget = 'desktop' | 'terminal' | null;
+type EntryTarget = 'desktop' | 'terminal' | 'workspace' | null;
 
 function parseEntryTarget(search: string): EntryTarget {
   const params = new URLSearchParams(search);
   const targets = params.getAll('target');
-  if (params.size !== targets.length || targets.length > 1 || (targets.length === 1 && targets[0] !== 'desktop' && targets[0] !== 'terminal')) {
+  if (params.size !== targets.length || targets.length > 1 || (targets.length === 1 && !['desktop', 'terminal', 'workspace'].includes(targets[0]!))) {
     throw new Error('云端电脑入口参数无效。');
   }
-  return targets.length === 0 ? null : targets[0] as 'desktop' | 'terminal';
+  return targets.length === 0 ? null : targets[0] as Exclude<EntryTarget, null>;
 }
 
 export function resolveHostEntryURL(value: string, hostURL: string, portalHostname = window.location.hostname): string {
@@ -42,10 +42,16 @@ export async function fetchEntryURL(id: string, target: EntryTarget): Promise<st
     const host = items.find((item) => item.id === id);
     const permitted = target === 'terminal'
       ? host?.permissions.includes('terminal:control')
-      : host?.permissions.includes('desktop:view') || host?.permissions.includes('desktop:control');
+      : target === 'workspace'
+        ? host?.permissions.includes('workspace:file:read')
+        : host?.permissions.includes('desktop:view') || host?.permissions.includes('desktop:control');
     if (!host || !permitted || host.state !== 'running') throw new Error('这台共享电脑已不可访问。');
     const ticket = await portalApi.issueObservationTicket(id, target);
-    return resolveHostEntryURL(ticket.url, host.url);
+    const destination = resolveHostEntryURL(ticket.url, host.url);
+    if (target === 'workspace' && new URL(destination).searchParams.get('next') !== '/__ch/wb/?tab=workspace') {
+      throw new Error('服务器返回了无效的云端电脑入口。');
+    }
+    return destination;
   }
   const host = await portalApi.host(id);
   const ticket = await portalApi.enterHost(id);

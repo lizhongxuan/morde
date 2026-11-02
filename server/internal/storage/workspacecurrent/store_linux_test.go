@@ -33,7 +33,11 @@ func TestMaterializeAtomicallyPublishesVerifiedWorkspaceTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 
 	first := []byte("first revision")
 	firstDigest := sha256.Sum256(first)
@@ -86,7 +90,11 @@ func TestCurrentRevisionRequiresValidMarkerAndPublishedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, nil, nil, testBlocks{}); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +132,11 @@ func TestMatchesManifestDetectsCurrentProjectionDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 
 	content := []byte("trusted")
 	digest := sha256.Sum256(content)
@@ -201,7 +213,11 @@ func TestMaterializeRecoversUnmarkedEmptyInitialDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 
 	ownerDigest := sha256.Sum256([]byte("u1234567"))
 	ownerRoot := filepath.Join(root, hex.EncodeToString(ownerDigest[:]))
@@ -237,7 +253,11 @@ func TestOpenRegularFileRejectsSymlinkComponents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 
 	content := []byte("inside")
 	digest := sha256.Sum256(content)
@@ -304,7 +324,11 @@ func TestMaterializeFailureKeepsPublishedTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 
 	content := []byte("verified")
 	digest := sha256.Sum256(content)

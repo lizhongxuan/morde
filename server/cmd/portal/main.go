@@ -303,6 +303,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize admin controls: %w", err)
 	}
+	adminOperations, err := app.NewAdminOperationsService(store)
+	if err != nil {
+		return fmt.Errorf("initialize admin operations: %w", err)
+	}
 	recordConsents, err := app.NewRecordConsentService(store)
 	if err != nil {
 		return fmt.Errorf("initialize record consents: %w", err)
@@ -529,6 +533,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize personal data quota service: %w", err)
 	}
+	personalDataQuotaUserService, err := app.NewPersonalDataQuotaUserService(store)
+	if err != nil {
+		return fmt.Errorf("initialize personal data quota user service: %w", err)
+	}
 	personalAttachmentService, err := app.NewPersonalAttachmentService(store, personalDataQuotaService)
 	if err != nil {
 		return fmt.Errorf("initialize personal attachment service: %w", err)
@@ -568,7 +576,7 @@ func serve(ctx context.Context, configPath string) error {
 			return err
 		}
 		taskWorker, err = newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
-			modelGateway, sealer, mcpConnectors, hubService, workerSuffix, logger)
+			modelGateway, sealer, mcpConnectors, recordCapture, hubService, workerSuffix, logger)
 		if err != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", err)
 		}
@@ -595,7 +603,7 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	gatewayHandler, err := gateway.New(gateway.Deps{
 		Config: cfg.Gateway, Domains: cfg.Domains, Security: cfg.Security,
-		Hosts: hosts, HostSharing: hostSharing, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
+		Hosts: hosts, HostSharing: hostSharing, WorkspaceFiles: workspaceSync, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
 		TerminalSessions: store, TerminalAIO: aioClient, Auth: credentials, Audit: auditService,
 		Logger: logger, Metrics: registry,
 	})
@@ -613,9 +621,11 @@ func serve(ctx context.Context, configPath string) error {
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
 		Goals: goalService, Schedules: schedules,
-		PersonalDataQuota: personalDataQuotaService, PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
+		PersonalDataQuota: personalDataQuotaService, PersonalDataQuotaUser: personalDataQuotaUserService,
+		PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
 		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
-		RecordConsents: recordConsents, RecordAccess: recordAccess,
+		AdminOperations: adminOperations,
+		RecordConsents:  recordConsents, RecordAccess: recordAccess, RecordCaptureStatus: recordCapture,
 		AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
 		AdminAudit: auditService,
 		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
@@ -704,7 +714,8 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
 	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
-	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, hubService *app.HubService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
+	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
+	hubService *app.HubService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -746,7 +757,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	tools, err := app.NewCloudDSHToolBroker(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(), hubService)
+	tools, err := app.NewCloudDSHToolBrokerWithRecordCapture(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(), recordCapture, hubService)
 	if err != nil {
 		return nil, err
 	}

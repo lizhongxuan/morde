@@ -17,6 +17,8 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '工作台' })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: '云端电脑' })).toHaveAttribute('href', '/hosts');
     expect(screen.getByRole('link', { name: '账户设置' })).toHaveAttribute('href', '/settings');
+    expect(screen.getByRole('link', { name: '个人数据' })).toHaveAttribute('href', '/personal');
+    expect(screen.getByRole('link', { name: '目标与计划' })).toHaveAttribute('href', '/goals');
     expect(screen.getAllByRole('link', { name: '工作区' })).toHaveLength(1);
     expect(screen.getByRole('link', { name: '工作区' })).toHaveAttribute('href', '/workspaces');
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();

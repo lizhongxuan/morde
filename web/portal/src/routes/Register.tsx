@@ -10,6 +10,7 @@ export function Register() {
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
+  const [inviteCode, setInviteCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   if (loading) return <main className="loading-page">正在检查登录状态…</main>;
@@ -20,7 +21,7 @@ export function Register() {
     if (password !== confirmation) { setError('两次输入的密码不一致。'); return; }
     setBusy(true); setError('');
     try {
-      await portalApi.register(name.trim(), password);
+      await portalApi.register(name.trim(), password, inviteCode.trim());
       navigate('/login', { replace: true, state: { registered: true } });
     } catch (reason) {
       const details = errorDetails(reason);
@@ -40,6 +41,9 @@ export function Register() {
         <input id="register-password" name="password" type="password" autoComplete="new-password" required minLength={8} maxLength={72} value={password} onChange={(event) => setPassword(event.target.value)} />
         <label htmlFor="register-confirmation">确认密码</label>
         <input id="register-confirmation" name="confirmation" type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
+        <label htmlFor="register-invite-code">邀请码（选填）</label>
+        <input id="register-invite-code" name="invite_code" autoComplete="off" maxLength={32} value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} />
+        <p className="muted">邀请码只记录邀请关系，注册仍需管理员审核；不会自动获得模型额度或奖励。</p>
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button button-primary button-wide" type="submit" disabled={busy}>{busy ? '正在注册…' : '注册'}</button>
       </form>

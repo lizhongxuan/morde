@@ -27,6 +27,7 @@ type scheduleRoutesServiceStub struct {
 	createKey    string
 	updateID     string
 	update       app.UpdateScheduleCommand
+	updateKey    string
 	actionID     string
 	action       app.ScheduleActionCommand
 	actionKey    string
@@ -63,9 +64,9 @@ func (s *scheduleRoutesServiceStub) Create(_ context.Context, principal identity
 	return s.value, s.err
 }
 
-func (s *scheduleRoutesServiceStub) Update(_ context.Context, principal identity.Principal, id string, command app.UpdateScheduleCommand) (schedule.Schedule, error) {
+func (s *scheduleRoutesServiceStub) Update(_ context.Context, principal identity.Principal, id string, command app.UpdateScheduleCommand, key string) (schedule.Schedule, error) {
 	s.updateCalls++
-	s.principal, s.updateID, s.update = principal, id, command
+	s.principal, s.updateID, s.update, s.updateKey = principal, id, command, key
 	return s.value, s.err
 }
 
@@ -182,9 +183,10 @@ func TestScheduleGetAndUpdateRoutes(t *testing.T) {
 		updateService := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
 		request := httptest.NewRequest(http.MethodPut, "/api/schedules/j1234567", strings.NewReader(test.body))
 		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "schedule-update-1")
 		response := httptest.NewRecorder()
 		scheduleRoutesRouter(&principal, updateService).ServeHTTP(response, request)
-		if response.Code != http.StatusOK || updateService.updateCalls != 1 || updateService.updateID != "j1234567" ||
+		if response.Code != http.StatusOK || updateService.updateCalls != 1 || updateService.updateID != "j1234567" || updateService.updateKey != "schedule-update-1" ||
 			updateService.update.ExpectedVersion != 2 || updateService.update.ObservationSet != test.set {
 			t.Fatalf("PUT schedule body=%s status=%d command=%+v response=%s", test.body, response.Code, updateService.update, response.Body)
 		}
@@ -224,7 +226,7 @@ func TestScheduleRunsPaginationAndNonNullArrays(t *testing.T) {
 		Items      []json.RawMessage `json:"items"`
 		NextCursor json.RawMessage   `json:"next_cursor"`
 	}
-	if err := json.Unmarshal(response.Body.Bytes(), &runPage); err != nil || runPage.Items == nil || string(runPage.NextCursor) != "null" {
+	if err := json.Unmarshal(response.Body.Bytes(), &runPage); err != nil || runPage.Items == nil || string(runPage.NextCursor) != `""` {
 		t.Fatalf("run arrays/cursor are not normalized: %+v err=%v body=%s", runPage, err, response.Body)
 	}
 
@@ -257,8 +259,9 @@ func TestScheduleRejectsInvalidBodiesHeadersAndQueriesBeforeCallingService(t *te
 		{name: "missing create key", method: http.MethodPost, path: "/api/schedules", body: `{}`, contentType: "application/json"},
 		{name: "duplicate create key", method: http.MethodPost, path: "/api/schedules", body: `{}`, contentType: "application/json", keys: []string{"schedule-create-1", "schedule-create-2"}},
 		{name: "malformed create key", method: http.MethodPost, path: "/api/schedules", body: `{}`, contentType: "application/json", keys: []string{"short"}},
-		{name: "missing expected version", method: http.MethodPut, path: "/api/schedules/j1234567", body: `{"objective":"new"}`, contentType: "application/json"},
-		{name: "unknown observation field", method: http.MethodPut, path: "/api/schedules/j1234567", body: `{"expected_version":1,"observation":{"url":"https://example.com","selector":"main","field":"text","extra":1}}`, contentType: "application/json"},
+		{name: "missing update key", method: http.MethodPut, path: "/api/schedules/j1234567", body: `{"expected_version":1}`, contentType: "application/json"},
+		{name: "missing expected version", method: http.MethodPut, path: "/api/schedules/j1234567", body: `{"objective":"new"}`, contentType: "application/json", keys: []string{"schedule-update-1"}},
+		{name: "unknown observation field", method: http.MethodPut, path: "/api/schedules/j1234567", body: `{"expected_version":1,"observation":{"url":"https://example.com","selector":"main","field":"text","extra":1}}`, contentType: "application/json", keys: []string{"schedule-update-1"}},
 		{name: "missing action key", method: http.MethodPost, path: "/api/schedules/j1234567/actions", body: `{"action":"disable","expected_version":1}`, contentType: "application/json"},
 		{name: "invalid schedule id", method: http.MethodGet, path: "/api/schedules/bad"},
 	}

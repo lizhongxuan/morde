@@ -12,6 +12,7 @@ const permissionOptions: { value: HostMemberPermission; title: string; descripti
   { value: 'desktop:control', title: '操作桌面', description: '可以点击和输入，也包含桌面查看权限。' },
   { value: 'terminal:control', title: '终端操作', description: '可以打开终端并运行命令。' },
   { value: 'mcp:control', title: 'MCP 操作', description: '可以通过 MCP 使用主机能力；对方还需要自己的有效 API Key。' },
+  { value: 'workspace:file:read', title: '读取工作区文件', description: '可以在只读 Workspace 页面浏览和下载已应用的文件；不包含桌面、终端或 MCP 权限。' },
 ];
 
 const permissionTitles = Object.fromEntries(permissionOptions.map(({ value, title }) => [value, title])) as Record<HostMemberPermission, string>;
@@ -59,6 +60,7 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
   });
 
   const canInvite = validUserID(userID) && permissions.length > 0 && !invite.isPending;
+  const grantsWorkspaceRead = inviteConfirmation?.permissions.includes('workspace:file:read') ?? false;
   const togglePermission = (permission: HostMemberPermission) => {
     setPermissions((current) => current.includes(permission)
       ? current.filter((value) => value !== permission)
@@ -140,7 +142,7 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
 
     {inviteConfirmation && <ConfirmDialog
       title="确认邀请共享成员"
-      description={`确认向账号 ${inviteConfirmation.userID} 授予：${inviteConfirmation.permissions.map((permission) => `${permission}（${permissionTitles[permission]}）`).join('、')}。桌面控制包含查看权限。此授权不包含工作区访问、主机管理或再次分享权限。`}
+      description={`确认向账号 ${inviteConfirmation.userID} 授予：${inviteConfirmation.permissions.map((permission) => `${permission}（${permissionTitles[permission]}）`).join('、')}。桌面控制包含查看权限。${grantsWorkspaceRead ? '工作区文件权限仅允许浏览和下载已应用的文件；不包含桌面、终端或 MCP 权限，也不包含主机管理或再次分享权限。' : '此授权不包含工作区访问、主机管理或再次分享权限。'}`}
       confirmLabel="确认授权"
       busy={invite.isPending}
       onClose={() => { if (!invite.isPending) setInviteConfirmation(null); }}

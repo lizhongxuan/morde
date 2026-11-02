@@ -50,8 +50,11 @@ func (g *gateway) consumeTicket(c *gin.Context) {
 		g.authFailure(c, "ticket")
 		return
 	}
-	if next == "/__ch/terminal" || next == "/__ch/terminal/" {
+	switch next {
+	case "/__ch/terminal", "/__ch/terminal/":
 		permission = host.PermissionTerminalControl
+	case "/__ch/wb/?tab=workspace":
+		permission = host.PermissionWorkspaceFileRead
 	}
 	owner, authErr := g.deps.HostSharing.Authorize(c.Request.Context(), ticket.HostID, ticket.ActorUserID, permission)
 	if authErr != nil || owner != (ticket.ActorUserID == ticket.UserID) {

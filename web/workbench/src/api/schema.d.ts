@@ -3005,6 +3005,10 @@ export interface components {
              * @description For Host replica downloads and bidirectional sync
              */
             base_revision: number;
+            /** @description Paired with task_hub_operation_key; accepted only for a device upload scoped to one file. */
+            task_id?: string;
+            /** @description Durable Hub operation key associated with this Task write. */
+            task_hub_operation_key?: string;
             scope?: string[];
             files: components["schemas"]["WorkspaceFile"][];
             empty_directories?: string[];

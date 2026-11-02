@@ -37,6 +37,24 @@ func validClarificationQuestion(value string) bool {
 	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00') && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 4096
 }
 
+const taskHubWorkspaceSyncClaimPredicate = `(t.status='waiting_user' AND t.waiting_reason='task_hub_workspace_sync' AND EXISTS (
+  SELECT 1 FROM task_hub_operations settled
+  JOIN task_events wait_event ON wait_event.task_id=t.id AND wait_event.sequence=t.event_seq
+  JOIN workspace_sync_sessions sync_session ON sync_session.workspace_id=settled.workspace_id AND sync_session.id=settled.sync_session_id
+  WHERE settled.owner_id=t.owner_id AND settled.task_id=t.id AND settled.action='file.put'
+    AND settled.status='succeeded' AND settled.sync_stage='cloud_synced'
+    AND wait_event.event_type='task.waiting_user'
+    AND wait_event.payload#>>'{detail,operation_key}'=settled.operation_key
+    AND sync_session.task_id=settled.task_id AND sync_session.task_hub_operation_key=settled.operation_key
+    AND sync_session.state='completed' AND sync_session.target_revision=settled.sync_revision
+    AND sync_session.replica_id='device:'||settled.target_installation_id
+) AND NOT EXISTS (
+  SELECT 1 FROM task_hub_operations active
+  WHERE active.owner_id=t.owner_id AND active.task_id=t.id AND active.action='file.put'
+    AND active.status IN ('prepared','dispatched','unknown')
+    AND active.sync_stage IN ('pending','local_applied','sync_pending')
+))`
+
 func (s *Store) withTaskSnapshot(ctx context.Context, fn func(pgx.Tx) error) error {
 	return withTx(ctx, func(ctx context.Context) (pgx.Tx, error) {
 		return s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -436,6 +454,7 @@ func (s *Store) claimNextTask(ctx context.Context, worker string, leaseDuration 
 		err := tx.QueryRow(ctx, `
 SELECT t.owner_id, t.execution_epoch FROM tasks AS t
 WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
+  `+taskHubWorkspaceSyncClaimPredicate+` OR
   (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
     SELECT 1 FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
     WHERE wb.host_id=t.host_id AND wb.workspace_id=t.workspace_id
@@ -499,6 +518,7 @@ LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&own
 SELECT t.id, COALESCE(t.host_id,''), t.lease_version FROM tasks AS t
 WHERE t.owner_id=$1 AND t.execution_epoch=$2
   AND (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
+    `+taskHubWorkspaceSyncClaimPredicate+` OR
     (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
       SELECT 1 FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
       WHERE wb.host_id=t.host_id AND wb.workspace_id=t.workspace_id
@@ -566,6 +586,16 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 			ready, err := workspaceTaskHostSyncReady(ctx, tx, taskRow)
 			if err != nil {
 				return err
+			}
+			if !ready {
+				return nil
+			}
+		}
+		if taskRow.Status == string(task.StatusWaitingUser) && taskRow.WaitingReason == "task_hub_workspace_sync" {
+			var ready bool
+			if err := tx.QueryRow(ctx, `SELECT `+taskHubWorkspaceSyncClaimPredicate+`
+FROM tasks AS t WHERE t.id=$1 AND t.owner_id=$2`, id, ownerID).Scan(&ready); err != nil {
+				return fmt.Errorf("recheck Task Hub Workspace sync before claim: %w", err)
 			}
 			if !ready {
 				return nil

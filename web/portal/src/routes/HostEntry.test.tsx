@@ -15,6 +15,27 @@ it('obtains a shared terminal ticket only for a currently permitted host', async
   expect(ticket).toHaveBeenCalledWith('h1234567', 'terminal');
 });
 
+it('opens a workspace-only shared host on the fixed read-only Workspace tab', async () => {
+  vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: 'h1234567', name: '共享电脑', state: 'running', url: hostURL, permissions: ['workspace:file:read'] }] });
+  const destination = `${hostURL}/__ch/auth?t=one-time&next=%2F__ch%2Fwb%2F%3Ftab%3Dworkspace`;
+  const ticket = vi.spyOn(portalApi, 'issueObservationTicket').mockResolvedValue({ url: destination, expires_at: '2027-10-25T00:01:00Z' });
+  expect(await fetchEntryURL('h1234567', 'workspace')).toBe(destination);
+  expect(ticket).toHaveBeenCalledWith('h1234567', 'workspace');
+});
+
+it('does not infer Workspace file access from desktop sharing', async () => {
+  vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: 'h1234567', name: '共享电脑', state: 'running', url: hostURL, permissions: ['desktop:view'] }] });
+  const ticket = vi.spyOn(portalApi, 'issueObservationTicket');
+  await expect(fetchEntryURL('h1234567', 'workspace')).rejects.toThrow('这台共享电脑已不可访问');
+  expect(ticket).not.toHaveBeenCalled();
+});
+
+it('rejects a workspace ticket that does not enter the fixed Workspace tab', async () => {
+  vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: 'h1234567', name: '共享电脑', state: 'running', url: hostURL, permissions: ['workspace:file:read'] }] });
+  vi.spyOn(portalApi, 'issueObservationTicket').mockResolvedValue({ url: `${hostURL}/__ch/auth?t=x&next=%2F__ch%2Fwb%2F%3Ftab%3Dbrowser`, expires_at: '2027-10-25T00:01:00Z' });
+  await expect(fetchEntryURL('h1234567', 'workspace')).rejects.toThrow('服务器返回了无效的云端电脑入口');
+});
+
 it('rejects a revoked shared permission before issuing a ticket', async () => {
   vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: 'h1234567', name: '共享电脑', state: 'running', url: hostURL, permissions: ['terminal:control'] }] });
   const ticket = vi.spyOn(portalApi, 'issueObservationTicket');

@@ -248,10 +248,10 @@ VALUES ($1,$2,$3,$4,1,0,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,'prepared')`,
 	}
 }
 
-func TestTaskWorkspacePublishPersistsCASConflict(t *testing.T) {
+func TestTaskWorkspacePublishBlocksSyncUntilPublishSettles(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-cas")
+	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-sync-barrier")
 	service, _ := taskWorkspacePublishTestService(t, store)
 	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
 		t.Fatal(err)
@@ -259,26 +259,31 @@ func TestTaskWorkspacePublishPersistsCASConflict(t *testing.T) {
 	external := syncTestFile("reports/result.txt", []byte("same content"))
 	session := newTestSyncSession(t, workspaceValue, command.OwnerID, []workspace.File{external}, []workspace.File{external}, nil)
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
-		syncTestIdempotency(command.OwnerID, "workspace.sync.create", "task-publish-cas:create", session.ID)); err != nil {
+		syncTestIdempotency(command.OwnerID, "workspace.sync.create", "task-publish-sync-barrier:create", session.ID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
-		syncTestIdempotency(command.OwnerID, "workspace.sync.commit", "task-publish-cas:commit", session.ID)); err != nil {
-		t.Fatal(err)
+		syncTestIdempotency(command.OwnerID, "workspace.sync.commit", "task-publish-sync-barrier:commit", session.ID)); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("sync commit during pending Task publish = %v; want Workspace busy", err)
 	}
-	file := syncTestFile("reports/result.txt", []byte("same content"))
+	file := syncTestFile("reports/task.txt", []byte("task output"))
 	manifestSHA, _ := workspace.ManifestSHA256([]workspace.File{file})
-	_, err := store.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, manifestSHA)
-	if domain.CodeOf(err) != domain.CodeWorkspaceConflict {
-		t.Fatalf("Task publish after PC revision change = %v; want Workspace conflict", err)
+	published, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+		if digest != file.SHA256 {
+			t.Fatalf("Task publish requested block %q; want %q", digest, file.SHA256)
+		}
+		return []byte("task output"), nil
+	})
+	if err != nil || published.State != app.TaskWorkspacePublishSucceeded || published.PublishedRevision != 1 {
+		t.Fatalf("Task publish after blocked sync = %#v, err=%v", published, err)
 	}
 	receipt, err := store.FindTaskWorkspacePublishReceipt(ctx, command.OwnerID, command.TaskID, command.WorkspaceID, command.OperationKey)
-	if err != nil || receipt.State != app.TaskWorkspacePublishConflict {
-		t.Fatalf("CAS conflict receipt = %#v, err=%v", receipt, err)
+	if err != nil || receipt.State != app.TaskWorkspacePublishSucceeded {
+		t.Fatalf("Task publish receipt = %#v, err=%v", receipt, err)
 	}
 	page, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, 1, "", "", 10)
 	if err != nil || len(page.Files) != 1 || page.Files[0].Path != file.Path || page.Files[0].SHA256 != file.SHA256 {
-		t.Fatalf("PC revision after Task publish conflict = %#v, err=%v", page, err)
+		t.Fatalf("Workspace revision after Task publish = %#v, err=%v", page, err)
 	}
 }
 

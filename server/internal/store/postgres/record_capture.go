@@ -15,7 +15,31 @@ import (
 	"morde/server/internal/domain/record"
 )
 
+const maxPendingRecordCapturesPerOwner int64 = 100
+
 func (s *Store) EnqueueRecordCapture(ctx context.Context, principal identity.Principal, input record.CaptureInput) (record.QueueItem, error) {
+	return s.enqueueRecordCapture(ctx, principal, input, 0)
+}
+
+func (s *Store) EnqueueRecordCaptureAtConsentVersion(ctx context.Context, principal identity.Principal, input record.CaptureInput,
+	expectedConsentVersion int64) (record.QueueItem, error) {
+	if expectedConsentVersion < 1 {
+		return record.QueueItem{}, domain.InvalidArgument("consent_version", "record consent version is invalid")
+	}
+	if err := record.ValidateCapture(input); err != nil {
+		if domain.ValidTaskID(input.TaskID) && input.Purpose.Valid() && input.Kind.Valid() &&
+			((input.Purpose == record.PurposeFullRecord && input.Kind == record.ItemTurn) ||
+				(input.Purpose == record.PurposeTrainingContribution && input.Kind == record.ItemSample)) {
+			item, rejectErr := s.RejectRecordCaptureAtConsentVersion(ctx, principal, input.TaskID, input.Purpose, input.Kind, expectedConsentVersion)
+			return item, errors.Join(err, rejectErr)
+		}
+		return record.QueueItem{}, err
+	}
+	return s.enqueueRecordCapture(ctx, principal, input, expectedConsentVersion)
+}
+
+func (s *Store) enqueueRecordCapture(ctx context.Context, principal identity.Principal, input record.CaptureInput,
+	expectedConsentVersion int64) (record.QueueItem, error) {
 	if err := record.ValidateCapture(input); err != nil {
 		return record.QueueItem{}, err
 	}
@@ -35,16 +59,25 @@ func (s *Store) EnqueueRecordCapture(ctx context.Context, principal identity.Pri
 		totalBytes += int64(len(attachment.Content))
 	}
 	var item record.QueueItem
-	item.ID = queueID
+	var enqueueFailure error
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := authorizeRecordUserInTx(ctx, tx, principal); err != nil {
 			return err
+		}
+		if input.TaskID != "" {
+			if existing, found, err := recordCaptureForTaskTx(ctx, tx, principal.UserID, input.TaskID, input.Purpose); err != nil {
+				return err
+			} else if found {
+				item = existing
+				return nil
+			}
 		}
 		var enabled bool
 		var consentVersion int64
 		err := tx.QueryRow(ctx, `SELECT enabled,version FROM record_consents
 WHERE owner_id=$1 AND purpose=$2 FOR SHARE`, principal.UserID, string(input.Purpose)).Scan(&enabled, &consentVersion)
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !enabled) {
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!enabled ||
+			(expectedConsentVersion != 0 && consentVersion != expectedConsentVersion))) {
 			item = record.QueueItem{}
 			return nil
 		}
@@ -60,8 +93,13 @@ WHERE owner_id=$1 AND purpose=$2 FOR SHARE`, principal.UserID, string(input.Purp
 FROM record_quotas WHERE owner_id=$1 FOR UPDATE`, principal.UserID).Scan(&retentionDays, &limitBytes, &usedBytes, &reservedBytes); err != nil {
 			return fmt.Errorf("lock record quota for capture: %w", err)
 		}
-		if usedBytes > limitBytes || reservedBytes > limitBytes-usedBytes || totalBytes > limitBytes-usedBytes-reservedBytes {
-			return domain.NewError(domain.CodeQuotaExceeded, "optional record capture quota is full")
+		if input.TaskID != "" {
+			if existing, found, err := recordCaptureForTaskTx(ctx, tx, principal.UserID, input.TaskID, input.Purpose); err != nil {
+				return err
+			} else if found {
+				item = existing
+				return nil
+			}
 		}
 		capturedAt := time.Now().UTC()
 		expiresAt := capturedAt.AddDate(0, 0, int(retentionDays))
@@ -69,10 +107,31 @@ FROM record_quotas WHERE owner_id=$1 FOR UPDATE`, principal.UserID).Scan(&retent
 		if principal.Kind == identity.KindClient {
 			installationID = principal.ClientInstallationID
 		}
+		var pendingCount int64
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM record_capture_queue
+WHERE owner_id=$1 AND state IN ('queued','leased')`, principal.UserID).Scan(&pendingCount); err != nil {
+			return fmt.Errorf("count pending record captures: %w", err)
+		}
+		if pendingCount >= maxPendingRecordCapturesPerOwner {
+			enqueueFailure = domain.NewError(domain.CodeQuotaExceeded, "optional record capture queue is full")
+			if input.TaskID == "" {
+				return enqueueFailure
+			}
+			return insertFailedRecordCaptureTx(ctx, tx, &item, queueID, principal, input.TaskID, input.Purpose,
+				input.Kind, consentVersion, installationID, capturedAt, expiresAt, "queue_full")
+		}
+		if usedBytes > limitBytes || reservedBytes > limitBytes-usedBytes || totalBytes > limitBytes-usedBytes-reservedBytes {
+			enqueueFailure = domain.NewError(domain.CodeQuotaExceeded, "optional record capture quota is full")
+			if input.TaskID == "" {
+				return enqueueFailure
+			}
+			return insertFailedRecordCaptureTx(ctx, tx, &item, queueID, principal, input.TaskID, input.Purpose,
+				input.Kind, consentVersion, installationID, capturedAt, expiresAt, "quota_exceeded")
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO record_capture_queue
-  (id,owner_id,purpose,item_kind,consent_version,captured_by_installation,captured_at,expires_at,payload,reserved_bytes,state)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'queued')`, queueID, principal.UserID, string(input.Purpose),
-			string(input.Kind), consentVersion, installationID, capturedAt, expiresAt, input.Payload, totalBytes)
+  (id,owner_id,purpose,item_kind,source_task_id,consent_version,captured_by_installation,captured_at,expires_at,payload,reserved_bytes,state)
+VALUES ($1,$2,$3,$4,NULLIF($5,''),$6,$7,$8,$9,$10,$11,'queued')`, queueID, principal.UserID, string(input.Purpose),
+			string(input.Kind), input.TaskID, consentVersion, installationID, capturedAt, expiresAt, input.Payload, totalBytes)
 		if err != nil {
 			return fmt.Errorf("enqueue optional record capture: %w", err)
 		}
@@ -95,6 +154,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7)`, attachmentIDs[index], queueID, attachment.FileNa
 		}
 		item = record.QueueItem{
 			ID: queueID, OwnerID: principal.UserID, Purpose: input.Purpose, Kind: input.Kind,
+			TaskID:         input.TaskID,
 			ConsentVersion: consentVersion, CapturedAt: capturedAt, ExpiresAt: expiresAt,
 			ReservedBytes: totalBytes, State: record.QueueQueued,
 		}
@@ -106,7 +166,169 @@ VALUES ($1,$2,$3,$4,$5,$6,$7)`, attachmentIDs[index], queueID, attachment.FileNa
 	if err != nil {
 		return record.QueueItem{}, err
 	}
+	return item, enqueueFailure
+}
+
+func (s *Store) RejectRecordCapture(ctx context.Context, principal identity.Principal, taskID string, purpose record.Purpose, kind record.ItemKind) (record.QueueItem, error) {
+	return s.rejectRecordCapture(ctx, principal, taskID, purpose, kind, 0)
+}
+
+func (s *Store) RejectRecordCaptureAtConsentVersion(ctx context.Context, principal identity.Principal, taskID string,
+	purpose record.Purpose, kind record.ItemKind, expectedConsentVersion int64) (record.QueueItem, error) {
+	if expectedConsentVersion < 1 {
+		return record.QueueItem{}, domain.InvalidArgument("consent_version", "record consent version is invalid")
+	}
+	return s.rejectRecordCapture(ctx, principal, taskID, purpose, kind, expectedConsentVersion)
+}
+
+func (s *Store) rejectRecordCapture(ctx context.Context, principal identity.Principal, taskID string, purpose record.Purpose,
+	kind record.ItemKind, expectedConsentVersion int64) (record.QueueItem, error) {
+	if !domain.ValidTaskID(taskID) || !purpose.Valid() || !kind.Valid() ||
+		(purpose == record.PurposeFullRecord && kind != record.ItemTurn) ||
+		(purpose == record.PurposeTrainingContribution && kind != record.ItemSample) {
+		return record.QueueItem{}, domain.InvalidArgument("record_capture", "record capture failure identity is invalid")
+	}
+	queueID, err := record.NewQueueItemID()
+	if err != nil {
+		return record.QueueItem{}, err
+	}
+	var item record.QueueItem
+	err = s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := authorizeRecordUserInTx(ctx, tx, principal); err != nil {
+			return err
+		}
+		if existing, found, err := recordCaptureForTaskTx(ctx, tx, principal.UserID, taskID, purpose); err != nil {
+			return err
+		} else if found {
+			item = existing
+			return nil
+		}
+		var enabled bool
+		var consentVersion int64
+		err := tx.QueryRow(ctx, `SELECT enabled,version FROM record_consents
+WHERE owner_id=$1 AND purpose=$2 FOR SHARE`, principal.UserID, string(purpose)).Scan(&enabled, &consentVersion)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!enabled ||
+			(expectedConsentVersion != 0 && consentVersion != expectedConsentVersion))) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read record consent for rejected capture: %w", err)
+		}
+		if err := ensureRecordQuotaTx(ctx, tx, principal.UserID); err != nil {
+			return err
+		}
+		var retentionDays int32
+		if err := tx.QueryRow(ctx, `SELECT retention_days FROM record_quotas WHERE owner_id=$1 FOR UPDATE`, principal.UserID).Scan(&retentionDays); err != nil {
+			return fmt.Errorf("lock record quota for rejected capture: %w", err)
+		}
+		if existing, found, err := recordCaptureForTaskTx(ctx, tx, principal.UserID, taskID, purpose); err != nil {
+			return err
+		} else if found {
+			item = existing
+			return nil
+		}
+		capturedAt := time.Now().UTC()
+		var installationID any
+		if principal.Kind == identity.KindClient {
+			installationID = principal.ClientInstallationID
+		}
+		return insertFailedRecordCaptureTx(ctx, tx, &item, queueID, principal, taskID, purpose, kind,
+			consentVersion, installationID, capturedAt, capturedAt.AddDate(0, 0, int(retentionDays)), "content_rejected")
+	})
+	if err != nil {
+		return record.QueueItem{}, err
+	}
 	return item, nil
+}
+
+func recordCaptureForTaskTx(ctx context.Context, tx pgx.Tx, ownerID, taskID string, purpose record.Purpose) (record.QueueItem, bool, error) {
+	var item record.QueueItem
+	err := tx.QueryRow(ctx, `SELECT id,owner_id,purpose,item_kind,source_task_id,failure_code,consent_version,
+COALESCE(captured_by_installation,''),captured_at,expires_at,reserved_bytes,state,COALESCE(lease_owner,''),lease_version,attempts
+FROM record_capture_queue WHERE owner_id=$1 AND source_task_id=$2 AND purpose=$3 FOR SHARE`, ownerID, taskID, string(purpose)).Scan(
+		&item.ID, &item.OwnerID, &item.Purpose, &item.Kind, &item.TaskID, &item.FailureCode, &item.ConsentVersion,
+		&item.CapturedByInstallation, &item.CapturedAt, &item.ExpiresAt, &item.ReservedBytes, &item.State,
+		&item.LeaseOwner, &item.LeaseVersion, &item.Attempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return record.QueueItem{}, false, nil
+	}
+	if err != nil {
+		return record.QueueItem{}, false, fmt.Errorf("read prior task record capture: %w", err)
+	}
+	return item, true, nil
+}
+
+func insertFailedRecordCaptureTx(ctx context.Context, tx pgx.Tx, item *record.QueueItem, queueID string, principal identity.Principal,
+	taskID string, purpose record.Purpose, kind record.ItemKind, consentVersion int64, installationID any,
+	capturedAt, expiresAt time.Time, failureCode string) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO record_capture_queue
+  (id,owner_id,purpose,item_kind,source_task_id,consent_version,captured_by_installation,captured_at,expires_at,payload,reserved_bytes,state,failure_code)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,decode('','hex'),0,'failed',$10)`, queueID, principal.UserID, string(purpose),
+		string(kind), taskID, consentVersion, installationID, capturedAt, expiresAt, failureCode); err != nil {
+		return fmt.Errorf("record failed optional capture status: %w", err)
+	}
+	*item = record.QueueItem{
+		ID: queueID, OwnerID: principal.UserID, Purpose: purpose, Kind: kind, TaskID: taskID,
+		FailureCode: failureCode, ConsentVersion: consentVersion, CapturedAt: capturedAt,
+		ExpiresAt: expiresAt, State: record.QueueFailed,
+	}
+	if principal.Kind == identity.KindClient {
+		item.CapturedByInstallation = principal.ClientInstallationID
+	}
+	return nil
+}
+
+func (s *Store) ListRecordCaptureStatuses(ctx context.Context, principal identity.Principal, query record.CaptureStatusQuery) (record.CaptureStatusPage, error) {
+	if query.Limit < 1 || query.Limit > 100 || (query.BeforeID != "" && !record.ValidQueueItemID(query.BeforeID)) {
+		return record.CaptureStatusPage{}, domain.InvalidArgument("record_capture_status", "capture status query is invalid")
+	}
+	page := record.CaptureStatusPage{Items: make([]record.CaptureStatus, 0, query.Limit)}
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := authorizeRecordUserInTx(ctx, tx, principal); err != nil {
+			return err
+		}
+		var beforeAt *time.Time
+		if query.BeforeID != "" {
+			var capturedAt time.Time
+			if err := tx.QueryRow(ctx, `SELECT captured_at FROM record_capture_queue
+WHERE id=$1 AND owner_id=$2 AND source_task_id IS NOT NULL`, query.BeforeID, principal.UserID).Scan(&capturedAt); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return domain.NewError(domain.CodeNotFound, "record capture status cursor was not found")
+				}
+				return fmt.Errorf("read record capture status cursor: %w", err)
+			}
+			beforeAt = &capturedAt
+		}
+		rows, err := tx.Query(ctx, `SELECT id,source_task_id,purpose,item_kind,state,failure_code,captured_at,expires_at
+FROM record_capture_queue WHERE owner_id=$1 AND source_task_id IS NOT NULL
+  AND ($2::timestamptz IS NULL OR (captured_at,id) < ($2,$3))
+ORDER BY captured_at DESC,id DESC LIMIT $4`, principal.UserID, beforeAt, query.BeforeID, query.Limit+1)
+		if err != nil {
+			return fmt.Errorf("list record capture statuses: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var item record.CaptureStatus
+			if err := rows.Scan(&item.ID, &item.TaskID, &item.Purpose, &item.Kind, &item.State,
+				&item.FailureCode, &item.CapturedAt, &item.ExpiresAt); err != nil {
+				return fmt.Errorf("scan record capture status: %w", err)
+			}
+			page.Items = append(page.Items, item)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("read record capture statuses: %w", err)
+		}
+		rows.Close()
+		if len(page.Items) > int(query.Limit) {
+			page.Items = page.Items[:query.Limit]
+			page.NextBefore = page.Items[len(page.Items)-1].ID
+		}
+		return nil
+	})
+	if err != nil {
+		return record.CaptureStatusPage{}, err
+	}
+	return page, nil
 }
 
 func (s *Store) ClaimRecordCaptures(ctx context.Context, worker string, now time.Time, lease time.Duration, limit int32) ([]record.QueueItem, error) {
@@ -259,7 +481,7 @@ FROM record_capture_queue_attachments WHERE queue_item_id=$1`, queueID, recordID
 		}
 		result, err := tx.Exec(ctx, `UPDATE record_quotas SET reserved_bytes=reserved_bytes-$2,
   used_bytes=used_bytes+$2,updated_at=clock_timestamp()
-WHERE owner_id=$1 AND reserved_bytes >= $2 AND used_bytes <= limit_bytes-$2`, item.OwnerID, item.ReservedBytes)
+WHERE owner_id=$1 AND reserved_bytes >= $2`, item.OwnerID, item.ReservedBytes)
 		if err != nil {
 			return fmt.Errorf("convert record reservation to usage: %w", err)
 		}

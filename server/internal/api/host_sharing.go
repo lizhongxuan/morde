@@ -179,6 +179,8 @@ func (h *api) issueObservationTicket(c *gin.Context) {
 		info, err = h.deps.HostSharing.IssueObservationTicket(c.Request.Context(), principal, hostID)
 	case "terminal":
 		info, err = h.deps.HostSharing.IssueTerminalTicket(c.Request.Context(), principal, hostID)
+	case "workspace":
+		info, err = h.deps.HostSharing.IssueWorkspaceTicket(c.Request.Context(), principal, hostID)
 	default:
 		writeError(c, domain.InvalidArgument("target", "ticket target is invalid"))
 		return

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -98,8 +99,8 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 	if err := store.pool.QueryRow(ctx, `SELECT auth_kind,execution_epoch FROM tasks WHERE id=$1`, *run.TaskID).Scan(&authKind, &executionEpoch); err != nil {
 		t.Fatal(err)
 	}
-	if authKind != string(identity.KindSession) || executionEpoch != value.ExecutionEpoch {
-		t.Fatalf("scheduled task authorization/epoch = %s/%d, want session/%d", authKind, executionEpoch, value.ExecutionEpoch)
+	if authKind != string(identity.KindScheduleTask) || executionEpoch != value.ExecutionEpoch {
+		t.Fatalf("scheduled task authorization/epoch = %s/%d, want schedule_task/%d", authKind, executionEpoch, value.ExecutionEpoch)
 	}
 	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
 	if err != nil || loaded.Status != schedule.StatusCompleted || loaded.Version != value.Version+1 || loaded.LastRun == nil || loaded.LastRun.ID != run.ID {
@@ -120,6 +121,57 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 	}
 }
 
+func TestPostgresScheduleOccurrenceMustMatchCurrentOccurrence(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	base := schedule.Occurrence{Key: value.NextOccurrenceKey, ScheduledAt: value.NextRunAt, CheckAt: *value.NextCheckAt, Status: schedule.RunQueued}
+	invalid := []struct {
+		name   string
+		mutate func(*schedule.Occurrence)
+	}{
+		{name: "key", mutate: func(value *schedule.Occurrence) { value.Key += ":later" }},
+		{name: "scheduled instant", mutate: func(value *schedule.Occurrence) {
+			shifted := value.ScheduledAt.Add(time.Second)
+			value.ScheduledAt = &shifted
+		}},
+		{name: "check instant", mutate: func(value *schedule.Occurrence) { value.CheckAt = value.CheckAt.Add(time.Second) }},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			occurrence := base
+			test.mutate(&occurrence)
+			_, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+				ScheduleID: value.ID, OwnerID: owner.ID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+				Occurrence: occurrence, NotificationEvents: []schedule.NotificationEvent{schedule.NotifyCompleted},
+			})
+			if err != nil || committed {
+				t.Fatalf("commit mismatched occurrence = committed %t, err=%v", committed, err)
+			}
+		})
+	}
+	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
+	if err != nil || loaded.Status != schedule.StatusEnabled || loaded.Version != value.Version ||
+		loaded.NextOccurrenceKey != value.NextOccurrenceKey || loaded.LastRun != nil {
+		t.Fatalf("schedule after mismatched occurrences = %#v, %v", loaded, err)
+	}
+	var runs, tasks int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM schedule_runs WHERE schedule_id=$1`, value.ID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE owner_id=$1`, owner.ID).Scan(&tasks); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 || tasks != 0 {
+		t.Fatalf("mismatched occurrences created %d runs and %d tasks", runs, tasks)
+	}
+}
+
 func TestPostgresScheduleObservationConfigAndRunSnapshotPersist(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -131,7 +183,9 @@ func TestPostgresScheduleObservationConfigAndRunSnapshotPersist(t *testing.T) {
 		[]schedule.NotificationEvent{schedule.NotifyCompleted})
 	observation := &schedule.ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: schedule.ObservationText}
 	value.Observation, value.ObservationConfigHash = observation, observation.ConfigHash()
-	updated, err := store.UpdateSchedule(ctx, owner.ID, value, value.Version)
+	record := testIdempotency(owner.ID, "schedule.update", "schedule-observation-update")
+	record.ResourceID = value.ID
+	updated, err := store.UpdateSchedule(ctx, owner.ID, record, value, value.Version)
 	if err != nil || updated.Observation == nil || updated.Observation.ConfigHash() != updated.ObservationConfigHash {
 		t.Fatalf("persist schedule observation = %#v, %v", updated, err)
 	}
@@ -222,14 +276,27 @@ func TestPostgresSkippedScheduleDoesNotBlockLaterDueSchedules(t *testing.T) {
 	revokedTime := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
 	revokedTiming := schedule.Timing{Kind: schedule.TimingOnce, RunAt: revokedTime.Format(time.RFC3339), TimeZone: "UTC"}
 	revoked, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, revokedTiming, schedule.MisfireSkip, events)
-	if _, err := store.pool.Exec(ctx, `UPDATE schedules SET auth_kind='api_key',auth_token_id=$2,auth_scopes=$3 WHERE id=$1`,
-		revoked.ID, "t1234567", []string{string(identity.ScopeScheduleManage)}); err != nil {
-		t.Fatal(err)
-	}
 
 	validTime := revokedTime.Add(time.Second)
 	validTiming := schedule.Timing{Kind: schedule.TimingOnce, RunAt: validTime.Format(time.RFC3339), TimeZone: "UTC"}
 	valid, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, validTiming, schedule.MisfireSkip, events)
+	validTokenID, err := domain.NewTokenID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validTokenHash := sha256.Sum256([]byte("schedule-test-session:" + validTokenID))
+	if _, err := store.CreateToken(ctx, identity.Token{
+		ID: validTokenID, OwnerID: owner.ID, Kind: identity.KindSession, SecretHash: validTokenHash[:],
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE schedules SET auth_token_id=$2 WHERE id=$1`, valid.ID, validTokenID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=clock_timestamp() WHERE id=$1`, testSessionTokenID(owner.ID)); err != nil {
+		t.Fatal(err)
+	}
 
 	// The scheduler is not currently wired; this checks the storage boundary for its decision.
 	for _, value := range []schedule.Schedule{revoked, valid} {
@@ -364,11 +431,39 @@ func TestPostgresScheduleEnableDisableUsesOptimisticVersionAndRecomputesNextRun(
 	}
 }
 
+func TestPostgresEveryNHoursTimingPersistsAndRestartsAfterEnable(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	timing := schedule.Timing{Kind: schedule.TimingEveryNHours, IntervalHours: 6, TimeZone: "America/New_York"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyWaitingUser})
+	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
+	if err != nil || loaded.Timing.Kind != schedule.TimingEveryNHours || loaded.Timing.IntervalHours != 6 ||
+		loaded.Timing.TimeZone != "America/New_York" {
+		t.Fatalf("persisted every-N-hours timing = %#v, %v", loaded.Timing, err)
+	}
+	disabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "every-n-hours-disable"), value.ID,
+		schedule.StatusDisabled, loaded.Version, loaded.Authorization)
+	if err != nil {
+		t.Fatalf("disable every-N-hours schedule: %v", err)
+	}
+	beforeEnable := time.Now().UTC()
+	enabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "every-n-hours-enable"), value.ID,
+		schedule.StatusEnabled, disabled.Version, disabled.Authorization)
+	if err != nil || enabled.NextCheckAt == nil || enabled.Timing.IntervalHours != 6 ||
+		enabled.NextCheckAt.Before(beforeEnable.Add(time.Minute-time.Second)) ||
+		enabled.NextCheckAt.After(beforeEnable.Add(time.Minute+time.Second)) {
+		t.Fatalf("re-enabled every-N-hours schedule = %#v, %v", enabled, err)
+	}
+}
+
 func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	timing := schedule.Timing{
 		Kind: schedule.TimingDaily, StartsOn: time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"),
@@ -379,11 +474,23 @@ func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *
 	assertScheduleSyncRevision(t, store, owner.ID, value.ID, value.Version, 1)
 
 	value.Objective = "updated scheduled objective"
-	updated, err := store.UpdateSchedule(ctx, owner.ID, value, value.Version)
+	updateRecord := testIdempotency(owner.ID, "schedule.update", "schedule-sync-update-key")
+	updateRecord.ResourceID = value.ID
+	updated, err := store.UpdateSchedule(ctx, owner.ID, updateRecord, value, value.Version)
 	if err != nil || updated.Version != value.Version+1 {
 		t.Fatalf("update schedule definition = %#v, %v", updated, err)
 	}
 	assertScheduleSyncRevision(t, store, owner.ID, updated.ID, updated.Version, 2)
+	replayed, err := store.UpdateSchedule(ctx, owner.ID, updateRecord, value, value.Version)
+	if err != nil || replayed.ID != updated.ID || replayed.Version != updated.Version || replayed.Objective != updated.Objective {
+		t.Fatalf("replayed schedule update = %#v, %v", replayed, err)
+	}
+	assertScheduleSyncRevision(t, store, owner.ID, updated.ID, updated.Version, 2)
+	conflictingRecord := updateRecord
+	conflictingRecord.RequestHash = hashBytes("schedule.update:different-body")
+	if _, err := store.UpdateSchedule(ctx, owner.ID, conflictingRecord, value, value.Version); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("schedule update key reuse error = %v, want idempotency_conflict", err)
+	}
 
 	disabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, updated.ID, "sync-disable-key"), updated.ID,
 		schedule.StatusDisabled, updated.Version, updated.Authorization)
@@ -439,8 +546,8 @@ func TestPostgresScheduleDefinitionChangeRollbackAndOwnerIsolation(t *testing.T)
 	ctx := context.Background()
 	ownerA := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	ownerB := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	principalA := createPersonalReadSessionPrincipal(t, store, ownerA.ID)
-	principalB := createPersonalReadSessionPrincipal(t, store, ownerB.ID)
+	principalA := identity.Principal{UserID: ownerA.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(ownerA.ID)}
+	principalB := identity.Principal{UserID: ownerB.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(ownerB.ID)}
 	hostA := createRunningControlHost(t, ctx, store, ownerA.ID, "ai", 0)
 	hostB := createRunningControlHost(t, ctx, store, ownerB.ID, "ai", 0)
 	timing := schedule.Timing{Kind: schedule.TimingDaily,
@@ -455,8 +562,15 @@ func TestPostgresScheduleDefinitionChangeRollbackAndOwnerIsolation(t *testing.T)
 	}
 	changed := scheduleA
 	changed.Objective = "must roll back"
-	if _, err := store.UpdateSchedule(ctx, ownerA.ID, changed, scheduleA.Version); domain.CodeOf(err) != domain.CodeInvalidState {
+	updateRecord := testIdempotency(ownerA.ID, "schedule.update", "schedule-sync-overflow-key")
+	updateRecord.ResourceID = scheduleA.ID
+	if _, err := store.UpdateSchedule(ctx, ownerA.ID, updateRecord, changed, scheduleA.Version); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("schedule update with exhausted change sequence error = %v, want invalid_state", err)
+	}
+	var idempotencyRows int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM idempotency_keys
+WHERE owner_id=$1 AND operation=$2 AND key=$3`, updateRecord.OwnerID, updateRecord.Operation, updateRecord.Key).Scan(&idempotencyRows); err != nil || idempotencyRows != 0 {
+		t.Fatalf("failed update idempotency row count = %d, want 0, err=%v", idempotencyRows, err)
 	}
 	rolledBack, err := store.GetSchedule(ctx, ownerA.ID, scheduleA.ID)
 	if err != nil || rolledBack.Version != scheduleA.Version || rolledBack.Objective != scheduleA.Objective {

@@ -275,6 +275,11 @@ func (s *Store) ListRecordMetadata(ctx context.Context, principal identity.Princ
 			if err := authorizeRecordUserInTx(ctx, tx, principal); err != nil {
 				return err
 			}
+			if query.Purpose.Valid() {
+				if err := requireRecordConsentTx(ctx, tx, ownerID, query.Purpose); err != nil {
+					return err
+				}
+			}
 		} else {
 			if err := recheckRecordAdminInTx(ctx, tx, principal, false); err != nil {
 				return err
@@ -290,11 +295,12 @@ func (s *Store) ListRecordMetadata(ctx context.Context, principal identity.Princ
 			rows, err = tx.Query(ctx, `SELECT e.id,e.owner_id,e.purpose,e.item_kind,e.consent_version,e.created_at,
 e.expires_at,e.payload_bytes,e.attachment_bytes,e.attachment_count,e.state
 FROM record_entries e
+JOIN record_consents c ON c.owner_id=e.owner_id AND c.purpose=e.purpose AND c.enabled
 WHERE e.owner_id=$1 AND e.state='active' AND e.expires_at > clock_timestamp()
   AND ($2='' OR e.purpose=$2)
   AND ($3='' OR EXISTS (SELECT 1 FROM record_entries cursor WHERE cursor.id=$3 AND cursor.owner_id=$1
     AND (e.created_at,e.id) < (cursor.created_at,cursor.id)))
-ORDER BY e.created_at DESC,e.id DESC LIMIT $4 FOR SHARE OF e`, ownerID, string(query.Purpose), query.BeforeID, limit)
+ORDER BY e.created_at DESC,e.id DESC LIMIT $4 FOR SHARE OF e,c`, ownerID, string(query.Purpose), query.BeforeID, limit)
 		} else {
 			rows, err = tx.Query(ctx, `SELECT e.id,e.owner_id,e.purpose,e.item_kind,e.consent_version,e.created_at,
 e.expires_at,e.payload_bytes,e.attachment_bytes,e.attachment_count,e.state
@@ -685,6 +691,9 @@ func lockRecordForAccessTx(ctx context.Context, tx pgx.Tx, principal identity.Pr
 		if err := scanRecordMetadata(tx.QueryRow(ctx, `SELECT id,owner_id,purpose,item_kind,consent_version,created_at,
 expires_at,payload_bytes,attachment_bytes,attachment_count,state FROM record_entries
 WHERE id=$1 AND owner_id=$2 AND state='active' AND expires_at > clock_timestamp() FOR SHARE`, recordID, ownerID), &value); err != nil {
+			return record.RecordMetadata{}, err
+		}
+		if err := requireRecordConsentTx(ctx, tx, ownerID, value.Purpose); err != nil {
 			return record.RecordMetadata{}, err
 		}
 		return value, nil

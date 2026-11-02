@@ -56,10 +56,17 @@ func NewUserServiceWithHub(users UserStore, hosts HostStore, hub HubRevocationCl
 	return service, nil
 }
 
-func (s *UserService) Register(ctx context.Context, name, password, ip string) (UserSummary, error) {
+func (s *UserService) Register(ctx context.Context, name, password, ip string, inviteCodes ...string) (UserSummary, error) {
 	name = strings.TrimSpace(name)
-	if len(name) < 3 || len(name) > 64 || len(password) < 8 || len(password) > 72 {
+	if len(name) < 3 || len(name) > 64 || len(password) < 8 || len(password) > 72 || len(inviteCodes) > 1 {
 		return UserSummary{}, domain.InvalidArgument("registration", "name must be 3-64 bytes and password 8-72 bytes")
+	}
+	inviteCode := ""
+	if len(inviteCodes) == 1 {
+		inviteCode = strings.ToLower(strings.TrimSpace(inviteCodes[0]))
+		if inviteCode != "" && !validInvitationCode(inviteCode) {
+			return UserSummary{}, domain.InvalidArgument("invite_code", "invitation code is invalid")
+		}
 	}
 	if _, ok := s.registrations.allow(ip, time.Now(), 5, time.Minute); !ok {
 		return UserSummary{}, domain.NewError(domain.CodeRateLimited, "registration rate limit reached")
@@ -75,11 +82,19 @@ func (s *UserService) Register(ctx context.Context, name, password, ip string) (
 	if err != nil {
 		return UserSummary{}, err
 	}
-	user, err := s.users.CreateUser(ctx, identity.User{
+	newUser := identity.User{
 		ID: id, Name: name, PasswordHash: string(passwordHash), Role: identity.RoleUser,
 		Status: identity.StatusPending, QuotaHosts: 1, QuotaCPUMilli: 4000, QuotaMemMiB: 8192,
 		DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048,
-	})
+	}
+	var user identity.User
+	if inviteCode == "" {
+		user, err = s.users.CreateUser(ctx, newUser)
+	} else if store, ok := s.users.(invitedUserStore); ok {
+		user, err = store.CreateInvitedUser(ctx, newUser, inviteCode)
+	} else {
+		return UserSummary{}, domain.NewError(domain.CodeInternal, "invitation registration is unavailable")
+	}
 	if err != nil {
 		if isUniqueViolation(err) {
 			return UserSummary{}, domain.NewError(domain.CodeConflict, "username already exists")
@@ -190,8 +205,8 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 		return UserSummary{}, domain.NewError(domain.CodeConflict, "account status changed; refresh the user list")
 	}
 	currentStatus := user.Status
+	currentRole := user.Role
 	changes := make(map[string]any)
-	revokeHubOwner := command.Status != nil || command.Role != nil
 	if command.Status != nil {
 		if !user.Status.CanTransitionTo(*command.Status) {
 			return UserSummary{}, domain.NewError(domain.CodeConflict, "account status transition is not allowed")
@@ -236,6 +251,7 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 		int64(user.QuotaHosts)*int64(user.DefaultHostMemMiB) > int64(user.QuotaMemMiB) {
 		return UserSummary{}, domain.InvalidArgument("quota", "quota CPU and memory must cover the host limit and default resources")
 	}
+	revokeHubOwner := user.Status != currentStatus || user.Role != currentRole
 	var disableRelay func(context.Context) error
 	if s.workspaceSyncController != nil {
 		disableRelay = func(gateCtx context.Context) error {
@@ -251,6 +267,11 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 	}
 	if revokeHubOwner && s.hub != nil {
 		s.hub.CloseOwner(user.ID)
+	}
+	if revokeHubOwner && s.workspaceSyncController != nil {
+		if err := s.workspaceSyncController.ReconcileWorkspaceSyncNodeOwner(ctx, user.ID); err != nil {
+			return UserSummary{}, domain.NewError(domain.CodeUpstreamError, "workspace sync node could not confirm account authorization change")
+		}
 	}
 	hosts, err := s.hosts.ListHostsByOwner(ctx, user.ID)
 	if err != nil {

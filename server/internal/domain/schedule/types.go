@@ -32,18 +32,25 @@ func (s Status) Valid() bool {
 type TimingKind string
 
 const (
-	TimingOnce   TimingKind = "once"
-	TimingDaily  TimingKind = "daily"
-	TimingWeekly TimingKind = "weekly"
+	TimingOnce        TimingKind = "once"
+	TimingDaily       TimingKind = "daily"
+	TimingWeekly      TimingKind = "weekly"
+	TimingEveryNHours TimingKind = "every_n_hours"
+)
+
+const (
+	MinIntervalHours = 1
+	MaxIntervalHours = 168
 )
 
 type Timing struct {
-	Kind      TimingKind `json:"kind"`
-	RunAt     string     `json:"run_at,omitempty"`
-	StartsOn  string     `json:"starts_on,omitempty"`
-	LocalTime string     `json:"local_time,omitempty"`
-	TimeZone  string     `json:"time_zone"`
-	Weekdays  []int      `json:"weekdays,omitempty"`
+	Kind          TimingKind `json:"kind"`
+	RunAt         string     `json:"run_at,omitempty"`
+	StartsOn      string     `json:"starts_on,omitempty"`
+	LocalTime     string     `json:"local_time,omitempty"`
+	TimeZone      string     `json:"time_zone"`
+	Weekdays      []int      `json:"weekdays,omitempty"`
+	IntervalHours int        `json:"interval_hours,omitempty"`
 }
 
 type MisfirePolicy string
@@ -286,14 +293,14 @@ func (t Timing) Validate() error {
 	}
 	switch t.Kind {
 	case TimingOnce:
-		if t.RunAt == "" || t.StartsOn != "" || t.LocalTime != "" || len(t.Weekdays) != 0 || !hasRFC3339Offset(t.RunAt) {
+		if t.RunAt == "" || t.StartsOn != "" || t.LocalTime != "" || len(t.Weekdays) != 0 || t.IntervalHours != 0 || !hasRFC3339Offset(t.RunAt) {
 			return errors.New("once timing requires run_at with an explicit RFC3339 offset and time_zone")
 		}
 		if _, err := time.Parse(time.RFC3339Nano, t.RunAt); err != nil {
 			return errors.New("run_at must be RFC3339")
 		}
 	case TimingDaily, TimingWeekly:
-		if t.RunAt != "" || !datePattern.MatchString(t.StartsOn) || !validDate(t.StartsOn) || !localTimePattern.MatchString(t.LocalTime) {
+		if t.RunAt != "" || t.IntervalHours != 0 || !datePattern.MatchString(t.StartsOn) || !validDate(t.StartsOn) || !localTimePattern.MatchString(t.LocalTime) {
 			return errors.New("recurring timing requires starts_on and local_time")
 		}
 		if t.Kind == TimingDaily && len(t.Weekdays) != 0 {
@@ -313,6 +320,11 @@ func (t Timing) Validate() error {
 				}
 				seen[day] = struct{}{}
 			}
+		}
+	case TimingEveryNHours:
+		if t.RunAt != "" || t.StartsOn != "" || t.LocalTime != "" || len(t.Weekdays) != 0 ||
+			t.IntervalHours < MinIntervalHours || t.IntervalHours > MaxIntervalHours {
+			return errors.New("every_n_hours timing requires interval_hours from 1 to 168")
 		}
 	default:
 		return errors.New("timing kind is invalid")
@@ -375,6 +387,9 @@ func FirstOccurrence(t Timing, now time.Time) (Occurrence, error) {
 		runAt = runAt.UTC()
 		return Occurrence{Key: "once:" + runAt.Format(time.RFC3339Nano), ScheduledAt: &runAt, CheckAt: runAt, Status: RunQueued}, nil
 	}
+	if t.Kind == TimingEveryNHours {
+		return intervalOccurrence(now.UTC().Truncate(time.Microsecond).Add(time.Minute)), nil
+	}
 	date, _ := time.Parse("2006-01-02", t.StartsOn)
 	location, _ := time.LoadLocation(t.TimeZone)
 	localNow := now.In(location)
@@ -403,6 +418,13 @@ func NextOccurrence(t Timing, currentKey string) (Occurrence, error) {
 	if t.Kind == TimingOnce {
 		return Occurrence{}, nil
 	}
+	if t.Kind == TimingEveryNHours {
+		current, err := instantFromIntervalKey(currentKey)
+		if err != nil {
+			return Occurrence{}, err
+		}
+		return intervalOccurrence(current.Add(time.Duration(t.IntervalHours) * time.Hour)), nil
+	}
 	date, err := dateFromOccurrenceKey(currentKey)
 	if err != nil {
 		return Occurrence{}, err
@@ -414,6 +436,23 @@ func NextOccurrence(t Timing, currentKey string) (Occurrence, error) {
 		}
 	}
 	return Occurrence{}, errors.New("could not find next schedule occurrence")
+}
+
+func intervalOccurrence(at time.Time) Occurrence {
+	at = at.UTC()
+	return Occurrence{Key: "every_n_hours:" + at.Format(time.RFC3339Nano), ScheduledAt: &at, CheckAt: at, Status: RunQueued}
+}
+
+func instantFromIntervalKey(key string) (time.Time, error) {
+	const prefix = "every_n_hours:"
+	if !strings.HasPrefix(key, prefix) {
+		return time.Time{}, errors.New("occurrence key is invalid")
+	}
+	value, err := time.Parse(time.RFC3339Nano, strings.TrimPrefix(key, prefix))
+	if err != nil || key != prefix+value.UTC().Format(time.RFC3339Nano) {
+		return time.Time{}, errors.New("occurrence key is invalid")
+	}
+	return value.UTC(), nil
 }
 
 // LatestDue coalesces all elapsed occurrences into the latest elapsed local slot.

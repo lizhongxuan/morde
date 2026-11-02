@@ -27,7 +27,7 @@ type PersonalDataQuota struct {
 
 type PersonalDataQuotaStore interface {
 	GetAdminPersonalDataQuota(context.Context, identity.Principal, string) (PersonalDataQuota, error)
-	SetAdminPersonalDataQuota(context.Context, identity.Principal, string, int64, int64, int64) (PersonalDataQuota, error)
+	SetAdminPersonalDataQuota(context.Context, identity.Principal, string, int64, int64, int64, string) (PersonalDataQuota, error)
 	ReservePersonalAttachment(context.Context, identity.Principal, string, int64) (string, error)
 	ReleasePersonalAttachmentReservation(context.Context, string, string) error
 	CleanupExpiredPersonalDataQuotaReservations(context.Context, time.Time, int32) (int32, error)
@@ -61,7 +61,7 @@ func (s *PersonalDataQuotaService) GetAdminPersonalDataQuota(ctx context.Context
 	return value, nil
 }
 
-func (s *PersonalDataQuotaService) SetAdminPersonalDataQuota(ctx context.Context, principal identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64) (PersonalDataQuota, error) {
+func (s *PersonalDataQuotaService) SetAdminPersonalDataQuota(ctx context.Context, principal identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64, ip string) (PersonalDataQuota, error) {
 	if err := authorizePersonalDataQuotaAdmin(principal); err != nil {
 		return PersonalDataQuota{}, err
 	}
@@ -69,7 +69,7 @@ func (s *PersonalDataQuotaService) SetAdminPersonalDataQuota(ctx context.Context
 		maxAttachmentBytes > personal.MaxAttachmentBytes {
 		return PersonalDataQuota{}, domain.InvalidArgument("personal_data_quota", "personal data quota limits or version are invalid")
 	}
-	value, err := s.store.SetAdminPersonalDataQuota(ctx, principal, ownerID, expectedVersion, quotaBytes, maxAttachmentBytes)
+	value, err := s.store.SetAdminPersonalDataQuota(ctx, principal, ownerID, expectedVersion, quotaBytes, maxAttachmentBytes, ip)
 	if err != nil {
 		return PersonalDataQuota{}, err
 	}

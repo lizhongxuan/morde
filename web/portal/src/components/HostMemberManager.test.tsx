@@ -121,6 +121,31 @@ describe('HostMemberManager', () => {
     expect(await screen.findByText(member.user_id)).toBeInTheDocument();
   });
 
+  it('can grant Workspace file reading without granting desktop, terminal, or MCP access', async () => {
+    await loginOwner();
+    const workspaceMember: HostMember = { ...member, permissions: ['workspace:file:read'] };
+    vi.spyOn(portalApi, 'hostMembers').mockResolvedValueOnce({ items: [] }).mockResolvedValue({ items: [workspaceMember] });
+    const invite = vi.spyOn(portalApi, 'inviteHostMember').mockResolvedValue(workspaceMember);
+    const user = userEvent.setup();
+    renderManager(hostId);
+
+    await expandManager(user);
+    await screen.findByText('还没有共享成员。');
+    await prepareInvite(user, member.user_id, ['workspace:file:read']);
+    await user.click(screen.getByRole('button', { name: '邀请并授权' }));
+
+    const dialog = screen.getByRole('dialog', { name: '确认邀请共享成员' });
+    expect(dialog).toHaveTextContent('workspace:file:read');
+    expect(dialog).toHaveTextContent('仅允许浏览和下载已应用的文件');
+    expect(dialog).toHaveTextContent('不包含桌面、终端或 MCP 权限');
+    expect(dialog).toHaveTextContent('不包含主机管理或再次分享权限');
+    await user.click(within(dialog).getByRole('button', { name: '确认授权' }));
+    await waitFor(() => expect(invite).toHaveBeenCalledWith(hostId, {
+      user_id: member.user_id, permissions: ['workspace:file:read'],
+    }));
+    expect(screen.getByText(member.user_id).closest('article')).toHaveTextContent('workspace:file:read（读取工作区文件）');
+  });
+
   it('reports an invite API error and keeps the reviewed request available', async () => {
     await loginOwner();
     vi.spyOn(portalApi, 'hostMembers').mockResolvedValue({ items: [] });

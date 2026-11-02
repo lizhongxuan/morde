@@ -52,6 +52,7 @@ type recordAccessAPITestService struct {
 	query       record.Query
 	ownerID     string
 	recordID    string
+	principal   identity.Principal
 	page        record.Page
 	content     record.Content
 	attachment  record.AttachmentContent
@@ -59,6 +60,20 @@ type recordAccessAPITestService struct {
 	access      app.RecordAdminAccess
 	tombstone   record.DeleteTombstone
 	err         error
+}
+
+type recordCaptureStatusAPITestService struct {
+	calls     int
+	principal identity.Principal
+	query     record.CaptureStatusQuery
+	page      record.CaptureStatusPage
+	err       error
+}
+
+func (s *recordCaptureStatusAPITestService) Statuses(_ context.Context, principal identity.Principal, query record.CaptureStatusQuery) (record.CaptureStatusPage, error) {
+	s.calls++
+	s.principal, s.query = principal, query
+	return s.page, s.err
 }
 
 func (s *recordAccessAPITestService) SetGrant(_ context.Context, _ identity.Principal, ownerID, recordAdminID string, capability record.AdminCapability, granted bool) (record.AdminGrant, error) {
@@ -71,8 +86,9 @@ func (s *recordAccessAPITestService) AdminSettings(context.Context, identity.Pri
 func (s *recordAccessAPITestService) AccessSettings(context.Context, identity.Principal, string) (app.RecordAdminAccess, error) {
 	return s.access, s.err
 }
-func (s *recordAccessAPITestService) List(_ context.Context, _ identity.Principal, ownerID string, query record.Query) (record.Page, error) {
+func (s *recordAccessAPITestService) List(_ context.Context, principal identity.Principal, ownerID string, query record.Query) (record.Page, error) {
 	s.listCalls++
+	s.principal = principal
 	s.ownerID, s.query = ownerID, query
 	return s.page, s.err
 }
@@ -92,18 +108,23 @@ func (*recordAccessAPITestService) ListAttachments(context.Context, identity.Pri
 func (s *recordAccessAPITestService) ReadAttachment(context.Context, identity.Principal, string, string, string) (record.AttachmentContent, error) {
 	return s.attachment, s.err
 }
-func (s *recordAccessAPITestService) Delete(_ context.Context, _ identity.Principal, ownerID, recordID string) (record.DeleteTombstone, error) {
+func (s *recordAccessAPITestService) Delete(_ context.Context, principal identity.Principal, ownerID, recordID string) (record.DeleteTombstone, error) {
 	s.deleteCalls++
+	s.principal = principal
 	s.ownerID, s.recordID = ownerID, recordID
 	return s.tombstone, s.err
 }
 
-func recordAdminAPIRouter(t *testing.T, role identity.Role, consents *recordConsentAPITestService, access *recordAccessAPITestService) *gin.Engine {
+func recordAdminAPIRouter(t *testing.T, role identity.Role, consents *recordConsentAPITestService, access *recordAccessAPITestService,
+	captureStatuses ...RecordCaptureStatusService) *gin.Engine {
 	t.Helper()
 	deps := newServices().deps()
 	deps.Verifier = verifierStub{role: role}
 	deps.RecordConsents = consents
 	deps.RecordAccess = access
+	if len(captureStatuses) > 0 {
+		deps.RecordCaptureStatus = captureStatuses[0]
+	}
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -125,6 +146,46 @@ func TestRecordConsentRoutesAuthorizeAndValidateRequest(t *testing.T) {
 	}
 }
 
+func TestRecordCaptureStatusRouteListsOwnerScopedMetadataOnly(t *testing.T) {
+	service := &recordCaptureStatusAPITestService{page: record.CaptureStatusPage{
+		Items: []record.CaptureStatus{{
+			ID: "j1234567", TaskID: "q1234567", Purpose: record.PurposeFullRecord, Kind: record.ItemTurn,
+			State: record.QueueQueued, CapturedAt: time.Date(2026, 11, 2, 1, 2, 3, 0, time.UTC),
+			ExpiresAt: time.Date(2026, 12, 2, 1, 2, 3, 0, time.UTC),
+		}}, NextBefore: "j7654321",
+	}}
+	router := recordAdminAPIRouter(t, identity.RoleUser, nil, nil, service)
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	response := requestWithCookie(router, http.MethodGet, "/api/me/record-captures?limit=7&before_id=j7654321", cookie, "https://portal.example.test")
+	if response.Code != http.StatusOK || service.calls != 1 || service.principal.UserID != testUserID ||
+		service.query.Limit != 7 || service.query.BeforeID != "j7654321" {
+		t.Fatalf("capture status page = %d %s service=%+v", response.Code, response.Body, service)
+	}
+	for _, expected := range []string{`"id":"j1234567"`, `"task_id":"q1234567"`, `"state":"queued"`, `"failure_code":""`, `"next_before":"j7654321"`} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("capture status response missing %s: %s", expected, response.Body)
+		}
+	}
+	if strings.Contains(response.Body.String(), "payload") || strings.Contains(response.Body.String(), "attachment") ||
+		strings.Contains(response.Body.String(), "lease") || strings.Contains(response.Body.String(), "owner_id") {
+		t.Fatalf("capture status response leaked queue internals: %s", response.Body)
+	}
+	clientCredential, _, err := identity.NewCredential(identity.KindClient, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientResponse := request(router, http.MethodGet, "/api/me/record-captures", "", "Bearer "+clientCredential, "")
+	if clientResponse.Code != http.StatusOK || service.calls != 2 || service.principal.Kind != identity.KindClient ||
+		service.principal.ClientInstallationID != "i1234567" {
+		t.Fatalf("client capture status page = %d %s principal=%#v calls=%d", clientResponse.Code, clientResponse.Body, service.principal, service.calls)
+	}
+
+	badCursor := requestWithCookie(router, http.MethodGet, "/api/me/record-captures?before_id=v1234567", cookie, "https://portal.example.test")
+	if badCursor.Code != http.StatusBadRequest || service.calls != 2 {
+		t.Fatalf("invalid capture status cursor = %d %s calls=%d", badCursor.Code, badCursor.Body, service.calls)
+	}
+}
+
 func TestAdminRecordRoutesValidateFilterAndRequireAdmin(t *testing.T) {
 	access := &recordAccessAPITestService{}
 	adminRouter := recordAdminAPIRouter(t, identity.RoleAdmin, nil, access)
@@ -142,6 +203,36 @@ func TestAdminRecordRoutesValidateFilterAndRequireAdmin(t *testing.T) {
 	denied := requestWithCookie(userRouter, http.MethodGet, "/api/admin/users/u1234567/records", cookie, "")
 	if denied.Code != http.StatusForbidden || access.listCalls != 1 {
 		t.Fatalf("non-admin record list = %d %s calls=%d", denied.Code, denied.Body, access.listCalls)
+	}
+}
+
+func TestMyRecordRoutesExposeOnlyOwnerMetadataAndRequestOwnerDeletion(t *testing.T) {
+	access := &recordAccessAPITestService{page: record.Page{
+		Items:      []record.RecordMetadata{{ID: "v1234567", OwnerID: testUserID, Purpose: record.PurposeFullRecord, Kind: record.ItemTurn}},
+		NextBefore: "v1234567",
+	}, tombstone: record.DeleteTombstone{
+		ID: "l1234567", OwnerID: testUserID, RecordID: "v1234567", State: record.DeletePending,
+		RequestedAt: time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC),
+	}}
+	router := recordAdminAPIRouter(t, identity.RoleUser, nil, access)
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+
+	listed := requestWithCookie(router, http.MethodGet, "/api/me/records?purpose=full_record&limit=10", cookie, "")
+	if listed.Code != http.StatusOK || access.listCalls != 1 || access.ownerID != "" || access.principal.UserID != testUserID ||
+		access.query.Purpose != record.PurposeFullRecord || access.query.Limit != 10 ||
+		!strings.Contains(listed.Body.String(), `"next_before":"v1234567"`) || strings.Contains(listed.Body.String(), `"payload"`) {
+		t.Fatalf("my record metadata = %d %s service=%+v", listed.Code, listed.Body, access)
+	}
+
+	badID := requestWithCookie(router, http.MethodDelete, "/api/me/records/nope", cookie, "https://portal.example.test")
+	if badID.Code != http.StatusBadRequest || access.deleteCalls != 0 {
+		t.Fatalf("invalid owner record delete = %d %s calls=%d", badID.Code, badID.Body, access.deleteCalls)
+	}
+	deleted := requestWithCookie(router, http.MethodDelete, "/api/me/records/v1234567", cookie, "https://portal.example.test")
+	if deleted.Code != http.StatusAccepted || access.deleteCalls != 1 || access.ownerID != testUserID ||
+		access.recordID != "v1234567" || access.principal.UserID != testUserID ||
+		!strings.Contains(deleted.Body.String(), `"state":"pending"`) {
+		t.Fatalf("my record delete = %d %s service=%+v", deleted.Code, deleted.Body, access)
 	}
 }
 

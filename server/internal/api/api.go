@@ -64,6 +64,7 @@ type Deps struct {
 	PersonalSync          personalSyncService
 	Goals                 goalRoutesService
 	Schedules             scheduleRoutesService
+	PersonalDataQuotaUser personalDataQuotaUserService
 	PersonalDataQuota     AdminPersonalDataQuotaService
 	PersonalAttachments   *app.PersonalAttachmentService
 	PersonalHistoryImport *app.PersonalHistoryImportService
@@ -72,8 +73,10 @@ type Deps struct {
 	AdminConsole          AdminConsoleService
 	AdminQualityActivity  AdminQualityActivityService
 	AdminControls         AdminControlsService
+	AdminOperations       AdminOperationsService
 	RecordConsents        RecordConsentService
 	RecordAccess          RecordAccessService
+	RecordCaptureStatus   RecordCaptureStatusService
 	AdminHostResources    AdminHostResourcesService
 	AdminWorkspaces       AdminWorkspaceService
 	AdminAudit            AdminAuditWriter
@@ -147,6 +150,9 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	engine.GET("/api/mcp/oauth/callback", h.mcpConnectorOAuthCallback)
 	engine.GET("/__ch/cert-authorize", h.authorizeTLS)
 	h.registerHostReplicaRoutes(engine)
+	if deps.AdminOperations != nil {
+		engine.GET("/api/nudges", h.getPublicNudges)
+	}
 	if deps.MCPDisabled {
 		engine.Any("/mcp", h.mcpDisabled)
 	} else {
@@ -177,6 +183,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 		registerScheduleRoutes(group, deps.Schedules)
 	}
 	personalDataGroup := group.Group("/personal-data")
+	RegisterPersonalDataQuotaRoute(personalDataGroup, deps.PersonalDataQuotaUser)
 	RegisterPersonalAttachmentRoutes(personalDataGroup, deps.PersonalAttachments)
 	RegisterPersonalHistoryImportRoutes(personalDataGroup, deps.PersonalHistoryImport)
 	h.registerInstantChat(group)
@@ -188,6 +195,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerAdmin(group)
 	h.registerAdminQualityActivity(group)
 	h.registerAdminControls(group)
+	h.registerAdminOperations(group)
 	h.registerAdminRecords(group)
 	h.registerAdminPersonalDataQuota(group)
 	h.registerAdminModelUsage(group)
@@ -492,10 +500,10 @@ func clientCredentialRoute(method, path string) bool {
 	switch method {
 	case http.MethodGet:
 		switch path {
-		case "/api/me", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
+		case "/api/me", "/api/me/record-captures", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
 			"/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
-			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id",
+			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id", "/api/personal-data/quota",
 			"/api/personal-data/attachments/:attachment_id",
 			"/api/goals", "/api/goals/:id",
 			"/api/schedules", "/api/schedules/:id", "/api/schedules/:id/runs",
@@ -642,6 +650,8 @@ func safeMessage(code domain.ErrorCode) string {
 		return "capacity exceeded"
 	case domain.CodeWorkspaceBusy:
 		return "workspace busy"
+	case domain.CodeWorkspaceUnavailable:
+		return "workspace service is unavailable"
 	case domain.CodeInvalidState:
 		return "invalid state"
 	case domain.CodeConflict:

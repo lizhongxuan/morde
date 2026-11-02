@@ -192,6 +192,24 @@ describe('Hosts', () => {
     expect(ticket).not.toHaveBeenCalled();
   });
 
+  it('gives a Workspace-only member a read-only Workspace entry without desktop or terminal access', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{ id: ownedHost.id, name: '工作区共享电脑', state: 'running', url: ownedHost.url, permissions: ['workspace:file:read'] }] });
+    const ticket = vi.spyOn(portalApi, 'issueObservationTicket');
+    const open = vi.spyOn(window, 'open').mockReturnValue({ opener: window } as Window);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('权限：读取工作区文件')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看工作区' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '查看桌面' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '打开终端' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '查看工作区' }));
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${ownedHost.id}?target=workspace`, '_blank');
+    expect(ticket).not.toHaveBeenCalled();
+  });
+
   it('waits for AI tool stop confirmation before completing a Host takeover and resumes with the same request ID', async () => {
     let firstRequest: Parameters<typeof portalApi.hostControlAction>[1] | undefined;
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"math"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/personal"
 )
@@ -63,11 +65,30 @@ func TestPostgresPersonalDataQuotaDefaultsAdminCASAndOverQuotaAdjustment(t *test
 	if err != nil || quota.UsedBytes != 24 || quota.QuotaBytes != app.DefaultPersonalDataQuotaBytes || quota.Version != 1 {
 		t.Fatalf("quota before limit reduction = %+v, err=%v", quota, err)
 	}
-	updated, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, quota.Version, 16, 8)
+	updated, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, quota.Version, 16, 8, "192.0.2.10")
 	if err != nil || updated.UsedBytes != 24 || updated.QuotaBytes != 16 || updated.MaxAttachmentBytes != 8 || updated.Version != 2 {
 		t.Fatalf("over-limit quota adjustment = %+v, err=%v", updated, err)
 	}
-	if _, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, quota.Version, 10, 5); domain.CodeOf(err) != domain.CodeConflict {
+	var auditActor, auditKind, auditAction, auditTarget, auditIP string
+	var auditDetail []byte
+	if err := store.pool.QueryRow(ctx, `SELECT actor_id,actor_kind,action,target,ip,detail FROM audit_logs
+WHERE action=$1 AND target=$2 ORDER BY id DESC LIMIT 1`, string(audit.ActionPersonalDataQuotaUpdate), owner.ID).
+		Scan(&auditActor, &auditKind, &auditAction, &auditTarget, &auditIP, &auditDetail); err != nil {
+		t.Fatalf("read quota audit: %v", err)
+	}
+	var auditValues struct {
+		QuotaBytesBefore int64 `json:"quota_bytes_before"`
+		QuotaBytesAfter  int64 `json:"quota_bytes_after"`
+	}
+	if err := json.Unmarshal(auditDetail, &auditValues); err != nil {
+		t.Fatalf("decode quota audit detail: %v", err)
+	}
+	if auditActor != admin.UserID || auditKind != string(audit.ActorSession) ||
+		auditAction != string(audit.ActionPersonalDataQuotaUpdate) || auditTarget != owner.ID || auditIP != "192.0.2.10" ||
+		auditValues.QuotaBytesBefore != app.DefaultPersonalDataQuotaBytes || auditValues.QuotaBytesAfter != 16 {
+		t.Fatalf("quota audit actor=%s kind=%s action=%s target=%s ip=%s detail=%s err=%v", auditActor, auditKind, auditAction, auditTarget, auditIP, auditDetail, err)
+	}
+	if _, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, quota.Version, 10, 5, "192.0.2.10"); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("stale quota version error = %v, want conflict", err)
 	}
 	if err := store.WithTx(ctx, func(tx pgx.Tx) error {
@@ -88,6 +109,28 @@ func TestPostgresPersonalDataQuotaDefaultsAdminCASAndOverQuotaAdjustment(t *test
 		return applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, owner.ID, -17)
 	}); domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("negative usage underflow = %v, want internal", err)
+	}
+}
+
+func TestPostgresPersonalDataQuotaAuditFailureRollsBackLimitChange(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 4000, 8192)
+	admin := personalQuotaAdminPrincipal(t, store)
+	service, err := app.NewPersonalDataQuotaService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE audit_logs ADD CONSTRAINT test_fail_personal_quota_audit
+CHECK (action <> 'personal_data.quota.update')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 1, 2048, 1024, "192.0.2.99"); err == nil {
+		t.Fatal("quota update succeeded despite audit insert failure")
+	}
+	quota, err := service.GetAdminPersonalDataQuota(ctx, admin, owner.ID)
+	if err != nil || quota.QuotaBytes != app.DefaultPersonalDataQuotaBytes || quota.MaxAttachmentBytes != 300<<20 || quota.Version != 1 {
+		t.Fatalf("quota after failed audit = %+v, %v", quota, err)
 	}
 }
 
@@ -184,7 +227,7 @@ func TestPostgresPersonalAttachmentQuotaAppliesCurrentLimitsAtReserveAndCommit(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := quotaService.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 1, 100, 20); err != nil {
+	if _, err := quotaService.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 1, 100, 20, "192.0.2.10"); err != nil {
 		t.Fatal(err)
 	}
 	tooLarge := createPendingPersonalQuotaUpload(t, store, owner.ID, 21, time.Now().Add(time.Hour))
@@ -199,7 +242,7 @@ func TestPostgresPersonalAttachmentQuotaAppliesCurrentLimitsAtReserveAndCommit(t
 	if _, err := store.pool.Exec(ctx, `UPDATE personal_attachment_uploads SET state='active' WHERE owner_id=$1 AND upload_id=$2`, owner.ID, within); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := quotaService.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 2, 100, 19); err != nil {
+	if _, err := quotaService.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 2, 100, 19, "192.0.2.10"); err != nil {
 		t.Fatal(err)
 	}
 	instanceID, err := store.ServiceInstanceID(ctx)
@@ -216,7 +259,7 @@ func TestPostgresPersonalAttachmentQuotaAppliesCurrentLimitsAtReserveAndCommit(t
 	if err := store.pool.QueryRow(ctx, `SELECT used_bytes,reserved_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&used, &reserved); err != nil || used != 0 || reserved != 20 {
 		t.Fatalf("failed commit changed quota totals used=%d reserved=%d err=%v", used, reserved, err)
 	}
-	if _, err := quotaService.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 3, 10, 20); err != nil {
+	if _, err := quotaService.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 3, 10, 20, "192.0.2.10"); err != nil {
 		t.Fatal(err)
 	}
 	err = store.WithTx(ctx, func(tx pgx.Tx) error {
@@ -283,7 +326,7 @@ func TestPostgresPersonalDataQuotaUsageDeltaRollsBackOnQuotaFailure(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 1, 3, 2); err != nil {
+	if _, err := service.SetAdminPersonalDataQuota(ctx, admin, owner.ID, 1, 3, 2, "192.0.2.10"); err != nil {
 		t.Fatal(err)
 	}
 	instanceID, err := store.ServiceInstanceID(ctx)

@@ -206,6 +206,10 @@ type UserStore interface {
 	UpdateUserWithAudit(context.Context, string, identity.AccountStatus, identity.User, audit.Entry, func(context.Context) error) (identity.User, error)
 }
 
+type invitedUserStore interface {
+	CreateInvitedUser(context.Context, identity.User, string) (identity.User, error)
+}
+
 type TokenStore interface {
 	GetTokenByID(context.Context, string) (identity.Token, error)
 	ListTokensByOwner(context.Context, string) ([]identity.Token, error)
@@ -216,7 +220,7 @@ type TokenStore interface {
 
 // ClientLoginStore commits installation credentials and audit as one operation.
 type ClientLoginStore interface {
-	LoginClient(context.Context, identity.ClientInstallation, string, int64, bool, []byte, []byte, string, string, func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error)
+	LoginClient(context.Context, identity.ClientInstallation, identity.User, string, int64, bool, []byte, []byte, string, string, func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error)
 	IssueClientWebSession(context.Context, identity.Principal, identity.Token) error
 	IssueClientScheduleGrant(context.Context, identity.Principal, identity.Token) error
 	RevokeClientScheduleGrants(context.Context, identity.Principal) error

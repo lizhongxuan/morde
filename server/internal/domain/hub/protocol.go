@@ -16,17 +16,18 @@ import (
 )
 
 const (
-	MaxFrameBytes       = 64 << 10
-	MaxCallIDBytes      = 80
-	MaxOpenURLBytes     = 2048
-	MaxNotifyTitleBytes = 100
-	MaxNotifyTextBytes  = 2000
-	MaxHubPathBytes     = 1024
-	MaxScreenBytes      = 40 << 10
-	MaxFileReadBytes    = 32 << 10
-	MaxCommandBytes     = 8 << 10
-	MaxCommandOutput    = 16 << 10
-	MaxFilesPerResult   = 128
+	MaxFrameBytes          = 64 << 10
+	MaxCallIDBytes         = 80
+	MaxOpenURLBytes        = 2048
+	MaxNotifyTitleBytes    = 100
+	MaxNotifyTextBytes     = 2000
+	MaxHubPathBytes        = 1024
+	MaxWorkspaceWriteBytes = 300 << 20
+	MaxScreenBytes         = 40 << 10
+	MaxFileReadBytes       = 32 << 10
+	MaxCommandBytes        = 8 << 10
+	MaxCommandOutput       = 16 << 10
+	MaxFilesPerResult      = 128
 
 	ActionInfo       = "info"
 	ActionOpen       = "open"
@@ -34,6 +35,7 @@ const (
 	ActionScreenshot = "screenshot"
 	ActionFiles      = "files"
 	ActionFileGet    = "file.get"
+	ActionFilePut    = "file.put" // Remains unavailable until its target and durable sync fences are integrated.
 	ActionCommand    = "command"
 )
 
@@ -64,6 +66,28 @@ type TaskContext struct {
 	AuthorizationVersion int64  `json:"authorization_version"`
 	TargetGrantVersion   int64  `json:"target_grant_version"`
 	OperationID          string `json:"operation_id"`
+}
+
+// WorkspaceWriteArgs binds a future PC write to a Workspace-relative path and
+// the exact bytes approved by the Task. Content transport remains F02-T10's
+// responsibility and is intentionally not part of the Hub JSON frame.
+type WorkspaceWriteArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	Path        string `json:"path"`
+	SizeBytes   int64  `json:"size_bytes"`
+	SHA256      string `json:"sha256"`
+}
+
+// WorkspaceWriteReceipt proves only that the target durably applied these
+// bytes locally; cloud sync must be confirmed separately before Task completion.
+type WorkspaceWriteReceipt struct {
+	OperationID        string `json:"operation_id"`
+	WorkspaceID        string `json:"workspace_id"`
+	Path               string `json:"path"`
+	SizeBytes          int64  `json:"size_bytes"`
+	SHA256             string `json:"sha256"`
+	TargetGrantVersion int64  `json:"target_grant_version"`
+	Stage              string `json:"stage"`
 }
 
 type ProtocolError struct {
@@ -109,6 +133,30 @@ func ValidCallID(id string) bool {
 func ValidateTaskContext(value TaskContext) error {
 	if !domain.ValidTaskID(value.TaskID) || value.AuthorizationVersion < 1 || value.TargetGrantVersion < 1 || !ValidCallID(value.OperationID) {
 		return ProtocolError{Code: "invalid_argument", Message: "task action context is invalid"}
+	}
+	return nil
+}
+
+func ValidateWorkspaceWriteArgs(raw json.RawMessage) (WorkspaceWriteArgs, error) {
+	var value WorkspaceWriteArgs
+	if err := decodeArgs(raw, &value); err != nil || !domain.ValidWorkspaceID(value.WorkspaceID) ||
+		!validRelativePath(value.Path) || value.SizeBytes < 0 || value.SizeBytes > MaxWorkspaceWriteBytes || !validSHA256(value.SHA256) {
+		return WorkspaceWriteArgs{}, ProtocolError{Code: "invalid_argument", Message: "workspace write metadata is invalid"}
+	}
+	return value, nil
+}
+
+func ValidateWorkspaceWriteReceipt(raw json.RawMessage, request WorkspaceWriteArgs, taskContext TaskContext) error {
+	if err := ValidateTaskContext(taskContext); err != nil ||
+		!domain.ValidWorkspaceID(request.WorkspaceID) || !validRelativePath(request.Path) ||
+		request.SizeBytes < 0 || request.SizeBytes > MaxWorkspaceWriteBytes || !validSHA256(request.SHA256) {
+		return ProtocolError{Code: "bad_result", Message: "workspace write receipt does not match a valid request"}
+	}
+	var receipt WorkspaceWriteReceipt
+	if err := decodeArgs(raw, &receipt); err != nil || receipt.OperationID != taskContext.OperationID ||
+		receipt.WorkspaceID != request.WorkspaceID || receipt.Path != request.Path || receipt.SizeBytes != request.SizeBytes ||
+		receipt.SHA256 != request.SHA256 || receipt.TargetGrantVersion != taskContext.TargetGrantVersion || receipt.Stage != "local_applied" {
+		return ProtocolError{Code: "bad_result", Message: "workspace write receipt is incomplete or mismatched"}
 	}
 	return nil
 }
@@ -195,6 +243,10 @@ func ValidateTaskActionArgs(action string, raw json.RawMessage) error {
 		}
 		if err := decodeArgs(raw, &args); err != nil || !validRelativePath(args.Path) || args.MaxBytes < 1 || args.MaxBytes > MaxFileReadBytes {
 			return ProtocolError{Code: "invalid_argument", Message: "file.get requires a relative path and bounded max_bytes"}
+		}
+	case ActionFilePut:
+		if _, err := ValidateWorkspaceWriteArgs(raw); err != nil {
+			return ProtocolError{Code: "invalid_argument", Message: "file.put requires bounded Workspace write metadata"}
 		}
 	case ActionCommand:
 		var args struct {
@@ -338,6 +390,22 @@ func ValidateActionResult(action string, frame Frame) error {
 			!utf8.ValidString(*result.Text) || len(*result.Text) > MaxFileReadBytes || result.TargetGrantVersion < 1 {
 			return ProtocolError{Code: "bad_result", Message: "file.get result must contain bounded UTF-8 text and a relative path"}
 		}
+	case ActionFilePut:
+		var receipt struct {
+			OperationID        *string `json:"operation_id"`
+			WorkspaceID        *string `json:"workspace_id"`
+			Path               *string `json:"path"`
+			SizeBytes          *int64  `json:"size_bytes"`
+			SHA256             *string `json:"sha256"`
+			TargetGrantVersion *int64  `json:"target_grant_version"`
+			Stage              *string `json:"stage"`
+		}
+		if err := decodeArgs(frame.Body, &receipt); err != nil || receipt.OperationID == nil || !ValidCallID(*receipt.OperationID) ||
+			receipt.WorkspaceID == nil || !domain.ValidWorkspaceID(*receipt.WorkspaceID) || receipt.Path == nil || !validRelativePath(*receipt.Path) ||
+			receipt.SizeBytes == nil || *receipt.SizeBytes < 0 || *receipt.SizeBytes > MaxWorkspaceWriteBytes || receipt.SHA256 == nil || !validSHA256(*receipt.SHA256) ||
+			receipt.TargetGrantVersion == nil || *receipt.TargetGrantVersion < 1 || receipt.Stage == nil || *receipt.Stage != "local_applied" {
+			return ProtocolError{Code: "bad_result", Message: "file.put result must contain a valid local Workspace write receipt"}
+		}
 	case ActionCommand:
 		var result struct {
 			ExitCode           *int    `json:"exit_code"`
@@ -378,6 +446,18 @@ func validRelativePath(value string) bool {
 	}
 	for _, part := range strings.Split(value, "/") {
 		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
 			return false
 		}
 	}

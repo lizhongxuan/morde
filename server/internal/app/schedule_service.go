@@ -17,6 +17,7 @@ const (
 	defaultSchedulePageSize int32 = 50
 	maxSchedulePageSize     int32 = 100
 	defaultDueScheduleLimit int32 = 100
+	maxDueScheduleLimit     int32 = 100
 )
 
 type ScheduleAuthorizationValidator interface {
@@ -143,12 +144,15 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 	return created, nil
 }
 
-func (s *ScheduleService) Update(ctx context.Context, principal identity.Principal, id string, command UpdateScheduleCommand) (schedule.Schedule, error) {
+func (s *ScheduleService) Update(ctx context.Context, principal identity.Principal, id string, command UpdateScheduleCommand, idempotencyKey string) (schedule.Schedule, error) {
 	if err := validateSchedulePrincipal(principal, identity.ScopeScheduleManage); err != nil {
 		return schedule.Schedule{}, err
 	}
 	if !schedule.ValidID(id) || command.ExpectedVersion < 1 {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule update fields are invalid")
+	}
+	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+		return schedule.Schedule{}, err
 	}
 	current, err := s.store.GetSchedule(ctx, principal.UserID, id)
 	if err != nil {
@@ -205,7 +209,16 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 	if err := schedule.Validate(current); err != nil {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", err.Error())
 	}
-	return s.store.UpdateSchedule(ctx, principal.UserID, current, command.ExpectedVersion)
+	requestHash, err := hashIdempotencyRequest(struct {
+		ScheduleID string                `json:"schedule_id"`
+		Command    UpdateScheduleCommand `json:"command"`
+	}{id, command})
+	if err != nil {
+		return schedule.Schedule{}, err
+	}
+	record := IdempotencyRecord{OwnerID: principal.UserID, Operation: "schedule.update", Key: idempotencyKey,
+		RequestHash: requestHash, ResourceID: id}
+	return s.store.UpdateSchedule(ctx, principal.UserID, record, current, command.ExpectedVersion)
 }
 
 func (s *ScheduleService) Action(ctx context.Context, principal identity.Principal, id string, command ScheduleActionCommand, idempotencyKey string) (ScheduleActionResult, error) {
@@ -289,7 +302,7 @@ func (s *ScheduleService) ProcessDue(ctx context.Context, now time.Time, limit i
 	if limit == 0 {
 		limit = defaultDueScheduleLimit
 	}
-	if limit < 1 || limit > 1000 {
+	if limit < 1 || limit > maxDueScheduleLimit {
 		return 0, domain.InvalidArgument("limit", "schedule batch size is out of range")
 	}
 	values, err := s.store.ListDueSchedules(ctx, now.UTC(), limit)
@@ -298,33 +311,58 @@ func (s *ScheduleService) ProcessDue(ctx context.Context, now time.Time, limit i
 	}
 	processed := 0
 	for _, value := range values {
-		occurrence, next, err := planDueSchedule(value, now.UTC())
-		if err != nil {
-			return processed, fmt.Errorf("plan due schedule %s: %w", value.ID, err)
-		}
-		if err := s.validator.ValidateScheduleAuthorization(ctx, value.OwnerID, value.Authorization); err != nil {
-			if domain.CodeOf(err) == domain.CodeUnauthenticated || domain.CodeOf(err) == domain.CodeForbidden || domain.CodeOf(err) == domain.CodeNotFound {
-				reason := schedule.SkipAuthorizationEnded
-				occurrence.Status, occurrence.SkipReason, occurrence.CoalescedCount = schedule.RunSkipped, &reason, 0
-			} else {
-				return processed, fmt.Errorf("validate schedule authorization %s: %w", value.ID, err)
+		latestDueKey := value.NextOccurrenceKey
+		if value.MisfirePolicy == schedule.MisfireRunOnce && value.NextCheckAt != nil && value.NextOccurrenceKey != "" {
+			current := schedule.Occurrence{Key: value.NextOccurrenceKey, ScheduledAt: value.NextRunAt, CheckAt: *value.NextCheckAt}
+			latest, _, err := schedule.LatestDue(value.Timing, current, now.UTC())
+			if err != nil {
+				return processed, fmt.Errorf("find latest due occurrence for schedule %s: %w", value.ID, err)
 			}
+			latestDueKey = latest.Key
 		}
-		_, committed, err := s.store.CommitScheduleOccurrence(ctx, ScheduleOccurrenceCommit{
-			ScheduleID: value.ID, OwnerID: value.OwnerID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
-			Occurrence: occurrence, NextOccurrence: next, NotificationEvents: value.NotificationEvents,
-		})
-		if err != nil {
-			return processed, fmt.Errorf("commit schedule occurrence %s/%s: %w", value.ID, occurrence.Key, err)
-		}
-		if committed {
+		coalescedCount := int64(0)
+		for {
+			occurrence, next, err := planDueSchedule(value, now.UTC(), coalescedCount, latestDueKey)
+			if err != nil {
+				return processed, fmt.Errorf("plan due schedule %s: %w", value.ID, err)
+			}
+			if err := s.validator.ValidateScheduleAuthorization(ctx, value.OwnerID, value.Authorization); err != nil {
+				if domain.CodeOf(err) == domain.CodeUnauthenticated || domain.CodeOf(err) == domain.CodeForbidden || domain.CodeOf(err) == domain.CodeNotFound {
+					reason := schedule.SkipAuthorizationEnded
+					occurrence.Status, occurrence.CoalescedCount = schedule.RunSkipped, 0
+					if occurrence.ScheduledAt != nil {
+						occurrence.SkipReason = &reason
+					}
+				} else {
+					return processed, fmt.Errorf("validate schedule authorization %s: %w", value.ID, err)
+				}
+			}
+			run, committed, err := s.store.CommitScheduleOccurrence(ctx, ScheduleOccurrenceCommit{
+				ScheduleID: value.ID, OwnerID: value.OwnerID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+				Occurrence: occurrence, NextOccurrence: next, NotificationEvents: value.NotificationEvents,
+			})
+			if err != nil {
+				return processed, fmt.Errorf("commit schedule occurrence %s/%s: %w", value.ID, occurrence.Key, err)
+			}
+			if !committed {
+				break
+			}
 			processed++
+			if next == nil || next.CheckAt.After(now.UTC()) || run.Status == schedule.RunQueued {
+				break
+			}
+			if value.MisfirePolicy == schedule.MisfireRunOnce {
+				coalescedCount++
+			}
+			value.NextOccurrenceKey, value.NextRunAt = next.Key, next.ScheduledAt
+			nextCheckAt := next.CheckAt
+			value.NextCheckAt = &nextCheckAt
 		}
 	}
 	return processed, nil
 }
 
-func planDueSchedule(value schedule.Schedule, now time.Time) (schedule.Occurrence, *schedule.Occurrence, error) {
+func planDueSchedule(value schedule.Schedule, now time.Time, coalescedCount int64, latestDueKey string) (schedule.Occurrence, *schedule.Occurrence, error) {
 	if value.NextCheckAt == nil || value.NextOccurrenceKey == "" {
 		return schedule.Occurrence{}, nil, domain.NewError(domain.CodeInvalidState, "due schedule has no next occurrence")
 	}
@@ -333,16 +371,15 @@ func planDueSchedule(value schedule.Schedule, now time.Time) (schedule.Occurrenc
 		reason := schedule.SkipDSTGap
 		occurrence.Status, occurrence.SkipReason = schedule.RunSkipped, &reason
 	}
-	if occurrence.ScheduledAt != nil && schedule.IsMisfire(*occurrence.ScheduledAt, now) {
-		if value.MisfirePolicy == schedule.MisfireSkip {
-			occurrence.Status = schedule.RunMissed
-		} else {
-			latest, count, err := schedule.LatestDue(value.Timing, occurrence, now)
-			if err != nil {
-				return schedule.Occurrence{}, nil, err
+	if schedule.IsMisfire(occurrence.CheckAt, now) {
+		if value.MisfirePolicy == schedule.MisfireSkip || latestDueKey != occurrence.Key {
+			if occurrence.ScheduledAt != nil {
+				occurrence.Status = schedule.RunMissed
 			}
-			latest.CoalescedCount = count
-			occurrence = latest
+		} else {
+			// This is the latest elapsed slot. Prior missed slots were already
+			// recorded during this poll; only this one may create a catch-up task.
+			occurrence.CoalescedCount = coalescedCount
 		}
 	}
 	var next *schedule.Occurrence

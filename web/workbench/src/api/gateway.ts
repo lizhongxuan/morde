@@ -8,24 +8,28 @@ export type GatewayHost = {
   portal_origin: string;
   state: 'creating' | 'running' | 'failed' | 'deleting' | 'deleted';
   expires_at: string | null;
-  workspaces: Array<{
-    workspace: {
-      id: string;
-      name: string;
-      revision: number;
-      used_bytes: number;
-      quota_bytes: number;
-      state: 'ready' | 'deleting' | 'deleted';
-    };
-    directory: string;
-    state: 'preparing' | 'active' | 'unbinding' | 'detached' | 'failed';
-    binding_version: number;
-    desired_revision: number;
-    applied_revision: number;
-    sync_state: 'healthy' | 'conflict';
-    sync_conflicts: string[];
-  }>;
+  workspaces: GatewayWorkspaceBinding[];
 };
+
+export type GatewayWorkspaceBinding = {
+  workspace: {
+    id: string;
+    name: string;
+    revision: number;
+    used_bytes: number;
+    quota_bytes: number;
+    state: 'ready' | 'deleting' | 'deleted';
+  };
+  directory: string;
+  state: 'preparing' | 'active' | 'unbinding' | 'detached' | 'failed';
+  binding_version: number;
+  desired_revision: number;
+  applied_revision: number;
+  sync_state: 'healthy' | 'conflict';
+  sync_conflicts: string[];
+};
+
+export type GatewayWorkspaceManifest = components['schemas']['WorkspaceManifest'];
 
 export type GatewayControlAction = 'take_over' | 'release';
 export type GatewayControlState = 'ai' | 'taking_over' | 'user' | 'returning';
@@ -70,6 +74,16 @@ type AcceptedJsonResponse<T> = {
 
 type GatewayPaths = {
   '/__ch/api/host': { get: JsonResponse<GatewayHost> };
+  '/__ch/api/workspaces': { get: JsonResponse<{ items: GatewayWorkspaceBinding[] }> };
+  '/__ch/api/workspaces/{workspace_id}/manifest': {
+    get: {
+      parameters: {
+        path: { workspace_id: string };
+        query: { revision: number; prefix?: string; cursor?: string; limit?: number };
+      };
+      responses: JsonResponse<GatewayWorkspaceManifest>['responses'];
+    };
+  };
   '/__ch/api/renew': { post: JsonResponse<GatewayHost> };
   '/__ch/api/control': { get: JsonResponse<GatewayControl> };
   '/__ch/api/applications': paths['/__ch/api/applications'];
@@ -146,9 +160,58 @@ function unwrap<T>(result: { data?: T; error?: unknown; response: Response }): T
   return result.data;
 }
 
+async function throwResponseError(response: Response): Promise<never> {
+  const envelope = await response.json().catch(() => null) as unknown;
+  const outer = isRecord(envelope) ? envelope : {};
+  const raw = isRecord(outer.error) ? outer.error : {};
+  const retryText = response.headers.get('Retry-After');
+  const retry = retryText === null ? undefined : Number(retryText);
+  throw new ApiError({
+    message: typeof raw.message === 'string' ? raw.message : `请求失败（HTTP ${response.status}）`,
+    code: typeof raw.code === 'string' ? raw.code : 'internal',
+    status: response.status,
+    retryAfter: Number.isFinite(retry) ? retry : undefined,
+    details: isRecord(raw.details) ? raw.details : {},
+  });
+}
+
+function workspaceFileURL(workspaceID: string, revision: number, relativePath: string): URL {
+  const encodedPath = encodeURIComponent(relativePath);
+  const url = new URL(`/__ch/api/workspaces/${encodeURIComponent(workspaceID)}/files/${encodedPath}`, window.location.origin);
+  url.searchParams.set('revision', String(revision));
+  return url;
+}
+
 export const gatewayApi = {
   async host() {
     return unwrap(await client.GET('/__ch/api/host'));
+  },
+  async workspaces() {
+    return unwrap(await client.GET('/__ch/api/workspaces'));
+  },
+  async workspaceManifest(workspaceID: string, revision: number, prefix?: string, cursor?: string, limit = 500) {
+    return unwrap(await client.GET('/__ch/api/workspaces/{workspace_id}/manifest', {
+      params: {
+        path: { workspace_id: workspaceID },
+        query: { revision, ...(prefix ? { prefix } : {}), ...(cursor ? { cursor } : {}), limit },
+      },
+    }));
+  },
+  async downloadWorkspaceFile(workspaceID: string, revision: number, relativePath: string) {
+    const response = await requestFetch(workspaceFileURL(workspaceID, revision, relativePath), { method: 'GET', credentials: 'same-origin' });
+    if (!response.ok) await throwResponseError(response);
+    const objectURL = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = objectURL;
+    link.download = relativePath.split('/').at(-1) || 'download';
+    link.hidden = true;
+    document.body.append(link);
+    try {
+      link.click();
+    } finally {
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectURL), 1000);
+    }
   },
   async renew() {
     return unwrap(await client.POST('/__ch/api/renew'));

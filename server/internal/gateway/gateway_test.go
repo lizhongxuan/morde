@@ -251,6 +251,7 @@ func newTestGateway(t *testing.T, runtime *testRuntime, verifier *testVerifier, 
 		Security:         config.Security{CookieKeyFile: keyPath, HostCookieTTL: time.Hour},
 		Hosts:            hosts,
 		HostSharing:      sharing,
+		WorkspaceFiles:   &testHostWorkspaceFileService{},
 		Control:          &testGatewayControlService{},
 		Runtime:          runtime,
 		ActivityLeases:   leases,
@@ -399,9 +400,13 @@ func TestMemberDesktopViewIsCheckedOnEveryRequestAndCannotReachOtherPaths(t *tes
 		t.Fatalf("member desktop response/calls = %d/%d, want 200/1", desktop.Code, sharing.calls)
 	}
 	for _, path := range []string{"/", "/__ch/wb/", "/v1/shell/sessions", "/v1/file/list", "/__ch/api/host", "/mcp", "/preview"} {
+		previousCalls := sharing.calls
 		response := request(handler, http.MethodGet, hostAuthority(), path, nil, hostCookieName+"="+cookie, "")
 		if response.Code != http.StatusNotFound {
 			t.Errorf("member path %s response = %d, want 404", path, response.Code)
+		}
+		if path == "/__ch/wb/" && sharing.calls != previousCalls {
+			t.Errorf("member workbench root without tab performed %d authorization checks", sharing.calls-previousCalls)
 		}
 	}
 

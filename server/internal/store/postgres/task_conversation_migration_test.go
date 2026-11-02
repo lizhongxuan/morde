@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"morde/server/internal/app"
 	"morde/server/internal/domain"
 )
 
@@ -16,10 +15,10 @@ func TestFusedConversationMigrationPreservesHistoryAndRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProvider()
+	owner := createTestUser(t, store, 1, 1000, 2048)
 	if _, err := provider.DownTo(ctx, 53); err != nil {
 		t.Fatalf("prepare old schema: %v", err)
 	}
-	owner := createTestUser(t, store, 1, 1000, 2048)
 	conversationID := mustID(t, domain.NewConversationID)
 	exchangeID := mustID(t, domain.NewMessageID)
 	userMessageID := mustID(t, domain.NewMessageID)
@@ -55,13 +54,40 @@ user_content, assistant_message_id, assistant_content FROM retired_instant_chat_
 	if err != nil || chat.ID != conversationID || chat.ModelID != "p1234567" || chat.Title != "old title" {
 		t.Fatalf("migrated canonical conversation = %#v, err=%v", chat, err)
 	}
-	firstPage, err := store.ListMessages(ctx, owner.ID, conversationID, app.PageRequest{Limit: 1})
-	if err != nil || len(firstPage.Items) != 1 || firstPage.Items[0].ID != assistantMessageID || firstPage.NextCursor == "" {
-		t.Fatalf("first message page = %#v, err=%v", firstPage, err)
+	messagePage := func(before int64) ([]struct {
+		id       string
+		sequence int64
+	}, error) {
+		rows, err := pool.Query(ctx, `SELECT id, sequence FROM conversation_messages
+WHERE owner_id=$1 AND conversation_id=$2 AND ($3=0 OR sequence<$3)
+ORDER BY sequence DESC LIMIT 2`, owner.ID, conversationID, before)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var messages []struct {
+			id       string
+			sequence int64
+		}
+		for rows.Next() {
+			var message struct {
+				id       string
+				sequence int64
+			}
+			if err := rows.Scan(&message.id, &message.sequence); err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
+		}
+		return messages, rows.Err()
 	}
-	secondPage, err := store.ListMessages(ctx, owner.ID, conversationID, app.PageRequest{Limit: 1, Cursor: firstPage.NextCursor})
-	if err != nil || len(secondPage.Items) != 1 || secondPage.Items[0].ID != userMessageID || secondPage.NextCursor != "" {
-		t.Fatalf("second message page = %#v, err=%v", secondPage, err)
+	firstPage, err := messagePage(0)
+	if err != nil || len(firstPage) != 2 || firstPage[0].id != assistantMessageID || firstPage[1].id != userMessageID || firstPage[0].sequence <= firstPage[1].sequence {
+		t.Fatalf("first migrated message page = %#v, err=%v", firstPage, err)
+	}
+	secondPage, err := messagePage(firstPage[0].sequence)
+	if err != nil || len(secondPage) != 1 || secondPage[0].id != userMessageID {
+		t.Fatalf("second migrated message page = %#v, err=%v", secondPage, err)
 	}
 	var messages, archived, tasks int
 	var oldTableMissing bool
@@ -103,15 +129,15 @@ func TestFusedConversationMigrationRejectsConflictingIDs(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer closeProvider()
-			if _, err := provider.DownTo(ctx, 53); err != nil {
-				t.Fatal(err)
-			}
 			owner := createTestUser(t, store, 2, 10000, 20000)
 			other := owner
 			if !sameOwner {
 				other = createTestUser(t, store, 2, 10000, 20000)
 			}
 			hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+			if _, err := provider.DownTo(ctx, 53); err != nil {
+				t.Fatal(err)
+			}
 			conversationID := mustID(t, domain.NewConversationID)
 			if _, err := pool.Exec(ctx, `INSERT INTO conversations (id, owner_id, host_id, title) VALUES ($1,$2,$3,'task history')`,
 				conversationID, owner.ID, hostValue.ID); err != nil {
@@ -141,12 +167,12 @@ func TestFusedConversationMigrationRejectsConflictingMessageIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := provider.DownTo(ctx, 53); err != nil {
-		t.Fatal(err)
-	}
 	owner := createTestUser(t, store, 2, 10000, 20000)
 	other := createTestUser(t, store, 2, 10000, 20000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	if _, err := provider.DownTo(ctx, 53); err != nil {
+		t.Fatal(err)
+	}
 	taskConversation := mustID(t, domain.NewConversationID)
 	taskID := mustID(t, domain.NewTaskID)
 	messageID := mustID(t, domain.NewMessageID)

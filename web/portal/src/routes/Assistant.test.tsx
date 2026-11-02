@@ -45,9 +45,9 @@ const task = {
   artifacts: [], pending_request: null, clarification_request: null, stop_request: null, assistant_message: null, finished_at: timestamp,
 } satisfies Awaited<ReturnType<typeof portalApi.task>>;
 
-function renderPage() {
+function renderPage(initialState: unknown = null) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  const view = render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
+  const view = render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[{ pathname: '/assistant', state: initialState }]}><Assistant /></MemoryRouter></ToastProvider></QueryClientProvider>);
   return { ...view, client };
 }
 
@@ -89,6 +89,15 @@ describe('Assistant durable tasks', () => {
 
     expect(await screen.findByRole('heading', { name: '今天想聊些什么？' })).toBeInTheDocument();
     expect(portalApi.conversationMessages).not.toHaveBeenCalled();
+  });
+
+  it('prefills an explicitly selected Idea without putting its text in the URL or sending it', async () => {
+    mockCommon();
+    const submit = vi.spyOn(portalApi, 'submitTask');
+    renderPage({ ideaID: 'idea-1', ideaPrompt: 'Draft a project outline' });
+
+    expect(await screen.findByRole('textbox', { name: '消息内容' })).toHaveValue('Draft a project outline');
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it('does not restore a conversation from another service instance', async () => {

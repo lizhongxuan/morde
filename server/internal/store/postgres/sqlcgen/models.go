@@ -80,6 +80,16 @@ type AdminControlRule struct {
 	FiredAccounts int64              `json:"fired_accounts"`
 }
 
+type AdminNudgePolicy struct {
+	ID        int16              `json:"id"`
+	Enabled   bool               `json:"enabled"`
+	Url       string             `json:"url"`
+	TextZh    string             `json:"text_zh"`
+	TextEn    string             `json:"text_en"`
+	Version   int64              `json:"version"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type AuditLog struct {
 	ID        int64              `json:"id"`
 	At        pgtype.Timestamptz `json:"at"`
@@ -595,6 +605,7 @@ type RecordCaptureQueue struct {
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 	RecordID               pgtype.Text        `json:"record_id"`
+	SourceTaskID           pgtype.Text        `json:"source_task_id"`
 }
 
 type RecordCaptureQueueAttachment struct {
@@ -959,6 +970,15 @@ type TaskHubOperation struct {
 	Status                   string             `json:"status"`
 	CreatedAt                pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	WorkspaceID              pgtype.Text        `json:"workspace_id"`
+	WorkspacePath            pgtype.Text        `json:"workspace_path"`
+	WorkspaceSizeBytes       pgtype.Int8        `json:"workspace_size_bytes"`
+	WorkspaceSha256          pgtype.Text        `json:"workspace_sha256"`
+	SourceCheckpointRevision pgtype.Int8        `json:"source_checkpoint_revision"`
+	LocalReceiptHash         []byte             `json:"local_receipt_hash"`
+	SyncStage                string             `json:"sync_stage"`
+	SyncSessionID            pgtype.Text        `json:"sync_session_id"`
+	SyncRevision             pgtype.Int8        `json:"sync_revision"`
 }
 
 type TaskMcpConnectorGrant struct {
@@ -1128,6 +1148,19 @@ type User struct {
 	MustChangePassword  bool               `json:"must_change_password"`
 	DefaultHostCpuMilli int32              `json:"default_host_cpu_milli"`
 	DefaultHostMemMib   int32              `json:"default_host_mem_mib"`
+}
+
+type UserInvite struct {
+	InviterID  string             `json:"inviter_id"`
+	InviteeID  string             `json:"invitee_id"`
+	InviteCode string             `json:"invite_code"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+type UserInviteCode struct {
+	OwnerID   string             `json:"owner_id"`
+	Code      string             `json:"code"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type UserPreference struct {
@@ -1401,6 +1434,8 @@ type WorkspaceSyncSession struct {
 	DeletedDirectories         []string           `json:"deleted_directories"`
 	UploadDeletedDirectories   []string           `json:"upload_deleted_directories"`
 	DownloadDeletedDirectories []string           `json:"download_deleted_directories"`
+	TaskID                     pgtype.Text        `json:"task_id"`
+	TaskHubOperationKey        pgtype.Text        `json:"task_hub_operation_key"`
 }
 
 type WorkspaceSyncSessionBlock struct {

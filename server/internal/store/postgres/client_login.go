@@ -20,7 +20,7 @@ import (
 	"morde/server/internal/store/postgres/sqlcgen"
 )
 
-func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstallation, instanceID string, generation int64, legacyAndroid bool, keyHash, requestHash []byte, renewalID, ip string,
+func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstallation, authenticated identity.User, instanceID string, generation int64, legacyAndroid bool, keyHash, requestHash []byte, renewalID, ip string,
 	issue func(string) (app.ClientIssuedTokens, error)) (identity.ClientInstallation, app.ClientIssuedTokens, error) {
 	var installation identity.ClientInstallation
 	var issued app.ClientIssuedTokens
@@ -35,8 +35,20 @@ func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstal
 				return fmt.Errorf("lock legacy Android login: %w", err)
 			}
 		}
-		var approved bool
-		if err := tx.QueryRow(ctx, `SELECT status='approved' FROM users WHERE id=$1 FOR SHARE`, requested.OwnerID).Scan(&approved); err != nil || !approved {
+		var currentName, currentPasswordHash, currentRole, currentStatus string
+		var currentMustChangePassword bool
+		if authenticated.ID != requested.OwnerID || authenticated.Status != identity.StatusApproved {
+			return identity.ErrInvalidCredential
+		}
+		if err := tx.QueryRow(ctx, `SELECT name, password_hash, role, status, must_change_password FROM users WHERE id=$1 FOR SHARE`, requested.OwnerID).
+			Scan(&currentName, &currentPasswordHash, &currentRole, &currentStatus, &currentMustChangePassword); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return identity.ErrInvalidCredential
+			}
+			return fmt.Errorf("verify account identity for client login: %w", err)
+		}
+		if currentName != authenticated.Name || currentPasswordHash != authenticated.PasswordHash || currentRole != string(authenticated.Role) ||
+			currentStatus != string(authenticated.Status) || currentMustChangePassword != authenticated.MustChangePassword {
 			return identity.ErrInvalidCredential
 		}
 		var savedHash []byte
@@ -164,7 +176,8 @@ func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstal
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE tokens SET revoked_at=COALESCE(revoked_at,now())
-  WHERE client_installation_id=$1 AND revoked_at IS NULL`, installation.ID); err != nil {
+  WHERE client_installation_id=$1 AND revoked_at IS NULL
+    AND NOT (kind='client' AND scopes=ARRAY['schedule:read','schedule:manage']::text[] AND expires_at IS NOT NULL AND expires_at>clock_timestamp())`, installation.ID); err != nil {
 			return fmt.Errorf("rotate client credentials: %w", err)
 		}
 		if err := cancelWorkspaceSyncSessions(ctx, tx, requested.OwnerID, installation.ID, "", false); err != nil {

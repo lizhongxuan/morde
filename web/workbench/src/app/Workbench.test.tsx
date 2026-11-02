@@ -22,7 +22,10 @@ const control: GatewayControl = {
 function mockWorkbenchApi() {
   vi.spyOn(gatewayApi, 'host').mockResolvedValue(host);
   vi.spyOn(gatewayApi, 'control').mockResolvedValue(control);
+  vi.spyOn(gatewayApi, 'workspaces').mockResolvedValue({ items: [] });
 }
+
+afterEach(() => window.history.replaceState({}, '', '/'));
 
 describe('Workbench MVP navigation', () => {
   beforeEach(mockWorkbenchApi);
@@ -55,8 +58,21 @@ describe('Workbench MVP navigation', () => {
     expect(screen.queryByText(/Codex|微信|QQ|飞书/)).not.toBeInTheDocument();
     await waitFor(() => expect(gatewayApi.host).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole('button', { name: 'Workspace' }));
-    expect(await screen.findByText('此主机没有绑定工作区。')).toBeVisible();
+    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
     appApi.forEach((call) => expect(call).not.toHaveBeenCalled());
+  });
+
+  it('opens a Workspace-only session without querying owner-only Host or control APIs', async () => {
+    window.history.replaceState({}, '', '/__ch/wb/?tab=workspace');
+    render(<Workbench />);
+
+    expect(await screen.findByRole('button', { name: 'Workspace' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '桌面' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '终端' })).not.toBeInTheDocument();
+    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
+    expect(gatewayApi.host).not.toHaveBeenCalled();
+    expect(gatewayApi.control).not.toHaveBeenCalled();
+    expect(gatewayApi.workspaces).toHaveBeenCalledOnce();
   });
 });
 

@@ -17,12 +17,44 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/record"
 	"morde/server/internal/domain/task"
 )
 
 type cloudDSHBrokerTaskStore struct {
 	*runtimeToolTaskStore
 	events []task.Event
+}
+
+type cloudDSHRecordCaptureStore struct {
+	taskStore       *cloudDSHBrokerTaskStore
+	calls           int
+	principal       identity.Principal
+	input           record.CaptureInput
+	statusAtEnqueue task.Status
+	err             error
+}
+
+func (s *cloudDSHRecordCaptureStore) EnqueueRecordCapture(_ context.Context, principal identity.Principal, input record.CaptureInput) (record.QueueItem, error) {
+	s.calls++
+	s.principal = principal
+	s.input = input
+	s.taskStore.mu.RLock()
+	s.statusAtEnqueue = s.taskStore.details.Task.Status
+	s.taskStore.mu.RUnlock()
+	return record.QueueItem{ID: "rq1234567", OwnerID: principal.UserID, Purpose: input.Purpose, Kind: input.Kind, State: record.QueueQueued}, s.err
+}
+
+func (*cloudDSHRecordCaptureStore) ClaimRecordCaptures(context.Context, string, time.Time, time.Duration, int32) ([]record.QueueItem, error) {
+	return nil, nil
+}
+
+func (*cloudDSHRecordCaptureStore) CommitRecordCapture(context.Context, string, string, int64) (record.RecordMetadata, error) {
+	return record.RecordMetadata{}, nil
+}
+
+func (*cloudDSHRecordCaptureStore) FailRecordCapture(context.Context, string, string, int64, string) error {
+	return nil
 }
 
 func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progress TaskProgress) (task.Event, error) {
@@ -780,6 +812,78 @@ func TestCloudDSHToolBrokerCompletesHostlessTaskWithMatchingCheckpoint(t *testin
 	if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "Cloud task finished." ||
 		len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepSucceeded {
 		t.Fatalf("completed task = %#v, steps = %#v", store.details.Task, store.details.Steps)
+	}
+}
+
+func TestCloudDSHToolBrokerCapturesOnlyCompletedUserTurn(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		authorizationKind string
+		captureErr        error
+		wantCapture       bool
+	}{
+		{name: "queued after completion", wantCapture: true},
+		{name: "queue error does not change completed task", captureErr: errors.New("queue unavailable"), wantCapture: true},
+		{name: "unsupported authorization kind is not rewritten", authorizationKind: string(identity.KindScheduleTask)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			store.details.Task.HostID = ""
+			store.details.Task.Objective = "Explain the answer in chat."
+			if test.authorizationKind != "" {
+				store.details.Task.Authorization.Kind = test.authorizationKind
+			}
+			store.details.Task.Authorization.TokenID = "t1234567"
+			setCloudDSHCompletionFence(&store.details.Task)
+
+			captureStore := &cloudDSHRecordCaptureStore{taskStore: store, err: test.captureErr}
+			capture, err := NewRecordCaptureService(captureStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			broker, err := NewCloudDSHToolBrokerWithRecordCapture(store, fixture.executor, nil, nil, capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			claimed := store.details.Task
+			const toolOnlySentinel = "tool-data-must-not-be-recorded"
+			inputs := []ModelInput{
+				{Type: "function_call", CallID: "mcp-call-1", Name: cloudDSHMCPToolPrefix + "connector_tool", Arguments: `{"query":"` + toolOnlySentinel + `"}`},
+				{Type: "function_call_output", CallID: "mcp-call-1", Output: toolOnlySentinel},
+			}
+			if err := broker.Complete(context.Background(), claimed, cloudDSHCompletionFor(claimed, "Cloud task finished.", inputs)); err != nil {
+				t.Fatalf("Complete() error = %v", err)
+			}
+			if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "Cloud task finished." {
+				t.Fatalf("capture changed task completion: status=%q result=%q", store.details.Task.Status, store.details.Task.Result)
+			}
+			if !test.wantCapture {
+				if captureStore.calls != 0 {
+					t.Fatalf("unsupported authorization kind triggered capture: %#v", captureStore.principal)
+				}
+				return
+			}
+			if captureStore.calls != 1 || captureStore.statusAtEnqueue != task.StatusCompleted {
+				t.Fatalf("capture calls=%d, task status at enqueue=%q", captureStore.calls, captureStore.statusAtEnqueue)
+			}
+			if captureStore.principal.UserID != claimed.OwnerID || captureStore.principal.Kind != identity.KindSession ||
+				captureStore.principal.TokenID != claimed.Authorization.TokenID || captureStore.principal.Role != "" {
+				t.Fatalf("capture principal was not derived from the persisted authorization snapshot: %#v", captureStore.principal)
+			}
+			if captureStore.input.Purpose != record.PurposeFullRecord || captureStore.input.Kind != record.ItemTurn || captureStore.input.TaskID != claimed.ID ||
+				len(captureStore.input.Attachments) != 0 || strings.Contains(string(captureStore.input.Payload), toolOnlySentinel) {
+				t.Fatalf("capture included unsupported data: %#v", captureStore.input)
+			}
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(captureStore.input.Payload, &payload); err != nil || len(payload) != 2 ||
+				string(payload["objective"]) != `"Explain the answer in chat."` ||
+				string(payload["result"]) != `"Cloud task finished."` {
+				t.Fatalf("captured payload must contain only the objective and final result: %s (err=%v)", captureStore.input.Payload, err)
+			}
+		})
 	}
 }
 

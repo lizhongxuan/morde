@@ -37,6 +37,7 @@ const sharingPermissionLabels: Record<HostMemberPermission, string> = {
   'desktop:control': '操作桌面',
   'terminal:control': '终端操作',
   'mcp:control': 'MCP 操作',
+  'workspace:file:read': '读取工作区文件',
 };
 const hostReasonLabel: Record<string, string> = {
   user_release: '正在释放计算资源',
@@ -79,7 +80,7 @@ export function Hosts() {
   };
 
   const sharedHosts = useQuery({ queryKey: ['shared-hosts'], queryFn: portalApi.sharedHosts });
-  const enterShared = async (host: Awaited<ReturnType<typeof portalApi.sharedHosts>>['items'][number], entryTarget: 'desktop' | 'terminal') => {
+  const enterShared = async (host: Awaited<ReturnType<typeof portalApi.sharedHosts>>['items'][number], entryTarget: 'desktop' | 'terminal' | 'workspace') => {
     try { enterHostInNewTab(host.id, entryTarget); }
     catch (error) { notify(errorDetails(error).message, 'error'); }
   };
@@ -99,12 +100,14 @@ export function Hosts() {
             : <div className="host-list">{sharedHosts.data.items.map((host) => {
               const canViewDesktop = host.permissions.includes('desktop:view') || host.permissions.includes('desktop:control');
               const canControlTerminal = host.permissions.includes('terminal:control');
+              const canReadWorkspace = host.permissions.includes('workspace:file:read');
               return <article className="host-card" key={host.id}>
               <div className="host-card-heading"><div><h3>{host.name || '未命名主机'}</h3><p className="muted mono">{host.id}</p></div><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
               <p className="muted">权限：{host.permissions.map((permission) => sharingPermissionLabels[permission]).join('、') || '无'}</p>
               <div className="host-actions">
                 {canViewDesktop && <button type="button" className="button button-primary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'desktop')}>{host.state === 'running' ? '查看桌面' : '主机运行后可查看'}</button>}
                 {canControlTerminal && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'terminal')}>{host.state === 'running' ? '打开终端' : '主机运行后可打开终端'}</button>}
+                {canReadWorkspace && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'workspace')}>{host.state === 'running' ? '查看工作区' : '主机运行后可查看工作区'}</button>}
                 {host.permissions.includes('mcp:control') && <Link className="button button-secondary" to="/apikeys">配置 MCP API Key</Link>}
               </div>
             </article>;

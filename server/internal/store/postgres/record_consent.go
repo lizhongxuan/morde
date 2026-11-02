@@ -184,15 +184,12 @@ func (s *Store) SetRecordQuota(ctx context.Context, principal identity.Principal
 		if err := ensureRecordQuotaTx(ctx, tx, ownerID); err != nil {
 			return err
 		}
-		var usedBytes, reservedBytes, version int64
-		if err := tx.QueryRow(ctx, `SELECT used_bytes,reserved_bytes,version FROM record_quotas WHERE owner_id=$1 FOR UPDATE`, ownerID).Scan(&usedBytes, &reservedBytes, &version); err != nil {
+		var version int64
+		if err := tx.QueryRow(ctx, `SELECT version FROM record_quotas WHERE owner_id=$1 FOR UPDATE`, ownerID).Scan(&version); err != nil {
 			return fmt.Errorf("lock record quota: %w", err)
 		}
 		if version != expectedVersion {
 			return domain.NewError(domain.CodeConflict, "record quota version changed")
-		}
-		if usedBytes > limitBytes || reservedBytes > limitBytes-usedBytes {
-			return domain.NewError(domain.CodeQuotaExceeded, "record quota limit is below current usage")
 		}
 		if err := scanRecordQuota(tx.QueryRow(ctx, `UPDATE record_quotas SET retention_days=$2,limit_bytes=$3,
 version=version+1,updated_at=clock_timestamp() WHERE owner_id=$1

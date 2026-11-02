@@ -36,6 +36,9 @@ def create_fixture(root: Path, *, unsafe_workspace_tar: bool = False) -> Path:
     (pg / "global" / "pg_control").write_bytes(b"synthetic control file")
     (pg / "base" / "synthetic.dat").write_bytes(b"offline test only")
 
+    wal_archive = root / "postgres-wal-archive"
+    wal_archive.mkdir(mode=0o700)
+
     workspace = root / "workspaces"
     workspace_id = workspace / "w1234567"
     workspace_id.mkdir(parents=True)
@@ -65,6 +68,8 @@ def create_fixture(root: Path, *, unsafe_workspace_tar: bool = False) -> Path:
     bundle.mkdir(mode=0o700)
     with tarfile.open(bundle / "postgres-data.tar", "w") as archive:
         archive.add(pg, arcname=".")
+    with tarfile.open(bundle / "postgres-wal-archive.tar", "w") as archive:
+        archive.add(wal_archive, arcname=".")
     if unsafe_workspace_tar:
         with tarfile.open(bundle / "workspace-blocks.tar", "w") as archive:
             info = tarfile.TarInfo("../outside")
@@ -77,20 +82,36 @@ def create_fixture(root: Path, *, unsafe_workspace_tar: bool = False) -> Path:
         archive.add(sites, arcname=".")
     metadata = {
         "format": "morde-single-node-backup",
-        "format_version": 2,
+        "format_version": 3,
         "created_at_utc": "2026-01-01T00:00:00+00:00",
         "source_paths": {
             "postgres_data_dir": "/var/lib/postgresql/data",
+            "postgres_wal_archive_dir": "/var/lib/postgresql/wal-archive",
             "workspace_root": "/srv/morde/workspaces",
             "site_storage_root": "/srv/morde/sites",
         },
-        "postgres": {"major_version": "16", "image": IMAGE},
+        "postgres": {
+            "major_version": "16",
+            "image": IMAGE,
+            "system_identifier": "7703556091144286253",
+            "checkpoint_lsn": "0/2000000",
+            "redo_lsn": "0/1FFF000",
+            "redo_wal_file": "000000010000000000000001",
+            "timeline_id": 1,
+            "wal_segment_size": 16777216,
+        },
+        "postgres_wal_archive": {"segment_count": 0, "total_bytes": 0},
         "workspace_store": {"block_count": 1, "block_bytes": len(block)},
         "site_store": {"release_count": 1, "file_count": 1, "file_bytes": len(site_content)},
-        "archives": {"postgres_data_dir": "postgres-data.tar", "workspace_root": "workspace-blocks.tar", "site_storage_root": "site-artifacts.tar"},
+        "archives": {
+            "postgres_data_dir": "postgres-data.tar",
+            "postgres_wal_archive_dir": "postgres-wal-archive.tar",
+            "workspace_root": "workspace-blocks.tar",
+            "site_storage_root": "site-artifacts.tar",
+        },
     }
     (bundle / "metadata.json").write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    entries = ("postgres-data.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
+    entries = ("postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
     (bundle / "SHA256SUMS").write_text("".join(f"{digest(bundle / name)}  {name}\n" for name in entries), encoding="ascii")
     return bundle
 
@@ -100,14 +121,17 @@ class OfflineBackupValidationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="morde-backup-test-")
         self.root = Path(self.temp.name)
         self.bundle = create_fixture(self.root)
-        (self.root / "workspace-current").mkdir()
+        (self.root / "workspace-current" / "w1234567").mkdir(parents=True)
+        (self.root / "unrelated").mkdir()
+        (self.root / "unrelated-volume").mkdir()
+        (self.root / "workspaces" / "volume-data").mkdir()
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self.fake_docker = self.bin_dir / "docker"
         self.fake_docker.write_text(
             "#!/bin/sh\n"
             "if [ \"$1 $2\" = \"image inspect\" ]; then exit 0; fi\n"
-            "if [ \"$1\" = \"run\" ]; then printf 'Database cluster state: shut down\\n'; exit 0; fi\n"
+            "if [ \"$1\" = \"run\" ]; then printf \"Database system identifier: 7703556091144286253\\nDatabase cluster state: shut down\\nLatest checkpoint location: 0/2000000\\nLatest checkpoint's REDO location: 0/1FFF000\\nLatest checkpoint's REDO WAL file: 000000010000000000000001\\nLatest checkpoint's TimeLineID: 1\\nBytes per WAL segment: 16777216\\n\"; exit 0; fi\n"
             "exit 9\n",
             encoding="utf-8",
         )
@@ -164,7 +188,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         )
         original_stat = Path.stat
         for alias_name, target in cases:
-            alias = self.root / alias_name
+            alias = (self.root / alias_name).resolve()
             alias.mkdir()
 
             def stat_with_bind_alias(path, *args, _alias=alias, _target=target, **kwargs):
@@ -193,12 +217,12 @@ class OfflineBackupValidationTests(unittest.TestCase):
         mounts = [
             {"Type": "bind", "Source": str(self.root / "pg"), "RW": False},
             {"Type": "bind", "Source": str(self.root / "unrelated"), "RW": True},
-            {"Type": "volume", "Name": "example", "Source": "/var/lib/docker/volumes/example/_data", "RW": True},
+            {"Type": "volume", "Name": "example", "Source": str(self.root / "unrelated-volume"), "RW": True},
             {"Type": "volume", "Name": "readonly", "Source": "/var/lib/docker/volumes/readonly/_data", "RW": False},
         ]
         with patch.object(BACKUP, "run", side_effect=[
             "0123456789abcdef\n", json.dumps(mounts),
-            json.dumps({"Driver": "local", "Mountpoint": "/var/lib/docker/volumes/example/_data", "Options": None}),
+            json.dumps({"Driver": "local", "Mountpoint": str(self.root / "unrelated-volume"), "Options": None}),
         ]):
             BACKUP.require_no_running_container_mounts(sources)
         with patch.object(BACKUP, "run", return_value=""):
@@ -300,6 +324,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         nested_current.mkdir()
         args = type("Args", (), {
             "postgres_data_dir": str(self.root / "pg"),
+            "postgres_wal_archive_dir": str(self.root / "postgres-wal-archive"),
             "workspace_root": str(self.root / "workspaces"),
             "workspace_current_root": str(nested_current),
             "site_storage_root": str(self.root / "sites"),
@@ -307,12 +332,113 @@ class OfflineBackupValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(BACKUP.BackupError, "directories must not overlap"):
             BACKUP.source_paths(args)
 
+    def test_wal_archive_must_not_overlap_postgres_data(self) -> None:
+        wal_archive = self.root / "pg" / "wal-archive"
+        wal_archive.mkdir()
+        args = type("Args", (), {
+            "postgres_data_dir": str(self.root / "pg"),
+            "postgres_wal_archive_dir": str(wal_archive),
+            "workspace_root": str(self.root / "workspaces"),
+            "workspace_current_root": str(self.root / "workspace-current"),
+            "site_storage_root": str(self.root / "sites"),
+        })()
+        with self.assertRaisesRegex(BACKUP.BackupError, "directories must not overlap"):
+            BACKUP.source_paths(args)
+
+    def test_recovery_can_resolve_missing_data_targets_from_existing_parents(self) -> None:
+        target_root = self.root / "interrupted"
+        target_root.mkdir()
+        args = type("Args", (), {
+            "postgres_data_dir": str(target_root / "pg"),
+            "postgres_wal_archive_dir": str(target_root / "wal"),
+            "workspace_root": str(target_root / "blocks"),
+            "workspace_current_root": str(self.root / "workspace-current"),
+            "site_storage_root": str(target_root / "sites"),
+        })()
+        sources = BACKUP.source_paths(args, allow_missing=True)
+        self.assertFalse(sources["postgres_data_dir"].exists())
+        self.assertFalse(sources["postgres_wal_archive_dir"].exists())
+
     def test_verifies_synthetic_postgres_workspace_and_site_bundle(self) -> None:
         result = self.run_verify()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Backup integrity verified", result.stdout)
         self.assertIn("Workspace blocks: 1", result.stdout)
         self.assertIn("Site releases: 1", result.stdout)
+
+    def test_pg_controldata_runs_as_control_file_owner(self) -> None:
+        for uid, gid in ((999, 999), (0, 0)):
+            with self.subTest(uid=uid, gid=gid):
+                info = os.stat_result((BACKUP.stat.S_IFREG | 0o600, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+                with patch.object(BACKUP.os, "lstat", return_value=info), patch.object(
+                    BACKUP, "run", side_effect=["", "Database cluster state: shut down\n"]
+                ) as run:
+                    BACKUP.postgres_control_data(self.root / "pg", IMAGE)
+
+                args = run.call_args_list[-1].args[0]
+                self.assertEqual(args[args.index("--user") + 1], f"{uid}:{gid}")
+
+    def test_pg_controldata_rejects_a_non_regular_control_file(self) -> None:
+        info = os.stat_result((BACKUP.stat.S_IFLNK | 0o777, 0, 0, 1, 999, 999, 0, 0, 0, 0))
+        with patch.object(BACKUP.os, "lstat", return_value=info), patch.object(BACKUP, "run") as run:
+            with self.assertRaisesRegex(BACKUP.BackupError, "not a regular file"):
+                BACKUP.postgres_control_data(self.root / "pg", IMAGE)
+        run.assert_not_called()
+
+    def test_wal_archive_accepts_postgres_backup_history_files(self) -> None:
+        wal_archive = self.root / "private-wal"
+        wal_archive.mkdir(mode=0o700)
+        os.chmod(wal_archive, 0o700)
+        (wal_archive / "000000010000000000000001").write_bytes(b"w" * (1 << 20))
+        (wal_archive / "000000010000000000000001.00000020.backup").write_text("backup history\n", encoding="ascii")
+        for path in wal_archive.iterdir():
+            path.chmod(0o600)
+
+        self.assertEqual(BACKUP.validate_wal_archive(wal_archive, 1 << 20), (1, (1 << 20) + len("backup history\n")))
+
+    def test_follow_up_requires_a_later_lsn_from_the_same_system_and_timeline(self) -> None:
+        base = json.loads((self.bundle / "metadata.json").read_text(encoding="utf-8"))["postgres"]
+        follow_up = {**base, "checkpoint_lsn": "0/3000000"}
+        self.assertEqual(
+            BACKUP.wal_replay_segments(base, follow_up, 4),
+            [
+                "000000010000000000000001",
+                "000000010000000000000002",
+                "000000010000000000000003",
+            ],
+        )
+        with self.assertRaisesRegex(BACKUP.BackupError, "different PostgreSQL system"):
+            BACKUP.wal_replay_segments(base, {**follow_up, "system_identifier": "7703556091144286254"}, 4)
+        with self.assertRaisesRegex(BACKUP.BackupError, "different PostgreSQL timeline"):
+            BACKUP.wal_replay_segments(base, {**follow_up, "timeline_id": 2}, 4)
+        with self.assertRaisesRegex(BACKUP.BackupError, "missing one or more required segments"):
+            BACKUP.wal_replay_segments(base, follow_up, 1)
+
+    def test_follow_up_replay_requires_every_wal_segment_and_uses_target_pg_wal_tail(self) -> None:
+        base = {
+            "system_identifier": "1",
+            "checkpoint_lsn": "0/180000",
+            "redo_lsn": "0/80000",
+            "timeline_id": 1,
+            "wal_segment_size": 1 << 20,
+        }
+        follow_up = {**base, "checkpoint_lsn": "0/300000"}
+        wal_stage = self.root / "follow-up-wal"
+        wal_stage.mkdir(mode=0o700)
+        for segment in range(3):
+            name = f"00000001000000000000000{segment}"
+            target = wal_stage / name
+            target.write_bytes(bytes([segment]) * (1 << 20))
+            target.chmod(0o600)
+        postgres_tar = self.root / "follow-up-postgres.tar"
+        with tarfile.open(postgres_tar, "w") as archive:
+            member = tarfile.TarInfo("pg_wal/000000010000000000000003")
+            member.size = 1 << 20
+            archive.addfile(member, __import__("io").BytesIO(b"\x03" * (1 << 20)))
+        segments = BACKUP.prepare_follow_up_wal(base, follow_up, wal_stage, postgres_tar)
+        self.assertEqual(len(segments), 4)
+        self.assertEqual((wal_stage / segments[-1]).stat().st_size, 1 << 20)
+        self.assertEqual(digest(wal_stage / segments[-1]), hashlib.sha256(b"\x03" * (1 << 20)).hexdigest())
 
     def test_rejects_tampered_site_archive_before_validation(self) -> None:
         with (self.bundle / "site-artifacts.tar").open("ab") as target:
@@ -328,7 +454,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
         (sites / ".staging" / "unexpected").write_text("keep", encoding="utf-8")
         with tarfile.open(bundle / "site-artifacts.tar", "w") as archive:
             archive.add(sites, arcname=".")
-        entries = ("postgres-data.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
+        entries = ("postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
         (bundle / "SHA256SUMS").write_text(
             "".join(f"{digest(bundle / name)}  {name}\n" for name in entries),
             encoding="ascii",
@@ -363,7 +489,7 @@ class OfflineBackupValidationTests(unittest.TestCase):
                 directory = tarfile.TarInfo(name)
                 directory.type = tarfile.DIRTYPE
                 archive.addfile(directory)
-        entries = ("postgres-data.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
+        entries = ("postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
         (self.bundle / "SHA256SUMS").write_text(
             "".join(f"{digest(self.bundle / name)}  {name}\n" for name in entries),
             encoding="ascii",

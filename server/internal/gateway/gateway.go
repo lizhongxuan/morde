@@ -39,6 +39,7 @@ type Deps struct {
 	Security         config.Security
 	Hosts            app.HostService
 	HostSharing      app.HostSharingService
+	WorkspaceFiles   hostWorkspaceFileService
 	Control          ControlService
 	Runtime          app.HostRuntime
 	ActivityLeases   app.HostActivityLeaseStore
@@ -83,7 +84,7 @@ func (h *gatewayHandler) CloseConnections() {
 }
 
 func New(d Deps) (http.Handler, error) {
-	if d.Logger == nil || d.Metrics == nil || d.Hosts == nil || d.HostSharing == nil || d.Control == nil || d.Runtime == nil || d.ActivityLeases == nil || d.InputPermits == nil || d.TerminalSessions == nil || d.TerminalAIO == nil || d.Auth == nil {
+	if d.Logger == nil || d.Metrics == nil || d.Hosts == nil || d.HostSharing == nil || d.WorkspaceFiles == nil || d.Control == nil || d.Runtime == nil || d.ActivityLeases == nil || d.InputPermits == nil || d.TerminalSessions == nil || d.TerminalAIO == nil || d.Auth == nil {
 		return nil, fmt.Errorf("gateway dependencies are required")
 	}
 	if d.Domains.Scheme != "http" && d.Domains.Scheme != "https" {
@@ -135,6 +136,9 @@ func New(d Deps) (http.Handler, error) {
 	g.engine.GET("/__ch/terminal", g.cookieAuthMiddleware(), g.terminalEntry)
 	g.engine.GET("/__ch/terminal/", g.cookieAuthMiddleware(), g.terminalEntry)
 	g.engine.GET("/__ch/api/host", g.cookieAuthMiddleware(), g.getHost)
+	g.engine.GET("/__ch/api/workspaces", g.cookieAuthMiddleware(), g.listHostWorkspaces)
+	g.engine.GET("/__ch/api/workspaces/:workspace_id/manifest", g.cookieAuthMiddleware(), g.getHostWorkspaceManifest)
+	g.engine.GET("/__ch/api/workspaces/:workspace_id/files/*path", g.cookieAuthMiddleware(), g.downloadHostWorkspaceFile)
 	g.engine.POST("/__ch/api/renew", g.cookieAuthMiddleware(), g.renewHost)
 	g.engine.GET("/__ch/api/control", g.cookieAuthMiddleware(), g.getControl)
 	g.engine.GET("/__ch/api/applications", g.cookieAuthMiddleware(), g.getApplications)

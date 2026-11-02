@@ -340,8 +340,8 @@ type nativeAcceptanceAuth struct {
 	users       *app.UserService
 }
 
-func (a nativeAcceptanceAuth) Register(ctx context.Context, name, password, ip string) (api.UserView, error) {
-	user, err := a.users.Register(ctx, name, password, ip)
+func (a nativeAcceptanceAuth) Register(ctx context.Context, name, password, ip string, inviteCode ...string) (api.UserView, error) {
+	user, err := a.users.Register(ctx, name, password, ip, inviteCode...)
 	return nativeAcceptanceUserView(user), err
 }
 

@@ -8,12 +8,31 @@ services:
       POSTGRES_DB: cloudhost
       POSTGRES_USER: cloudhost
       POSTGRES_PASSWORD: ${CH_POSTGRES_PASSWORD:?Set CH_POSTGRES_PASSWORD in /etc/cloudhost/cloudhost.env}
+    command:
+      - postgres
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=60s
+      - -c
+      - "archive_command=/usr/local/bin/morde-archive-wal %p %f"
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - type: bind
         source: ${CH_POSTGRES_DATA_DIR:?Set CH_POSTGRES_DATA_DIR to a directory on the PostgreSQL data partition}
         target: /var/lib/postgresql/data
+      - type: bind
+        source: ${CH_POSTGRES_WAL_ARCHIVE_DIR:?Set CH_POSTGRES_WAL_ARCHIVE_DIR to a pre-created local directory owned by 999:999 with mode 0700}
+        target: /var/lib/postgresql/wal-archive
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./backup/archive-wal.sh
+        target: /usr/local/bin/morde-archive-wal
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s

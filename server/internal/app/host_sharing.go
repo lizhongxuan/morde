@@ -67,7 +67,7 @@ func (s *hostSharingService) Invite(ctx context.Context, principal identity.Prin
 }
 
 func normalizeHostMemberPermissions(permissions []host.Permission) ([]host.Permission, error) {
-	var desktopView, desktopControl, terminalControl, mcpControl bool
+	var desktopView, desktopControl, terminalControl, mcpControl, workspaceFileRead bool
 	for _, permission := range permissions {
 		switch permission {
 		case host.PermissionDesktopView:
@@ -78,6 +78,8 @@ func normalizeHostMemberPermissions(permissions []host.Permission) ([]host.Permi
 			terminalControl = true
 		case host.PermissionMCPControl:
 			mcpControl = true
+		case host.PermissionWorkspaceFileRead:
+			workspaceFileRead = true
 		default:
 			return nil, domain.InvalidArgument("permissions", "host member permission is unsupported")
 		}
@@ -85,10 +87,10 @@ func normalizeHostMemberPermissions(permissions []host.Permission) ([]host.Permi
 	if desktopControl {
 		desktopView = true
 	}
-	if !desktopView && !desktopControl && !terminalControl && !mcpControl {
+	if !desktopView && !desktopControl && !terminalControl && !mcpControl && !workspaceFileRead {
 		return nil, domain.InvalidArgument("permissions", "at least one host member permission is required")
 	}
-	result := make([]host.Permission, 0, 4)
+	result := make([]host.Permission, 0, 5)
 	if desktopView {
 		result = append(result, host.PermissionDesktopView)
 	}
@@ -100,6 +102,9 @@ func normalizeHostMemberPermissions(permissions []host.Permission) ([]host.Permi
 	}
 	if mcpControl {
 		result = append(result, host.PermissionMCPControl)
+	}
+	if workspaceFileRead {
+		result = append(result, host.PermissionWorkspaceFileRead)
 	}
 	return result, nil
 }
@@ -139,6 +144,10 @@ func (s *hostSharingService) IssueObservationTicket(ctx context.Context, princip
 
 func (s *hostSharingService) IssueTerminalTicket(ctx context.Context, principal identity.Principal, hostID string) (EnterInfo, error) {
 	return s.issueHostTicket(ctx, principal, hostID, host.PermissionTerminalControl, "terminal_control", "/__ch/terminal/")
+}
+
+func (s *hostSharingService) IssueWorkspaceTicket(ctx context.Context, principal identity.Principal, hostID string) (EnterInfo, error) {
+	return s.issueHostTicket(ctx, principal, hostID, host.PermissionWorkspaceFileRead, "workspace_file_read", "/__ch/wb/?tab=workspace")
 }
 
 func (s *hostSharingService) issueHostTicket(ctx context.Context, principal identity.Principal, hostID string, permission host.Permission, mode, next string) (EnterInfo, error) {

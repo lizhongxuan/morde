@@ -29,12 +29,13 @@ func TestPostgresPersonalContentObjectsAreOwnerScopedVersionedAndSyncable(t *tes
 		{ObjectType: personal.ObjectTypeFeedPreferences, ObjectID: "default", Body: json.RawMessage(`{"content":"Prefer concise suggestions."}`)},
 		{ObjectType: personal.ObjectTypeIdeaMark, ObjectID: "train-watch", Body: json.RawMessage(`{"state":"saved"}`)},
 		{ObjectType: personal.ObjectTypeLibraryItem, ObjectID: "library-item_1", Body: json.RawMessage(`{"name":"notes.md","kind":"artifact","mime":"text/markdown","size_bytes":4}`)},
-		{ObjectType: personal.ObjectTypeGoal, ObjectID: "g_1", Body: json.RawMessage(`{"title":"Learn Go","status":"active","steps":[{"id":"s_1","title":"Read the tour","status":"pending"}],"related_material_ids":["library-item_1"]}`)},
+		{ObjectType: personal.ObjectTypeGoal, ObjectID: "g_1", Body: json.RawMessage(`{"title":"Learn Go","status":"active","steps":[{"id":"s_1","title":"Read the tour","status":"pending"}],"related_material_ids":[]}`)},
 		{ObjectType: personal.ObjectTypeSkillSetting, ObjectID: "builtin_weather", Body: json.RawMessage(`{"enabled":false}`)},
 		{ObjectType: personal.ObjectTypeConnectorSetting, ObjectID: "catalogue_calendar", Body: json.RawMessage(`{"auth":"oauth","enabled":true}`)},
 	}
-	if len(objects) != len(personal.PersonalSyncObjectTypes()) {
-		t.Fatalf("test covers %d of %d syncable types", len(objects), len(personal.PersonalSyncObjectTypes()))
+	// Schedules use the schedule API and have their own sync integration tests.
+	if len(objects) != len(personal.PersonalSyncObjectTypes())-1 {
+		t.Fatalf("test covers %d of %d generic syncable types", len(objects), len(personal.PersonalSyncObjectTypes())-1)
 	}
 
 	mutations := make([]personal.Mutation, len(objects))
@@ -226,7 +227,7 @@ func updatedPersonalContentBody(object personal.Object) json.RawMessage {
 	case personal.ObjectTypeLibraryItem:
 		return json.RawMessage(`{"name":"updated-notes.md","kind":"artifact","mime":"text/markdown","size_bytes":12}`)
 	case personal.ObjectTypeGoal:
-		return json.RawMessage(`{"title":"Learn Go","status":"active","steps":[{"id":"s_1","title":"Read the tour","status":"done"}],"related_material_ids":["library-item_1"]}`)
+		return json.RawMessage(`{"title":"Learn Go","status":"active","steps":[{"id":"s_1","title":"Read the tour","status":"done"}],"related_material_ids":[]}`)
 	case personal.ObjectTypeSkillSetting:
 		return json.RawMessage(`{"enabled":true}`)
 	case personal.ObjectTypeConnectorSetting:

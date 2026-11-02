@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link } from 'react-router';
+import { Link, useLocation, useNavigate } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
@@ -99,11 +99,18 @@ export function Assistant() {
   const client = useQueryClient();
   const { notify } = useToast();
   const { user } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const navigationIdea = typeof location.state === 'object' && location.state !== null
+    ? location.state as { ideaID?: unknown; ideaPrompt?: unknown }
+    : null;
+  const ideaPrompt = typeof navigationIdea?.ideaPrompt === 'string' ? navigationIdea.ideaPrompt : '';
+  const hasNavigationIdea = typeof navigationIdea?.ideaID === 'string' && Boolean(navigationIdea.ideaID) && Boolean(ideaPrompt);
   const [conversationSelection, setConversationSelection] = useState<{ scope: string; id: string | null } | null>(null);
   const [hostSelection, setHostSelection] = useState<string | null>(null);
   const [workspaceSelection, setWorkspaceSelection] = useState('');
   const [modelID, setModelID] = useState('');
-  const [content, setContent] = useState('');
+  const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
   const [clarificationAnswer, setClarificationAnswer] = useState('');
   const pendingSend = useRef<{ fingerprint: string; key: string } | null>(null);
   const pendingTaskActions = useRef(new Map<string, { fingerprint: string; key: string }>());
@@ -314,6 +321,11 @@ export function Assistant() {
       void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
     }
   }, [activeTaskStatus, client, conversationID]);
+
+  useEffect(() => {
+    if (!hasNavigationIdea) return;
+    navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
+  }, [hasNavigationIdea, location.hash, location.pathname, location.search, navigate]);
 
   return <section className="assistant-page">
     <div className="page-heading assistant-heading">

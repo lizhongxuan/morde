@@ -17,8 +17,29 @@ type recordCaptureQueueFake struct {
 	committed         int
 	failed            int
 	failureCode       string
+	failedState       record.QueueState
 	cancel            context.CancelFunc
 	cancelAfterCommit bool
+}
+
+type recordCaptureRecoveryQueueFake struct {
+	*recordCaptureQueueFake
+	recovered bool
+}
+
+func (f *recordCaptureRecoveryQueueFake) RecoverCloudDSHCaptures(_ context.Context, limit int32) error {
+	if limit != 3 {
+		return errors.New("invalid recovery limit")
+	}
+	f.recovered = true
+	return nil
+}
+
+func (f *recordCaptureRecoveryQueueFake) Claim(ctx context.Context, worker string, now time.Time, lease time.Duration, limit int32) ([]record.QueueItem, error) {
+	if !f.recovered {
+		return nil, errors.New("capture recovery did not run before claiming")
+	}
+	return f.recordCaptureQueueFake.Claim(ctx, worker, now, lease, limit)
 }
 
 func (f *recordCaptureQueueFake) Claim(_ context.Context, worker string, now time.Time, lease time.Duration, limit int32) ([]record.QueueItem, error) {
@@ -43,6 +64,7 @@ func (f *recordCaptureQueueFake) Commit(_ context.Context, queueID, worker strin
 func (f *recordCaptureQueueFake) Fail(_ context.Context, queueID, worker string, leaseVersion int64, failureCode string) error {
 	f.failed++
 	f.failureCode = failureCode
+	f.failedState = record.QueueFailed
 	if queueID != "j1234567" || worker != "record-worker" || leaseVersion != 4 {
 		return errors.New("invalid fail arguments")
 	}
@@ -93,19 +115,52 @@ func TestRecordCaptureWorkerCommitsAndProcessesDeletions(t *testing.T) {
 	}
 }
 
+func TestRecordCaptureWorkerRecoversCompletedCloudDSHTasksBeforeClaiming(t *testing.T) {
+	queue := &recordCaptureRecoveryQueueFake{recordCaptureQueueFake: &recordCaptureQueueFake{}}
+	access := &recordDeleteQueueFake{}
+	worker := newRecordWorkerForTest(t, queue, access, nil)
+	if err := worker.processSafely(context.Background()); err != nil {
+		t.Fatalf("processSafely() error = %v", err)
+	}
+	if !queue.recovered || queue.claimed != 1 {
+		t.Fatalf("recovery/claim calls: recovered=%t claimed=%d", queue.recovered, queue.claimed)
+	}
+}
+
 func TestRecordCaptureWorkerDoesNotFailTransientCommitErrors(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
 	queue := &recordCaptureQueueFake{
-		items:     []record.QueueItem{{ID: "j1234567", State: record.QueueLeased, LeaseOwner: "record-worker", LeaseVersion: 4}},
-		commitErr: domain.NewError(domain.CodeInternal, "temporary database failure"), cancelAfterCommit: true,
+		items: []record.QueueItem{{
+			ID: "j1234567", State: record.QueueLeased, LeaseOwner: "record-worker", LeaseVersion: 4,
+			Attempts: maxRecordCaptureAttempts - 1,
+		}},
+		commitErr: domain.NewError(domain.CodeInternal, "temporary database failure"),
 	}
 	access := &recordDeleteQueueFake{}
-	worker := newRecordWorkerForTest(t, queue, access, cancel)
-	if err := worker.Run(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want context canceled", err)
+	worker := newRecordWorkerForTest(t, queue, access, nil)
+	if err := worker.processSafely(context.Background()); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("processSafely() error = %v, want transient internal error", err)
 	}
-	if queue.claimed < 1 || queue.committed != 1 || queue.failed != 0 {
+	if queue.claimed != 1 || queue.committed != 1 || queue.failed != 0 {
 		t.Fatalf("transient commit calls: claim=%d commit=%d fail=%d", queue.claimed, queue.committed, queue.failed)
+	}
+}
+
+func TestRecordCaptureWorkerFailsTransientCommitErrorsAtAttemptLimit(t *testing.T) {
+	queue := &recordCaptureQueueFake{
+		items: []record.QueueItem{{
+			ID: "j1234567", State: record.QueueLeased, LeaseOwner: "record-worker", LeaseVersion: 4,
+			Attempts: maxRecordCaptureAttempts,
+		}},
+		commitErr: domain.NewError(domain.CodeInternal, "temporary database failure"),
+	}
+	access := &recordDeleteQueueFake{}
+	worker := newRecordWorkerForTest(t, queue, access, nil)
+	if err := worker.processSafely(context.Background()); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("processSafely() error = %v, want transient internal error", err)
+	}
+	if queue.committed != 1 || queue.failed != 1 || queue.failureCode != "commit_failed" || queue.failedState != record.QueueFailed {
+		t.Fatalf("transient commit at attempt limit: commit=%d fail=%d code=%q state=%q",
+			queue.committed, queue.failed, queue.failureCode, queue.failedState)
 	}
 }
 

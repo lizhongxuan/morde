@@ -208,18 +208,18 @@ func TestPendingLegacyImportBlockGCReleasesAbandonedReservations(t *testing.T) {
 func TestPendingLegacyImportBlockGCFailsClosedWithActiveSync(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	snapshot := createPendingLegacyWorkspace(t, ctx, store, "pending-import-gc-active-sync")
-	value, err := store.GetWorkspace(ctx, snapshot.WorkspaceID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "pending-import-gc-active-sync")
 	session := newTestSyncSession(t, value, value.OwnerID, []workspace.File{}, []workspace.File{}, nil)
 	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, []workspace.TransferBlock{},
 		syncTestIdempotency(value.OwnerID, "workspace.sync.create", "legacy-gc-active:"+session.ID, session.ID)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, value.ID, "legacy-"+value.ID); err != nil {
+		t.Fatal(err)
+	}
 	called := false
-	err = store.WithPendingLegacyImportWorkspaceBlockGC(ctx, snapshot.WorkspaceID, func([]workspace.BlockReference) ([]app.WorkspaceBlockRemoval, error) {
+	err := store.WithPendingLegacyImportWorkspaceBlockGC(ctx, value.ID, func([]workspace.BlockReference) ([]app.WorkspaceBlockRemoval, error) {
 		called = true
 		return nil, nil
 	})
@@ -370,9 +370,13 @@ func TestWorkspaceLegacyImportSerializesDirectReceive(t *testing.T) {
 	if err := store.MarkWorkspaceCurrentMaterialized(ctx, workspaceValue.ID, 0); err != nil {
 		t.Fatal(err)
 	}
+	secondPrincipal := syncDeviceTestPrincipal(t, store, owner.ID)
+	registerTestWorkspaceSyncDevice(t, store, secondPrincipal, workspaceValue.ID,
+		"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB", "receive-test-"+workspaceValue.ID)
+	applyWorkspaceSyncNodeState(t, store, owner.ID)
 	activeRequest := receiveTestRequest(owner.ID, workspaceValue.ID, "from-phone.txt", 1, "receive-before-import")
-	if reservation := reserveTestWorkspaceReceive(t, ctx, store, activeRequest); reservation.State != "reserved" {
-		t.Fatalf("reserve direct receive before pending import = %#v", reservation)
+	if reservation, err := reserveTestWorkspaceReceiveErr(t, ctx, store, activeRequest); err != nil || reservation.State != "reserved" {
+		t.Fatalf("reserve direct receive before pending import = %#v, err=%v", reservation, err)
 	}
 	volumeName := "legacy-" + workspaceValue.ID
 	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state) VALUES ($1,$2,'pending')`, workspaceValue.ID, volumeName); err != nil {

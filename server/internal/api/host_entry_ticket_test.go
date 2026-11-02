@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,8 +13,9 @@ import (
 
 type entryTicketHostSharing struct {
 	app.HostSharingService
-	desktopCalls  int
-	terminalCalls int
+	desktopCalls   int
+	terminalCalls  int
+	workspaceCalls int
 }
 
 func (s *entryTicketHostSharing) IssueObservationTicket(context.Context, identity.Principal, string) (app.EnterInfo, error) {
@@ -24,6 +26,11 @@ func (s *entryTicketHostSharing) IssueObservationTicket(context.Context, identit
 func (s *entryTicketHostSharing) IssueTerminalTicket(context.Context, identity.Principal, string) (app.EnterInfo, error) {
 	s.terminalCalls++
 	return app.EnterInfo{URL: "https://h1234567.hosts.test/__ch/auth?t=terminal&next=%2F__ch%2Fterminal%2F", ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
+func (s *entryTicketHostSharing) IssueWorkspaceTicket(context.Context, identity.Principal, string) (app.EnterInfo, error) {
+	s.workspaceCalls++
+	return app.EnterInfo{URL: "https://h1234567.hosts.test/__ch/auth?t=workspace&next=%2F__ch%2Fwb%2F%3Ftab%3Dworkspace", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
 
 func TestHostEntryTicketTargetIsStrictAndPermissionSpecific(t *testing.T) {
@@ -45,6 +52,10 @@ func TestHostEntryTicketTargetIsStrictAndPermissionSpecific(t *testing.T) {
 	if terminal.Code != http.StatusOK || sharing.desktopCalls != 1 || sharing.terminalCalls != 1 {
 		t.Fatalf("terminal ticket = %d calls=%d/%d", terminal.Code, sharing.desktopCalls, sharing.terminalCalls)
 	}
+	workspace := requestWithCookie(router, http.MethodPost, "/api/hosts/"+testHostID+"/observation-ticket?target=workspace", cookie, "https://portal.example.test")
+	if workspace.Code != http.StatusOK || sharing.workspaceCalls != 1 || !strings.Contains(workspace.Body.String(), "__ch%2Fwb%2F%3Ftab%3Dworkspace") {
+		t.Fatalf("workspace ticket = %d calls=%d body=%s", workspace.Code, sharing.workspaceCalls, workspace.Body)
+	}
 	for _, path := range []string{
 		"/api/hosts/" + testHostID + "/observation-ticket?target=unknown",
 		"/api/hosts/" + testHostID + "/observation-ticket?target=terminal&target=desktop",
@@ -55,7 +66,7 @@ func TestHostEntryTicketTargetIsStrictAndPermissionSpecific(t *testing.T) {
 			t.Errorf("invalid ticket target %s = %d %s; want 400", path, response.Code, response.Body)
 		}
 	}
-	if sharing.desktopCalls != 1 || sharing.terminalCalls != 1 {
-		t.Fatalf("invalid target reached issuer: calls=%d/%d", sharing.desktopCalls, sharing.terminalCalls)
+	if sharing.desktopCalls != 1 || sharing.terminalCalls != 1 || sharing.workspaceCalls != 1 {
+		t.Fatalf("invalid target reached issuer: calls=%d/%d/%d", sharing.desktopCalls, sharing.terminalCalls, sharing.workspaceCalls)
 	}
 }

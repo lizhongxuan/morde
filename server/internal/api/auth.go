@@ -13,7 +13,7 @@ import (
 )
 
 type AuthService interface {
-	Register(context.Context, string, string, string) (UserView, error)
+	Register(context.Context, string, string, string, ...string) (UserView, error)
 	Login(context.Context, string, string, string) (LoginResult, error)
 	Logout(context.Context, identity.Principal) error
 	ChangePassword(context.Context, identity.Principal, string, string) error
@@ -47,6 +47,12 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+type registerRequest struct {
+	Name       string `json:"name"`
+	Password   string `json:"password"`
+	InviteCode string `json:"invite_code,omitempty"`
+}
+
 func (h *api) registerAuth(group *gin.RouterGroup) {
 	group.POST("/auth/register", h.register)
 	group.POST("/auth/login", h.login)
@@ -59,11 +65,11 @@ func (h *api) registerAuth(group *gin.RouterGroup) {
 }
 
 func (h *api) register(c *gin.Context) {
-	var request loginRequest
+	var request registerRequest
 	if !decodeJSON(c, &request) {
 		return
 	}
-	user, err := h.deps.Auth.Register(c.Request.Context(), request.Name, request.Password, c.ClientIP())
+	user, err := h.deps.Auth.Register(c.Request.Context(), request.Name, request.Password, c.ClientIP(), request.InviteCode)
 	if err != nil {
 		writeError(c, err)
 		return

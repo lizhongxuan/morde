@@ -177,7 +177,6 @@ type cloudDSHTestModels struct {
 	calls     []app.ModelCall
 	response  app.ModelResponse
 	responses []app.ModelResponse
-	block     bool
 	complete  func(context.Context, app.ModelCall) (app.ModelResponse, error)
 }
 
@@ -185,10 +184,6 @@ func (m *cloudDSHTestModels) Complete(ctx context.Context, call app.ModelCall) (
 	m.calls = append(m.calls, call)
 	if m.complete != nil {
 		return m.complete(ctx, call)
-	}
-	if m.block {
-		<-ctx.Done()
-		return app.ModelResponse{}, ctx.Err()
 	}
 	if len(m.responses) >= len(m.calls) {
 		return m.responses[len(m.calls)-1], nil
@@ -905,11 +900,30 @@ func TestCloudDSHExecutorCancellationStopsChild(t *testing.T) {
 
 func TestCloudDSHExecutorCancellationDuringModelCall(t *testing.T) {
 	executor, _, store, _, models, value := cloudDSHFixture(t)
-	models.block = true
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	modelStarted := make(chan struct{})
+	models.complete = func(ctx context.Context, _ app.ModelCall) (app.ModelResponse, error) {
+		close(modelStarted)
+		<-ctx.Done()
+		return app.ModelResponse{}, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	err := executor.ExecuteTask(ctx, value)
-	if !errors.Is(err, context.DeadlineExceeded) || len(models.calls) != 1 || store.stopped != 1 {
+	done := make(chan error, 1)
+	go func() { done <- executor.ExecuteTask(ctx, value) }()
+	select {
+	case <-modelStarted:
+		cancel()
+	case err := <-done:
+		t.Fatalf("ExecuteTask() returned before model call started: %v", err)
+	case <-time.After(3 * time.Second):
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("ExecuteTask() after cancellation = %v", err)
+		}
+		t.Fatal("model call did not start before timeout")
+	}
+	err := <-done
+	if !errors.Is(err, context.Canceled) || len(models.calls) != 1 || store.stopped != 1 {
 		t.Fatalf("cancelled model result = %v, calls=%d stopped=%d", err, len(models.calls), store.stopped)
 	}
 }

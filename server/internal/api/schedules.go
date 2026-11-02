@@ -25,7 +25,7 @@ type ScheduleService interface {
 	List(context.Context, identity.Principal, schedule.Status, app.PageRequest) (app.SchedulePage, error)
 	Get(context.Context, identity.Principal, string) (schedule.Schedule, error)
 	Create(context.Context, identity.Principal, app.CreateScheduleCommand, string) (schedule.Schedule, error)
-	Update(context.Context, identity.Principal, string, app.UpdateScheduleCommand) (schedule.Schedule, error)
+	Update(context.Context, identity.Principal, string, app.UpdateScheduleCommand, string) (schedule.Schedule, error)
 	Action(context.Context, identity.Principal, string, app.ScheduleActionCommand, string) (app.ScheduleActionResult, error)
 	Runs(context.Context, identity.Principal, string, app.PageRequest) (app.ScheduleRunPage, error)
 }
@@ -114,12 +114,12 @@ type scheduleResponse struct {
 
 type scheduleListResponse struct {
 	Items      []scheduleResponse `json:"items"`
-	NextCursor *string            `json:"next_cursor"`
+	NextCursor string             `json:"next_cursor"`
 }
 
 type scheduleRunListResponse struct {
 	Items      []scheduleRunResponse `json:"items"`
-	NextCursor *string               `json:"next_cursor"`
+	NextCursor string                `json:"next_cursor"`
 }
 
 type scheduleActionResponse struct {
@@ -160,7 +160,7 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 		for _, value := range result.Items {
 			items = append(items, toScheduleResponse(value))
 		}
-		c.JSON(http.StatusOK, scheduleListResponse{Items: items, NextCursor: cursorPointer(result.NextCursor)})
+		c.JSON(http.StatusOK, scheduleListResponse{Items: items, NextCursor: result.NextCursor})
 	})
 
 	group.POST("/schedules", func(c *gin.Context) {
@@ -241,6 +241,10 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 		if !decodeStrictJSON(c, &request) {
 			return
 		}
+		key, ok := scheduleIdempotencyKey(c)
+		if !ok {
+			return
+		}
 		if request.ExpectedVersion == nil || *request.ExpectedVersion < 1 {
 			writeError(c, domain.InvalidArgument("expected_version", "expected_version is required and must be positive"))
 			return
@@ -269,7 +273,7 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 				command.Observation = &observation
 			}
 		}
-		value, err := service.Update(c.Request.Context(), principal, id, command)
+		value, err := service.Update(c.Request.Context(), principal, id, command, key)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -347,7 +351,7 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 		for _, value := range result.Items {
 			items = append(items, toScheduleRunResponse(value))
 		}
-		c.JSON(http.StatusOK, scheduleRunListResponse{Items: items, NextCursor: cursorPointer(result.NextCursor)})
+		c.JSON(http.StatusOK, scheduleRunListResponse{Items: items, NextCursor: result.NextCursor})
 	})
 }
 

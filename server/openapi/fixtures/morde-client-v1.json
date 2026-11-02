@@ -67,7 +67,7 @@
   ],
   "error_codes": [
     "invalid_argument", "unauthenticated", "forbidden", "account_pending", "account_rejected", "account_disabled",
-    "not_found", "conflict", "quota_exceeded", "capacity_exceeded", "workspace_busy", "workspace_conflict",
+    "not_found", "conflict", "quota_exceeded", "capacity_exceeded", "workspace_busy", "workspace_conflict", "workspace_unavailable",
     "transfer_expired", "invalid_state", "idempotency_conflict", "event_cursor_expired", "unsupported",
     "request_too_large", "result_too_large", "rate_limited", "internal", "upstream_error", "host_not_ready", "upstream_timeout"
   ],
@@ -108,7 +108,24 @@
     "profile_put_request": {"base_revision": 4, "body": {"name": "Muse", "avatar": "dragon"}},
     "profile_delete_request": {"base_revision": 5},
     "mutation_receipt": {"object_type": "profile", "object_id": "default", "result_revision": 5, "account_change_sequence": 12, "replay": false},
-    "idempotency_key": "profile-change-001"
+      "idempotency_key": "profile-change-001",
+      "snapshot_page": {
+        "watermark": 12,
+        "items": [
+          {"object_type": "profile", "object_id": "default", "revision": 6, "body": {"name": "Muse 2", "avatar": "dragon"}},
+          {"object_type": "memory", "object_id": "global", "revision": 2, "body": {"content": "Current personal view"}}
+        ],
+        "next_cursor": "signed-cursor-placeholder"
+      },
+      "changes_page": {
+        "items": [
+          {"change_sequence": 13, "object_type": "memory", "object_id": "global", "revision": 2, "operation": "upsert", "mutation_id": "memory-change-001"},
+          {"change_sequence": 15, "object_type": "profile", "object_id": "default", "revision": 6, "operation": "upsert", "mutation_id": "profile-change-002"}
+        ],
+        "through_sequence": 16,
+        "next_after_sequence": 15,
+        "has_more": false
+      }
   },
   "non_json_error": {
     "status": 502,

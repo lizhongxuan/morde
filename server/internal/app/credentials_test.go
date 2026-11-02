@@ -318,9 +318,9 @@ func TestUserServiceClosesOwnerHubAfterStatusOrRoleCommit(t *testing.T) {
 			users := &credentialRevocationUsers{
 				credentialUsers: &credentialUsers{values: map[string]identity.User{member.ID: member}}, events: &events,
 			}
-			hosts := &credentialHosts{listErr: errors.New("host list failed after update")}
+			hosts := &credentialHosts{}
 			hub := &clientRevocationHub{events: &events}
-			controller := &credentialRevocationWorkspaceSync{events: &events}
+			controller := &credentialRevocationWorkspaceSync{events: &events, reconcileErr: errors.New("reconcile failed")}
 			service, err := NewUserServiceWithHub(users, hosts, hub, controller)
 			if err != nil {
 				t.Fatal(err)
@@ -328,10 +328,10 @@ func TestUserServiceClosesOwnerHubAfterStatusOrRoleCommit(t *testing.T) {
 			admin := identity.Principal{UserID: "u7654321", Role: identity.RoleSuperAdmin, Kind: identity.KindSession, TokenID: "t7654321"}
 
 			_, err = service.Update(context.Background(), admin, member.ID, tc.command)
-			if err == nil {
-				t.Fatal("Update() ignored host listing failure")
+			if domain.CodeOf(err) != domain.CodeUpstreamError {
+				t.Fatalf("Update() error = %v, want workspace sync reconciliation failure", err)
 			}
-			if got, want := strings.Join(events, ","), "disable:u1234567,commit:u1234567,hub-owner-close:u1234567"; got != want {
+			if got, want := strings.Join(events, ","), "disable:u1234567,commit:u1234567,hub-owner-close:u1234567,reconcile:u1234567"; got != want {
 				t.Fatalf("update events = %q, want %q", got, want)
 			}
 		})

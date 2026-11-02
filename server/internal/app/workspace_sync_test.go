@@ -664,6 +664,50 @@ func TestWorkspaceSyncServiceCreateReportsQuotaExceeded(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncServiceRestrictsTaskLinkedSessionsToDevices(t *testing.T) {
+	store := newSyncServiceStore()
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	_, err = service.CreateSyncSession(context.Background(), principal, store.workspace.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, BaseRevision: 0,
+		TaskID: "qabc1234", TaskHubOperationKey: "agent:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Scope: []string{"report.txt"}, Files: []workspace.File{},
+	}, "task-write-sync")
+	if domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("Task-linked Portal session error = %v; want forbidden", err)
+	}
+	if len(store.sessions) != 0 {
+		t.Fatalf("Task-linked Portal session persisted %d sessions", len(store.sessions))
+	}
+
+	device := identity.Principal{
+		UserID: store.workspace.OwnerID, Role: identity.RoleUser, Kind: identity.KindDevice,
+		TokenID: "t1234567", ClientInstallationID: "i1234567",
+		Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	first := syncServiceFile("reports/result.txt", []byte("result"))
+	second := syncServiceFile("reports/extra.txt", []byte("extra"))
+	command := workspace.CreateSyncSession{
+		Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, BaseRevision: 0,
+		TaskID: "qabc1234", TaskHubOperationKey: "agent:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Scope: []string{"reports"}, Files: []workspace.File{first, second},
+	}
+	if _, err := service.CreateSyncSession(context.Background(), device, store.workspace.ID, command, "task-write-multiple-files"); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("Task-linked multi-file sync error = %v; want forbidden", err)
+	}
+	if len(store.sessions) != 0 {
+		t.Fatalf("Task-linked multi-file sync persisted %d sessions", len(store.sessions))
+	}
+
+	command.Scope, command.Files = []string{first.Path}, []workspace.File{first}
+	if _, err := service.CreateSyncSession(context.Background(), device, store.workspace.ID, command, "task-write-single-file"); err != nil {
+		t.Fatalf("Task-linked exact single-file sync: %v", err)
+	}
+}
+
 func TestWorkspaceSyncServiceRejectsOversizedUploadsButAllowsExistingFiles(t *testing.T) {
 	oversized := workspace.File{
 		Path: "large.bin", SizeBytes: workspace.MaxSyncFileBytes + 1,

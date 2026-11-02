@@ -28,8 +28,8 @@ type authAdapter struct {
 	users   *app.UserService
 }
 
-func (a authAdapter) Register(ctx context.Context, name, password, ip string) (api.UserView, error) {
-	value, err := a.users.Register(ctx, name, password, ip)
+func (a authAdapter) Register(ctx context.Context, name, password, ip string, inviteCode ...string) (api.UserView, error) {
+	value, err := a.users.Register(ctx, name, password, ip, inviteCode...)
 	if err != nil {
 		return api.UserView{}, err
 	}

@@ -264,11 +264,8 @@ func (s *Store) ListUsersByStatus(ctx context.Context, status *identity.AccountS
 }
 
 func (s *Store) CreateUser(ctx context.Context, value identity.User) (identity.User, error) {
-	if !domain.ValidUserID(value.ID) || strings.TrimSpace(value.Name) == "" || value.Name != strings.TrimSpace(value.Name) ||
-		strings.EqualFold(value.Name, "admin") || value.PasswordHash == "" || value.Role != identity.RoleUser ||
-		value.Status != identity.StatusPending || value.MustChangePassword || value.QuotaHosts < 0 ||
-		value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 || value.DefaultHostCPUMilli <= 0 || value.DefaultHostMemMiB <= 0 {
-		return identity.User{}, domain.InvalidArgument("user", "new users must be pending standard accounts with valid fields")
+	if err := validateNewUser(value); err != nil {
+		return identity.User{}, err
 	}
 	row, err := s.q.CreateUser(ctx, sqlcgen.CreateUserParams{
 		ID: value.ID, Name: value.Name, PasswordHash: value.PasswordHash, Role: string(value.Role),
@@ -280,6 +277,16 @@ func (s *Store) CreateUser(ctx context.Context, value identity.User) (identity.U
 		return identity.User{}, fmt.Errorf("create user: %w", err)
 	}
 	return userDomain(row), nil
+}
+
+func validateNewUser(value identity.User) error {
+	if !domain.ValidUserID(value.ID) || strings.TrimSpace(value.Name) == "" || value.Name != strings.TrimSpace(value.Name) ||
+		strings.EqualFold(value.Name, "admin") || value.PasswordHash == "" || value.Role != identity.RoleUser ||
+		value.Status != identity.StatusPending || value.MustChangePassword || value.QuotaHosts < 0 ||
+		value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 || value.DefaultHostCPUMilli <= 0 || value.DefaultHostMemMiB <= 0 {
+		return domain.InvalidArgument("user", "new users must be pending standard accounts with valid fields")
+	}
+	return nil
 }
 
 func (s *Store) UpdateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User) (identity.User, error) {

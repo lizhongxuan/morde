@@ -13,6 +13,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   capacity_exceeded: "当前资源容量不足",
   workspace_busy: "工作目录正在被其他主机使用",
   workspace_conflict: "工作区发生冲突，请刷新后核对",
+  workspace_unavailable: "工作区文件暂时不可用，请稍后重试",
   transfer_expired: "文件传输已过期，请重新发起",
   invalid_state: "当前状态不允许此操作",
   idempotency_conflict: "该请求与已受理操作不一致，请核对任务状态",

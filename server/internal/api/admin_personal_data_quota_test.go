@@ -8,7 +8,6 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
-	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 )
 
@@ -28,7 +27,7 @@ func (s *adminPersonalDataQuotaServiceStub) GetAdminPersonalDataQuota(_ context.
 	return s.quota, nil
 }
 
-func (s *adminPersonalDataQuotaServiceStub) SetAdminPersonalDataQuota(_ context.Context, _ identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64) (app.PersonalDataQuota, error) {
+func (s *adminPersonalDataQuotaServiceStub) SetAdminPersonalDataQuota(_ context.Context, _ identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64, _ string) (app.PersonalDataQuota, error) {
 	s.setCalls++
 	s.ownerID, s.expected = ownerID, expectedVersion
 	if s.setErr != nil {
@@ -49,9 +48,8 @@ func TestAdminPersonalDataQuotaAPIReadsUpdatesAuditsAndRejectsUnauthorized(t *te
 		UsedBytes: 1024, ReservedBytes: 128, QuotaBytes: app.DefaultPersonalDataQuotaBytes,
 		MaxAttachmentBytes: 300 << 20, Version: 1,
 	}}
-	writer := &adminAuditWriterStub{}
 	deps := services.deps()
-	deps.PersonalDataQuota, deps.AdminAudit = quotaService, writer
+	deps.PersonalDataQuota = quotaService
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -69,13 +67,9 @@ func TestAdminPersonalDataQuotaAPIReadsUpdatesAuditsAndRejectsUnauthorized(t *te
 	updated := requestWithCookieBody(router, http.MethodPatch, "/api/admin/users/"+testUserID+"/personal-data-quota",
 		`{"expected_version":1,"quota_bytes":2048,"max_attachment_bytes":524288}`, cookie, "https://portal.example.test")
 	if updated.Code != http.StatusOK || quotaService.setCalls != 1 || quotaService.expected != 1 ||
-		quotaService.requested.QuotaBytes != 2048 || quotaService.requested.MaxAttachmentBytes != 524288 || len(writer.entries) != 1 {
+		quotaService.requested.QuotaBytes != 2048 || quotaService.requested.MaxAttachmentBytes != 524288 {
 		t.Fatalf("PATCH quota = %d %s set=%d expected=%d requested=%+v audit=%+v", updated.Code, updated.Body,
-			quotaService.setCalls, quotaService.expected, quotaService.requested, writer.entries)
-	}
-	if writer.entries[0].Action != audit.ActionPersonalDataQuotaUpdate || writer.entries[0].ActorKind != audit.ActorSession ||
-		writer.entries[0].Target != testUserID || writer.entries[0].Detail["quota_bytes_before"] != int64(app.DefaultPersonalDataQuotaBytes) {
-		t.Fatalf("quota update audit = %+v", writer.entries[0])
+			quotaService.setCalls, quotaService.expected, quotaService.requested, nil)
 	}
 	var response adminPersonalDataQuotaResponse
 	if err := json.Unmarshal(updated.Body.Bytes(), &response); err != nil || response.QuotaBytes != 2048 || response.Version != 2 {

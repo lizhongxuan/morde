@@ -94,66 +94,86 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
 
 ## 离线备份与恢复
 
-   `backup/backup.py` 备份 PostgreSQL 完整数据目录、`workspace_storage.root_dir` 不可变块和 `site_storage.root_dir` 发布物。它不会备份 `CH_WORKSPACE_SYNC_CURRENT_FILES_DIR` 当前目录投影；MVP 从 PostgreSQL revision 和块库重建它。create/restore/recover 必须提供 `--workspace-current-root`，脚本用它拒绝与其他数据根重叠，并检查所有运行中 Docker 容器的可写挂载；current root 不进入备份 metadata 或 restore targets。它不会自动停止或启动服务。备份与恢复前，先通过实际使用的进程管理器停止 `portal serve`，再停止 Compose 中的 PostgreSQL，并在整个操作期间保持二者停止；脚本会检查 Portal/PostgreSQL 未运行和 PostgreSQL 已干净关闭，但无法阻止外部管理器重新启动它们。也要停止所有可能直接改写这三个归档数据目录或 current root 的进程。例如在仓库目录中停止 PostgreSQL：
+`backup/backup.py` 的 v3 bundle 包含四个本地数据根：PostgreSQL 完整数据目录、连续 WAL 归档、Workspace 不可变块、Site 发布物。个人附件块、记录正文及记录专用附件随 PostgreSQL 目录备份；Workspace 当前文件投影不归档，恢复后由数据库 revision 与块库重建。校验覆盖校验和、tar 路径、控制文件、WAL 段与块/发布物结构，不逐行核对业务引用。
+
+PostgreSQL 容器启用 WAL 归档和 60 秒切段。部署前在独立于 Workspace 数据文件系统的位置创建归档目录，并设为 PostgreSQL 容器用户 `999:999`、权限 `0700`；安装器会拒绝目录缺失、权限不符、与 PGDATA/Workspace 重叠或与 Workspace 共用文件系统。例如：
+
+```sh
+sudo install -d -o 999 -g 999 -m 0700 /srv/cloudhost-postgres-wal-archive
+```
+
+归档包含数据库变更日志，需限制本地介质访问；当前没有自动保留/清理策略，容量会随写入持续增长。
+
+备份与恢复不会自动停止或启动服务。先通过实际使用的进程管理器停止 `portal serve`，再停止 Compose 中的 PostgreSQL，并在整个操作期间保持二者停止；同时停止所有能写入四个数据根或 Workspace 当前目录的进程。脚本会检查 Portal/PostgreSQL 未运行、PostgreSQL 已干净关闭及运行中容器没有重叠的可写挂载，但无法阻止外部管理器重新启动服务。例如：
 
 ```sh
 sudo docker compose --env-file /etc/cloudhost/cloudhost.env -f deploy/single/docker-compose.yml stop postgres
 ```
 
-在 Linux 部署仓库目录执行。需要 root、GNU tar、Docker/Compose、util-linux `findmnt`，且三个归档数据路径和备份目标必须在脚本支持的本地文件系统。current root 也必须是存在的真实目录，并与三个归档数据根分离。备份目标目录先由 root 创建为私有目录；从受信任的环境文件读取三个归档路径和 current root，只把路径参数交给 sudo：
+在 Linux 部署仓库目录执行。需要 root、GNU tar、Docker/Compose、util-linux `findmnt`，且四个数据根、current root 和备份目标必须在脚本支持的本地文件系统；所有数据根和 current root 必须是彼此分离的真实目录，不能是挂载点或包含内部挂载点。备份目标先由 root 创建为私有目录；从受信任的环境文件读取路径，只把路径参数交给 sudo：
 
 ```sh
 set -e
 sudo install -d -o root -g root -m 0700 /var/backups/morde
 sudo install -d -o root -g root -m 0700 /var/backups/morde/.tmp
 CH_POSTGRES_DATA_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_POSTGRES_DATA_DIR)
+CH_POSTGRES_WAL_ARCHIVE_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_POSTGRES_WAL_ARCHIVE_DIR)
 CH_WORKSPACE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_STORAGE_ROOT_DIR)
 CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_CURRENT_FILES_DIR)
 CH_SITE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_SITE_STORAGE_ROOT_DIR)
 sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py create \
   --postgres-data-dir "$CH_POSTGRES_DATA_DIR" \
+  --postgres-wal-archive-dir "$CH_POSTGRES_WAL_ARCHIVE_DIR" \
   --workspace-root "$CH_WORKSPACE_STORAGE_ROOT_DIR" \
   --workspace-current-root "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" \
   --site-storage-root "$CH_SITE_STORAGE_ROOT_DIR" \
   --destination "/var/backups/morde/morde-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-备份格式当前为 v2，只写到本机指定目录，不覆盖已存在的 bundle；目录权限为 `0700`，bundle 文件为 `0600`。它包含校验和、三个源路径、PostgreSQL 镜像 digest、Workspace 块统计和 Site release 统计。此前生成的 v1 bundle 不会被当前脚本验证或恢复；升级前请确认旧 bundle 是否仍需恢复，并在迁移前保留。备份目标需能容纳三份数据目录的完整离线副本及归档开销。完整性验证会在 `TMPDIR`（默认通常是 `/tmp`）解包一份临时副本；需为它准备足够空间。下例中的 `BUNDLE` 应替换为实际生成的 bundle 目录。验证会检查校验和、安全 tar 路径、Workspace 块哈希、Site 发布物结构和 PostgreSQL 控制文件，不连接或更改在线服务；需要本机已缓存 metadata 记录的精确 PostgreSQL 镜像。
+v3 bundle 只写到本机指定目录，不覆盖已存在的 bundle；目录权限为 `0700`，bundle 文件为 `0600`。metadata 记录四个源路径、PostgreSQL 镜像 digest、系统 ID、时间线、checkpoint/redo LSN、WAL 段大小和数据统计。当前脚本不支持旧 v1/v2 bundle；若仍需它们，请在升级前保留旧脚本与归档。备份目标需容纳四份完整归档及 rollback bundle；`verify` 会在 `TMPDIR`（通常为 `/tmp`）解包临时副本，也需预留相应空间。`verify` 不连接或修改在线服务，且需要本机已缓存 metadata 中记录的精确 PostgreSQL 镜像。
 
 ```sh
 BUNDLE=/var/backups/morde/morde-实际时间戳
 sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py verify --bundle "$BUNDLE"
 ```
 
-恢复会替换三个数据目录。只在确认已经停止 Portal 和 PostgreSQL、并已验证 bundle 后执行；bundle 必须 root 持有且仅 root 可访问，路径必须与备份记录完全相同，PostgreSQL 镜像必须使用同一 digest。确保目标盘和 `TMPDIR` 的余量足以同时容纳当前数据、rollback bundle、临时验证副本和解包后的目标数据。脚本会在修改前先生成并验证一份当前数据的 rollback bundle，在同级临时目录解包并校验，再分别替换三个目录，并保留回滚 bundle：
+`restore` 使用两个经校验的 bundle：从较早的 base bundle 取 PostgreSQL 数据目录，从较后的 follow-up bundle 取 WAL、Workspace、Site；PostgreSQL 在隔离容器中重放 WAL 到 follow-up checkpoint 并提升。两个 bundle 必须属于同一 PostgreSQL 系统、同一时间线、相同路径和镜像 digest，且连续 WAL 段齐全；follow-up checkpoint 还必须不早于当前数据库状态。这样保留随 PostgreSQL 事务记录的新增、删除和撤权状态。条件不满足时，会在替换数据目录前失败。此恢复不能修复损坏或缺失的当前目录，因为脚本需要读取当前状态并创建 rollback bundle。
+
+恢复会替换四个数据根，并在操作前创建并校验当前数据的 rollback bundle。确认服务已停止、bundle 已验证，且同级目录和 `TMPDIR` 有足够空间后，在交互终端执行；准确输入脚本显示的四个目标路径才会继续：
 
 ```sh
 set -e
 CH_POSTGRES_DATA_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_POSTGRES_DATA_DIR)
+CH_POSTGRES_WAL_ARCHIVE_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_POSTGRES_WAL_ARCHIVE_DIR)
 CH_WORKSPACE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_STORAGE_ROOT_DIR)
 CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_CURRENT_FILES_DIR)
 CH_SITE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_SITE_STORAGE_ROOT_DIR)
-BUNDLE=/var/backups/morde/morde-实际时间戳
+BASE_BUNDLE=/var/backups/morde/较早的基线时间戳
+FOLLOW_UP_BUNDLE=/var/backups/morde/较后的可信时间戳
 sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py restore \
   --postgres-data-dir "$CH_POSTGRES_DATA_DIR" \
+  --postgres-wal-archive-dir "$CH_POSTGRES_WAL_ARCHIVE_DIR" \
   --workspace-root "$CH_WORKSPACE_STORAGE_ROOT_DIR" \
   --workspace-current-root "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" \
   --site-storage-root "$CH_SITE_STORAGE_ROOT_DIR" \
-  --bundle "$BUNDLE" \
+  --bundle "$BASE_BUNDLE" \
+  --follow-up-bundle "$FOLLOW_UP_BUNDLE" \
   --confirm-restore
 ```
 
-除 `--confirm-restore` 外，还必须在交互终端准确输入脚本显示的三个目标路径。恢复完成前不要启动服务。若恢复进程在目录替换期间意外中断，保持服务停止，保留所有同级 `.pre-restore-*`、`.morde-restore-*` 目录及 rollback bundle，不要手动删除或改名；使用脚本输出的 rollback bundle 执行：
+恢复完成前不要启动服务。脚本会保留 rollback bundle；若目录替换期间意外中断，保持服务停止，保留 `.pre-restore-*`、`.morde-restore-*` 路径和 rollback bundle，不要手工改名或删除。仅对这类中断执行下面的 `recover`：
 
 ```sh
 set -e
 CH_POSTGRES_DATA_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_POSTGRES_DATA_DIR)
+CH_POSTGRES_WAL_ARCHIVE_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_POSTGRES_WAL_ARCHIVE_DIR)
 CH_WORKSPACE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_STORAGE_ROOT_DIR)
 CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_WORKSPACE_SYNC_CURRENT_FILES_DIR)
 CH_SITE_STORAGE_ROOT_DIR=$(python3 deploy/single/read-env-values.py /etc/cloudhost/cloudhost.env CH_SITE_STORAGE_ROOT_DIR)
 ROLLBACK_BUNDLE=/var/backups/morde/本次生成的回滚目录
 sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py recover \
   --postgres-data-dir "$CH_POSTGRES_DATA_DIR" \
+  --postgres-wal-archive-dir "$CH_POSTGRES_WAL_ARCHIVE_DIR" \
   --workspace-root "$CH_WORKSPACE_STORAGE_ROOT_DIR" \
   --workspace-current-root "$CH_WORKSPACE_SYNC_CURRENT_FILES_DIR" \
   --site-storage-root "$CH_SITE_STORAGE_ROOT_DIR" \
@@ -161,6 +181,6 @@ sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py r
   --confirm-recover
 ```
 
-还必须在交互终端准确输入脚本显示的三个目标路径，才能恢复保留的原始目录。脚本会在回滚重试时把三个目标目录与已校验的回滚归档逐文件比较；若无法证明目录状态，journal 会标记 `manual_recovery_required` 并拒绝继续自动替换。遇到该状态、目标和原始目录都缺失或任何校验错误时，保持服务停止、保留所有路径和回滚 bundle，交由人工检查。
+还必须在交互终端准确输入脚本显示的四个目标路径，才能恢复保留的原始目录。脚本会逐文件比对目录与已校验 rollback 归档；若不能证明目录状态，会标记 `manual_recovery_required` 并拒绝自动替换。遇到该状态、目标与原始目录都缺失或任何校验错误时，保持服务停止，保留所有路径和 rollback bundle，交由人工检查。
 
-该工具不备份 Portal 二进制/迁移文件、配置、数据加密密钥、Cookie 密钥、Docker/Caddy named volumes、Host/Sandbox 卷或镜像。它不是跨版本或跨路径迁移工具；恢复后应用代码、数据库 schema、密钥和部署配置必须仍兼容。它只支持同一 Linux 主机的原路径恢复，拒绝数据根目录/内部挂载点、符号链接及特殊文件；备份内容可能含用户数据，需放在受保护的本地介质上并自行管理介质保管。工具不加密、不上传，也不提供时间点恢复。目标环境尚未完成真实备份/恢复演练；当前验证仅使用合成数据，不能替代演练。
+该工具不备份 Portal 二进制/迁移文件、配置、数据加密密钥、Cookie 密钥、Docker/Caddy named volumes、Host/Sandbox 卷或镜像。它不是跨版本或跨路径迁移工具；恢复后应用代码、数据库 schema、密钥和部署配置必须仍兼容。当前仅允许同系统、同时间线的 LSN 恢复，不能跨时间线分支。工具只支持同一 Linux 主机的原路径归档验证、恢复及中断恢复，拒绝符号链接和特殊文件；备份内容可能含用户数据，保存在受保护的本地介质上，自行管理介质保管。工具不加密、不上传。目标环境尚未完成真实备份/恢复演练；当前验证仅使用合成数据，不能替代演练。

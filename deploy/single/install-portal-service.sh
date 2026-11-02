@@ -37,6 +37,29 @@ workspace_sync_data_root_from_config() {
   ' "$repo_root/deploy/single/portal.yaml"
 }
 
+path_overlaps() {
+  local left=$1 right=$2
+  [[ $left == / ]] || left=${left%/}
+  [[ $right == / ]] || right=${right%/}
+  [[ $left == / || $right == / || $left == "$right" || $left == "$right/"* || $right == "$left/"* ]]
+}
+
+validate_postgres_wal_archive_layout() {
+  local archive_dir=${CH_POSTGRES_WAL_ARCHIVE_DIR:-} postgres_dir=${CH_POSTGRES_DATA_DIR:-}
+  local workspace_dir=${CH_WORKSPACE_SYNC_DATA_ROOT_DIR:-} archive_real postgres_real workspace_real archive_device
+  [[ $archive_dir == /* && -d $archive_dir && ! -L $archive_dir && $(realpath -e -- "$archive_dir" 2>/dev/null) == "$archive_dir" ]] || die 'CH_POSTGRES_WAL_ARCHIVE_DIR must be an existing absolute directory without symlinks'
+  [[ $(stat -c '%u:%g:%a' "$archive_dir") == '999:999:700' ]] || die 'CH_POSTGRES_WAL_ARCHIVE_DIR must be mode 0700 and owned by UID/GID 999'
+  [[ -n $postgres_dir && -d $postgres_dir ]] || die 'PostgreSQL data directory is unavailable'
+  [[ -n $workspace_dir && -d $workspace_dir ]] || die 'Workspace shared data root is unavailable'
+  archive_real=$(realpath -e -- "$archive_dir" 2>/dev/null) || die 'could not resolve PostgreSQL WAL archive directory'
+  postgres_real=$(realpath -e -- "$postgres_dir" 2>/dev/null) || die 'could not resolve PostgreSQL data directory'
+  workspace_real=$(realpath -e -- "$workspace_dir" 2>/dev/null) || die 'could not resolve Workspace shared data root'
+  ! path_overlaps "$archive_real" "$postgres_real" || die 'PostgreSQL WAL archive directory must not overlap PGDATA'
+  ! path_overlaps "$archive_real" "$workspace_real" || die 'PostgreSQL WAL archive directory must not overlap the Workspace data root'
+  archive_device=$(stat -c '%d' "$archive_dir") || die 'could not inspect PostgreSQL WAL archive filesystem'
+  [[ $archive_device != "$1" ]] || die 'PostgreSQL WAL archive directory must not be on the Workspace data filesystem'
+}
+
 check_workspace_sync_current_root_config() {
   local configured_root
   configured_root=$(workspace_sync_current_root_from_config)
@@ -103,6 +126,7 @@ validate_workspace_sync_data_layout() {
     [[ -n $protected && -d $protected ]] || die "Workspace shared data isolation path is unavailable: $protected"
     [[ $(stat -c '%d' "$protected") != "$root_device" ]] || die "Workspace shared data filesystem must be separate from $protected"
   done
+  validate_postgres_wal_archive_layout "$root_device"
 }
 
 check_workspace_sync_mount_bindings() {
@@ -163,21 +187,22 @@ env_values=()
 while IFS= read -r -d '' value; do env_values+=("$value"); done < <(
   python3 "$repo_root/deploy/single/read-env-values.py" --null "$env_file" \
     CH_DATA_KEY_FILE CH_COOKIE_KEY_FILE CH_WORKSPACE_STORAGE_ROOT_DIR \
-    CH_SITE_STORAGE_ROOT_DIR CH_DOCKER_DATA_DIR CH_POSTGRES_DATA_DIR \
+    CH_SITE_STORAGE_ROOT_DIR CH_DOCKER_DATA_DIR CH_POSTGRES_DATA_DIR CH_POSTGRES_WAL_ARCHIVE_DIR \
     CH_WORKSPACE_SYNC_DATA_ROOT_DIR CH_WORKSPACE_SYNC_CURRENT_FILES_DIR CH_DOCKER_HOST CH_OSB_URL CH_OSB_CONFIG_FILE
 )
-((${#env_values[@]} == 11)) || die 'could not read the required non-secret environment values'
+((${#env_values[@]} == 12)) || die 'could not read the required non-secret environment values'
 CH_DATA_KEY_FILE=${env_values[0]}
 CH_COOKIE_KEY_FILE=${env_values[1]}
 CH_WORKSPACE_STORAGE_ROOT_DIR=${env_values[2]}
 CH_SITE_STORAGE_ROOT_DIR=${env_values[3]}
 CH_DOCKER_DATA_DIR=${env_values[4]}
 CH_POSTGRES_DATA_DIR=${env_values[5]}
-CH_WORKSPACE_SYNC_DATA_ROOT_DIR=${env_values[6]}
-CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=${env_values[7]}
-CH_DOCKER_HOST=${env_values[8]}
-CH_OSB_URL=${env_values[9]}
-CH_OSB_CONFIG_FILE=${env_values[10]}
+CH_POSTGRES_WAL_ARCHIVE_DIR=${env_values[6]}
+CH_WORKSPACE_SYNC_DATA_ROOT_DIR=${env_values[7]}
+CH_WORKSPACE_SYNC_CURRENT_FILES_DIR=${env_values[8]}
+CH_DOCKER_HOST=${env_values[9]}
+CH_OSB_URL=${env_values[10]}
+CH_OSB_CONFIG_FILE=${env_values[11]}
 
 workspace_sync_enabled=$(workspace_sync_enabled_from_config)
 [[ $workspace_sync_enabled == true || $workspace_sync_enabled == false ]] || die 'workspace_sync_node.enabled must be a literal true or false'

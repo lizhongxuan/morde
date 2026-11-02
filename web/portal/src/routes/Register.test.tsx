@@ -38,10 +38,24 @@ describe('registration page', () => {
     await user.type(screen.getByLabelText('确认密码'), 'secret-pass');
     await user.click(screen.getByRole('button', { name: '注册' }));
 
-    await waitFor(() => expect(portalApi.register).toHaveBeenCalledWith('new-user', 'secret-pass'));
+    await waitFor(() => expect(portalApi.register).toHaveBeenCalledWith('new-user', 'secret-pass', ''));
     expect(await screen.findByRole('status')).toHaveTextContent('申请已提交，等待管理员审核通过后才能登录。');
     expect(portalApi.login).not.toHaveBeenCalled();
     expect(client.getQueryData(['auth', 'me'])).toBeNull();
+  });
+
+  it('submits the optional invitation code without changing the review requirement', async () => {
+    vi.mocked(portalApi.register).mockResolvedValueOnce({ user: { id: 'u1234567', name: 'new-user', role: 'user', status: 'pending' } } as never);
+    const user = userEvent.setup();
+    renderRoute('/register');
+    await user.type(screen.getByRole('textbox', { name: '用户名' }), 'new-user');
+    await user.type(screen.getByLabelText('密码', { exact: true }), 'secret-pass');
+    await user.type(screen.getByLabelText('确认密码'), 'secret-pass');
+    await user.type(screen.getByLabelText('邀请码（选填）'), '0123456789abcdef0123456789abcdef');
+    await user.click(screen.getByRole('button', { name: '注册' }));
+
+    await waitFor(() => expect(portalApi.register).toHaveBeenCalledWith('new-user', 'secret-pass', '0123456789abcdef0123456789abcdef'));
+    expect(await screen.findByRole('status')).toHaveTextContent('申请已提交，等待管理员审核通过后才能登录。');
   });
 
   it('shows form and conflict errors without submitting a mismatched password', async () => {

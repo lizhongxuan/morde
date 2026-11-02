@@ -40,7 +40,106 @@ beforeEach(() => { resetMockState(); api = createApiClient(); workspaceSequence 
 afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); });
 afterAll(() => server.close());
 
+describe("portal personal-data mock reads", () => {
+  it("serves an empty account snapshot, quota, changes, and metadata-only record page", async () => {
+    expect((await api("/api/sync/snapshot")).status).toBe(401);
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+
+    const snapshot = await api("/api/sync/snapshot?limit=100");
+    expect(await snapshot.json()).toEqual({ watermark: 0, items: [], next_cursor: null });
+    const changes = await api("/api/sync/changes?after_sequence=4&limit=100");
+    expect(await changes.json()).toEqual({ items: [], through_sequence: 4, next_after_sequence: 4, has_more: false });
+    const quota = await api("/api/personal-data/quota");
+    expect(await quota.json()).toMatchObject({ owner_id: "u1a2b3c4", used_bytes: 0, remaining_bytes: 5_368_709_120, version: 1 });
+    const records = await api("/api/me/records?limit=50");
+    expect(await records.json()).toEqual({ items: [], next_before: "" });
+    const captureStatuses = await api("/api/me/record-captures?limit=50");
+    expect(await captureStatuses.json()).toEqual({ items: [], next_before: "" });
+  });
+
+  it("imports only the selected text messages and returns the same conversation for follow-up batches", async () => {
+    expect((await api("/api/personal-data/history/import", json("POST", {}))).status).toBe(401);
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const body = {
+      source_id: "nanomuse-export-v1", device_account_id: "nanomuse-local-v1", source_conversation_id: "main",
+      title: "Imported chat", messages: [{ source_message_id: "e_user01", role: "user", content: "hello" }],
+    };
+    const first = await api("/api/personal-data/history/import", json("POST", body));
+    const responseBody = await first.json() as { conversation_id: string; messages: Array<{ role: string; content: string }> };
+    expect(first.status).toBe(200);
+    expect(responseBody).toMatchObject({ title: "Imported chat", messages: [{ role: "user", content: "hello" }] });
+    expect(JSON.stringify(responseBody)).not.toContain("task_id");
+    const next = await api("/api/personal-data/history/import", json("POST", { ...body, target_conversation_id: responseBody.conversation_id }));
+    expect(await next.json()).toMatchObject({ conversation_id: responseBody.conversation_id });
+  });
+});
+
+describe("schedule mock routes", () => {
+  it("creates and lists an every-N-hours schedule", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const hosts = await api("/api/hosts");
+    const models = await api("/api/available-models");
+    const host = (await hosts.json() as { items: Array<{ id: string }> }).items[0];
+    const model = (await models.json() as { items: Array<{ id: string }> }).items[0];
+    if (!host || !model) throw new Error("mock schedule dependencies are missing");
+    const timing = { kind: "every_n_hours", interval_hours: 6, time_zone: "America/New_York" };
+
+    const created = await api("/api/schedules", {
+      ...json("POST", {
+        host_id: host.id, model_id: model.id, objective: "每六小时检查一次", timing,
+        budget: { active_seconds: 900, tool_calls: 20, model_tokens: 10000 },
+      }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "mock-schedule-create-0001" },
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ timing, objective: "每六小时检查一次", status: "enabled" });
+
+    const listed = await api("/api/schedules");
+    expect(await listed.json()).toMatchObject({ items: [{ timing, objective: "每六小时检查一次" }] });
+  });
+});
+
 describe("admin console mock routes", () => {
+  it("records invitation attribution without bypassing review and keeps admin defaults safe", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const settings = await api("/api/admin/settings");
+    expect(await settings.json()).toMatchObject({
+      registration_review_required: true, automatic_new_user_model_budget: false,
+      automatic_invitation_reward: false, automatic_contribution_reward: false,
+    });
+    const codeResponse = await api("/api/me/invite-code");
+    const { code } = await codeResponse.json() as { code: string };
+    expect(code).toMatch(/^[a-f0-9]{32}$/);
+
+    const invalid = await createApiClient()("/api/auth/register", json("POST", { name: "bad-invite", password: "secret-pass", invite_code: "invalid" }));
+    expect(invalid.status).toBe(400);
+    const registered = await createApiClient()("/api/auth/register", json("POST", {
+      name: "invited-user", password: "secret-pass", invite_code: code,
+    }));
+    expect(registered.status).toBe(201);
+    expect(registered.headers.get("set-cookie")).toBeNull();
+    expect(await registered.json()).toMatchObject({ user: { name: "invited-user", status: "pending" } });
+
+    const invites = await api("/api/admin/invites?search=invited-user&limit=10&offset=0");
+    expect(await invites.json()).toMatchObject({ total: 1, total_inviters: 1, items: [{ inviter_name: "demo", invitee_name: "invited-user", invitee_status: "pending", inviter_invitees: 1 }] });
+    const sites = await api("/api/admin/sites");
+    expect(await sites.json()).toMatchObject({ integrations: { demo: "not_configured", github_stats: "not_configured", traffic: "not_collected" }, total: 0 });
+
+    const initialPolicy = await api("/api/admin/nudges");
+    expect(await initialPolicy.json()).toMatchObject({ enabled: false, version: 1 });
+    const enabled = await api("/api/admin/nudges", json("PUT", {
+      expected_version: 1, enabled: true, url: "https://github.com/acme/project", text_zh: "查看项目", text_en: "View the project",
+    }));
+    expect(await enabled.json()).toMatchObject({ enabled: true, version: 2 });
+    expect(await (await createApiClient()("/api/nudges")).json()).toMatchObject({ enabled: true, url: "https://github.com/acme/project" });
+    const stale = await api("/api/admin/nudges", json("PUT", {
+      expected_version: 1, enabled: false, url: "", text_zh: "", text_en: "",
+    }));
+    expect(stale.status).toBe(409);
+    const audit = await api("/api/admin/audit?limit=20&offset=0");
+    expect(await audit.text()).toContain("admin.nudge.policy.update");
+  });
+
   it("reads and compare-and-set updates isolated personal-data quotas", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const initial = await api("/api/admin/users/u1a2b3c4/personal-data-quota");
@@ -457,6 +556,33 @@ describe("portal mock Host sharing", () => {
     expect(await terminal.json()).toMatchObject({ url: expect.stringContaining("next=%2F__ch%2Fterminal%2F") });
     expect((await member(`/api/hosts/${host.id}/observation-ticket`, { method: "POST" })).status).toBe(404);
     expect((await member("/api/apikeys", json("POST", { name: "账号权限 Key" }))).status).toBe(201);
+  });
+
+  it("gives a Workspace-only member a fixed read-only entry without implying desktop access", async () => {
+    const owner = createApiClient();
+    const member = createApiClient();
+    await owner("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2, owner);
+    const created = await owner("/api/hosts", {
+      method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "workspace-share-key-001" },
+      body: JSON.stringify({ name: "工作区只读共享", workspace_ids: [] }),
+    });
+    const host = await created.json() as { id: string };
+    await wait(950);
+    const grant = await owner(`/api/hosts/${host.id}/members`, json("POST", { user_id: "umember1", permissions: ["workspace:file:read"] }));
+    expect(grant.status).toBe(201);
+    expect(await grant.json()).toMatchObject({ permissions: ["workspace:file:read"] });
+
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect(await (await member("/api/shared-hosts")).json()).toMatchObject({ items: [{ id: host.id, permissions: ["workspace:file:read"] }] });
+    const workspaceTicket = await member(`/api/hosts/${host.id}/observation-ticket?target=workspace`, { method: "POST" });
+    expect(workspaceTicket.status).toBe(200);
+    expect(await workspaceTicket.json()).toMatchObject({ url: expect.stringContaining("next=%2F__ch%2Fwb%2F%3Ftab%3Dworkspace") });
+    expect((await member(`/api/hosts/${host.id}/observation-ticket`, { method: "POST" })).status).toBe(404);
+    expect((await member(`/api/hosts/${host.id}/observation-ticket?target=workspace&target=desktop`, { method: "POST" })).status).toBe(400);
+
+    expect((await owner(`/api/hosts/${host.id}/members/umember1`, { method: "DELETE" })).status).toBe(204);
+    expect((await member(`/api/hosts/${host.id}/observation-ticket?target=workspace`, { method: "POST" })).status).toBe(404);
   });
 });
 

@@ -42,6 +42,7 @@ const (
 	ActionUserCreate                   Action = "user.create"
 	ActionUserUpdate                   Action = "user.update"
 	ActionPersonalDataQuotaUpdate      Action = "personal_data.quota.update"
+	ActionAdminNudgePolicyUpdate       Action = "admin.nudge.policy.update"
 	ActionAdminControlRuleCreate       Action = "admin.control.rule.create"
 	ActionAdminControlRuleUpdate       Action = "admin.control.rule.update"
 	ActionAdminControlRuleDelete       Action = "admin.control.rule.delete"
@@ -81,7 +82,7 @@ func (a Action) Valid() bool {
 		ActionModelConnectionCreate, ActionModelConnectionUpdate, ActionModelConnectionDelete, ActionModelConnectionCheck,
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
 		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientScheduleGrant, ActionClientRevoke,
-		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate,
+		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionAdminNudgePolicyUpdate,
 		ActionAdminControlRuleCreate, ActionAdminControlRuleUpdate, ActionAdminControlRuleDelete,
 		ActionAdminControlRuleFire, ActionAdminControlEvaluate, ActionAdminControlNotifyTest, ActionMCPCall,
 		ActionRecordConsentRead, ActionRecordConsentUpdate, ActionRecordQuotaRead, ActionRecordQuotaUpdate,

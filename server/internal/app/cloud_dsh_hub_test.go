@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ type cloudDSHHubTaskStore struct {
 	*cloudDSHBrokerTaskStore
 	mu         sync.Mutex
 	operations map[string]TaskHubOperation
+	receiptErr error
 }
 
 func (s *cloudDSHHubTaskStore) PrepareTaskHubOperation(_ context.Context, value TaskHubOperation, _ string) (TaskHubOperation, bool, error) {
@@ -81,6 +83,25 @@ func (s *cloudDSHHubTaskStore) GetTaskHubOperation(_ context.Context, ownerID, t
 		return TaskHubOperation{}, domain.NewError(domain.CodeNotFound, "task Hub operation not found")
 	}
 	return value, nil
+}
+
+func (s *cloudDSHHubTaskStore) RecordTaskHubOperationLocalReceipt(_ context.Context, value TaskHubOperation, _ string, receiptHash []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.receiptErr != nil {
+		return s.receiptErr
+	}
+	stored, ok := s.operations[value.Key]
+	if !ok || stored.Action != hub.ActionFilePut || stored.Status != task.OperationDispatched || stored.SyncStage != TaskHubWriteStagePending ||
+		stored.WorkspaceID != value.WorkspaceID || stored.WorkspacePath != value.WorkspacePath ||
+		stored.WorkspaceSizeBytes != value.WorkspaceSizeBytes || stored.WorkspaceSHA256 != value.WorkspaceSHA256 ||
+		stored.SourceCheckpointRevision != value.SourceCheckpointRevision || len(receiptHash) != 32 {
+		return domain.NewError(domain.CodeConflict, "file.put operation cannot record its local receipt")
+	}
+	stored.LocalReceiptHash = append([]byte(nil), receiptHash...)
+	stored.SyncStage = TaskHubWriteStageLocal
+	s.operations[value.Key] = stored
+	return nil
 }
 
 type cloudDSHHubTaskAuthorizer struct{ authorization task.Authorization }
@@ -152,7 +173,7 @@ func TestCloudDSHHubToolsStayHiddenUntilTargetAdvertisesGrant(t *testing.T) {
 		definitions <- value
 		errors <- err
 	}()
-	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionOpen, hub.ActionNotify}, nil)
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionOpen, hub.ActionNotify, hub.ActionFilePut}, nil)
 	value := <-definitions
 	if err := <-errors; err != nil {
 		t.Fatalf("Definitions() error = %v", err)
@@ -161,6 +182,9 @@ func TestCloudDSHHubToolsStayHiddenUntilTargetAdvertisesGrant(t *testing.T) {
 		if _, _, _, ok := parseHubTaskToolName(definition.Name); ok {
 			t.Fatalf("ungranted Hub tool was exposed: %q", definition.Name)
 		}
+	}
+	if _, _, _, ok := parseHubTaskToolName("morde_hub_file_put_i7654321_v1"); ok {
+		t.Fatal("file.put remained callable without an advertised server tool")
 	}
 }
 
@@ -276,5 +300,190 @@ func TestCloudDSHHubInterruptedActionIsMarkedUnknownAndNotReportedSuccessful(t *
 	operation, err := store.GetTaskHubOperation(context.Background(), claimed.OwnerID, claimed.ID, agentOperationKey(call.CallID))
 	if err != nil || operation.Status != task.OperationUnknown || fixture.store.details.Task.Status != task.StatusWaitingUser {
 		t.Fatalf("unknown Hub operation/task state = %#v / %s, err=%v", operation, fixture.store.details.Task.Status, err)
+	}
+}
+
+func TestCloudDSHHubFilePutWaitsForWorkspaceSyncAndRehydratesReceipt(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, nil)
+	claimed.WorkspaceID = "w1234567"
+	checkpoint := int64(3)
+	claimed.WorkspaceCheckpointRevision = &checkpoint
+	fixture.store.details.Task.WorkspaceID = claimed.WorkspaceID
+	fixture.store.details.Task.WorkspaceCheckpointRevision = &checkpoint
+	operation := TaskHubOperation{
+		OwnerID: claimed.OwnerID, TaskID: claimed.ID, Key: "agent:0123456789abcdef", ToolName: "morde_hub_file_put_i7654321_v5",
+		TargetInstallationID: "i7654321", Action: hub.ActionFilePut, TaskAuthorizationVersion: claimed.Authorization.Version,
+		TargetGrantVersion: 5, LeaseVersion: claimed.Lease.Version, RequestHash: sha256Bytes([]byte("file.put request")),
+		Status: task.OperationDispatched, WorkspaceID: claimed.WorkspaceID, WorkspacePath: "reports/summary.txt",
+		WorkspaceSizeBytes: 12, WorkspaceSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		SourceCheckpointRevision: checkpoint, LocalReceiptHash: bytes.Repeat([]byte{1}, 32),
+		SyncStage: TaskHubWriteStageSyncPending, SyncSessionID: "p1234567",
+	}
+	call := ModelToolCall{CallID: "call_hub_file_put_1", Name: operation.ToolName, Arguments: `{}`}
+	waiting, handled, err := broker.reconcileHubTaskOperation(context.Background(), claimed, call, operation, operation, true, nil)
+	if err != nil || !handled || waiting.Status != AgentToolNeedsUser || waiting.WaitingReason != "task_hub_workspace_sync" ||
+		fixture.store.details.Task.Status != task.StatusWaitingUser || fixture.store.details.Task.WaitingReason != "task_hub_workspace_sync" {
+		t.Fatalf("file.put sync wait = %#v, handled=%t, task=%#v, err=%v", waiting, handled, fixture.store.details.Task, err)
+	}
+	var eventPayload map[string]json.RawMessage
+	if len(store.events) == 0 || json.Unmarshal(store.events[len(store.events)-1].Payload, &eventPayload) != nil {
+		t.Fatalf("file.put wait event missing: %#v", store.events)
+	}
+	var detail struct {
+		OperationKey string `json:"operation_key"`
+	}
+	if json.Unmarshal(eventPayload["detail"], &detail) != nil || detail.OperationKey != operation.Key {
+		t.Fatalf("file.put wait event operation key = %q, want %q", detail.OperationKey, operation.Key)
+	}
+
+	settledFixture := newRuntimeToolExecutorFixture(t, nil)
+	settledBroker, _, settledTask := newCloudDSHHubBroker(t, settledFixture, nil)
+	settledTask.WorkspaceID = operation.WorkspaceID
+	currentCheckpoint := int64(7)
+	settledTask.WorkspaceCheckpointRevision = &currentCheckpoint
+	settledFixture.store.details.Task.WorkspaceID = settledTask.WorkspaceID
+	settledFixture.store.details.Task.WorkspaceCheckpointRevision = &currentCheckpoint
+	settled := operation
+	settled.OwnerID, settled.TaskID, settled.LeaseVersion = settledTask.OwnerID, settledTask.ID, settledTask.Lease.Version
+	settled.SyncStage, settled.SyncSessionID, settled.SyncRevision, settled.Status =
+		TaskHubWriteStageCloudSynced, "p1234567", currentCheckpoint, task.OperationSucceeded
+	resultHash, err := TaskHubFilePutCloudReceiptHash(settled)
+	if err != nil {
+		t.Fatalf("hash settled file.put receipt: %v", err)
+	}
+	settled.ResultHash = resultHash[:]
+	settledCall := call
+	completed, handled, err := settledBroker.reconcileHubTaskOperation(context.Background(), settledTask, settledCall, settled, settled, true, nil)
+	if err != nil || !handled || completed.Status != AgentToolSucceeded || !bytes.Contains([]byte(completed.Output), []byte("reports/summary.txt")) {
+		t.Fatalf("rehydrated file.put result = %#v, handled=%t, err=%v", completed, handled, err)
+	}
+
+	tamperedFixture := newRuntimeToolExecutorFixture(t, nil)
+	tamperedBroker, _, tamperedTask := newCloudDSHHubBroker(t, tamperedFixture, nil)
+	tamperedTask.WorkspaceID = settled.WorkspaceID
+	tamperedTask.WorkspaceCheckpointRevision = &currentCheckpoint
+	tamperedFixture.store.details.Task.WorkspaceID = settled.WorkspaceID
+	tamperedFixture.store.details.Task.WorkspaceCheckpointRevision = &currentCheckpoint
+	tampered := settled
+	tampered.OwnerID, tampered.TaskID, tampered.LeaseVersion = tamperedTask.OwnerID, tamperedTask.ID, tamperedTask.Lease.Version
+	tamperedHash, err := TaskHubFilePutCloudReceiptHash(tampered)
+	if err != nil {
+		t.Fatalf("hash tampered-test file.put receipt: %v", err)
+	}
+	tampered.ResultHash = sha256Bytes([]byte("tampered receipt"))
+	if bytes.Equal(tampered.ResultHash, tamperedHash[:]) {
+		t.Fatal("tampered result unexpectedly matches the Task file.put receipt")
+	}
+	unknown, handled, err := tamperedBroker.reconcileHubTaskOperation(context.Background(), tamperedTask, call, tampered, tampered, true, nil)
+	if err != nil || !handled || unknown.Status != AgentToolUnknown {
+		t.Fatalf("tampered file.put receipt = %#v, handled=%t, err=%v; want durable unknown", unknown, handled, err)
+	}
+}
+
+func TestCloudDSHHubFilePutReceiptIsPersistedBeforeSyncWait(t *testing.T) {
+	newPendingWrite := func(t *testing.T, receiptErr error) (*CloudDSHToolBroker, *cloudDSHHubTaskStore, task.Task, TaskHubOperation, hub.WorkspaceWriteArgs, hub.TaskContext) {
+		t.Helper()
+		fixture := newRuntimeToolExecutorFixture(t, nil)
+		broker, store, claimed := newCloudDSHHubBroker(t, fixture, nil)
+		claimed.WorkspaceID = "w1234567"
+		checkpoint := int64(4)
+		claimed.WorkspaceCheckpointRevision = &checkpoint
+		fixture.store.details.Task.WorkspaceID = claimed.WorkspaceID
+		fixture.store.details.Task.WorkspaceCheckpointRevision = &checkpoint
+		store.receiptErr = receiptErr
+		request := hub.WorkspaceWriteArgs{
+			WorkspaceID: claimed.WorkspaceID, Path: "reports/summary.txt", SizeBytes: 12,
+			SHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		}
+		call := ModelToolCall{CallID: "call_hub_file_put_receipt", Name: "morde_hub_file_put_i7654321_v5", Arguments: `{}`}
+		operationKey := agentOperationKey(call.CallID)
+		operation := TaskHubOperation{
+			OwnerID: claimed.OwnerID, TaskID: claimed.ID, Key: operationKey, ToolName: call.Name,
+			TargetInstallationID: "i7654321", Action: hub.ActionFilePut,
+			TaskAuthorizationVersion: claimed.Authorization.Version, TargetGrantVersion: 5,
+			LeaseVersion: claimed.Lease.Version, RequestHash: sha256Bytes([]byte("file.put request")),
+			Status: task.OperationPrepared, WorkspaceID: request.WorkspaceID, WorkspacePath: request.Path,
+			WorkspaceSizeBytes: request.SizeBytes, WorkspaceSHA256: request.SHA256,
+			SourceCheckpointRevision: checkpoint, SyncStage: TaskHubWriteStagePending,
+		}
+		operation, replayed, err := store.PrepareTaskHubOperation(context.Background(), operation, claimed.Lease.Owner)
+		if err != nil || replayed {
+			t.Fatalf("prepare file.put operation = %#v, replayed=%t, err=%v", operation, replayed, err)
+		}
+		if err := store.MarkTaskHubOperationDispatched(context.Background(), operation, claimed.Lease.Owner); err != nil {
+			t.Fatalf("mark file.put operation dispatched: %v", err)
+		}
+		operation.Status = task.OperationDispatched
+		taskContext := hub.TaskContext{
+			TaskID: claimed.ID, AuthorizationVersion: claimed.Authorization.Version,
+			TargetGrantVersion: 5, OperationID: operationKey,
+		}
+		return broker, store, claimed, operation, request, taskContext
+	}
+	writeReceipt := func(t *testing.T, request hub.WorkspaceWriteArgs, taskContext hub.TaskContext) json.RawMessage {
+		t.Helper()
+		value, err := json.Marshal(hub.WorkspaceWriteReceipt{
+			OperationID: taskContext.OperationID, WorkspaceID: request.WorkspaceID, Path: request.Path,
+			SizeBytes: request.SizeBytes, SHA256: request.SHA256,
+			TargetGrantVersion: taskContext.TargetGrantVersion, Stage: "local_applied",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+
+	t.Run("valid local receipt", func(t *testing.T) {
+		broker, store, claimed, operation, request, taskContext := newPendingWrite(t, nil)
+		call := ModelToolCall{CallID: "call_hub_file_put_receipt", Name: operation.ToolName, Arguments: `{}`}
+		result, err := broker.recordHubTaskFilePutReceipt(context.Background(), claimed, call, store, operation,
+			request, taskContext, HubTaskCallResult{OK: true, Body: writeReceipt(t, request, taskContext)})
+		if err != nil || result.Status != AgentToolNeedsUser || result.WaitingReason != "task_hub_workspace_sync" ||
+			claimed.ID != store.operations[operation.Key].TaskID || store.operations[operation.Key].SyncStage != TaskHubWriteStageLocal ||
+			len(store.operations[operation.Key].LocalReceiptHash) != 32 || store.operations[operation.Key].Status != task.OperationDispatched {
+			t.Fatalf("local receipt result/state = %#v / %#v, err=%v", result, store.operations[operation.Key], err)
+		}
+		if fixtureTask := store.details.Task; fixtureTask.Status != task.StatusWaitingUser || fixtureTask.WaitingReason != "task_hub_workspace_sync" {
+			t.Fatalf("Task state after local receipt = %#v", fixtureTask)
+		}
+		var eventPayload map[string]json.RawMessage
+		if json.Unmarshal(store.events[len(store.events)-1].Payload, &eventPayload) != nil {
+			t.Fatalf("file.put wait event is invalid: %#v", store.events)
+		}
+		var detail struct {
+			OperationKey string `json:"operation_key"`
+		}
+		if json.Unmarshal(eventPayload["detail"], &detail) != nil || detail.OperationKey != operation.Key {
+			t.Fatalf("file.put wait event operation key = %q, want %q", detail.OperationKey, operation.Key)
+		}
+	})
+
+	for name, receiptErr := range map[string]error{
+		"receipt mismatch":    nil,
+		"receipt persistence": domain.NewError(domain.CodeInternal, "test receipt persistence failure"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			broker, store, claimed, operation, request, taskContext := newPendingWrite(t, receiptErr)
+			call := ModelToolCall{CallID: "call_hub_file_put_receipt", Name: operation.ToolName, Arguments: `{}`}
+			body := writeReceipt(t, request, taskContext)
+			if name == "receipt mismatch" {
+				mismatchBody, marshalErr := json.Marshal(hub.WorkspaceWriteReceipt{
+					OperationID: taskContext.OperationID, WorkspaceID: request.WorkspaceID, Path: "reports/other.txt",
+					SizeBytes: request.SizeBytes, SHA256: request.SHA256,
+					TargetGrantVersion: taskContext.TargetGrantVersion, Stage: "local_applied",
+				})
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				body = mismatchBody
+			}
+			result, err := broker.recordHubTaskFilePutReceipt(context.Background(), claimed, call, store, operation,
+				request, taskContext, HubTaskCallResult{OK: true, Body: body})
+			if err != nil || result.Status != AgentToolUnknown || store.operations[operation.Key].Status != task.OperationUnknown ||
+				store.details.Task.WaitingReason != "hub_action_unknown" {
+				t.Fatalf("unknown local receipt result/state = %#v / %#v, err=%v", result, store.operations[operation.Key], err)
+			}
+		})
 	}
 }

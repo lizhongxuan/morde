@@ -154,29 +154,33 @@ func (s verifierStub) roleOrUser() identity.Role {
 }
 
 type authServiceStub struct {
-	registerUser UserView
-	registerErr  error
-	registerName string
-	registerPass string
-	registerIP   string
-	loginResult  LoginResult
-	loginErr     error
-	logoutErr    error
-	changeErr    error
-	changeCalls  int
-	changeOld    string
-	changeNew    string
-	changeP      identity.Principal
-	current      UserView
-	currentErr   error
-	logoutCalls  int
-	loginName    string
-	loginPass    string
-	loginIP      string
+	registerUser       UserView
+	registerErr        error
+	registerName       string
+	registerPass       string
+	registerIP         string
+	registerInviteCode string
+	loginResult        LoginResult
+	loginErr           error
+	logoutErr          error
+	changeErr          error
+	changeCalls        int
+	changeOld          string
+	changeNew          string
+	changeP            identity.Principal
+	current            UserView
+	currentErr         error
+	logoutCalls        int
+	loginName          string
+	loginPass          string
+	loginIP            string
 }
 
-func (s *authServiceStub) Register(_ context.Context, name, password, ip string) (UserView, error) {
+func (s *authServiceStub) Register(_ context.Context, name, password, ip string, inviteCode ...string) (UserView, error) {
 	s.registerName, s.registerPass, s.registerIP = name, password, ip
+	if len(inviteCode) == 1 {
+		s.registerInviteCode = inviteCode[0]
+	}
 	return s.registerUser, s.registerErr
 }
 
@@ -545,6 +549,7 @@ func TestDomainErrorResponsesAreMappedAndSanitized(t *testing.T) {
 		{domain.CodeQuotaExceeded, http.StatusConflict, "quota exceeded"},
 		{domain.CodeCapacityExceeded, http.StatusConflict, "capacity exceeded"},
 		{domain.CodeWorkspaceBusy, http.StatusConflict, "workspace busy"},
+		{domain.CodeWorkspaceUnavailable, http.StatusServiceUnavailable, "workspace service is unavailable"},
 		{domain.CodeInvalidState, http.StatusConflict, "invalid state"},
 		{domain.CodeConflict, http.StatusConflict, "conflict"},
 		{domain.CodeIdempotencyConflict, http.StatusConflict, "request conflicts with an earlier operation"},
@@ -1063,11 +1068,12 @@ func TestPublicRegistrationCreatesAccountWithoutSession(t *testing.T) {
 	services := newServices()
 	services.auth.registerUser = UserView{ID: testUserID, Name: "new-user", Role: identity.RoleUser}
 	router := newRouter(t, services, Options{})
-	response := request(router, http.MethodPost, "/api/auth/register", `{"name":"new-user","password":"long-secret"}`, "", "")
+	response := request(router, http.MethodPost, "/api/auth/register", `{"name":"new-user","password":"long-secret","invite_code":"0123456789abcdef0123456789abcdef"}`, "", "")
 	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"role":"user"`) || len(response.Result().Cookies()) != 0 {
 		t.Fatalf("registration response = %d %s, cookies=%v", response.Code, response.Body, response.Result().Cookies())
 	}
-	if services.auth.registerName != "new-user" || services.auth.registerPass != "long-secret" || services.auth.registerIP != "192.0.2.1" || strings.Contains(response.Body.String(), "long-secret") {
+	if services.auth.registerName != "new-user" || services.auth.registerPass != "long-secret" || services.auth.registerIP != "192.0.2.1" ||
+		services.auth.registerInviteCode != "0123456789abcdef0123456789abcdef" || strings.Contains(response.Body.String(), "long-secret") {
 		t.Fatal("registration arguments or response were invalid")
 	}
 	services.auth.registerErr = domain.NewError(domain.CodeRateLimited, "registration rate limit reached")

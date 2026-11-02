@@ -43,7 +43,7 @@ func (s *personalDataQuotaStoreStub) GetAdminPersonalDataQuota(_ context.Context
 	return s.quota, s.getErr
 }
 
-func (s *personalDataQuotaStoreStub) SetAdminPersonalDataQuota(_ context.Context, principal identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64) (PersonalDataQuota, error) {
+func (s *personalDataQuotaStoreStub) SetAdminPersonalDataQuota(_ context.Context, principal identity.Principal, ownerID string, expectedVersion, quotaBytes, maxAttachmentBytes int64, _ string) (PersonalDataQuota, error) {
 	s.setCalls++
 	s.principal, s.ownerID = principal, ownerID
 	s.expected, s.quotaBytes, s.maxAttachment = expectedVersion, quotaBytes, maxAttachmentBytes
@@ -90,7 +90,7 @@ func TestPersonalDataQuotaAdminGetSetAuthorizationAndValidation(t *testing.T) {
 	if err != nil || got != store.quota || store.getCalls != 1 || !reflect.DeepEqual(store.principal, admin) || store.ownerID != "u7654321" {
 		t.Fatalf("get quota = %+v, err=%v, store=%+v", got, err, store)
 	}
-	updated, err := service.SetAdminPersonalDataQuota(ctx, admin, "u7654321", 2, 2048, 512)
+	updated, err := service.SetAdminPersonalDataQuota(ctx, admin, "u7654321", 2, 2048, 512, "")
 	if err != nil || updated != store.quota || store.setCalls != 1 || store.expected != 2 || store.quotaBytes != 2048 || store.maxAttachment != 512 {
 		t.Fatalf("set quota = %+v, err=%v, store=%+v", updated, err, store)
 	}
@@ -105,7 +105,7 @@ func TestPersonalDataQuotaAdminGetSetAuthorizationAndValidation(t *testing.T) {
 		if _, err := service.GetAdminPersonalDataQuota(ctx, denied, "u7654321"); domain.CodeOf(err) != domain.CodeForbidden {
 			t.Errorf("GET accepted non-admin principal %+v: %v", denied, err)
 		}
-		if _, err := service.SetAdminPersonalDataQuota(ctx, denied, "u7654321", 2, 2048, 512); domain.CodeOf(err) != domain.CodeForbidden {
+		if _, err := service.SetAdminPersonalDataQuota(ctx, denied, "u7654321", 2, 2048, 512, ""); domain.CodeOf(err) != domain.CodeForbidden {
 			t.Errorf("PATCH accepted non-admin principal %+v: %v", denied, err)
 		}
 	}
@@ -124,7 +124,7 @@ func TestPersonalDataQuotaAdminGetSetAuthorizationAndValidation(t *testing.T) {
 		{owner: "u7654321", expected: 1, quota: 1, attachment: 0},
 		{owner: "u7654321", expected: 1, quota: 1, attachment: personal.MaxAttachmentBytes + 1},
 	} {
-		if _, err := service.SetAdminPersonalDataQuota(ctx, admin, values.owner, values.expected, values.quota, values.attachment); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		if _, err := service.SetAdminPersonalDataQuota(ctx, admin, values.owner, values.expected, values.quota, values.attachment, ""); domain.CodeOf(err) != domain.CodeInvalidArgument {
 			t.Errorf("invalid quota limits accepted: %+v, err=%v", values, err)
 		}
 	}
@@ -145,7 +145,7 @@ func TestPersonalDataQuotaRejectsInvalidStoreReceipt(t *testing.T) {
 	}
 	store.quota.OwnerID = "u7654321"
 	store.quota.ReservedBytes = -1
-	if _, err := service.SetAdminPersonalDataQuota(context.Background(), personalDataQuotaAdmin(), "u7654321", 1, 4, 2); domain.CodeOf(err) != domain.CodeInternal {
+	if _, err := service.SetAdminPersonalDataQuota(context.Background(), personalDataQuotaAdmin(), "u7654321", 1, 4, 2, ""); domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("invalid PATCH receipt error = %v", err)
 	}
 }

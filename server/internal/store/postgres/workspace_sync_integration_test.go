@@ -70,6 +70,51 @@ func TestWorkspaceSyncPersistsPlanAndCommitsImmutableRevision(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSyncCommittedBeforeTaskPublishKeepsTaskPublishFenced(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "sync-before-task-publish")
+
+	deviceFile := syncTestFile("reports/device.txt", []byte("device revision"))
+	session := newTestSyncSession(t, workspaceValue, command.OwnerID, []workspace.File{deviceFile}, []workspace.File{deviceFile}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, session, syncTestBlocks(session.UploadFiles),
+		syncTestIdempotency(command.OwnerID, "workspace.sync.create", "sync-before-task-publish:create", session.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, workspaceValue.ID, session.ID,
+		syncTestIdempotency(command.OwnerID, "workspace.sync.commit", "sync-before-task-publish:commit", session.ID)); err != nil {
+		t.Fatalf("commit Workspace sync before Task publish: %v", err)
+	}
+
+	service, _ := taskWorkspacePublishTestService(t, store)
+	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
+		t.Fatalf("reserve Task publish at its existing checkpoint: %v", err)
+	}
+	taskFile := syncTestFile("reports/task.txt", []byte("Task output"))
+	manifestSHA, err := workspace.ManifestSHA256([]workspace.File{taskFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{taskFile}, nil, manifestSHA,
+		func(_ context.Context, digest string) ([]byte, error) {
+			if digest != taskFile.SHA256 {
+				t.Fatalf("Task publish requested block %q; want %q", digest, taskFile.SHA256)
+			}
+			return []byte("Task output"), nil
+		})
+	if domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("Task publish after prior Workspace sync = %v; want Workspace conflict", err)
+	}
+	receipt, err := store.FindTaskWorkspacePublishReceipt(ctx, command.OwnerID, command.TaskID, command.WorkspaceID, command.OperationKey)
+	if err != nil || receipt.State != app.TaskWorkspacePublishConflict {
+		t.Fatalf("Task publish conflict receipt = %#v, err=%v", receipt, err)
+	}
+	page, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, 1, "", "", 10)
+	if err != nil || len(page.Files) != 1 || page.Files[0].Path != deviceFile.Path || page.Files[0].SHA256 != deviceFile.SHA256 {
+		t.Fatalf("Workspace revision after fenced Task publish = %#v, err=%v", page, err)
+	}
+}
+
 func TestWorkspaceSyncPersistsAndDeletesEmptyDirectoriesAcrossRevisions(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

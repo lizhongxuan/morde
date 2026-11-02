@@ -471,6 +471,16 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 	if err != nil {
 		return workspace.SyncSession{}, err
 	}
+	if command.TaskID != "" || command.TaskHubOperationKey != "" {
+		if principal.Kind != identity.KindDevice || !domain.ValidTaskID(command.TaskID) || command.TaskHubOperationKey == "" ||
+			len(command.TaskHubOperationKey) > 512 || strings.TrimSpace(command.TaskHubOperationKey) != command.TaskHubOperationKey ||
+			strings.ContainsRune(command.TaskHubOperationKey, '\x00') || command.Direction != workspace.SyncUpload ||
+			command.Policy != workspace.SyncCompareMerge || len(command.Scope) != 1 || len(command.Files) != 1 ||
+			command.Files[0].Path != command.Scope[0] || len(command.DeletedPaths) != 0 ||
+			len(command.DeletedDirectories) != 0 || len(command.EmptyDirectories) != 0 || command.AckCursor != nil {
+			return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "Task-linked sync requires a device upload scoped to one file")
+		}
+	}
 	if value.State != workspace.StateReady {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace is not available for synchronization")
 	}
@@ -567,6 +577,7 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 	replicaID := syncReplicaID(principal)
 	session := workspace.SyncSession{
 		ID: sessionID, WorkspaceID: workspaceID, OwnerID: value.OwnerID, ReplicaID: replicaID,
+		TaskID: command.TaskID, TaskHubOperationKey: command.TaskHubOperationKey,
 		Direction: command.Direction, Policy: command.Policy, State: workspace.SyncPlanned,
 		BaseRevision: command.BaseRevision, TargetRevision: value.Revision, PinnedRevision: value.Revision,
 		Stage: workspace.SyncStageCompare, PlannedBytes: plannedBytes, ConfirmedBytes: 0,

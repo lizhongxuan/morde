@@ -131,7 +131,7 @@ type AdminQualityActivityService interface {
 
 type AdminPersonalDataQuotaService interface {
 	GetAdminPersonalDataQuota(context.Context, identity.Principal, string) (app.PersonalDataQuota, error)
-	SetAdminPersonalDataQuota(context.Context, identity.Principal, string, int64, int64, int64) (app.PersonalDataQuota, error)
+	SetAdminPersonalDataQuota(context.Context, identity.Principal, string, int64, int64, int64, string) (app.PersonalDataQuota, error)
 }
 
 type AdminControlsService interface {
@@ -143,11 +143,25 @@ type AdminControlsService interface {
 	NotifyTest(context.Context, identity.Principal) (app.AdminControlNotifyTest, error)
 }
 
+type AdminOperationsService interface {
+	Settings(context.Context, identity.Principal) (app.AdminSettings, error)
+	InviteCode(context.Context, identity.Principal) (string, error)
+	ListInvites(context.Context, identity.Principal, app.AdminInviteFilter) (app.AdminInvitePage, error)
+	ListSites(context.Context, identity.Principal, int, int) (app.AdminSitePage, error)
+	NudgePolicy(context.Context, identity.Principal) (app.AdminNudgePolicy, error)
+	PublicNudgePolicy(context.Context) (app.AdminNudgePolicy, error)
+	UpdateNudgePolicy(context.Context, identity.Principal, app.UpdateAdminNudgeCommand) (app.AdminNudgePolicy, error)
+}
+
 type RecordConsentService interface {
 	List(context.Context, identity.Principal) ([]record.Consent, error)
 	Set(context.Context, identity.Principal, record.Purpose, bool) (record.Consent, error)
 	Quota(context.Context, identity.Principal, string) (record.Quota, error)
 	SetQuota(context.Context, identity.Principal, string, int64, int32, int64) (record.Quota, error)
+}
+
+type RecordCaptureStatusService interface {
+	Statuses(context.Context, identity.Principal, record.CaptureStatusQuery) (record.CaptureStatusPage, error)
 }
 
 type RecordAccessService interface {

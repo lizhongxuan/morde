@@ -414,7 +414,7 @@ func statusForCode(code domain.ErrorCode) int {
 		return http.StatusTooManyRequests
 	case domain.CodeUpstreamError:
 		return http.StatusBadGateway
-	case domain.CodeHostNotReady:
+	case domain.CodeHostNotReady, domain.CodeWorkspaceUnavailable:
 		return http.StatusServiceUnavailable
 	case domain.CodeUpstreamTimeout:
 		return http.StatusGatewayTimeout

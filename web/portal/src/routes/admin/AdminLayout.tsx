@@ -6,6 +6,9 @@ import { useToast } from '../../app/toast';
 const links = [
   { to: '/admin', label: '总览', icon: '▦', end: true },
   { to: '/admin/users', label: '用户', icon: '♧' },
+  { to: '/admin/settings', label: '配置与预算', icon: '⚙' },
+  { to: '/admin/invites', label: '邀请', icon: '↗' },
+  { to: '/admin/sites', label: '站点与提示', icon: '▱' },
   { to: '/admin/models', label: '平台模型', icon: '◇' },
   { to: '/admin/usage', label: '用量与统计', icon: '▤' },
   { to: '/admin/quality', label: '质量与风险', icon: '◇' },
@@ -18,6 +21,7 @@ const links = [
 
 const titles: Record<string, string> = {
   '/admin': '总览', '/admin/': '总览', '/admin/users': '用户', '/admin/hosts': '云端电脑',
+  '/admin/settings': '配置与预算', '/admin/invites': '邀请', '/admin/sites': '站点与提示',
   '/admin/models': '平台模型', '/admin/usage': '用量与统计', '/admin/quality': '质量与风险', '/admin/activity': '活动', '/admin/controls': '规则与通知', '/admin/workspaces': '工作区', '/admin/audit': '审计',
 };
 

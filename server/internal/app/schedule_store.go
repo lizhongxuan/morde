@@ -74,7 +74,7 @@ type ScheduleStore interface {
 	CreateSchedule(context.Context, schedule.Schedule, IdempotencyRecord) (schedule.Schedule, bool, error)
 	ListSchedules(context.Context, string, []string, schedule.Status, PageRequest) (SchedulePage, error)
 	GetSchedule(context.Context, string, string) (schedule.Schedule, error)
-	UpdateSchedule(context.Context, string, schedule.Schedule, int64) (schedule.Schedule, error)
+	UpdateSchedule(context.Context, string, IdempotencyRecord, schedule.Schedule, int64) (schedule.Schedule, error)
 	SetScheduleStatus(context.Context, IdempotencyRecord, string, schedule.Status, int64, task.Authorization) (schedule.Schedule, error)
 	ListScheduleRuns(context.Context, string, string, []string, PageRequest) (ScheduleRunPage, error)
 	ListDueSchedules(context.Context, time.Time, int32) ([]schedule.Schedule, error)

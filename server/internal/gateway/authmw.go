@@ -128,6 +128,19 @@ func memberGatewayPermissions(request *http.Request, parsed ParsedHost) ([]host.
 	if parsed.PreviewPort != nil {
 		return nil, false
 	}
+	if request.Method == http.MethodGet && requestPath == "/__ch/wb/" && request.URL.RawQuery == "tab=workspace" {
+		return []host.Permission{host.PermissionWorkspaceFileRead}, true
+	}
+	if strings.HasPrefix(requestPath, "/__ch/wb/") && requestPath != "/__ch/wb/" &&
+		request.Method == http.MethodGet && request.URL.RawQuery == "" {
+		return []host.Permission{host.PermissionWorkspaceFileRead}, true
+	}
+	if requestPath == "/__ch/api/workspaces" && request.Method == http.MethodGet && request.URL.RawQuery == "" {
+		return []host.Permission{host.PermissionWorkspaceFileRead}, true
+	}
+	if validHostWorkspaceReadRequest(request) {
+		return []host.Permission{host.PermissionWorkspaceFileRead}, true
+	}
 	if requestPath == "/vnc" || strings.HasPrefix(requestPath, "/vnc/") {
 		if request.Method == http.MethodGet || request.Method == http.MethodHead {
 			return []host.Permission{host.PermissionDesktopView}, true

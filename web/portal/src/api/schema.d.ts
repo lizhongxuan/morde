@@ -183,6 +183,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/client-schedule-grant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue an installation-bound cloud schedule credential
+         * @description Requires the regular native Client credential for the active installation. Returns a separate 12-hour credential restricted to schedule read and management routes; it never grants direct task scopes and is stored by the native client in its credential store.
+         */
+        post: operations["issueClientScheduleGrant"];
+        /**
+         * Revoke cloud schedule credentials for the current installation
+         * @description Requires the regular native Client credential; revokes all schedule grants belonging to this installation without revoking the installation itself or cancelling tasks already accepted by the scheduler.
+         */
+        delete: operations["revokeClientScheduleGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/me": {
         parameters: {
             query?: never;
@@ -192,6 +216,46 @@ export interface paths {
         };
         /** Get the current user and quota usage */
         get: operations["getMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/invite-code": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get or create the current user's invitation code
+         * @description Requires an approved Portal session. The code records signup attribution only; it grants no quota or reward and does not bypass administrator review.
+         */
+        get: operations["getMyInviteCode"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/nudges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the explicitly enabled operational nudge
+         * @description Public read-only settings; disabled policies return no message or external link. No external integration is called by this endpoint.
+         */
+        get: operations["getPublicNudgePolicy"];
         put?: never;
         post?: never;
         delete?: never;
@@ -216,6 +280,68 @@ export interface paths {
         put: operations["setMyRecordConsent"];
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/records": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the current user's own record metadata
+         * @description Requires an approved Portal session. The owner may see metadata and request deletion even after withdrawing consent; payloads and attachments are never returned by this endpoint.
+         */
+        get: operations["listMyRecords"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/record-captures": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List this account's Task record-capture statuses
+         * @description Requires the current account's Session or Client principal. Results are owner-scoped and contain queue metadata only; payloads, attachments, lease fields, and quota reservations are never returned. `queued` and `leased` mean pending; only `stored` means a durable record exists; `rejected` and `failed` are terminal capture failures with a bounded failure code. An empty page may mean capture consent is disabled or no Task capture was enqueued; read record consents for the opt-in state.
+         */
+        get: operations["listMyRecordCaptureStatuses"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/records/{record_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Request deletion of one of the current user's records
+         * @description The Portal session owner may delete their own record without current capture consent. Creates an idempotent tombstone; the record and dedicated attachments are removed asynchronously. This endpoint cannot delete personal-data objects or business attachments.
+         */
+        delete: operations["requestMyRecordDelete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -650,7 +776,7 @@ export interface paths {
         put?: never;
         /**
          * Grant an existing user scoped access to a host
-         * @description Owner-only. Accepts desktop:view, desktop:control, terminal:control, and mcp:control in any de-duplicated combination. desktop:control also grants desktop:view. MCP use also requires a valid caller-owned API Key and current permission to observe or operate this Host; revoked sharing access is checked again for each operation. No Workspace access, Host management, or re-sharing is granted.
+         * @description Owner-only. Accepts desktop:view, desktop:control, terminal:control, mcp:control, and workspace:file:read in any de-duplicated combination. desktop:control also grants desktop:view. workspace:file:read is independent and grants only read-only access to files in an active, applied Workspace binding; it does not grant desktop, terminal, or MCP access. MCP use also requires a valid caller-owned API Key and current permission to observe or operate this Host; revoked sharing access is checked again for each operation. No Host management or re-sharing is granted.
          */
         post: operations["inviteHostMember"];
         delete?: never;
@@ -714,8 +840,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Issue a one-time ticket for an authorized desktop or terminal user
-         * @description The current Portal user or native client must own the host or have the permission selected by target. Native clients may request desktop observation only. The default target is desktop and requires desktop:view (also implied by desktop:control); Portal sessions may request terminal when granted terminal:control. The resulting Host cookie keeps member identity separate from Host ownership; every Gateway request rechecks the exact permission and client installation state.
+         * Issue a one-time ticket for an authorized desktop, terminal, or Workspace user
+         * @description The current Portal user or native client must own the host or have the permission selected by target. Native clients may request desktop observation only. The default target is desktop and requires desktop:view (also implied by desktop:control); Portal sessions may request terminal when granted terminal:control or the Workspace tab only when granted workspace:file:read. A Workspace ticket always enters `/__ch/wb/?tab=workspace`; the Gateway then permits only that member's explicitly granted read-only Workspace access and rechecks it dynamically. workspace:file:read does not imply desktop, terminal, or MCP access. The resulting Host cookie keeps member identity separate from Host ownership; every Gateway request rechecks the exact permission and client installation state.
          */
         post: operations["issueHostObservationTicket"];
         delete?: never;
@@ -1885,29 +2011,180 @@ export interface paths {
         patch: operations["renameDevice"];
         trace?: never;
     };
+    "/api/goals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the current account's goals */
+        get: operations["listGoals"];
+        put?: never;
+        /**
+         * Create a goal in the personal-object ledger
+         * @description The client supplies a stable ID so an Idempotency-Key retry addresses the same object. The goal body, material references, quota, revision, and account change entry commit atomically.
+         */
+        post: operations["createGoal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/goals/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        /** Read one current-account goal */
+        get: operations["getGoal"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a goal using its current revision
+         * @description Deletion creates a tombstone; old offline retries cannot recreate the goal.
+         */
+        delete: operations["deleteGoal"];
+        options?: never;
+        head?: never;
+        /** Replace a goal body with an optimistic revision check */
+        patch: operations["updateGoal"];
+        trace?: never;
+    };
+    "/api/schedules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List schedules owned by the current account
+         * @description Schedule-scoped Client grants can access this API; execution authorization remains server-side.
+         */
+        get: operations["listSchedules"];
+        put?: never;
+        /**
+         * Create and enable a schedule
+         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+         */
+        post: operations["createSchedule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/schedules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        /** Read one current-account schedule */
+        get: operations["getSchedule"];
+        /** Update a schedule definition at the expected version */
+        put: operations["updateSchedule"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/schedules/{id}/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Enable or disable a schedule
+         * @description Requires an Idempotency-Key and expected_version. Disabling does not cancel the current run unless current_run_action is cancel.
+         */
+        post: operations["updateScheduleStatus"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/schedules/{id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        /** List run history for a schedule */
+        get: operations["listScheduleRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the authenticated account's personal-data quota
+         * @description Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
+         */
+        get: operations["getPersonalDataQuota"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/personal-data/{type}/{id}": {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                type: "profile";
-                id: "default";
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
         };
         /**
-         * Read the current account's profile object
-         * @description Requires an approved portal session or active Client credential. The first enabled personal object is only profile/default; a missing or deleted object returns not_found. Object revision and body are read together.
+         * Read a current-account personal object
+         * @description Requires an approved portal session or active Client credential. Schedule definitions use the dedicated Schedule API; a missing or deleted object returns not_found. Object revision and body are read together.
          */
         get: operations["getPersonalObject"];
         /**
-         * Replace the current account's profile object
-         * @description Requires an approved portal session or active Client credential. The write is an optimistic compare-and-set using base_revision. On a revision conflict, details contain only base_revision, current_revision and deleted; the server never returns the profile body in the conflict.
+         * Replace a current-account personal object
+         * @description Requires an approved portal session or active Client credential. The write is an optimistic compare-and-set using base_revision. On a revision conflict, details contain only base_revision, current_revision and deleted; the server never returns the object body in the conflict.
          */
         put: operations["replacePersonalObject"];
         post?: never;
         /**
-         * Delete the current account's profile object
+         * Delete a current-account personal object
          * @description Requires an approved portal session or active Client credential. Deletion records a versioned tombstone; the same profile ID cannot be recreated. The body-free receipt is idempotent through Idempotency-Key.
          */
         delete: operations["deletePersonalObject"];
@@ -2051,8 +2328,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read a stable first slice of the current account's personal data
-         * @description Requires an approved portal session or active Client credential. The first sync slice contains only profile/default. The first page fixes a committed account change watermark; later pages use the signed cursor, which is bound to this account, service instance, type range, and keyset position. Tombstoned profiles are omitted from the current snapshot view. Changes committed after the watermark are read from the change feed; the client must preserve its local outbox while replacing its remote view.
+         * Read a keyset page of the current account's personal data
+         * @description Requires an approved Portal session or eligible active Client credential. The supported personal-object set includes profile, memory, soul, diary, goals, schedules, feed posts and preferences, idea marks, library metadata, and built-in skill and connector settings. The first page fixes the account change-feed watermark; later pages use a signed cursor bound to this account, service instance, and keyset position.
+         *
+         *     Pages are reads of the current object view, not a point-in-time snapshot: each page is read in its own database view. Writes after the watermark may appear in later pages and are also present in the change feed. Deleted objects are omitted. Clients must merge by object revision and account change sequence so an older feed event cannot replace a newer page value; preserve the local outbox until reconciliation is complete. Fetch changes only after all snapshot pages have completed, starting after this watermark.
          *
          *     The cursor remains valid for the lifetime of the account change log. Change-log rows are currently retained for the account lifetime; pruning requires a cursor floor and a response that directs the client to fetch a new snapshot.
          */
@@ -2073,8 +2352,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read profile changes after an account sequence
-         * @description Requires an approved portal session or active Client credential. Start after the snapshot watermark. The first request fixes through_sequence to the current committed account watermark; pass that same value on each subsequent request while has_more is true. Change items contain only profile events; other account object types are not enabled in this slice and are skipped while the terminal next_after_sequence advances through the fixed watermark. No object body or profile secrets are returned in this feed.
+         * Read personal-data changes after an account sequence
+         * @description Requires an approved Portal session or eligible active Client credential. Fetch changes after all snapshot pages have completed, starting with after_sequence set to the snapshot watermark. Omit through_sequence on the first request; it fixes the upper watermark for this read. While has_more is true, pass the returned through_sequence unchanged and resume from next_after_sequence.
+         *
+         *     The feed returns change metadata for supported personal objects and schedules, never object bodies or secret values. Conversation and message sequence entries are filtered out, so gaps in change_sequence are expected. On the final page, next_after_sequence advances to through_sequence even when the last returned event is earlier.
          *
          *     Account sequence values are owner-scoped. Change-log rows are currently retained for the account lifetime, so old cursors do not expire. Pruning must not be added without a minimum retained sequence and snapshot-recovery response.
          */
@@ -2362,6 +2643,87 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read fixed account, reward, and quota policy
+         * @description Requires an approved administrator's unbound Portal session. Token budgets are set per account; new accounts have no default model budget. This endpoint does not change account consent or issue credits.
+         */
+        get: operations["getAdminSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Morde invitation attribution and signup history
+         * @description Requires an approved administrator's unbound Portal session. Read-only; no reward, account disable, or account deletion action is exposed. No registration IP is retained.
+         */
+        get: operations["listAdminInvites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/sites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read local Site and Release statistics
+         * @description Requires an approved administrator's unbound Portal session. Site counts come only from local Morde data; GitHub analytics and external traffic are not configured or collected. This is read-only and does not publish content.
+         */
+        get: operations["listAdminSites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/nudges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the saved operational nudge policy */
+        get: operations["getAdminNudgePolicy"];
+        /**
+         * Version-update the operational nudge policy
+         * @description Requires an approved administrator's unbound Portal session. External links must point to GitHub. The policy is disabled by default; updates are audited in the same transaction.
+         */
+        put: operations["updateAdminNudgePolicy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/hosts": {
         parameters: {
             query?: never;
@@ -2486,7 +2848,7 @@ export interface paths {
         };
         /**
          * Read a user's personal-data usage and limits
-         * @description Requires an approved administrator's unbound Portal session. This quota covers personal attachments only and is separate from chat, Workspace, and record quotas.
+         * @description Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
          */
         get: operations["getAdminPersonalDataQuota"];
         put?: never;
@@ -3202,7 +3564,7 @@ export interface components {
         ErrorResponse: {
             error: {
                 /** @enum {string} */
-                code: "invalid_argument" | "unauthenticated" | "forbidden" | "account_pending" | "account_rejected" | "account_disabled" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
+                code: "invalid_argument" | "unauthenticated" | "forbidden" | "account_pending" | "account_rejected" | "account_disabled" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "workspace_unavailable" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
                 message: string;
                 details: {
                     [key: string]: unknown;
@@ -3215,10 +3577,10 @@ export interface components {
         SiteReleaseId: string;
         UserId: string;
         /** @enum {string} */
-        HostMemberPermission: "desktop:view" | "desktop:control" | "terminal:control" | "mcp:control";
+        HostMemberPermission: "desktop:view" | "desktop:control" | "terminal:control" | "mcp:control" | "workspace:file:read";
         HostMemberInviteRequest: {
             user_id: components["schemas"]["UserId"];
-            /** @description Duplicate entries are removed; desktop:control is stored together with desktop:view. */
+            /** @description Duplicate entries are removed; desktop:control is stored together with desktop:view. workspace:file:read is independent and does not imply desktop access. */
             permissions: components["schemas"]["HostMemberPermission"][];
         };
         HostMember: {
@@ -3238,9 +3600,13 @@ export interface components {
         TokenId: string;
         ClientInstallationId: string;
         /** @enum {string} */
-        PersonalObjectType: "profile";
+        PersonalMutationObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @enum {string} */
-        PersonalObjectId: "default";
+        PersonalObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        /** @description Path-free opaque identifier; exact accepted values depend on object_type. The server rejects . and .. and enforces each type's allowlist. */
+        PersonalObjectId: string;
+        GoalId: string;
+        ScheduleId: string;
         PersonalAttachmentUploadId: string;
         PersonalAttachmentId: string;
         ConversationId: string;
@@ -3392,6 +3758,105 @@ export interface components {
         RegisterRequest: {
             name: string;
             password: string;
+            /** @description Optional Morde invitation attribution. The account remains pending review and receives no reward. */
+            invite_code?: string;
+        };
+        InviteCode: {
+            code: string;
+        };
+        AdminSettings: {
+            registration_review_required: boolean;
+            /** @constant */
+            automatic_new_user_model_budget: false;
+            /** @constant */
+            automatic_invitation_reward: false;
+            /** @constant */
+            automatic_contribution_reward: false;
+            /** Format: int64 */
+            default_personal_data_quota_bytes: number;
+            /** Format: int64 */
+            default_personal_attachment_bytes: number;
+        };
+        AdminInvite: {
+            inviter_id: components["schemas"]["UserId"];
+            inviter_name: string;
+            invitee_id: components["schemas"]["UserId"];
+            invitee_name: string;
+            invitee_status: components["schemas"]["AccountStatus"];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            inviter_invitees: number;
+        };
+        AdminInvitePage: {
+            items: components["schemas"]["AdminInvite"][];
+            /** Format: int64 */
+            total: number;
+            /** Format: int64 */
+            total_inviters: number;
+            limit: number;
+            offset: number;
+        };
+        AdminSite: {
+            id: string;
+            owner_id: components["schemas"]["UserId"];
+            owner_name: string;
+            host_id: components["schemas"]["HostId"];
+            /** @enum {string} */
+            state: "active" | "draining" | "stopped";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            release_count: number;
+            /** Format: int64 */
+            healthy_release_count: number;
+            /** Format: date-time */
+            latest_release_at: string | null;
+        };
+        AdminSiteSummary: {
+            /** Format: int64 */
+            sites: number;
+            /** Format: int64 */
+            active_sites: number;
+            /** Format: int64 */
+            releases: number;
+            /** Format: int64 */
+            healthy_releases: number;
+        };
+        AdminSiteIntegrations: {
+            /** @constant */
+            demo: "not_configured";
+            /** @constant */
+            github_stats: "not_configured";
+            /** @constant */
+            traffic: "not_collected";
+        };
+        AdminSitePage: {
+            items: components["schemas"]["AdminSite"][];
+            summary: components["schemas"]["AdminSiteSummary"];
+            integrations: components["schemas"]["AdminSiteIntegrations"];
+            /** Format: int64 */
+            total: number;
+            limit: number;
+            offset: number;
+        };
+        AdminNudgePolicy: {
+            enabled: boolean;
+            url: string;
+            text_zh: string;
+            text_en: string;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at: string | null;
+        };
+        UpdateAdminNudgePolicyRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            enabled: boolean;
+            url: string;
+            text_zh: string;
+            text_en: string;
         };
         /** @enum {string} */
         AccountStatus: "pending" | "rejected" | "approved" | "disabled";
@@ -3827,6 +4292,10 @@ export interface components {
              * @description For Host replica downloads and bidirectional sync
              */
             base_revision: number;
+            /** @description Optional Task write fence. Must be paired with task_hub_operation_key and is accepted only for a device upload scoped to one file. */
+            task_id?: string;
+            /** @description The durable Hub operation key associated with this Task write; must be paired with task_id. */
+            task_hub_operation_key?: string;
             scope?: string[];
             files: components["schemas"]["WorkspaceFile"][];
             empty_directories?: string[];
@@ -4087,10 +4556,256 @@ export interface components {
             /** @enum {string} */
             style?: "" | "muse" | "flat" | "clay" | "watercolor" | "pixel" | "line" | "sticker";
         };
+        PersonalMemory: {
+            content: string;
+            category?: string;
+        };
+        PersonalSoul: {
+            name: string;
+            emoji?: string;
+            style?: string;
+            lang?: string;
+            content: string;
+        };
+        PersonalDiary: {
+            /** Format: date */
+            date: string;
+            content: string;
+        };
+        GoalStep: {
+            id: string;
+            title: string;
+            /** @enum {string} */
+            status: "pending" | "in_progress" | "done" | "blocked" | "skipped";
+            note?: string;
+        };
+        GoalBody: {
+            title: string;
+            description: string;
+            /** @enum {string} */
+            status: "active" | "paused" | "done" | "cancelled";
+            steps: components["schemas"]["GoalStep"][];
+            related_material_ids: components["schemas"]["PersonalObjectId"][];
+        };
+        /** @enum {string} */
+        ScheduleStatus: "enabled" | "disabled" | "completed";
+        /** @enum {string} */
+        ScheduleNotificationEvent: "completed" | "failed" | "waiting_user";
+        ScheduleBudget: {
+            /** Format: int64 */
+            active_seconds: number;
+            /** Format: int64 */
+            tool_calls: number;
+            /** Format: int64 */
+            model_tokens: number;
+        };
+        ScheduleObservation: {
+            /** Format: uri */
+            url: string;
+            selector: string;
+            /** @enum {string} */
+            field: "text" | "value";
+        };
+        ScheduleOnceTiming: {
+            /** @enum {string} */
+            kind: "once";
+            /**
+             * Format: date-time
+             * @description RFC3339 instant with an explicit UTC offset.
+             */
+            run_at: string;
+            /** @description IANA time-zone identifier used for display. */
+            time_zone: string;
+        };
+        ScheduleDailyTiming: {
+            /** @enum {string} */
+            kind: "daily";
+            /** Format: date */
+            starts_on: string;
+            local_time: string;
+            /** @description IANA time-zone identifier. */
+            time_zone: string;
+        };
+        ScheduleWeeklyTiming: {
+            /** @enum {string} */
+            kind: "weekly";
+            /** Format: date */
+            starts_on: string;
+            local_time: string;
+            /** @description IANA time-zone identifier. */
+            time_zone: string;
+            weekdays: number[];
+        };
+        ScheduleEveryNHoursTiming: {
+            /** @enum {string} */
+            kind: "every_n_hours";
+            /** @description Elapsed hours between occurrences. */
+            interval_hours: number;
+            /** @description Must be a valid IANA time-zone identifier; the server rejects unknown identifiers. */
+            time_zone: string;
+        };
+        ScheduleTiming: components["schemas"]["ScheduleOnceTiming"] | components["schemas"]["ScheduleDailyTiming"] | components["schemas"]["ScheduleWeeklyTiming"] | components["schemas"]["ScheduleEveryNHoursTiming"];
+        /** @enum {string} */
+        ScheduleMisfirePolicy: "skip" | "run_once";
+        ScheduleSyncDefinition: {
+            status: components["schemas"]["ScheduleStatus"];
+            host_id: components["schemas"]["HostId"];
+            model_id: string;
+            objective: string;
+            timing: components["schemas"]["ScheduleTiming"];
+            budget: components["schemas"]["ScheduleBudget"];
+            misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events: components["schemas"]["ScheduleNotificationEvent"][];
+            observation?: components["schemas"]["ScheduleObservation"];
+        };
+        GoalCreateRequest: {
+            id: components["schemas"]["GoalId"];
+            body: components["schemas"]["GoalBody"];
+        };
+        GoalMutationRequest: {
+            /** Format: int64 */
+            base_revision: number;
+            body: components["schemas"]["GoalBody"];
+        };
+        GoalDeleteRequest: {
+            /** Format: int64 */
+            base_revision: number;
+        };
+        GoalPage: {
+            items: components["schemas"]["PersonalObject"][];
+            next_cursor: string | null;
+        };
+        ScheduleCreateRequest: {
+            host_id: components["schemas"]["HostId"];
+            model_id: string;
+            objective: string;
+            timing: components["schemas"]["ScheduleTiming"];
+            budget: components["schemas"]["ScheduleBudget"];
+            misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
+            observation?: components["schemas"]["ScheduleObservation"] | null;
+        };
+        ScheduleUpdateRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            host_id?: components["schemas"]["HostId"];
+            model_id?: string;
+            objective?: string;
+            timing?: components["schemas"]["ScheduleTiming"];
+            budget?: components["schemas"]["ScheduleBudget"];
+            misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
+            observation?: components["schemas"]["ScheduleObservation"] | null;
+        };
+        ScheduleActionRequest: {
+            /** @enum {string} */
+            action: "enable" | "disable";
+            /** Format: int64 */
+            expected_version: number;
+            /** @enum {string} */
+            current_run_action?: "continue" | "cancel";
+        };
+        /** @enum {string} */
+        ScheduleRunStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "stopping" | "completed" | "failed" | "cancelled" | "skipped" | "missed";
+        /** @enum {string} */
+        ScheduleRunSkipReason: "dst_gap" | "overlap" | "authorization_ended";
+        ScheduleRun: {
+            id: components["schemas"]["ScheduleRunId"];
+            schedule_id: components["schemas"]["ScheduleId"];
+            /** Format: int64 */
+            schedule_version: number;
+            occurrence_key: string;
+            /** Format: date-time */
+            scheduled_at: string | null;
+            /** Format: int64 */
+            coalesced_count: number;
+            status: components["schemas"]["ScheduleRunStatus"];
+            skip_reason: components["schemas"]["ScheduleRunSkipReason"] | null;
+            task_id: components["schemas"]["TaskId"] | null;
+            notification_events: components["schemas"]["ScheduleNotificationEvent"][];
+            observation: components["schemas"]["ScheduleObservation"] | null;
+            /** @enum {string} */
+            observation_outcome: "unknown" | "baseline" | "changed" | "no_change";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: date-time */
+            finished_at: string | null;
+        };
+        Schedule: {
+            id: components["schemas"]["ScheduleId"];
+            /** Format: int64 */
+            version: number;
+            status: components["schemas"]["ScheduleStatus"];
+            host_id: components["schemas"]["HostId"];
+            model_id: string;
+            objective: string;
+            timing: components["schemas"]["ScheduleTiming"];
+            budget: components["schemas"]["ScheduleBudget"];
+            misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events: components["schemas"]["ScheduleNotificationEvent"][];
+            observation: components["schemas"]["ScheduleObservation"] | null;
+            /** Format: date-time */
+            next_run_at: string | null;
+            last_run: components["schemas"]["ScheduleRun"] | null;
+            current_run: components["schemas"]["ScheduleRun"] | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        SchedulePage: {
+            items: components["schemas"]["Schedule"][];
+            /** @description Empty string means there are no more pages. */
+            next_cursor: string;
+        };
+        ScheduleRunPage: {
+            items: components["schemas"]["ScheduleRun"][];
+            /** @description Empty string means there are no more pages. */
+            next_cursor: string;
+        };
+        ScheduleActionResponse: {
+            schedule: components["schemas"]["Schedule"];
+            current_run: components["schemas"]["ScheduleRun"] | null;
+        };
+        PersonalFeedPost: {
+            title: string;
+            type: string;
+            emoji?: string;
+            /** Format: date-time */
+            created_at?: string;
+            liked?: boolean;
+            body: string;
+        };
+        PersonalFeedPreferences: {
+            content: string;
+        };
+        PersonalIdeaMark: {
+            /** @enum {string} */
+            state: "saved" | "dismissed";
+        };
+        PersonalLibraryItem: {
+            name: string;
+            /** @enum {string} */
+            kind: "artifact" | "media";
+            mime?: string;
+            /** Format: int64 */
+            size_bytes?: number;
+            attachment_id?: string;
+        };
+        PersonalSkillSetting: {
+            enabled: boolean;
+        };
+        PersonalConnectorSetting: {
+            /** @enum {string} */
+            auth: "open" | "oauth" | "key";
+            enabled: boolean;
+        };
         PersonalObjectPutRequest: {
             /** Format: int64 */
             base_revision: number;
-            body: components["schemas"]["PersonalProfile"];
+            body: components["schemas"]["PersonalProfile"] | components["schemas"]["PersonalMemory"] | components["schemas"]["PersonalSoul"] | components["schemas"]["PersonalDiary"] | components["schemas"]["GoalBody"] | components["schemas"]["PersonalFeedPost"] | components["schemas"]["PersonalFeedPreferences"] | components["schemas"]["PersonalIdeaMark"] | components["schemas"]["PersonalLibraryItem"] | components["schemas"]["PersonalSkillSetting"] | components["schemas"]["PersonalConnectorSetting"];
         };
         PersonalObjectDeleteRequest: {
             /** Format: int64 */
@@ -4101,10 +4816,10 @@ export interface components {
             object_id: components["schemas"]["PersonalObjectId"];
             /** Format: int64 */
             revision: number;
-            body: components["schemas"]["PersonalProfile"];
+            body: components["schemas"]["PersonalProfile"] | components["schemas"]["PersonalMemory"] | components["schemas"]["PersonalSoul"] | components["schemas"]["PersonalDiary"] | components["schemas"]["GoalBody"] | components["schemas"]["ScheduleSyncDefinition"] | components["schemas"]["PersonalFeedPost"] | components["schemas"]["PersonalFeedPreferences"] | components["schemas"]["PersonalIdeaMark"] | components["schemas"]["PersonalLibraryItem"] | components["schemas"]["PersonalSkillSetting"] | components["schemas"]["PersonalConnectorSetting"];
         };
         PersonalMutationReceipt: {
-            object_type: components["schemas"]["PersonalObjectType"];
+            object_type: components["schemas"]["PersonalMutationObjectType"];
             object_id: components["schemas"]["PersonalObjectId"];
             /** Format: int64 */
             result_revision: number;
@@ -4115,11 +4830,11 @@ export interface components {
         PersonalSnapshotPage: {
             /**
              * Format: int64
-             * @description Fixed committed account sequence for this snapshot.
+             * @description Account change sequence captured on the first request; this fixes the change-feed starting point but not object values across pages.
              */
             watermark: number;
             items: components["schemas"]["PersonalObject"][];
-            /** @description Signed cursor for the next stable page; null when complete. */
+            /** @description Signed cursor for the next current-view keyset page; null when complete. */
             next_cursor: string | null;
         };
         PersonalChange: {
@@ -4143,7 +4858,7 @@ export interface components {
             through_sequence: number;
             /**
              * Format: int64
-             * @description Resume from this sequence on the next page.
+             * @description Resume from this sequence on the next page; on the final page this advances to through_sequence
              */
             next_after_sequence: number;
             has_more: boolean;
@@ -4248,6 +4963,21 @@ export interface components {
              */
             default_max_attachment_bytes: 314572800;
         };
+        PersonalDataQuota: {
+            owner_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            reserved_bytes: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            /** Format: int64 */
+            max_attachment_bytes: number;
+            /** Format: int64 */
+            remaining_bytes: number;
+            /** Format: int64 */
+            version: number;
+        };
         ClientLoginRequest: {
             name: string;
             password: string;
@@ -4291,6 +5021,11 @@ export interface components {
             web_session_credential: string;
             /** Format: date-time */
             web_session_expires_at: string;
+        };
+        ClientScheduleGrantResponse: {
+            credential: string;
+            /** Format: date-time */
+            expires_at: string;
         };
         DeviceWorkspace: {
             id: components["schemas"]["WorkspaceId"];
@@ -4893,6 +5628,7 @@ export interface components {
         RecordCapability: "view" | "attachment" | "export" | "delete";
         RecordId: string;
         RecordAttachmentId: string;
+        RecordCaptureQueueId: string;
         RecordConsent: {
             owner_id: components["schemas"]["UserId"];
             purpose: components["schemas"]["RecordPurpose"];
@@ -4981,6 +5717,24 @@ export interface components {
         };
         RecordPage: {
             items: components["schemas"]["RecordMetadata"][];
+            next_before: string;
+        };
+        RecordCaptureStatus: {
+            id: components["schemas"]["RecordCaptureQueueId"];
+            task_id: components["schemas"]["TaskId"];
+            purpose: components["schemas"]["RecordPurpose"];
+            /** @enum {string} */
+            kind: "turn" | "sample";
+            /** @enum {string} */
+            state: "queued" | "leased" | "stored" | "rejected" | "failed";
+            failure_code: string;
+            /** Format: date-time */
+            captured_at: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        RecordCaptureStatusPage: {
+            items: components["schemas"]["RecordCaptureStatus"][];
             next_before: string;
         };
         RecordContent: {
@@ -5297,7 +6051,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the profile-only snapshot and change-feed services are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
@@ -5580,6 +6334,50 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    issueClientScheduleGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Credential returned once for the current installation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientScheduleGrantResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeClientScheduleGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule grants revoked for the current installation */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     getMe: {
         parameters: {
             query?: never;
@@ -5599,6 +6397,50 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getMyInviteCode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation code */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InviteCode"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPublicNudgePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Public nudge policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminNudgePolicy"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
@@ -5648,6 +6490,86 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyRecords: {
+        parameters: {
+            query?: {
+                purpose?: components["schemas"]["RecordPurpose"];
+                before_id?: components["schemas"]["RecordId"];
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of this account's record metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyRecordCaptureStatuses: {
+        parameters: {
+            query?: {
+                before_id?: components["schemas"]["RecordCaptureQueueId"];
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of this account's Task-linked capture statuses */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordCaptureStatusPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    requestMyRecordDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion tombstone */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordDeleteTombstone"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -6391,7 +7313,7 @@ export interface operations {
         parameters: {
             query?: {
                 /** @description Entry surface. Unknown or repeated query parameters are rejected. */
-                target?: "desktop" | "terminal";
+                target?: "desktop" | "terminal" | "workspace";
             };
             header?: never;
             path: {
@@ -8378,19 +9300,370 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    getPersonalObject: {
+    listGoals: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner-scoped goals */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GoalCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Goal created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getGoal: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                type: "profile";
-                id: "default";
+                id: components["schemas"]["GoalId"];
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Current profile and revision */
+            /** @description Goal body and revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalObject"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GoalDeleteRequest"];
+            };
+        };
+        responses: {
+            /** @description Body-free mutation receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GoalMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Body-free mutation receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listSchedules: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["ScheduleStatus"];
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchedulePage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createSchedule: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Created schedule */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSchedule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule definition and current run summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateSchedule: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated schedule */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateScheduleStatus: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated schedule and current run state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listScheduleRuns: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule run history page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleRunPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalDataQuota: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authenticated owner's current personal-data usage and available space */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalDataQuota"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalObject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current object and revision */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -8412,8 +9685,9 @@ export interface operations {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
             };
             path: {
-                type: "profile";
-                id: "default";
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
         };
@@ -8447,8 +9721,9 @@ export interface operations {
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
             };
             path: {
-                type: "profile";
-                id: "default";
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
         };
@@ -8675,7 +9950,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One snapshot page and its fixed account watermark */
+            /** @description One current-view page and the fixed account change-feed watermark */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -8704,7 +9979,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Profile change metadata through a fixed account watermark */
+            /** @description Personal-data change metadata through a fixed account watermark */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -9272,6 +10547,136 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    getAdminSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current fixed policy and personal-data quota defaults */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminInvites: {
+        parameters: {
+            query?: {
+                search?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation history */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminInvitePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminSites: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local Site and Release summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSitePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminNudgePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Saved policy and version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminNudgePolicy"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminNudgePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminNudgePolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminNudgePolicy"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
         };
     };
     listAllHosts: {

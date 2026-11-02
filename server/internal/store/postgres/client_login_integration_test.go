@@ -22,6 +22,8 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/schedule"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -31,6 +33,21 @@ type clientLoginHTTPAuth struct {
 }
 
 type clientLoginHTTPAdmin struct{ api.AdminService }
+
+type delayedClientLoginStore struct {
+	app.ClientLoginStore
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *delayedClientLoginStore) LoginClient(ctx context.Context, requested identity.ClientInstallation, authenticated identity.User, instanceID string,
+	generation int64, legacyAndroid bool, keyHash, requestHash []byte, renewalID, ip string,
+	issue func(string) (app.ClientIssuedTokens, error)) (identity.ClientInstallation, app.ClientIssuedTokens, error) {
+	close(s.entered)
+	<-s.release
+	return s.ClientLoginStore.LoginClient(ctx, requested, authenticated, instanceID, generation, legacyAndroid,
+		keyHash, requestHash, renewalID, ip, issue)
+}
 
 var clientLoginTestSequence = struct {
 	sync.Mutex
@@ -242,6 +259,85 @@ func TestClientLoginCredentialRotationCancelsDeviceSyncSession(t *testing.T) {
 	if err != nil || cancelled.State != workspace.SyncCancelled {
 		t.Fatalf("session after credential rotation = %q, %v; want cancelled", cancelled.State, err)
 	}
+}
+
+func TestClientLoginRenewalPreservesActiveScheduleGrantAuthorization(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "ios-schedule-renew-0001", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPrincipal, err := credentials.VerifyClient(ctx, first.ClientCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := clients.IssueScheduleGrant(ctx, clientPrincipal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantPrincipal, err := credentials.VerifyClient(ctx, grant.Credential)
+	if err != nil || !identity.IsScheduleGrantScopeSet(grantPrincipal.Scopes) {
+		t.Fatalf("issued schedule grant principal = %#v, %v", grantPrincipal, err)
+	}
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	scheduled, err := createLoginRenewalSchedule(t, ctx, store, owner.ID, hostValue.ID, grantPrincipal)
+	if err != nil {
+		t.Fatalf("create schedule with grant = %v", err)
+	}
+
+	renewed, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", first.InstallationID, "ios-schedule-renew-0002", "192.0.2.1")
+	if err != nil || renewed.InstallationID != first.InstallationID {
+		t.Fatalf("renew iOS installation = %#v, %v", renewed, err)
+	}
+	if _, err := credentials.VerifyClient(ctx, first.ClientCredential); err == nil {
+		t.Fatal("old regular client credential survived installation renewal")
+	}
+	if _, err := credentials.VerifyClient(ctx, renewed.ClientCredential); err != nil {
+		t.Fatalf("new regular client credential was rejected: %v", err)
+	}
+	stillAuthorizedGrant, err := credentials.VerifyClient(ctx, grant.Credential)
+	if err != nil || stillAuthorizedGrant.TokenID != grantPrincipal.TokenID {
+		t.Fatalf("active schedule grant did not survive client renewal: %#v, %v", stillAuthorizedGrant, err)
+	}
+	updatedSchedule, err := store.GetSchedule(ctx, owner.ID, scheduled.ID)
+	if err != nil || updatedSchedule.Authorization.TokenID != grantPrincipal.TokenID || updatedSchedule.Version != scheduled.Version {
+		t.Fatalf("schedule authorization after client renewal = %#v, %v", updatedSchedule, err)
+	}
+	if err := credentials.ValidateScheduleAuthorization(ctx, owner.ID, updatedSchedule.Authorization); err != nil {
+		t.Fatalf("schedule grant authorization after client renewal: %v", err)
+	}
+}
+
+func createLoginRenewalSchedule(t *testing.T, ctx context.Context, store *Store, ownerID, hostID string, grant identity.Principal) (schedule.Schedule, error) {
+	t.Helper()
+	timing := schedule.Timing{Kind: schedule.TimingDaily,
+		StartsOn: time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"), LocalTime: "10:00", TimeZone: "UTC"}
+	occurrence, err := schedule.FirstOccurrence(timing, time.Now().UTC())
+	if err != nil {
+		return schedule.Schedule{}, err
+	}
+	id := mustID(t, schedule.NewID)
+	grantScopes := make([]string, 0, len(grant.Scopes))
+	for _, scope := range grant.Scopes {
+		grantScopes = append(grantScopes, string(scope))
+	}
+	value := schedule.Schedule{
+		ID: id, OwnerID: ownerID, Version: 1, Status: schedule.StatusEnabled, ExecutionEpoch: 1,
+		HostID: hostID, ModelID: "model-test", Objective: "schedule grant login renewal test", Timing: timing,
+		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
+		Authorization: task.Authorization{Kind: string(grant.Kind), TokenID: grant.TokenID,
+			ClientInstallationID: grant.ClientInstallationID, Scopes: grantScopes},
+		MisfirePolicy: schedule.MisfireSkip, NotificationEvents: []schedule.NotificationEvent{schedule.NotifyCompleted},
+		NextOccurrenceKey: occurrence.Key, NextRunAt: occurrence.ScheduledAt, NextCheckAt: &occurrence.CheckAt,
+	}
+	record := testIdempotency(ownerID, "schedule.create", "schedule-login-renewal-"+id)
+	record.ResourceID = id
+	created, _, err := store.CreateSchedule(ctx, value, record)
+	return created, err
 }
 
 func TestClientLoginMobileAndCrossAccountRenewal(t *testing.T) {
@@ -582,6 +678,60 @@ func TestClientLoginRacingRevocationCannotRestoreInstallation(t *testing.T) {
 	items, err := store.ListClientInstallations(ctx, owner.ID)
 	if err != nil || len(items) != 1 || items[0].RevokedAt == nil {
 		t.Fatalf("racing revoke left another installation: %#v, %v", items, err)
+	}
+}
+
+func TestClientLoginRacingPasswordChangeCannotRestoreInstallation(t *testing.T) {
+	store, credentials, _, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	owner, err := store.GetUserByID(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delayed := &delayedClientLoginStore{ClientLoginStore: store, entered: make(chan struct{}), release: make(chan struct{})}
+	clients, err := app.NewClientLoginService(delayed, credentials, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginResult := make(chan error, 1)
+	go func() {
+		_, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "laptop", "", "login-password-race-0001", "192.0.2.1")
+		loginResult <- err
+	}()
+	select {
+	case <-delayed.entered:
+	case <-time.After(5 * time.Second):
+		close(delayed.release)
+		t.Fatal("client login did not reach the credential transaction after password authentication")
+	}
+	newPasswordHash, err := bcrypt.GenerateFromPassword([]byte("client-password-456"), bcrypt.MinCost)
+	if err != nil {
+		close(delayed.release)
+		t.Fatal(err)
+	}
+	updated := owner
+	updated.PasswordHash = string(newPasswordHash)
+	_, err = store.UpdateUserWithAudit(ctx, owner.ID, owner.Status, updated, audit.Entry{
+		ActorID: owner.ID, ActorKind: audit.ActorSession, Action: audit.ActionUserUpdate,
+		Target: owner.ID, Detail: map[string]any{"password_changed": true},
+	}, nil)
+	if err != nil {
+		close(delayed.release)
+		t.Fatalf("update password before delayed client login: %v", err)
+	}
+	close(delayed.release)
+	if err := <-loginResult; domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("client login authenticated before password change = %v; want unauthenticated", err)
+	}
+	var installations, tokens int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM client_installations WHERE owner_id=$1`, owner.ID).Scan(&installations); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM tokens WHERE owner_id=$1`, owner.ID).Scan(&tokens); err != nil {
+		t.Fatal(err)
+	}
+	if installations != 0 || tokens != 0 {
+		t.Fatalf("delayed login created credentials after password change: installations=%d tokens=%d", installations, tokens)
 	}
 }
 

@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/record"
 	"morde/server/internal/domain/task"
 )
 
@@ -18,6 +20,7 @@ import (
 type CloudDSHToolBroker struct {
 	store          TaskStore
 	runtime        *RuntimeToolExecutor
+	recordCapture  *RecordCaptureService
 	mcpCredentials MCPConnectorCredentialProvider
 	mcpClient      MCPConnectorToolClient
 	hub            *HubService
@@ -35,6 +38,20 @@ type CloudDSHTaskCompletion struct {
 }
 
 func NewCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider, mcpClient MCPConnectorToolClient, hubs ...*HubService) (*CloudDSHToolBroker, error) {
+	return newCloudDSHToolBroker(store, runtime, nil, mcpCredentials, mcpClient, hubs...)
+}
+
+// NewCloudDSHToolBrokerWithRecordCapture enables best-effort full-record capture after successful task completion.
+func NewCloudDSHToolBrokerWithRecordCapture(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider,
+	mcpClient MCPConnectorToolClient, recordCapture *RecordCaptureService, hubs ...*HubService) (*CloudDSHToolBroker, error) {
+	if recordCapture == nil {
+		return nil, errors.New("record capture dependency is required")
+	}
+	return newCloudDSHToolBroker(store, runtime, recordCapture, mcpCredentials, mcpClient, hubs...)
+}
+
+func newCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, recordCapture *RecordCaptureService,
+	mcpCredentials MCPConnectorCredentialProvider, mcpClient MCPConnectorToolClient, hubs ...*HubService) (*CloudDSHToolBroker, error) {
 	if store == nil || runtime == nil {
 		return nil, errors.New("dsh tool broker dependencies are required")
 	}
@@ -44,7 +61,10 @@ func NewCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, mcpCre
 	if len(hubs) > 1 {
 		return nil, errors.New("at most one Hub service may be configured")
 	}
-	broker := &CloudDSHToolBroker{store: store, runtime: runtime, mcpCredentials: mcpCredentials, mcpClient: mcpClient}
+	broker := &CloudDSHToolBroker{
+		store: store, runtime: runtime, recordCapture: recordCapture,
+		mcpCredentials: mcpCredentials, mcpClient: mcpClient,
+	}
 	if len(hubs) == 1 {
 		broker.hub = hubs[0]
 	}
@@ -142,9 +162,8 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if err != nil {
 			return err
 		}
-		_, err = agent.completeWithArtifacts(ctx, current, step, current.Usage, completion.Result,
+		return b.completeWithRecordCapture(ctx, agent, current, step, current.Usage, completion.Result,
 			map[string]any{"source": "cloud_dsh"}, "", nil)
-		return err
 	}
 
 	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs, nil)
@@ -157,9 +176,8 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if err != nil {
 			return err
 		}
-		_, err = agent.completeWithArtifacts(ctx, current, step, current.Usage, completion.Result,
+		return b.completeWithRecordCapture(ctx, agent, current, step, current.Usage, completion.Result,
 			map[string]any{"source": "cloud_dsh"}, "", nil)
-		return err
 	}
 	step, err := cloudDSHCompletionVerificationStep(current, details.Steps)
 	if err != nil {
@@ -197,9 +215,46 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	}
 	step.Status = task.StepSucceeded
 	step.Summary = safeStepSummary(verification.Summary, "Host and committed Workspace verified the task output.")
-	_, err = agent.completeWithArtifacts(ctx, current, step, current.Usage, completion.Result,
+	return b.completeWithRecordCapture(ctx, agent, current, step, current.Usage, completion.Result,
 		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts)
-	return err
+}
+
+func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, agent *Agent, current task.Task, step task.Step,
+	usage task.Usage, result string, detail any, observationFingerprint string, artifacts []task.Artifact) error {
+	completed, err := agent.completeWithArtifacts(ctx, current, step, usage, result, detail, observationFingerprint, artifacts)
+	if err != nil {
+		return err
+	}
+	if completed.Status == task.StatusCompleted {
+		b.captureCompletedTurn(ctx, current, completed.Result)
+	}
+	return nil
+}
+
+func (b *CloudDSHToolBroker) captureCompletedTurn(ctx context.Context, current task.Task, result string) {
+	if b.recordCapture == nil {
+		return
+	}
+	kind := identity.Kind(current.Authorization.Kind)
+	if kind != identity.KindSession && kind != identity.KindClient {
+		return
+	}
+	principal := identity.Principal{
+		UserID: current.OwnerID, Kind: kind, TokenID: current.Authorization.TokenID,
+		ClientInstallationID: current.Authorization.ClientInstallationID,
+	}
+	payload, err := json.Marshal(struct {
+		Objective string `json:"objective"`
+		Result    string `json:"result"`
+	}{Objective: current.Objective, Result: result})
+	if err != nil {
+		return
+	}
+	captureCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+	defer cancel()
+	_, _ = b.recordCapture.Capture(captureCtx, principal, record.CaptureInput{
+		Purpose: record.PurposeFullRecord, Kind: record.ItemTurn, TaskID: current.ID, Payload: payload,
+	})
 }
 
 func cloudDSHCompletionVerificationStep(current task.Task, steps []task.Step) (task.Step, error) {

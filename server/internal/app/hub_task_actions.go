@@ -18,12 +18,76 @@ import (
 	"morde/server/internal/domain/hub"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 const (
 	hubTaskInfoTimeout = 3 * time.Second
 	hubTaskCallSlack   = 5 * time.Second
 )
+
+func TaskHubFilePutCloudReceiptHash(value TaskHubOperation) ([32]byte, error) {
+	if !domain.ValidUserID(value.OwnerID) || !domain.ValidTaskID(value.TaskID) || !hub.ValidCallID(value.Key) ||
+		!domain.ValidClientInstallationID(value.TargetInstallationID) || value.Action != hub.ActionFilePut ||
+		value.TargetGrantVersion < 1 || value.SourceCheckpointRevision < 0 || len(value.LocalReceiptHash) != 32 ||
+		!workspace.ValidSessionID(value.SyncSessionID) || value.SyncRevision < value.SourceCheckpointRevision ||
+		value.SyncStage != TaskHubWriteStageCloudSynced || value.Status != task.OperationSucceeded {
+		return [32]byte{}, domain.InvalidArgument("file_put_receipt", "cloud-synced Task file.put receipt is invalid")
+	}
+	request, err := json.Marshal(hub.WorkspaceWriteArgs{
+		WorkspaceID: value.WorkspaceID, Path: value.WorkspacePath, SizeBytes: value.WorkspaceSizeBytes, SHA256: value.WorkspaceSHA256,
+	})
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("encode Task file.put request for receipt: %w", err)
+	}
+	if _, err := hub.ValidateWorkspaceWriteArgs(request); err != nil {
+		return [32]byte{}, domain.InvalidArgument("file_put_receipt", "cloud-synced Task file.put receipt is invalid")
+	}
+	canonical, err := json.Marshal(struct {
+		Version                  string `json:"version"`
+		OwnerID                  string `json:"owner_id"`
+		TaskID                   string `json:"task_id"`
+		OperationKey             string `json:"operation_key"`
+		TargetInstallationID     string `json:"target_installation_id"`
+		WorkspaceID              string `json:"workspace_id"`
+		Path                     string `json:"path"`
+		SizeBytes                int64  `json:"size_bytes"`
+		SHA256                   string `json:"sha256"`
+		SourceCheckpointRevision int64  `json:"source_checkpoint_revision"`
+		LocalReceiptHash         []byte `json:"local_receipt_hash"`
+		SyncSessionID            string `json:"sync_session_id"`
+		SyncRevision             int64  `json:"sync_revision"`
+		Stage                    string `json:"stage"`
+	}{"morde.task-hub.file-put.v1", value.OwnerID, value.TaskID, value.Key, value.TargetInstallationID,
+		value.WorkspaceID, value.WorkspacePath, value.WorkspaceSizeBytes, value.WorkspaceSHA256,
+		value.SourceCheckpointRevision, value.LocalReceiptHash, value.SyncSessionID, value.SyncRevision, value.SyncStage})
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("encode Task file.put cloud receipt: %w", err)
+	}
+	return sha256.Sum256(canonical), nil
+}
+
+func TaskHubFilePutCloudSyncedOutput(value TaskHubOperation) (string, error) {
+	if _, err := TaskHubFilePutCloudReceiptHash(value); err != nil {
+		return "", err
+	}
+	output, err := json.Marshal(struct {
+		OperationID          string `json:"operation_id"`
+		TargetInstallationID string `json:"target_installation_id"`
+		TargetGrantVersion   int64  `json:"target_grant_version"`
+		WorkspaceID          string `json:"workspace_id"`
+		Path                 string `json:"path"`
+		SizeBytes            int64  `json:"size_bytes"`
+		SHA256               string `json:"sha256"`
+		Revision             int64  `json:"revision"`
+		Stage                string `json:"stage"`
+	}{value.Key, value.TargetInstallationID, value.TargetGrantVersion, value.WorkspaceID, value.WorkspacePath,
+		value.WorkspaceSizeBytes, value.WorkspaceSHA256, value.SyncRevision, TaskHubWriteStageCloudSynced})
+	if err != nil {
+		return "", fmt.Errorf("encode Task file.put tool result: %w", err)
+	}
+	return string(output), nil
+}
 
 type TaskHubOperation struct {
 	OwnerID                  string
@@ -38,7 +102,23 @@ type TaskHubOperation struct {
 	RequestHash              []byte
 	ResultHash               []byte
 	Status                   task.OperationStatus
+	WorkspaceID              string
+	WorkspacePath            string
+	WorkspaceSizeBytes       int64
+	WorkspaceSHA256          string
+	SourceCheckpointRevision int64
+	LocalReceiptHash         []byte
+	SyncStage                string
+	SyncSessionID            string
+	SyncRevision             int64
 }
+
+const (
+	TaskHubWriteStagePending     = "pending"
+	TaskHubWriteStageLocal       = "local_applied"
+	TaskHubWriteStageSyncPending = "sync_pending"
+	TaskHubWriteStageCloudSynced = "cloud_synced"
+)
 
 // TaskHubOperationStore is implemented by the PostgreSQL integration layer.
 // Results are hashed so sensitive file contents and screenshots never enter this ledger.
@@ -48,6 +128,12 @@ type TaskHubOperationStore interface {
 	CompleteTaskHubOperation(context.Context, TaskHubOperation, string, task.OperationStatus, []byte) error
 	MarkTaskHubOperationUnknown(context.Context, TaskHubOperation, string) error
 	GetTaskHubOperation(context.Context, string, string, string) (TaskHubOperation, error)
+}
+
+// TaskHubWorkspaceWriteStore is an optional extension for file.put. Keeping it
+// separate lets existing stores for ordinary Hub actions remain compatible.
+type TaskHubWorkspaceWriteStore interface {
+	RecordTaskHubOperationLocalReceipt(context.Context, TaskHubOperation, string, []byte) error
 }
 
 type HubTaskCallResult struct {
@@ -298,6 +384,16 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 	if err != nil || hub.ValidateTaskActionArgs(tool.action, args) != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Task Hub action arguments are invalid")
 	}
+	var writeRequest hub.WorkspaceWriteArgs
+	if tool.action == hub.ActionFilePut {
+		writeRequest, err = hub.ValidateWorkspaceWriteArgs(args)
+		if err != nil || current.WorkspaceID != writeRequest.WorkspaceID || current.WorkspaceCheckpointRevision == nil {
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Task file.put must target the current Workspace checkpoint")
+		}
+		if _, ok := b.store.(TaskHubWorkspaceWriteStore); !ok {
+			return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "Task Workspace write receipt storage is unavailable")
+		}
+	}
 	requestHash, err := hubTaskOperationHash(call.Name, targetID, grantVersion, args)
 	if err != nil {
 		return AgentToolResult{}, err
@@ -308,6 +404,11 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		TargetInstallationID: targetID, Action: tool.action,
 		TaskAuthorizationVersion: current.Authorization.Version, TargetGrantVersion: grantVersion,
 		LeaseVersion: current.Lease.Version, RequestHash: requestHash[:], Status: task.OperationPrepared,
+	}
+	if tool.action == hub.ActionFilePut {
+		operation.WorkspaceID, operation.WorkspacePath = writeRequest.WorkspaceID, writeRequest.Path
+		operation.WorkspaceSizeBytes, operation.WorkspaceSHA256 = writeRequest.SizeBytes, writeRequest.SHA256
+		operation.SourceCheckpointRevision, operation.SyncStage = *current.WorkspaceCheckpointRevision, TaskHubWriteStagePending
 	}
 	expectedOperation := operation
 	stored, lookupErr := operationStore.GetTaskHubOperation(ctx, current.OwnerID, current.ID, operationKey)
@@ -377,6 +478,9 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		}
 		return b.pauseHubTaskUnknown(ctx, current, call, operationKey, "Task authorization changed while the Hub action was in flight.")
 	}
+	if tool.action == hub.ActionFilePut && result.OK {
+		return b.recordHubTaskFilePutReceipt(ctx, current, call, operationStore, operation, writeRequest, *taskContext, result)
+	}
 	output, images, err := hubTaskToolOutput(tool.action, grantVersion, result)
 	if err != nil {
 		if err := markTaskHubOperationUnknown(ctx, operationStore, operation, current.Lease.Owner); err != nil {
@@ -411,11 +515,69 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 	return AgentToolResult{Status: agentStatus, ExternalID: operationKey, Output: output, Images: images}, nil
 }
 
+func (b *CloudDSHToolBroker) recordHubTaskFilePutReceipt(ctx context.Context, current task.Task, call ModelToolCall,
+	operationStore TaskHubOperationStore, operation TaskHubOperation, request hub.WorkspaceWriteArgs,
+	taskContext hub.TaskContext, result HubTaskCallResult) (AgentToolResult, error) {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+	defer cancel()
+	unknown := func(summary string) (AgentToolResult, error) {
+		if err := markTaskHubOperationUnknown(persistCtx, operationStore, operation, current.Lease.Owner); err != nil {
+			return AgentToolResult{}, err
+		}
+		return b.pauseHubTaskUnknown(persistCtx, current, call, operation.Key, summary)
+	}
+	if result.Unknown || !result.OK || hub.ValidateWorkspaceWriteReceipt(result.Body, request, taskContext) != nil {
+		return unknown("The target did not return a matching durable local Workspace write receipt.")
+	}
+	var receipt hub.WorkspaceWriteReceipt
+	if err := json.Unmarshal(result.Body, &receipt); err != nil {
+		return unknown("The target did not return a matching durable local Workspace write receipt.")
+	}
+	canonicalReceipt, err := json.Marshal(receipt)
+	if err != nil {
+		return unknown("The target local Workspace write receipt could not be recorded.")
+	}
+	receiptHash := sha256.Sum256(canonicalReceipt)
+	writeStore, ok := b.store.(TaskHubWorkspaceWriteStore)
+	if !ok {
+		return unknown("Task Workspace write receipt storage is unavailable after the target write.")
+	}
+	if err := writeStore.RecordTaskHubOperationLocalReceipt(persistCtx, operation, current.Lease.Owner, receiptHash[:]); err != nil {
+		return unknown("The target write receipt could not be durably recorded.")
+	}
+	operation.SyncStage = TaskHubWriteStageLocal
+	return b.pauseHubTaskWorkspaceSync(persistCtx, current, call, operation)
+}
+
 func (b *CloudDSHToolBroker) reconcileHubTaskOperation(ctx context.Context, current task.Task, call ModelToolCall,
 	expected, operation TaskHubOperation, recovering bool, checkpointOutput *string) (AgentToolResult, bool, error) {
 	if !sameTaskHubOperation(operation, expected) {
 		result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The stored Hub operation does not match this exact Task action.")
 		return result, true, err
+	}
+	if expected.Action == hub.ActionFilePut {
+		switch operation.SyncStage {
+		case TaskHubWriteStageLocal, TaskHubWriteStageSyncPending:
+			if (operation.Status == task.OperationDispatched || operation.Status == task.OperationUnknown) &&
+				len(operation.LocalReceiptHash) == 32 && current.WorkspaceID == operation.WorkspaceID &&
+				current.WorkspaceCheckpointRevision != nil && *current.WorkspaceCheckpointRevision == operation.SourceCheckpointRevision {
+				result, err := b.pauseHubTaskWorkspaceSync(ctx, current, call, operation)
+				return result, true, err
+			}
+			result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The target file write cannot be matched to its current Workspace checkpoint.")
+			return result, true, err
+		case TaskHubWriteStageCloudSynced:
+			resultHash, hashErr := TaskHubFilePutCloudReceiptHash(operation)
+			output, outputErr := TaskHubFilePutCloudSyncedOutput(operation)
+			if operation.Status != task.OperationSucceeded || hashErr != nil || outputErr != nil ||
+				!bytes.Equal(operation.ResultHash, resultHash[:]) || current.WorkspaceID != operation.WorkspaceID ||
+				current.WorkspaceCheckpointRevision == nil || *current.WorkspaceCheckpointRevision != operation.SyncRevision ||
+				(checkpointOutput != nil && *checkpointOutput != output) {
+				result, err := b.pauseHubTaskUnknown(ctx, current, call, expected.Key, "The saved Workspace sync receipt does not match the Task file write.")
+				return result, true, err
+			}
+			return AgentToolResult{Status: AgentToolSucceeded, Output: output}, true, nil
+		}
 	}
 	switch operation.Status {
 	case task.OperationSucceeded, task.OperationFailed:
@@ -566,7 +728,9 @@ func sameTaskHubOperation(actual, expected TaskHubOperation) bool {
 		actual.ToolName == expected.ToolName && actual.TargetInstallationID == expected.TargetInstallationID &&
 		actual.Action == expected.Action && actual.TaskAuthorizationVersion == expected.TaskAuthorizationVersion &&
 		actual.TargetGrantVersion == expected.TargetGrantVersion &&
-		bytes.Equal(actual.RequestHash, expected.RequestHash)
+		bytes.Equal(actual.RequestHash, expected.RequestHash) && actual.WorkspaceID == expected.WorkspaceID &&
+		actual.WorkspacePath == expected.WorkspacePath && actual.WorkspaceSizeBytes == expected.WorkspaceSizeBytes &&
+		actual.WorkspaceSHA256 == expected.WorkspaceSHA256 && actual.SourceCheckpointRevision == expected.SourceCheckpointRevision
 }
 
 func hubTaskToolOutput(action string, targetGrantVersion int64, result HubTaskCallResult) (string, []ModelImage, error) {
@@ -632,6 +796,26 @@ func (b *CloudDSHToolBroker) pauseHubTaskUnknown(ctx context.Context, current ta
 		"tool": call.Name, "operation_key": operationKey, "operation_status": task.OperationUnknown,
 	})
 	return AgentToolResult{Status: AgentToolUnknown}, err
+}
+
+func (b *CloudDSHToolBroker) pauseHubTaskWorkspaceSync(ctx context.Context, current task.Task, call ModelToolCall,
+	operation TaskHubOperation) (AgentToolResult, error) {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+	defer cancel()
+	details, err := b.store.GetTask(persistCtx, current.ID, current.OwnerID)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepWaitingUser,
+		"Waiting for target Workspace sync", "The target has applied the file; its Workspace sync receipt is still pending.")
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	err = b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, "task_hub_workspace_sync", "task.waiting_user", map[string]any{
+		"tool": call.Name, "operation_key": operation.Key, "operation_status": operation.Status,
+		"workspace_id": operation.WorkspaceID, "path": operation.WorkspacePath, "sync_stage": operation.SyncStage,
+	})
+	return AgentToolResult{Status: AgentToolNeedsUser, WaitingReason: "task_hub_workspace_sync"}, err
 }
 
 func (b *CloudDSHToolBroker) failHubTaskBeforeDispatch(ctx context.Context, current task.Task, call ModelToolCall, operation TaskHubOperation, message string) (AgentToolResult, error) {

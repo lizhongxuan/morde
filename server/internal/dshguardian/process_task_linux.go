@@ -177,7 +177,7 @@ func (p hostProcessInspector) resolveContainerPID(containerID string, runtimePro
 			return walkErr
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
-			return errors.New("Runtime cgroup tree contains a symlink")
+			return errors.New("runtime cgroup tree contains a symlink")
 		}
 		if !entry.IsDir() {
 			return nil

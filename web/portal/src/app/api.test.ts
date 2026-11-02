@@ -5,6 +5,19 @@ import { enterHostInNewTab, portalApi } from './api';
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+  it('sends an optional trimmed invitation code during registration', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ user: { id: 'u1234567', name: 'new-user', role: 'user', status: 'pending' } }, { status: 201 });
+    }));
+
+    await portalApi.register('new-user', 'secret-pass', '  0123456789abcdef0123456789abcdef  ');
+
+    expect([request!.method, new URL(request!.url).pathname]).toEqual(['POST', '/api/auth/register']);
+    expect(await request!.json()).toEqual({ name: 'new-user', password: 'secret-pass', invite_code: '0123456789abcdef0123456789abcdef' });
+  });
+
   it('opens a visible same-origin Host handoff page in a new tab', async () => {
     const tab = { opener: window as Window | null };
     const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
@@ -23,6 +36,14 @@ describe('typed Portal API client', () => {
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/h1234567?target=terminal`, '_blank');
     expect(tab.opener).toBeNull();
     expect(ticket).not.toHaveBeenCalled();
+  });
+
+  it('opens a shared workspace through the same-origin Host handoff page', () => {
+    const tab = { opener: window as Window | null };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    enterHostInNewTab('h1234567', 'workspace');
+    expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/h1234567?target=workspace`, '_blank');
+    expect(tab.opener).toBeNull();
   });
 
   it('sends schema-typed requests with request IDs and Cookie credentials', async () => {
@@ -46,6 +67,41 @@ describe('typed Portal API client', () => {
     expect(request.headers.get('Idempotency-Key')).toBe('host-create-key-001');
     expect(request.credentials).toBe('include');
     expect(await request.json()).toEqual({ workspace_ids: [] });
+  });
+
+  it('lists only record metadata and requests owner-scoped record deletion', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      if (request.method === 'DELETE') return Response.json({ id: 'l1234567', owner_id: 'u1234567', record_id: 'v1234567', state: 'pending', attempts: 0, requested_at: '2026-11-02T00:00:00Z' }, { status: 202 });
+      return Response.json({ items: [], next_before: '' });
+    }));
+
+    await portalApi.myRecords({ purpose: 'full_record' });
+    await expect(portalApi.deleteMyRecord('v1234567')).resolves.toMatchObject({ state: 'pending' });
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname, new URL(request.url).search])).toEqual([
+      ['GET', '/api/me/records', '?limit=50&purpose=full_record'],
+      ['DELETE', '/api/me/records/v1234567', ''],
+    ]);
+    expect(requests.every((request) => request.credentials === 'include')).toBe(true);
+  });
+
+  it('lists Task record-capture statuses without requesting capture content', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ items: [], next_before: '' });
+    }));
+
+    await expect(portalApi.myRecordCaptureStatuses({ limit: 7, before_id: 'j1234567' })).resolves.toEqual({ items: [], next_before: '' });
+
+    expect(request).toBeDefined();
+    expect([request!.method, new URL(request!.url).pathname, new URL(request!.url).search]).toEqual([
+      'GET', '/api/me/record-captures', '?limit=7&before_id=j1234567',
+    ]);
+    expect(request!.credentials).toBe('include');
   });
 
   it('sends a stable idempotency key for a metered model connection check', async () => {

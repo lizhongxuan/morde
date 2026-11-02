@@ -73,6 +73,28 @@ type clientContractFixture struct {
 			AccountChangeSequence int64  `json:"account_change_sequence"`
 			Replay                bool   `json:"replay"`
 		} `json:"mutation_receipt"`
+		SnapshotPage struct {
+			Watermark int64 `json:"watermark"`
+			Items     []struct {
+				ObjectType string          `json:"object_type"`
+				ObjectID   string          `json:"object_id"`
+				Revision   int64           `json:"revision"`
+				Body       json.RawMessage `json:"body"`
+			} `json:"items"`
+			NextCursor *string `json:"next_cursor"`
+		} `json:"snapshot_page"`
+		ChangesPage struct {
+			Items []struct {
+				ChangeSequence int64  `json:"change_sequence"`
+				ObjectType     string `json:"object_type"`
+				ObjectID       string `json:"object_id"`
+				Revision       int64  `json:"revision"`
+				Operation      string `json:"operation"`
+			} `json:"items"`
+			ThroughSequence   int64 `json:"through_sequence"`
+			NextAfterSequence int64 `json:"next_after_sequence"`
+			HasMore           bool  `json:"has_more"`
+		} `json:"changes_page"`
 		IdempotencyKey string `json:"idempotency_key"`
 	} `json:"personal_data"`
 }
@@ -313,7 +335,7 @@ func TestSharedHubFramesMatchProtocolValidators(t *testing.T) {
 	}
 }
 
-func TestSharedPersonalDataFixtureMatchesProfileMutationContract(t *testing.T) {
+func TestSharedPersonalDataFixtureMatchesProfileAndSyncContract(t *testing.T) {
 	fixture := loadClientContractFixture(t)
 	value := fixture.PersonalData
 	if value.ProfileRead.ObjectType != personal.ObjectTypeProfile || value.ProfileRead.ObjectID != personal.ProfileObjectID ||
@@ -331,6 +353,32 @@ func TestSharedPersonalDataFixtureMatchesProfileMutationContract(t *testing.T) {
 	}
 	if value.ProfileDeleteRequest.BaseRevision < value.ProfilePutRequest.BaseRevision {
 		t.Fatalf("shared profile delete revision is invalid: %+v", value.ProfileDeleteRequest)
+	}
+	if value.SnapshotPage.Watermark < 0 || len(value.SnapshotPage.Items) == 0 || value.SnapshotPage.NextCursor == nil ||
+		len(value.SnapshotPage.Items) > 100 {
+		t.Fatalf("shared personal snapshot fixture is incomplete: %+v", value.SnapshotPage)
+	}
+	for _, item := range value.SnapshotPage.Items {
+		if !personal.IsPersonalSyncObjectType(item.ObjectType) || personal.ValidateObjectIdentifier(item.ObjectType, item.ObjectID) != nil ||
+			item.Revision < 1 || personal.ValidateObjectBody(item.ObjectType, item.ObjectID, item.Body) != nil {
+			t.Fatalf("shared personal snapshot item is invalid: %+v", item)
+		}
+	}
+	if len(value.ChangesPage.Items) == 0 || value.ChangesPage.ThroughSequence < value.SnapshotPage.Watermark ||
+		value.ChangesPage.NextAfterSequence < value.SnapshotPage.Watermark || value.ChangesPage.HasMore {
+		t.Fatalf("shared personal change fixture is incomplete: %+v", value.ChangesPage)
+	}
+	previousSequence := value.SnapshotPage.Watermark
+	for _, change := range value.ChangesPage.Items {
+		if change.ChangeSequence <= previousSequence || change.ChangeSequence > value.ChangesPage.ThroughSequence ||
+			!personal.IsPersonalSyncObjectType(change.ObjectType) || personal.ValidateObjectIdentifier(change.ObjectType, change.ObjectID) != nil ||
+			change.Revision < 1 || (change.Operation != "upsert" && change.Operation != "delete") {
+			t.Fatalf("shared personal change item is invalid: %+v", change)
+		}
+		previousSequence = change.ChangeSequence
+	}
+	if value.ChangesPage.NextAfterSequence != previousSequence {
+		t.Fatalf("shared personal change cursor = %d, want last returned sequence %d", value.ChangesPage.NextAfterSequence, previousSequence)
 	}
 }
 

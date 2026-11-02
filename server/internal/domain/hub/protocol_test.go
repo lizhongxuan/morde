@@ -106,11 +106,12 @@ func TestValidateActionResultKeepsResultsWithinActionContract(t *testing.T) {
 		body   string
 		error  string
 	}{
-		"info path leak":        {action: ActionInfo, body: `{"name":"Phone","platform":"ios","path":"/private"}`},
-		"info invalid platform": {action: ActionInfo, body: `{"name":"Phone","platform":"server"}`},
-		"open incomplete":       {action: ActionOpen, body: `{"opened":false}`},
-		"notify incomplete":     {action: ActionNotify, body: `{"notified":false}`},
-		"unknown action error":  {action: ActionNotify, error: "shell_executed"},
+		"info path leak":           {action: ActionInfo, body: `{"name":"Phone","platform":"ios","path":"/private"}`},
+		"info invalid platform":    {action: ActionInfo, body: `{"name":"Phone","platform":"server"}`},
+		"info unimplemented write": {action: ActionInfo, body: `{"name":"PC","platform":"desktop","actions":["file.put"]}`},
+		"open incomplete":          {action: ActionOpen, body: `{"opened":false}`},
+		"notify incomplete":        {action: ActionNotify, body: `{"notified":false}`},
+		"unknown action error":     {action: ActionNotify, error: "shell_executed"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			frame := Frame{Type: "result", ID: "call-5", OK: &ok, Body: json.RawMessage(test.body)}
@@ -125,7 +126,7 @@ func TestValidateActionResultKeepsResultsWithinActionContract(t *testing.T) {
 }
 
 func TestValidateCallDoesNotExposeTaskOnlyActions(t *testing.T) {
-	for _, action := range []string{ActionScreenshot, ActionFiles, ActionFileGet, ActionCommand} {
+	for _, action := range []string{ActionScreenshot, ActionFiles, ActionFileGet, ActionFilePut, ActionCommand} {
 		if err := ValidateCall(Frame{Type: "call", ID: "call-task", To: "i1234567", Action: action, Args: json.RawMessage(`{}`)}); err == nil {
 			t.Fatalf("ordinary Hub call exposed Task-only action %q", action)
 		}
@@ -160,6 +161,7 @@ func TestValidateTaskActionArgsAreStrictlyBounded(t *testing.T) {
 		"files":      {action: ActionFiles, args: `{}`},
 		"files path": {action: ActionFiles, args: `{"path":"workspace/docs"}`},
 		"file.get":   {action: ActionFileGet, args: `{"path":"workspace/notes.txt","max_bytes":32768}`},
+		"file.put":   {action: ActionFilePut, args: `{"workspace_id":"w1234567","path":"workspace/notes.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`},
 		"command":    {action: ActionCommand, args: `{"command":"echo hello","timeout_ms":300000}`},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -172,7 +174,7 @@ func TestValidateTaskActionArgsAreStrictlyBounded(t *testing.T) {
 		action string
 		args   string
 	}{
-		"unknown action":      {action: "file.put", args: `{}`},
+		"unknown action":      {action: "shell", args: `{}`},
 		"extra screen arg":    {action: ActionScreenshot, args: `{"path":"/private"}`},
 		"files absolute path": {action: ActionFiles, args: `{"path":"/private"}`},
 		"files parent path":   {action: ActionFiles, args: `{"path":"workspace/../private"}`},
@@ -196,6 +198,57 @@ func TestValidateTaskActionArgsAreStrictlyBounded(t *testing.T) {
 	}
 }
 
+func TestWorkspaceWriteContractBindsRelativePathAndExactContentDigest(t *testing.T) {
+	requestJSON := `{"workspace_id":"w1234567","path":"notes/today.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	request, err := ValidateWorkspaceWriteArgs(json.RawMessage(requestJSON))
+	if err != nil {
+		t.Fatalf("valid workspace write metadata: %v", err)
+	}
+	for name, raw := range map[string]string{
+		"absolute path":     `{"workspace_id":"w1234567","path":"/tmp/today.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"parent path":       `{"workspace_id":"w1234567","path":"notes/../today.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"backslash path":    `{"workspace_id":"w1234567","path":"notes\\today.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"invalid workspace": `{"workspace_id":"outside","path":"notes/today.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"negative size":     `{"workspace_id":"w1234567","path":"notes/today.txt","size_bytes":-1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"oversized":         `{"workspace_id":"w1234567","path":"notes/today.txt","size_bytes":314572801,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"bad digest":        `{"workspace_id":"w1234567","path":"notes/today.txt","size_bytes":5,"sha256":"not-a-digest"}`,
+		"extra field":       `{"workspace_id":"w1234567","path":"notes/today.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"hello"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateWorkspaceWriteArgs(json.RawMessage(raw)); err == nil {
+				t.Fatal("invalid workspace write metadata was accepted")
+			}
+		})
+	}
+
+	taskContext := TaskContext{TaskID: "q1234567", AuthorizationVersion: 4, TargetGrantVersion: 9, OperationID: "op_0123456789abcdef"}
+	validReceipt := WorkspaceWriteReceipt{
+		OperationID: taskContext.OperationID, WorkspaceID: request.WorkspaceID, Path: request.Path,
+		SizeBytes: request.SizeBytes, SHA256: request.SHA256, TargetGrantVersion: taskContext.TargetGrantVersion, Stage: "local_applied",
+	}
+	if err := ValidateWorkspaceWriteReceipt(mustJSON(t, validReceipt), request, taskContext); err != nil {
+		t.Fatalf("valid local receipt: %v", err)
+	}
+	for name, change := range map[string]func(*WorkspaceWriteReceipt){
+		"different operation": func(value *WorkspaceWriteReceipt) { value.OperationID = "op_1123456789abcdef" },
+		"different workspace": func(value *WorkspaceWriteReceipt) { value.WorkspaceID = "w7654321" },
+		"different path":      func(value *WorkspaceWriteReceipt) { value.Path = "notes/other.txt" },
+		"different digest": func(value *WorkspaceWriteReceipt) {
+			value.SHA256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		},
+		"different grant":    func(value *WorkspaceWriteReceipt) { value.TargetGrantVersion++ },
+		"cloud sync claimed": func(value *WorkspaceWriteReceipt) { value.Stage = "cloud_synced" },
+	} {
+		t.Run("receipt "+name, func(t *testing.T) {
+			value := validReceipt
+			change(&value)
+			if err := ValidateWorkspaceWriteReceipt(mustJSON(t, value), request, taskContext); err == nil {
+				t.Fatal("mismatched local receipt was accepted")
+			}
+		})
+	}
+}
+
 func TestValidateProtectedActionResultsRequireGrantFenceAndBounds(t *testing.T) {
 	ok := true
 	jpegData := taskTestJPEG(t)
@@ -205,6 +258,7 @@ func TestValidateProtectedActionResultsRequireGrantFenceAndBounds(t *testing.T) 
 		})},
 		ActionFiles:   {Type: "result", ID: "call-2", OK: &ok, Body: json.RawMessage(`{"entries":[{"path":"workspace/notes.txt","kind":"file","size_bytes":5}],"target_grant_version":2}`)},
 		ActionFileGet: {Type: "result", ID: "call-3", OK: &ok, Body: json.RawMessage(`{"path":"workspace/notes.txt","text":"hello","truncated":false,"target_grant_version":2}`)},
+		ActionFilePut: {Type: "result", ID: "call-put", OK: &ok, Body: json.RawMessage(`{"operation_id":"op_0123456789abcdef","workspace_id":"w1234567","path":"workspace/notes.txt","size_bytes":5,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target_grant_version":2,"stage":"local_applied"}`)},
 		ActionCommand: {Type: "result", ID: "call-4", OK: &ok, Body: json.RawMessage(`{"exit_code":0,"stdout":"ok","stderr":"","timed_out":false,"stopped":true,"target_grant_version":2}`)},
 	}
 	for action, frame := range valid {
@@ -226,6 +280,8 @@ func TestValidateProtectedActionResultsRequireGrantFenceAndBounds(t *testing.T) 
 		"files duplicate path":       {action: ActionFiles, body: `{"entries":[{"path":"notes.txt","kind":"file","size_bytes":1},{"path":"notes.txt","kind":"file","size_bytes":1}],"target_grant_version":2}`},
 		"file.get missing truncated": {action: ActionFileGet, body: `{"path":"notes.txt","text":"hello","target_grant_version":2}`},
 		"file.get too large":         {action: ActionFileGet, body: `{"path":"notes.txt","text":"` + string(bytes.Repeat([]byte("x"), MaxFileReadBytes+1)) + `","truncated":false,"target_grant_version":2}`},
+		"file.put cloud sync claim":  {action: ActionFilePut, body: `{"operation_id":"op_0123456789abcdef","workspace_id":"w1234567","path":"notes.txt","size_bytes":0,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target_grant_version":2,"stage":"cloud_synced"}`},
+		"file.put missing operation": {action: ActionFilePut, body: `{"workspace_id":"w1234567","path":"notes.txt","size_bytes":0,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target_grant_version":2,"stage":"local_applied"}`},
 		"command missing fields":     {action: ActionCommand, body: `{"exit_code":0,"stdout":"","stderr":"","timed_out":false,"target_grant_version":2}`},
 		"command output too large":   {action: ActionCommand, body: `{"exit_code":0,"stdout":"` + string(bytes.Repeat([]byte("x"), MaxCommandOutput+1)) + `","stderr":"","timed_out":false,"stopped":true,"target_grant_version":2}`},
 	}

@@ -170,6 +170,7 @@ func TestWriteErrorMappings(t *testing.T) {
 		{domain.CodeCapacityExceeded, http.StatusConflict},
 		{domain.CodeWorkspaceBusy, http.StatusConflict},
 		{domain.CodeWorkspaceConflict, http.StatusConflict},
+		{domain.CodeWorkspaceUnavailable, http.StatusServiceUnavailable},
 		{domain.CodeTransferExpired, http.StatusConflict},
 		{domain.CodeInvalidState, http.StatusConflict},
 		{domain.CodeConflict, http.StatusConflict},

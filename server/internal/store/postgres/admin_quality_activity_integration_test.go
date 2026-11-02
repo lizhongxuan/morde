@@ -64,7 +64,8 @@ VALUES ('audit-actor-id-secret-sentinel','system','auth.login','audit-target-sec
 		activity.HubOperations[0].Status != "succeeded" || activity.HubOperations[0].Count != 1 {
 		t.Fatalf("Hub operation summary = %#v", activity.HubOperations)
 	}
-	if len(activity.TaskEvents) != 1 || activity.TaskEvents[0].Type != "task.step" || activity.TaskEvents[0].Count != 1 {
+	if len(activity.TaskEvents) != 2 || activity.TaskEvents[0].Type != "task.status" || activity.TaskEvents[0].Count != 1 ||
+		activity.TaskEvents[1].Type != "task.step" || activity.TaskEvents[1].Count != 1 {
 		t.Fatalf("task event summary = %#v", activity.TaskEvents)
 	}
 	var loginCount int64
@@ -88,7 +89,7 @@ VALUES ('audit-actor-id-secret-sentinel','system','auth.login','audit-target-sec
 			break
 		}
 	}
-	if !foundInsideDay || dailyHubOperations != 1 || dailyTaskEvents != 1 || dailyAuditEvents < 1 {
+	if !foundInsideDay || dailyHubOperations != 1 || dailyTaskEvents != 2 || dailyAuditEvents < 1 {
 		t.Fatalf("daily aggregate containing test events = %#v", activity.ByDay)
 	}
 
@@ -138,12 +139,16 @@ VALUES ($1,$2,'Quality target','desktop',clock_timestamp()+interval '1 day')`, i
 	}
 	operationKeys := []string{"quality-operation-0", "quality-operation-1"}
 	for index, status := range []string{"failed", "unknown"} {
+		var resultHash []byte
+		if status == "failed" {
+			resultHash = hashBytes("quality-result")
+		}
 		if _, err := store.pool.Exec(ctx, `INSERT INTO task_hub_operations (
 task_id,owner_id,operation_key,tool_name,target_installation_id,action,task_authorization_version,target_grant_version,lease_version,
 request_hash,result_hash,status,created_at,updated_at)
 VALUES ($1,$2,$3,'morde_hub_files',$4,'files',1,1,1,$5,$6,$7,$8,$8)`,
 			created.Task.ID, owner.ID, operationKeys[index], installationID,
-			hashBytes("quality-request"), hashBytes("quality-result"), status, now.Add(-time.Hour)); err != nil {
+			hashBytes("quality-request"), resultHash, status, now.Add(-time.Hour)); err != nil {
 			t.Fatalf("insert Hub risk metadata %s: %v", status, err)
 		}
 	}
@@ -166,7 +171,7 @@ VALUES ($1,'training_contribution',true,3)`, owner.ID); err != nil {
 		if _, err := store.pool.Exec(ctx, `INSERT INTO record_entries
 (id,owner_id,purpose,item_kind,consent_version,captured_at,created_at,expires_at,payload_bytes,attachment_bytes,attachment_count,state)
 VALUES ($1,$2,'training_contribution','sample',$3,$4,$4,$5,32,0,0,'active')`,
-			id, owner.ID, value.version, now.Add(-time.Hour), value.expiresAt); err != nil {
+			id, owner.ID, value.version, now.Add(-2*time.Hour), value.expiresAt); err != nil {
 			t.Fatalf("insert sample fixture %d: %v", index, err)
 		}
 	}

@@ -28,8 +28,11 @@ func TestWorkspaceSyncQuotaSocketsCreatesOwnerPrivateEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(tempRoot) })
-	root := tempRoot
+	root, err := filepath.EvalSymlinks(tempRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	ctx, cancel := context.WithCancel(context.Background())
 	manager := &WorkspaceSyncNodeQuotaSockets{
 		root: root, groupID: os.Getegid(), service: workspaceSyncQuotaSocketServiceStub{},

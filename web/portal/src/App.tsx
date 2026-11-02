@@ -5,6 +5,7 @@ import { AdminGuard, RouteGuard } from './app/RouteGuard';
 import { ToastProvider } from './app/toast';
 import { PortalLayout } from './components/PortalLayout';
 import { AccountSettings } from './routes/AccountSettings';
+import { GoalsAndSchedules } from './routes/GoalsAndSchedules';
 import { ApiKeys } from './routes/ApiKeys';
 import { Assistant } from './routes/Assistant';
 import { Connections } from './routes/Connections';
@@ -17,6 +18,7 @@ import { Register } from './routes/Register';
 import { ChangePassword } from './routes/ChangePassword';
 import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
+import { PersonalData } from './routes/PersonalData';
 import { Workspaces } from './routes/Workspaces';
 import { AdminAudit } from './routes/admin/AdminAudit';
 import { AdminHosts } from './routes/admin/AdminHosts';
@@ -33,6 +35,9 @@ import { AdminHostDetail } from './routes/admin/AdminHostDetail';
 import { AdminUserDetail } from './routes/admin/AdminUserDetail';
 import { AdminWorkspaces } from './routes/admin/AdminWorkspaces';
 import { AdminWorkspaceDetail } from './routes/admin/AdminWorkspaceDetail';
+import { AdminSettings } from './routes/admin/AdminSettings';
+import { AdminInvites } from './routes/admin/AdminInvites';
+import { AdminSites } from './routes/admin/AdminSites';
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true } } });
 
@@ -55,6 +60,8 @@ function UserRoutes() {
       <Route element={<PortalLayout />}>
         <Route index element={<Navigate to="/hosts" replace />} />
         <Route path="assistant" element={<Assistant />} />
+        <Route path="personal" element={<PersonalData />} />
+        <Route path="goals" element={<GoalsAndSchedules />} />
         <Route path="hosts" element={<Hosts />} />
         <Route path="hosts/new" element={<NewHost />} />
         <Route path="notifications" element={<Notifications />} />
@@ -81,6 +88,9 @@ function AdminRoutes() {
           <Route path="users" element={<AdminUsers />} />
           <Route path="users/:id/records" element={<AdminRecords />} />
           <Route path="users/:id" element={<AdminUserDetail />} />
+          <Route path="settings" element={<AdminSettings />} />
+          <Route path="invites" element={<AdminInvites />} />
+          <Route path="sites" element={<AdminSites />} />
           <Route path="models" element={<AdminModels />} />
           <Route path="usage" element={<AdminUsage />} />
           <Route path="quality" element={<AdminQuality />} />

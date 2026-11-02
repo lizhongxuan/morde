@@ -48,6 +48,7 @@ type HostSharingService interface {
 	ListSharedHosts(context.Context, identity.Principal) ([]host.SharedHost, error)
 	IssueObservationTicket(context.Context, identity.Principal, string) (EnterInfo, error)
 	IssueTerminalTicket(context.Context, identity.Principal, string) (EnterInfo, error)
+	IssueWorkspaceTicket(context.Context, identity.Principal, string) (EnterInfo, error)
 	Authorize(context.Context, string, string, host.Permission) (bool, error)
 }
 

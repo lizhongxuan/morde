@@ -5,10 +5,10 @@ import "time"
 type Permission string
 
 const (
-	PermissionDesktopView     Permission = "desktop:view"
-	PermissionDesktopControl  Permission = "desktop:control"
-	PermissionTerminalControl Permission = "terminal:control"
-	PermissionMCPControl      Permission = "mcp:control"
+	PermissionDesktopView       Permission = "desktop:view"
+	PermissionDesktopControl    Permission = "desktop:control"
+	PermissionTerminalControl   Permission = "terminal:control"
+	PermissionMCPControl        Permission = "mcp:control"
 	PermissionWorkspaceFileRead Permission = "workspace:file:read"
 )
 

@@ -16,7 +16,7 @@ export const portalApi = {
   onboardingStatus: async () => unwrapApiResponse(await api.GET('/api/onboarding/status')),
   ensureDefaultHost: async (body: components['schemas']['EnsureDefaultHostRequest'] = {}) => unwrapApiResponse(await api.POST('/api/me/default-host', { body })),
   login: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/login', { body: { name, password } })),
-  register: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/register', { body: { name, password } })),
+  register: async (name: string, password: string, inviteCode = '') => unwrapApiResponse(await api.POST('/api/auth/register', { body: { name, password, ...(inviteCode.trim() ? { invite_code: inviteCode.trim() } : {}) } })),
   logout: async () => unwrapApiResponse(await api.POST('/api/auth/logout')),
   changePassword: async (body: components['schemas']['ChangePasswordRequest']) => unwrapApiResponse(await api.POST('/api/me/password', { body })),
   hosts: async () => unwrapApiResponse(await api.GET('/api/hosts')),
@@ -26,8 +26,8 @@ export const portalApi = {
   revokeHostMember: async (id: string, userID: string) => {
     unwrapApiResponse(await api.DELETE('/api/hosts/{id}/members/{user_id}', { params: { path: { id, user_id: userID } } }));
   },
-  issueObservationTicket: async (id: string, target: 'desktop' | 'terminal' = 'desktop') => unwrapApiResponse(await api.POST('/api/hosts/{id}/observation-ticket', {
-    params: { path: { id }, ...(target === 'terminal' ? { query: { target } } : {}) },
+  issueObservationTicket: async (id: string, target: 'desktop' | 'terminal' | 'workspace' = 'desktop') => unwrapApiResponse(await api.POST('/api/hosts/{id}/observation-ticket', {
+    params: { path: { id }, ...(target !== 'desktop' ? { query: { target } } : {}) },
   })),
   host: async (id: string) => unwrapApiResponse(await api.GET('/api/hosts/{id}', { params: { path: { id } } })),
   templates: async () => unwrapApiResponse(await api.GET('/api/templates')),
@@ -137,6 +137,77 @@ export const portalApi = {
   apiKeys: async () => unwrapApiResponse(await api.GET('/api/apikeys')),
   createApiKey: async (body: components['schemas']['CreateAPIKeyRequest']) => unwrapApiResponse(await api.POST('/api/apikeys', { body })),
   deleteApiKey: async (id: string) => unwrapApiResponse(await api.DELETE('/api/apikeys/{id}', { params: { path: { id } } })),
+  personalDataSnapshot: async (cursor?: string, limit = 100) => unwrapApiResponse(await api.GET('/api/sync/snapshot', {
+    params: { query: { limit, ...(cursor ? { cursor } : {}) } },
+  })),
+  personalDataChanges: async (afterSequence: number, throughSequence?: number, limit = 100) => unwrapApiResponse(await api.GET('/api/sync/changes', {
+    params: { query: { after_sequence: afterSequence, limit, ...(throughSequence === undefined ? {} : { through_sequence: throughSequence }) } },
+  })),
+  getPersonalObject: async (type: components['schemas']['PersonalMutationObjectType'], id: string) => unwrapApiResponse(await api.GET('/api/personal-data/{type}/{id}', { params: { path: { type, id } } })),
+  replacePersonalObject: async (
+    type: components['schemas']['PersonalMutationObjectType'], id: string, baseRevision: number,
+    body: components['schemas']['PersonalObjectPutRequest']['body'], idempotencyKey = newIdempotencyKey(),
+  ) => unwrapApiResponse(await api.PUT('/api/personal-data/{type}/{id}', {
+    params: { path: { type, id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { base_revision: baseRevision, body },
+  })),
+  deletePersonalObject: async (
+    type: components['schemas']['PersonalMutationObjectType'], id: string, baseRevision: number,
+    idempotencyKey = newIdempotencyKey(),
+  ) => unwrapApiResponse(await api.DELETE('/api/personal-data/{type}/{id}', {
+    params: { path: { type, id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { base_revision: baseRevision },
+  })),
+  personalDataQuota: async () => unwrapApiResponse(await api.GET('/api/personal-data/quota')),
+  createPersonalAttachmentUpload: async (
+    body: components['schemas']['PersonalAttachmentUploadRequest'], idempotencyKey = newIdempotencyKey(),
+  ) => unwrapApiResponse(await api.POST('/api/personal-data/uploads', {
+    params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  putPersonalAttachmentChunk: async (uploadID: string, sequence: number, body: BodyInit, sha256: string) => {
+    const response = await requestFetch(`/api/personal-data/uploads/${encodeURIComponent(uploadID)}/chunks/${sequence}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-SHA256': sha256 }, body,
+    });
+    if (!response.ok) await throwResponseError(response);
+    return unwrapApiResponse(await response.json().then((data) => ({ data, response })));
+  },
+  commitPersonalAttachment: async (uploadID: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/personal-data/uploads/{upload_id}/commit', {
+    params: { path: { upload_id: uploadID }, header: { 'Idempotency-Key': idempotencyKey } },
+  })),
+  cancelPersonalAttachmentUpload: async (uploadID: string) => unwrapApiResponse(await api.DELETE('/api/personal-data/uploads/{upload_id}', { params: { path: { upload_id: uploadID } } })),
+  personalAttachment: async (attachmentID: string): Promise<Blob> => {
+    const response = await requestFetch(`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`);
+    if (!response.ok) await throwResponseError(response);
+    return response.blob();
+  },
+  importPersonalHistory: async (body: components['schemas']['PersonalHistoryImportRequest']) => unwrapApiResponse(await api.POST('/api/personal-data/history/import', { body })),
+  goals: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/goals', {
+    params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } },
+  })),
+  createGoal: async (body: components['schemas']['GoalCreateRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/goals', {
+    params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  getGoal: async (id: string) => unwrapApiResponse(await api.GET('/api/goals/{id}', { params: { path: { id } } })),
+  updateGoal: async (id: string, body: components['schemas']['GoalMutationRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.PATCH('/api/goals/{id}', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  deleteGoal: async (id: string, body: components['schemas']['GoalDeleteRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.DELETE('/api/goals/{id}', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  schedules: async (query: NonNullable<operations['listSchedules']['parameters']['query']> = {}) => unwrapApiResponse(await api.GET('/api/schedules', {
+    params: { query: { limit: 100, ...query } },
+  })),
+  createSchedule: async (body: components['schemas']['ScheduleCreateRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/schedules', {
+    params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  getSchedule: async (id: string) => unwrapApiResponse(await api.GET('/api/schedules/{id}', { params: { path: { id } } })),
+  updateSchedule: async (id: string, body: components['schemas']['ScheduleUpdateRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.PUT('/api/schedules/{id}', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  scheduleAction: async (id: string, body: components['schemas']['ScheduleActionRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/schedules/{id}/actions', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
+  scheduleRuns: async (id: string, query: NonNullable<operations['listScheduleRuns']['parameters']['query']> = {}) => unwrapApiResponse(await api.GET('/api/schedules/{id}/runs', {
+    params: { path: { id }, query: { limit: 100, ...query } },
+  })),
   modelConnections: async () => unwrapApiResponse(await api.GET('/api/model-connections')),
   createModelConnection: async (body: components['schemas']['CreateModelConnectionRequest']) => unwrapApiResponse(await api.POST('/api/model-connections', { body })),
   updateModelConnection: async (id: string, body: operations['updateModelConnection']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/model-connections/{id}', { params: { path: { id } }, body })),
@@ -151,6 +222,13 @@ export const portalApi = {
   adminActivity: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/activity', { params: { query: { days } } })),
   adminPlaces: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/places', { params: { query: { days } } })),
   adminControls: async () => unwrapApiResponse(await api.GET('/api/admin/controls')),
+  adminSettings: async () => unwrapApiResponse(await api.GET('/api/admin/settings')),
+  adminInvites: async (search = '', limit = 25, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/invites', { params: { query: { search, limit, offset } } })),
+  adminSites: async (limit = 25, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/sites', { params: { query: { limit, offset } } })),
+  adminNudges: async () => unwrapApiResponse(await api.GET('/api/admin/nudges')),
+  updateAdminNudges: async (body: components['schemas']['UpdateAdminNudgePolicyRequest']) => unwrapApiResponse(await api.PUT('/api/admin/nudges', { body })),
+  myInviteCode: async () => unwrapApiResponse(await api.GET('/api/me/invite-code')),
+  publicNudges: async () => unwrapApiResponse(await api.GET('/api/nudges')),
   createAdminControlRule: async (body: components['schemas']['CreateAdminControlRuleRequest']) => unwrapApiResponse(await api.POST('/api/admin/controls/rules', { body })),
   updateAdminControlRule: async (id: number, body: operations['updateAdminControlRule']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/admin/controls/rules/{id}', { params: { path: { id } }, body })),
   deleteAdminControlRule: async (id: number, expectedVersion: number) => unwrapApiResponse(await api.DELETE('/api/admin/controls/rules/{id}', { params: { path: { id }, query: { expected_version: expectedVersion } } })),
@@ -158,6 +236,9 @@ export const portalApi = {
   adminControlNotifyTest: async () => unwrapApiResponse(await api.POST('/api/admin/controls/notify-test')),
   recordConsents: async () => unwrapApiResponse(await api.GET('/api/me/record-consents')),
   setRecordConsent: async (body: components['schemas']['SetRecordConsentRequest']) => unwrapApiResponse(await api.PUT('/api/me/record-consents', { body })),
+  myRecordCaptureStatuses: async (query: NonNullable<operations['listMyRecordCaptureStatuses']['parameters']['query']> = {}) => unwrapApiResponse(await api.GET('/api/me/record-captures', { params: { query: { limit: 50, ...query } } })),
+  myRecords: async (query: NonNullable<operations['listMyRecords']['parameters']['query']> = {}) => unwrapApiResponse(await api.GET('/api/me/records', { params: { query: { limit: 50, ...query } } })),
+  deleteMyRecord: async (recordID: string) => unwrapApiResponse(await api.DELETE('/api/me/records/{record_id}', { params: { path: { record_id: recordID } } })),
   adminRecordSettings: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/record-settings', { params: { path: { id } } })),
   adminRecordAccess: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/record-access', { params: { path: { id } } })),
   updateRecordQuota: async (id: string, body: components['schemas']['SetAdminRecordQuotaRequest']) => unwrapApiResponse(await api.PUT('/api/admin/users/{id}/record-quota', { params: { path: { id } }, body })),
@@ -235,7 +316,7 @@ export function errorDetails(error: unknown): { code?: string; message: string; 
   return { code: value?.code, message: errorMessage(error), retryAfter };
 }
 
-export function enterHostInNewTab(id: string, target?: 'desktop' | 'terminal'): void {
+export function enterHostInNewTab(id: string, target?: 'desktop' | 'terminal' | 'workspace'): void {
   const destination = new URL(`/host-entry/${encodeURIComponent(id)}`, window.location.origin);
   if (target) destination.searchParams.set('target', target);
   const tab = window.open(destination.href, '_blank');

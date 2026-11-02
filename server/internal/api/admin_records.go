@@ -85,6 +85,22 @@ type recordPageResponse struct {
 	NextBefore string               `json:"next_before"`
 }
 
+type recordCaptureStatusView struct {
+	ID          string            `json:"id"`
+	TaskID      string            `json:"task_id"`
+	Purpose     record.Purpose    `json:"purpose"`
+	Kind        record.ItemKind   `json:"kind"`
+	State       record.QueueState `json:"state"`
+	FailureCode string            `json:"failure_code"`
+	CapturedAt  time.Time         `json:"captured_at"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+}
+
+type recordCaptureStatusPageResponse struct {
+	Items      []recordCaptureStatusView `json:"items"`
+	NextBefore string                    `json:"next_before"`
+}
+
 type recordContentResponse struct {
 	Metadata recordMetadataView `json:"metadata"`
 	Payload  json.RawMessage    `json:"payload"`
@@ -120,6 +136,9 @@ type recordGrantRequest struct {
 func (h *api) registerAdminRecords(group *gin.RouterGroup) {
 	group.GET("/me/record-consents", h.listRecordConsents)
 	group.PUT("/me/record-consents", h.setRecordConsent)
+	group.GET("/me/record-captures", h.listMyRecordCaptureStatuses)
+	group.GET("/me/records", h.listMyRecords)
+	group.DELETE("/me/records/:record_id", h.deleteMyRecord)
 	group.GET("/admin/users/:id/record-settings", h.getAdminRecordSettings)
 	group.GET("/admin/users/:id/record-access", h.getAdminRecordAccess)
 	group.PUT("/admin/users/:id/record-quota", h.setAdminRecordQuota)
@@ -130,6 +149,87 @@ func (h *api) registerAdminRecords(group *gin.RouterGroup) {
 	group.GET("/admin/users/:id/records/:record_id/attachments/:attachment_id", h.getAdminRecordAttachment)
 	group.GET("/admin/users/:id/records/:record_id/export", h.exportAdminRecord)
 	group.DELETE("/admin/users/:id/records/:record_id", h.deleteAdminRecord)
+}
+
+func (h *api) listMyRecordCaptureStatuses(c *gin.Context) {
+	if h.deps.RecordCaptureStatus == nil {
+		serviceUnavailable(c)
+		return
+	}
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	query, ok := recordCaptureStatusQuery(c)
+	if !ok {
+		return
+	}
+	page, err := h.deps.RecordCaptureStatus.Statuses(c.Request.Context(), principal, query)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	response := recordCaptureStatusPageResponse{Items: make([]recordCaptureStatusView, 0, len(page.Items)), NextBefore: page.NextBefore}
+	for _, value := range page.Items {
+		response.Items = append(response.Items, recordCaptureStatusView{
+			ID: value.ID, TaskID: value.TaskID, Purpose: value.Purpose, Kind: value.Kind,
+			State: value.State, FailureCode: value.FailureCode, CapturedAt: value.CapturedAt, ExpiresAt: value.ExpiresAt,
+		})
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *api) listMyRecords(c *gin.Context) {
+	if h.deps.RecordAccess == nil {
+		serviceUnavailable(c)
+		return
+	}
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	query, ok := recordQuery(c)
+	if !ok {
+		return
+	}
+	page, err := h.deps.RecordAccess.List(c.Request.Context(), principal, "", query)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	response := recordPageResponse{Items: make([]recordMetadataView, 0, len(page.Items)), NextBefore: page.NextBefore}
+	for _, value := range page.Items {
+		response.Items = append(response.Items, recordMetadataViewOf(value))
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *api) deleteMyRecord(c *gin.Context) {
+	if h.deps.RecordAccess == nil {
+		serviceUnavailable(c)
+		return
+	}
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return
+	}
+	recordID := c.Param("record_id")
+	if !record.ValidRecordID(recordID) {
+		writeError(c, domain.InvalidArgument("record_id", "record id is invalid"))
+		return
+	}
+	value, err := h.deps.RecordAccess.Delete(c.Request.Context(), principal, principal.UserID, recordID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, recordDeleteResponse{
+		ID: value.ID, OwnerID: value.OwnerID, RecordID: value.RecordID,
+		State: value.State, Attempts: value.Attempts, RequestedAt: value.RequestedAt, CompletedAt: value.CompletedAt,
+	})
 }
 
 func (h *api) listRecordConsents(c *gin.Context) {
@@ -528,6 +628,31 @@ func recordQuery(c *gin.Context) (record.Query, bool) {
 		}
 	}
 	return record.Query{Purpose: purpose, BeforeID: beforeID, Limit: int32(limit)}, true
+}
+
+func recordCaptureStatusQuery(c *gin.Context) (record.CaptureStatusQuery, bool) {
+	beforeID, ok := singleQuery(c, "before_id")
+	if !ok {
+		return record.CaptureStatusQuery{}, false
+	}
+	if beforeID != "" && !record.ValidQueueItemID(beforeID) {
+		writeError(c, domain.InvalidArgument("before_id", "record capture status cursor is invalid"))
+		return record.CaptureStatusQuery{}, false
+	}
+	limit := int64(50)
+	if values, exists := c.Request.URL.Query()["limit"]; exists {
+		if len(values) != 1 {
+			writeError(c, domain.InvalidArgument("limit", "record capture status page limit must appear once"))
+			return record.CaptureStatusQuery{}, false
+		}
+		var err error
+		limit, err = strconv.ParseInt(values[0], 10, 32)
+		if err != nil || limit < 1 || limit > 100 {
+			writeError(c, domain.InvalidArgument("limit", "record capture status page limit must be between 1 and 100"))
+			return record.CaptureStatusQuery{}, false
+		}
+	}
+	return record.CaptureStatusQuery{BeforeID: beforeID, Limit: int32(limit)}, true
 }
 
 func recordConsentViewOf(value record.Consent) recordConsentView {

@@ -10,7 +10,10 @@ async function resolveHandler(method: string, path: string, request: Request): P
     const info = candidate.info as { method?: string; path?: string };
     const expected = (info.path ?? "").split("/");
     const actual = path.split("/");
-    return info.method === method && expected.length === actual.length && expected.every((part, index) => part.startsWith(":") || part === actual[index]);
+    const wildcardIndex = expected.findIndex((part) => part.startsWith("*"));
+    const fixedParts = wildcardIndex < 0 ? expected : expected.slice(0, wildcardIndex);
+    return info.method === method && (wildcardIndex < 0 ? expected.length === actual.length : actual.length > wildcardIndex)
+      && fixedParts.every((part, index) => part.startsWith(":") || part === actual[index]);
   });
   if (!handler) throw new Error(`Missing mock handler: ${method} ${path}`);
   const result = await handler.run({
@@ -66,23 +69,41 @@ describe("workbench mock file handlers", () => {
     });
   });
 
-  it("provides a bound Workspace and its Host directory for the local browser flow", async () => {
-    const response = await resolveHandler("GET", "/__ch/api/host", new Request(`${baseUrl}/__ch/api/host`));
-    const body = await response.json() as { workspaces: Array<{ workspace: { id: string; quota_bytes: number; used_bytes: number }; directory: string; sync_state: string; sync_conflicts: string[] }> };
-    const workspace = body.workspaces[0]!;
-    const listing = await listPath(`/home/gem/workspace/${workspace.workspace.id}`);
-    const overQuotaWorkspace = body.workspaces[1]!;
-    const overQuotaListing = await listPath(`/home/gem/workspace/${overQuotaWorkspace.workspace.id}`);
-
+  it("lists explicit Workspace bindings and pages the applied revision manifest", async () => {
+    const bindingsResponse = await resolveHandler("GET", "/__ch/api/workspaces", new Request(`${baseUrl}/__ch/api/workspaces`));
+    const bindings = await bindingsResponse.json() as { items: Array<{ workspace: { id: string; quota_bytes: number; used_bytes: number }; directory: string; sync_state: string; sync_conflicts: string[] }> };
+    const workspace = bindings.items[0]!;
     expect(workspace).toMatchObject({
       workspace: { id: "w1234567", quota_bytes: 5 * 1024 ** 3 },
       directory: "w1234567", sync_state: "healthy", sync_conflicts: [],
     });
-    expect(listing.data.files).toContainEqual(expect.objectContaining({
-      name: "README.md", path: "/home/gem/workspace/w1234567/README.md", is_directory: false,
-    }));
-    expect(overQuotaWorkspace.workspace.used_bytes).toBeGreaterThan(overQuotaWorkspace.workspace.quota_bytes);
-    expect(overQuotaListing.data.files).toContainEqual(expect.objectContaining({ name: "should-not-display.txt" }));
+
+    const firstURL = `${baseUrl}/__ch/api/workspaces/${workspace.workspace.id}/manifest?revision=4&limit=1`;
+    const first = await resolveHandler("GET", `/__ch/api/workspaces/${workspace.workspace.id}/manifest`, new Request(firstURL));
+    const firstBody = await first.json() as { workspace_id: string; revision: number; files: Array<{ path: string }>; next_cursor: string | null };
+    expect(firstBody).toMatchObject({ workspace_id: "w1234567", revision: 4, files: [{ path: "README.md" }] });
+    expect(firstBody.next_cursor).toBe("mock-1");
+
+    const secondURL = `${baseUrl}/__ch/api/workspaces/${workspace.workspace.id}/manifest?revision=4&limit=1&cursor=${firstBody.next_cursor}`;
+    const second = await resolveHandler("GET", `/__ch/api/workspaces/${workspace.workspace.id}/manifest`, new Request(secondURL));
+    expect(await second.json()).toMatchObject({ workspace_id: "w1234567", revision: 4, files: [{ path: "src/main.go" }] });
+  });
+
+  it("downloads a nested Workspace file through the revision-pinned Host route", async () => {
+    const path = "notes & plans/hello world.txt";
+    const requestURL = `${baseUrl}/__ch/api/workspaces/w1234567/files/notes%20%26%20plans%2Fhello%20world.txt?revision=4`;
+    const response = await resolveHandler("GET", "/__ch/api/workspaces/w1234567/files/notes%20%26%20plans%2Fhello%20world.txt", new Request(requestURL));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(response.headers.get("Content-Disposition")).toContain("hello%20world.txt");
+    expect(await response.text()).toContain("路径包含空格和符号");
+    expect(path).toBe("notes & plans/hello world.txt");
+  });
+
+  it("rejects a manifest request for a revision that is not applied", async () => {
+    const response = await resolveHandler("GET", "/__ch/api/workspaces/w1234567/manifest", new Request(`${baseUrl}/__ch/api/workspaces/w1234567/manifest?revision=3`));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: "workspace_conflict" } });
   });
 
   it("accepts WeChat install requests idempotently and exposes the operation for polling", async () => {

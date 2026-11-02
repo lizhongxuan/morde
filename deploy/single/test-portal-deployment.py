@@ -45,6 +45,133 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 reader.parse_values(io.StringIO(source), ["CH_DATA_KEY_FILE"])
 
+    def test_environment_reader_requires_postgres_wal_archive_path(self):
+        self.assertEqual(
+            reader.parse_values(
+                io.StringIO("CH_POSTGRES_WAL_ARCHIVE_DIR=/srv/cloudhost-postgres-wal-archive\n"),
+                ["CH_POSTGRES_WAL_ARCHIVE_DIR"],
+            ),
+            ["/srv/cloudhost-postgres-wal-archive"],
+        )
+        with self.assertRaisesRegex(ValueError, "missing required key"):
+            reader.parse_values(io.StringIO(""), ["CH_POSTGRES_WAL_ARCHIVE_DIR"])
+
+    def test_postgres_wal_archive_compose_and_installer_guards(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        installer = (ROOT / "install-portal-service.sh").read_text()
+        self.assertIn(
+            "source: ${CH_POSTGRES_WAL_ARCHIVE_DIR:?Set CH_POSTGRES_WAL_ARCHIVE_DIR",
+            compose,
+        )
+        self.assertIn("target: /var/lib/postgresql/wal-archive", compose)
+        self.assertIn("create_host_path: false", compose)
+        self.assertIn("archive_mode=on", compose)
+        self.assertIn("archive_timeout=60s", compose)
+        self.assertIn("archive_command=/usr/local/bin/morde-archive-wal %p %f", compose)
+        self.assertIn("source: ./backup/archive-wal.sh", compose)
+        self.assertIn("target: /usr/local/bin/morde-archive-wal", compose)
+        self.assertIn("read_only: true", compose)
+        self.assertIn("CH_POSTGRES_WAL_ARCHIVE_DIR", installer)
+        self.assertIn("'999:999:700'", installer)
+        self.assertIn("validate_postgres_wal_archive_layout \"$root_device\"", installer)
+        self.assertIn('path_overlaps "$archive_real" "$postgres_real"', installer)
+        self.assertIn('path_overlaps "$archive_real" "$workspace_real"', installer)
+        self.assertIn('[[ $archive_device != "$1" ]] || die', installer)
+
+    def test_postgres_wal_archive_script_validates_and_publishes_safely(self):
+        script = ROOT / "backup/archive-wal.sh"
+        content = script.read_text()
+        self.assertTrue(os.access(script, os.X_OK))
+        self.assertLess(content.index('sync "$tmp"'), content.index('mv --no-clobber'))
+        self.assertLess(content.index('mv --no-clobber'), content.rindex('sync "$archive_dir"'))
+        self.assertIn("cmp -s \"$source_file\" \"$destination\"", content)
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = pathlib.Path(directory)
+            postgres_root = temp_root / "postgresql"
+            pgdata = postgres_root / "data"
+            archive_dir = postgres_root / "wal-archive"
+            wal_dir = pgdata / "pg_wal"
+            wal_dir.mkdir(parents=True)
+            archive_dir.mkdir()
+            name = "000000010000000000000001"
+            source = wal_dir / name
+            source.write_bytes(b"wal bytes")
+            destination = archive_dir / name
+            command_bin = temp_root / "bin"
+            command_bin.mkdir()
+            wrappers = {
+                "cp": '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec /bin/cp "$@"\n',
+                "rm": '#!/bin/sh\n[ "$1" = "--" ] && shift\nexec /bin/rm "$@"\n',
+                "mv": (
+                    "#!/bin/sh\n"
+                    "while [ \"$#\" -gt 0 ]; do\n"
+                    "  case \"$1\" in --no-clobber|--no-target-directory|--) shift ;; *) break ;; esac\n"
+                    "done\nexec /bin/mv -n \"$@\"\n"
+                ),
+                "sync": '#!/bin/sh\nprintf "%s\\n" "$1" >> "$MORDE_TEST_SYNC_LOG"\n',
+            }
+            for name, content in wrappers.items():
+                wrapper = command_bin / name
+                wrapper.write_text(content)
+                wrapper.chmod(0o755)
+            sync_log = temp_root / "sync.log"
+            env = {
+                **os.environ,
+                "PGDATA": str(pgdata),
+                "PATH": f"{command_bin}:{os.environ['PATH']}",
+                "MORDE_TEST_SYNC_LOG": str(sync_log),
+            }
+
+            def run_archive_command(source_arg=f"pg_wal/{source.name}", archive_name=source.name):
+                return subprocess.run(
+                    [str(script), source_arg, archive_name],
+                    cwd=pgdata,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+
+            first = run_archive_command()
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(destination.read_bytes(), b"wal bytes")
+            self.assertEqual(run_archive_command().returncode, 0)
+            self.assertEqual(len(sync_log.read_text().splitlines()), 4)
+            source.write_bytes(b"different bytes")
+            conflict = run_archive_command()
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertEqual(destination.read_bytes(), b"wal bytes")
+            self.assertNotEqual(run_archive_command("pg_wal/invalid", source.name).returncode, 0)
+            self.assertNotEqual(run_archive_command("pg_wal/../outside", "../outside").returncode, 0)
+
+    def test_installer_path_overlap_guard_respects_directory_boundaries(self):
+        installer = (ROOT / "install-portal-service.sh").read_text()
+        start = installer.index("path_overlaps() {")
+        end = installer.index("\n}", start) + 2
+        function = installer[start:end]
+        cases = (
+            ("/srv/workspace", "/srv/workspace", True),
+            ("/srv/workspace", "/srv/workspace/archive", True),
+            ("/srv/workspace/archive", "/srv/workspace", True),
+            ("/srv/workspace", "/srv/workspace-old", False),
+            ("/", "/srv/workspace", True),
+        )
+        for left, right, overlaps in cases:
+            with self.subTest(left=left, right=right):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        function + '\npath_overlaps "$1" "$2"',
+                        "path-overlap",
+                        left,
+                        right,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode == 0, overlaps, result.stderr)
+
     def test_admin_bootstrap_has_no_credential_file_or_cli_user_creation(self):
         for name in (".env.example", "portal.yaml", "install-portal-service.sh", "read-env-values.py"):
             with self.subTest(name=name):
@@ -118,8 +245,8 @@ class DeploymentTests(unittest.TestCase):
         preload = policy.split("preload_network() {", 1)[1].split("\n}", 1)[0]
         apply = policy.split("apply_network() {", 1)[1].split("\n}", 1)[0]
         self.assertNotRegex(preload, r"(?m)^\s*docker\b")
-        self.assertLess(preload.index("config_preflight preload"), preload.index("install_policy_rules"))
-        self.assertLess(apply.index("config_preflight apply"), apply.index("install_policy_rules"))
+        self.assertLess(preload.index("config_preflight preload"), preload.index("apply_policy_rules"))
+        self.assertLess(apply.index("config_preflight apply"), apply.index("apply_policy_rules"))
         self.assertEqual(policy.count('cat >"$TMP_DIR/rules.nft"'), 1)
 
     def test_workspace_sync_egress_is_limited_to_the_static_relay(self):

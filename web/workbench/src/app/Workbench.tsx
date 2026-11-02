@@ -36,16 +36,17 @@ function controlActionCompleted(control: GatewayControl, action: GatewayControlA
 }
 
 export default function Workbench() {
+  const workspaceOnly = new URLSearchParams(window.location.search).get('tab') === 'workspace';
   const [host, setHost] = useState<GatewayHost | null>(null);
   const [control, setControl] = useState<GatewayControl | null>(null);
-  const [controlLoading, setControlLoading] = useState(true);
+  const [controlLoading, setControlLoading] = useState(!workspaceOnly);
   const [controlError, setControlError] = useState('');
   const [controlActionError, setControlActionError] = useState('');
   const [controlActionPending, setControlActionPending] = useState(false);
   const [controlRequest, setControlRequest] = useState<GatewayControlRequest | null>(null);
   const [pageError, setPageError] = useState('');
-  const [active, setActive] = useState<Tab>('browser');
-  const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(['browser']));
+  const [active, setActive] = useState<Tab>(() => workspaceOnly ? 'workspace' : 'browser');
+  const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(workspaceOnly ? ['workspace'] : ['browser']));
   const [browserStatus, setBrowserStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'failed'>('connecting');
   const [browserReconnect, setBrowserReconnect] = useState(0);
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
@@ -81,6 +82,7 @@ export default function Workbench() {
   }, []);
 
   useEffect(() => {
+    if (workspaceOnly) return;
     let current = true;
     gatewayApi.host()
       .then((value) => current && setHost(value))
@@ -92,9 +94,10 @@ export default function Workbench() {
     return () => {
       current = false;
     };
-  }, [applyControl]);
+  }, [applyControl, workspaceOnly]);
 
   useEffect(() => {
+    if (workspaceOnly) return;
     const transition = control?.control_state === 'taking_over' || control?.control_state === 'returning';
     const interval = (controlActionPending || (transition && !control?.active_transition?.failure_reason)) ? 1000 : 3000;
     let current = true;
@@ -111,7 +114,7 @@ export default function Workbench() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending]);
+  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, workspaceOnly]);
 
   const stopBrowserWatch = useCallback(() => {
     browserObserverRef.current?.disconnect();
@@ -430,9 +433,10 @@ export default function Workbench() {
       : control?.control_state === 'ai' ? '接管电脑'
         : control?.control_state === 'user' ? '交回 AI' : '';
   const visibleActive = active === 'vscode' && !vscodeAvailable ? 'browser' : active;
+  const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace') : primaryTabs;
   return (
     <main className="workbench-app">
-      <TopBar
+      {!workspaceOnly && <TopBar
         host={host}
         renewing={renewing}
         onRenew={renew}
@@ -444,7 +448,7 @@ export default function Workbench() {
         controlActionPending={controlActionPending}
         onControlAction={controlComputer}
         onRetryControl={reloadControl}
-      />
+      />}
       {notice && <p className={`notice${noticeKind === 'error' ? ' notice-error' : ''}`} role={noticeKind === 'error' ? 'alert' : 'status'}>{notice}</p>}
       {pageError ? (
         <section className="page-message" role="alert">
@@ -456,7 +460,7 @@ export default function Workbench() {
         <>
           <nav className="workbench-tabs" aria-label="工作台功能">
             <div className="primary-tabs">
-              {primaryTabs.map((tab) => (
+              {visibleTabs.map((tab) => (
                 <button
                   key={tab.id}
                   className={`tab-button${active === tab.id ? ' is-active' : ''}`}
@@ -580,7 +584,7 @@ export default function Workbench() {
             )}
             {loaded.has('workspace') && (
               <div className="tab-panel tab-panel-workspace" aria-hidden={visibleActive !== 'workspace'} inert={visibleActive !== 'workspace'}>
-                <WorkspaceBrowser host={host} active={visibleActive === 'workspace'} canRead={vscodeAvailable} />
+                <WorkspaceBrowser active={visibleActive === 'workspace'} />
               </div>
             )}
             {loaded.has('vscode') && (

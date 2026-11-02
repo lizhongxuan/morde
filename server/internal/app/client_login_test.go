@@ -16,10 +16,12 @@ type clientRevocationStore struct {
 	events         *[]string
 	err            error
 	loginInstallID string
+	authenticated  identity.User
 }
 
-func (s *clientRevocationStore) LoginClient(_ context.Context, installation identity.ClientInstallation, _ string, _ int64, _ bool, _, _ []byte, _, _ string,
+func (s *clientRevocationStore) LoginClient(_ context.Context, installation identity.ClientInstallation, authenticated identity.User, _ string, _ int64, _ bool, _, _ []byte, _, _ string,
 	issue func(string) (ClientIssuedTokens, error)) (identity.ClientInstallation, ClientIssuedTokens, error) {
+	s.authenticated = authenticated
 	if s.err != nil {
 		return identity.ClientInstallation{}, ClientIssuedTokens{}, s.err
 	}
@@ -154,7 +156,7 @@ func TestClientAccountPrincipalRequiresUserInstallation(t *testing.T) {
 }
 
 func TestClientLoginClosesInstallationAfterCredentialCommit(t *testing.T) {
-	credentials, _, _, _, _, _ := newCredentialFixture(t)
+	credentials, users, _, _, _, _ := newCredentialFixture(t)
 	events := []string{}
 	store := &clientRevocationStore{events: &events, loginInstallID: "i1234567"}
 	hub := &clientRevocationHub{events: &events}
@@ -169,5 +171,11 @@ func TestClientLoginClosesInstallationAfterCredentialCommit(t *testing.T) {
 	}
 	if got, want := strings.Join(events, ","), "login-commit:i1234567,hub-close:i1234567"; got != want {
 		t.Fatalf("login events = %q, want %q", got, want)
+	}
+	expectedUser := users.values["u1234567"]
+	if store.authenticated.ID != expectedUser.ID || store.authenticated.PasswordHash != expectedUser.PasswordHash ||
+		store.authenticated.Role != expectedUser.Role || store.authenticated.Status != expectedUser.Status ||
+		store.authenticated.MustChangePassword != expectedUser.MustChangePassword {
+		t.Fatalf("LoginClient() identity snapshot = %#v, want %#v", store.authenticated, expectedUser)
 	}
 }
