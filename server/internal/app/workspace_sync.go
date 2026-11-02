@@ -839,15 +839,16 @@ func (s *WorkspaceSyncService) PutSyncBlock(ctx context.Context, principal ident
 		return 0, domain.NewError(domain.CodeNotFound, "workspace sync block is not required by this session")
 	}
 	reader := body
-	if principal.Kind == identity.KindDevice {
+	switch principal.Kind {
+	case identity.KindDevice:
 		reader = reauthorizeSyncReader{reader: body, authorize: func() error {
 			return s.store.CheckWorkspaceSyncDeviceAccess(ctx, principal, workspaceID)
 		}}
-	} else if principal.Kind == identity.KindHostReplica {
+	case identity.KindHostReplica:
 		reader = authorizedSyncReader{reader: body, withAccess: func(read func() error) error {
 			return s.store.WithWorkspaceSyncHostSessionAccess(ctx, principal, workspaceID, sessionID, read)
 		}}
-	} else if principal.Kind == identity.KindSession {
+	case identity.KindSession:
 		reader = authorizedSyncReader{reader: body, withAccess: func(read func() error) error {
 			return s.store.WithWorkspaceSyncSessionAccess(ctx, principal, workspaceID, sessionID, read)
 		}}

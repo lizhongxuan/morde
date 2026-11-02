@@ -44,9 +44,10 @@ func clientLoginForTest(ctx context.Context, clients *app.ClientLoginService, na
 	generation := clientLoginTestSequence.values[sequenceKey]
 	clientLoginTestSequence.Unlock()
 	instanceID := "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
-	if platform == "ios" {
+	switch platform {
+	case "ios":
 		instanceID = "8f0de095-66ba-49c6-a87b-0c527f4f81a1"
-	} else if platform == "android" {
+	case "android":
 		instanceID = "7f0de095-66ba-49c6-a87b-0c527f4f81a1"
 	}
 	return clients.Login(ctx, name, password, platform, displayName, renewalID, key, ip,
@@ -828,5 +829,44 @@ func TestClientLoginMigrationRetiresLegacyPairingAndCredentials(t *testing.T) {
 	token, err := store.GetTokenByID(ctx, legacy.ID)
 	if err != nil || token.RevokedAt == nil {
 		t.Fatalf("old Client credential = %#v, %v", token, err)
+	}
+}
+
+func TestRenameClientInstallationRequiresOwnerAndActiveInstallation(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	other := createTestUser(t, store, 3, 20_000, 40_000)
+	activeID := createTestClientInstallation(t, pool, owner.ID, nil)
+
+	if err := store.RenameClientInstallation(ctx, owner.ID, activeID, "renamed desktop"); err != nil {
+		t.Fatalf("rename active installation: %v", err)
+	}
+	active, err := store.GetClientInstallation(ctx, activeID)
+	if err != nil || active.DisplayName != "renamed desktop" {
+		t.Fatalf("renamed installation = %#v, %v", active, err)
+	}
+	if err := store.RenameClientInstallation(ctx, other.ID, activeID, "wrong owner"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("wrong owner rename error = %v, want not found", err)
+	}
+	active, err = store.GetClientInstallation(ctx, activeID)
+	if err != nil || active.DisplayName != "renamed desktop" {
+		t.Fatalf("wrong owner changed installation = %#v, %v", active, err)
+	}
+
+	revokedID := createTestClientInstallation(t, pool, owner.ID, nil)
+	if _, err := pool.Exec(ctx, `UPDATE client_installations SET revoked_at=now() WHERE id=$1`, revokedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RenameClientInstallation(ctx, owner.ID, revokedID, "revoked rename"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked installation rename error = %v, want not found", err)
+	}
+
+	expiredID := createTestClientInstallation(t, pool, owner.ID, nil)
+	if _, err := pool.Exec(ctx, `UPDATE client_installations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, expiredID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RenameClientInstallation(ctx, owner.ID, expiredID, "expired rename"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("expired installation rename error = %v, want not found", err)
 	}
 }

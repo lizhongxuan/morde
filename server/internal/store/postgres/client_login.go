@@ -298,6 +298,19 @@ func (s *Store) GetClientInstallation(ctx context.Context, id string) (identity.
   COALESCE(expires_at,created_at),created_at,last_used_at,revoked_at FROM client_installations WHERE id=$1`, id))
 }
 
+func (s *Store) RenameClientInstallation(ctx context.Context, ownerID, id, displayName string) error {
+	updated, err := s.q.RenameClientInstallation(ctx, sqlcgen.RenameClientInstallationParams{
+		DisplayName: displayName, InstallationID: id, OwnerID: ownerID,
+	})
+	if err != nil {
+		return fmt.Errorf("rename client installation: %w", err)
+	}
+	if updated != 1 {
+		return domain.NewError(domain.CodeNotFound, "device not found")
+	}
+	return nil
+}
+
 func (s *Store) RevokeClientInstallation(ctx context.Context, id, ownerID, ip string, actorKind audit.ActorKind, disableRelay func(context.Context) error) error {
 	if actorKind != audit.ActorSession && actorKind != audit.ActorClient {
 		return domain.InvalidArgument("actor_kind", "client revocation actor is invalid")

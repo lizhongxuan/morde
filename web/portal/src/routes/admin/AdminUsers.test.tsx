@@ -26,9 +26,12 @@ function userRecord(id: string, name: string, role: AdminUser['role'], status: A
 
 function setup(records: AdminUser[]) {
   const rows = [...records];
-  const list = vi.spyOn(portalApi, 'adminUsers').mockImplementation(async (status) => ({
-    items: rows.filter((item) => status === undefined || item.status === status),
-  }));
+  const list = vi.spyOn(portalApi, 'adminUsers').mockImplementation(async (status, offset = 0) => {
+    const filtered = rows.filter((item) => status === undefined || item.status === status);
+    return {
+      items: filtered.slice(offset, offset + 50), total: filtered.length, limit: 50, offset,
+    };
+  });
   const update = vi.spyOn(portalApi, 'updateUser').mockImplementation(async (id, body) => {
     const index = rows.findIndex((item) => item.id === id);
     const current = rows[index];
@@ -60,7 +63,7 @@ describe('admin account management', () => {
     expect(within(protectedRow).queryByRole('button')).not.toBeInTheDocument();
     await input.selectOptions(screen.getByLabelText('账号状态'), 'pending');
     expect(await screen.findByRole('row', { name: /alice.*待审核/ })).toBeInTheDocument();
-    expect(list).toHaveBeenLastCalledWith('pending');
+    expect(list).toHaveBeenLastCalledWith('pending', 0);
     const currentRow = screen.getByRole('row', { name: /alice.*待审核/ });
     expect(within(currentRow).getByRole('button', { name: '通过审核' })).toBeInTheDocument();
   });

@@ -32,11 +32,22 @@ func (h *api) capabilities(c *gin.Context) {
 	_, clientVerifier := h.deps.Verifier.(interface {
 		VerifyClient(context.Context, string) (identity.Principal, error)
 	})
+	var hubVersion *string
 	if h.deps.ClientLogin != nil && clientVerifier {
 		features = append(features, "ordered_client_login", "client_installations")
 	}
+	if h.deps.Hub != nil && clientVerifier {
+		version := "1"
+		hubVersion = &version
+	}
 	if h.deps.ModelConnections != nil && clientVerifier {
 		features = append(features, "available_models")
+	}
+	if hubVersion != nil {
+		features = append(features, "hub")
+	}
+	if h.deps.PersonalData != nil && h.deps.PersonalSync != nil && clientVerifier {
+		features = append(features, "personal_sync")
 	}
 	if h.deps.ModelGateway != nil && clientVerifier {
 		features = append(features, "model_gateway")
@@ -51,6 +62,7 @@ func (h *api) capabilities(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, capabilitiesResponse{
 		ServiceInstanceID: h.options.ServiceInstanceID,
-		APIVersion:        "1", SupportedFeatures: features, DefaultMaxRequestBytes: h.options.APIMaxBodyBytes,
+		APIVersion:        "1", HubVersion: hubVersion, SupportedFeatures: features,
+		DefaultMaxRequestBytes: h.options.APIMaxBodyBytes,
 	})
 }

@@ -295,6 +295,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model usage admin: %w", err)
 	}
+	adminConsole, err := app.NewAdminConsoleService(store)
+	if err != nil {
+		return fmt.Errorf("initialize admin console: %w", err)
+	}
 	aioClient := aio.New(nil)
 	volumes, err := newVolumeDeleter(cfg.Storage)
 	if err != nil {
@@ -416,10 +420,15 @@ func serve(ctx context.Context, configPath string) error {
 			return fmt.Errorf("configure Workspace sync node observer: %w", err)
 		}
 	}
-	credentials, err := app.NewCredentialService(store, store, store, countedAudit, app.CredentialOptions{
+	hubService, err := app.NewHubService(store)
+	if err != nil {
+		return err
+	}
+	defer hubService.Close()
+	credentials, err := app.NewCredentialServiceWithHub(store, store, store, countedAudit, app.CredentialOptions{
 		SessionTTL: cfg.Security.SessionTTL, TicketTTL: cfg.Security.TicketTTL,
 		LoginLimit: loginLimit(cfg.Security.LoginRateLimit), LoginWindow: time.Minute,
-	}, hosts, workspaceSyncNodeOwnerReconciler)
+	}, hosts, hubService, workspaceSyncNodeOwnerReconciler)
 	if err != nil {
 		return err
 	}
@@ -452,7 +461,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err := workspaceSync.ReconcilePendingWorkspaceCurrentMaterializations(ctx); err != nil {
 		return fmt.Errorf("reconcile Workspace current-file materializations before serving: %w", err)
 	}
-	users, err := app.NewUserService(store, store, workspaceSyncNodeOwnerReconciler)
+	users, err := app.NewUserServiceWithHub(store, store, hubService, workspaceSyncNodeOwnerReconciler)
 	if err != nil {
 		return err
 	}
@@ -472,9 +481,33 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	clientLogin, err := app.NewClientLoginService(store, credentials, workspaceSyncNodeOwnerReconciler)
+	clientLogin, err := app.NewClientLoginService(store, credentials, workspaceSyncNodeOwnerReconciler, hubService)
 	if err != nil {
 		return err
+	}
+	deviceService, err := app.NewDeviceService(clientLogin, store, hubService)
+	if err != nil {
+		return err
+	}
+	personalDataService, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		return err
+	}
+	personalSyncService, err := app.NewPersonalSyncService(store, dataKey)
+	if err != nil {
+		return err
+	}
+	personalDataQuotaService, err := app.NewPersonalDataQuotaService(store)
+	if err != nil {
+		return fmt.Errorf("initialize personal data quota service: %w", err)
+	}
+	personalAttachmentService, err := app.NewPersonalAttachmentService(store, personalDataQuotaService)
+	if err != nil {
+		return fmt.Errorf("initialize personal attachment service: %w", err)
+	}
+	personalHistoryImportService, err := app.NewPersonalHistoryImportService(store)
+	if err != nil {
+		return fmt.Errorf("initialize personal history import service: %w", err)
 	}
 	notificationService, err := app.NewNotificationService(store)
 	if err != nil {
@@ -500,7 +533,7 @@ func serve(ctx context.Context, configPath string) error {
 			return err
 		}
 		taskWorker, err = newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
-			modelGateway, sealer, mcpConnectors, workerSuffix, logger)
+			modelGateway, sealer, mcpConnectors, hubService, workerSuffix, logger)
 		if err != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", err)
 		}
@@ -542,8 +575,12 @@ func serve(ctx context.Context, configPath string) error {
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
-		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin, Onboarding: onboardingService, Admin: admin, AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
-		Readiness: readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
+		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
+		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
+		PersonalDataQuota: personalDataQuotaService, PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
+		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
+		AdminAudit: auditService,
+		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
 	}, api.Options{
 		Logger: logger, Metrics: registry, ServiceInstanceID: serviceInstanceID, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
@@ -587,12 +624,43 @@ func serve(ctx context.Context, configPath string) error {
 	gatewayServer := httpserver.NewServer(cfg.Listen.Gateway, gatewayHandler, cfg.HTTP)
 	metricsServer := httpserver.NewServer(cfg.Listen.Metrics, metricsHandler(registry), cfg.HTTP)
 	logger.Info("portal starting", zap.String("instance", cfg.Instance), zap.Int64("migration_version", migrationVersion), zap.String("api", cfg.Listen.API), zap.String("gateway", cfg.Listen.Gateway), zap.String("metrics", cfg.Listen.Metrics))
+	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
+	defer stopPersonalCleanup()
+	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, logger)
 	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+}
+
+func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService, logger *zap.Logger) {
+	const (
+		batchLimit int32 = 1000
+		interval         = time.Minute
+		timeout          = 30 * time.Second
+	)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(ctx, timeout)
+		if _, err := attachments.CleanupExpiredPersonalAttachmentUploads(cleanupCtx, time.Now().UTC(), batchLimit); err != nil && logger != nil {
+			logger.Warn("personal attachment cleanup failed", zap.Error(err))
+		}
+		if _, err := quota.CleanupExpiredPersonalDataQuotaReservations(cleanupCtx, time.Now().UTC(), batchLimit); err != nil && logger != nil {
+			logger.Warn("orphan personal data quota reservation cleanup failed", zap.Error(err))
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
 	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
-	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
+	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, hubService *app.HubService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -634,7 +702,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	tools, err := app.NewCloudDSHToolBroker(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient())
+	tools, err := app.NewCloudDSHToolBroker(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(), hubService)
 	if err != nil {
 		return nil, err
 	}

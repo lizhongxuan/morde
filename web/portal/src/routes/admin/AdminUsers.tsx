@@ -30,9 +30,10 @@ export function AdminUsers() {
   const { user: current } = useAuth();
   const { notify } = useToast();
   const [filter, setFilter] = useState<AccountStatus | 'all'>('all');
+  const [offset, setOffset] = useState(0);
   const query = useQuery({
-    queryKey: ['admin', 'users', filter],
-    queryFn: () => portalApi.adminUsers(filter === 'all' ? undefined : filter),
+    queryKey: ['admin', 'users', filter, offset],
+    queryFn: () => portalApi.adminUsers(filter === 'all' ? undefined : filter, offset),
   });
   const update = useMutation({
     mutationFn: ({ id, body }: { id: string; body: { expected_status: AccountStatus; status?: AccountStatus; role?: 'user' | 'admin' } }) => portalApi.updateUser(id, body),
@@ -56,7 +57,7 @@ export function AdminUsers() {
     <div className="page-heading"><div><p className="eyebrow">账号与权限</p><h1>用户</h1><p className="muted">审核注册申请，管理已通过账号的使用状态和管理员权限。</p></div></div>
     <div className="device-manager-actions">
       <label htmlFor="user-status-filter">账号状态</label>
-      <select id="user-status-filter" value={filter} onChange={(event) => setFilter(event.target.value as AccountStatus | 'all')}>
+      <select id="user-status-filter" value={filter} onChange={(event) => { setFilter(event.target.value as AccountStatus | 'all'); setOffset(0); }}>
         <option value="all">全部状态</option>
         {Object.entries(statusLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
       </select>
@@ -83,6 +84,11 @@ export function AdminUsers() {
       })}
     </tbody></table></div>
     {query.isSuccess && !query.data.items.length && <div className="empty-card compact"><p>当前筛选下没有用户。</p></div>}
+    {query.isSuccess && query.data.total > 0 && <nav className="admin-pagination" aria-label="用户列表分页">
+      <span>显示 {offset + 1}–{Math.min(offset + query.data.items.length, query.data.total)} / {query.data.total}</span>
+      <div className="inline-actions"><button className="button button-secondary button-small" type="button" disabled={offset === 0 || query.isFetching} onClick={() => setOffset(Math.max(0, offset - query.data.limit))}>上一页</button>
+        <button className="button button-secondary button-small" type="button" disabled={offset + query.data.items.length >= query.data.total || query.isFetching} onClick={() => setOffset(offset + query.data.limit)}>下一页</button></div>
+    </nav>}
     {query.isPending && <div className="loading-card">正在加载用户…</div>}
     {query.isError && <div className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></div>}
   </section>;

@@ -91,8 +91,6 @@ export default function Workbench() {
     };
   }, [applyControl]);
 
-  const hasControl = control !== null;
-
   useEffect(() => {
     const transition = control?.control_state === 'taking_over' || control?.control_state === 'returning';
     const interval = (controlActionPending || (transition && !control?.active_transition?.failure_reason)) ? 1000 : 3000;
@@ -102,7 +100,7 @@ export default function Workbench() {
         const value = await gatewayApi.control();
         if (current) applyControl(value);
       } catch (error) {
-        if (current && !hasControl) setControlError(messageOf(error));
+        if (current) setControlError(messageOf(error));
       }
     };
     const timer = window.setInterval(() => void refresh(), interval);
@@ -110,7 +108,7 @@ export default function Workbench() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, hasControl]);
+  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending]);
 
   const stopBrowserWatch = useCallback(() => {
     browserObserverRef.current?.disconnect();
@@ -420,7 +418,7 @@ export default function Workbench() {
     request_id: failedTransition.request_id,
     expected_control_version: failedTransition.expected_control_version,
   } : null);
-  const controlActionLabel = controlActionPending && controlRequest
+  const controlActionLabel = controlError ? '' : controlActionPending && controlRequest
     ? controlRequest.action === 'take_over' ? '接管中…' : '交回中…'
     : (controlActionError || failedTransition) && retryControlRequest
       ? retryControlRequest.action === 'take_over' ? '重试接管' : '重试交回 AI'
@@ -558,7 +556,7 @@ export default function Workbench() {
                 ) : terminalAvailable && terminalSession?.state === 'creating' ? (
                   <p className="panel-loading" role="status">终端正在创建，确认就绪后会自动连接…</p>
                 ) : controlError ? (
-                  <p className="panel-error" role="alert">{controlError}</p>
+                  <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
                 ) : terminalAvailable ? (
                   <p className="panel-loading" role="status">正在连接终端…</p>
                 ) : (
@@ -570,14 +568,18 @@ export default function Workbench() {
               <div className="tab-panel tab-panel-files" aria-hidden={visibleActive !== 'files'} inert={visibleActive !== 'files'}>
                 {vscodeAvailable
                   ? <FileManager />
-                  : <p className="panel-loading" role="status">请先接管电脑后使用文件。</p>}
+                  : controlError
+                    ? <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
+                    : <p className="panel-loading" role="status">请先接管电脑后使用文件。</p>}
               </div>
             )}
             {loaded.has('vscode') && (
               <div className="tab-panel tab-panel-vscode" aria-hidden={visibleActive !== 'vscode'} inert={visibleActive !== 'vscode'}>
                 {vscodeAvailable
                   ? <iframe title="VSCode" src="/code-server/" />
-                  : <p className="panel-loading" role="status">请先接管电脑后使用 VSCode。</p>}
+                  : controlError
+                    ? <p className="panel-error" role="alert">控制状态暂不可用：{controlError}</p>
+                    : <p className="panel-loading" role="status">请先接管电脑后使用 VSCode。</p>}
               </div>
             )}
           </div>

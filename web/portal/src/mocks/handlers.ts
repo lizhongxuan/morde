@@ -2,7 +2,7 @@ import { http, HttpResponse } from "msw";
 import type { components } from "../api/schema";
 import type { HostMemberPermission } from "../app/api";
 
-type User = { id: string; name: string; role: components["schemas"]["UserRole"]; status: components["schemas"]["AccountStatus"]; must_change_password: boolean; quota: { hosts: number; cpu_milli: number; mem_mib: number }; usage: { hosts: number; cpu_milli: number; mem_mib: number }; default_host_resources: { cpu_milli: number; mem_mib: number } };
+type User = { id: string; name: string; role: components["schemas"]["UserRole"]; status: components["schemas"]["AccountStatus"]; must_change_password: boolean; quota: { hosts: number; cpu_milli: number; mem_mib: number }; usage: { hosts: number; cpu_milli: number; mem_mib: number }; default_host_resources: { cpu_milli: number; mem_mib: number }; created_at?: string };
 type AuditLog = { id: number; at: string; actor_id: string; actor_kind: string; action: string; target: string; detail: Record<string, unknown>; ip: string };
 type Workspace = components["schemas"]["Workspace"];
 type WorkspaceRef = components["schemas"]["WorkspaceRef"];
@@ -21,6 +21,8 @@ type Notification = components["schemas"]["Notification"];
 type ClientInstallation = components["schemas"]["ClientInstallation"];
 type AdminWorkspace = components["schemas"]["AdminWorkspace"];
 type VisibleAdminWorkspace = Omit<Workspace, "state"> & { state: "ready" | "deleting" };
+type ModelAccountBudget = { owner_id: string; configured: boolean; token_limit: number; max_concurrent: number; used_tokens: number; in_flight: number; has_unknown: boolean };
+type PersonalDataQuota = components["schemas"]["AdminPersonalDataQuota"];
 
 const defaultHostResources = { cpu_milli: 1000, mem_mib: 2048 };
 const demoUser: User = { id: "u1a2b3c4", name: "demo", role: "admin", status: "approved", must_change_password: false, quota: { hosts: 1, cpu_milli: 4000, mem_mib: 8192 }, usage: { hosts: 0, cpu_milli: 0, mem_mib: 0 }, default_host_resources: defaultHostResources };
@@ -49,6 +51,8 @@ let userPreferences = new Map<string, UserPreferences>();
 let notifications: Notification[] = [];
 let clients: ClientInstallation[] = [];
 const clientOwners = new Map<string, string>();
+const modelBudgets = new Map<string, ModelAccountBudget>();
+const personalDataQuotas = new Map<string, PersonalDataQuota>();
 let notificationOwners = new Map<string, string>();
 const workspaceCreateReplays = new Map<string, { request: string; response: Workspace }>();
 const hostCreateReplays = new Map<string, { request: string; response: Host }>();
@@ -229,6 +233,8 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   clients = [{ id: "cli_demo01", platform: "desktop", display_name: "Morde 演示电脑", expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(), revoked: false, created_at: now(), last_used_at: null } as ClientInstallation];
   clientOwners.clear();
   clientOwners.set(clients[0]!.id, demoUser.id);
+  modelBudgets.clear();
+  personalDataQuotas.clear();
   notificationOwners = new Map();
   workspaceCreateReplays.clear();
   hostCreateReplays.clear();
@@ -482,6 +488,20 @@ function ensureMockDefaultHost(user: User) {
 
 function userWithUsage(user: User) {
   return { ...user, usage: usageFor(user.id) };
+}
+
+function recordMockAudit(actor: User, action: string, target: string, detail: Record<string, unknown>) {
+  auditLogs.unshift({ id: Date.now(), at: now(), actor_id: actor.id, actor_kind: "user", action, target, detail, ip: "127.0.0.1" });
+}
+
+function adminPage(request: Request, defaultLimit = 25) {
+  const query = new URL(request.url).searchParams;
+  const limits = query.getAll("limit");
+  const offsets = query.getAll("offset");
+  const limit = limits.length ? Number(limits[0]) : defaultLimit;
+  const offset = offsets.length ? Number(offsets[0]) : 0;
+  return limits.length > 1 || offsets.length > 1 || !Number.isInteger(limit) || limit < 1 || limit > 100 ||
+    !Number.isInteger(offset) || offset < 0 || offset > 1_000_000 ? null : { limit, offset };
 }
 
 function capacityUsage() {
@@ -1082,23 +1102,59 @@ export const handlers = [
     return json(task);
   }),
   http.get("/api/model-connections", () => json({ items: modelConnections })),
-  http.post("/api/model-connections", async ({ request }) => {
+  http.post("/api/model-connections", async ({ request, cookies }) => {
     const body = await request.json().catch(() => null) as components["schemas"]["CreateModelConnectionRequest"] | null;
     if (!body || !body.name?.trim() || !body.model_name?.trim() || !body.api_key?.trim()) return failure("invalid_argument", "模型连接信息不完整", 400);
+    const actor = sessionUser(cookies)!;
+    if (body.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
     let parsedURL: URL;
     try { parsedURL = new URL(body.base_url); } catch { return failure("invalid_argument", "服务地址无效", 400); }
     if (parsedURL.protocol !== "https:") return failure("invalid_argument", "服务地址必须使用 HTTPS", 400);
     const timestamp = now();
-    const connection: ModelConnection = { id: id("p"), name: body.name.trim(), base_url: body.base_url, model_name: body.model_name.trim(), shared: false, has_api_key: true, capabilities: { text: true, tools: false, vision: false }, checked_at: null, created_at: timestamp, updated_at: timestamp };
+    const connection: ModelConnection = { id: id("p"), name: body.name.trim(), base_url: body.base_url, model_name: body.model_name.trim(), shared: body.shared, has_api_key: true, capabilities: { text: false, tools: false, vision: false }, checked_at: null, created_at: timestamp, updated_at: timestamp };
     modelConnections.unshift(connection);
+    if (connection.shared) recordMockAudit(actor, "model.connection.create", connection.id, { shared: true, model_name: connection.model_name, base_host: parsedURL.hostname, has_api_key: true });
     return json(connection, 201);
   }),
-  http.post("/api/model-connections/:connectionID/check", ({ params }) => {
+  http.put("/api/model-connections/:connectionID", async ({ params, request, cookies }) => {
     const connection = modelConnections.find((item) => item.id === String(params.connectionID));
     if (!connection) return failure("not_found", "模型连接不存在", 404);
+    const actor = sessionUser(cookies)!;
+    if (connection.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const body = await request.json().catch(() => null) as components["schemas"]["UpdateModelConnectionRequest"] | null;
+    if (!body || !body.name.trim() || !body.model_name.trim()) return failure("invalid_argument", "模型连接信息不完整", 400);
+    let parsedURL: URL;
+    try { parsedURL = new URL(body.base_url); } catch { return failure("invalid_argument", "服务地址无效", 400); }
+    if (parsedURL.protocol !== "https:") return failure("invalid_argument", "服务地址必须使用 HTTPS", 400);
+    connection.name = body.name.trim();
+    connection.base_url = body.base_url;
+    connection.model_name = body.model_name.trim();
+    connection.has_api_key ||= Boolean(body.api_key?.trim());
+    connection.checked_at = null;
+    connection.capabilities = { text: false, tools: false, vision: false };
+    connection.updated_at = now();
+    if (connection.shared) recordMockAudit(actor, "model.connection.update", connection.id, { shared: true, model_name: connection.model_name, base_host: parsedURL.hostname, has_api_key: connection.has_api_key, api_key_replaced: Boolean(body.api_key?.trim()) });
+    return json(connection);
+  }),
+  http.delete("/api/model-connections/:connectionID", ({ params, cookies }) => {
+    const index = modelConnections.findIndex((item) => item.id === String(params.connectionID));
+    if (index < 0) return failure("not_found", "模型连接不存在", 404);
+    const connection = modelConnections[index]!;
+    const actor = sessionUser(cookies)!;
+    if (connection.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    modelConnections.splice(index, 1);
+    if (connection.shared) recordMockAudit(actor, "model.connection.delete", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname });
+    return empty();
+  }),
+  http.post("/api/model-connections/:connectionID/check", ({ params, cookies }) => {
+    const connection = modelConnections.find((item) => item.id === String(params.connectionID));
+    if (!connection) return failure("not_found", "模型连接不存在", 404);
+    const actor = sessionUser(cookies)!;
+    if (connection.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
     connection.capabilities = { text: true, tools: true, vision: false };
     connection.checked_at = now();
     connection.updated_at = now();
+    if (connection.shared) recordMockAudit(actor, "model.connection.check", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname, capabilities: connection.capabilities });
     return json(connection.capabilities);
   }),
   http.get("/api/notifications", ({ request, cookies }) => {
@@ -1185,12 +1241,149 @@ export const handlers = [
     const workspace = workspaces.filter(isVisibleAdminWorkspace).find((item) => item.id === String(params.workspaceId));
     return workspace ? json(adminWorkspaceView(workspace)) : failure("not_found", "工作区不存在", 404);
   }),
+  http.get("/api/admin/overview", ({ cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const usage = capacityUsage();
+    return json({ checked_at: now(), health: { ready: true }, online_installations: 0,
+      limit: { hosts: 100, ...capacityLimit }, allocated: { hosts: hosts.filter(occupiesResources).length, ...usage },
+      hosts_by_state: hostsByState(), agents_by_state: {} });
+  }),
+  http.get("/api/admin/model-connections", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({ items: modelConnections.filter((item) => item.shared) });
+  }),
+  http.get("/api/admin/usage", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const query = new URL(request.url).searchParams;
+    const values = query.getAll("days");
+    const days = Number(values[0] ?? 7);
+    if (values.length > 1 || ![7, 30, 90].includes(days)) return failure("invalid_argument", "统计区间必须为 7、30 或 90 天", 400);
+    const to = now();
+    const from = new Date(Date.now() - days * 86_400_000).toISOString();
+    return json({ days, from, to, summary: { calls: 0, settled_calls: 0, unknown_calls: 0, input_tokens: 0, output_tokens: 0, active_accounts: 0 }, by_day: [], by_model: [] });
+  }),
+  http.get("/api/admin/stats", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const counts = { total: users.length, approved: 0, pending: 0, rejected: 0, disabled: 0 };
+    for (const user of users) counts[user.status]++;
+    const platforms = new Map<string, { installations: number; active_installations: number; users: Set<string> }>();
+    const currentTime = Date.now();
+    for (const client of clients) {
+      const values = platforms.get(client.platform) ?? { installations: 0, active_installations: 0, users: new Set<string>() };
+      values.installations++;
+      if (!client.revoked && Date.parse(client.expires_at) > currentTime && client.last_used_at && Date.parse(client.last_used_at) >= currentTime - 30 * 86_400_000) values.active_installations++;
+      const ownerID = clientOwners.get(client.id);
+      if (ownerID) values.users.add(ownerID);
+      platforms.set(client.platform, values);
+    }
+    return json({ users: counts, platforms: Array.from(platforms, ([platform, values]) => ({ platform, installations: values.installations, active_installations: values.active_installations, users: values.users.size })), cohorts: [], version_tracking_available: false });
+  }),
   http.get("/api/admin/users", ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
     if (!isAdmin(user)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const page = adminPage(request, 50);
+    if (!page) return failure("invalid_argument", "分页参数无效", 400);
     const requested = new URL(request.url).searchParams.getAll("status");
     if (requested.length > 1 || (requested.length === 1 && !validAccountStatus(requested[0]!))) return failure("invalid_argument", "账号状态无效", 400);
-    return json({ items: users.filter((item) => !requested.length || item.status === requested[0]).map(userWithUsage) });
+    const filtered = users.filter((item) => !requested.length || item.status === requested[0]);
+    return json({ items: filtered.slice(page.offset, page.offset + page.limit).map((item) => ({ ...userWithUsage(item), created_at: item.created_at ?? now() })), total: filtered.length, ...page });
+  }),
+  http.get("/api/admin/users/:userId", ({ params, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const user = users.find((item) => item.id === String(params.userId));
+    return user ? json({ ...userWithUsage(user), created_at: user.created_at ?? now() }) : failure("not_found", "用户不存在", 404);
+  }),
+  http.get("/api/admin/users/:userId/installations", ({ params, request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const page = adminPage(request);
+    if (!page) return failure("invalid_argument", "分页参数无效", 400);
+    const owned = clients.filter((client) => clientOwners.get(client.id) === String(params.userId));
+    const items = owned.slice(page.offset, page.offset + page.limit).map((client) => ({ id: client.id, display_name: client.display_name, platform: client.platform,
+      created_at: client.created_at, last_used_at: client.last_used_at, expires_at: client.expires_at, revoked_at: null, online: false }));
+    return json({ items, total: owned.length, ...page });
+  }),
+  http.get("/api/admin/users/:userId/authorizations", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const page = adminPage(request);
+    if (!page) return failure("invalid_argument", "分页参数无效", 400);
+    return json({ items: [], total: 0, ...page });
+  }),
+  http.get("/api/admin/users/:userId/model-usage/ledger", ({ request, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const page = adminPage(request);
+    if (!page) return failure("invalid_argument", "分页参数无效", 400);
+    return json({ items: [], total: 0, ...page });
+  }),
+  http.get("/api/admin/users/:userId/model-usage-budget", ({ params, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!users.some((user) => user.id === String(params.userId))) return failure("not_found", "用户不存在", 404);
+    return json(modelBudgets.get(String(params.userId)) ?? { owner_id: String(params.userId), configured: false, token_limit: 0, max_concurrent: 0, used_tokens: 0, in_flight: 0, has_unknown: false });
+  }),
+  http.put("/api/admin/users/:userId/model-usage-budget", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    const body = await request.json().catch(() => null) as { token_limit?: unknown; max_concurrent?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.token_limit) || Number(body.token_limit) < 1 || !Number.isInteger(body.max_concurrent) || Number(body.max_concurrent) < 1 || Number(body.max_concurrent) > 100) return failure("invalid_argument", "平台模型预算无效", 400);
+    const budget: ModelAccountBudget = { owner_id: ownerID, configured: true, token_limit: Number(body.token_limit), max_concurrent: Number(body.max_concurrent), used_tokens: 0, in_flight: 0, has_unknown: false };
+    modelBudgets.set(ownerID, budget);
+    recordMockAudit(actor, "model.usage.budget.update", ownerID, { token_limit: budget.token_limit, max_concurrent: budget.max_concurrent });
+    return json(budget);
+  }),
+  http.get("/api/admin/users/:userId/personal-data-quota", ({ params, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    const existing = personalDataQuotas.get(ownerID);
+    return json(existing ?? {
+      used_bytes: 0,
+      reserved_bytes: 0,
+      quota_bytes: 5 * 1024 ** 3,
+      max_attachment_bytes: 300 * 1024 ** 2,
+      version: 1,
+      default_quota_bytes: 5 * 1024 ** 3,
+      default_max_attachment_bytes: 300 * 1024 ** 2,
+    });
+  }),
+  http.patch("/api/admin/users/:userId/personal-data-quota", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const ownerID = String(params.userId);
+    if (!users.some((user) => user.id === ownerID)) return failure("not_found", "用户不存在", 404);
+    const current = personalDataQuotas.get(ownerID) ?? {
+      used_bytes: 0,
+      reserved_bytes: 0,
+      quota_bytes: 5 * 1024 ** 3,
+      max_attachment_bytes: 300 * 1024 ** 2,
+      version: 1,
+      default_quota_bytes: 5 * 1024 ** 3,
+      default_max_attachment_bytes: 300 * 1024 ** 2,
+    };
+    const body = await request.json().catch(() => null) as { expected_version?: unknown; quota_bytes?: unknown; max_attachment_bytes?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.expected_version) || !Number.isSafeInteger(body.quota_bytes) || Number(body.quota_bytes) < 1 ||
+      !Number.isSafeInteger(body.max_attachment_bytes) || Number(body.max_attachment_bytes) < 1 || Number(body.max_attachment_bytes) > 9007199250546688) {
+      return failure("invalid_argument", "个人数据额度无效", 400);
+    }
+    if (Number(body.expected_version) !== current.version) return failure("conflict", "个人数据额度版本已变化，请刷新后重试", 409);
+    const updated: PersonalDataQuota = {
+      ...current,
+      quota_bytes: Number(body.quota_bytes),
+      max_attachment_bytes: Number(body.max_attachment_bytes),
+      version: current.version + 1,
+    };
+    personalDataQuotas.set(ownerID, updated);
+    recordMockAudit(actor, "personal_data.quota.update", ownerID, {
+      quota_bytes: updated.quota_bytes,
+      max_attachment_bytes: updated.max_attachment_bytes,
+      version: updated.version,
+    });
+    return json(updated);
+  }),
+  http.get("/api/admin/model-usage/unknown", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({ items: [] });
   }),
   http.patch("/api/admin/users/:userId", async ({ params, request, cookies }) => {
     const actor = sessionUser(cookies)!;

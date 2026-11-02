@@ -28,12 +28,20 @@ function renderPage() {
   </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
+function mockUserDetails() {
+  vi.spyOn(portalApi, 'adminUser').mockResolvedValue(user);
+  vi.spyOn(portalApi, 'adminUserInstallations').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
+  vi.spyOn(portalApi, 'adminUserAuthorizations').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
+  vi.spyOn(portalApi, 'adminUserModelCalls').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
+  vi.spyOn(portalApi, 'audit').mockResolvedValue({ items: [] });
+}
+
 describe('admin model usage reconciliation', () => {
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
   it('lists only after opening and records provider-verified counts with evidence', async () => {
     const input = userEvent.setup();
-    vi.spyOn(portalApi, 'adminUsers').mockResolvedValue({ items: [user] });
+    mockUserDetails();
     vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'adminWorkspaces').mockResolvedValue({ items: [], next_cursor: null });
     vi.spyOn(portalApi, 'adminModelAccountBudget').mockResolvedValue({ owner_id: user.id, configured: true, token_limit: 5000, max_concurrent: 2, used_tokens: 0, in_flight: 0, has_unknown: false });
@@ -62,7 +70,7 @@ describe('admin model usage reconciliation', () => {
 
   it('lets an administrator update the token and concurrency limits', async () => {
     const input = userEvent.setup();
-    vi.spyOn(portalApi, 'adminUsers').mockResolvedValue({ items: [user] });
+    mockUserDetails();
     vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'adminWorkspaces').mockResolvedValue({ items: [], next_cursor: null });
     vi.spyOn(portalApi, 'adminModelAccountBudget').mockResolvedValue({ owner_id: user.id, configured: true, token_limit: 5000, max_concurrent: 2, used_tokens: 120, in_flight: 1, has_unknown: true });

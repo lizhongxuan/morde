@@ -30,6 +30,35 @@ type AccountAgentRuntime struct {
 	GuardianStopAcknowledgedAt    pgtype.Timestamptz `json:"guardian_stop_acknowledged_at"`
 }
 
+type AccountChangeCounter struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	LastSequence      int64              `json:"last_sequence"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AccountChangeLog struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ChangeSequence    int64              `json:"change_sequence"`
+	ObjectType        string             `json:"object_type"`
+	ObjectID          string             `json:"object_id"`
+	Revision          int64              `json:"revision"`
+	Operation         string             `json:"operation"`
+	MutationID        pgtype.Text        `json:"mutation_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type AccountObjectVersion struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ObjectType        string             `json:"object_type"`
+	ObjectID          string             `json:"object_id"`
+	Revision          int64              `json:"revision"`
+	IsDeleted         bool               `json:"is_deleted"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type AuditLog struct {
 	ID        int64              `json:"id"`
 	At        pgtype.Timestamptz `json:"at"`
@@ -399,6 +428,28 @@ type OwnerExecutionControl struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type PersonalMutationReceipt struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	MutationID        string             `json:"mutation_id"`
+	RequestHash       []byte             `json:"request_hash"`
+	ObjectType        string             `json:"object_type"`
+	ObjectID          string             `json:"object_id"`
+	ResultRevision    int64              `json:"result_revision"`
+	ChangeSequence    int64              `json:"change_sequence"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type PersonalObject struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ObjectType        string             `json:"object_type"`
+	ObjectID          string             `json:"object_id"`
+	Body              []byte             `json:"body"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RetiredInstantChatConversation struct {
 	ID        string             `json:"id"`
 	OwnerID   string             `json:"owner_id"`
@@ -632,6 +683,17 @@ type TaskArtifact struct {
 	WorkspaceRevision pgtype.Int8        `json:"workspace_revision"`
 	SizeBytes         pgtype.Int8        `json:"size_bytes"`
 	Sha256            pgtype.Text        `json:"sha256"`
+}
+
+type TaskAssistantMessageSnapshot struct {
+	TaskID          string             `json:"task_id"`
+	MessageID       string             `json:"message_id"`
+	TurnID          string             `json:"turn_id"`
+	Content         string             `json:"content"`
+	Status          string             `json:"status"`
+	MessageSequence pgtype.Int8        `json:"message_sequence"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TaskBatchItem struct {

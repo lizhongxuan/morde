@@ -16,7 +16,10 @@ import (
 )
 
 type adminUserListResponse struct {
-	Items []adminUserResponse `json:"items"`
+	Items  []adminUserResponse `json:"items"`
+	Total  int64               `json:"total"`
+	Limit  int                 `json:"limit"`
+	Offset int                 `json:"offset"`
 }
 
 type adminUserResponse struct {
@@ -52,6 +55,7 @@ type auditResponse struct {
 }
 
 func (h *api) registerAdmin(group *gin.RouterGroup) {
+	h.registerAdminConsole(group)
 	group.GET("/admin/hosts", h.listAllHosts)
 	group.GET("/admin/hosts/:id/resources", h.getAdminHostResources)
 	group.PATCH("/admin/hosts/:id/resources", h.updateAdminHostResources)
@@ -107,12 +111,31 @@ func (h *api) listUsers(c *gin.Context) {
 		}
 		status = &value
 	}
-	items, err := h.deps.Admin.ListUsers(c.Request.Context(), principal, status)
-	if err != nil {
-		writeError(c, err)
+	limit, offset, ok := adminPageQueryWithDefault(c, 50)
+	if !ok {
 		return
 	}
-	response := adminUserListResponse{Items: make([]adminUserResponse, 0, len(items))}
+	var items []AdminUserRecord
+	var total int64
+	if service, ok := h.deps.Admin.(AdminUserPageService); ok {
+		page, err := service.ListUserPage(c.Request.Context(), principal, status, limit, offset)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		items, total = page.Items, page.Total
+	} else {
+		all, err := h.deps.Admin.ListUsers(c.Request.Context(), principal, status)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		total = int64(len(all))
+		start := min(offset, len(all))
+		end := min(start+limit, len(all))
+		items = all[start:end]
+	}
+	response := adminUserListResponse{Items: make([]adminUserResponse, 0, len(items)), Total: total, Limit: limit, Offset: offset}
 	for _, item := range items {
 		view, err := toAdminUserResponse(item)
 		if err != nil {

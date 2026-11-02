@@ -64,6 +64,12 @@ func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
 	if err != nil || appended.Task.ID != created.Task.ID || appended.Message.TaskID != created.Task.ID || appended.Task.Status != task.StatusQueued {
 		t.Fatalf("append to active task = %#v, err=%v", appended, err)
 	}
+	assertAccountChangeLog(t, ctx, store, owner.ID,
+		expectedAccountChange{objectType: "conversation", objectID: created.Conversation.ID, revision: 1},
+		expectedAccountChange{objectType: "message", objectID: created.Message.ID, revision: 1},
+		expectedAccountChange{objectType: "conversation", objectID: created.Conversation.ID, revision: 2},
+		expectedAccountChange{objectType: "message", objectID: appended.Message.ID, revision: 1},
+	)
 	events, err := store.ListTaskEvents(ctx, owner.ID, created.Task.ID, 1, 10)
 	if err != nil || len(events) != 1 || events[0].Sequence != 2 || events[0].Type != "task.message" {
 		t.Fatalf("append event = %#v, err=%v", events, err)
@@ -1494,6 +1500,12 @@ func TestPostgresAssistantMessageSnapshotSupportsNonStreamingCommit(t *testing.T
 	if err != nil || assistantCount != 1 {
 		t.Fatalf("non-streaming assistant message count = %d, messages=%#v, err=%v", assistantCount, messages.Items, err)
 	}
+	assertAccountChangeLog(t, ctx, store, owner.ID,
+		expectedAccountChange{objectType: "conversation", objectID: created.Conversation.ID, revision: 1},
+		expectedAccountChange{objectType: "message", objectID: created.Message.ID, revision: 1},
+		expectedAccountChange{objectType: "conversation", objectID: created.Conversation.ID, revision: 2},
+		expectedAccountChange{objectType: "message", objectID: message.ID, revision: 1},
+	)
 }
 
 func TestPostgresAssistantMessageSnapshotBoundsAccumulatedText(t *testing.T) {

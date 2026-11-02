@@ -1293,6 +1293,14 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 		if err := tx.QueryRow(ctx, `SELECT created_at FROM task_events WHERE task_id=$1 AND sequence=$2`, progress.TaskID, sequence).Scan(&createdAt); err != nil {
 			return fmt.Errorf("read committed task event time: %w", err)
 		}
+		if message := progress.AssistantMessage; message != nil {
+			if err := recordAccountObjectChanges(ctx, tx,
+				accountObjectChange{OwnerID: current.OwnerID, ObjectType: "conversation", ObjectID: current.ConversationID, Operation: "upsert"},
+				accountObjectChange{OwnerID: current.OwnerID, ObjectType: "message", ObjectID: message.ID, Operation: "upsert"},
+			); err != nil {
+				return err
+			}
+		}
 		result = task.Event{TaskID: progress.TaskID, Sequence: sequence, Type: progress.Event.Type, Payload: eventPayload, CreatedAt: createdAt}
 		return nil
 	})

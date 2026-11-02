@@ -105,6 +105,38 @@ type AdminService interface {
 	ListAudit(context.Context, identity.Principal, AuditQuery) ([]AuditRecord, error)
 }
 
+type AdminUserDetailService interface {
+	GetUser(context.Context, identity.Principal, string) (AdminUserRecord, error)
+}
+
+type AdminUserPageService interface {
+	ListUserPage(context.Context, identity.Principal, *identity.AccountStatus, int, int) (app.AdminPage[AdminUserRecord], error)
+}
+
+type AdminConsoleService interface {
+	AgentStates(context.Context, identity.Principal) (map[string]int64, error)
+	Installations(context.Context, identity.Principal, string, int, int) (app.AdminPage[app.AdminInstallation], error)
+	Authorizations(context.Context, identity.Principal, string, int, int) (app.AdminPage[app.AdminAuthorization], error)
+	ModelCalls(context.Context, identity.Principal, string, int, int) (app.AdminPage[app.AdminModelCall], error)
+	Usage(context.Context, identity.Principal, int) (app.AdminUsage, error)
+	Stats(context.Context, identity.Principal) (app.AdminStats, error)
+}
+
+type AdminQualityActivityService interface {
+	Quality(context.Context, identity.Principal, int) (app.AdminQuality, error)
+	Activity(context.Context, identity.Principal, int) (app.AdminActivity, error)
+	Places(context.Context, identity.Principal, int) (app.AdminPlaces, error)
+}
+
+type HubPresenceReader interface {
+	OnlineInstallationCount() int
+	InstallationOnline(string, string) bool
+}
+
+type AdminAuditWriter interface {
+	Write(context.Context, audit.Entry) error
+}
+
 type AdminHostResourcesService interface {
 	Get(context.Context, identity.Principal, string) (app.HostResourceSnapshot, error)
 	Update(context.Context, identity.Principal, string, app.HostResources, int64) (app.HostResourceSnapshot, error)

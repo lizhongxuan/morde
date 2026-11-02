@@ -28,6 +28,7 @@ type UserService struct {
 	users                   UserStore
 	hosts                   HostStore
 	workspaceSyncController WorkspaceSyncNodeOwnerReconciler
+	hub                     HubRevocationCloser
 	registrations           loginLimiter
 }
 
@@ -41,6 +42,18 @@ func NewUserService(users UserStore, hosts HostStore, controllers ...WorkspaceSy
 	}
 	return &UserService{users: users, hosts: hosts, workspaceSyncController: workspaceSyncController,
 		registrations: loginLimiter{attempts: make(map[string]loginAttempt)}}, nil
+}
+
+func NewUserServiceWithHub(users UserStore, hosts HostStore, hub HubRevocationCloser, controllers ...WorkspaceSyncNodeOwnerReconciler) (*UserService, error) {
+	if hub == nil {
+		return nil, errors.New("hub revocation closer is required")
+	}
+	service, err := NewUserService(users, hosts, controllers...)
+	if err != nil {
+		return nil, err
+	}
+	service.hub = hub
+	return service, nil
 }
 
 func (s *UserService) Register(ctx context.Context, name, password, ip string) (UserSummary, error) {
@@ -99,6 +112,65 @@ func (s *UserService) List(ctx context.Context, principal identity.Principal, st
 	return values, nil
 }
 
+func (s *UserService) ListPage(ctx context.Context, principal identity.Principal, status *identity.AccountStatus, limit, offset int) (AdminPage[UserSummary], error) {
+	if err := authorizeAdmin(principal); err != nil {
+		return AdminPage[UserSummary]{}, err
+	}
+	if status != nil && !validStatus(*status) {
+		return AdminPage[UserSummary]{}, domain.InvalidArgument("status", "invalid account status")
+	}
+	limit, offset, err := normalizeAdminPage(limit, offset)
+	if err != nil {
+		return AdminPage[UserSummary]{}, err
+	}
+	var users []identity.User
+	var total int64
+	if pageStore, ok := s.users.(interface {
+		ListAdminUsersPage(context.Context, *identity.AccountStatus, int, int) ([]identity.User, int64, error)
+	}); ok {
+		users, total, err = pageStore.ListAdminUsersPage(ctx, status, limit, offset)
+	} else {
+		var all []identity.User
+		all, err = s.users.ListUsersByStatus(ctx, status)
+		total = int64(len(all))
+		if err == nil {
+			start := min(offset, len(all))
+			end := min(start+limit, len(all))
+			users = all[start:end]
+		}
+	}
+	if err != nil {
+		return AdminPage[UserSummary]{}, err
+	}
+	page := AdminPage[UserSummary]{Items: make([]UserSummary, 0, len(users)), Total: total, Limit: limit, Offset: offset}
+	for _, user := range users {
+		hosts, err := s.hosts.ListHostsByOwner(ctx, user.ID)
+		if err != nil {
+			return AdminPage[UserSummary]{}, err
+		}
+		page.Items = append(page.Items, userSummary(user, allocatedUsage(hosts)))
+	}
+	return page, nil
+}
+
+func (s *UserService) Get(ctx context.Context, principal identity.Principal, userID string) (UserSummary, error) {
+	if err := authorizeAdmin(principal); err != nil {
+		return UserSummary{}, err
+	}
+	if !domain.ValidUserID(userID) {
+		return UserSummary{}, domain.InvalidArgument("user_id", "invalid user id")
+	}
+	user, err := s.users.GetUserByID(ctx, userID)
+	if err != nil {
+		return UserSummary{}, err
+	}
+	hosts, err := s.hosts.ListHostsByOwner(ctx, user.ID)
+	if err != nil {
+		return UserSummary{}, err
+	}
+	return userSummary(user, allocatedUsage(hosts)), nil
+}
+
 func (s *UserService) Update(ctx context.Context, principal identity.Principal, userID string, command UpdateUserCommand) (UserSummary, error) {
 	if err := authorizeAdmin(principal); err != nil {
 		return UserSummary{}, err
@@ -119,6 +191,7 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 	}
 	currentStatus := user.Status
 	changes := make(map[string]any)
+	revokeHubOwner := command.Status != nil || command.Role != nil
 	if command.Status != nil {
 		if !user.Status.CanTransitionTo(*command.Status) {
 			return UserSummary{}, domain.NewError(domain.CodeConflict, "account status transition is not allowed")
@@ -175,6 +248,9 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 	}, disableRelay)
 	if err != nil {
 		return UserSummary{}, err
+	}
+	if revokeHubOwner && s.hub != nil {
+		s.hub.CloseOwner(user.ID)
 	}
 	hosts, err := s.hosts.ListHostsByOwner(ctx, user.ID)
 	if err != nil {

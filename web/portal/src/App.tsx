@@ -19,10 +19,12 @@ import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
 import { Workspaces } from './routes/Workspaces';
 import { AdminAudit } from './routes/admin/AdminAudit';
-import { AdminCapacity } from './routes/admin/AdminCapacity';
 import { AdminHosts } from './routes/admin/AdminHosts';
 import { AdminLayout } from './routes/admin/AdminLayout';
 import { AdminUsers } from './routes/admin/AdminUsers';
+import { AdminOverview } from './routes/admin/AdminOverview';
+import { AdminModels } from './routes/admin/AdminModels';
+import { AdminUsage } from './routes/admin/AdminUsage';
 import { AdminHostDetail } from './routes/admin/AdminHostDetail';
 import { AdminUserDetail } from './routes/admin/AdminUserDetail';
 import { AdminWorkspaces } from './routes/admin/AdminWorkspaces';
@@ -71,9 +73,11 @@ function AdminRoutes() {
       <Route path="/admin/access-denied" element={<AdminAccessDenied />} />
       <Route element={<AdminGuard deniedTo="/admin/access-denied" />}>
         <Route path="/admin" element={<AdminLayout />}>
-          <Route index element={<AdminCapacity />} />
+          <Route index element={<AdminOverview />} />
           <Route path="users" element={<AdminUsers />} />
           <Route path="users/:id" element={<AdminUserDetail />} />
+          <Route path="models" element={<AdminModels />} />
+          <Route path="usage" element={<AdminUsage />} />
           <Route path="hosts" element={<AdminHosts />} />
           <Route path="hosts/:id" element={<AdminHostDetail />} />
           <Route path="workspaces" element={<AdminWorkspaces />} />

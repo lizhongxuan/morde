@@ -122,6 +122,34 @@ func TestConversationMessagesReturnChronologicalItems(t *testing.T) {
 	}
 }
 
+func TestConversationMessagesReturnTasklessImportedHistoryAndAttachmentIDs(t *testing.T) {
+	message := conversation.Message{
+		ID: "m1234567", ConversationID: "c1234567", Role: conversation.RoleUser,
+		Content: "Imported question", AttachmentIDs: []string{"pa_0123456789abcdef0123456789abcdef"},
+		CreatedAt: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC),
+	}
+	engine := taskAPIRouter(nil, &conversationServiceStub{messagePage: app.MessagePage{Items: []conversation.Message{message}}})
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/messages", nil))
+	var body struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || len(body.Items) != 1 {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body)
+	}
+	if _, exists := body.Items[0]["task_id"]; exists {
+		t.Fatalf("taskless imported message returned a Task ID field: %s", response.Body)
+	}
+	var attachmentIDs []string
+	if err := json.Unmarshal(body.Items[0]["attachment_ids"], &attachmentIDs); err != nil ||
+		len(attachmentIDs) != 1 || attachmentIDs[0] != message.AttachmentIDs[0] {
+		t.Fatalf("attachment IDs = %#v, body=%s, err=%v", attachmentIDs, response.Body, err)
+	}
+}
+
 func TestConversationCreateRejectsUnknownFields(t *testing.T) {
 	service := &conversationServiceStub{}
 	engine := taskAPIRouter(nil, service)

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,24 @@ import (
 type credentialUsers struct {
 	UserStore
 	values map[string]identity.User
+}
+
+type credentialRevocationUsers struct {
+	*credentialUsers
+	events *[]string
+}
+
+func (s *credentialRevocationUsers) UpdateUserWithAudit(ctx context.Context, actorID string, expected identity.AccountStatus, user identity.User, entry audit.Entry, disableRelay func(context.Context) error) (identity.User, error) {
+	if disableRelay != nil {
+		if err := disableRelay(ctx); err != nil {
+			return identity.User{}, err
+		}
+	}
+	updated, err := s.credentialUsers.UpdateUserWithAudit(ctx, actorID, expected, user, entry, nil)
+	if err == nil {
+		*s.events = append(*s.events, "commit:"+user.ID)
+	}
+	return updated, err
 }
 
 func (s *credentialUsers) GetUserByID(_ context.Context, id string) (identity.User, error) {
@@ -85,6 +104,7 @@ type credentialHosts struct {
 	mu        sync.Mutex
 	values    []host.Host
 	ensureErr error
+	listErr   error
 }
 
 func (s *credentialHosts) EnsureDefaultStopped(_ context.Context, user identity.User) (host.Host, bool, error) {
@@ -136,6 +156,9 @@ func (s *credentialHosts) GetHost(_ context.Context, id string) (host.Host, erro
 }
 
 func (s *credentialHosts) ListHostsByOwner(_ context.Context, ownerID string) ([]host.Host, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	values := make([]host.Host, 0)
 	for _, value := range s.values {
 		if value.OwnerID == ownerID {
@@ -143,6 +166,21 @@ func (s *credentialHosts) ListHostsByOwner(_ context.Context, ownerID string) ([
 		}
 	}
 	return values, nil
+}
+
+type credentialRevocationWorkspaceSync struct {
+	events       *[]string
+	reconcileErr error
+}
+
+func (s *credentialRevocationWorkspaceSync) DisableWorkspaceSyncNodeRelay(_ context.Context, ownerID string) error {
+	*s.events = append(*s.events, "disable:"+ownerID)
+	return nil
+}
+
+func (s *credentialRevocationWorkspaceSync) ReconcileWorkspaceSyncNodeOwner(_ context.Context, ownerID string) error {
+	*s.events = append(*s.events, "reconcile:"+ownerID)
+	return s.reconcileErr
 }
 
 type credentialWorkspaces struct {
@@ -264,6 +302,80 @@ func newCredentialFixture(t *testing.T) (*CredentialService, *credentialUsers, *
 	}
 	return service, users, hosts, workspaces, tokens, auditor
 }
+
+func TestUserServiceClosesOwnerHubAfterStatusOrRoleCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command UpdateUserCommand
+	}{
+		{name: "status", command: UpdateUserCommand{ExpectedStatus: identity.StatusApproved, Status: statusPointer(identity.StatusDisabled)}},
+		{name: "role", command: UpdateUserCommand{ExpectedStatus: identity.StatusApproved, Role: rolePointer(identity.RoleAdmin)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			member := identity.User{ID: "u1234567", Name: "alice", Role: identity.RoleUser, Status: identity.StatusApproved,
+				QuotaHosts: 1, QuotaCPUMilli: 4000, QuotaMemMiB: 8192, DefaultHostCPUMilli: 1000, DefaultHostMemMiB: 2048}
+			users := &credentialRevocationUsers{
+				credentialUsers: &credentialUsers{values: map[string]identity.User{member.ID: member}}, events: &events,
+			}
+			hosts := &credentialHosts{listErr: errors.New("host list failed after update")}
+			hub := &clientRevocationHub{events: &events}
+			controller := &credentialRevocationWorkspaceSync{events: &events}
+			service, err := NewUserServiceWithHub(users, hosts, hub, controller)
+			if err != nil {
+				t.Fatal(err)
+			}
+			admin := identity.Principal{UserID: "u7654321", Role: identity.RoleSuperAdmin, Kind: identity.KindSession, TokenID: "t7654321"}
+
+			_, err = service.Update(context.Background(), admin, member.ID, tc.command)
+			if err == nil {
+				t.Fatal("Update() ignored host listing failure")
+			}
+			if got, want := strings.Join(events, ","), "disable:u1234567,commit:u1234567,hub-owner-close:u1234567"; got != want {
+				t.Fatalf("update events = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCredentialPasswordChangeClosesHubBeforeFailedReconcile(t *testing.T) {
+	events := []string{}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("old password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := identity.User{ID: "u1234567", Name: "admin", PasswordHash: string(passwordHash), Role: identity.RoleSuperAdmin, Status: identity.StatusApproved}
+	users := &credentialRevocationUsers{
+		credentialUsers: &credentialUsers{values: map[string]identity.User{admin.ID: admin}}, events: &events,
+	}
+	hosts := &credentialHosts{}
+	tokens := &credentialTokens{values: map[string]identity.Token{}}
+	auditor := &credentialAudit{}
+	controller := &credentialRevocationWorkspaceSync{events: &events, reconcileErr: errors.New("reconcile failed")}
+	hub := &clientRevocationHub{events: &events}
+	service, err := NewCredentialServiceWithHub(users, hosts, tokens, auditor, CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 2, LoginWindow: time.Minute,
+	}, hosts, hub, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: admin.ID, Role: identity.RoleSuperAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
+
+	err = service.ChangePassword(context.Background(), principal, "old password", "new secure password")
+	if domain.CodeOf(err) != domain.CodeUpstreamError {
+		t.Fatalf("ChangePassword() error = %v, want reconcile failure", err)
+	}
+	if got, want := strings.Join(events, ","), "disable:u1234567,commit:u1234567,hub-owner-close:u1234567,reconcile:u1234567"; got != want {
+		t.Fatalf("password change events = %q, want %q", got, want)
+	}
+	if bcrypt.CompareHashAndPassword([]byte(users.values[admin.ID].PasswordHash), []byte("new secure password")) != nil {
+		t.Fatal("password change was not committed before reconciliation failed")
+	}
+}
+
+func statusPointer(value identity.AccountStatus) *identity.AccountStatus { return &value }
+
+func rolePointer(value identity.Role) *identity.Role { return &value }
 
 func TestCredentialServiceLoginVerifyLogoutAndRateLimit(t *testing.T) {
 	service, _, _, _, tokens, auditor := newCredentialFixture(t)

@@ -18,6 +18,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/httpserver"
 )
 
@@ -28,39 +29,52 @@ const (
 	workspaceSyncBlockBodyLimit  = 4 << 20
 	workspaceSyncActionBodyLimit = 32 << 10
 	modelGatewayBodyLimit        = 8 << 20
+	personalAttachmentJSONLimit  = 16 << 10
+	personalAttachmentChunkLimit = 4 << 20
+	personalHistoryImportLimit   = 8 << 20
 )
 
 type Deps struct {
-	Hosts                app.HostService
-	HostSharing          app.HostSharingService
-	HostReplicas         app.HostReplicaService
-	TLSAuthorizer        app.HostTLSAuthorizer
-	Verifier             app.Verifier
-	Auth                 AuthService
-	WorkspaceOps         WorkspaceService
-	WorkspaceSync        WorkspaceSyncService
-	WorkspaceSyncDevices WorkspaceSyncDeviceService
-	Sites                SiteService
-	Templates            TemplateReader
-	Tokens               TokenService
-	ClientLogin          ClientLoginService
-	Notifications        NotificationService
-	Control              ControlService
-	ExecutionControl     ExecutionControlService
-	Tasks                TaskService
-	Conversations        ConversationService
-	InstantChat          InstantChatService
-	ModelConnections     ModelConnectionManager
-	MCPConnectors        MCPConnectorManager
-	ModelGateway         ModelGateway
-	ModelUsageAdmin      ModelUsageAdmin
-	Onboarding           OnboardingManager
-	Admin                AdminService
-	AdminHostResources   AdminHostResourcesService
-	AdminWorkspaces      AdminWorkspaceService
-	Readiness            ReadinessChecker
-	MCP                  http.Handler
-	MCPDisabled          bool
+	Hosts                 app.HostService
+	HostSharing           app.HostSharingService
+	HostReplicas          app.HostReplicaService
+	TLSAuthorizer         app.HostTLSAuthorizer
+	Verifier              app.Verifier
+	Auth                  AuthService
+	WorkspaceOps          WorkspaceService
+	WorkspaceSync         WorkspaceSyncService
+	WorkspaceSyncDevices  WorkspaceSyncDeviceService
+	Sites                 SiteService
+	Templates             TemplateReader
+	Tokens                TokenService
+	ClientLogin           ClientLoginService
+	Notifications         NotificationService
+	Control               ControlService
+	ExecutionControl      ExecutionControlService
+	Tasks                 TaskService
+	Conversations         ConversationService
+	InstantChat           InstantChatService
+	ModelConnections      ModelConnectionManager
+	MCPConnectors         MCPConnectorManager
+	ModelGateway          ModelGateway
+	ModelUsageAdmin       ModelUsageAdmin
+	Hub                   app.HubConnectionService
+	Devices               deviceService
+	PersonalData          personalDataService
+	PersonalSync          personalSyncService
+	PersonalDataQuota     *app.PersonalDataQuotaService
+	PersonalAttachments   *app.PersonalAttachmentService
+	PersonalHistoryImport *app.PersonalHistoryImportService
+	Onboarding            OnboardingManager
+	Admin                 AdminService
+	AdminConsole          AdminConsoleService
+	AdminQualityActivity  AdminQualityActivityService
+	AdminHostResources    AdminHostResourcesService
+	AdminWorkspaces       AdminWorkspaceService
+	AdminAudit            AdminAuditWriter
+	Readiness             ReadinessChecker
+	MCP                   http.Handler
+	MCPDisabled           bool
 }
 
 type Options struct {
@@ -148,12 +162,21 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerWorkspaceSyncDeviceRoutes(group, deps.WorkspaceSyncDevices)
 	h.registerSites(group)
 	h.registerClients(group)
+	registerDeviceRoutes(group, deps.Devices)
+	registerPersonalDataRoutes(group, deps.PersonalData)
+	registerPersonalSyncRoutes(group, deps.PersonalSync)
+	personalDataGroup := group.Group("/personal-data")
+	RegisterPersonalAttachmentRoutes(personalDataGroup, deps.PersonalAttachments)
+	RegisterPersonalHistoryImportRoutes(personalDataGroup, deps.PersonalHistoryImport)
 	h.registerInstantChat(group)
 	h.registerNotifications(group, deps.Notifications)
 	h.registerModelConnections(group)
 	h.registerMCPConnectors(group)
+	group.GET("/hub", hubConnectionHandler(deps.Hub, options.PortalDomain))
 	h.registerModelGateway(group)
 	h.registerAdmin(group)
+	h.registerAdminQualityActivity(group)
+	h.registerAdminPersonalDataQuota(group)
 	h.registerAdminModelUsage(group)
 	engine.NoRoute(h.noRoute)
 	engine.NoMethod(func(c *gin.Context) {
@@ -169,6 +192,14 @@ func (h *api) limitBody(c *gin.Context) {
 		limit = modelGatewayBodyLimit
 	case c.Request.Method == http.MethodPost && strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-sessions"):
 		limit = workspaceSyncJSONBodyLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/uploads":
+		limit = personalAttachmentJSONLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/history/import":
+		limit = personalHistoryImportLimit
+	case c.Request.Method == http.MethodPut && c.FullPath() == "/api/personal-data/uploads/:upload_id/chunks/:sequence":
+		limit = personalAttachmentChunkLimit
+	case (c.Request.Method == http.MethodPut || c.Request.Method == http.MethodDelete) && c.FullPath() == "/api/personal-data/:type/:id":
+		limit = personal.MaxMutationBodyBytes + 4096
 	case c.Request.Method == http.MethodPost && (strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-device-challenges") ||
 		strings.HasSuffix(c.FullPath(), "/workspaces/:id/sync-devices")):
 		limit = workspaceSyncActionBodyLimit
@@ -440,10 +471,12 @@ func clientCredentialRoute(method, path string) bool {
 	switch method {
 	case http.MethodGet:
 		switch path {
-		case "/api/me", "/api/clients", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
+		case "/api/me", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
 			"/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
-			"/api/tasks/:id/workspace-view-deletions",
+			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id",
+			"/api/personal-data/attachments/:attachment_id",
+			"/api/sync/snapshot", "/api/sync/changes",
 			"/api/notifications", "/api/available-models":
 			return true
 		}
@@ -461,9 +494,16 @@ func clientCredentialRoute(method, path string) bool {
 			return true
 		case "/api/notifications/:id/read", "/api/hosts/:id/enter", "/api/hosts/:id/observation-ticket":
 			return true
+		case "/api/personal-data/uploads", "/api/personal-data/uploads/:upload_id/commit", "/api/personal-data/history/import":
+			return true
 		}
+	case http.MethodPut:
+		return path == "/api/personal-data/:type/:id" || path == "/api/personal-data/uploads/:upload_id/chunks/:sequence"
+	case http.MethodPatch:
+		return path == "/api/devices/:id"
 	case http.MethodDelete:
-		return path == "/api/clients/:id"
+		return path == "/api/clients/:id" || path == "/api/devices/:id" || path == "/api/personal-data/:type/:id" ||
+			path == "/api/personal-data/uploads/:upload_id"
 	}
 	return false
 }
@@ -508,6 +548,16 @@ func writeError(c *gin.Context, err error) {
 	}
 	if appError.Code == domain.CodeConflict {
 		switch appError.Details["reason"] {
+		case "personal_object_revision_changed":
+			if base, ok := appError.Details["base_revision"].(int64); ok && base >= 0 {
+				safe.Details["base_revision"] = base
+			}
+			if current, ok := appError.Details["current_revision"].(int64); ok && current >= 0 {
+				safe.Details["current_revision"] = current
+			}
+			if deleted, ok := appError.Details["deleted"].(bool); ok {
+				safe.Details["deleted"] = deleted
+			}
 		case "host_release_unsettled_operation":
 			if id, ok := appError.Details["task_id"].(string); ok && domain.ValidTaskID(id) {
 				safe.Details["reason"] = "host_release_unsettled_operation"

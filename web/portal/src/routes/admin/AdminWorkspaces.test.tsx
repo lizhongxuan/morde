@@ -22,6 +22,14 @@ const user: components['schemas']['AdminUser'] = {
   created_at: '2026-10-22T00:00:00Z',
 };
 
+function mockUserDetails() {
+  vi.spyOn(portalApi, 'adminUser').mockResolvedValue(user);
+  vi.spyOn(portalApi, 'adminUserInstallations').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
+  vi.spyOn(portalApi, 'adminUserAuthorizations').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
+  vi.spyOn(portalApi, 'adminUserModelCalls').mockResolvedValue({ items: [], total: 0, limit: 25, offset: 0 });
+  vi.spyOn(portalApi, 'audit').mockResolvedValue({ items: [] });
+}
+
 function renderPage(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[path]}><Routes>
@@ -55,7 +63,7 @@ describe('admin workspaces', () => {
   });
 
   it('shows the user workspace metadata and finds it across pages', async () => {
-    vi.spyOn(portalApi, 'adminUsers').mockResolvedValue({ items: [user] });
+    mockUserDetails();
     vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'adminModelAccountBudget').mockResolvedValue({ owner_id: user.id, configured: false, token_limit: 0, max_concurrent: 0, used_tokens: 0, in_flight: 0, has_unknown: false });
     const list = vi.spyOn(portalApi, 'adminWorkspaces')

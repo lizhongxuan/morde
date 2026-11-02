@@ -27,6 +27,7 @@ type Message struct {
 	Role                    Role
 	Content                 string
 	TaskID                  string
+	AttachmentIDs           []string
 	ModelID                 string
 	Sequence                int64
 	SourceKind              string

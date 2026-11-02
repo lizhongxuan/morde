@@ -11,6 +11,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 )
 
 type ConversationService interface {
@@ -43,7 +44,8 @@ type messageResponse struct {
 	ConversationID string            `json:"conversation_id"`
 	Role           conversation.Role `json:"role"`
 	Content        string            `json:"content"`
-	TaskID         string            `json:"task_id"`
+	TaskID         string            `json:"task_id,omitempty"`
+	AttachmentIDs  []string          `json:"attachment_ids,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 }
 
@@ -250,11 +252,17 @@ func toConversationResponse(value conversation.Conversation) (conversationRespon
 
 func toMessageResponse(value conversation.Message) (messageResponse, error) {
 	if !domain.ValidMessageID(value.ID) || !domain.ValidConversationID(value.ConversationID) ||
-		!domain.ValidTaskID(value.TaskID) || (value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.CreatedAt.IsZero() {
+		(value.TaskID != "" && !domain.ValidTaskID(value.TaskID)) ||
+		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.CreatedAt.IsZero() {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	for _, attachmentID := range value.AttachmentIDs {
+		if !personal.ValidPersonalAttachmentID(attachmentID) {
+			return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
 	}
 	return messageResponse{
 		ID: value.ID, ConversationID: value.ConversationID, Role: value.Role, Content: value.Content,
-		TaskID: value.TaskID, CreatedAt: value.CreatedAt,
+		TaskID: value.TaskID, AttachmentIDs: append([]string(nil), value.AttachmentIDs...), CreatedAt: value.CreatedAt,
 	}, nil
 }

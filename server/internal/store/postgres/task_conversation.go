@@ -13,6 +13,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/store/postgres/sqlcgen"
@@ -47,6 +48,11 @@ INSERT INTO conversations (id, owner_id, host_id, title, model_id)
 VALUES ($1, $2, $3, $4, $5)`, value.ID, value.OwnerID, nullableText(value.HostID), value.Title, value.ModelID)
 		if err != nil {
 			return fmt.Errorf("create conversation: %w", err)
+		}
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{
+			OwnerID: value.OwnerID, ObjectType: "conversation", ObjectID: value.ID, Operation: "upsert", MutationID: key.Key,
+		}); err != nil {
+			return err
 		}
 		created, err := sqlcgen.New(tx).GetConversation(ctx, sqlcgen.GetConversationParams{ID: value.ID, OwnerID: value.OwnerID})
 		if err != nil {
@@ -178,12 +184,54 @@ func (s *Store) ListMessages(ctx context.Context, ownerID, conversationID string
 		return app.MessagePage{}, fmt.Errorf("list conversation messages: %w", err)
 	}
 	items := mapRows(rows, messageDomain)
+	if err := s.attachConversationMessageAttachmentIDs(ctx, ownerID, conversationID, items); err != nil {
+		return app.MessagePage{}, err
+	}
 	pageResult := app.MessagePage{Items: items}
 	if int32(len(items)) > limit {
 		pageResult.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(items[limit-1].Sequence, 10)))
 		pageResult.Items = items[:limit]
 	}
 	return pageResult, nil
+}
+
+func (s *Store) attachConversationMessageAttachmentIDs(ctx context.Context, ownerID, conversationID string, items []conversation.Message) error {
+	if len(items) == 0 {
+		return nil
+	}
+	instanceID, err := s.ServiceInstanceID(ctx)
+	if err != nil {
+		return err
+	}
+	messageIDs := make([]string, len(items))
+	byMessageID := make(map[string]int, len(items))
+	for index, item := range items {
+		messageIDs[index] = item.ID
+		byMessageID[item.ID] = index
+	}
+	rows, err := s.pool.Query(ctx, `SELECT message_id, attachment_id
+FROM conversation_message_attachments
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id=$3 AND message_id=ANY($4::text[])
+ORDER BY message_id, attachment_id`, instanceID, ownerID, conversationID, messageIDs)
+	if err != nil {
+		return fmt.Errorf("list conversation message attachments: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var messageID, attachmentID string
+		if err := rows.Scan(&messageID, &attachmentID); err != nil {
+			return fmt.Errorf("scan conversation message attachment: %w", err)
+		}
+		index, exists := byMessageID[messageID]
+		if !exists || !personal.ValidPersonalAttachmentID(attachmentID) {
+			return domain.NewError(domain.CodeInternal, "conversation message attachment is invalid")
+		}
+		items[index].AttachmentIDs = append(items[index].AttachmentIDs, attachmentID)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list conversation message attachment rows: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (app.TaskSubmissionResult, error) {
@@ -333,6 +381,12 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 			submission.Task.ConversationID, submission.Task.OwnerID, submission.Task.ModelID, nullableText(submission.Task.HostID))
 		if err != nil {
 			return fmt.Errorf("touch task conversation: %w", err)
+		}
+		if err := recordAccountObjectChanges(ctx, tx,
+			accountObjectChange{OwnerID: message.OwnerID, ObjectType: "conversation", ObjectID: message.ConversationID, Operation: "upsert", MutationID: submission.Idempotency.Key},
+			accountObjectChange{OwnerID: message.OwnerID, ObjectType: "message", ObjectID: message.ID, Operation: "upsert", MutationID: submission.Idempotency.Key},
+		); err != nil {
+			return err
 		}
 		result, err = loadSubmissionResult(ctx, tx, submission.Task.OwnerID, submission.Task.ID, message.ID)
 		return err
@@ -531,6 +585,12 @@ WHERE id=$1 RETURNING event_seq`, targetTask.ID, status, string(submission.Task.
 			message.ConversationID, message.OwnerID, targetTask.ModelID, nullableText(targetTask.HostID))
 		if err != nil {
 			return fmt.Errorf("touch conversation after message: %w", err)
+		}
+		if err := recordAccountObjectChanges(ctx, tx,
+			accountObjectChange{OwnerID: message.OwnerID, ObjectType: "conversation", ObjectID: message.ConversationID, Operation: "upsert", MutationID: submission.Idempotency.Key},
+			accountObjectChange{OwnerID: message.OwnerID, ObjectType: "message", ObjectID: message.ID, Operation: "upsert", MutationID: submission.Idempotency.Key},
+		); err != nil {
+			return err
 		}
 		result, err = loadSubmissionResult(ctx, tx, message.OwnerID, targetTask.ID, message.ID)
 		return err

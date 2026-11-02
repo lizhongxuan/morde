@@ -1535,7 +1535,7 @@ func (s *services) deps() Deps {
 func TestSyncOnlyCredentialFence(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
-	for _, path := range []string{"/api/device-authorizations", "/api/device-authorizations/token", "/api/devices"} {
+	for _, path := range []string{"/api/device-authorizations", "/api/device-authorizations/token"} {
 		response := request(router, http.MethodGet, path, "", "", "")
 		if response.Code != http.StatusNotFound {
 			t.Fatalf("old pairing route %s = %d", path, response.Code)
@@ -1558,6 +1558,9 @@ func TestSyncOnlyCredentialFence(t *testing.T) {
 	}
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/api/hosts"},
+		{http.MethodGet, "/api/personal-data/profile/default"},
+		{http.MethodGet, "/api/sync/snapshot"},
+		{http.MethodGet, "/api/sync/changes?after_sequence=0"},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/enter"},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/observation-ticket"},
 	} {

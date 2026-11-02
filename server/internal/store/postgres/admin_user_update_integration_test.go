@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
@@ -17,6 +19,7 @@ func TestUserUpdateUsesExpectedStatusAndRevokesCredentials(t *testing.T) {
 	admin := createTestSuperAdmin(t, store)
 	member := createTestUser(t, store, 3, 20_000, 40_000)
 	tokenIDs := createTestCredentials(t, store, member.ID)
+	installationID := clientInstallationIDForOwner(t, pool, member.ID)
 
 	member.Status = identity.StatusDisabled
 	updated, err := store.UpdateUser(ctx, admin.ID, identity.StatusApproved, member)
@@ -32,6 +35,7 @@ func TestUserUpdateUsesExpectedStatusAndRevokesCredentials(t *testing.T) {
 			t.Fatalf("credential %s revoked = %t, %v", id, revoked, err)
 		}
 	}
+	assertClientInstallationRevoked(t, pool, installationID, true)
 	users, err := store.ListUsersByStatus(ctx, statusPointer(identity.StatusDisabled))
 	if err != nil || len(users) != 1 || users[0].ID != member.ID {
 		t.Fatalf("disabled user list = %#v, %v", users, err)
@@ -52,6 +56,7 @@ func TestUserUpdateUsesExpectedStatusAndRevokesCredentials(t *testing.T) {
 			t.Fatalf("credential %s revoked after role change = %t, %v", id, revoked, err)
 		}
 	}
+	assertNoActiveClientInstallations(t, pool, member.ID)
 
 	admin.Status = identity.StatusDisabled
 	if _, err := store.UpdateUser(ctx, member.ID, identity.StatusApproved, admin); domain.CodeOf(err) != domain.CodeForbidden {
@@ -70,6 +75,7 @@ func TestQuotaUpdateKeepsCredentialsAndSuperAdminPasswordIsNotReset(t *testing.T
 	admin := createTestSuperAdmin(t, store)
 	member := createTestUser(t, store, 3, 20_000, 40_000)
 	tokenIDs := createTestCredentials(t, store, member.ID)
+	installationID := clientInstallationIDForOwner(t, pool, member.ID)
 
 	member.QuotaHosts++
 	if _, err := store.UpdateUser(ctx, admin.ID, identity.StatusApproved, member); err != nil {
@@ -81,8 +87,10 @@ func TestQuotaUpdateKeepsCredentialsAndSuperAdminPasswordIsNotReset(t *testing.T
 			t.Fatalf("credential %s revoked by quota update = %t, %v", id, revoked, err)
 		}
 	}
+	assertClientInstallationRevoked(t, pool, installationID, false)
 
 	adminTokenIDs := createTestCredentials(t, store, admin.ID)
+	adminInstallationID := clientInstallationIDForOwner(t, pool, admin.ID)
 	admin.PasswordHash = "changed-hash"
 	admin.MustChangePassword = false
 	updated, err := store.UpdateUser(ctx, admin.ID, identity.StatusApproved, admin)
@@ -95,6 +103,7 @@ func TestQuotaUpdateKeepsCredentialsAndSuperAdminPasswordIsNotReset(t *testing.T
 			t.Fatalf("super admin credential %s revoked = %t, %v", id, revoked, err)
 		}
 	}
+	assertClientInstallationRevoked(t, pool, adminInstallationID, true)
 	newCandidate := initialAdminUser(t, "new-initial-hash")
 	if err := store.EnsureInitialAdmin(ctx, newCandidate); err != nil {
 		t.Fatalf("idempotent initial admin check: %v", err)
@@ -114,6 +123,7 @@ func TestUserUpdateAndAuditAreAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	tokenIDs := createTestCredentials(t, store, member.ID)
+	installationID := clientInstallationIDForOwner(t, pool, member.ID)
 	member.Status = identity.StatusApproved
 	_, err = store.UpdateUserWithAudit(ctx, admin.ID, identity.StatusPending, member, audit.Entry{
 		ActorID: admin.ID, ActorKind: audit.ActorKind("invalid"), Action: audit.ActionUserUpdate,
@@ -132,6 +142,7 @@ func TestUserUpdateAndAuditAreAtomic(t *testing.T) {
 			t.Fatalf("credential %s revoked after rolled-back update = %t, %v", id, revoked, err)
 		}
 	}
+	assertClientInstallationRevoked(t, pool, installationID, false)
 }
 
 func TestEnsureInitialAdminSerializesFirstCreationAndRejectsNonEmptyStore(t *testing.T) {
@@ -264,6 +275,31 @@ VALUES ($1, $2, 'test client', 'desktop', now()+interval '1 day')`, installation
 	}
 	ids = append(ids, clientTokenID)
 	return ids
+}
+
+func clientInstallationIDForOwner(t *testing.T, pool *pgxpool.Pool, ownerID string) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM client_installations WHERE owner_id=$1 ORDER BY created_at,id LIMIT 1`, ownerID).Scan(&id); err != nil {
+		t.Fatalf("find client installation for owner %s: %v", ownerID, err)
+	}
+	return id
+}
+
+func assertClientInstallationRevoked(t *testing.T, pool *pgxpool.Pool, id string, want bool) {
+	t.Helper()
+	var revoked bool
+	if err := pool.QueryRow(context.Background(), `SELECT revoked_at IS NOT NULL FROM client_installations WHERE id=$1`, id).Scan(&revoked); err != nil || revoked != want {
+		t.Fatalf("client installation %s revoked = %t, want %t (error: %v)", id, revoked, want, err)
+	}
+}
+
+func assertNoActiveClientInstallations(t *testing.T, pool *pgxpool.Pool, ownerID string) {
+	t.Helper()
+	var active int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM client_installations WHERE owner_id=$1 AND revoked_at IS NULL`, ownerID).Scan(&active); err != nil || active != 0 {
+		t.Fatalf("active client installations for owner %s = %d, want 0 (error: %v)", ownerID, active, err)
+	}
 }
 
 func statusPointer(value identity.AccountStatus) *identity.AccountStatus { return &value }

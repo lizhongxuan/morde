@@ -139,9 +139,18 @@ export const portalApi = {
   deleteApiKey: async (id: string) => unwrapApiResponse(await api.DELETE('/api/apikeys/{id}', { params: { path: { id } } })),
   modelConnections: async () => unwrapApiResponse(await api.GET('/api/model-connections')),
   createModelConnection: async (body: components['schemas']['CreateModelConnectionRequest']) => unwrapApiResponse(await api.POST('/api/model-connections', { body })),
+  updateModelConnection: async (id: string, body: operations['updateModelConnection']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/model-connections/{id}', { params: { path: { id } }, body })),
+  deleteModelConnection: async (id: string) => unwrapApiResponse(await api.DELETE('/api/model-connections/{id}', { params: { path: { id } } })),
   checkModelConnection: async (id: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } },
   })),
+  adminOverview: async () => unwrapApiResponse(await api.GET('/api/admin/overview')),
+  adminModelConnections: async () => unwrapApiResponse(await api.GET('/api/admin/model-connections')),
+  adminUsage: async (days: 7 | 30 | 90) => unwrapApiResponse(await api.GET('/api/admin/usage', { params: { query: { days } } })),
+  adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
+  adminActivity: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/activity', { params: { query: { days } } })),
+  adminPlaces: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/places', { params: { query: { days } } })),
+  adminStats: async () => unwrapApiResponse(await api.GET('/api/admin/stats')),
   adminHosts: async () => unwrapApiResponse(await api.GET('/api/admin/hosts')),
   adminHostResources: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/hosts/{id}/resources', { params: { path: { id } } })),
   updateAdminHostResources: async (id: string, body: components['schemas']['UpdateAdminHostResourcesRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/hosts/{id}/resources', { params: { path: { id } }, body })),
@@ -149,9 +158,13 @@ export const portalApi = {
     params: { query: { limit: 50, ...(cursor ? { cursor } : {}) } },
   })),
   adminWorkspace: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/workspaces/{id}', { params: { path: { id } } })),
-  adminUsers: async (status?: components['schemas']['AccountStatus']) => unwrapApiResponse(await api.GET('/api/admin/users', {
-    params: { query: status ? { status } : {} },
+  adminUsers: async (status?: components['schemas']['AccountStatus'], offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users', {
+    params: { query: { limit: 50, offset, ...(status ? { status } : {}) } },
   })),
+  adminUser: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}', { params: { path: { id } } })),
+  adminUserInstallations: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/installations', { params: { path: { id }, query: { limit: 25, offset } } })),
+  adminUserAuthorizations: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/authorizations', { params: { path: { id }, query: { limit: 25, offset } } })),
+  adminUserModelCalls: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/model-usage/ledger', { params: { path: { id }, query: { limit: 25, offset } } })),
   updateUser: async (id: string, body: components['schemas']['UpdateUserRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/users/{id}', { params: { path: { id } }, body })),
   adminUnknownModelUsage: async (ownerID: string) => unwrapApiResponse(await api.GET('/api/admin/model-usage/unknown', {
     params: { query: { owner_id: ownerID, limit: 100 } },
@@ -159,6 +172,8 @@ export const portalApi = {
   reconcileModelUsage: async (body: operations['reconcileUnknownModelUsage']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.POST('/api/admin/model-usage/reconcile', { body })),
   adminModelAccountBudget: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/model-usage-budget', { params: { path: { id } } })),
   setAdminModelAccountBudget: async (id: string, body: operations['setModelAccountBudget']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/admin/users/{id}/model-usage-budget', { params: { path: { id } }, body })),
+  adminPersonalDataQuota: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/personal-data-quota', { params: { path: { id } } })),
+  setAdminPersonalDataQuota: async (id: string, body: operations['setAdminPersonalDataQuota']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PATCH('/api/admin/users/{id}/personal-data-quota', { params: { path: { id } }, body })),
   capacity: async () => unwrapApiResponse(await api.GET('/api/admin/capacity')),
   audit: async (params: URLSearchParams) => {
     const query: AuditQuery = {};

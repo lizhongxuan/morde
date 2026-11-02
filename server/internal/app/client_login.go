@@ -60,17 +60,27 @@ type ClientLoginAttempt struct {
 	LegacyAndroid bool
 }
 
+type HubRevocationCloser interface {
+	CloseInstallation(string)
+	CloseOwner(string)
+}
+
 type ClientLoginService struct {
 	store                   ClientLoginStore
 	credentials             *CredentialService
 	workspaceSyncReconciler WorkspaceSyncNodeOwnerReconciler
+	hub                     HubRevocationCloser
 }
 
-func NewClientLoginService(store ClientLoginStore, credentials *CredentialService, workspaceSyncReconciler WorkspaceSyncNodeOwnerReconciler) (*ClientLoginService, error) {
-	if store == nil || credentials == nil {
+func NewClientLoginService(store ClientLoginStore, credentials *CredentialService, workspaceSyncReconciler WorkspaceSyncNodeOwnerReconciler, hubs ...HubRevocationCloser) (*ClientLoginService, error) {
+	if store == nil || credentials == nil || len(hubs) > 1 {
 		return nil, domain.InvalidArgument("dependencies", "client login dependencies are required")
 	}
-	return &ClientLoginService{store: store, credentials: credentials, workspaceSyncReconciler: workspaceSyncReconciler}, nil
+	var hub HubRevocationCloser
+	if len(hubs) == 1 {
+		hub = hubs[0]
+	}
+	return &ClientLoginService{store: store, credentials: credentials, workspaceSyncReconciler: workspaceSyncReconciler, hub: hub}, nil
 }
 
 func (s *ClientLoginService) Login(ctx context.Context, name, password, platform, displayName, renewalID, idempotencyKey, ip string, attempt ClientLoginAttempt) (ClientLoginResult, error) {
@@ -145,6 +155,9 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 		}
 		return ClientLoginResult{}, err
 	}
+	if s.hub != nil {
+		s.hub.CloseInstallation(value.ID)
+	}
 	result := ClientLoginResult{InstallationID: value.ID, ClientCredential: issued.ClientCredential, ClientExpiresAt: issued.Client.ExpiresAt,
 		SyncCredential: issued.SyncCredential, WebSessionCredential: issued.WebCredential, User: userSummary(user, ResourceUsage{})}
 	if issued.Sync != nil {
@@ -182,6 +195,9 @@ func (s *ClientLoginService) Logout(ctx context.Context, principal identity.Prin
 		func(gateCtx context.Context) error { return s.disableWorkspaceSyncRelay(gateCtx, principal.UserID) }); err != nil {
 		return err
 	}
+	if s.hub != nil {
+		s.hub.CloseInstallation(principal.ClientInstallationID)
+	}
 	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
 }
 
@@ -192,6 +208,9 @@ func (s *ClientLoginService) LogoutWebSession(ctx context.Context, principal ide
 	if err := s.store.RevokeClientInstallation(ctx, principal.ClientInstallationID, principal.UserID, ip, audit.ActorSession,
 		func(gateCtx context.Context) error { return s.disableWorkspaceSyncRelay(gateCtx, principal.UserID) }); err != nil {
 		return err
+	}
+	if s.hub != nil {
+		s.hub.CloseInstallation(principal.ClientInstallationID)
 	}
 	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
 }
@@ -222,6 +241,9 @@ func (s *ClientLoginService) Revoke(ctx context.Context, principal identity.Prin
 	if err := s.store.RevokeClientInstallation(ctx, id, principal.UserID, ip, audit.ActorKind(principal.Kind),
 		func(gateCtx context.Context) error { return s.disableWorkspaceSyncRelay(gateCtx, principal.UserID) }); err != nil {
 		return err
+	}
+	if s.hub != nil {
+		s.hub.CloseInstallation(id)
 	}
 	return s.reconcileWorkspaceSyncAfterInstallationRevocation(ctx, principal.UserID)
 }

@@ -64,6 +64,7 @@ type CredentialService struct {
 	limiter                 loginLimiter
 	defaultHosts            DefaultHostEnsurer
 	workspaceSyncController WorkspaceSyncNodeOwnerReconciler
+	hub                     HubRevocationCloser
 }
 
 type DefaultHostEnsurer interface {
@@ -101,6 +102,18 @@ func NewCredentialService(users UserStore, hosts HostStore, tokens TokenStore, w
 		defaultHosts: defaultHosts, workspaceSyncController: workspaceSyncController,
 		limiter: loginLimiter{attempts: make(map[string]loginAttempt)},
 	}, nil
+}
+
+func NewCredentialServiceWithHub(users UserStore, hosts HostStore, tokens TokenStore, writer AuditWriter, options CredentialOptions, defaultHosts DefaultHostEnsurer, hub HubRevocationCloser, controllers ...WorkspaceSyncNodeOwnerReconciler) (*CredentialService, error) {
+	if hub == nil {
+		return nil, fmt.Errorf("hub revocation closer is required")
+	}
+	service, err := NewCredentialService(users, hosts, tokens, writer, options, defaultHosts, controllers...)
+	if err != nil {
+		return nil, err
+	}
+	service.hub = hub
+	return service, nil
 }
 
 func (s *CredentialService) Login(ctx context.Context, name, password, ip string) (LoginResult, error) {
@@ -215,6 +228,9 @@ func (s *CredentialService) ChangePassword(ctx context.Context, principal identi
 	}, disableRelay)
 	if err != nil {
 		return err
+	}
+	if s.hub != nil {
+		s.hub.CloseOwner(user.ID)
 	}
 	if s.workspaceSyncController != nil {
 		if err := s.workspaceSyncController.ReconcileWorkspaceSyncNodeOwner(ctx, user.ID); err != nil {

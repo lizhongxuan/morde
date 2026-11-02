@@ -22,6 +22,10 @@ const (
 	ActionHostRestore                  Action = "host.restore"
 	ActionModelBudgetUpdate            Action = "model.budget.update"
 	ActionModelUsageReconcile          Action = "model.usage.reconcile"
+	ActionModelConnectionCreate        Action = "model.connection.create"
+	ActionModelConnectionUpdate        Action = "model.connection.update"
+	ActionModelConnectionDelete        Action = "model.connection.delete"
+	ActionModelConnectionCheck         Action = "model.connection.check"
 	ActionAPIKeyCreate                 Action = "apikey.create"
 	ActionAPIKeyDelete                 Action = "apikey.delete"
 	ActionDevicePair                   Action = "device.pair"
@@ -36,6 +40,7 @@ const (
 	ActionWorkspaceDelete              Action = "workspace.delete"
 	ActionUserCreate                   Action = "user.create"
 	ActionUserUpdate                   Action = "user.update"
+	ActionPersonalDataQuotaUpdate      Action = "personal_data.quota.update"
 	ActionMCPCall                      Action = "mcp.call"
 	ActionMCPConnectorCreate           Action = "mcp.connector.create"
 	ActionMCPConnectorUpdate           Action = "mcp.connector.update"
@@ -52,9 +57,10 @@ func (a Action) Valid() bool {
 	switch a {
 	case ActionLogin, ActionLoginFailed, ActionLogout,
 		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter, ActionHostControl, ActionHostResourcesUpdate, ActionHostApplicationInstall, ActionHostApplicationLaunch, ActionHostApplicationStop, ActionHostMemberInvite, ActionHostMemberRevoke, ActionExecutionControl, ActionHostRelease, ActionHostRestore, ActionModelBudgetUpdate, ActionModelUsageReconcile,
+		ActionModelConnectionCreate, ActionModelConnectionUpdate, ActionModelConnectionDelete, ActionModelConnectionCheck,
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
 		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientRevoke,
-		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionMCPCall,
+		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionMCPCall,
 		ActionMCPConnectorCreate, ActionMCPConnectorUpdate, ActionMCPConnectorEnable,
 		ActionMCPConnectorDisable, ActionMCPConnectorCredentialRotate, ActionMCPConnectorDelete,
 		ActionSystemLost, ActionOrphanDeleted, ActionSystemRenew:

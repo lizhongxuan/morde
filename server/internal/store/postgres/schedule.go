@@ -77,6 +77,17 @@ observation_config_hash, baseline_fingerprint
 		if err != nil {
 			return fmt.Errorf("create schedule: %w", err)
 		}
+		contentBytes, err := personalScheduleContentBytesInTx(ctx, tx, value.OwnerID, value.ID)
+		if err != nil {
+			return err
+		}
+		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if err := applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, value.OwnerID, contentBytes); err != nil {
+			return err
+		}
 		result, err = loadSchedule(ctx, tx, value.OwnerID, value.ID)
 		return err
 	})
@@ -165,7 +176,22 @@ func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, value schedu
 		if err := schedule.Validate(value); err != nil {
 			return domain.InvalidArgument("schedule", err.Error())
 		}
-		return updateScheduleRow(ctx, tx, ownerID, value)
+		previousContentBytes, err := personalScheduleContentBytesInTx(ctx, tx, ownerID, value.ID)
+		if err != nil {
+			return err
+		}
+		if err := updateScheduleRow(ctx, tx, ownerID, value); err != nil {
+			return err
+		}
+		nextContentBytes, err := personalScheduleContentBytesInTx(ctx, tx, ownerID, value.ID)
+		if err != nil {
+			return err
+		}
+		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		return applyPersonalObjectUsageDeltaInTx(ctx, tx, instanceID, ownerID, nextContentBytes-previousContentBytes)
 	})
 	if err != nil {
 		return schedule.Schedule{}, err
@@ -467,6 +493,14 @@ WHERE id=$1 AND owner_id=$2`, value.ID, value.OwnerID, commit.NextOccurrence.Key
 		if err != nil {
 			return fmt.Errorf("advance schedule occurrence: %w", err)
 		}
+		if taskID != "" {
+			if err := recordAccountObjectChanges(ctx, tx,
+				accountObjectChange{OwnerID: value.OwnerID, ObjectType: "conversation", ObjectID: conversationID, Operation: "upsert"},
+				accountObjectChange{OwnerID: value.OwnerID, ObjectType: "message", ObjectID: messageID, Operation: "upsert"},
+			); err != nil {
+				return err
+			}
+		}
 		result = schedule.Run{
 			ID: runID, ScheduleID: value.ID, ScheduleVersion: value.Version, OccurrenceKey: occurrence.Key,
 			ScheduledAt: occurrence.ScheduledAt, CoalescedCount: occurrence.CoalescedCount, Status: occurrence.Status,
@@ -684,6 +718,25 @@ WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Sta
 		return domain.NewError(domain.CodeNotFound, "schedule not found")
 	}
 	return nil
+}
+
+func personalScheduleContentBytesInTx(ctx context.Context, tx pgx.Tx, ownerID, scheduleID string) (int64, error) {
+	var contentBytes int64
+	err := tx.QueryRow(ctx, `SELECT octet_length(jsonb_build_object(
+  'objective',objective,'model',model_id,'host',host_id,'timing',timing,
+  'budgets',jsonb_build_object('active_seconds',budget_active_seconds,'tool_calls',budget_tool_calls,'model_tokens',budget_model_tokens),
+  'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec
+)::text) FROM schedules WHERE id=$1 AND owner_id=$2`, scheduleID, ownerID).Scan(&contentBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, domain.NewError(domain.CodeNotFound, "schedule not found")
+	}
+	if err != nil {
+		return 0, fmt.Errorf("measure schedule personal data content: %w", err)
+	}
+	if contentBytes < 1 {
+		return 0, domain.NewError(domain.CodeInternal, "schedule personal data size is invalid")
+	}
+	return contentBytes, nil
 }
 
 func marshalObservation(value *schedule.ObservationSpec) ([]byte, error) {

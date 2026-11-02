@@ -15,12 +15,15 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/hub"
+	"morde/server/internal/domain/personal"
 )
 
 type clientContractFixture struct {
 	Capabilities map[string]struct {
 		ServiceInstanceID      string   `json:"service_instance_id"`
 		APIVersion             string   `json:"api_version"`
+		HubVersion             *string  `json:"hub_version"`
 		SupportedFeatures      []string `json:"supported_features"`
 		DefaultMaxRequestBytes int64    `json:"default_max_request_bytes"`
 	} `json:"capabilities"`
@@ -46,9 +49,36 @@ type clientContractFixture struct {
 			CreatedAt      string `json:"created_at"`
 		} `json:"assistant_message"`
 	} `json:"task_snapshot"`
-	AssistantMessageStatuses []string          `json:"assistant_message_statuses"`
-	TaskEventFrames          map[string]string `json:"task_event_frames"`
+	AssistantMessageStatuses []string                   `json:"assistant_message_statuses"`
+	TaskEventFrames          map[string]string          `json:"task_event_frames"`
+	HubFrames                map[string]json.RawMessage `json:"hub_frames"`
+	PersonalData             struct {
+		ProfileRead struct {
+			ObjectType string                     `json:"object_type"`
+			ObjectID   string                     `json:"object_id"`
+			Revision   int64                      `json:"revision"`
+			Body       map[string]json.RawMessage `json:"body"`
+		} `json:"profile_read"`
+		ProfilePutRequest struct {
+			BaseRevision int64           `json:"base_revision"`
+			Body         json.RawMessage `json:"body"`
+		} `json:"profile_put_request"`
+		ProfileDeleteRequest struct {
+			BaseRevision int64 `json:"base_revision"`
+		} `json:"profile_delete_request"`
+		MutationReceipt struct {
+			ObjectType            string `json:"object_type"`
+			ObjectID              string `json:"object_id"`
+			ResultRevision        int64  `json:"result_revision"`
+			AccountChangeSequence int64  `json:"account_change_sequence"`
+			Replay                bool   `json:"replay"`
+		} `json:"mutation_receipt"`
+		IdempotencyKey string `json:"idempotency_key"`
+	} `json:"personal_data"`
 }
+
+type personalDataCapabilityStub struct{ personalDataService }
+type personalSyncCapabilityStub struct{ personalSyncService }
 
 func loadClientContractFixture(t *testing.T) clientContractFixture {
 	t.Helper()
@@ -68,6 +98,7 @@ func TestCapabilitiesArePublicAndOnlyAdvertiseAssembledServices(t *testing.T) {
 	services := newServices()
 	deps := services.deps()
 	deps.ClientLogin = &clientLoginHTTPStub{}
+	deps.PersonalData = &personalDataCapabilityStub{}
 	options := validOptions()
 	options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
 	router, err := New(deps, options)
@@ -136,10 +167,14 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 		name           string
 		taskAPI        bool
 		cloudExecution bool
+		hub            bool
+		personalSync   bool
 	}{
 		{name: "unsupported"},
 		{name: "queued_task_api", taskAPI: true},
 		{name: "cloud_execution", taskAPI: true, cloudExecution: true},
+		{name: "hub", hub: true},
+		{name: "personal_sync", personalSync: true},
 	} {
 		expected, ok := fixture.Capabilities[scenario.name]
 		if !ok {
@@ -149,6 +184,13 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 		deps := services.deps()
 		deps.ClientLogin = &clientLoginHTTPStub{}
 		deps.ModelConnections = &modelConnectionManagerStub{}
+		if scenario.hub {
+			deps.Hub = newHubSessionStub()
+		}
+		if scenario.personalSync {
+			deps.PersonalData = &personalDataCapabilityStub{}
+			deps.PersonalSync = &personalSyncCapabilityStub{}
+		}
 		if scenario.taskAPI {
 			deps.Tasks = &taskServiceStub{}
 			deps.Conversations = &conversationServiceStub{}
@@ -168,6 +210,8 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 			t.Fatalf("fixture capabilities %s response = %d %s", scenario.name, response.Code, response.Body)
 		}
 		if actual.APIVersion != expected.APIVersion || actual.DefaultMaxRequestBytes != expected.DefaultMaxRequestBytes ||
+			(actual.HubVersion == nil) != (expected.HubVersion == nil) ||
+			(actual.HubVersion != nil && *actual.HubVersion != *expected.HubVersion) ||
 			!slices.Equal(actual.SupportedFeatures, expected.SupportedFeatures) {
 			t.Fatalf("fixture capabilities %s = %+v; expected %+v", scenario.name, actual, expected)
 		}
@@ -235,6 +279,58 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 	}
 	if got, want := snapshotFrame.String(), fixture.TaskEventFrames["snapshot_required"]; got != want {
 		t.Fatalf("snapshot recovery frame = %q; want %q", got, want)
+	}
+}
+
+func TestSharedHubFramesMatchProtocolValidators(t *testing.T) {
+	fixture := loadClientContractFixture(t)
+	for name, raw := range fixture.HubFrames {
+		frame, err := hub.DecodeFrame(raw)
+		if err != nil {
+			t.Fatalf("decode Hub fixture %s: %v", name, err)
+		}
+		switch name {
+		case "hello":
+			err = hub.ValidateHello(frame)
+		case "ping", "devices", "cancel":
+		case "call_info", "call_open", "call_notify":
+			err = hub.ValidateCall(frame)
+		case "result_info", "result_open", "result_notify", "result_denied":
+			err = hub.ValidateResult(frame)
+			if err == nil {
+				action := map[string]string{"result_info": "info", "result_open": "open", "result_notify": "notify", "result_denied": "info"}[name]
+				err = hub.ValidateActionResult(action, frame)
+			}
+		default:
+			t.Fatalf("unknown Hub fixture frame %q", name)
+		}
+		if err != nil {
+			t.Fatalf("validate Hub fixture %s: %v", name, err)
+		}
+	}
+	if len(fixture.HubFrames) != 11 {
+		t.Fatalf("Hub fixture frame count = %d, want 11", len(fixture.HubFrames))
+	}
+}
+
+func TestSharedPersonalDataFixtureMatchesProfileMutationContract(t *testing.T) {
+	fixture := loadClientContractFixture(t)
+	value := fixture.PersonalData
+	if value.ProfileRead.ObjectType != personal.ObjectTypeProfile || value.ProfileRead.ObjectID != personal.ProfileObjectID ||
+		value.ProfileRead.Revision < 1 || value.IdempotencyKey == "" ||
+		value.MutationReceipt.ObjectType != personal.ObjectTypeProfile || value.MutationReceipt.ObjectID != personal.ProfileObjectID ||
+		value.MutationReceipt.ResultRevision < 1 || value.MutationReceipt.AccountChangeSequence < 1 {
+		t.Fatalf("shared personal data fixture is incomplete: %+v", value)
+	}
+	if err := personal.ValidateMutation(personal.Mutation{
+		OwnerID: testUserID, MutationID: value.IdempotencyKey, ObjectType: personal.ObjectTypeProfile,
+		ObjectID: personal.ProfileObjectID, BaseRevision: value.ProfilePutRequest.BaseRevision,
+		Body: value.ProfilePutRequest.Body,
+	}); err != nil {
+		t.Fatalf("shared profile PUT fixture violates the domain contract: %v", err)
+	}
+	if value.ProfileDeleteRequest.BaseRevision < value.ProfilePutRequest.BaseRevision {
+		t.Fatalf("shared profile delete revision is invalid: %+v", value.ProfileDeleteRequest)
 	}
 }
 

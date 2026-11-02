@@ -40,6 +40,65 @@ beforeEach(() => { resetMockState(); api = createApiClient(); workspaceSequence 
 afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); });
 afterAll(() => server.close());
 
+describe("admin console mock routes", () => {
+  it("reads and compare-and-set updates isolated personal-data quotas", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const initial = await api("/api/admin/users/u1a2b3c4/personal-data-quota");
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toMatchObject({
+      used_bytes: 0, reserved_bytes: 0, quota_bytes: 5 * 1024 ** 3,
+      max_attachment_bytes: 300 * 1024 ** 2, version: 1,
+      default_quota_bytes: 5 * 1024 ** 3, default_max_attachment_bytes: 300 * 1024 ** 2,
+    });
+
+    const update = await api("/api/admin/users/u1a2b3c4/personal-data-quota", json("PATCH", {
+      expected_version: 1, quota_bytes: 6 * 1024 ** 3, max_attachment_bytes: 400 * 1024 ** 2,
+    }));
+    expect(update.status).toBe(200);
+    expect(await update.json()).toMatchObject({ quota_bytes: 6 * 1024 ** 3, max_attachment_bytes: 400 * 1024 ** 2, version: 2 });
+    const replayedRead = await api("/api/admin/users/u1a2b3c4/personal-data-quota");
+    expect(await replayedRead.json()).toMatchObject({ quota_bytes: 6 * 1024 ** 3, version: 2 });
+
+    const stale = await api("/api/admin/users/u1a2b3c4/personal-data-quota", json("PATCH", {
+      expected_version: 1, quota_bytes: 7 * 1024 ** 3, max_attachment_bytes: 500 * 1024 ** 2,
+    }));
+    expect(stale.status).toBe(409);
+  });
+
+  it("serves the admin views and never returns or audits a shared model key", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const overview = await api("/api/admin/overview");
+    expect(overview.status).toBe(200);
+    expect(await overview.json()).toMatchObject({ health: { ready: true }, online_installations: 0, agents_by_state: {} });
+    const stats = await api("/api/admin/stats");
+    expect(await stats.json()).toMatchObject({ users: { total: 3 }, platforms: [{ platform: "desktop", installations: 1 }], version_tracking_available: false });
+
+    const created = await api("/api/model-connections", json("POST", {
+      name: "本地测试连接", base_url: "https://models.example.test/v1", model_name: "test-model", api_key: "local-test-secret", shared: true,
+    }));
+    expect(created.status).toBe(201);
+    const createdText = await created.text();
+    expect(createdText).not.toContain("local-test-secret");
+    const connection = JSON.parse(createdText) as { id: string; shared: boolean };
+    expect(connection.shared).toBe(true);
+    const page = await api("/api/admin/model-connections");
+    const pageBody = await page.json();
+    expect(pageBody.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: connection.id, shared: true, has_api_key: true })]));
+    const audit = await api(`/api/admin/audit?target=${connection.id}`);
+    const auditText = await audit.text();
+    expect(auditText).toContain("model.connection.create");
+    expect(auditText).not.toContain("local-test-secret");
+  });
+
+  it("rejects non-admin console reads and shared model writes", async () => {
+    await api("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await api("/api/admin/overview")).status).toBe(403);
+    expect((await api("/api/model-connections", json("POST", {
+      name: "未授权连接", base_url: "https://models.example.test/v1", model_name: "test-model", api_key: "local-test-secret", shared: true,
+    }))).status).toBe(403);
+  });
+});
+
 describe("portal mock cookie sessions", () => {
   it("allocates one stopped 1-core 2-GiB computer on login and refuses another", async () => {
     resetMockState();

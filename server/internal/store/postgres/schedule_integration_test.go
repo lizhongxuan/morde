@@ -80,6 +80,16 @@ func TestPostgresScheduleOccurrenceAtomicallyCreatesTaskGraphAndDeduplicatesConc
 	if conversations != 1 || tasks != 1 || messages != 1 || events != 1 || runs != 1 {
 		t.Fatalf("atomic schedule task graph counts = conversations:%d tasks:%d messages:%d events:%d runs:%d", conversations, tasks, messages, events, runs)
 	}
+	var conversationID, messageID string
+	if err := store.pool.QueryRow(ctx, `SELECT c.id, m.id FROM conversations c
+JOIN conversation_messages m ON m.conversation_id=c.id AND m.owner_id=c.owner_id
+WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversationID, &messageID); err != nil {
+		t.Fatal(err)
+	}
+	assertAccountChangeLog(t, ctx, store, owner.ID,
+		expectedAccountChange{objectType: "conversation", objectID: conversationID, revision: 1},
+		expectedAccountChange{objectType: "message", objectID: messageID, revision: 1},
+	)
 	var authKind string
 	var executionEpoch int64
 	if err := store.pool.QueryRow(ctx, `SELECT auth_kind,execution_epoch FROM tasks WHERE id=$1`, *run.TaskID).Scan(&authKind, &executionEpoch); err != nil {
@@ -129,6 +139,13 @@ func TestPostgresScheduleObservationConfigAndRunSnapshotPersist(t *testing.T) {
 			t.Fatalf("invalid persisted observation spec accepted: %s", invalid)
 		}
 	}
+	var scheduledContentBytes int64
+	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&scheduledContentBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE personal_data_quotas SET quota_bytes=used_bytes WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
 	run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
 		ScheduleID: updated.ID, OwnerID: owner.ID, ExpectedVersion: updated.Version, ExpectedEpoch: updated.ExecutionEpoch,
 		Occurrence:         schedule.Occurrence{Key: updated.NextOccurrenceKey, ScheduledAt: updated.NextRunAt, CheckAt: *updated.NextCheckAt, Status: schedule.RunQueued},
@@ -137,6 +154,10 @@ func TestPostgresScheduleObservationConfigAndRunSnapshotPersist(t *testing.T) {
 	if err != nil || !committed || run.Observation == nil || run.Observation.Selector != "#status" ||
 		run.ObservationConfigHash != observation.ConfigHash() || run.ObservationOutcome != schedule.ObservationUnknown {
 		t.Fatalf("commit observation run snapshot = %#v committed=%t err=%v", run, committed, err)
+	}
+	var usageAfterRun int64
+	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&usageAfterRun); err != nil || usageAfterRun != scheduledContentBytes {
+		t.Fatalf("schedule occurrence changed personal content usage = %d, want %d, err=%v", usageAfterRun, scheduledContentBytes, err)
 	}
 	page, err := store.ListScheduleRuns(ctx, owner.ID, updated.ID, nil, app.PageRequest{Limit: 10})
 	if err != nil || len(page.Items) != 1 || page.Items[0].Observation == nil || page.Items[0].Observation.URL != observation.URL ||

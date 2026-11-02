@@ -28,6 +28,24 @@
       "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "task_api", "cloud_tasks"],
       "default_max_request_bytes": 1048576
     },
+    "hub": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "1",
+      "hub_version": "1",
+      "event_version": null,
+      "minimum_client_version": null,
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "hub"],
+      "default_max_request_bytes": 1048576
+    },
+    "personal_sync": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "1",
+      "hub_version": null,
+      "event_version": null,
+      "minimum_client_version": null,
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "personal_sync"],
+      "default_max_request_bytes": 1048576
+    },
     "unsupported_version": {
       "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
       "api_version": "2",
@@ -71,6 +89,26 @@
   "task_event_frames": {
     "assistant_delta": "id: 7\nevent: task.message\ndata: {\"task_id\":\"q1234567\",\"sequence\":7,\"type\":\"task.message\",\"created_at\":\"2026-11-01T00:00:00Z\",\"payload\":{\"role\":\"assistant\",\"message_id\":\"m1234567\",\"turn_id\":\"s1234567\",\"delta\":\"Hello \"}}\n\n",
     "snapshot_required": "id: 8\nevent: task.snapshot_required\ndata: {\"sequence\":8}\n\n"
+  },
+  "hub_frames": {
+    "hello": {"type": "hello"},
+    "ping": {"type": "ping"},
+    "devices": {"type": "devices"},
+    "call_info": {"type": "call", "id": "call-0001", "to": "i1234567", "action": "info", "args": {}},
+    "call_open": {"type": "call", "id": "call-0002", "to": "i1234567", "action": "open", "args": {"url": "https://example.test/"}},
+    "call_notify": {"type": "call", "id": "call-0003", "to": "i1234567", "action": "notify", "args": {"title": "Morde", "text": "Hello"}},
+    "result_info": {"type": "result", "id": "call-0001", "ok": true, "body": {"name": "Desktop", "platform": "desktop", "os": "linux", "version": "1.0", "actions": ["info", "open", "notify"]}},
+    "result_open": {"type": "result", "id": "call-0002", "ok": true, "body": {"opened": true}},
+    "result_notify": {"type": "result", "id": "call-0003", "ok": true, "body": {"notified": true}},
+    "result_denied": {"type": "result", "id": "call-0001", "ok": false, "error": "denied"},
+    "cancel": {"type": "cancel", "id": "call-0001"}
+  },
+  "personal_data": {
+    "profile_read": {"object_type": "profile", "object_id": "default", "revision": 4, "body": {"name": "Muse", "avatar": "dragon"}},
+    "profile_put_request": {"base_revision": 4, "body": {"name": "Muse", "avatar": "dragon"}},
+    "profile_delete_request": {"base_revision": 5},
+    "mutation_receipt": {"object_type": "profile", "object_id": "default", "result_revision": 5, "account_change_sequence": 12, "replay": false},
+    "idempotency_key": "profile-change-001"
   },
   "non_json_error": {
     "status": 502,

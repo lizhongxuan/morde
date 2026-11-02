@@ -79,6 +79,36 @@ describe('Workbench control conflicts', () => {
     await waitFor(() => expect(action).toHaveBeenCalledTimes(2));
     expect(action.mock.calls.map(([request]) => request.expected_control_version)).toEqual([0, 1]);
   });
+
+  it('fails closed when a control refresh fails after the user took over', async () => {
+    vi.useFakeTimers();
+    const userControl = { ...control, control_state: 'user' as const, control_version: 1 };
+    vi.spyOn(gatewayApi, 'control')
+      .mockResolvedValueOnce(userControl)
+      .mockRejectedValueOnce(new Error('connection lost'))
+      .mockResolvedValue(userControl);
+    render(<Workbench />);
+
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByText('当前控制者：你')).toBeVisible();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(screen.getByText('控制状态暂时不可用')).toBeVisible();
+    expect(screen.getByRole('button', { name: '重试读取' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '交回 AI' })).not.toBeInTheDocument();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=true');
+
+    fireEvent.click(screen.getByRole('button', { name: '文件' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('控制状态暂不可用：connection lost');
+    expect(screen.queryByLabelText('当前路径')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试读取' }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByText('当前控制者：你')).toBeVisible();
+    expect(screen.getByRole('button', { name: '交回 AI' })).toBeVisible();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
+  });
 });
 
 describe('Workbench terminal sessions', () => {

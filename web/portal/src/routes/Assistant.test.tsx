@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -205,6 +205,20 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(submit).toHaveBeenCalledWith({ model_id: model.id, objective: '你好' }, expect.any(String)));
     await waitFor(() => expect(screen.getByText('你好！')).toBeInTheDocument());
     expect(taskQuery).toHaveBeenCalledWith('q1234567');
+  });
+
+  it('only offers models that were checked and support text', async () => {
+    mockCommon();
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [
+      model,
+      { ...model, id: 'p1111111', name: '未检查模型', checked_at: null },
+      { ...model, id: 'p2222222', name: '仅视觉模型', capabilities: { ...model.capabilities, text: false } },
+    ] });
+    renderPage();
+
+    const selector = await screen.findByRole('combobox', { name: '选择 AI 模型' });
+    await waitFor(() => expect(selector).toHaveValue(model.id));
+    expect(within(selector).getAllByRole('option').map((option) => (option as HTMLOptionElement).value)).toEqual(['', model.id]);
   });
 
   it('recovers a streaming assistant message from the Task snapshot after conversation history expires', async () => {

@@ -160,6 +160,26 @@ func (a adminAdapter) ListUsers(ctx context.Context, principal identity.Principa
 	return result, nil
 }
 
+func (a adminAdapter) ListUserPage(ctx context.Context, principal identity.Principal, status *identity.AccountStatus, limit, offset int) (app.AdminPage[api.AdminUserRecord], error) {
+	page, err := a.users.ListPage(ctx, principal, status, limit, offset)
+	if err != nil {
+		return app.AdminPage[api.AdminUserRecord]{}, err
+	}
+	result := app.AdminPage[api.AdminUserRecord]{Items: make([]api.AdminUserRecord, 0, len(page.Items)), Total: page.Total, Limit: page.Limit, Offset: page.Offset}
+	for _, value := range page.Items {
+		result.Items = append(result.Items, adminUser(value))
+	}
+	return result, nil
+}
+
+func (a adminAdapter) GetUser(ctx context.Context, principal identity.Principal, id string) (api.AdminUserRecord, error) {
+	value, err := a.users.Get(ctx, principal, id)
+	if err != nil {
+		return api.AdminUserRecord{}, err
+	}
+	return adminUser(value), nil
+}
+
 func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Principal, id string, command api.UpdateAdminUserCommand) (api.AdminUserRecord, error) {
 	var quota *app.ResourceUsage
 	if command.Quota != nil {

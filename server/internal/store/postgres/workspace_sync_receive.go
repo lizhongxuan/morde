@@ -95,12 +95,13 @@ FROM workspace_sync_receive_quota_rejections WHERE owner_id=$1 AND workspace_id=
 				reservation = stored
 				return nil
 			}
-			if previousQuotaState == "paused" {
+			switch previousQuotaState {
+			case "paused":
 				retryReservation = &stored
-			} else if previousQuotaState == "resumed" || previousQuotaState == "superseded" {
+			case "resumed", "superseded":
 				quotaSuperseded = true
 				return nil
-			} else {
+			default:
 				reservation = stored
 				return nil
 			}

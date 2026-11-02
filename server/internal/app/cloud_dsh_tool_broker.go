@@ -20,6 +20,7 @@ type CloudDSHToolBroker struct {
 	runtime        *RuntimeToolExecutor
 	mcpCredentials MCPConnectorCredentialProvider
 	mcpClient      MCPConnectorToolClient
+	hub            *HubService
 }
 
 type CloudDSHTaskCompletion struct {
@@ -33,14 +34,21 @@ type CloudDSHTaskCompletion struct {
 	Inputs                    []ModelInput
 }
 
-func NewCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider, mcpClient MCPConnectorToolClient) (*CloudDSHToolBroker, error) {
+func NewCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider, mcpClient MCPConnectorToolClient, hubs ...*HubService) (*CloudDSHToolBroker, error) {
 	if store == nil || runtime == nil {
 		return nil, errors.New("dsh tool broker dependencies are required")
 	}
 	if (mcpCredentials == nil) != (mcpClient == nil) {
 		return nil, errors.New("MCP connector execution dependencies must be configured together")
 	}
-	return &CloudDSHToolBroker{store: store, runtime: runtime, mcpCredentials: mcpCredentials, mcpClient: mcpClient}, nil
+	if len(hubs) > 1 {
+		return nil, errors.New("at most one Hub service may be configured")
+	}
+	broker := &CloudDSHToolBroker{store: store, runtime: runtime, mcpCredentials: mcpCredentials, mcpClient: mcpClient}
+	if len(hubs) == 1 {
+		broker.hub = hubs[0]
+	}
+	return broker, nil
 }
 
 func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task) ([]AgentToolDefinition, error) {
@@ -64,6 +72,14 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		}
 		if b.authorizeSkillTask(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHSkillReadDefinition())
+		}
+		hubDefinitions, err := b.hubTaskDefinitions(ctx, details.Task)
+		if err != nil {
+			return nil, err
+		}
+		available := maxCloudDSHToolDefinitions - len(definitions) - 1
+		if available > 0 {
+			definitions = append(definitions, hubDefinitions[:min(len(hubDefinitions), available)]...)
 		}
 	}
 	if len(definitions)+1 > maxCloudDSHToolDefinitions {
@@ -393,6 +409,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	if call.Name == cloudDSHSkillReadToolName {
 		return b.executeSkillRead(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if strings.HasPrefix(call.Name, "morde_hub_") {
+		return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if b.mcpClient != nil && strings.HasPrefix(call.Name, cloudDSHMCPToolPrefix) {
 		details, err := b.currentServerTask(ctx, claimed)

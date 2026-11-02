@@ -6,12 +6,14 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
 )
 
@@ -164,11 +166,19 @@ func (h *api) createModelConnection(c *gin.Context) {
 		serviceUnavailable(c)
 		return
 	}
+	if !h.requireModelConnectionAudit(c, principal) {
+		return
+	}
 	item, err := h.deps.ModelConnections.Create(c.Request.Context(), principal, app.ModelConnectionCommand{
 		Name: request.Name, BaseURL: request.BaseURL, ModelName: request.ModelName, APIKey: request.APIKey, Shared: request.Shared,
 	})
 	if err != nil {
 		writeError(c, err)
+		return
+	}
+	if !h.writeModelConnectionAudit(c, principal, audit.ActionModelConnectionCreate, item.ID, map[string]any{
+		"shared": item.Shared, "model_name": item.ModelName, "base_host": modelConnectionHost(item.BaseURL), "has_api_key": item.HasAPIKey,
+	}) {
 		return
 	}
 	response, err := toModelConnectionResponse(item)
@@ -196,11 +206,19 @@ func (h *api) updateModelConnection(c *gin.Context) {
 		serviceUnavailable(c)
 		return
 	}
+	if !h.requireModelConnectionAudit(c, principal) {
+		return
+	}
 	item, err := h.deps.ModelConnections.Update(c.Request.Context(), principal, id, app.ModelConnectionCommand{
 		Name: request.Name, BaseURL: request.BaseURL, ModelName: request.ModelName, APIKey: request.APIKey,
 	})
 	if err != nil {
 		writeError(c, err)
+		return
+	}
+	if !h.writeModelConnectionAudit(c, principal, audit.ActionModelConnectionUpdate, item.ID, map[string]any{
+		"shared": item.Shared, "model_name": item.ModelName, "base_host": modelConnectionHost(item.BaseURL), "api_key_replaced": request.APIKey != "",
+	}) {
 		return
 	}
 	response, err := toModelConnectionResponse(item)
@@ -224,8 +242,25 @@ func (h *api) deleteModelConnection(c *gin.Context) {
 		serviceUnavailable(c)
 		return
 	}
+	if !h.requireModelConnectionAudit(c, principal) {
+		return
+	}
+	var item app.ModelConnectionView
+	if principal.Role.IsAdmin() {
+		var err error
+		item, err = h.deps.ModelConnections.Get(c.Request.Context(), principal, id)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+	}
 	if err := h.deps.ModelConnections.Delete(c.Request.Context(), principal, id); err != nil {
 		writeError(c, err)
+		return
+	}
+	if !h.writeModelConnectionAudit(c, principal, audit.ActionModelConnectionDelete, id, map[string]any{
+		"shared": item.Shared, "model_name": item.ModelName, "base_host": modelConnectionHost(item.BaseURL),
+	}) {
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -244,6 +279,9 @@ func (h *api) checkModelConnection(c *gin.Context) {
 		serviceUnavailable(c)
 		return
 	}
+	if !h.requireModelConnectionAudit(c, principal) {
+		return
+	}
 	request := struct {
 		Capability string `json:"capability"`
 	}{Capability: "all"}
@@ -255,9 +293,44 @@ func (h *api) checkModelConnection(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
+	if !h.writeModelConnectionAudit(c, principal, audit.ActionModelConnectionCheck, id, map[string]any{
+		"capability": request.Capability, "text": capabilities.Text, "tools": capabilities.Tools, "vision": capabilities.Vision,
+	}) {
+		return
+	}
 	c.JSON(http.StatusOK, modelConnectionCapabilities{
 		Text: capabilities.Text, Tools: capabilities.Tools, Vision: capabilities.Vision,
 	})
+}
+
+func (h *api) requireModelConnectionAudit(c *gin.Context, principal identity.Principal) bool {
+	if !principal.Role.IsAdmin() || h.deps.AdminAudit != nil {
+		return true
+	}
+	serviceUnavailable(c)
+	return false
+}
+
+func (h *api) writeModelConnectionAudit(c *gin.Context, principal identity.Principal, action audit.Action, target string, detail map[string]any) bool {
+	if !principal.Role.IsAdmin() {
+		return true
+	}
+	if err := h.deps.AdminAudit.Write(c.Request.Context(), audit.Entry{
+		ActorID: principal.UserID, ActorKind: audit.ActorSession, Action: action,
+		Target: target, Detail: detail, IP: c.ClientIP(),
+	}); err != nil {
+		writeError(c, err)
+		return false
+	}
+	return true
+}
+
+func modelConnectionHost(baseURL string) string {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }
 
 func modelSession(c *gin.Context) (identity.Principal, bool) {

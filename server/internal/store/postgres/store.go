@@ -125,7 +125,7 @@ WHERE h.id=ANY($1::text[])`, ids, host.RuntimeHeartbeatFreshness.Seconds())
 		}
 		index, exists := byID[id]
 		if !exists {
-			return fmt.Errorf("Host Runtime liveness returned an unexpected Host")
+			return fmt.Errorf("host runtime liveness returned an unexpected host")
 		}
 		hosts[index].WorkspaceRuntimeOnline = online
 		hosts[index].WorkspaceRuntimeLastSeenAt = timePointer(lastSeen)
@@ -382,6 +382,10 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 			}
 			if _, err := tx.Exec(ctx, `UPDATE tokens SET revoked_at=COALESCE(revoked_at, now()) WHERE owner_id=$1 AND revoked_at IS NULL`, value.ID); err != nil {
 				return fmt.Errorf("revoke account credentials: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE client_installations SET revoked_at=COALESCE(revoked_at, now())
+  WHERE owner_id=$1 AND revoked_at IS NULL`, value.ID); err != nil {
+				return fmt.Errorf("revoke account client installations: %w", err)
 			}
 			if err := revokeWorkspaceSyncDevicesForOwner(ctx, tx, value.ID); err != nil {
 				return err
