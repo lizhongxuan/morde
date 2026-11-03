@@ -51,6 +51,9 @@ func modelProbeFixture(t *testing.T, usage app.ModelUsage) (*Store, *app.ModelGa
 	t.Helper()
 	store, credentials, _, owner := clientLoginFixture(t)
 	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE users SET role='admin' WHERE id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
 	login, err := credentials.Login(ctx, owner.Name, "client-password-123", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +74,7 @@ func modelProbeFixture(t *testing.T, usage app.ModelUsage) (*Store, *app.ModelGa
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := models.Create(ctx, principal, app.ModelConnectionCommand{Name: "probe model", BaseURL: "https://model.example/v1", ModelName: "test-model", APIKey: "synthetic-key"})
+	created, err := models.Create(ctx, principal, app.ModelConnectionCommand{Name: "probe model", BaseURL: "https://model.example/v1", ModelName: "test-model", APIKey: "synthetic-key", Shared: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +149,10 @@ func TestPostgresModelGatewayHTTPSettlesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, err := models.Create(ctx, portal, app.ModelConnectionCommand{
-		Name: "integration model", BaseURL: "https://model.example/v1", ModelName: "test-model", APIKey: "synthetic-key",
+	platformAdmin := portal
+	platformAdmin.Role = identity.RoleAdmin
+	connection, err := models.Create(ctx, platformAdmin, app.ModelConnectionCommand{
+		Name: "integration model", BaseURL: "https://model.example/v1", ModelName: "test-model", APIKey: "synthetic-key", Shared: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -237,8 +242,8 @@ func modelUsageFixture(t *testing.T) (*Store, identity.Principal, app.ModelCallR
 	}
 	var version time.Time
 	err = store.pool.QueryRow(ctx, `INSERT INTO model_connections(id,owner_id,name,base_url,model_name,api_key_cipher,
- capability_text,capability_tools,capability_vision,checked_at) VALUES ('p1234567',$1,'model','https://model.example/v1','test-model',
- decode(repeat('01',29),'hex'),true,true,true,now()) RETURNING updated_at`, owner.ID).Scan(&version)
+ capability_text,capability_tools,capability_vision,checked_at) VALUES ('p1234567',NULL,'model','https://model.example/v1','test-model',
+ decode(repeat('01',29),'hex'),true,true,true,now()) RETURNING updated_at`).Scan(&version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +392,7 @@ VALUES ('q1234567',$1,'agent-1',2,'session-1','engine','profile','supervisor-1',
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := app.ModelTaskFence{TaskID: "q1234567", OwnerID: principal.UserID, LeaseOwner: "worker-1", LeaseVersion: 3,
+	fence := app.ModelTaskFence{TaskID: "q1234567", OwnerID: principal.UserID, InitiatorID: principal.UserID, LeaseOwner: "worker-1", LeaseVersion: 3,
 		AgentInstanceID: "agent-1", AgentGeneration: 2, AgentSessionID: "session-1", AuthorizationVersion: 7, ThroughSequence: 0,
 		EngineVersion: "engine", ProfileVersion: "profile"}
 	reservation.Source, reservation.Task, reservation.Principal = app.ModelCallTask, &fence, identity.Principal{}
@@ -595,7 +600,8 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	nonce := make([]byte, 32)
 	nonce[0] = 1
 	started, replayed, err := agents.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
-		TaskID: claimed.ID, OwnerID: principal.UserID, AgentInstanceID: "agent-1", AgentSessionID: "session-1", SupervisorID: "supervisor-1",
+		TaskID: claimed.ID, OwnerID: principal.UserID, InitiatorID: principal.UserID,
+		AgentInstanceID: "agent-1", AgentSessionID: "session-1", SupervisorID: "supervisor-1",
 		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AuthorizationVersion: 1,
 		EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"}, SupervisorNonce: nonce, LeaseDuration: 30 * time.Second})
 	if err != nil || replayed {
@@ -607,7 +613,8 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	}
 	payload := []byte(`{"header":{"id":"session-1"},"from_seq":0,"events":[{"seq":0,"type":"message"}]}`)
 	digest := sha256.Sum256(payload)
-	checkpointFence := app.AgentCheckpointFence{TaskID: claimed.ID, OwnerID: principal.UserID, AgentInstanceID: started.Fence.AgentInstanceID,
+	checkpointFence := app.AgentCheckpointFence{TaskID: claimed.ID, OwnerID: principal.UserID, InitiatorID: principal.UserID,
+		AgentInstanceID: started.Fence.AgentInstanceID,
 		AgentGeneration: started.Fence.AgentGeneration, AgentSessionID: started.Fence.AgentSessionID, AuthorizationVersion: 1,
 		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"}
 	if _, err := checkpoint.Save(ctx, app.AgentCheckpointCommand{Fence: checkpointFence, From: 0, Through: 0, Digest: digest[:], Payload: payload}); err != nil {
@@ -622,7 +629,8 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := app.ModelTaskFence{TaskID: claimed.ID, OwnerID: principal.UserID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+	fence := app.ModelTaskFence{TaskID: claimed.ID, OwnerID: principal.UserID, InitiatorID: principal.UserID,
+		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		AgentInstanceID: started.Fence.AgentInstanceID, AgentGeneration: started.Fence.AgentGeneration,
 		AgentSessionID: started.Fence.AgentSessionID, AuthorizationVersion: 1, ThroughSequence: 0,
 		EngineVersion: started.Fence.EngineVersion, ProfileVersion: started.Fence.ProfileVersion}

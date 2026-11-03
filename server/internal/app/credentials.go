@@ -148,8 +148,11 @@ func (s *CredentialService) Login(ctx context.Context, name, password, ip string
 }
 
 func (s *CredentialService) ensureDefaultHost(ctx context.Context, user identity.User) error {
-	_, _, err := s.defaultHosts.EnsureDefaultStopped(ctx, user)
-	return err
+	// Creating the default Host and Workspace is best-effort onboarding. Quota,
+	// storage, or Workspace initialization failures must not prevent a valid
+	// user from receiving a session credential.
+	_, _, _ = s.defaultHosts.EnsureDefaultStopped(ctx, user)
+	return nil
 }
 
 func (s *CredentialService) authenticatePassword(ctx context.Context, name, password, ip string) (identity.User, error) {

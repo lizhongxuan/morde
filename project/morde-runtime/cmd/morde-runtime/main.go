@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"morde-runtime/contract"
+	"morde-runtime/internal/operationstore"
 	"morde-runtime/runtime_desktop"
 	"morde-runtime/runtimeactions"
 	"morde-runtime/runtimeapplications"
@@ -31,7 +32,7 @@ const (
 	replicaCredentialPath = "/run/morde-runtime/replica-credential"
 	storePath             = "/var/lib/morde-runtime"
 	workspacePath         = "/home/gem/workspace"
-	applicationStorePath  = "/opt/morde/apps"
+	applicationStorePath  = "/run/morde-runtime/apps"
 )
 
 func main() {
@@ -117,6 +118,22 @@ func run() error {
 	if err != nil {
 		return errors.New("runtime credential unavailable")
 	}
+	portalURL := os.Getenv("MORDE_PORTAL_URL")
+	if portalURL == "" {
+		return errors.New("Host Replica Portal origin unavailable")
+	}
+	replicaCredential, err := runtimeidentity.ReadReplicaCredentialFile(replicaCredentialPath)
+	if err != nil {
+		return errors.New("Host Replica credential unavailable")
+	}
+	coreLedger, err := operationstore.OpenRemote(operationstore.RemoteOptions{
+		HostID: hostID, Generation: generation, Namespace: operationstore.RemoteNamespaceCore,
+		PortalURL: portalURL, Credential: replicaCredential,
+	})
+	if err != nil {
+		return errors.New("runtime Portal operation ledger unavailable")
+	}
+	defer coreLedger.Close()
 	applicationDomain, domainErr := runtimeactions.NewApplicationProcessDomain(runtimeactions.ApplicationProcessDomainOptions{})
 	if domainErr != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: native application launch unavailable")
@@ -160,18 +177,20 @@ func run() error {
 		_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: desktop capabilities unavailable")
 	}
 	var browser *runtimebrowser.Controller
+	var browserLedger *operationstore.Remote
 	if os.Getenv("DISABLE_BROWSER") != "true" {
-		var browserErr error
-		browser, browserErr = runtimebrowser.NewHandlers(runtimebrowser.Options{
-			StoreDir: storePath, ExpectedOwnerUID: 0, Endpoint: os.Getenv("MORDE_BROWSER_CDP_ENDPOINT"),
+		browserLedger, err = operationstore.OpenRemote(operationstore.RemoteOptions{
+			HostID: hostID, Generation: generation, Namespace: operationstore.RemoteNamespaceBrowser,
+			PortalURL: portalURL, Credential: replicaCredential,
 		})
-		if browserErr == nil {
-			handlers = append(handlers, browser.Handlers()...)
-		} else {
-			// Browser tools are advertised only after an isolated-context CDP probe
-			// proves they cannot attach to or close a user's default-profile tabs.
-			_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: browser capabilities unavailable")
+		if err != nil {
+			return errors.New("runtime browser operation ledger unavailable")
 		}
+		defer func() {
+			if browserLedger != nil {
+				_ = browserLedger.Close()
+			}
+		}()
 	}
 	var manager *runtimecore.Manager
 	managerClosed := false
@@ -194,11 +213,30 @@ func run() error {
 		}
 	}()
 	manager, err = runtimecore.Open(runtimecore.Options{
-		StoreDir: storePath, ExpectedOwnerUID: 0, HostID: hostID, Generation: generation,
+		StoreDir: storePath, ExpectedOwnerUID: 0, Store: coreLedger, HostID: hostID, Generation: generation,
 		ProtocolVersion: contract.ProtocolVersion, Handlers: handlers, TaskWorkspaceViews: workspace,
 	})
 	if err != nil {
 		return errors.New("runtime operation store unavailable")
+	}
+	if browserLedger != nil {
+		var browserErr error
+		browser, browserErr = runtimebrowser.NewHandlers(runtimebrowser.Options{
+			StoreDir: storePath, ExpectedOwnerUID: 0, Store: browserLedger, Endpoint: os.Getenv("MORDE_BROWSER_CDP_ENDPOINT"),
+		})
+		if browserErr != nil {
+			if errors.Is(browserErr, runtimebrowser.ErrOperationLedgerUnavailable) ||
+				errors.Is(browserErr, operationstore.ErrStoreUnhealthy) || errors.Is(browserErr, operationstore.ErrStoreClosed) {
+				return errors.New("runtime browser operation ledger reconciliation failed")
+			}
+			_ = browserLedger.Close()
+			browserLedger = nil
+			// Browser tools are advertised only after an isolated-context CDP probe
+			// proves they cannot attach to or close a user's default-profile tabs.
+			_, _ = fmt.Fprintln(os.Stderr, "morde-runtime: browser capabilities unavailable")
+		} else if err := manager.RegisterHandlers(browser.Handlers()); err != nil {
+			return errors.New("runtime browser capabilities could not be installed")
+		}
 	}
 	currentCapabilities, err := manager.Capabilities(contract.CapabilitiesRequest{
 		ProtocolVersion: contract.ProtocolVersion, HostID: hostID, RuntimeGeneration: generation,
@@ -232,11 +270,7 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
-	if portalURL := os.Getenv("MORDE_PORTAL_URL"); portalURL != "" {
-		replicaCredential, err := runtimeidentity.ReadReplicaCredentialFile(replicaCredentialPath)
-		if err != nil {
-			return errors.New("Host workspace replica credential unavailable")
-		}
+	if portalURL != "" {
 		replica, err := workspacereplica.New(workspacereplica.Options{
 			HostID: hostID, Generation: generation, PortalURL: portalURL,
 			BootstrapCredential: replicaCredential, WorkspaceRoot: workspacePath,

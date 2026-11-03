@@ -13,6 +13,8 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/task"
 )
 
 func validateNormalizedTaskMCPConnectorIDs(connectorIDs []string) error {
@@ -27,10 +29,12 @@ func validateNormalizedTaskMCPConnectorIDs(connectorIDs []string) error {
 	return nil
 }
 
-// insertTaskMCPConnectorGrants validates and locks all selected enabled
-// connectors before recording their version snapshots in the task transaction.
-func insertTaskMCPConnectorGrants(ctx context.Context, tx pgx.Tx, ownerID, taskID string, connectorIDs []string) error {
-	if !domain.ValidUserID(ownerID) || !domain.ValidTaskID(taskID) {
+// insertTaskMCPConnectorGrants keeps the grant keyed by Task owner while
+// snapshotting the separately owned personal connector. Project Tasks must
+// select only connectors with an active, explicit project grant.
+func insertTaskMCPConnectorGrants(ctx context.Context, tx pgx.Tx, taskValue task.Task, connectorIDs []string) error {
+	if !domain.ValidUserID(taskValue.OwnerID) || !domain.ValidUserID(taskValue.InitiatorID) || !domain.ValidTaskID(taskValue.ID) ||
+		(taskValue.ProjectID != "" && !project.ValidID(taskValue.ProjectID)) {
 		return domain.InvalidArgument("mcp_connector_ids", "MCP connector grant fields are invalid")
 	}
 	if err := validateNormalizedTaskMCPConnectorIDs(connectorIDs); err != nil {
@@ -39,24 +43,44 @@ func insertTaskMCPConnectorGrants(ctx context.Context, tx pgx.Tx, ownerID, taskI
 	if len(connectorIDs) == 0 {
 		return nil
 	}
-	rows, err := tx.Query(ctx, `
-SELECT id, revision, credential_version
+	query := `
+SELECT id, owner_id, revision, credential_version, NULL::text, NULL::bigint
 FROM mcp_connectors
 WHERE owner_id=$1 AND enabled=true AND id=ANY($2::text[])
 ORDER BY id
-FOR SHARE`, ownerID, connectorIDs)
+FOR SHARE`
+	args := []any{taskValue.OwnerID, connectorIDs}
+	if taskValue.ProjectID != "" {
+		query = `
+SELECT g.connector_id, g.connector_owner_id, c.revision, c.credential_version, g.project_id, g.version
+FROM project_mcp_connector_grants g
+JOIN project_members actor_member ON actor_member.project_id=g.project_id AND actor_member.user_id=$2
+JOIN users actor_user ON actor_user.id=actor_member.user_id AND actor_user.status='approved'
+JOIN project_members connector_owner_member ON connector_owner_member.project_id=g.project_id AND connector_owner_member.user_id=g.connector_owner_id
+JOIN users connector_owner_user ON connector_owner_user.id=connector_owner_member.user_id AND connector_owner_user.status='approved'
+JOIN mcp_connectors c ON c.id=g.connector_id AND c.owner_id=g.connector_owner_id AND c.enabled
+WHERE g.project_id=$1 AND g.active AND g.authorized_by=g.connector_owner_id AND g.connector_id=ANY($3::text[])
+ORDER BY g.connector_id
+FOR SHARE OF g,actor_member,actor_user,connector_owner_member,connector_owner_user,c`
+		args = []any{taskValue.ProjectID, taskValue.InitiatorID, connectorIDs}
+	}
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("lock selected MCP connectors: %w", err)
 	}
 	type connectorSnapshot struct {
-		id                string
-		revision          int64
-		credentialVersion int64
+		id                  string
+		ownerID             string
+		revision            int64
+		credentialVersion   int64
+		projectID           *string
+		projectGrantVersion *int64
 	}
 	snapshots := make([]connectorSnapshot, 0, len(connectorIDs))
 	for rows.Next() {
 		var snapshot connectorSnapshot
-		if err := rows.Scan(&snapshot.id, &snapshot.revision, &snapshot.credentialVersion); err != nil {
+		if err := rows.Scan(&snapshot.id, &snapshot.ownerID, &snapshot.revision, &snapshot.credentialVersion,
+			&snapshot.projectID, &snapshot.projectGrantVersion); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan selected MCP connector: %w", err)
 		}
@@ -72,10 +96,15 @@ FOR SHARE`, ownerID, connectorIDs)
 		return domain.NewError(domain.CodeNotFound, "MCP connector not found")
 	}
 	for _, snapshot := range snapshots {
+		var projectID any
+		if snapshot.projectID != nil {
+			projectID = *snapshot.projectID
+		}
 		if _, err := tx.Exec(ctx, `
 INSERT INTO task_mcp_connector_grants
-  (task_id, owner_id, connector_id, connector_revision, credential_version)
-VALUES ($1, $2, $3, $4, $5)`, taskID, ownerID, snapshot.id, snapshot.revision, snapshot.credentialVersion); err != nil {
+  (task_id, owner_id, connector_id, connector_revision, credential_version, connector_owner_id, project_id, project_grant_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, taskValue.ID, taskValue.OwnerID, snapshot.id, snapshot.revision,
+			snapshot.credentialVersion, snapshot.ownerID, projectID, snapshot.projectGrantVersion); err != nil {
 			return fmt.Errorf("create task MCP connector grant: %w", err)
 		}
 	}
@@ -113,8 +142,9 @@ WHERE owner_id=$1 AND task_id=$2 AND revoked_at IS NULL ORDER BY connector_id`, 
 
 func listTaskMCPConnectorGrantsTx(ctx context.Context, tx pgx.Tx, ownerID, taskID string) ([]app.TaskMCPConnectorGrant, error) {
 	rows, err := tx.Query(ctx, `
-SELECT task_id, owner_id, connector_id, connector_revision, credential_version,
-       grant_version, tool_schema, tool_schema_sha256, revoked_at, created_at, updated_at
+SELECT task_id, owner_id, connector_owner_id, COALESCE(project_id,''), COALESCE(project_grant_version,0),
+       connector_id, connector_revision, credential_version, grant_version, tool_schema, tool_schema_sha256,
+       revoked_at, created_at, updated_at
 FROM task_mcp_connector_grants
 WHERE owner_id=$1 AND task_id=$2
 ORDER BY connector_id`, ownerID, taskID)
@@ -146,9 +176,9 @@ func scanTaskMCPConnectorGrant(row taskMCPConnectorGrantScanner) (app.TaskMCPCon
 	var digest []byte
 	var revokedAt *time.Time
 	err := row.Scan(
-		&grant.TaskID, &grant.OwnerID, &grant.ConnectorID, &grant.ConnectorRevision,
-		&grant.CredentialVersion, &grant.GrantVersion, &schema, &digest, &revokedAt,
-		&grant.CreatedAt, &grant.UpdatedAt,
+		&grant.TaskID, &grant.OwnerID, &grant.ConnectorOwnerID, &grant.ProjectID, &grant.ProjectGrantVersion,
+		&grant.ConnectorID, &grant.ConnectorRevision, &grant.CredentialVersion, &grant.GrantVersion,
+		&schema, &digest, &revokedAt, &grant.CreatedAt, &grant.UpdatedAt,
 	)
 	if err != nil {
 		return app.TaskMCPConnectorGrant{}, err
@@ -224,8 +254,9 @@ WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3
 			}
 		}
 		grant, err = scanTaskMCPConnectorGrant(tx.QueryRow(ctx, `
-SELECT task_id, owner_id, connector_id, connector_revision, credential_version,
-       grant_version, tool_schema, tool_schema_sha256, revoked_at, created_at, updated_at
+SELECT task_id, owner_id, connector_owner_id, COALESCE(project_id,''), COALESCE(project_grant_version,0),
+       connector_id, connector_revision, credential_version, grant_version, tool_schema, tool_schema_sha256,
+       revoked_at, created_at, updated_at
 FROM task_mcp_connector_grants WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3`, ownerID, taskID, connectorID))
 		if err != nil {
 			return fmt.Errorf("read pinned task MCP connector grant: %w", err)
@@ -274,8 +305,9 @@ WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 FOR UPDATE`, ownerID, taskI
 UPDATE task_mcp_connector_grants
 SET revoked_at=clock_timestamp(), grant_version=grant_version+1, updated_at=clock_timestamp()
 WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 AND grant_version=$4 AND revoked_at IS NULL
-RETURNING task_id, owner_id, connector_id, connector_revision, credential_version,
-          grant_version, tool_schema, tool_schema_sha256, revoked_at, created_at, updated_at`,
+RETURNING task_id, owner_id, connector_owner_id, COALESCE(project_id,''), COALESCE(project_grant_version,0),
+          connector_id, connector_revision, credential_version, grant_version, tool_schema, tool_schema_sha256,
+          revoked_at, created_at, updated_at`,
 			ownerID, taskID, connectorID, expectedGrantVersion))
 		if err != nil {
 			return fmt.Errorf("revoke task MCP connector grant: %w", err)

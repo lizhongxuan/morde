@@ -23,12 +23,28 @@ func (s *Store) MarkCreateAttempt(ctx context.Context, hostID string) error {
 	result, err := s.pool.Exec(ctx, `
 UPDATE hosts
 SET create_attempted_at = now(), updated_at = now()
-WHERE id = $1 AND state = 'creating' AND create_attempted_at IS NULL`, hostID)
+WHERE id = $1 AND state = 'creating' AND create_attempted_at IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM workspace_bindings wb
+    JOIN workspace_copy_reservations c ON c.source_workspace_id=wb.workspace_id
+    WHERE wb.host_id=hosts.id AND wb.state <> 'detached' AND c.state IN ('reserved','copying','unknown')
+  )`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark host create attempt: %w", err)
 	}
 	if result.RowsAffected() == 1 {
 		return nil
+	}
+	var copyFrozen bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_bindings wb
+JOIN workspace_copy_reservations c ON c.source_workspace_id=wb.workspace_id
+WHERE wb.host_id=$1 AND wb.state <> 'detached' AND c.state IN ('reserved','copying','unknown')
+)`, hostID).Scan(&copyFrozen); err != nil {
+		return fmt.Errorf("check Workspace copy before Host create attempt: %w", err)
+	}
+	if copyFrozen {
+		return domain.NewError(domain.CodeWorkspaceBusy, "Workspace copy is in progress")
 	}
 
 	current, err := s.GetHost(ctx, hostID)
@@ -474,6 +490,9 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 		if err != nil {
 			return err
 		}
+		if err := lockUsableHostWorkspaceBinding(ctx, tx, current.ID, current.OwnerID); err != nil {
+			return err
+		}
 		result = current
 		if current.State == host.StateCreating && current.RuntimeGeneration > 1 &&
 			(current.StateReason == "restore_pending" || current.StateReason == "restore_unknown") {
@@ -515,7 +534,8 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 		tag, err := tx.Exec(ctx, `
 UPDATE hosts
 SET state='creating', state_reason='restore_pending', runtime_generation=runtime_generation+1,
-    control_version=0, control_state='ai', runtime_instance_id=NULL, sandbox_id=NULL,
+    control_version=0, control_state='ai', control_actor_id=NULL, control_lease_expires_at=NULL,
+    runtime_instance_id=NULL, sandbox_id=NULL,
     create_attempted_at=NULL, runtime_credential_enc=$2, expires_at=$3,
     last_active_at=now(), updated_at=now()
 WHERE id=$1 AND state='stopped' AND runtime_generation=$4 AND deleted_at IS NULL`,
@@ -541,6 +561,52 @@ WHERE id=$1 AND state='stopped' AND runtime_generation=$4 AND deleted_at IS NULL
 		return host.Host{}, false, err
 	}
 	return result, changed, nil
+}
+
+func lockUsableHostWorkspaceBinding(ctx context.Context, tx pgx.Tx, hostID, ownerID string) error {
+	rows, err := tx.Query(ctx, `SELECT wb.workspace_id, wb.owner_id, wb.state, wb.sync_state,
+       w.owner_id, w.state, (w.deleted_at IS NULL)
+FROM workspace_bindings AS wb
+JOIN workspaces AS w ON w.id=wb.workspace_id
+WHERE wb.host_id=$1 AND wb.state <> 'detached'
+ORDER BY wb.workspace_id
+FOR UPDATE OF wb, w`, hostID)
+	if err != nil {
+		return fmt.Errorf("lock Host workspace binding before restore: %w", err)
+	}
+	defer rows.Close()
+	count := 0
+	valid := true
+	workspaceIDs := make([]string, 0, 1)
+	for rows.Next() {
+		var workspaceID, bindingOwner, bindingState, syncState, workspaceOwner, workspaceState string
+		var workspaceAvailable bool
+		if err := rows.Scan(&workspaceID, &bindingOwner, &bindingState, &syncState, &workspaceOwner, &workspaceState, &workspaceAvailable); err != nil {
+			return fmt.Errorf("read Host workspace binding before restore: %w", err)
+		}
+		count++
+		workspaceIDs = append(workspaceIDs, workspaceID)
+		if bindingOwner != ownerID || workspaceOwner != ownerID || !workspaceAvailable ||
+			workspaceState != string(workspace.StateReady) || syncState != string(workspace.BindingSyncHealthy) ||
+			(bindingState != string(workspace.BindingPreparing) && bindingState != string(workspace.BindingActive)) {
+			valid = false
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read Host workspace bindings before restore: %w", err)
+	}
+	if count != 1 {
+		return domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
+	}
+	for _, workspaceID := range workspaceIDs {
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
+		}
+	}
+	if !valid {
+		return domain.NewError(domain.CodeWorkspaceBusy, "host workspace binding is not available")
+	}
+	return nil
 }
 
 func (s *Store) SetHostStateReason(ctx context.Context, hostID string, expected host.State, generation int64, reason string) error {

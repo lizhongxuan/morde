@@ -51,7 +51,7 @@ type scheduleCreateRequest struct {
 
 type scheduleUpdateRequest struct {
 	ExpectedVersion    *int64                        `json:"expected_version"`
-	HostID             *string                       `json:"host_id"`
+	HostID             json.RawMessage               `json:"host_id"`
 	ModelID            *string                       `json:"model_id"`
 	Objective          *string                       `json:"objective"`
 	Timing             *schedule.Timing              `json:"timing"`
@@ -97,7 +97,7 @@ type scheduleResponse struct {
 	ID                 string                       `json:"id"`
 	Version            int64                        `json:"version"`
 	Status             schedule.Status              `json:"status"`
-	HostID             string                       `json:"host_id"`
+	HostID             *string                      `json:"host_id"`
 	ModelID            string                       `json:"model_id"`
 	Objective          string                       `json:"objective"`
 	Timing             schedule.Timing              `json:"timing"`
@@ -249,8 +249,13 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 			writeError(c, domain.InvalidArgument("expected_version", "expected_version is required and must be positive"))
 			return
 		}
+		hostID, err := parseScheduleHostID(request.HostID)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
 		command := app.UpdateScheduleCommand{
-			ExpectedVersion: *request.ExpectedVersion, HostID: request.HostID, ModelID: request.ModelID,
+			ExpectedVersion: *request.ExpectedVersion, HostID: hostID, ModelID: request.ModelID,
 			Objective: request.Objective, Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
 			NotificationEvents: request.NotificationEvents,
 		}
@@ -396,8 +401,12 @@ func scheduleIdempotencyKey(c *gin.Context) (string, bool) {
 }
 
 func toScheduleResponse(value schedule.Schedule) scheduleResponse {
+	var hostID *string
+	if value.HostID != "" {
+		hostID = &value.HostID
+	}
 	result := scheduleResponse{
-		ID: value.ID, Version: value.Version, Status: value.Status, HostID: value.HostID, ModelID: value.ModelID,
+		ID: value.ID, Version: value.Version, Status: value.Status, HostID: hostID, ModelID: value.ModelID,
 		Objective: value.Objective, Timing: value.Timing,
 		Budget: scheduleBudgetResponse{
 			ActiveSeconds: value.Budget.ActiveSeconds,
@@ -420,6 +429,21 @@ func toScheduleResponse(value schedule.Schedule) scheduleResponse {
 		result.CurrentRun = &currentRun
 	}
 	return result
+}
+
+func parseScheduleHostID(raw json.RawMessage) (*string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		hostID := ""
+		return &hostID, nil
+	}
+	var hostID string
+	if err := json.Unmarshal(raw, &hostID); err != nil {
+		return nil, err
+	}
+	return &hostID, nil
 }
 
 func toScheduleRunResponse(value schedule.Run) scheduleRunResponse {

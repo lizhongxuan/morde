@@ -41,6 +41,16 @@ type Event struct {
 	Hash         string          `json:"hash"`
 }
 
+// EventStore is the append-only contract shared by the local migration source
+// and the Portal-backed ledger. Implementations must not expose an event until
+// Append has durably committed it.
+type EventStore interface {
+	Events() ([]Event, error)
+	Append(kind string, data any) error
+	Ready() bool
+	Close() error
+}
+
 type hashInput struct {
 	Version      int             `json:"version"`
 	Sequence     uint64          `json:"sequence"`

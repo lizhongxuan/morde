@@ -11,11 +11,17 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 )
 
 type modelGatewayStoreTest struct {
 	reservation ModelCallReservation
 	settlement  ModelCallSettlement
+	taskProject string
+	scopeErr    error
+	reserveN    int
+	dispatchN   int
+	settleN     int
 	reserveErr  error
 	dispatchErr error
 	dispatch    bool
@@ -24,16 +30,23 @@ type modelGatewayStoreTest struct {
 }
 
 func (s *modelGatewayStoreTest) ReserveModelCall(_ context.Context, value ModelCallReservation) error {
+	s.reserveN++
 	s.reservation = value
 	return s.reserveErr
 }
 
+func (s *modelGatewayStoreTest) ModelTaskProjectID(_ context.Context, _ ModelTaskFence) (string, error) {
+	return s.taskProject, s.scopeErr
+}
+
 func (s *modelGatewayStoreTest) BeginModelCallDispatch(_ context.Context, value ModelCallReservation) error {
+	s.dispatchN++
 	s.reservation, s.dispatch = value, true
 	return s.dispatchErr
 }
 
 func (s *modelGatewayStoreTest) SettleModelCall(ctx context.Context, value ModelCallSettlement) error {
+	s.settleN++
 	s.settlement, s.settledCtx = value, ctx.Err()
 	return s.settleErr
 }
@@ -178,7 +191,7 @@ func TestTaskModelRequestUsesTheCheckpointedDSHFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
 		EngineVersion: "dsh-1", ProfileVersion: "v1"}
 	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
@@ -205,9 +218,51 @@ func TestTaskModelRequestUsesTheCheckpointedDSHFrame(t *testing.T) {
 	}
 }
 
+func TestModelGatewayProjectTaskUsesAtomicBudgetPathAndFailsClosedWhenUnwired(t *testing.T) {
+	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: projectBudgetTestOwner, InitiatorID: projectBudgetTestMember,
+		LeaseOwner: "worker-1", LeaseVersion: 1, AgentInstanceID: "agent-1", AgentGeneration: 1,
+		AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0, EngineVersion: "dsh-1", ProfileVersion: "v1"}
+	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelCall{Source: ModelCallTask, Task: &fence, ModelID: "p1234567", CallID: callID,
+		RawRequest: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"do work"}]}],"tools":[],"max_tokens":16}`)}
+	store := &modelGatewayStoreTest{taskProject: projectBudgetTestID}
+	budget, projectStore, _, rates := projectBudgetServiceFixture(t, project.RoleMember)
+	rates.rate.Model = "test-model"
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "done", Usage: ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, err := service.Complete(context.Background(), call); err != nil || response.Text != "done" {
+		t.Fatalf("project Task model call = %#v, %v", response, err)
+	}
+	reserved := projectStore.reservation
+	if store.reserveN != 0 || store.dispatchN != 1 || store.settleN != 0 || client.calls != 1 ||
+		projectStore.reserveCalls != 1 || projectStore.settleCalls != 1 || reserved.ProjectID != projectBudgetTestID ||
+		reserved.ActorID != projectBudgetTestMember || reserved.TaskID != fence.TaskID || reserved.AccountCall.OwnerID != projectBudgetTestMember ||
+		reserved.AccountCall.Task == nil || reserved.AccountCall.Task.OwnerID != projectBudgetTestOwner ||
+		projectStore.settlement.Unknown || projectStore.settlement.Usage != (project.Usage{InputTokens: 2, OutputTokens: 1}) {
+		t.Fatalf("project budget path was not used atomically: account=%#v project=%#v", store, projectStore)
+	}
+
+	unwired := &modelGatewayStoreTest{taskProject: projectBudgetTestID}
+	unwiredClient := &modelGatewayClientTest{}
+	unwiredService, err := NewModelGatewayService(unwired, &modelGatewayResolverTest{}, unwiredClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unwiredService.Complete(context.Background(), call); domain.CodeOf(err) != domain.CodeUnsupported ||
+		unwired.reserveN != 0 || unwiredClient.calls != 0 {
+		t.Fatalf("project call without budget integration was not rejected before dispatch: %v", err)
+	}
+}
+
 func TestDSHToolImageBecomesAuthorizedModelObservation(t *testing.T) {
 	raw := json.RawMessage(`{"provider":"morde","model":"p1234567","messages":[{"role":"assistant","content":[{"type":"tool-call","id":"call-1","name":"desktop_screenshot","arguments":"{}"}]},{"role":"tool","toolCallId":"call-1","content":[{"type":"text","text":"screenshot captured"},{"type":"image","attachment":{"id":"registered"}}]}],"tools":[]}`)
-	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+	fence := ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 1,
 		EngineVersion: "dsh-1", ProfileVersion: "v1"}
 	request, err := parseDSHModelRequest(context.Background(), fence, "p1234567", raw, modelTaskImageResolverTest{})

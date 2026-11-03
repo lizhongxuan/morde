@@ -88,6 +88,9 @@ func (s *ModelConnectionService) List(ctx context.Context, principal identity.Pr
 	}
 	views := make([]ModelConnectionView, 0, len(records))
 	for _, record := range records {
+		if record.OwnerID != "" {
+			continue
+		}
 		views = append(views, modelConnectionView(record))
 	}
 	sort.Slice(views, func(i, j int) bool {
@@ -119,7 +122,7 @@ func (s *ModelConnectionService) Get(ctx context.Context, principal identity.Pri
 	if err != nil {
 		return ModelConnectionView{}, err
 	}
-	if !canUseModelConnection(principal, record) {
+	if !canUseModelConnection(record) {
 		return ModelConnectionView{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
 	return modelConnectionView(record), nil
@@ -129,8 +132,8 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if err := validateModelPrincipal(principal); err != nil {
 		return ModelConnectionView{}, err
 	}
-	if command.Shared && !principal.Role.IsAdmin() {
-		return ModelConnectionView{}, domain.NewError(domain.CodeForbidden, "administrator role required for shared model connections")
+	if !principal.Role.IsAdmin() || !command.Shared {
+		return ModelConnectionView{}, domain.NewError(domain.CodeForbidden, "administrator role and shared model connection required")
 	}
 	if err := validateModelConnectionCommand(command, s.allowedHost, true); err != nil {
 		return ModelConnectionView{}, err
@@ -143,12 +146,8 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if err != nil {
 		return ModelConnectionView{}, fmt.Errorf("encrypt model API key: %w", err)
 	}
-	ownerID := principal.UserID
-	if command.Shared {
-		ownerID = ""
-	}
 	record, err := s.store.CreateModelConnection(ctx, ModelConnectionRecord{
-		ID: id, OwnerID: ownerID, Name: strings.TrimSpace(command.Name), BaseURL: strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"),
+		ID: id, OwnerID: "", Name: strings.TrimSpace(command.Name), BaseURL: strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"),
 		ModelName: strings.TrimSpace(command.ModelName), APIKeyCipher: ciphertext,
 	})
 	if err != nil {
@@ -255,7 +254,7 @@ func (s *ModelConnectionService) IsConfiguredModel(ctx context.Context, ownerID,
 	if err != nil {
 		return false, err
 	}
-	if record.OwnerID != "" && record.OwnerID != ownerID {
+	if record.OwnerID != "" {
 		return false, nil
 	}
 	return record.CheckedAt != nil && record.Capabilities.Text && record.Capabilities.Tools, nil
@@ -269,7 +268,7 @@ func (s *ModelConnectionService) ResolveEndpoint(ctx context.Context, ownerID, m
 	if err != nil {
 		return ModelEndpoint{}, err
 	}
-	if (record.OwnerID != "" && record.OwnerID != ownerID) || record.CheckedAt == nil || !record.Capabilities.Text || !record.Capabilities.Tools {
+	if record.OwnerID != "" || record.CheckedAt == nil || !record.Capabilities.Text || !record.Capabilities.Tools {
 		return ModelEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
 	key, err := s.sealer.Open(record.APIKeyCipher)
@@ -287,7 +286,7 @@ func (s *ModelConnectionService) ResolveGatewayEndpoint(ctx context.Context, own
 	if err != nil {
 		return ModelGatewayEndpoint{}, err
 	}
-	if (record.OwnerID != "" && record.OwnerID != ownerID) || record.CheckedAt == nil || !record.Capabilities.Text ||
+	if record.OwnerID != "" || record.CheckedAt == nil || !record.Capabilities.Text ||
 		(needsTools && !record.Capabilities.Tools) || (needsVision && !record.Capabilities.Vision) {
 		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
@@ -366,12 +365,12 @@ func validateModelPrincipal(principal identity.Principal) error {
 	return nil
 }
 
-func canUseModelConnection(principal identity.Principal, record ModelConnectionRecord) bool {
-	return record.OwnerID == "" || record.OwnerID == principal.UserID
+func canUseModelConnection(record ModelConnectionRecord) bool {
+	return record.OwnerID == ""
 }
 
 func canManageModelConnection(principal identity.Principal, record ModelConnectionRecord) bool {
-	return record.OwnerID == principal.UserID || (record.OwnerID == "" && principal.Role.IsAdmin())
+	return record.OwnerID == "" && principal.Role.IsAdmin()
 }
 
 func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {

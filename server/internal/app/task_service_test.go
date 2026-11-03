@@ -72,6 +72,8 @@ type taskWorkspaceStoreStub struct {
 	value            workspace.Workspace
 	files            []workspace.File
 	emptyDirectories []string
+	directories      []workspace.Directory
+	manifestOwners   []string
 }
 
 func (s *taskWorkspaceStoreStub) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
@@ -103,7 +105,10 @@ func (s *taskWorkspaceStoreStub) GetWorkspaceManifestPage(_ context.Context, id 
 		start++
 	}
 	end := min(start+int(limit), len(items))
-	page := workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: []workspace.File{}, EmptyDirectories: []string{}}
+	page := workspace.ManifestPage{
+		WorkspaceID: id, Revision: revision, Files: []workspace.File{}, EmptyDirectories: []string{},
+		Directories: append([]workspace.Directory(nil), s.directories...),
+	}
 	for _, value := range items[start:end] {
 		if value.file != nil {
 			page.Files = append(page.Files, *value.file)
@@ -116,6 +121,11 @@ func (s *taskWorkspaceStoreStub) GetWorkspaceManifestPage(_ context.Context, id 
 		page.NextCursor = &cursor
 	}
 	return page, nil
+}
+
+func (s *taskWorkspaceStoreStub) GetWorkspaceManifestPageForOwner(ctx context.Context, ownerID, id string, revision int64, prefix, after string, limit int32) (workspace.ManifestPage, error) {
+	s.manifestOwners = append(s.manifestOwners, ownerID)
+	return s.GetWorkspaceManifestPage(ctx, id, revision, prefix, after, limit)
 }
 
 func (s *taskStoreStub) CreateConversation(_ context.Context, value conversation.Conversation, _ IdempotencyRecord) (conversation.Conversation, bool, error) {
@@ -460,6 +470,9 @@ func TestTaskServicePinsCommittedWorkspaceManifestAndHashesInputRevision(t *test
 	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
 		t.Fatal(err)
 	}
+	if len(store.manifestOwners) != 1 || store.manifestOwners[0] != taskTestPrincipal().UserID {
+		t.Fatalf("Workspace manifest owner scope = %#v, want %q", store.manifestOwners, taskTestPrincipal().UserID)
+	}
 	first := store.submissions[0]
 	expectedDigest, err := workspace.ManifestSHA256(files)
 	if err != nil {
@@ -513,6 +526,72 @@ func TestTaskServiceIncludesEmptyDirectoriesInInputDigest(t *testing.T) {
 	want, _ := hex.DecodeString(expected)
 	if !bytes.Equal(store.submissions[0].Task.ContextDigest, want) {
 		t.Fatalf("Task input digest = %x; want directory-aware %x", store.submissions[0].Task.ContextDigest, want)
+	}
+}
+
+func TestTaskServiceInputDigestIncludesNativeFileAndDirectoryMetadata(t *testing.T) {
+	emptyDigest := sha256.Sum256(nil)
+	file := workspace.File{
+		Path: "src/main.go", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0o640, Chunks: []workspace.Chunk{},
+		MetadataKnown: true, Xattrs: []workspace.ExtendedAttribute{{Name: "user.note", Value: []byte("file-value")}},
+		ACL: &workspace.NativeACL{Platform: "linux", Format: "linux-posix-acl-v1", Data: []byte{1}},
+	}
+	rootMode, rootTime := uint32(0o750), int64(10)
+	srcMode, srcTime := uint32(0o750), int64(20)
+	store := &taskWorkspaceStoreStub{
+		taskStoreStub:    &taskStoreStub{},
+		value:            workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
+		files:            []workspace.File{file},
+		emptyDirectories: []string{"cache"},
+		directories: []workspace.Directory{
+			{Path: ".", Mode: &rootMode, ModTimeNS: &rootTime, MetadataKnown: true,
+				Xattrs: []workspace.ExtendedAttribute{{Name: "user.note", Value: []byte("root-value")}}},
+			{Path: "cache", Mode: &srcMode, ModTimeNS: &srcTime, MetadataKnown: true},
+			{Path: "src", Mode: &srcMode, ModTimeNS: &srcTime, MetadataKnown: true,
+				ACL: &workspace.NativeACL{Platform: "linux", Format: "linux-posix-acl-v1", Data: []byte{2}}},
+		},
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(1)
+	command := SubmitTaskCommand{
+		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		ModelID: "model-a", Objective: "inspect native metadata", IdempotencyKey: "workspace-native-meta-input",
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := workspace.ManifestTreeWithMetadataSHA256(store.files, store.emptyDirectories, store.directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := hex.DecodeString(wantDigest)
+	if !bytes.Equal(store.submissions[0].Task.ContextDigest, want) {
+		t.Fatalf("Task input digest = %x; want metadata digest %x", store.submissions[0].Task.ContextDigest, want)
+	}
+}
+
+func TestTaskServiceRejectsNativeInputMetadataWithoutRootSnapshot(t *testing.T) {
+	emptyDigest := sha256.Sum256(nil)
+	store := &taskWorkspaceStoreStub{
+		taskStoreStub: &taskStoreStub{},
+		value:         workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
+		files: []workspace.File{{Path: "notes.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0o600,
+			Chunks: []workspace.Chunk{}, MetadataKnown: true}},
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(1)
+	command := SubmitTaskCommand{
+		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		ModelID: "model-a", Objective: "inspect the workspace", IdempotencyKey: "workspace-native-meta-missing-root",
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); domain.CodeOf(err) != domain.CodeWorkspaceConflict || len(store.submissions) != 0 {
+		t.Fatalf("Submit() error/submissions = %v/%d; want conflict before task creation", err, len(store.submissions))
 	}
 }
 
@@ -600,32 +679,21 @@ func TestTaskServiceAppendMessageBindsApplicationTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := AppendMessageCommand{HostID: "h1234567", ApplicationID: WechatApplicationID, ModelID: "model-a", Content: "continue", IdempotencyKey: "app-append-001"}
+	command := AppendMessageCommand{ExpectedTaskID: "q1234567", HostID: "h1234567", ApplicationID: WechatApplicationID, ModelID: "model-a", Content: "continue", IdempotencyKey: "app-append-001"}
 	if _, err := service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", command); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.appends) != 1 || store.appends[0].Task.ApplicationID != WechatApplicationID {
+	if len(store.appends) != 1 || store.appends[0].Task.ApplicationID != WechatApplicationID || store.appends[0].ExpectedTaskID != command.ExpectedTaskID {
 		t.Fatalf("append application target = %#v", store.appends)
 	}
+	command.ExpectedTaskID = "invalid"
+	if _, err := service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.appends) != 1 {
+		t.Fatalf("invalid expected Task error=%v, appends=%d", err, len(store.appends))
+	}
 	command.ApplicationID = "unknown"
+	command.ExpectedTaskID = "q1234567"
 	if _, err := service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.appends) != 1 {
 		t.Fatalf("unknown application error=%v, appends=%d", err, len(store.appends))
-	}
-}
-
-func TestInitialAgentInputsKeepApplicationTargetAcrossBatchAndRecovery(t *testing.T) {
-	current := task.Task{ID: "q1234567", HostID: "h1234567", ApplicationID: WechatApplicationID, Objective: "draft a reply"}
-	plain := initialAgentInputs(current, nil)
-	batch := initialAgentInputs(current, &agentBatchScope{Item: task.BatchItem{Key: "first", Input: "look up contact"}})
-	for _, inputs := range [][]ModelInput{plain, batch} {
-		if len(inputs) != 1 || !strings.Contains(inputs[0].Text, "WeChat (wechat) on Host h1234567") || !strings.Contains(inputs[0].Text, "draft a reply") {
-			t.Fatalf("task target is missing from model input: %#v", inputs)
-		}
-	}
-	untargeted := current
-	untargeted.ApplicationID = ""
-	if got := initialAgentInputs(untargeted, nil); len(got) != 1 || got[0].Text != current.Objective {
-		t.Fatalf("untargeted task input changed: %#v", got)
 	}
 }
 
@@ -756,6 +824,43 @@ func TestTaskServiceListEventsPreservesAndAuthorizesExpiredCursorSnapshot(t *tes
 	page, err = service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 3, 50)
 	if domain.CodeOf(err) != domain.CodeNotFound || page.CurrentSequence != 0 || authorizer.calls != 2 {
 		t.Fatalf("unauthorized expired cursor page=%#v err=%v auth=%#v", page, err, authorizer)
+	}
+}
+
+func TestTaskServiceRedactsArtifactsAfterWorkspaceOwnershipTransfer(t *testing.T) {
+	for _, ownerID := range []string{"u1234567", "u7654321"} {
+		store := &taskWorkspaceStoreStub{
+			taskStoreStub: &taskStoreStub{
+				details: TaskDetails{
+					Task:      task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", WorkspaceID: "w1234567"},
+					Artifacts: []task.Artifact{{ID: "a1234567", TaskID: "q1234567", StepID: "s1234567", Path: "reports/private.txt"}},
+				},
+				events: []task.Event{{
+					TaskID: "q1234567", Sequence: 1, Type: "task.artifact", Payload: []byte(`{"path":"reports/private.txt"}`), CreatedAt: time.Now(),
+				}},
+			},
+			value: workspace.Workspace{ID: "w1234567", OwnerID: ownerID, State: workspace.StateReady},
+		}
+		service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		details, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567")
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, err := service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 0, 50)
+		if err != nil || len(page.Items) != 1 {
+			t.Fatalf("artifact event page = %#v, err=%v", page, err)
+		}
+		if ownerID == taskTestPrincipal().UserID {
+			if len(details.Artifacts) != 1 || string(page.Items[0].Payload) != `{"path":"reports/private.txt"}` {
+				t.Fatalf("current Workspace owner lost artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
+			}
+		} else if len(details.Artifacts) != 0 || string(page.Items[0].Payload) != `{"redacted":true}` {
+			t.Fatalf("previous Workspace owner retained artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
+		}
 	}
 }
 

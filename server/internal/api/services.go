@@ -153,6 +153,11 @@ type AdminOperationsService interface {
 	UpdateNudgePolicy(context.Context, identity.Principal, app.UpdateAdminNudgeCommand) (app.AdminNudgePolicy, error)
 }
 
+type AdminModelBudgetDefaultService interface {
+	Get(context.Context, identity.Principal) (app.ModelBudgetDefault, error)
+	Update(context.Context, identity.Principal, app.UpdateModelBudgetDefaultCommand, string) (app.ModelBudgetDefault, error)
+}
+
 type RecordConsentService interface {
 	List(context.Context, identity.Principal) ([]record.Consent, error)
 	Set(context.Context, identity.Principal, record.Purpose, bool) (record.Consent, error)

@@ -18,10 +18,175 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/schedule"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/template"
 	"morde/server/internal/orchestrator"
 	"morde/server/internal/worker"
 )
+
+type cloudDSHAdapters struct {
+	tasks             api.TaskService
+	schedules         api.ScheduleService
+	instantChat       api.InstantChatService
+	scheduleProcessor worker.ScheduleProcessor
+}
+
+func cloudDSHAdaptersForRuntime(enabled bool, tasks api.TaskService, schedules api.ScheduleService,
+	instantChat api.InstantChatService, scheduleProcessor worker.ScheduleProcessor) cloudDSHAdapters {
+	if enabled {
+		return cloudDSHAdapters{tasks: tasks, schedules: schedules, instantChat: instantChat, scheduleProcessor: scheduleProcessor}
+	}
+	return cloudDSHAdapters{
+		tasks:       runtimeUnavailableTaskService{TaskService: tasks},
+		schedules:   runtimeUnavailableScheduleService{ScheduleService: schedules},
+		instantChat: runtimeUnavailableInstantChatService{InstantChatService: instantChat},
+	}
+}
+
+func taskRuntimeUnavailable() error {
+	return domain.NewError(domain.CodeHostNotReady, "task execution runtime is disabled")
+}
+
+type projectConversationTaskAppender struct{ tasks api.TaskService }
+
+func (a projectConversationTaskAppender) AppendProjectMessage(ctx context.Context, principal identity.Principal, projectID, conversationID string,
+	command app.AppendMessageCommand) (app.TaskSubmissionResult, error) {
+	command.ProjectID = projectID
+	return a.tasks.AppendMessage(ctx, principal, conversationID, command)
+}
+
+type projectWorkItemTaskLinkAuthorizer struct{ tasks api.TaskService }
+
+func (a projectWorkItemTaskLinkAuthorizer) AuthorizeProjectTaskLink(ctx context.Context, principal identity.Principal, projectID, taskID string) error {
+	if a.tasks == nil {
+		return domain.NewError(domain.CodeUnsupported, "project Task authorization is unavailable")
+	}
+	details, err := a.tasks.Get(ctx, principal, taskID)
+	if err != nil {
+		return err
+	}
+	if details.Task.ID != taskID || details.Task.ProjectID != projectID {
+		return domain.NewError(domain.CodeForbidden, "Task is not available to this project member")
+	}
+	return nil
+}
+
+type projectWorkspaceManifestReader interface {
+	GetWorkspaceManifest(context.Context, identity.Principal, string, string, int64, string, string, int32) (app.ProjectWorkspaceFilePage, error)
+}
+
+type projectWorkItemDeliveryAuthorizer struct {
+	tasks      api.TaskService
+	projects   projectWorkspaceManifestReader
+	savedProof app.ProjectDeliveryAuthorizer
+}
+
+func (a projectWorkItemDeliveryAuthorizer) AuthorizeSavedProjectDelivery(ctx context.Context, principal identity.Principal, projectID string,
+	evidence project.WorkItemDelivery) error {
+	if a.tasks == nil || a.projects == nil || a.savedProof == nil {
+		return domain.NewError(domain.CodeUnsupported, "project delivery authorization is unavailable")
+	}
+	details, err := a.tasks.Get(ctx, principal, evidence.TaskID)
+	if err != nil {
+		return err
+	}
+	if details.Task.ID != evidence.TaskID || details.Task.ProjectID != projectID || details.Task.WorkspaceID != evidence.WorkspaceID ||
+		details.Task.WorkspaceCheckpointRevision == nil || *details.Task.WorkspaceCheckpointRevision != evidence.Revision {
+		return domain.NewError(domain.CodeWorkspaceConflict, "delivery evidence does not match the readable project Task checkpoint")
+	}
+	manifest, err := a.projects.GetWorkspaceManifest(ctx, principal, projectID, evidence.WorkspaceID, evidence.Revision, "", "", 1)
+	if err != nil {
+		return err
+	}
+	if manifest.ProjectID != projectID || manifest.WorkspaceID != evidence.WorkspaceID || manifest.Revision != evidence.Revision {
+		return domain.NewError(domain.CodeWorkspaceConflict, "delivery Workspace revision is not readable by this project member")
+	}
+	return a.savedProof.AuthorizeSavedProjectDelivery(ctx, principal, projectID, evidence)
+}
+
+// Keep reads and stop/cleanup actions available without queuing work when no task worker runs.
+type runtimeUnavailableTaskService struct{ api.TaskService }
+
+func (s runtimeUnavailableTaskService) Submit(context.Context, identity.Principal, app.SubmitTaskCommand) (app.TaskSubmissionResult, error) {
+	return app.TaskSubmissionResult{}, taskRuntimeUnavailable()
+}
+
+func (s runtimeUnavailableTaskService) AppendMessage(context.Context, identity.Principal, string, app.AppendMessageCommand) (app.TaskSubmissionResult, error) {
+	return app.TaskSubmissionResult{}, taskRuntimeUnavailable()
+}
+
+func (s runtimeUnavailableTaskService) RequestAction(ctx context.Context, principal identity.Principal, taskID string,
+	action task.Action, expectedStatus task.Status, idempotencyKey string) (app.TaskActionResult, error) {
+	if action == task.ActionResume {
+		return app.TaskActionResult{}, taskRuntimeUnavailable()
+	}
+	return s.TaskService.RequestAction(ctx, principal, taskID, action, expectedStatus, idempotencyKey)
+}
+
+func (s runtimeUnavailableTaskService) RetryBatchItem(context.Context, identity.Principal, string, string, string) error {
+	return taskRuntimeUnavailable()
+}
+
+func (s runtimeUnavailableTaskService) RespondToPendingRequest(ctx context.Context, principal identity.Principal, taskID, pendingID string,
+	version int64, decision task.PendingDecision, idempotencyKey string) error {
+	if decision == task.PendingDecisionApprove {
+		return taskRuntimeUnavailable()
+	}
+	return s.TaskService.RespondToPendingRequest(ctx, principal, taskID, pendingID, version, decision, idempotencyKey)
+}
+
+func (s runtimeUnavailableTaskService) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error {
+	return taskRuntimeUnavailable()
+}
+
+func (s runtimeUnavailableTaskService) RequestWorkspaceViewDeletion(ctx context.Context, principal identity.Principal,
+	taskID string, confirm bool, idempotencyKey string) (app.TaskWorkspaceViewDeletion, error) {
+	service, ok := s.TaskService.(api.TaskWorkspaceViewDeletionService)
+	if !ok {
+		return app.TaskWorkspaceViewDeletion{}, domain.NewError(domain.CodeUnsupported, "task Workspace view deletion is unavailable")
+	}
+	return service.RequestWorkspaceViewDeletion(ctx, principal, taskID, confirm, idempotencyKey)
+}
+
+func (s runtimeUnavailableTaskService) GetWorkspaceViewDeletion(ctx context.Context, principal identity.Principal,
+	taskID string) (app.TaskWorkspaceViewDeletion, error) {
+	service, ok := s.TaskService.(api.TaskWorkspaceViewDeletionService)
+	if !ok {
+		return app.TaskWorkspaceViewDeletion{}, domain.NewError(domain.CodeUnsupported, "task Workspace view deletion is unavailable")
+	}
+	return service.GetWorkspaceViewDeletion(ctx, principal, taskID)
+}
+
+func (s runtimeUnavailableTaskService) RevokeMCPConnectorGrant(ctx context.Context, principal identity.Principal,
+	taskID, connectorID string, expectedVersion int64) (app.TaskMCPConnectorGrant, error) {
+	service, ok := s.TaskService.(api.TaskMCPConnectorGrantService)
+	if !ok {
+		return app.TaskMCPConnectorGrant{}, domain.NewError(domain.CodeUnsupported, "task MCP connector grants are unavailable")
+	}
+	return service.RevokeMCPConnectorGrant(ctx, principal, taskID, connectorID, expectedVersion)
+}
+
+type runtimeUnavailableScheduleService struct{ api.ScheduleService }
+
+func (s runtimeUnavailableScheduleService) Create(context.Context, identity.Principal, app.CreateScheduleCommand, string) (schedule.Schedule, error) {
+	return schedule.Schedule{}, taskRuntimeUnavailable()
+}
+
+func (s runtimeUnavailableScheduleService) Action(ctx context.Context, principal identity.Principal, id string,
+	command app.ScheduleActionCommand, idempotencyKey string) (app.ScheduleActionResult, error) {
+	if command.Action == schedule.ActionEnable {
+		return app.ScheduleActionResult{}, taskRuntimeUnavailable()
+	}
+	return s.ScheduleService.Action(ctx, principal, id, command, idempotencyKey)
+}
+
+type runtimeUnavailableInstantChatService struct{ api.InstantChatService }
+
+func (s runtimeUnavailableInstantChatService) Send(context.Context, identity.Principal, app.InstantChatSend) (app.InstantChatReply, error) {
+	return app.InstantChatReply{}, taskRuntimeUnavailable()
+}
 
 type authAdapter struct {
 	service *app.CredentialService
@@ -272,7 +437,15 @@ type workerApplicationAdapter struct {
 	*app.WorkerApp
 	workspaceBlockGC             *app.WorkspaceBlockGarbageCollector
 	workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
+	hostUsage                    *app.HostUsageService
 	logger                       *zap.Logger
+}
+
+func (a workerApplicationAdapter) CollectHostUsage(ctx context.Context) error {
+	if a.hostUsage == nil {
+		return errors.New("host usage service is unavailable")
+	}
+	return a.hostUsage.CollectAll(ctx)
 }
 
 func (a workerApplicationAdapter) Reconcile(ctx context.Context) (map[string]int, error) {
@@ -349,7 +522,9 @@ var _ api.TokenService = tokenAdapter{}
 var _ api.TemplateReader = templateAdapter{}
 var _ api.AdminService = adminAdapter{}
 var _ api.ReadinessChecker = readiness{}
+var _ api.HostUsageReceiptService = (*app.HostUsageService)(nil)
 var _ api.WorkspaceService = (*app.WorkspaceService)(nil)
 var _ app.AuditWriter = countedAuditWriter{}
 var _ worker.Application = workerApplicationAdapter{}
+var _ interface{ CollectHostUsage(context.Context) error } = workerApplicationAdapter{}
 var _ worker.LeaderLock = leaderLockAdapter{}

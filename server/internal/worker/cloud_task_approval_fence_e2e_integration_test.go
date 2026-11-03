@@ -43,7 +43,8 @@ func TestCloudTaskApprovalIsRevalidatedAfterHostControlFenceChanges(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID)
+	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
+	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
 	approvalDesktop := &f01ApprovalDesktopHandler{}
 	runtimeStore := filepath.Join(t.TempDir(), "runtime-state")
 	if err := os.MkdirAll(runtimeStore, 0o700); err != nil {

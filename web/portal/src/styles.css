@@ -308,11 +308,19 @@ tbody tr:last-child td { border-bottom: 0; }
 .assistant-sidebar-heading h2 { margin: 0; font-size: 1rem; }
 .assistant-sidebar-empty { padding: 10px 2px; font-size: .9rem; }
 .conversation-list { display: grid; gap: 5px; }
+.conversation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px; }
 .conversation-item { width: 100%; padding: 11px 10px; display: grid; gap: 6px; border: 1px solid transparent; border-radius: 8px; color: var(--ink); background: transparent; cursor: pointer; text-align: left; }
 .conversation-item:hover { background: #f5f8fc; }
 .conversation-item.is-selected { border-color: #cad9ff; background: #eff4ff; }
 .conversation-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .91rem; }
 .conversation-item small { color: var(--muted); font-size: .78rem; }
+.conversation-row > .button { white-space: nowrap; }
+.task-event-feed { margin: 14px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fbfcfe; }
+.task-event-feed-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-event-feed ol { display: grid; gap: 7px; margin: 10px 0 0; padding-left: 20px; }
+.task-event-feed li { display: flex; justify-content: space-between; gap: 12px; font-size: .86rem; }
+.task-event-feed li small { color: var(--muted); white-space: nowrap; }
+.task-event-feed > p { margin: 8px 0 0; font-size: .86rem; }
 .assistant-main { min-height: 520px; display: flex; flex-direction: column; overflow: hidden; }
 .assistant-welcome { width: min(720px, 100%); margin: auto; padding: 40px 28px 28px; text-align: center; }
 .assistant-mark { width: 46px; height: 46px; margin: 0 auto 16px; display: grid; place-items: center; border: 1px solid #cad8fb; border-radius: 15px; color: var(--brand); background: #eff4ff; font-size: 1.45rem; font-weight: 800; }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"morde/server/internal/domain"
 )
 
@@ -50,9 +52,11 @@ user_content, assistant_message_id, assistant_content FROM retired_instant_chat_
 		t.Fatalf("migrated legacy exchange = %q/%q/%q/%q %q/%q %q/%q, err=%v", archivedID, archivedConversationID,
 			archivedOwnerID, archivedKey, archivedUserID, archivedUserContent, archivedAssistantID, archivedAssistantContent, err)
 	}
-	chat, err := store.GetConversation(ctx, conversationID, owner.ID)
-	if err != nil || chat.ID != conversationID || chat.ModelID != "p1234567" || chat.Title != "old title" {
-		t.Fatalf("migrated canonical conversation = %#v, err=%v", chat, err)
+	var canonicalID, canonicalOwnerID, canonicalModelID, canonicalTitle string
+	if err := pool.QueryRow(ctx, `SELECT id, owner_id, model_id, title FROM conversations WHERE id=$1 AND owner_id=$2`,
+		conversationID, owner.ID).Scan(&canonicalID, &canonicalOwnerID, &canonicalModelID, &canonicalTitle); err != nil ||
+		canonicalID != conversationID || canonicalOwnerID != owner.ID || canonicalModelID != "p1234567" || canonicalTitle != "old title" {
+		t.Fatalf("migrated canonical conversation = %q/%q/%q/%q, err=%v", canonicalID, canonicalOwnerID, canonicalModelID, canonicalTitle, err)
 	}
 	messagePage := func(before int64) ([]struct {
 		id       string
@@ -135,6 +139,7 @@ func TestFusedConversationMigrationRejectsConflictingIDs(t *testing.T) {
 				other = createTestUser(t, store, 2, 10000, 20000)
 			}
 			hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+			markWorkspaceVolumesLegacyForMigrationRollback(t, ctx, pool)
 			if _, err := provider.DownTo(ctx, 53); err != nil {
 				t.Fatal(err)
 			}
@@ -170,6 +175,7 @@ func TestFusedConversationMigrationRejectsConflictingMessageIDs(t *testing.T) {
 	owner := createTestUser(t, store, 2, 10000, 20000)
 	other := createTestUser(t, store, 2, 10000, 20000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	markWorkspaceVolumesLegacyForMigrationRollback(t, ctx, pool)
 	if _, err := provider.DownTo(ctx, 53); err != nil {
 		t.Fatal(err)
 	}
@@ -208,5 +214,18 @@ VALUES ($1,$2,$3,'old-chat-key',$4,$5,'different message','answer')`,
 JOIN instant_chat_exchanges i ON i.user_message_id=m.id WHERE m.id=$1`, messageID).Scan(&original, &legacy); err != nil ||
 		original != "existing task message" || legacy != "different message" {
 		t.Fatalf("conflicting messages changed: original=%q legacy=%q err=%v", original, legacy, err)
+	}
+}
+
+func markWorkspaceVolumesLegacyForMigrationRollback(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE workspace_volumes AS volume
+SET state='legacy', volume_name=NULL, ready_at=NULL,
+    legacy_host_id=(
+      SELECT CASE WHEN count(*)=1 THEN min(binding.host_id) ELSE NULL END
+      FROM workspace_bindings AS binding
+      WHERE binding.workspace_id=volume.workspace_id AND binding.state IN ('preparing','active')
+    )`); err != nil {
+		t.Fatalf("prepare legacy Workspace volumes before migration rollback: %v", err)
 	}
 }

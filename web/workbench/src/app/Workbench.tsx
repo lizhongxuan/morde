@@ -10,6 +10,7 @@ import {
 import { ApiError } from '../api/client';
 import FileManager from '../components/FileManager';
 import TopBar from '../components/TopBar';
+import TaskObservation from '../components/TaskObservation';
 import WorkspaceBrowser from '../components/WorkspaceBrowser';
 
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
@@ -30,23 +31,29 @@ function requestId() {
 }
 
 function controlActionCompleted(control: GatewayControl, action: GatewayControlAction) {
-  const target = action === 'take_over' ? 'user' : 'ai';
-  return control.control_state === target && !control.pending_operation_ids?.length &&
+  const leaseMatches = action === 'take_over'
+    ? control.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me
+    : control.control_state === 'ai' && !control.control_lease_active;
+  return leaseMatches && !control.pending_operation_ids?.length &&
     (!control.active_transition || control.active_transition.phase === 'completed');
 }
 
 export default function Workbench() {
-  const workspaceOnly = new URLSearchParams(window.location.search).get('tab') === 'workspace';
+  const query = new URLSearchParams(window.location.search);
+  const taskObservationOnly = query.has('task_id');
+  const taskObservationID = query.get('task_id') ?? '';
+  const workspaceOnly = query.get('tab') === 'workspace';
+  const hostSessionOnly = workspaceOnly || taskObservationOnly;
   const [host, setHost] = useState<GatewayHost | null>(null);
   const [control, setControl] = useState<GatewayControl | null>(null);
-  const [controlLoading, setControlLoading] = useState(!workspaceOnly);
+  const [controlLoading, setControlLoading] = useState(!hostSessionOnly);
   const [controlError, setControlError] = useState('');
   const [controlActionError, setControlActionError] = useState('');
   const [controlActionPending, setControlActionPending] = useState(false);
   const [controlRequest, setControlRequest] = useState<GatewayControlRequest | null>(null);
   const [pageError, setPageError] = useState('');
-  const [active, setActive] = useState<Tab>(() => workspaceOnly ? 'workspace' : 'browser');
-  const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(workspaceOnly ? ['workspace'] : ['browser']));
+  const [active, setActive] = useState<Tab>(() => hostSessionOnly ? 'workspace' : 'browser');
+  const [loaded, setLoaded] = useState<Set<Tab>>(() => new Set(hostSessionOnly ? ['workspace'] : ['browser']));
   const [browserStatus, setBrowserStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'failed'>('connecting');
   const [browserReconnect, setBrowserReconnect] = useState(0);
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
@@ -63,6 +70,7 @@ export default function Workbench() {
   const browserConnectTimeoutRef = useRef<number | undefined>(undefined);
   const browserConnectedRef = useRef(false);
   const controlRequestRef = useRef<GatewayControlRequest | null>(null);
+  const leaseRenewalRef = useRef(false);
   const terminalRequestRef = useRef(false);
   const terminalReplacementRef = useRef(false);
 
@@ -82,7 +90,7 @@ export default function Workbench() {
   }, []);
 
   useEffect(() => {
-    if (workspaceOnly) return;
+    if (hostSessionOnly) return;
     let current = true;
     gatewayApi.host()
       .then((value) => current && setHost(value))
@@ -94,10 +102,10 @@ export default function Workbench() {
     return () => {
       current = false;
     };
-  }, [applyControl, workspaceOnly]);
+  }, [applyControl, hostSessionOnly]);
 
   useEffect(() => {
-    if (workspaceOnly) return;
+    if (hostSessionOnly) return;
     const transition = control?.control_state === 'taking_over' || control?.control_state === 'returning';
     const interval = (controlActionPending || (transition && !control?.active_transition?.failure_reason)) ? 1000 : 3000;
     let current = true;
@@ -114,7 +122,24 @@ export default function Workbench() {
       current = false;
       window.clearInterval(timer);
     };
-  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, workspaceOnly]);
+  }, [applyControl, control?.active_transition?.failure_reason, control?.control_state, controlActionPending, hostSessionOnly]);
+
+  useEffect(() => {
+    if (hostSessionOnly || !control?.control_lease_active || !control.control_lease_held_by_me) return;
+    const timer = window.setInterval(() => {
+      if (leaseRenewalRef.current) return;
+      leaseRenewalRef.current = true;
+      void gatewayApi.renewControlLease(control.control_version)
+        .then(applyControl)
+        .catch(async (error: unknown) => {
+          setControlActionError(`操作租约续期失败：${messageOf(error)}`);
+          try { applyControl(await gatewayApi.control()); }
+          catch (statusError) { setControlError(messageOf(statusError)); }
+        })
+        .finally(() => { leaseRenewalRef.current = false; });
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [applyControl, control?.control_lease_active, control?.control_lease_held_by_me, control?.control_version, hostSessionOnly]);
 
   const stopBrowserWatch = useCallback(() => {
     browserObserverRef.current?.disconnect();
@@ -133,7 +158,8 @@ export default function Workbench() {
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
 
-  const terminalAvailable = !controlLoading && !controlError && !controlActionPending && control?.control_state === 'user';
+  const leaseHeldByMe = control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
+  const terminalAvailable = !controlLoading && !controlError && !controlActionPending && leaseHeldByMe;
 
   useEffect(() => {
     if (active !== 'terminal' || !terminalAvailable || terminalSession || terminalError || terminalRequestRef.current || terminalReplacementRef.current) return;
@@ -327,7 +353,7 @@ export default function Workbench() {
   }
 
   function openMobileKeyboard() {
-    if (control?.control_state !== 'user' || browserStatus !== 'connected') return;
+    if (!leaseHeldByMe || browserStatus !== 'connected') return;
     try {
       const button = browserFrameRef.current?.contentDocument?.getElementById('noVNC_keyboard_button');
       if (!button) throw new Error('keyboard unavailable');
@@ -372,7 +398,8 @@ export default function Workbench() {
     const transition = control.active_transition;
     const retryTransition = transition?.failure_reason ? transition : null;
     const current = controlRequestRef.current;
-    const action = current?.action ?? retryTransition?.action ?? (control.control_state === 'user' ? 'release' : 'take_over');
+    if (!current && !retryTransition && control.control_state === 'user' && !leaseHeldByMe) return;
+    const action = current?.action ?? retryTransition?.action ?? (leaseHeldByMe ? 'release' : 'take_over');
     const request = current ?? {
       action,
       request_id: retryTransition?.request_id ?? requestId(),
@@ -419,8 +446,8 @@ export default function Workbench() {
   }
 
   const failedTransition = control?.active_transition?.failure_reason ? control.active_transition : null;
-  const vscodeAvailable = !controlLoading && !controlError && control?.control_state === 'user' && !controlActionPending;
-  const browserViewOnly = controlLoading || !!controlError || (control?.control_state !== 'user' && control?.control_state !== 'returning');
+  const vscodeAvailable = !controlLoading && !controlError && leaseHeldByMe && !controlActionPending;
+  const browserViewOnly = controlLoading || !!controlError || !leaseHeldByMe;
   const retryControlRequest = controlRequest ?? (failedTransition ? {
     action: failedTransition.action,
     request_id: failedTransition.request_id,
@@ -431,9 +458,10 @@ export default function Workbench() {
     : (controlActionError || failedTransition) && retryControlRequest
       ? retryControlRequest.action === 'take_over' ? '重试接管' : '重试交回 AI'
       : control?.control_state === 'ai' ? '接管电脑'
-        : control?.control_state === 'user' ? '交回 AI' : '';
+        : leaseHeldByMe ? '交回 AI' : '';
   const visibleActive = active === 'vscode' && !vscodeAvailable ? 'browser' : active;
   const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace') : primaryTabs;
+  if (taskObservationOnly) return <TaskObservation key={taskObservationID} taskID={taskObservationID} />;
   return (
     <main className="workbench-app">
       {!workspaceOnly && <TopBar

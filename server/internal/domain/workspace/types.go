@@ -6,6 +6,7 @@ type State string
 
 const (
 	StateReady    State = "ready"
+	StateCopying  State = "copying"
 	StateDeleting State = "deleting"
 	StateDeleted  State = "deleted"
 )

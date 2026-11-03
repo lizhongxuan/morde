@@ -164,8 +164,10 @@ func (h *Handler) abort(w http.ResponseWriter, r *http.Request, reservationID st
 }
 
 func validateReserveRequest(value ReserveRequest) error {
+	validPath := workspace.ValidateRelativePath(value.Path) == nil ||
+		(value.Operation == OperationDirectoryUpsert && value.Path == ".")
 	if !domain.ValidWorkspaceID(value.WorkspaceID) || !workspace.ValidSyncFolderID(value.FolderID) || !operationIDPattern.MatchString(value.OperationID) ||
-		workspace.ValidateRelativePath(value.Path) != nil || value.SizeBytes < 0 || value.SizeBytes > workspace.MaxSyncFileBytes {
+		!validPath || value.SizeBytes < 0 || value.SizeBytes > workspace.MaxSyncFileBytes {
 		return errors.New("invalid reservation identity, path, or size")
 	}
 	switch value.Operation {

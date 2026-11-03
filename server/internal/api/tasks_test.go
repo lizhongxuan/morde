@@ -62,6 +62,20 @@ type taskServiceStub struct {
 	err                  error
 }
 
+type observationTicketTaskServiceStub struct {
+	*taskServiceStub
+	principal identity.Principal
+	taskID    string
+	calls     int
+	value     app.TaskWorkbenchObservationTicket
+}
+
+func (s *observationTicketTaskServiceStub) IssueWorkbenchObservationTicket(_ context.Context, principal identity.Principal, taskID string) (app.TaskWorkbenchObservationTicket, error) {
+	s.calls++
+	s.principal, s.taskID = principal, taskID
+	return s.value, s.err
+}
+
 func (s *taskServiceStub) Submit(_ context.Context, _ identity.Principal, command app.SubmitTaskCommand) (app.TaskSubmissionResult, error) {
 	s.submitCalls++
 	s.submitCommand = command
@@ -326,8 +340,43 @@ func TestTaskResponseIncludesBatchAttemptAndArtifactAssociation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(view.BatchItems) != 1 || view.BatchItems[0].Attempt != 2 || len(view.Artifacts) != 1 ||
-		view.Artifacts[0].BatchItemID == nil || *view.Artifacts[0].BatchItemID != "b1234567" || view.Artifacts[0].BatchAttempt != 1 {
+		view.Artifacts[0].BatchItemID == nil || *view.Artifacts[0].BatchItemID != "b1234567" || view.Artifacts[0].BatchAttempt != 1 ||
+		view.Artifacts[0].Verified || view.Artifacts[0].WorkspaceID != nil || view.Artifacts[0].WorkspaceRevision != nil ||
+		view.Artifacts[0].SizeBytes != nil || view.Artifacts[0].SHA256 != nil {
 		t.Fatalf("batch response metadata = %#v", view)
+	}
+}
+
+func TestTaskResponseIncludesVerifiedArtifactWorkspaceProof(t *testing.T) {
+	now := time.Now().UTC()
+	current := apiTestTask()
+	current.WorkspaceID = "w1234567"
+	revision := int64(3)
+	current.InputRevision, current.WorkspaceCheckpointRevision = &revision, &revision
+	digest := strings.Repeat("a", 64)
+	value := app.TaskDetails{Task: current, Artifacts: []task.Artifact{{
+		ID: "a1234567", TaskID: current.ID, StepID: "s1234567", Label: "Report", Path: "reports/summary.txt",
+		MediaType: "text/plain", WorkspaceID: current.WorkspaceID, Revision: 4, SizeBytes: 12, SHA256: digest, CreatedAt: now,
+	}}}
+	view, err := toTaskResponse(value)
+	if err != nil || len(view.Artifacts) != 1 {
+		t.Fatalf("verified artifact response = %#v, err=%v", view.Artifacts, err)
+	}
+	artifact := view.Artifacts[0]
+	if !artifact.Verified || artifact.WorkspaceID == nil || *artifact.WorkspaceID != current.WorkspaceID ||
+		artifact.WorkspaceRevision == nil || *artifact.WorkspaceRevision != 4 || artifact.SizeBytes == nil || *artifact.SizeBytes != 12 ||
+		artifact.SHA256 == nil || *artifact.SHA256 != digest {
+		t.Fatalf("artifact proof response = %#v", artifact)
+	}
+
+	value.Artifacts[0].SHA256 = ""
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("partial artifact proof returned %v", err)
+	}
+	value.Artifacts[0].SHA256 = digest
+	value.Artifacts[0].WorkspaceID = "w7654321"
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("artifact proof from another Workspace returned %v", err)
 	}
 }
 
@@ -560,12 +609,13 @@ func TestTaskListReturnsNullCursorAndEmptyItems(t *testing.T) {
 func TestAppendConversationMessageRequiresExplicitModelAndReturnsTask(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
-	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"host_id":"h1234567","workspace_id":"w1234567","input_revision":7,"mcp_connector_ids":["kaaaaaaa"],"application_id":"wechat","model_id":"model-a","content":"continue","budget":{"active_seconds":120,"tool_calls":20,"model_tokens":4000}}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"expected_task_id":"q1234567","host_id":"h1234567","workspace_id":"w1234567","input_revision":7,"mcp_connector_ids":["kaaaaaaa"],"application_id":"wechat","model_id":"model-a","content":"continue","budget":{"active_seconds":120,"tool_calls":20,"model_tokens":4000}}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "retry-key-009")
 	response := httptest.NewRecorder()
 	engine.ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted || service.appendCalls != 1 || service.appendID != "c1234567" ||
+		service.appendCommand.ExpectedTaskID != "q1234567" ||
 		service.appendCommand.WorkspaceID != "w1234567" || service.appendCommand.InputRevision == nil || *service.appendCommand.InputRevision != 7 ||
 		service.appendCommand.ApplicationID != "wechat" || service.appendCommand.ModelID != "model-a" || service.appendCommand.Budget.ToolCalls != 20 || service.appendCommand.IdempotencyKey != "retry-key-009" ||
 		len(service.appendCommand.MCPConnectorIDs) != 1 || service.appendCommand.MCPConnectorIDs[0] != "kaaaaaaa" {
@@ -790,6 +840,41 @@ func TestTaskEventsRejectInvalidBatchBeforeStartingSSE(t *testing.T) {
 	}
 }
 
+func TestIssueWorkbenchObservationTicketRequiresPortalSessionAndDoesNotCache(t *testing.T) {
+	service := &observationTicketTaskServiceStub{
+		taskServiceStub: &taskServiceStub{},
+		value:           app.TaskWorkbenchObservationTicket{Ticket: "opaque-ticket", TaskID: "q1234567", HostID: "h1234567", ExpiresAt: time.Now().UTC().Add(time.Minute)},
+	}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/workbench-observation-ticket", nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("ticket response = %d headers=%#v body=%s", response.Code, response.Header(), response.Body)
+	}
+	if service.calls != 1 || service.taskID != "q1234567" || service.principal.Kind != identity.KindSession || service.principal.UserID != "u1234567" {
+		t.Fatalf("ticket service call = %#v, calls=%d", service.principal, service.calls)
+	}
+	var decoded app.TaskWorkbenchObservationTicket
+	if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil || decoded.Ticket != service.value.Ticket || decoded.HostID != service.value.HostID {
+		t.Fatalf("ticket response decode = %#v err=%v", decoded, err)
+	}
+	for _, target := range []string{
+		"/api/tasks/q1234567/workbench-observation-ticket?unexpected=1",
+	} {
+		bad := httptest.NewRecorder()
+		engine.ServeHTTP(bad, httptest.NewRequest(http.MethodPost, target, nil))
+		if bad.Code != http.StatusBadRequest {
+			t.Errorf("ticket request %s = %d, want 400", target, bad.Code)
+		}
+	}
+	badBody := httptest.NewRecorder()
+	engine.ServeHTTP(badBody, httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/workbench-observation-ticket", strings.NewReader("{}")))
+	if badBody.Code != http.StatusBadRequest || service.calls != 1 {
+		t.Fatalf("ticket body request = %d calls=%d, want rejected before service", badBody.Code, service.calls)
+	}
+}
+
 type deadlineRecorder struct {
 	*httptest.ResponseRecorder
 	deadlineCalls int
@@ -810,6 +895,9 @@ func taskAPIRouter(tasks TaskService, conversations ConversationService) *gin.En
 	group := engine.Group("/api")
 	handler := &api{}
 	handler.registerTasks(group, tasks)
+	if ticketService, ok := tasks.(TaskWorkbenchObservationTicketService); ok {
+		handler.registerTaskWorkbenchObservationTickets(group, ticketService)
+	}
 	handler.registerConversations(group, conversations, tasks)
 	return engine
 }

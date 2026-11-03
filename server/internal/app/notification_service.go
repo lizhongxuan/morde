@@ -63,6 +63,27 @@ func (s *NotificationService) ProcessPending(ctx context.Context, limit int32) (
 			processed++
 		}
 	}
+	sourceEvents, err := s.store.ListUnprocessedNotificationSourceEvents(ctx, limit)
+	if err != nil {
+		return processed, fmt.Errorf("list unprocessed notification source events: %w", err)
+	}
+	for _, event := range sourceEvents {
+		id, err := notification.NewID()
+		if err != nil {
+			return processed, err
+		}
+		value, err := notification.NewSourceEventNotification(event, id)
+		if err != nil {
+			return processed, fmt.Errorf("derive notification from source event: %w", err)
+		}
+		consumed, err := s.store.ConsumeNotificationSourceEvent(ctx, event, value)
+		if err != nil {
+			return processed, fmt.Errorf("consume notification source event %d: %w", event.ID, err)
+		}
+		if consumed {
+			processed++
+		}
+	}
 	return processed, nil
 }
 

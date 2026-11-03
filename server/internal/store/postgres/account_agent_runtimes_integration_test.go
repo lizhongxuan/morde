@@ -10,7 +10,37 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/execution"
 )
+
+func TestPostgresAccountAgentRuntimeFailureIsReported(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	service, err := app.NewAccountAgentRuntimeService(f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, replayed, err := service.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID,
+		RuntimeID: "account-runtime-failed", LeaseOwner: "portal-runtime-failed",
+		SupervisorNonce: append([]byte(nil), f.request.SupervisorNonce...), MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
+	if err != nil || replayed {
+		t.Fatalf("start account Runtime: runtime=%+v replayed=%t err=%v", runtime, replayed, err)
+	}
+	if err := service.Fail(ctx, runtime.Fence, execution.RuntimeFailureStartup); err != nil {
+		t.Fatalf("mark failed account Runtime: %v", err)
+	}
+	loaded, found, err := service.Get(ctx, runtime.Fence.OwnerID)
+	if err != nil || !found || loaded.State != app.AccountAgentRuntimeFailed || loaded.FailureReason != execution.RuntimeFailureStartup {
+		t.Fatalf("failed Runtime state=%+v found=%t err=%v", loaded, found, err)
+	}
+	control, err := f.store.GetExecutionControl(ctx, runtime.Fence.OwnerID)
+	if err != nil || control.Runtime.State != execution.RuntimeStateFailed || control.Runtime.FailureReason != execution.RuntimeFailureStartup {
+		t.Fatalf("execution status Runtime=%+v err=%v", control.Runtime, err)
+	}
+	if _, err := service.Renew(ctx, runtime.Fence, 15*time.Second); err == nil {
+		t.Fatal("failed account Runtime renewed its lease")
+	}
+}
 
 func TestPostgresAccountAgentRuntimeLeaseAndTaskSequence(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
@@ -367,7 +397,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[3], failedExpired.Fence.RuntimeID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='runtime_failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[3], failedExpired.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
 	identity, err := runtimeService.StopIdentity(ctx, owners[5])

@@ -29,6 +29,10 @@ type TaskService interface {
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
+type TaskWorkbenchObservationTicketService interface {
+	IssueWorkbenchObservationTicket(context.Context, identity.Principal, string) (app.TaskWorkbenchObservationTicket, error)
+}
+
 type TaskWorkspaceViewDeletionService interface {
 	RequestWorkspaceViewDeletion(context.Context, identity.Principal, string, bool, string) (app.TaskWorkspaceViewDeletion, error)
 	GetWorkspaceViewDeletion(context.Context, identity.Principal, string) (app.TaskWorkspaceViewDeletion, error)
@@ -46,6 +50,7 @@ type taskPageResponse struct {
 type taskSummaryResponse struct {
 	ID                          string             `json:"id"`
 	OwnerID                     string             `json:"owner_id"`
+	InitiatorID                 string             `json:"initiator_id"`
 	HostID                      string             `json:"host_id,omitempty"`
 	ExecutionLocation           string             `json:"execution_location"`
 	WorkspaceID                 string             `json:"workspace_id,omitempty"`
@@ -178,14 +183,19 @@ type taskBatchItemResponse struct {
 }
 
 type taskArtifactResponse struct {
-	ID           string    `json:"id"`
-	StepID       string    `json:"step_id"`
-	Label        string    `json:"label"`
-	Path         string    `json:"path"`
-	MediaType    string    `json:"media_type"`
-	BatchItemID  *string   `json:"batch_item_id"`
-	BatchAttempt int32     `json:"batch_attempt"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	StepID            string    `json:"step_id"`
+	Label             string    `json:"label"`
+	Path              string    `json:"path"`
+	MediaType         string    `json:"media_type"`
+	WorkspaceID       *string   `json:"workspace_id"`
+	WorkspaceRevision *int64    `json:"workspace_revision"`
+	SizeBytes         *int64    `json:"size_bytes"`
+	SHA256            *string   `json:"sha256"`
+	Verified          bool      `json:"verified"`
+	BatchItemID       *string   `json:"batch_item_id"`
+	BatchAttempt      int32     `json:"batch_attempt"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 type submitTaskRequest struct {
@@ -243,6 +253,44 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+func (h *api) registerTaskWorkbenchObservationTickets(group *gin.RouterGroup, service TaskWorkbenchObservationTicketService) {
+	if service == nil {
+		return
+	}
+	group.POST("/tasks/:id/workbench-observation-ticket", h.issueWorkbenchObservationTicket(service))
+}
+
+func (h *api) issueWorkbenchObservationTicket(service TaskWorkbenchObservationTicketService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" {
+			writeError(c, domain.InvalidArgument("query", "unexpected query parameters"))
+			return
+		}
+		if c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("body", "request body is not allowed"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok || principal.Kind != identity.KindSession {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		value, err := service.IssueWorkbenchObservationTicket(c.Request.Context(), principal, taskID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.JSON(http.StatusCreated, value)
+	}
 }
 
 func (h *api) getTaskWorkspaceViewDeletion(service TaskService) gin.HandlerFunc {
@@ -558,7 +606,12 @@ func (h *api) getTask(service TaskService) gin.HandlerFunc {
 }
 
 func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
+	initiatorID := value.InitiatorID
+	if initiatorID == "" {
+		initiatorID = value.OwnerID
+	}
 	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
+		!domain.ValidUserID(initiatorID) ||
 		(value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
 		(value.WorkspaceID != "" && !domain.ValidWorkspaceID(value.WorkspaceID)) ||
 		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
@@ -573,7 +626,7 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 		return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return taskSummaryResponse{
-		ID: value.ID, OwnerID: value.OwnerID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
+		ID: value.ID, OwnerID: value.OwnerID, InitiatorID: initiatorID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
 		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
 		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, CurrentStep: stringPointer(value.CurrentStep),
@@ -698,14 +751,27 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			(artifact.BatchItemID != "" && (!domain.ValidBatchItemID(artifact.BatchItemID) || artifact.BatchAttempt < 1)) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
+		proofPresent := artifact.WorkspaceID != "" || artifact.Revision != 0 || artifact.SizeBytes != 0 || artifact.SHA256 != ""
+		if proofPresent && (!domain.ValidWorkspaceID(artifact.WorkspaceID) || artifact.WorkspaceID != value.Task.WorkspaceID ||
+			artifact.Revision < 0 || artifact.SizeBytes < 0 || !validWorkspaceSyncSHA256(artifact.SHA256)) {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
 		if artifact.BatchItemID != "" {
 			if _, exists := batchItemIDs[artifact.BatchItemID]; !exists {
 				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 			}
 		}
+		var workspaceRevision, sizeBytes *int64
+		workspaceID, sha256 := stringPointer(artifact.WorkspaceID), stringPointer(artifact.SHA256)
+		if proofPresent {
+			revision, size := artifact.Revision, artifact.SizeBytes
+			workspaceRevision, sizeBytes = &revision, &size
+		}
 		response.Artifacts = append(response.Artifacts, taskArtifactResponse{
 			ID: artifact.ID, StepID: artifact.StepID, Label: artifact.Label, Path: artifact.Path,
-			MediaType: artifact.MediaType, BatchItemID: stringPointer(artifact.BatchItemID), BatchAttempt: artifact.BatchAttempt, CreatedAt: artifact.CreatedAt,
+			MediaType: artifact.MediaType, WorkspaceID: workspaceID, WorkspaceRevision: workspaceRevision, SizeBytes: sizeBytes,
+			SHA256: sha256, Verified: proofPresent,
+			BatchItemID: stringPointer(artifact.BatchItemID), BatchAttempt: artifact.BatchAttempt, CreatedAt: artifact.CreatedAt,
 		})
 	}
 	return response, nil

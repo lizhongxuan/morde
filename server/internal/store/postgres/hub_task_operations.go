@@ -222,15 +222,19 @@ func lockTaskHubOperationWorkspaceSyncCreateTx(ctx context.Context, tx pgx.Tx, o
 	}
 	var op app.TaskHubOperation
 	var localReceiptHash []byte
+	var syncSessionID pgtype.Text
 	err := tx.QueryRow(ctx, `SELECT target_installation_id, action, workspace_id, workspace_path, workspace_size_bytes,
 workspace_sha256, source_checkpoint_revision, local_receipt_hash, sync_stage, sync_session_id, status, task_authorization_version
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 FOR UPDATE`, ownerID, taskID, operationKey).
 		Scan(&op.TargetInstallationID, &op.Action, &op.WorkspaceID, &op.WorkspacePath, &op.WorkspaceSizeBytes,
-			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &op.SyncSessionID, &op.Status, &op.TaskAuthorizationVersion)
+			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &syncSessionID, &op.Status, &op.TaskAuthorizationVersion)
 	if err != nil {
 		return storeError("lock Task file.put operation before Workspace sync create", "Hub Task operation", err)
 	}
 	op.LocalReceiptHash = append([]byte(nil), localReceiptHash...)
+	if syncSessionID.Valid {
+		op.SyncSessionID = syncSessionID.String
+	}
 	writeStateReady := (op.SyncStage == app.TaskHubWriteStageLocal || op.SyncStage == app.TaskHubWriteStageSyncPending) &&
 		(op.Status == task.OperationDispatched || op.Status == task.OperationUnknown)
 	writeStateSettled := op.SyncStage == app.TaskHubWriteStageCloudSynced && op.Status == task.OperationSucceeded
@@ -284,15 +288,19 @@ FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sess
 	}
 	var op app.TaskHubOperation
 	var localReceiptHash []byte
+	var syncSessionID pgtype.Text
 	err := tx.QueryRow(ctx, `SELECT target_installation_id, action, workspace_id, workspace_path, workspace_size_bytes,
 workspace_sha256, source_checkpoint_revision, local_receipt_hash, sync_stage, sync_session_id, status, task_authorization_version
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 FOR UPDATE`, ownerID, taskID.String, operationKey.String).
 		Scan(&op.TargetInstallationID, &op.Action, &op.WorkspaceID, &op.WorkspacePath, &op.WorkspaceSizeBytes,
-			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &op.SyncSessionID, &op.Status, &op.TaskAuthorizationVersion)
+			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &syncSessionID, &op.Status, &op.TaskAuthorizationVersion)
 	if err != nil {
 		return storeError("lock Task file.put operation before Workspace sync commit", "Hub Task operation", err)
 	}
 	op.LocalReceiptHash = append([]byte(nil), localReceiptHash...)
+	if syncSessionID.Valid {
+		op.SyncSessionID = syncSessionID.String
+	}
 	if op.Action != hub.ActionFilePut || op.WorkspaceID != workspaceID || op.TargetInstallationID != targetInstallationID ||
 		op.WorkspacePath != scope[0] || op.SourceCheckpointRevision != baseRevision || op.SyncSessionID != sessionID ||
 		len(op.LocalReceiptHash) != 32 ||
@@ -370,15 +378,19 @@ FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, worksp
 	}
 	var op app.TaskHubOperation
 	var localReceiptHash []byte
+	var syncSessionID pgtype.Text
 	err = tx.QueryRow(ctx, `SELECT target_installation_id, action, workspace_id, workspace_path, workspace_size_bytes,
 workspace_sha256, source_checkpoint_revision, local_receipt_hash, sync_stage, sync_session_id, status
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`, ownerID, taskID, operationKey).
 		Scan(&op.TargetInstallationID, &op.Action, &op.WorkspaceID, &op.WorkspacePath, &op.WorkspaceSizeBytes,
-			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &op.SyncSessionID, &op.Status)
+			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &syncSessionID, &op.Status)
 	if err != nil {
 		return storeError("lock Task Hub operation for Workspace sync association", "Hub Task operation", err)
 	}
 	op.LocalReceiptHash = append([]byte(nil), localReceiptHash...)
+	if syncSessionID.Valid {
+		op.SyncSessionID = syncSessionID.String
+	}
 	if op.Action != hub.ActionFilePut || op.WorkspaceID != workspaceID || op.TargetInstallationID != targetInstallationID ||
 		len(op.LocalReceiptHash) != 32 || (op.Status != task.OperationDispatched && op.Status != task.OperationUnknown) {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Workspace sync session does not match the Task file.put operation")
@@ -503,12 +515,14 @@ func reconcileTaskHubOperationWorkspaceSyncCommitTx(ctx context.Context, tx pgx.
 	var localReceiptHash []byte
 	var syncRevision pgtype.Int8
 	if err := tx.QueryRow(ctx, `SELECT target_installation_id, action, workspace_id, workspace_path, workspace_size_bytes,
-workspace_sha256, source_checkpoint_revision, local_receipt_hash, sync_stage, sync_session_id, sync_revision, status, result_hash
+target_grant_version, workspace_sha256, source_checkpoint_revision, local_receipt_hash, sync_stage, sync_session_id, sync_revision, status, result_hash
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`, ownerID, taskID.String, operationKey.String).
 		Scan(&op.TargetInstallationID, &op.Action, &op.WorkspaceID, &op.WorkspacePath, &op.WorkspaceSizeBytes,
-			&op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash, &op.SyncStage, &op.SyncSessionID, &syncRevision, &op.Status, &op.ResultHash); err != nil {
+			&op.TargetGrantVersion, &op.WorkspaceSHA256, &op.SourceCheckpointRevision, &localReceiptHash,
+			&op.SyncStage, &op.SyncSessionID, &syncRevision, &op.Status, &op.ResultHash); err != nil {
 		return storeError("lock Task file.put operation for sync commit", "Hub Task operation", err)
 	}
+	op.OwnerID, op.TaskID, op.Key = ownerID, taskID.String, operationKey.String
 	op.LocalReceiptHash = append([]byte(nil), localReceiptHash...)
 	if syncRevision.Valid {
 		op.SyncRevision = syncRevision.Int64
@@ -541,7 +555,7 @@ FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`,
 	var actualSHA256 string
 	if err := tx.QueryRow(ctx, `SELECT size_bytes, sha256 FROM workspace_revision_files
 WHERE workspace_id=$1 AND file_path=$2 AND valid_from_revision <= $3
-  AND (valid_to_revision IS NULL OR valid_to_revision > $3)`, workspaceID, op.WorkspacePath, committedRevision).
+  AND (valid_to_revision IS NULL OR valid_to_revision > $3) AND kind='file'`, workspaceID, op.WorkspacePath, committedRevision).
 		Scan(&actualSize, &actualSHA256); err != nil {
 		return storeError("verify Task file.put in committed Workspace revision", "workspace file", err)
 	}

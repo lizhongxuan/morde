@@ -41,7 +41,9 @@ export function AdminUsers() {
       notify('账号信息已更新。', 'success');
       void client.invalidateQueries({ queryKey: ['admin', 'users'] });
     },
-    onError: (error) => notify(errorDetails(error).message, 'error'),
+    onError: (error) => notify(errorDetails(error).code === 'invalid_state'
+      ? '尚未配置新用户默认模型额度，请先到“设置与默认额度”配置后再批准。'
+      : errorDetails(error).message, 'error'),
   });
 
   const changeStatus = (item: AdminUser, status: AccountStatus) => update.mutate({

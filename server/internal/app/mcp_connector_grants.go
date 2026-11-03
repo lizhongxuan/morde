@@ -18,21 +18,25 @@ const (
 )
 
 type TaskMCPConnectorGrant struct {
-	TaskID            string
-	OwnerID           string
-	ConnectorID       string
-	ConnectorRevision int64
-	CredentialVersion int64
-	GrantVersion      int64
-	ToolSchema        []byte
-	ToolSchemaSHA256  []byte
-	RevokedAt         *time.Time
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	TaskID              string
+	OwnerID             string // Task owner; this scopes the grant row and operation ledger.
+	ConnectorOwnerID    string // Personal account that owns the referenced connector.
+	ProjectID           string
+	ProjectGrantVersion int64
+	ConnectorID         string
+	ConnectorRevision   int64
+	CredentialVersion   int64
+	GrantVersion        int64
+	ToolSchema          []byte
+	ToolSchemaSHA256    []byte
+	RevokedAt           *time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
-// TaskMCPConnectorGrantStore persists owner-scoped connector grants independently
-// from Host-bound task_operations.
+// TaskMCPConnectorGrantStore persists Task-owner-scoped connector grants independently
+// from Host-bound task_operations. ConnectorOwnerID separately identifies the
+// personal account whose connector was explicitly granted to the Task/project.
 type TaskMCPConnectorGrantStore interface {
 	ListTaskMCPConnectorGrants(context.Context, string, string) ([]TaskMCPConnectorGrant, error)
 	SetTaskMCPConnectorToolSchema(context.Context, string, string, string, int64, []byte, []byte) (TaskMCPConnectorGrant, error)
@@ -85,5 +89,5 @@ func (s *TaskService) RevokeMCPConnectorGrant(ctx context.Context, principal ide
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return TaskMCPConnectorGrant{}, hideTaskAccessError(err)
 	}
-	return grantStore.RevokeTaskMCPConnectorGrant(ctx, principal.UserID, taskID, connectorID, expectedGrantVersion)
+	return grantStore.RevokeTaskMCPConnectorGrant(ctx, details.Task.OwnerID, taskID, connectorID, expectedGrantVersion)
 }

@@ -19,7 +19,7 @@ func TestTaskOperationWorkspaceAdmissionMigrationBackfillsTaskInputRevision(t *t
 	defer closeProvider()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "operation-revision-migration")
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
 		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
@@ -44,6 +44,21 @@ func TestTaskOperationWorkspaceAdmissionMigrationBackfillsTaskInputRevision(t *t
 	claimed, found, err := store.ClaimNextTask(ctx, "migration-worker", time.Minute)
 	if err != nil || !found || claimed.ID != created.Task.ID {
 		t.Fatalf("claim Workspace task: claimed=%t task=%s err=%v", found, claimed.ID, err)
+	}
+	// This schema downgrade fixture has no provisioned data volumes.
+	if _, err := pool.Exec(ctx, `UPDATE workspace_volumes SET state='legacy',volume_name=NULL,ready_at=NULL WHERE state <> 'legacy'`); err != nil {
+		t.Fatalf("prepare legacy Workspace volume fixture: %v", err)
+	}
+	// This migration backfills sync versions for every existing account object.
+	// The downgrade guard requires an empty sync ledger before returning to the
+	// pre-sync schema used by this fixture.
+	if _, err := pool.Exec(ctx, `
+DELETE FROM personal_mutation_receipts;
+DELETE FROM personal_objects;
+DELETE FROM account_change_log;
+DELETE FROM account_object_versions;
+DELETE FROM account_change_counters;`); err != nil {
+		t.Fatalf("prepare legacy account sync fixture: %v", err)
 	}
 	if _, err := provider.DownTo(ctx, 71); err != nil {
 		t.Fatalf("prepare pre-admission schema: %v", err)

@@ -240,7 +240,7 @@ func (b *CloudDSHToolBroker) authorizeSkillTask(ctx context.Context, current tas
 	if b.runtime.authorizer == nil {
 		return domain.NewError(domain.CodeForbidden, "task authorizer is unavailable")
 	}
-	return b.runtime.authorizer.AuthorizeTaskAction(ctx, current.OwnerID, identity.Kind(authorization.Kind), authorization.TokenID,
+	return b.runtime.authorizer.AuthorizeTaskAction(ctx, current.InitiatorID, identity.Kind(authorization.Kind), authorization.TokenID,
 		current.HostID, agentScopeSnapshot(authorization.Scopes), identity.ScopeTaskRead)
 }
 

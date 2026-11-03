@@ -24,6 +24,10 @@ type CloudDSHToolBroker struct {
 	mcpCredentials MCPConnectorCredentialProvider
 	mcpClient      MCPConnectorToolClient
 	hub            *HubService
+	personalData   *PersonalMutationService
+	personalSync   cloudDSHPersonalSnapshotReader
+	goals          *GoalService
+	projectContext *ProjectService
 }
 
 type CloudDSHTaskCompletion struct {
@@ -50,6 +54,23 @@ func NewCloudDSHToolBrokerWithRecordCapture(store TaskStore, runtime *RuntimeToo
 	return newCloudDSHToolBroker(store, runtime, recordCapture, mcpCredentials, mcpClient, hubs...)
 }
 
+// NewCloudDSHToolBrokerWithPersonalData connects personal context to the same
+// account-scoped business services used by the Portal APIs.
+func NewCloudDSHToolBrokerWithPersonalData(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider,
+	mcpClient MCPConnectorToolClient, recordCapture *RecordCaptureService, personalData *PersonalMutationService,
+	personalSync cloudDSHPersonalSnapshotReader, goals *GoalService, projectContext *ProjectService, hubs ...*HubService) (*CloudDSHToolBroker, error) {
+	if personalData == nil || personalSync == nil || goals == nil {
+		return nil, errors.New("personal Task context dependencies are required")
+	}
+	broker, err := NewCloudDSHToolBrokerWithRecordCapture(store, runtime, mcpCredentials, mcpClient, recordCapture, hubs...)
+	if err != nil {
+		return nil, err
+	}
+	broker.personalData, broker.personalSync, broker.goals = personalData, personalSync, goals
+	broker.projectContext = projectContext
+	return broker, nil
+}
+
 func newCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, recordCapture *RecordCaptureService,
 	mcpCredentials MCPConnectorCredentialProvider, mcpClient MCPConnectorToolClient, hubs ...*HubService) (*CloudDSHToolBroker, error) {
 	if store == nil || runtime == nil {
@@ -69,6 +90,23 @@ func newCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, record
 		broker.hub = hubs[0]
 	}
 	return broker, nil
+}
+
+func (b *CloudDSHToolBroker) currentTaskDetails(ctx context.Context, claimed task.Task) (TaskDetails, error) {
+	details, err := b.store.GetTask(ctx, claimed.ID, claimed.OwnerID)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	current := details.Task
+	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.HostID != claimed.HostID ||
+		current.ApplicationID != claimed.ApplicationID || current.ModelID != claimed.ModelID {
+		return TaskDetails{}, domain.NewError(domain.CodeInvalidState, "cloud task identity changed")
+	}
+	if current.Status == task.StatusRunning && (current.Lease.Owner != claimed.Lease.Owner ||
+		current.Lease.Version != claimed.Lease.Version || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now())) {
+		return TaskDetails{}, domain.NewError(domain.CodeInvalidState, "cloud task lease changed")
+	}
+	return details, nil
 }
 
 func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task) ([]AgentToolDefinition, error) {
@@ -92,6 +130,9 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		}
 		if b.authorizeSkillTask(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHSkillReadDefinition())
+		}
+		if b.personalData != nil && cloudDSHPersonalContextEligible(details.Task) {
+			definitions = append(definitions, cloudDSHPersonalUpdateDefinition())
 		}
 		hubDefinitions, err := b.hubTaskDefinitions(ctx, details.Task)
 		if err != nil {
@@ -133,8 +174,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return domain.InvalidArgument("dsh_completion", "cloud dsh completion evidence exceeds its limit")
 		}
 	}
-	agent := &Agent{store: b.store}
-	details, err := agent.refreshTask(ctx, claimed)
+	details, err := b.currentTaskDetails(ctx, claimed)
 	if err != nil {
 		return err
 	}
@@ -162,11 +202,11 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if err != nil {
 			return err
 		}
-		return b.completeWithRecordCapture(ctx, agent, current, step, current.Usage, completion.Result,
+		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
 			map[string]any{"source": "cloud_dsh"}, "", nil)
 	}
 
-	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs, nil)
+	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs)
 	if evidenceErr == nil && !cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) && len(evidence) == 0 {
 		if fileIntent != task.FileDeliveryNone {
 			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
@@ -176,7 +216,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if err != nil {
 			return err
 		}
-		return b.completeWithRecordCapture(ctx, agent, current, step, current.Usage, completion.Result,
+		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
 			map[string]any{"source": "cloud_dsh"}, "", nil)
 	}
 	step, err := cloudDSHCompletionVerificationStep(current, details.Steps)
@@ -209,25 +249,97 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	if verifyErr != nil || verification.Status != AgentVerified || validateAgentVerificationArtifacts(verification) != nil || len(verification.Artifacts) == 0 {
 		return b.pauseCompletion(ctx, current, step, "output_verification_pending", "Host or committed Workspace could not verify the task output.")
 	}
-	artifacts, err := agent.persistVerifiedArtifacts(ctx, current, step, nil, verification.Artifacts)
+	artifacts, err := prepareCloudDSHVerifiedArtifacts(details, step, verification.Artifacts)
 	if err != nil {
 		return err
 	}
 	step.Status = task.StepSucceeded
 	step.Summary = safeStepSummary(verification.Summary, "Host and committed Workspace verified the task output.")
-	return b.completeWithRecordCapture(ctx, agent, current, step, current.Usage, completion.Result,
+	return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
 		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts)
 }
 
-func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, agent *Agent, current task.Task, step task.Step,
+func prepareCloudDSHVerifiedArtifacts(details TaskDetails, step task.Step, verifiedArtifacts []AgentVerifiedArtifact) ([]task.Artifact, error) {
+	if len(verifiedArtifacts) == 0 {
+		return nil, nil
+	}
+	current := details.Task
+	if len(verifiedArtifacts) > maxAgentVerifiedArtifacts || step.TaskID != current.ID || !domain.ValidStepID(step.ID) {
+		return nil, domain.NewError(domain.CodeInvalidArgument, "verified artifact metadata is invalid")
+	}
+	prepared := make([]task.Artifact, 0, len(verifiedArtifacts))
+	for _, verified := range verifiedArtifacts {
+		if err := validateAgentVerificationArtifacts(AgentVerificationResult{Status: AgentVerified, Artifacts: []AgentVerifiedArtifact{verified}}); err != nil {
+			return nil, domain.NewError(domain.CodeInvalidArgument, "verified artifact metadata is invalid")
+		}
+		if verified.WorkspaceID != current.WorkspaceID {
+			return nil, domain.NewError(domain.CodeInvalidState, "verified artifact is outside the task workspace")
+		}
+		var existing *task.Artifact
+		for index := range details.Artifacts {
+			candidate := &details.Artifacts[index]
+			if candidate.TaskID == current.ID && candidate.BatchItemID == "" && candidate.BatchAttempt == 0 && candidate.Path == verified.Path {
+				existing = candidate
+				break
+			}
+		}
+		if existing != nil {
+			if existing.Label != verified.Label || existing.MediaType != verified.MediaType || existing.WorkspaceID != verified.WorkspaceID ||
+				existing.Revision != verified.Revision || existing.SizeBytes != verified.SizeBytes || existing.SHA256 != verified.SHA256 {
+				return nil, domain.NewError(domain.CodeInvalidState, "verified artifact metadata changed during recovery")
+			}
+			prepared = append(prepared, *existing)
+			continue
+		}
+		artifactID, err := domain.NewArtifactID()
+		if err != nil {
+			return nil, err
+		}
+		prepared = append(prepared, task.Artifact{
+			ID: artifactID, TaskID: current.ID, StepID: step.ID, Label: verified.Label, Path: verified.Path,
+			WorkspaceID: verified.WorkspaceID, Revision: verified.Revision, SizeBytes: verified.SizeBytes, SHA256: verified.SHA256,
+			MediaType: verified.MediaType,
+		})
+	}
+	return prepared, nil
+}
+
+func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, current task.Task, step task.Step,
 	usage task.Usage, result string, detail any, observationFingerprint string, artifacts []task.Artifact) error {
-	completed, err := agent.completeWithArtifacts(ctx, current, step, usage, result, detail, observationFingerprint, artifacts)
+	if len(result) > agentUserVisibleResultBytes || !validUTF8(result) {
+		step.Status = task.StepFailed
+		step.Summary = "The cloud task returned invalid text output."
+		usage = boundedTaskUsage(current, usage)
+		payload, err := agentStepEvent(step, usage, map[string]any{"error": "invalid_model_output"})
+		if err != nil {
+			return err
+		}
+		_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
+			TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+			Status: task.StatusFailed, CurrentStep: step.ID, Result: "Task stopped: invalid_model_output", Usage: usage,
+			Steps: []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
+		})
+		return err
+	}
+	usage = boundedTaskUsage(current, usage)
+	payload, err := agentStepEvent(step, usage, detail)
 	if err != nil {
 		return err
 	}
-	if completed.Status == task.StatusCompleted {
-		b.captureCompletedTurn(ctx, current, completed.Result)
+	_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
+		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: step.ID, Result: result, Usage: usage,
+		ObservationFingerprint: observationFingerprint, Steps: []task.Step{step}, Artifacts: artifacts,
+		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
+	})
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
+			_, pauseErr := b.pauseForWorkspaceInputChange(ctx, current, step, usage, "task.complete")
+			return pauseErr
+		}
+		return err
 	}
+	b.captureCompletedTurn(ctx, current, result)
 	return nil
 }
 
@@ -464,6 +576,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	if call.Name == cloudDSHSkillReadToolName {
 		return b.executeSkillRead(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if call.Name == cloudDSHPersonalUpdateToolName {
+		return b.executePersonalUpdate(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if strings.HasPrefix(call.Name, "morde_hub_") {
 		return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)

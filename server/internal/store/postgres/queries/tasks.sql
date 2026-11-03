@@ -2,12 +2,15 @@
 SELECT * FROM tasks WHERE id = $1 AND owner_id = $2;
 
 -- name: ListTasks :many
-SELECT * FROM tasks
-WHERE owner_id = $1
-  AND ($2::text[] IS NULL OR host_id = ANY($2::text[]))
-  AND ($3 = '' OR status = $3)
-  AND ($4::timestamptz IS NULL OR created_at < $4::timestamptz OR (created_at = $4::timestamptz AND id < $5))
-ORDER BY created_at DESC, id DESC
+SELECT tasks.* FROM tasks
+WHERE ((tasks.project_id IS NULL AND tasks.owner_id = $1) OR (tasks.project_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM project_members pm JOIN users u ON u.id=pm.user_id AND u.status='approved'
+    WHERE pm.project_id=tasks.project_id AND pm.user_id=$1
+  )))
+  AND ($2::text[] IS NULL OR tasks.host_id = ANY($2::text[]))
+  AND ($3 = '' OR tasks.status = $3)
+  AND ($4::timestamptz IS NULL OR tasks.created_at < $4::timestamptz OR (tasks.created_at = $4::timestamptz AND tasks.id < $5))
+ORDER BY tasks.created_at DESC, tasks.id DESC
 LIMIT $6;
 
 -- name: ListTaskSteps :many

@@ -44,7 +44,8 @@ func TestValidateCreateHost(t *testing.T) {
 			State: host.StateCreating, CPUMilli: 500, MemMiB: 512, CPULimitMilli: 1000, MemLimitMiB: 1024,
 			AIOKeyEnc: []byte("ciphertext"), RuntimeCredentialEnc: []byte("runtime ciphertext"), RuntimeGeneration: 1,
 		},
-		Capacity: app.Capacity{CPUMilli: 2000, MemMiB: 2048},
+		WorkspaceIDs: []string{"w1234567"},
+		Capacity:     app.Capacity{CPUMilli: 2000, MemMiB: 2048},
 	}
 	if err := validateCreateHost(params); err != nil {
 		t.Fatalf("valid create host params: %v", err)
@@ -63,6 +64,8 @@ func TestValidateCreateHost(t *testing.T) {
 		{name: "negative runtime generation", mutate: func(p *app.CreateHostParams) { p.Host.RuntimeGeneration = -1 }},
 		{name: "request exceeds limit", mutate: func(p *app.CreateHostParams) { p.Host.CPULimitMilli = 499 }},
 		{name: "invalid workspace ID", mutate: func(p *app.CreateHostParams) { p.WorkspaceIDs = []string{"invalid"} }},
+		{name: "missing workspace", mutate: func(p *app.CreateHostParams) { p.WorkspaceIDs = nil }},
+		{name: "multiple workspaces", mutate: func(p *app.CreateHostParams) { p.WorkspaceIDs = []string{"w1234567", "w7654321"} }},
 		{name: "capacity missing", mutate: func(p *app.CreateHostParams) { p.Capacity.MemMiB = 0 }},
 	}
 	for _, tc := range cases {

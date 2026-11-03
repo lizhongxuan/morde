@@ -270,7 +270,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, oldFence.
 func f01RunNodeAccountTask(t *testing.T, ctx context.Context, manager *CloudDSHAccountRuntimeManager,
 	session *cloudDSHAccountRuntimeSession, ownerID string, sequence int64) {
 	t.Helper()
-	fence := app.AgentInstanceFence{TaskID: fmt.Sprintf("q%07d", sequence), OwnerID: ownerID,
+	fence := app.AgentInstanceFence{TaskID: fmt.Sprintf("q%07d", sequence), OwnerID: ownerID, InitiatorID: ownerID,
 		AgentInstanceID: fmt.Sprintf("agent-%d", sequence), AgentSessionID: fmt.Sprintf("session-%d", sequence),
 		AgentGeneration: 1, SupervisorID: "f01-node-supervisor", LeaseOwner: "f01-node-task", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}

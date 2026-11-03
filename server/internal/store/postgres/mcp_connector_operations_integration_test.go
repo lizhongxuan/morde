@@ -10,6 +10,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -509,14 +510,18 @@ func newMCPConnectorOperationFixture(t *testing.T, ctx context.Context, store *S
 func newMCPConnectorOperationFixtureWithWorkspace(t *testing.T, ctx context.Context, store *Store, ownerID, idempotencyKey string,
 	workspaceValue *workspace.Workspace) mcpConnectorOperationFixture {
 	t.Helper()
-	hostValue := createRunningControlHost(t, ctx, store, ownerID, "ai", 0)
+	var hostValue host.Host
 	var bindingVersion int64
-	if workspaceValue != nil {
-		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-			OwnerID: ownerID, HostID: hostValue.ID, Workspace: *workspaceValue, Directory: workspaceValue.ID,
-			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-			SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
-		})
+	if workspaceValue == nil {
+		hostValue = createRunningControlHost(t, ctx, store, ownerID, "ai", 0)
+	} else {
+		// CreateHost already establishes the single preparing binding for this
+		// Workspace; point the Host fixture at it instead of adding another one.
+		hostValue = createTestHost(t, ctx, store, ownerID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+		if _, err := store.pool.Exec(ctx, `UPDATE hosts SET state='running', control_state='ai', control_version=0 WHERE id=$1`, hostValue.ID); err != nil {
+			t.Fatal(err)
+		}
+		binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -554,8 +559,8 @@ VALUES ($1,$2,$3,$4,true,0,1)`, connectorID, ownerID, "test connector", "https:/
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_grants
-(task_id, owner_id, connector_id, connector_revision, credential_version, grant_version)
-VALUES ($1,$2,$3,1,0,1)`, running.ID, ownerID, connectorID); err != nil {
+(task_id, owner_id, connector_owner_id, connector_id, connector_revision, credential_version, grant_version)
+VALUES ($1,$2,$2,$3,1,0,1)`, running.ID, ownerID, connectorID); err != nil {
 		t.Fatal(err)
 	}
 	fixture := mcpConnectorOperationFixture{

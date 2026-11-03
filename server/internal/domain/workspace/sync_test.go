@@ -62,6 +62,115 @@ func TestValidateCreateSyncSessionEnforcesManifestLimitsAndPaths(t *testing.T) {
 	}
 }
 
+func TestPlanSyncTreatsModificationTimeAsFileMetadata(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	oldTime, newTime := int64(1_700_000_000_000_000_000), int64(1_700_000_001_000_000_000)
+	base := file("notes.txt", digest, 1)
+	base.ModTimeNS = &oldTime
+	current := file("notes.txt", digest, 1)
+	current.ModTimeNS = &oldTime
+	local := file("notes.txt", digest, 1)
+	local.ModTimeNS = &newTime
+	plan := PlanSyncTree([]File{base}, []File{current}, nil, nil, CreateSyncSession{
+		Direction: SyncBidirectional, Policy: SyncLive, Files: []File{local},
+	})
+	if len(plan.UploadFiles) != 1 || plan.UploadFiles[0].ModTimeNS == nil || *plan.UploadFiles[0].ModTimeNS != newTime || len(plan.Conflicts) != 0 {
+		t.Fatalf("metadata-only sync plan = %#v", plan)
+	}
+}
+
+func TestDirectoryMetadataPlanPreservesUnknownBaselineAndDetectsConflicts(t *testing.T) {
+	mode, baseTime := uint32(0o750), int64(1_700_000_000_000_000_000)
+	local := Directory{Path: "src", Mode: &mode, ModTimeNS: &baseTime}
+	unknown := Directory{Path: "src"}
+	plan := PlanSyncTreeWithDirectories(nil, nil, nil, nil, []Directory{unknown}, []Directory{unknown}, CreateSyncSession{
+		Direction: SyncBidirectional, Policy: SyncCompareMerge, Directories: []Directory{local},
+	})
+	if len(plan.UploadDirectories) != 1 || !SameDirectoryMetadata(plan.UploadDirectories[0], local) || len(plan.Conflicts) != 0 {
+		t.Fatalf("known local metadata over an unknown legacy baseline = %#v", plan)
+	}
+
+	remoteMode, remoteTime := uint32(0o700), int64(baseTime+1)
+	remote := Directory{Path: "src", Mode: &remoteMode, ModTimeNS: &remoteTime}
+	plan = PlanSyncTreeWithDirectories(nil, nil, nil, nil, []Directory{unknown}, []Directory{remote}, CreateSyncSession{
+		Direction: SyncBidirectional, Policy: SyncCompareMerge, Directories: []Directory{local},
+	})
+	if len(plan.Conflicts) != 1 || plan.Conflicts[0].Path != "src" || plan.Conflicts[0].Reason != "metadata_changed" {
+		t.Fatalf("different known metadata from both sides = %#v", plan)
+	}
+
+	plan = PlanSyncTreeWithDirectories(nil, nil, nil, nil, []Directory{unknown}, []Directory{remote}, CreateSyncSession{
+		Direction: SyncDownload, Policy: SyncCompareMerge, Directories: []Directory{unknown},
+	})
+	if len(plan.DownloadDirectories) != 1 || !SameDirectoryMetadata(plan.DownloadDirectories[0], remote) {
+		t.Fatalf("known remote metadata download = %#v", plan)
+	}
+
+	acl := &NativeACL{Platform: "linux", Format: "posix_acl_xattr", Data: []byte("acl")}
+	baseNative := Directory{Path: "."}
+	remoteNative := Directory{Path: ".", MetadataKnown: true, ACL: acl}
+	localNative := Directory{Path: ".", MetadataKnown: true}
+	plan = PlanSyncTreeWithDirectories(nil, nil, nil, nil, []Directory{baseNative}, []Directory{remoteNative}, CreateSyncSession{
+		Direction: SyncDownload, Policy: SyncFillMissing, Directories: []Directory{localNative},
+	})
+	if len(plan.DownloadDirectories) != 1 || !SameDirectoryMetadata(plan.DownloadDirectories[0], remoteNative) {
+		t.Fatalf("fill-missing root native metadata download = %#v", plan)
+	}
+	plan = PlanSyncTreeWithDirectories(nil, nil, nil, nil, []Directory{baseNative}, []Directory{remoteNative}, CreateSyncSession{
+		Direction: SyncBidirectional, Policy: SyncCompareMerge, Directories: []Directory{localNative},
+	})
+	if len(plan.Conflicts) != 1 || plan.Conflicts[0].Reason != "metadata_changed" {
+		t.Fatalf("different native metadata from both sides = %#v", plan)
+	}
+
+	baseTime, localTime, remoteTime := int64(1), int64(2), int64(3)
+	baseMode := uint32(0o750)
+	baseDirectory := Directory{Path: "src", Mode: &baseMode, ModTimeNS: &baseTime, MetadataKnown: true}
+	localDirectory := Directory{Path: "src", Mode: &baseMode, ModTimeNS: &localTime, MetadataKnown: true}
+	remoteDirectory := Directory{Path: "src", Mode: &baseMode, ModTimeNS: &remoteTime, MetadataKnown: true}
+	plan = PlanSyncTreeWithDirectories(nil, []File{file("src/remote.txt", strings.Repeat("b", 64), 1)}, nil, nil,
+		[]Directory{baseDirectory}, []Directory{remoteDirectory}, CreateSyncSession{
+			Direction: SyncBidirectional, Policy: SyncLive, Files: []File{file("src/local.txt", strings.Repeat("c", 64), 1)}, Directories: []Directory{localDirectory},
+		})
+	if len(plan.Conflicts) != 0 || len(plan.UploadDirectories) != 1 || len(plan.DownloadDirectories) != 0 {
+		t.Fatalf("independent tree changes conflicted on derived directory mtime = %#v", plan)
+	}
+	plan = PlanSyncTreeWithDirectories(nil, nil, nil, nil, []Directory{baseDirectory}, []Directory{remoteDirectory}, CreateSyncSession{
+		Direction: SyncBidirectional, Policy: SyncLive, Directories: []Directory{localDirectory},
+	})
+	if len(plan.Conflicts) != 0 || len(plan.UploadDirectories) != 0 || len(plan.DownloadDirectories) != 1 ||
+		!SameDirectoryMetadata(plan.DownloadDirectories[0], remoteDirectory) {
+		t.Fatalf("converged tree with differing root mtime = %#v", plan)
+	}
+}
+
+func TestSyncSessionDirectoryMetadataMustBeCompleteAndKnown(t *testing.T) {
+	mode := uint32(0o750)
+	modified := int64(1_700_000_000_000_000_000)
+	valid := CreateSyncSession{
+		Direction: SyncUpload, Policy: SyncCompareMerge,
+		Files: []File{file("src/nested/main.go", strings.Repeat("a", 64), 1)},
+		Directories: []Directory{
+			{Path: "src", Mode: &mode, ModTimeNS: &modified},
+			{Path: "src/nested", Mode: &mode, ModTimeNS: &modified},
+		},
+	}
+	if err := ValidateCreateSyncSession(valid, 1024); err != nil {
+		t.Fatalf("complete directory metadata rejected: %v", err)
+	}
+	invalid := valid
+	invalid.Directories = valid.Directories[:1]
+	if err := ValidateCreateSyncSession(invalid, 1024); err == nil {
+		t.Fatal("accepted incomplete directory metadata")
+	}
+	invalid = valid
+	invalid.Directories = append([]Directory(nil), valid.Directories...)
+	invalid.Directories[1] = Directory{Path: "src/nested", Mode: &mode}
+	if err := ValidateCreateSyncSession(invalid, 1024); err == nil {
+		t.Fatal("accepted directory metadata with unknown modification time")
+	}
+}
+
 func TestValidateSyncManifestIncludesEmptyDirectoriesWithoutChargingFileQuota(t *testing.T) {
 	value := CreateSyncSession{
 		Direction: SyncUpload, Policy: SyncLive, Files: []File{file("notes.txt", strings.Repeat("a", 64), 3)},
@@ -103,6 +212,12 @@ func TestPlanSyncTreeCoalescesFileDirectoryReplacement(t *testing.T) {
 	}
 	if err := ValidateDownloadAction(actions[0]); err != nil {
 		t.Fatalf("directory download action rejected: %v", err)
+	}
+	if err := ValidateDownloadAction(DownloadAction{Path: ".", Action: ChangeDirectoryUpsert}); err != nil {
+		t.Fatalf("root metadata download action rejected: %v", err)
+	}
+	if err := ValidateDownloadAction(DownloadAction{Path: ".", Action: ChangeDirectoryDelete}); err == nil {
+		t.Fatal("root directory delete action was accepted")
 	}
 
 	request = CreateSyncSession{
@@ -243,5 +358,10 @@ func TestManifestAndChangeCursorsAreBoundedAndValidated(t *testing.T) {
 	}
 	if _, err := DecodeChangeCursor(EncodeChangeCursor(ChangeCursor{Revision: -1})); err == nil {
 		t.Fatal("accepted negative change cursor")
+	}
+	rootChange := ChangeCursor{Revision: 13, Path: "."}
+	decodedRootChange, err := DecodeChangeCursor(EncodeChangeCursor(rootChange))
+	if err != nil || decodedRootChange != rootChange {
+		t.Fatalf("root directory change cursor round trip = %#v, %v", decodedRootChange, err)
 	}
 }

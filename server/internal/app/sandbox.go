@@ -29,10 +29,11 @@ type SandboxResources struct {
 }
 
 type SandboxVolume struct {
-	Name      string
-	MountPath string
-	ClaimName string
-	Storage   string
+	Name            string
+	MountPath       string
+	ClaimName       string
+	Storage         string
+	RequireExisting bool
 }
 
 type SandboxCreateRequest struct {

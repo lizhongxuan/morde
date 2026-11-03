@@ -395,7 +395,7 @@ func (q *Queries) GetWorkspaceRevision(ctx context.Context, arg GetWorkspaceRevi
 }
 
 const getWorkspaceRevisionFile = `-- name: GetWorkspaceRevisionFile :one
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2) AND file_path=$3
 ORDER BY valid_from_revision DESC LIMIT 1
@@ -408,11 +408,18 @@ type GetWorkspaceRevisionFileParams struct {
 }
 
 type GetWorkspaceRevisionFileRow struct {
-	FilePath  string `json:"file_path"`
-	SizeBytes int64  `json:"size_bytes"`
-	Sha256    string `json:"sha256"`
-	Mode      int32  `json:"mode"`
-	Chunks    []byte `json:"chunks"`
+	FilePath      string      `json:"file_path"`
+	SizeBytes     int64       `json:"size_bytes"`
+	Sha256        string      `json:"sha256"`
+	Mode          int32       `json:"mode"`
+	Kind          string      `json:"kind"`
+	SymlinkTarget pgtype.Text `json:"symlink_target"`
+	ModTimeNs     pgtype.Int8 `json:"mod_time_ns"`
+	HardlinkTo    pgtype.Text `json:"hardlink_to"`
+	Chunks        []byte      `json:"chunks"`
+	Xattrs        []byte      `json:"xattrs"`
+	Acl           []byte      `json:"acl"`
+	MetadataKnown bool        `json:"metadata_known"`
 }
 
 func (q *Queries) GetWorkspaceRevisionFile(ctx context.Context, arg GetWorkspaceRevisionFileParams) (GetWorkspaceRevisionFileRow, error) {
@@ -423,7 +430,14 @@ func (q *Queries) GetWorkspaceRevisionFile(ctx context.Context, arg GetWorkspace
 		&i.SizeBytes,
 		&i.Sha256,
 		&i.Mode,
+		&i.Kind,
+		&i.SymlinkTarget,
+		&i.ModTimeNs,
+		&i.HardlinkTo,
 		&i.Chunks,
+		&i.Xattrs,
+		&i.Acl,
+		&i.MetadataKnown,
 	)
 	return i, err
 }
@@ -539,8 +553,8 @@ func (q *Queries) GetWorkspaceSyncTransferBlock(ctx context.Context, arg GetWork
 }
 
 const insertWorkspaceChange = `-- name: InsertWorkspaceChange :exec
-INSERT INTO workspace_changes (workspace_id, revision, file_path, action, file)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO workspace_changes (workspace_id, revision, file_path, action, file, directory)
+VALUES ($1, $2, $3, $4, $5, $6)
 `
 
 type InsertWorkspaceChangeParams struct {
@@ -549,6 +563,7 @@ type InsertWorkspaceChangeParams struct {
 	FilePath    string `json:"file_path"`
 	Action      string `json:"action"`
 	File        []byte `json:"file"`
+	Directory   []byte `json:"directory"`
 }
 
 func (q *Queries) InsertWorkspaceChange(ctx context.Context, arg InsertWorkspaceChangeParams) error {
@@ -558,6 +573,7 @@ func (q *Queries) InsertWorkspaceChange(ctx context.Context, arg InsertWorkspace
 		arg.FilePath,
 		arg.Action,
 		arg.File,
+		arg.Directory,
 	)
 	return err
 }
@@ -585,19 +601,26 @@ func (q *Queries) InsertWorkspaceRevisionEmptyDirectory(ctx context.Context, arg
 }
 
 const insertWorkspaceRevisionFile = `-- name: InsertWorkspaceRevisionFile :exec
-INSERT INTO workspace_revision_files (workspace_id, valid_from_revision, file_path, folded_path, size_bytes, sha256, mode, chunks)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO workspace_revision_files (workspace_id, valid_from_revision, file_path, folded_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 `
 
 type InsertWorkspaceRevisionFileParams struct {
-	WorkspaceID       string `json:"workspace_id"`
-	ValidFromRevision int64  `json:"valid_from_revision"`
-	FilePath          string `json:"file_path"`
-	FoldedPath        string `json:"folded_path"`
-	SizeBytes         int64  `json:"size_bytes"`
-	Sha256            string `json:"sha256"`
-	Mode              int32  `json:"mode"`
-	Chunks            []byte `json:"chunks"`
+	WorkspaceID       string      `json:"workspace_id"`
+	ValidFromRevision int64       `json:"valid_from_revision"`
+	FilePath          string      `json:"file_path"`
+	FoldedPath        string      `json:"folded_path"`
+	SizeBytes         int64       `json:"size_bytes"`
+	Sha256            string      `json:"sha256"`
+	Mode              int32       `json:"mode"`
+	Kind              string      `json:"kind"`
+	SymlinkTarget     pgtype.Text `json:"symlink_target"`
+	ModTimeNs         pgtype.Int8 `json:"mod_time_ns"`
+	HardlinkTo        pgtype.Text `json:"hardlink_to"`
+	Chunks            []byte      `json:"chunks"`
+	Xattrs            []byte      `json:"xattrs"`
+	Acl               []byte      `json:"acl"`
+	MetadataKnown     bool        `json:"metadata_known"`
 }
 
 func (q *Queries) InsertWorkspaceRevisionFile(ctx context.Context, arg InsertWorkspaceRevisionFileParams) error {
@@ -609,7 +632,14 @@ func (q *Queries) InsertWorkspaceRevisionFile(ctx context.Context, arg InsertWor
 		arg.SizeBytes,
 		arg.Sha256,
 		arg.Mode,
+		arg.Kind,
+		arg.SymlinkTarget,
+		arg.ModTimeNs,
+		arg.HardlinkTo,
 		arg.Chunks,
+		arg.Xattrs,
+		arg.Acl,
+		arg.MetadataKnown,
 	)
 	return err
 }
@@ -854,7 +884,7 @@ func (q *Queries) ListWorkspaceBlockReferences(ctx context.Context) ([]ListWorks
 }
 
 const listWorkspaceChangesPage = `-- name: ListWorkspaceChangesPage :many
-SELECT revision, file_path, action, file
+SELECT revision, file_path, action, file, directory
 FROM workspace_changes
 WHERE workspace_id=$1 AND (revision > $2 OR (revision=$2 AND file_path > $3))
 ORDER BY revision, file_path
@@ -869,10 +899,11 @@ type ListWorkspaceChangesPageParams struct {
 }
 
 type ListWorkspaceChangesPageRow struct {
-	Revision int64  `json:"revision"`
-	FilePath string `json:"file_path"`
-	Action   string `json:"action"`
-	File     []byte `json:"file"`
+	Revision  int64  `json:"revision"`
+	FilePath  string `json:"file_path"`
+	Action    string `json:"action"`
+	File      []byte `json:"file"`
+	Directory []byte `json:"directory"`
 }
 
 func (q *Queries) ListWorkspaceChangesPage(ctx context.Context, arg ListWorkspaceChangesPageParams) ([]ListWorkspaceChangesPageRow, error) {
@@ -894,6 +925,7 @@ func (q *Queries) ListWorkspaceChangesPage(ctx context.Context, arg ListWorkspac
 			&i.FilePath,
 			&i.Action,
 			&i.File,
+			&i.Directory,
 		); err != nil {
 			return nil, err
 		}
@@ -1008,7 +1040,7 @@ func (q *Queries) ListWorkspaceRevisionEmptyDirectoriesPage(ctx context.Context,
 }
 
 const listWorkspaceRevisionFiles = `-- name: ListWorkspaceRevisionFiles :many
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
 ORDER BY file_path
@@ -1020,11 +1052,18 @@ type ListWorkspaceRevisionFilesParams struct {
 }
 
 type ListWorkspaceRevisionFilesRow struct {
-	FilePath  string `json:"file_path"`
-	SizeBytes int64  `json:"size_bytes"`
-	Sha256    string `json:"sha256"`
-	Mode      int32  `json:"mode"`
-	Chunks    []byte `json:"chunks"`
+	FilePath      string      `json:"file_path"`
+	SizeBytes     int64       `json:"size_bytes"`
+	Sha256        string      `json:"sha256"`
+	Mode          int32       `json:"mode"`
+	Kind          string      `json:"kind"`
+	SymlinkTarget pgtype.Text `json:"symlink_target"`
+	ModTimeNs     pgtype.Int8 `json:"mod_time_ns"`
+	HardlinkTo    pgtype.Text `json:"hardlink_to"`
+	Chunks        []byte      `json:"chunks"`
+	Xattrs        []byte      `json:"xattrs"`
+	Acl           []byte      `json:"acl"`
+	MetadataKnown bool        `json:"metadata_known"`
 }
 
 func (q *Queries) ListWorkspaceRevisionFiles(ctx context.Context, arg ListWorkspaceRevisionFilesParams) ([]ListWorkspaceRevisionFilesRow, error) {
@@ -1041,7 +1080,14 @@ func (q *Queries) ListWorkspaceRevisionFiles(ctx context.Context, arg ListWorksp
 			&i.SizeBytes,
 			&i.Sha256,
 			&i.Mode,
+			&i.Kind,
+			&i.SymlinkTarget,
+			&i.ModTimeNs,
+			&i.HardlinkTo,
 			&i.Chunks,
+			&i.Xattrs,
+			&i.Acl,
+			&i.MetadataKnown,
 		); err != nil {
 			return nil, err
 		}
@@ -1054,7 +1100,7 @@ func (q *Queries) ListWorkspaceRevisionFiles(ctx context.Context, arg ListWorksp
 }
 
 const listWorkspaceRevisionFilesPage = `-- name: ListWorkspaceRevisionFilesPage :many
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
   AND ($3::text = '' OR file_path=$3 OR starts_with(file_path, $3 || '/'))
@@ -1072,11 +1118,18 @@ type ListWorkspaceRevisionFilesPageParams struct {
 }
 
 type ListWorkspaceRevisionFilesPageRow struct {
-	FilePath  string `json:"file_path"`
-	SizeBytes int64  `json:"size_bytes"`
-	Sha256    string `json:"sha256"`
-	Mode      int32  `json:"mode"`
-	Chunks    []byte `json:"chunks"`
+	FilePath      string      `json:"file_path"`
+	SizeBytes     int64       `json:"size_bytes"`
+	Sha256        string      `json:"sha256"`
+	Mode          int32       `json:"mode"`
+	Kind          string      `json:"kind"`
+	SymlinkTarget pgtype.Text `json:"symlink_target"`
+	ModTimeNs     pgtype.Int8 `json:"mod_time_ns"`
+	HardlinkTo    pgtype.Text `json:"hardlink_to"`
+	Chunks        []byte      `json:"chunks"`
+	Xattrs        []byte      `json:"xattrs"`
+	Acl           []byte      `json:"acl"`
+	MetadataKnown bool        `json:"metadata_known"`
 }
 
 func (q *Queries) ListWorkspaceRevisionFilesPage(ctx context.Context, arg ListWorkspaceRevisionFilesPageParams) ([]ListWorkspaceRevisionFilesPageRow, error) {
@@ -1099,7 +1152,14 @@ func (q *Queries) ListWorkspaceRevisionFilesPage(ctx context.Context, arg ListWo
 			&i.SizeBytes,
 			&i.Sha256,
 			&i.Mode,
+			&i.Kind,
+			&i.SymlinkTarget,
+			&i.ModTimeNs,
+			&i.HardlinkTo,
 			&i.Chunks,
+			&i.Xattrs,
+			&i.Acl,
+			&i.MetadataKnown,
 		); err != nil {
 			return nil, err
 		}

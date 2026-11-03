@@ -93,6 +93,9 @@ func (s *WorkspaceSyncService) VerifyCommittedArtifact(ctx context.Context, expe
 		return TaskArtifactProof{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace artifact manifest is invalid")
 	}
 	file := page.Files[0]
+	if file.Kind == "symlink" {
+		return TaskArtifactProof{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace artifact must be a regular file")
+	}
 	if file.SizeBytes != expected.SizeBytes || file.SHA256 != expected.SHA256 {
 		return TaskArtifactProof{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace artifact does not match the expected file")
 	}

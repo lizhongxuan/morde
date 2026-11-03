@@ -19,7 +19,7 @@ func TestPostgresControlTransitionTakeoverAndRelease(t *testing.T) {
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 
 	takeover := control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "takeover-001",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "takeover-001",
 		Action: control.ActionTakeOver, ExpectedControlVersion: 0,
 	}
 	started, err := store.BeginControlTransition(ctx, takeover)
@@ -100,7 +100,7 @@ func TestPostgresControlTransitionTakeoverAndRelease(t *testing.T) {
 	}
 
 	release := control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "release-001",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "release-001",
 		Action: control.ActionRelease, ExpectedControlVersion: 2,
 	}
 	releasing, err := store.BeginControlTransition(ctx, release)
@@ -140,7 +140,7 @@ func TestPostgresControlTransitionOwnershipCASAndFailure(t *testing.T) {
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 7)
 
 	request := control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "release-failure",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "release-failure",
 		Action: control.ActionRelease, ExpectedControlVersion: 6,
 	}
 	if _, err := store.BeginControlTransition(ctx, request); domain.CodeOf(err) != domain.CodeInvalidState {
@@ -170,7 +170,7 @@ func TestPostgresControlTransitionOwnershipCASAndFailure(t *testing.T) {
 		t.Fatalf("Host after recorded failure = %#v, err=%v", storedHost, err)
 	}
 	if _, err := store.BeginControlTransition(ctx, control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "release-again",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "release-again",
 		Action: control.ActionRelease, ExpectedControlVersion: transition.BlockedControlVersion,
 	}); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("new transition while failed transition is active error = %v", err)
@@ -184,7 +184,7 @@ func TestPostgresCompleteControlTransitionRequiresExactBlockedFence(t *testing.T
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 
 	takeover, err := store.BeginControlTransition(ctx, control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "takeover-fence",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "takeover-fence",
 		Action: control.ActionTakeOver, ExpectedControlVersion: 0,
 	})
 	if err != nil {
@@ -215,7 +215,7 @@ func TestPostgresCompleteControlTransitionRequiresExactBlockedFence(t *testing.T
 	// state check while keeping the recorded blocked version unchanged.
 	releaseHost := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 10)
 	release, err := store.BeginControlTransition(ctx, control.BeginRequest{
-		HostID: releaseHost.ID, OwnerID: owner.ID, RequestID: "release-fence",
+		HostID: releaseHost.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "release-fence",
 		Action: control.ActionRelease, ExpectedControlVersion: 10,
 	})
 	if err != nil {
@@ -252,7 +252,7 @@ func TestPostgresControlTransitionConcurrentBeginIsSerialized(t *testing.T) {
 			defer wait.Done()
 			<-start
 			_, err := store.BeginControlTransition(ctx, control.BeginRequest{
-				HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "takeover-race-" + string(rune('a'+i)),
+				HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "takeover-race-" + string(rune('a'+i)),
 				Action: control.ActionTakeOver, ExpectedControlVersion: 0,
 			})
 			results <- err
@@ -283,8 +283,8 @@ func TestPostgresControlTransitionValidationAndMissingReads(t *testing.T) {
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 
 	badRequests := []control.BeginRequest{
-		{HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "bad id", Action: control.ActionTakeOver},
-		{HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "too-high", Action: control.ActionTakeOver, ExpectedControlVersion: int64(^uint64(0) >> 1)},
+		{HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "bad id", Action: control.ActionTakeOver},
+		{HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "too-high", Action: control.ActionTakeOver, ExpectedControlVersion: int64(^uint64(0) >> 1)},
 	}
 	for _, request := range badRequests {
 		if _, err := store.BeginControlTransition(ctx, request); domain.CodeOf(err) != domain.CodeInvalidArgument {

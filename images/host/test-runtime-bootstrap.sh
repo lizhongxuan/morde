@@ -13,12 +13,12 @@ workspace_volume="morde-workspace-smoke-${smoke_id}"
 apps_volume="morde-apps-smoke-${smoke_id}"
 container=""
 entrypoint="$(dirname "${BASH_SOURCE[0]}")/morde-host-entrypoint.sh"
-apps_mount_line="$(grep -nF 'mountpoint -q "$apps_store"' "$entrypoint" | cut -d: -f1)"
+apps_setup_line="$(grep -nF 'install -d -o root -g root -m 0700 /run/morde-runtime "$apps_store"' "$entrypoint" | cut -d: -f1)"
 restore_apps_line="$(grep -nFx '/usr/local/bin/morde-runtime restore-apps' "$entrypoint" | cut -d: -f1)"
 aio_start_line="$(grep -nFx '/opt/gem/run.sh "$@" &' "$entrypoint" | cut -d: -f1)"
-if [[ -z "$apps_mount_line" || -z "$restore_apps_line" || -z "$aio_start_line" ||
-      "$apps_mount_line" -ge "$restore_apps_line" || "$restore_apps_line" -ge "$aio_start_line" ]]; then
-  echo "application store recovery must run after mount validation and before AIO" >&2
+if [[ -z "$apps_setup_line" || -z "$restore_apps_line" || -z "$aio_start_line" ||
+      "$apps_setup_line" -ge "$restore_apps_line" || "$restore_apps_line" -ge "$aio_start_line" ]]; then
+  echo "temporary application store must be initialized and restored before AIO" >&2
   exit 1
 fi
 cleanup() {
@@ -42,30 +42,35 @@ docker volume create "$apps_volume" >/dev/null
 
 if missing_apps_output="$(docker run --rm --platform "$platform" --network none \
   --entrypoint /usr/local/bin/morde-host-entrypoint "$image" 2>&1)"; then
-  echo "Host unexpectedly started without the persistent application store mount" >&2
+  echo "Host unexpectedly started without the required Runtime credential" >&2
   exit 1
 fi
-if ! grep -Fq 'dedicated persistent mount at /opt/morde/apps' <<<"$missing_apps_output"; then
+if ! grep -Fq 'Morde runtime credential is missing or invalid' <<<"$missing_apps_output"; then
   echo "Host failed for an unexpected reason without the application store mount" >&2
   printf '%s\n' "$missing_apps_output" >&2
   exit 1
 fi
-for apps_setup in 'mkdir -p /opt/morde/apps' 'mkdir -p /opt/morde && ln -s /tmp /opt/morde/apps'; do
+for apps_setup in 'mkdir -p /run/morde-runtime && touch /run/morde-runtime/apps' 'mkdir -p /run/morde-runtime && ln -s /tmp /run/morde-runtime/apps'; do
   if invalid_apps_output="$(docker run --rm --platform "$platform" --network none \
     --entrypoint /bin/sh "$image" -c "set -e; $apps_setup; exec /usr/local/bin/morde-host-entrypoint" 2>&1)"; then
-    echo "Host unexpectedly started with an invalid application store path: $apps_setup" >&2
+    echo "Host unexpectedly started with an unsafe temporary application path: $apps_setup" >&2
     exit 1
   fi
-  if ! grep -Fq 'dedicated persistent mount at /opt/morde/apps' <<<"$invalid_apps_output"; then
-    echo "Host failed for an unexpected reason with an invalid application store path: $apps_setup" >&2
+  if ! grep -Fq 'Morde application state directory is unsafe.' <<<"$invalid_apps_output"; then
+    echo "Host failed for an unexpected reason with an unsafe temporary application path: $apps_setup" >&2
     printf '%s\n' "$invalid_apps_output" >&2
     exit 1
   fi
 done
 
+assert_legacy_apps_volume() {
+  docker run --rm --platform "$platform" --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps,readonly" \
+    --entrypoint /bin/sh "$image" -c 'test "$(stat -c "%u:%g:%a" /opt/morde/apps)" = 0:0:755 && test "$(cat /opt/morde/apps/smoke-marker)" = installed-app'
+}
+
 docker run --rm --platform "$platform" --network none \
   --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps" \
-  --entrypoint /bin/sh "$image" -c 'printf installed-app > /opt/morde/apps/smoke-marker && chmod 0777 /opt/morde/apps'
+  --entrypoint /bin/sh "$image" -c 'printf installed-app > /opt/morde/apps/smoke-marker'
 docker run --rm --platform "$platform" --network none \
   --mount "type=volume,src=$profile_volume,dst=/home/gem" \
   --entrypoint /bin/sh "$image" -c '
@@ -82,11 +87,11 @@ container="$(docker run -d --platform "$platform" --network none \
   --mount "type=volume,src=$profile_volume,dst=/home/gem" \
   --mount "type=volume,src=$workspace_volume,dst=/home/gem/workspace" \
   --mount "type=volume,src=$runtime_volume,dst=/var/lib/morde-runtime" \
-  --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps" \
   --env "MORDE_RUNTIME_BOOTSTRAP_KEY=$credential" \
   --env "MORDE_HOST_REPLICA_KEY=$replica_credential" \
   --env MORDE_HOST_ID=h1234567 \
   --env MORDE_RUNTIME_GENERATION=1 \
+  --env MORDE_WORKSPACE_LAYOUT=workspace \
   --env SANDBOX_API_KEY=synthetic-aio-key \
   --env JUPYTER_POOL_SIZE=0 \
   --env DISABLE_BROWSER=true "$image")"
@@ -114,7 +119,7 @@ if docker exec --env SANDBOX_API_KEY=wrong-key "$container" /usr/local/bin/cloud
   echo "Host healthcheck accepted an invalid AIO API key" >&2
   exit 1
 fi
-docker exec "$container" sh -c 'test "$(stat -c "%u:%g:%a" /opt/morde/apps)" = 0:0:755 && test "$(cat /opt/morde/apps/smoke-marker)" = installed-app'
+assert_legacy_apps_volume
 if docker logs "$container" 2>&1 | grep -Fq 'morde-runtime: desktop capabilities unavailable'; then
   echo "desktop capability was unavailable during AIO startup" >&2
   exit 1
@@ -233,11 +238,11 @@ container="$(docker run -d --platform "$platform" --network none \
   --mount "type=volume,src=$profile_volume,dst=/home/gem" \
   --mount "type=volume,src=$workspace_volume,dst=/home/gem/workspace" \
   --mount "type=volume,src=$runtime_volume,dst=/var/lib/morde-runtime" \
-  --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps" \
   --env "MORDE_RUNTIME_BOOTSTRAP_KEY=$credential" \
   --env "MORDE_HOST_REPLICA_KEY=$replica_credential" \
   --env MORDE_HOST_ID=h1234567 \
   --env MORDE_RUNTIME_GENERATION=1 \
+  --env MORDE_WORKSPACE_LAYOUT=workspace \
   --env SANDBOX_API_KEY=synthetic-aio-key \
   --env JUPYTER_POOL_SIZE=0 \
   --env DISABLE_BROWSER=true "$image")"
@@ -259,7 +264,7 @@ if [[ "$ready" != true ]]; then
   echo "AIO did not become ready after container recreation" >&2
   exit 1
 fi
-docker exec "$container" sh -c 'test "$(stat -c "%u:%g:%a" /opt/morde/apps)" = 0:0:755 && test "$(cat /opt/morde/apps/smoke-marker)" = installed-app'
+assert_legacy_apps_volume
 docker exec --user 1000:1000 "$container" sh -c '
   test "$(cat /home/gem/.local/share/morde-smoke-marker)" = persistent-profile
   test "$(cat /home/gem/workspace/morde-smoke-marker)" = persistent-workspace

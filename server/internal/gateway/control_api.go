@@ -26,6 +26,7 @@ const maxControlActionBytes = 4096
 
 type ControlService interface {
 	Status(context.Context, identity.Principal, string) (app.ControlStatus, error)
+	RenewLease(context.Context, identity.Principal, string, int64) (app.ControlStatus, error)
 	Applications(context.Context, identity.Principal, string) (app.ApplicationsStatus, error)
 	InstallApplication(context.Context, identity.Principal, string, string, string) (app.ApplicationInstallResult, error)
 	LaunchApplication(context.Context, identity.Principal, string, string, string) (app.ApplicationLaunchResult, error)
@@ -48,10 +49,14 @@ type controlTransitionSummary struct {
 }
 
 type controlStatusResponse struct {
-	HostID           string                    `json:"host_id"`
-	ControlState     host.ControlState         `json:"control_state"`
-	ControlVersion   int64                     `json:"control_version"`
-	ActiveTransition *controlTransitionSummary `json:"active_transition"`
+	HostID                string                    `json:"host_id"`
+	ControlState          host.ControlState         `json:"control_state"`
+	ControlVersion        int64                     `json:"control_version"`
+	ControlActorUserID    string                    `json:"control_actor_user_id"`
+	ControlLeaseExpiresAt *time.Time                `json:"control_lease_expires_at"`
+	ControlLeaseActive    bool                      `json:"control_lease_active"`
+	ControlLeaseHeldByMe  bool                      `json:"control_lease_held_by_me"`
+	ActiveTransition      *controlTransitionSummary `json:"active_transition"`
 }
 
 type applicationsStatusResponse struct {
@@ -126,6 +131,10 @@ type controlActionRequest struct {
 	ExpectedControlVersion *int64         `json:"expected_control_version"`
 }
 
+type controlLeaseRenewRequest struct {
+	ExpectedControlVersion *int64 `json:"expected_control_version"`
+}
+
 func (g *gateway) getControl(c *gin.Context) {
 	hostID := c.GetString(hostIDKey)
 	status, err := g.deps.Control.Status(c.Request.Context(), hostControlPrincipal(c), hostID)
@@ -134,6 +143,32 @@ func (g *gateway) getControl(c *gin.Context) {
 		return
 	}
 	response, err := toControlStatusResponse(status, hostID)
+	if err != nil {
+		httpserver.WriteError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (g *gateway) renewControlLease(c *gin.Context) {
+	if c.Request.URL.RawQuery != "" {
+		httpserver.WriteError(c, domain.InvalidArgument("query", "unexpected query parameters"))
+		return
+	}
+	var request controlLeaseRenewRequest
+	if !decodeControlActionJSON(c, &request) {
+		return
+	}
+	if request.ExpectedControlVersion == nil || *request.ExpectedControlVersion < 0 {
+		httpserver.WriteError(c, domain.InvalidArgument("expected_control_version", "control version is out of range"))
+		return
+	}
+	status, err := g.deps.Control.RenewLease(c.Request.Context(), hostControlPrincipal(c), c.GetString(hostIDKey), *request.ExpectedControlVersion)
+	if err != nil {
+		httpserver.WriteError(c, err)
+		return
+	}
+	response, err := toControlStatusResponse(status, c.GetString(hostIDKey))
 	if err != nil {
 		httpserver.WriteError(c, err)
 		return
@@ -529,7 +564,11 @@ func writeControlDecodeError(c *gin.Context, err error) {
 }
 
 func toControlStatusResponse(value app.ControlStatus, expectedHostID string) (controlStatusResponse, error) {
-	if !domain.ValidHostID(value.HostID) || value.HostID != expectedHostID || !validControlState(value.ControlState) || value.ControlVersion < 0 {
+	if !domain.ValidHostID(value.HostID) || value.HostID != expectedHostID || !validControlState(value.ControlState) || value.ControlVersion < 0 ||
+		(value.ControlActorUserID != "" && !domain.ValidUserID(value.ControlActorUserID)) ||
+		(value.ControlLeaseExpiresAt != nil && value.ControlLeaseExpiresAt.IsZero()) ||
+		(value.ControlLeaseActive && (value.ControlState != host.ControlUser || value.ControlActorUserID == "" || value.ControlLeaseExpiresAt == nil)) ||
+		(value.ControlLeaseHeldByMe && (!value.ControlLeaseActive || value.ControlActorUserID == "")) {
 		return controlStatusResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	var transition *controlTransitionSummary
@@ -542,7 +581,10 @@ func toControlStatusResponse(value app.ControlStatus, expectedHostID string) (co
 	}
 	return controlStatusResponse{
 		HostID: value.HostID, ControlState: value.ControlState,
-		ControlVersion: value.ControlVersion, ActiveTransition: transition,
+		ControlVersion: value.ControlVersion, ControlActorUserID: value.ControlActorUserID,
+		ControlLeaseExpiresAt: value.ControlLeaseExpiresAt, ControlLeaseActive: value.ControlLeaseActive,
+		ControlLeaseHeldByMe: value.ControlLeaseHeldByMe,
+		ActiveTransition:     transition,
 	}, nil
 }
 

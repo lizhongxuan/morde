@@ -52,14 +52,14 @@ func (s *WorkspaceSyncService) FindTaskWorkspacePublishReceipt(ctx context.Conte
 	return s.store.FindTaskWorkspacePublishReceipt(ctx, ownerID, taskID, workspaceID, operationKey)
 }
 
-func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
+func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
 	if err := ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return TaskWorkspacePublishReceipt{}, err
 	}
-	if readBlock == nil || !validSyncDigest(manifestSHA) || len(files)+len(emptyDirectories) > workspace.MaxSyncFiles {
+	if readBlock == nil || !validSyncDigest(manifestSHA) || len(files)+max(len(emptyDirectories), len(directories)) > workspace.MaxSyncFiles {
 		return TaskWorkspacePublishReceipt{}, domain.InvalidArgument("task_workspace_publish", "Task Workspace output manifest is invalid")
 	}
-	actualManifestSHA, err := workspace.ManifestTreeSHA256(files, emptyDirectories)
+	actualManifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
 	if err != nil || actualManifestSHA != manifestSHA {
 		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest digest changed")
 	}
@@ -159,6 +159,9 @@ func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, v
 		}
 	}
 	for _, file := range files {
+		if file.Kind == "symlink" {
+			continue // ValidateFile authenticates the link target; reading content blocks would follow the wrong model.
+		}
 		hasher := sha256.New()
 		var total int64
 		for _, chunk := range file.Chunks {
@@ -173,7 +176,7 @@ func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, v
 			return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output file failed integrity verification")
 		}
 	}
-	receipt, err = s.store.CommitTaskWorkspacePublish(ctx, value, files, emptyDirectories, manifestSHA)
+	receipt, err = s.store.CommitTaskWorkspacePublish(ctx, value, files, emptyDirectories, directories, manifestSHA)
 	if err != nil {
 		return TaskWorkspacePublishReceipt{}, err
 	}

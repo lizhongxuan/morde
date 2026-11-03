@@ -23,12 +23,12 @@ import (
 	"morde-runtime/runtimefiles"
 	"morde-runtime/runtimehttp"
 	"morde-runtime/runtimeidentity"
+	mordesync "morde-sync/client"
 
 	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
-	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
 )
 
@@ -64,17 +64,7 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID)
-	if _, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, 1,
-		workspace.BindingPreparing, workspace.BindingActive, 0, 0); err != nil {
-		t.Fatalf("activate empty test Workspace binding: %v", err)
-	}
+	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
 
 	hostRoot := t.TempDir()
 	workspaceDirectory := filepath.Join(hostRoot, workspaceValue.ID)
@@ -183,6 +173,9 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := runtimeControl.Handshake(ctx, hostValue.ID); err != nil {
+		t.Fatalf("connect Host runtime before Agent task: %v", err)
+	}
 	runtimeTools, err := app.NewRuntimeToolExecutor(store, credentials, runtimeControl, runtimeControl, syncService)
 	if err != nil {
 		t.Fatal(err)
@@ -205,6 +198,29 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	portal := httptest.NewServer(apiRouter)
 	defer portal.Close()
 	httpClient := portal.Client()
+
+	preparingCredential, preparingBinding := f01BindingCredential(t, httpClient, portal.URL, hostValue, replicaCredential, workspaceValue.ID)
+	preparingClient, err := mordesync.New(portal.URL, preparingCredential, httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroRevision := int64(0)
+	initialDownload, err := preparingClient.Sync(ctx, mordesync.SyncOptions{
+		WorkspaceID: workspaceValue.ID, Directory: workspaceDirectory, Direction: "download", Policy: "fill_missing", BaseRevision: &zeroRevision,
+	})
+	if err != nil || initialDownload.Session.State != "completed" || initialDownload.Session.TargetRevision != 0 {
+		t.Fatalf("initial Host replica download = %#v, %v", initialDownload.Session, err)
+	}
+	if err := preparingClient.ConfirmDownloadedLiveBaseline(ctx, workspaceValue.ID, workspaceDirectory, initialDownload.Session.TargetRevision); err != nil {
+		t.Fatalf("record initial Host replica baseline: %v", err)
+	}
+	if err := f01RecordApplied(httpClient, portal.URL, hostValue, replicaCredential, workspaceValue.ID,
+		preparingBinding.BindingVersion, initialDownload.Session.ID, initialDownload.Session.TargetRevision); err != nil {
+		t.Fatal(err)
+	}
+	if err := f01ActivateBinding(httpClient, portal.URL, hostValue, replicaCredential, workspaceValue.ID, preparingBinding.BindingVersion); err != nil {
+		t.Fatal(err)
+	}
 
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -246,7 +262,7 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	workerContextCanceled := make(chan struct{}, 1)
 	recorder := f01RevocationRecordingExecutor{inner: executor, done: executionDone, contextCanceled: workerContextCanceled}
 	backgroundWorker, err := NewTaskWorker(TaskWorkerOptions{
-		Store: store, Executor: recorder, WorkerID: "f01-revoke-worker", LeaseDuration: 900 * time.Millisecond,
+		Store: store, Executor: recorder, WorkerID: "f01-revoke-worker", LeaseDuration: 30 * time.Second,
 		PollInterval: 5 * time.Millisecond, Logger: zap.NewNop(),
 	})
 	if err != nil {
@@ -295,7 +311,9 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 	select {
 	case <-gate.executeEntered:
 	case runErr := <-executionDone:
-		t.Fatalf("dsh execution ended before Host operation boundary: %v", runErr)
+		current, taskErr := store.GetTask(ctx, accepted.ID, owner.ID)
+		t.Fatalf("dsh execution ended before Host operation boundary: %v; model_calls=%d task_status=%q waiting_reason=%q task_error=%v",
+			runErr, model.callCount(), current.Task.Status, current.Task.WaitingReason, taskErr)
 	case <-ctx.Done():
 		t.Fatalf("dsh did not reach Host operation boundary: %v", ctx.Err())
 	}

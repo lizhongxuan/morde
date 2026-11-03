@@ -202,7 +202,7 @@ func workspaceSyncRequest(router http.Handler, method, path string, body []byte,
 
 func TestWorkspaceSyncManifestAndChangesForwardPrincipalAndBounds(t *testing.T) {
 	service := &workspaceSyncServiceStub{
-		manifest: workspace.ManifestPage{WorkspaceID: testWorkspaceID, Revision: 4, Files: []workspace.File{}},
+		manifest: workspace.ManifestPage{WorkspaceID: testWorkspaceID, Revision: 4, Files: []workspace.File{{Path: "z.txt", HardlinkTo: "a.txt"}}},
 		changes:  workspace.ChangePage{Items: []workspace.Change{}},
 	}
 	router := newWorkspaceSyncRouter(t, service, Options{})
@@ -210,6 +210,9 @@ func TestWorkspaceSyncManifestAndChangesForwardPrincipalAndBounds(t *testing.T) 
 	manifest := workspaceSyncRequest(router, http.MethodGet, "/api/workspaces/"+testWorkspaceID+"/manifest?revision=4&prefix=src&cursor=abc&limit=99", nil, "", "Bearer "+apiKeyCredential(), nil)
 	if manifest.Code != http.StatusOK {
 		t.Fatalf("manifest status = %d, body = %s", manifest.Code, manifest.Body)
+	}
+	if !strings.Contains(manifest.Body.String(), `"hardlink_to":"a.txt"`) {
+		t.Fatalf("manifest omitted hardlink metadata: %s", manifest.Body)
 	}
 	if service.manifestCalls != 1 || service.workspaceID != testWorkspaceID || service.principal.Kind != identity.KindAPIKey ||
 		service.manifestRevision != 4 || service.manifestPrefix != "src" || service.manifestCursor != "abc" || service.manifestLimit != 99 {

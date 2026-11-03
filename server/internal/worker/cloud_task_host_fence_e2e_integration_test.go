@@ -51,14 +51,8 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
-	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID)
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	hostValue, runtimeCredential, _ := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	binding := hostValue.Workspaces[0]
 	activeBinding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
 	if err != nil {
@@ -483,7 +477,7 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("new-fence Host operation did not succeed: %v", err)
 	}
-	content, err := os.ReadFile(filepath.Join(taskViewRoot, newTaskID, newTaskViewID, "after-release.txt"))
+	content, err := os.ReadFile(filepath.Join(taskViewRoot, newTaskID, newTaskViewID, "workspace", "after-release.txt"))
 	if err != nil || string(content) != "new fence write" {
 		t.Fatalf("new-fence Workspace content = %q err=%v", content, err)
 	}

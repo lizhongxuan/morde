@@ -11,9 +11,16 @@ import (
 
 type conversationStoreStub struct {
 	TaskStore
-	value       conversation.Conversation
-	key         IdempotencyRecord
-	filterHosts []string
+	value        conversation.Conversation
+	key          IdempotencyRecord
+	filterHosts  []string
+	main         conversation.MainConversation
+	mainRecord   IdempotencyRecord
+	mainTarget   string
+	mainExpected int64
+	mainCalls    int
+	mainReplayed bool
+	mainErr      error
 }
 
 func (s *conversationStoreStub) CreateConversation(_ context.Context, value conversation.Conversation, key IdempotencyRecord) (conversation.Conversation, bool, error) {
@@ -34,6 +41,31 @@ func (s *conversationStoreStub) ListConversations(_ context.Context, ownerID str
 		return ConversationPage{Items: []conversation.Conversation{}}, nil
 	}
 	return ConversationPage{Items: []conversation.Conversation{s.value}}, nil
+}
+
+func (s *conversationStoreStub) GetMainConversation(context.Context, string) (conversation.MainConversation, error) {
+	s.mainCalls++
+	return s.main, s.mainErr
+}
+
+func (s *conversationStoreStub) EnsureMainConversation(_ context.Context, value conversation.Conversation, record IdempotencyRecord) (conversation.MainConversation, bool, error) {
+	s.mainCalls++
+	s.mainRecord = record
+	if s.main.Status == conversation.MainConversationUninitialized {
+		s.main = conversation.MainConversation{Status: conversation.MainConversationReady, ConversationID: value.ID, Version: 1}
+	}
+	return s.main, s.mainReplayed, s.mainErr
+}
+
+func (s *conversationStoreStub) SetMainConversation(_ context.Context, ownerID, conversationID string, expectedVersion int64, record IdempotencyRecord) (conversation.MainConversation, bool, error) {
+	s.mainCalls++
+	s.mainRecord = record
+	s.mainTarget, s.mainExpected = conversationID, expectedVersion
+	if record.OwnerID != ownerID {
+		return conversation.MainConversation{}, false, domain.NewError(domain.CodeNotFound, "conversation not found")
+	}
+	s.main = conversation.MainConversation{Status: conversation.MainConversationReady, ConversationID: conversationID, Version: expectedVersion + 1}
+	return s.main, s.mainReplayed, s.mainErr
 }
 
 func TestConversationServiceDoesNotBindConversationToHost(t *testing.T) {
@@ -85,5 +117,56 @@ func TestConversationServiceChecksOptionalHostAndClientIdentity(t *testing.T) {
 	_, _, err = service.Create(context.Background(), client, CreateConversationCommand{IdempotencyKey: "conversation-456"})
 	if domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("missing client installation should be rejected: %v", err)
+	}
+}
+
+func TestConversationServiceReadsEnsuresAndSwitchesMainConversation(t *testing.T) {
+	store := &conversationStoreStub{main: conversation.MainConversation{Status: conversation.MainConversationUninitialized}}
+	service, err := NewConversationService(store, &taskAuthorizerStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := taskTestPrincipal()
+	value, err := service.GetMain(context.Background(), principal)
+	if err != nil || value.Status != conversation.MainConversationUninitialized || store.mainCalls != 1 {
+		t.Fatalf("read uninitialized main conversation = %+v, calls=%d, err=%v", value, store.mainCalls, err)
+	}
+	value, replayed, err := service.EnsureMain(context.Background(), principal, EnsureMainConversationCommand{IdempotencyKey: "main-ensure-001"})
+	if err != nil || replayed || value.Status != conversation.MainConversationReady || value.ConversationID == "" || value.Version != 1 ||
+		store.mainCalls != 2 || store.mainRecord.OwnerID != principal.UserID || store.mainRecord.Operation != "main_conversation.ensure" ||
+		store.mainRecord.Key != "main-ensure-001" || len(store.mainRecord.RequestHash) != 32 {
+		t.Fatalf("ensure main conversation = %+v, replay=%t, calls=%d, record=%+v, err=%v", value, replayed, store.mainCalls, store.mainRecord, err)
+	}
+	value, replayed, err = service.SetMain(context.Background(), principal, SetMainConversationCommand{
+		ConversationID: "c7654321", ExpectedVersion: value.Version, IdempotencyKey: "main-switch-001",
+	})
+	if err != nil || replayed || value.Status != conversation.MainConversationReady || value.ConversationID != "c7654321" || value.Version != 2 ||
+		store.mainCalls != 3 || store.mainTarget != "c7654321" || store.mainExpected != 1 || store.mainRecord.Operation != "main_conversation.set" {
+		t.Fatalf("switch main conversation = %+v, replay=%t, calls=%d, record=%+v, err=%v", value, replayed, store.mainCalls, store.mainRecord, err)
+	}
+}
+
+func TestConversationServiceValidatesMainConversationMutations(t *testing.T) {
+	store := &conversationStoreStub{main: conversation.MainConversation{Status: conversation.MainConversationUninitialized}}
+	service, err := NewConversationService(store, &taskAuthorizerStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := taskTestPrincipal()
+	if _, _, err := service.EnsureMain(context.Background(), principal, EnsureMainConversationCommand{IdempotencyKey: "short"}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("short ensure key should be rejected: %v", err)
+	}
+	if _, _, err := service.SetMain(context.Background(), principal, SetMainConversationCommand{
+		ConversationID: "bad", ExpectedVersion: -1, IdempotencyKey: "main-switch-002",
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("invalid main conversation target/version should be rejected: %v", err)
+	}
+	if store.mainCalls != 0 {
+		t.Fatalf("invalid mutations reached the store %d times", store.mainCalls)
+	}
+	principal.Scopes = []identity.Scope{identity.ScopeTaskSubmit}
+	principal.Kind = identity.KindAPIKey
+	if _, err := service.GetMain(context.Background(), principal); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("main conversation read without task read scope should fail: %v", err)
 	}
 }

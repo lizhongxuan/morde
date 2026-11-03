@@ -38,12 +38,20 @@ func (s *Store) RespondToPendingRequest(ctx context.Context, record app.Idempote
 		if err != nil {
 			return err
 		}
-		var status string
+		var status, workspaceID, initiatorID string
 		var leaseVersion, taskEpoch int64
-		if err := tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).Scan(&status, &leaseVersion, &taskEpoch); errors.Is(err, pgx.ErrNoRows) {
+		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, true)
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch, COALESCE(workspace_id,''), initiator_id
+FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("lock task for pending response: %w", err)
+		}
+		if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+			return err
 		}
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
@@ -90,7 +98,7 @@ WHERE id=$1 AND task_id=$2`, pendingID, taskID, requestStatus, string(decision))
 		var sequence int64
 		err = tx.QueryRow(ctx, `UPDATE tasks SET status='queued', lease_version=lease_version+1, waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND status='waiting_user' AND lease_owner='' AND lease_expires_at IS NULL
-RETURNING event_seq`, taskID, record.OwnerID).Scan(&sequence)
+RETURNING event_seq`, taskID, taskOwnerID).Scan(&sequence)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "task state changed while applying the response")
 		}
@@ -130,13 +138,21 @@ func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.Idemp
 		if err != nil {
 			return err
 		}
-		var status, waitingReason, storedFileIntent, workspaceID string
+		var status, waitingReason, storedFileIntent, workspaceID, initiatorID string
 		var leaseVersion, taskEpoch int64
-		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, execution_epoch, file_delivery_intent, COALESCE(workspace_id, '') FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
-			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch, &storedFileIntent, &workspaceID); errors.Is(err, pgx.ErrNoRows) {
+		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, true)
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, execution_epoch, file_delivery_intent,
+COALESCE(workspace_id, ''), initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
+			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch, &storedFileIntent, &workspaceID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("lock task for clarification answer: %w", err)
+		}
+		if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+			return err
 		}
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
@@ -190,7 +206,7 @@ WHERE id=$1 AND task_id=$2`, clarificationID, taskID, answer); err != nil {
 file_delivery_intent=CASE WHEN $4='' THEN file_delivery_intent ELSE $4 END,
 status='queued', lease_version=lease_version+1, waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND status='waiting_user' AND waiting_reason='clarification_required' AND lease_owner='' AND lease_expires_at IS NULL
-RETURNING event_seq`, taskID, record.OwnerID, objective, string(fileIntent)).Scan(&sequence)
+RETURNING event_seq`, taskID, taskOwnerID, objective, string(fileIntent)).Scan(&sequence)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "task state changed while applying the clarification")
 		}

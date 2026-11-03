@@ -65,7 +65,7 @@ func TestCreateRequestMatchesGolden(t *testing.T) {
 		Env: map[string]string{
 			"SANDBOX_API_KEY": "redacted", "MORDE_RUNTIME_BOOTSTRAP_KEY": "redacted",
 			"MORDE_HOST_ID": "h1234567", "MORDE_RUNTIME_GENERATION": "1",
-			"WORKSPACE": "/home/gem/workspace", "TZ": "Asia/Shanghai",
+			"WORKSPACE": "/home/gem/workspace", "MORDE_WORKSPACE_LAYOUT": "workspace", "TZ": "Asia/Shanghai",
 		},
 		Metadata: map[string]string{"ch-host": "h1234567", "ch-owner": "cli", "ch-workspace": "", "ch-env": "hostctl"},
 		Volumes: []app.SandboxVolume{
@@ -94,6 +94,47 @@ func TestCreateRequestMatchesGolden(t *testing.T) {
 	}
 	if !bytes.Equal(got, wantCompact.Bytes()) {
 		t.Fatalf("create request differs from golden:\n got: %s\nwant: %s", got, wantCompact.Bytes())
+	}
+}
+
+func TestCreateRequiresRegisteredVolumesToExist(t *testing.T) {
+	var createIfNotExists bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/sandboxes" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var request struct {
+			Volumes []struct {
+				Name string `json:"name"`
+				PVC  struct {
+					CreateIfNotExists bool `json:"createIfNotExists"`
+				} `json:"pvc"`
+			} `json:"volumes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode sandbox request: %v", err)
+		}
+		if len(request.Volumes) != 1 {
+			t.Errorf("volumes = %#v, want exactly one", request.Volumes)
+		} else {
+			createIfNotExists = request.Volumes[0].PVC.CreateIfNotExists
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `{"id":"sandbox-1","status":{"state":"Running"}}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, nil)
+	client.checkNetworkPolicy = func(context.Context, string, string) error { return nil }
+	_, err := client.Create(context.Background(), app.SandboxCreateRequest{
+		Image:   "registry.local/cloudhost/host:1.0.0",
+		Volumes: []app.SandboxVolume{{Name: "workspace", MountPath: "/home/gem/workspace", ClaimName: "workspace-w1234567", Storage: "20Gi", RequireExisting: true}},
+	})
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+	if createIfNotExists {
+		t.Fatal("OpenSandbox createIfNotExists = true for a registered Workspace volume")
 	}
 }
 

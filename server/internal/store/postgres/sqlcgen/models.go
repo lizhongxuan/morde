@@ -28,6 +28,7 @@ type AccountAgentRuntime struct {
 	UpdatedAt                     pgtype.Timestamptz `json:"updated_at"`
 	SupervisorNonceSha256         pgtype.Text        `json:"supervisor_nonce_sha256"`
 	GuardianStopAcknowledgedAt    pgtype.Timestamptz `json:"guardian_stop_acknowledged_at"`
+	FailureReason                 string             `json:"failure_reason"`
 }
 
 type AccountChangeCounter struct {
@@ -47,6 +48,14 @@ type AccountChangeLog struct {
 	Operation         string             `json:"operation"`
 	MutationID        pgtype.Text        `json:"mutation_id"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type AccountMainConversation struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ConversationID    string             `json:"conversation_id"`
+	Version           int64              `json:"version"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type AccountObjectVersion struct {
@@ -78,6 +87,14 @@ type AdminControlRule struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 	LastFiredAt   pgtype.Timestamptz `json:"last_fired_at"`
 	FiredAccounts int64              `json:"fired_accounts"`
+}
+
+type AdminModelBudgetDefault struct {
+	ID            int32              `json:"id"`
+	TokenLimit    int64              `json:"token_limit"`
+	MaxConcurrent int32              `json:"max_concurrent"`
+	Version       int64              `json:"version"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type AdminNudgePolicy struct {
@@ -156,6 +173,8 @@ type Conversation struct {
 	ModelID    string             `json:"model_id"`
 	SourceKind string             `json:"source_kind"`
 	MessageSeq int64              `json:"message_seq"`
+	ArchivedAt pgtype.Timestamptz `json:"archived_at"`
+	ProjectID  pgtype.Text        `json:"project_id"`
 }
 
 type ConversationMessage struct {
@@ -171,6 +190,8 @@ type ConversationMessage struct {
 	SourceExchangeID        string             `json:"source_exchange_id"`
 	RequestedConversationID string             `json:"requested_conversation_id"`
 	Sequence                int64              `json:"sequence"`
+	DeliveryStatus          string             `json:"delivery_status"`
+	ActorID                 string             `json:"actor_id"`
 }
 
 type ConversationMessageAttachment struct {
@@ -222,6 +243,8 @@ type Host struct {
 	ResourceUpdateState    string             `json:"resource_update_state"`
 	ResourceTargetCpuMilli pgtype.Int4        `json:"resource_target_cpu_milli"`
 	ResourceTargetMemMib   pgtype.Int4        `json:"resource_target_mem_mib"`
+	ControlActorID         pgtype.Text        `json:"control_actor_id"`
+	ControlLeaseExpiresAt  pgtype.Timestamptz `json:"control_lease_expires_at"`
 }
 
 type HostActivityLease struct {
@@ -279,6 +302,7 @@ type HostControlTransition struct {
 	FailureReason          string             `json:"failure_reason"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	ActorUserID            pgtype.Text        `json:"actor_user_id"`
 }
 
 type HostMember struct {
@@ -295,6 +319,30 @@ type HostRuntimeHeartbeat struct {
 	HostID            string             `json:"host_id"`
 	RuntimeGeneration int64              `json:"runtime_generation"`
 	LastSeenAt        pgtype.Timestamptz `json:"last_seen_at"`
+}
+
+type HostRuntimeOperationLedgerEvent struct {
+	HostID            string             `json:"host_id"`
+	RuntimeGeneration int64              `json:"runtime_generation"`
+	Namespace         string             `json:"namespace"`
+	Sequence          int64              `json:"sequence"`
+	Kind              string             `json:"kind"`
+	Data              []byte             `json:"data"`
+	DataCanonical     []byte             `json:"data_canonical"`
+	PreviousHash      string             `json:"previous_hash"`
+	EventHash         string             `json:"event_hash"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type HostRuntimeOperationLedgerHead struct {
+	HostID            string             `json:"host_id"`
+	RuntimeGeneration int64              `json:"runtime_generation"`
+	Namespace         string             `json:"namespace"`
+	EventCount        int64              `json:"event_count"`
+	HeadHash          string             `json:"head_hash"`
+	TotalBytes        int64              `json:"total_bytes"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type HostSiteDrain struct {
@@ -316,6 +364,56 @@ type HostTerminalSession struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type HostUsageInterval struct {
+	ID                        int64              `json:"id"`
+	HostID                    string             `json:"host_id"`
+	RuntimeGeneration         int64              `json:"runtime_generation"`
+	SandboxID                 string             `json:"sandbox_id"`
+	StartObservationID        pgtype.Int8        `json:"start_observation_id"`
+	EndObservationID          int64              `json:"end_observation_id"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	EndedAt                   pgtype.Timestamptz `json:"ended_at"`
+	State                     string             `json:"state"`
+	UnknownReason             pgtype.Text        `json:"unknown_reason"`
+	CalculationMethod         string             `json:"calculation_method"`
+	CpuSeconds                pgtype.Float8      `json:"cpu_seconds"`
+	EstimatedMemoryMibSeconds pgtype.Float8      `json:"estimated_memory_mib_seconds"`
+	OwnerID                   string             `json:"owner_id"`
+	AttributionState          string             `json:"attribution_state"`
+	AttributionReason         pgtype.Text        `json:"attribution_reason"`
+	WorkspaceID               pgtype.Text        `json:"workspace_id"`
+	WorkspaceBindingID        pgtype.Text        `json:"workspace_binding_id"`
+	WorkspaceBindingVersion   pgtype.Int8        `json:"workspace_binding_version"`
+	ProjectID                 pgtype.Text        `json:"project_id"`
+	ProjectResourceVersion    pgtype.Int8        `json:"project_resource_version"`
+	ActorID                   pgtype.Text        `json:"actor_id"`
+}
+
+type HostUsageSample struct {
+	ID                      int64              `json:"id"`
+	HostID                  string             `json:"host_id"`
+	RuntimeGeneration       int64              `json:"runtime_generation"`
+	SandboxID               string             `json:"sandbox_id"`
+	OwnerID                 string             `json:"owner_id"`
+	ObservedAt              pgtype.Timestamptz `json:"observed_at"`
+	SampledAt               pgtype.Timestamptz `json:"sampled_at"`
+	State                   string             `json:"state"`
+	Reason                  pgtype.Text        `json:"reason"`
+	Source                  string             `json:"source"`
+	ContainerID             pgtype.Text        `json:"container_id"`
+	CpuUsageTotalNs         pgtype.Int8        `json:"cpu_usage_total_ns"`
+	MemoryUsageBytes        pgtype.Int8        `json:"memory_usage_bytes"`
+	RawPayload              []byte             `json:"raw_payload"`
+	AttributionState        string             `json:"attribution_state"`
+	AttributionReason       pgtype.Text        `json:"attribution_reason"`
+	WorkspaceID             pgtype.Text        `json:"workspace_id"`
+	WorkspaceBindingID      pgtype.Text        `json:"workspace_binding_id"`
+	WorkspaceBindingVersion pgtype.Int8        `json:"workspace_binding_version"`
+	ProjectID               pgtype.Text        `json:"project_id"`
+	ProjectResourceVersion  pgtype.Int8        `json:"project_resource_version"`
+	ActorID                 pgtype.Text        `json:"actor_id"`
 }
 
 type IdempotencyKey struct {
@@ -434,8 +532,8 @@ type ModelConnection struct {
 type Notification struct {
 	ID             string             `json:"id"`
 	OwnerID        string             `json:"owner_id"`
-	TaskID         string             `json:"task_id"`
-	EventSequence  int64              `json:"event_sequence"`
+	TaskID         pgtype.Text        `json:"task_id"`
+	EventSequence  pgtype.Int8        `json:"event_sequence"`
 	Kind           string             `json:"kind"`
 	Summary        string             `json:"summary"`
 	RequestID      string             `json:"request_id"`
@@ -444,12 +542,29 @@ type Notification struct {
 	ReadAt         pgtype.Timestamptz `json:"read_at"`
 	HandledAt      pgtype.Timestamptz `json:"handled_at"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	SourceEventID  pgtype.Int8        `json:"source_event_id"`
+	SourceKind     pgtype.Text        `json:"source_kind"`
+	SourceID       pgtype.Text        `json:"source_id"`
+	SourceVersion  pgtype.Int8        `json:"source_version"`
+	ProjectID      pgtype.Text        `json:"project_id"`
 }
 
 type NotificationEventReceipt struct {
 	TaskID        string             `json:"task_id"`
 	EventSequence int64              `json:"event_sequence"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type NotificationSourceEvent struct {
+	ID            int64              `json:"id"`
+	SourceKind    string             `json:"source_kind"`
+	SourceID      string             `json:"source_id"`
+	SourceVersion int64              `json:"source_version"`
+	EventKind     string             `json:"event_kind"`
+	RecipientID   string             `json:"recipient_id"`
+	ProjectID     pgtype.Text        `json:"project_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ProcessedAt   pgtype.Timestamptz `json:"processed_at"`
 }
 
 type OrphanHostVolumeCleanup struct {
@@ -561,6 +676,178 @@ type PersonalObject struct {
 	Body              []byte             `json:"body"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type Project struct {
+	ID                   string             `json:"id"`
+	OwnerID              string             `json:"owner_id"`
+	OwnerRole            string             `json:"owner_role"`
+	Name                 string             `json:"name"`
+	Description          string             `json:"description"`
+	Version              int64              `json:"version"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	CreateIdempotencyKey string             `json:"create_idempotency_key"`
+	CreateRequestDigest  []byte             `json:"create_request_digest"`
+}
+
+type ProjectBudget struct {
+	ProjectID      string             `json:"project_id"`
+	Version        int64              `json:"version"`
+	Currency       string             `json:"currency"`
+	LimitMicros    int64              `json:"limit_micros"`
+	UpdatedBy      string             `json:"updated_by"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	RequestDigest  []byte             `json:"request_digest"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type ProjectBudgetLedger struct {
+	ProjectID              string             `json:"project_id"`
+	Source                 string             `json:"source"`
+	CallID                 string             `json:"call_id"`
+	ActorID                string             `json:"actor_id"`
+	TaskID                 pgtype.Text        `json:"task_id"`
+	ModelID                string             `json:"model_id"`
+	RateProvider           string             `json:"rate_provider"`
+	RateModel              string             `json:"rate_model"`
+	RateVersion            int64              `json:"rate_version"`
+	Currency               string             `json:"currency"`
+	InputMicrosPerMillion  int64              `json:"input_micros_per_million"`
+	OutputMicrosPerMillion int64              `json:"output_micros_per_million"`
+	ReservedInputTokens    int64              `json:"reserved_input_tokens"`
+	ReservedOutputTokens   int64              `json:"reserved_output_tokens"`
+	ReservedMicros         int64              `json:"reserved_micros"`
+	Status                 string             `json:"status"`
+	ActualInputTokens      pgtype.Int8        `json:"actual_input_tokens"`
+	ActualOutputTokens     pgtype.Int8        `json:"actual_output_tokens"`
+	ActualMicros           pgtype.Int8        `json:"actual_micros"`
+	RequestDigest          []byte             `json:"request_digest"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	SettledAt              pgtype.Timestamptz `json:"settled_at"`
+}
+
+type ProjectContentComment struct {
+	ProjectID       string             `json:"project_id"`
+	ContentKind     string             `json:"content_kind"`
+	ContentID       string             `json:"content_id"`
+	ContentRevision int64              `json:"content_revision"`
+	RowID           string             `json:"row_id"`
+	CommentID       string             `json:"comment_id"`
+	Version         int64              `json:"version"`
+	Body            pgtype.Text        `json:"body"`
+	Deleted         bool               `json:"deleted"`
+	Current         bool               `json:"current"`
+	UpdatedBy       string             `json:"updated_by"`
+	IdempotencyKey  string             `json:"idempotency_key"`
+	RequestDigest   []byte             `json:"request_digest"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type ProjectContentRevision struct {
+	ProjectID      string             `json:"project_id"`
+	Kind           string             `json:"kind"`
+	ContentID      string             `json:"content_id"`
+	Revision       int64              `json:"revision"`
+	Body           []byte             `json:"body"`
+	Deleted        bool               `json:"deleted"`
+	Current        bool               `json:"current"`
+	UpdatedBy      string             `json:"updated_by"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	RequestDigest  []byte             `json:"request_digest"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type ProjectIdempotencyKey struct {
+	ActorID        string             `json:"actor_id"`
+	Operation      string             `json:"operation"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	ProjectID      string             `json:"project_id"`
+	ResultKind     string             `json:"result_kind"`
+	ResultID       string             `json:"result_id"`
+	ResultVersion  int64              `json:"result_version"`
+	RequestDigest  []byte             `json:"request_digest"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type ProjectInvitation struct {
+	ID                   string             `json:"id"`
+	ProjectID            string             `json:"project_id"`
+	InviterID            string             `json:"inviter_id"`
+	InviteeID            string             `json:"invitee_id"`
+	Role                 string             `json:"role"`
+	State                string             `json:"state"`
+	Version              int64              `json:"version"`
+	CreateIdempotencyKey string             `json:"create_idempotency_key"`
+	CreateRequestDigest  []byte             `json:"create_request_digest"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	AcceptedAt           pgtype.Timestamptz `json:"accepted_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type ProjectMcpConnectorGrant struct {
+	ProjectID        string             `json:"project_id"`
+	ConnectorID      string             `json:"connector_id"`
+	ConnectorOwnerID string             `json:"connector_owner_id"`
+	Version          int64              `json:"version"`
+	AuthorizedBy     string             `json:"authorized_by"`
+	Active           bool               `json:"active"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ProjectMember struct {
+	ProjectID string             `json:"project_id"`
+	UserID    string             `json:"user_id"`
+	Role      string             `json:"role"`
+	Version   int64              `json:"version"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ProjectResource struct {
+	ProjectID       string             `json:"project_id"`
+	Kind            string             `json:"kind"`
+	ResourceID      string             `json:"resource_id"`
+	ResourceOwnerID string             `json:"resource_owner_id"`
+	HostID          pgtype.Text        `json:"host_id"`
+	WorkspaceID     pgtype.Text        `json:"workspace_id"`
+	Version         int64              `json:"version"`
+	Active          bool               `json:"active"`
+	UpdatedBy       string             `json:"updated_by"`
+	IdempotencyKey  pgtype.Text        `json:"idempotency_key"`
+	RequestDigest   []byte             `json:"request_digest"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ProjectWorkItem struct {
+	ProjectID           string             `json:"project_id"`
+	ID                  string             `json:"id"`
+	Title               string             `json:"title"`
+	Description         string             `json:"description"`
+	AcceptanceCriteria  []byte             `json:"acceptance_criteria"`
+	AssigneeID          string             `json:"assignee_id"`
+	State               string             `json:"state"`
+	BlockedReason       string             `json:"blocked_reason"`
+	DeliveryTaskID      pgtype.Text        `json:"delivery_task_id"`
+	DeliveryWorkspaceID pgtype.Text        `json:"delivery_workspace_id"`
+	DeliveryRevision    pgtype.Int8        `json:"delivery_revision"`
+	Version             int64              `json:"version"`
+	CreatedBy           string             `json:"created_by"`
+	UpdatedBy           string             `json:"updated_by"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ProjectWorkItemTask struct {
+	ProjectID  string             `json:"project_id"`
+	WorkItemID string             `json:"work_item_id"`
+	TaskID     string             `json:"task_id"`
+	LinkedBy   string             `json:"linked_by"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type RecordAdminGrant struct {
@@ -702,7 +989,7 @@ type Schedule struct {
 	Version                  int64              `json:"version"`
 	Status                   string             `json:"status"`
 	ExecutionEpoch           int64              `json:"execution_epoch"`
-	HostID                   string             `json:"host_id"`
+	HostID                   pgtype.Text        `json:"host_id"`
 	ModelID                  string             `json:"model_id"`
 	Objective                string             `json:"objective"`
 	Timing                   []byte             `json:"timing"`
@@ -827,6 +1114,8 @@ type Task struct {
 	CheckpointThroughSeq        int64              `json:"checkpoint_through_seq"`
 	FileDeliveryIntent          string             `json:"file_delivery_intent"`
 	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
+	ProjectID                   pgtype.Text        `json:"project_id"`
+	InitiatorID                 string             `json:"initiator_id"`
 }
 
 type TaskAgentCheckpoint struct {
@@ -982,17 +1271,20 @@ type TaskHubOperation struct {
 }
 
 type TaskMcpConnectorGrant struct {
-	TaskID            string             `json:"task_id"`
-	OwnerID           string             `json:"owner_id"`
-	ConnectorID       string             `json:"connector_id"`
-	ConnectorRevision int64              `json:"connector_revision"`
-	CredentialVersion int64              `json:"credential_version"`
-	GrantVersion      int64              `json:"grant_version"`
-	ToolSchema        []byte             `json:"tool_schema"`
-	ToolSchemaSha256  []byte             `json:"tool_schema_sha256"`
-	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	TaskID              string             `json:"task_id"`
+	OwnerID             string             `json:"owner_id"`
+	ConnectorID         string             `json:"connector_id"`
+	ConnectorRevision   int64              `json:"connector_revision"`
+	CredentialVersion   int64              `json:"credential_version"`
+	GrantVersion        int64              `json:"grant_version"`
+	ToolSchema          []byte             `json:"tool_schema"`
+	ToolSchemaSha256    []byte             `json:"tool_schema_sha256"`
+	RevokedAt           pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	ConnectorOwnerID    string             `json:"connector_owner_id"`
+	ProjectID           pgtype.Text        `json:"project_id"`
+	ProjectGrantVersion pgtype.Int8        `json:"project_grant_version"`
 }
 
 type TaskMcpConnectorOperation struct {
@@ -1087,6 +1379,22 @@ type TaskStopRequest struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type TaskWorkbenchObservationTicket struct {
+	TicketHash        []byte             `json:"ticket_hash"`
+	NonceHash         []byte             `json:"nonce_hash"`
+	SessionHash       []byte             `json:"session_hash"`
+	TaskID            string             `json:"task_id"`
+	HostID            string             `json:"host_id"`
+	ActorUserID       string             `json:"actor_user_id"`
+	SessionTokenID    string             `json:"session_token_id"`
+	RuntimeGeneration int64              `json:"runtime_generation"`
+	ReadScope         string             `json:"read_scope"`
+	ExpiresAt         pgtype.Timestamptz `json:"expires_at"`
+	UsedAt            pgtype.Timestamptz `json:"used_at"`
+	SessionExpiresAt  pgtype.Timestamptz `json:"session_expires_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
 type TaskWorkspacePublishReceipt struct {
@@ -1218,6 +1526,20 @@ type WorkspaceChange struct {
 	Action      string             `json:"action"`
 	File        []byte             `json:"file"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	Directory   []byte             `json:"directory"`
+}
+
+type WorkspaceCopyReservation struct {
+	ID                string             `json:"id"`
+	OwnerID           string             `json:"owner_id"`
+	SourceWorkspaceID string             `json:"source_workspace_id"`
+	TargetWorkspaceID string             `json:"target_workspace_id"`
+	ServiceInstanceID string             `json:"service_instance_id"`
+	SourceRevision    int64              `json:"source_revision"`
+	ReservedBytes     int64              `json:"reserved_bytes"`
+	State             string             `json:"state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WorkspaceCurrentMaterialization struct {
@@ -1244,6 +1566,28 @@ type WorkspaceOwnerBlockUsage struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type WorkspaceOwnershipHistory struct {
+	WorkspaceID string             `json:"workspace_id"`
+	OwnerID     string             `json:"owner_id"`
+	TransferID  pgtype.Text        `json:"transfer_id"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	EndedAt     pgtype.Timestamptz `json:"ended_at"`
+}
+
+type WorkspaceOwnershipTransfer struct {
+	ID               string             `json:"id"`
+	WorkspaceID      string             `json:"workspace_id"`
+	FromOwnerID      string             `json:"from_owner_id"`
+	ToOwnerID        string             `json:"to_owner_id"`
+	State            string             `json:"state"`
+	ExpectedRevision int64              `json:"expected_revision"`
+	OperationID      pgtype.Text        `json:"operation_id"`
+	Version          int64              `json:"version"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	AcceptedAt       pgtype.Timestamptz `json:"accepted_at"`
+}
+
 type WorkspaceRevision struct {
 	WorkspaceID    string             `json:"workspace_id"`
 	Revision       int64              `json:"revision"`
@@ -1251,6 +1595,19 @@ type WorkspaceRevision struct {
 	TotalBytes     int64              `json:"total_bytes"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	DirectoryCount int64              `json:"directory_count"`
+}
+
+type WorkspaceRevisionDirectory struct {
+	WorkspaceID       string      `json:"workspace_id"`
+	ValidFromRevision int64       `json:"valid_from_revision"`
+	ValidToRevision   pgtype.Int8 `json:"valid_to_revision"`
+	DirectoryPath     string      `json:"directory_path"`
+	FoldedPath        string      `json:"folded_path"`
+	Mode              pgtype.Int4 `json:"mode"`
+	ModTimeNs         pgtype.Int8 `json:"mod_time_ns"`
+	Xattrs            []byte      `json:"xattrs"`
+	Acl               []byte      `json:"acl"`
+	MetadataKnown     bool        `json:"metadata_known"`
 }
 
 type WorkspaceRevisionEmptyDirectory struct {
@@ -1271,6 +1628,13 @@ type WorkspaceRevisionFile struct {
 	Sha256            string      `json:"sha256"`
 	Mode              int32       `json:"mode"`
 	Chunks            []byte      `json:"chunks"`
+	ModTimeNs         pgtype.Int8 `json:"mod_time_ns"`
+	Kind              string      `json:"kind"`
+	SymlinkTarget     pgtype.Text `json:"symlink_target"`
+	HardlinkTo        pgtype.Text `json:"hardlink_to"`
+	Xattrs            []byte      `json:"xattrs"`
+	Acl               []byte      `json:"acl"`
+	MetadataKnown     bool        `json:"metadata_known"`
 }
 
 type WorkspaceSyncCommitReceipt struct {
@@ -1379,6 +1743,7 @@ type WorkspaceSyncReceiveQuotaRejection struct {
 	State                  string             `json:"state"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	BaseFileModTimeNs      pgtype.Int8        `json:"base_file_mod_time_ns"`
 }
 
 type WorkspaceSyncReceiveReservation struct {
@@ -1447,6 +1812,14 @@ type WorkspaceSyncSessionBlock struct {
 	Received    bool   `json:"received"`
 }
 
+type WorkspaceSyncSessionDirectory struct {
+	WorkspaceID         string `json:"workspace_id"`
+	SessionID           string `json:"session_id"`
+	Directories         []byte `json:"directories"`
+	UploadDirectories   []byte `json:"upload_directories"`
+	DownloadDirectories []byte `json:"download_directories"`
+}
+
 type WorkspaceSyncSessionDownloadAction struct {
 	WorkspaceID string      `json:"workspace_id"`
 	SessionID   string      `json:"session_id"`
@@ -1455,4 +1828,16 @@ type WorkspaceSyncSessionDownloadAction struct {
 	Sha256      pgtype.Text `json:"sha256"`
 	SizeBytes   int64       `json:"size_bytes"`
 	Applied     bool        `json:"applied"`
+}
+
+type WorkspaceVolume struct {
+	WorkspaceID        string             `json:"workspace_id"`
+	OwnerID            string             `json:"owner_id"`
+	State              string             `json:"state"`
+	VolumeName         pgtype.Text        `json:"volume_name"`
+	LegacyHostID       pgtype.Text        `json:"legacy_host_id"`
+	ReadyAt            pgtype.Timestamptz `json:"ready_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	ProvisionedOwnerID string             `json:"provisioned_owner_id"`
 }

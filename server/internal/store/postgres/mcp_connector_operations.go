@@ -186,6 +186,11 @@ func lockMCPConnectorWorkspaceFence(ctx context.Context, tx pgx.Tx, value app.MC
 		*value.InputRevision < 0 || *value.WorkspaceCheckpointRevision < *value.InputRevision || value.BindingVersion <= 0 {
 		return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Workspace fence is invalid")
 	}
+	var actorID string
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(NULLIF(initiator_id,''),owner_id) FROM tasks WHERE id=$1 AND owner_id=$2`,
+		value.TaskID, value.OwnerID).Scan(&actorID); err != nil {
+		return fmt.Errorf("read MCP operation Task actor: %w", err)
+	}
 	var hostOwner, hostState string
 	var hostDeleted bool
 	if err := tx.QueryRow(ctx, `SELECT owner_id, state, deleted_at IS NOT NULL FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).
@@ -195,7 +200,7 @@ func lockMCPConnectorWorkspaceFence(ctx context.Context, tx pgx.Tx, value app.MC
 		}
 		return fmt.Errorf("lock Host for MCP Workspace fence: %w", err)
 	}
-	if hostOwner != value.OwnerID || hostState != string(host.StateRunning) || hostDeleted {
+	if hostOwner != actorID || hostState != string(host.StateRunning) || hostDeleted {
 		return domain.NewError(domain.CodeWorkspaceConflict, "MCP operation Host changed after Task preparation")
 	}
 	var workspaceOwner, workspaceState string
@@ -208,7 +213,7 @@ func lockMCPConnectorWorkspaceFence(ctx context.Context, tx pgx.Tx, value app.MC
 		return fmt.Errorf("lock Workspace for MCP operation fence: %w", err)
 	}
 	checkpoint := *value.WorkspaceCheckpointRevision
-	if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) || workspaceRevision != checkpoint {
+	if workspaceOwner != actorID || workspaceState != string(workspace.StateReady) || workspaceRevision != checkpoint {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this Task checkpoint was confirmed")
 	}
 	if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
@@ -224,7 +229,7 @@ FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, value.H
 		}
 		return fmt.Errorf("lock Host Workspace binding for MCP operation fence: %w", err)
 	}
-	if bindingOwner != value.OwnerID || bindingState != string(workspace.BindingActive) || syncState != string(workspace.BindingSyncHealthy) ||
+	if bindingOwner != actorID || bindingState != string(workspace.BindingActive) || syncState != string(workspace.BindingSyncHealthy) ||
 		bindingVersion != value.BindingVersion || desiredRevision != checkpoint || appliedRevision != checkpoint {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed after Task preparation")
 	}
@@ -253,12 +258,30 @@ func (s *Store) CompleteMCPConnectorOperation(ctx context.Context, value app.MCP
 		if err := lockMCPConnectorTask(ctx, tx, value.TaskID, value.OwnerID); err != nil {
 			return err
 		}
+		// Keep the result commit behind current grants. A deleted Connector is the
+		// exception: its already-dispatched operation still needs a durable result.
+		grantErr := lockCurrentTaskMCPConnectorGrant(ctx, tx, value)
+		if grantErr != nil && domain.CodeOf(grantErr) != domain.CodeForbidden {
+			return grantErr
+		}
 		stored, err := getMCPConnectorOperationForUpdate(ctx, tx, value.OwnerID, value.TaskID, value.ConnectorID, value.Key)
 		if err != nil {
 			return fmt.Errorf("read MCP connector operation for completion: %w", err)
 		}
 		if !sameMCPConnectorOperationRequest(stored, value) || stored.LeaseVersion != value.LeaseVersion {
 			return idempotencyConflict()
+		}
+		if grantErr != nil {
+			if stored.CancelRequested {
+				return domain.NewError(domain.CodeConflict, "MCP connector operation was revoked before result commit")
+			}
+			var connectorExists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM mcp_connectors WHERE id=$1)`, value.ConnectorID).Scan(&connectorExists); err != nil {
+				return fmt.Errorf("check MCP connector before result settlement: %w", err)
+			}
+			if connectorExists || stored.Status != task.OperationDispatched {
+				return grantErr
+			}
 		}
 		if stored.Status == status && stored.Result == output {
 			result = stored
@@ -371,22 +394,74 @@ func lockMCPConnectorTask(ctx context.Context, tx pgx.Tx, taskID, ownerID string
 }
 
 func lockCurrentTaskMCPConnectorGrant(ctx context.Context, tx pgx.Tx, value app.MCPConnectorOperation) error {
-	var connectorRevision, credentialVersion, grantVersion int64
+	var grantConnectorRevision, grantCredentialVersion, grantVersion int64
+	var connectorRevision, credentialVersion int64
 	var enabled bool
-	err := tx.QueryRow(ctx, `SELECT g.connector_revision, g.credential_version, g.grant_version, c.enabled
+	var projectID, taskProjectID, taskInitiatorID, connectorOwnerID string
+	var projectGrantVersion *int64
+	err := tx.QueryRow(ctx, `SELECT COALESCE(g.project_id,''),COALESCE(t.project_id,''),COALESCE(NULLIF(t.initiator_id,''),t.owner_id),
+       g.connector_owner_id,g.project_grant_version
 FROM task_mcp_connector_grants g
-JOIN mcp_connectors c ON c.id=g.connector_id AND c.owner_id=g.owner_id
+JOIN tasks t ON t.id=g.task_id AND t.owner_id=g.owner_id
+WHERE g.task_id=$1 AND g.owner_id=$2 AND g.connector_id=$3 AND g.revoked_at IS NULL`,
+		value.TaskID, value.OwnerID, value.ConnectorID).Scan(&projectID, &taskProjectID, &taskInitiatorID, &connectorOwnerID, &projectGrantVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeForbidden, "MCP connector grant is not available for this task")
+	}
+	if err != nil {
+		return fmt.Errorf("load task MCP connector grant scope: %w", err)
+	}
+	if projectID != taskProjectID {
+		return domain.NewError(domain.CodeForbidden, "MCP connector grant project scope does not match the task")
+	}
+	if projectID != "" {
+		if projectGrantVersion == nil || *projectGrantVersion < 1 {
+			return domain.NewError(domain.CodeForbidden, "project MCP connector grant version is unavailable")
+		}
+		if err := authorizeProjectMCPConnectorInTx(ctx, tx, projectID, taskInitiatorID, connectorOwnerID, value.ConnectorID, *projectGrantVersion); err != nil {
+			return err
+		}
+	} else if projectGrantVersion != nil {
+		return domain.NewError(domain.CodeInternal, "personal MCP connector grant has a project version")
+	}
+	err = tx.QueryRow(ctx, `SELECT g.connector_revision,g.credential_version,g.grant_version,c.revision,c.credential_version,c.enabled
+FROM task_mcp_connector_grants g
+JOIN mcp_connectors c ON c.id=g.connector_id AND c.owner_id=g.connector_owner_id
 WHERE g.task_id=$1 AND g.owner_id=$2 AND g.connector_id=$3 AND g.revoked_at IS NULL
-FOR SHARE OF g, c`, value.TaskID, value.OwnerID, value.ConnectorID).Scan(
-		&connectorRevision, &credentialVersion, &grantVersion, &enabled)
+  AND COALESCE(g.project_id,'')=$4 AND g.connector_owner_id=$5 AND g.project_grant_version IS NOT DISTINCT FROM $6
+FOR SHARE OF g,c`, value.TaskID, value.OwnerID, value.ConnectorID, projectID, connectorOwnerID, projectGrantVersion).Scan(
+		&grantConnectorRevision, &grantCredentialVersion, &grantVersion, &connectorRevision, &credentialVersion, &enabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeForbidden, "MCP connector grant is not available for this task")
 	}
 	if err != nil {
 		return fmt.Errorf("lock task MCP connector grant: %w", err)
 	}
-	if !enabled || connectorRevision != value.ConnectorRevision || credentialVersion != value.CredentialVersion || grantVersion != value.GrantVersion {
+	if !enabled || grantConnectorRevision != value.ConnectorRevision || grantCredentialVersion != value.CredentialVersion ||
+		connectorRevision != value.ConnectorRevision || credentialVersion != value.CredentialVersion || grantVersion != value.GrantVersion {
 		return domain.NewError(domain.CodeConflict, "MCP connector grant changed before dispatch")
+	}
+	return nil
+}
+
+func authorizeProjectMCPConnectorInTx(ctx context.Context, tx pgx.Tx, projectID, actorID, connectorOwnerID, connectorID string, expectedVersion int64) error {
+	var authorized int
+	err := tx.QueryRow(ctx, `SELECT 1
+FROM project_mcp_connector_grants g
+JOIN project_members actor_member ON actor_member.project_id=g.project_id AND actor_member.user_id=$2
+JOIN users actor_user ON actor_user.id=actor_member.user_id AND actor_user.status='approved'
+JOIN project_members connector_owner_member ON connector_owner_member.project_id=g.project_id AND connector_owner_member.user_id=g.connector_owner_id
+JOIN users connector_owner_user ON connector_owner_user.id=connector_owner_member.user_id AND connector_owner_user.status='approved'
+JOIN mcp_connectors c ON c.id=g.connector_id AND c.owner_id=g.connector_owner_id AND c.enabled
+WHERE g.project_id=$1 AND actor_member.user_id=$2 AND g.connector_owner_id=$3 AND g.connector_id=$4
+  AND g.active AND g.version=$5 AND g.authorized_by=g.connector_owner_id
+FOR SHARE OF g,actor_member,actor_user,connector_owner_member,connector_owner_user,c`,
+		projectID, actorID, connectorOwnerID, connectorID, expectedVersion).Scan(&authorized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeForbidden, "project connector authorization is no longer active")
+	}
+	if err != nil {
+		return fmt.Errorf("lock current project MCP connector authorization: %w", err)
 	}
 	return nil
 }

@@ -94,6 +94,11 @@ func (s *Store) UpdateBatchItem(ctx context.Context, ownerID string, item task.B
 		if err := requireCurrentLease(ctx, tx, taskRow, leaseOwner, leaseVersion); err != nil {
 			return err
 		}
+		if taskRow.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
+				return err
+			}
+		}
 
 		var current sqlcgen.TaskBatchItem
 		err = tx.QueryRow(ctx, `SELECT id, task_id, item_key, input, status, result, error, created_at, updated_at, attempt
@@ -193,6 +198,11 @@ func (s *Store) RetryFailedBatchItem(ctx context.Context, idempotency app.Idempo
 		}
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
+		}
+		if taskRow.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
+				return err
+			}
 		}
 		var viewDeletionRequested bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_workspace_view_deletions WHERE task_id=$1)`, taskID).Scan(&viewDeletionRequested); err != nil {
@@ -323,6 +333,11 @@ func (s *Store) RecordValidatedArtifact(ctx context.Context, ownerID string, art
 		if err := requireCurrentLease(ctx, tx, taskRow, leaseOwner, leaseVersion); err != nil {
 			return err
 		}
+		if taskRow.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
+				return err
+			}
+		}
 		var stepExists bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_steps WHERE task_id=$1 AND id=$2)`, artifact.TaskID, artifact.StepID).Scan(&stepExists); err != nil {
 			return fmt.Errorf("check artifact source step: %w", err)
@@ -370,7 +385,7 @@ func validateTaskArtifactWorkspaceProof(ctx context.Context, tx pgx.Tx, ownerID 
   JOIN workspaces w ON w.id=$3 AND w.owner_id=t.owner_id AND w.deleted_at IS NULL
   JOIN workspace_revision_files f ON f.workspace_id=$3 AND f.file_path=$4
     AND f.valid_from_revision <= $5 AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $5)
-    AND f.size_bytes=$6 AND f.sha256=$7
+    AND f.kind='file' AND f.size_bytes=$6 AND f.sha256=$7
   WHERE t.id=$1 AND t.owner_id=$2 AND t.workspace_id=$3 AND t.workspace_checkpoint_revision=$5
 )`, artifact.TaskID, ownerID, artifact.WorkspaceID, artifact.Path, artifact.Revision, artifact.SizeBytes, artifact.SHA256).Scan(&matches)
 	if err != nil {
@@ -490,7 +505,7 @@ func validateCompletedTaskArtifacts(ctx context.Context, tx pgx.Tx, ownerID, tas
   LEFT JOIN workspace_revision_files f ON f.workspace_id=a.workspace_id AND f.file_path=a.path
     AND f.valid_from_revision <= a.workspace_revision
     AND (f.valid_to_revision IS NULL OR f.valid_to_revision > a.workspace_revision)
-    AND f.size_bytes=a.size_bytes AND f.sha256=a.sha256
+    AND f.kind='file' AND f.size_bytes=a.size_bytes AND f.sha256=a.sha256
   LEFT JOIN task_batch_items bi ON bi.task_id=a.task_id AND bi.id=a.batch_item_id
   WHERE a.task_id=$1 AND (
     a.workspace_id IS NULL OR a.workspace_revision IS NULL OR a.size_bytes IS NULL OR a.sha256 IS NULL

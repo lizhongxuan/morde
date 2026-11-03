@@ -146,7 +146,7 @@ func TestCapabilitiesArePublicAndOnlyAdvertiseAssembledServices(t *testing.T) {
 			t.Fatalf("missing %s in %v", feature, result.SupportedFeatures)
 		}
 	}
-	for _, feature := range []string{"client_login", "available_models", "task_api", "cloud_tasks", "hub", "personal_sync"} {
+	for _, feature := range []string{"client_login", "available_models", "task_api", "cloud_tasks", "project_budget_execution", "hub", "personal_sync", "workspace_sync"} {
 		if slices.Contains(result.SupportedFeatures, feature) {
 			t.Fatalf("unassembled or unimplemented feature %s was advertised", feature)
 		}
@@ -172,29 +172,33 @@ func TestCapabilitiesSeparateTaskAPIFromCloudExecution(t *testing.T) {
 	}
 
 	deps.ExecutionControl = &executionControlServiceStub{}
+	deps.ProjectBudgetExecutionReady = true
 	router, err = New(deps, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	response = request(router, http.MethodGet, "/api/capabilities", "", "", "")
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil ||
-		!slices.Contains(result.SupportedFeatures, "task_api") || !slices.Contains(result.SupportedFeatures, "cloud_tasks") {
-		t.Fatalf("executable task capabilities = %d %s; want task_api and cloud_tasks", response.Code, response.Body)
+		!slices.Contains(result.SupportedFeatures, "task_api") || !slices.Contains(result.SupportedFeatures, "cloud_tasks") ||
+		slices.Contains(result.SupportedFeatures, "project_budget_execution") {
+		t.Fatalf("executable task capabilities = %d %s; want task_api and cloud_tasks without the incomplete project stack", response.Code, response.Body)
 	}
 }
 
 func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testing.T) {
 	fixture := loadClientContractFixture(t)
 	for _, scenario := range []struct {
-		name           string
-		taskAPI        bool
-		cloudExecution bool
-		hub            bool
-		personalSync   bool
+		name                   string
+		taskAPI                bool
+		cloudExecution         bool
+		projectBudgetExecution bool
+		hub                    bool
+		personalSync           bool
 	}{
 		{name: "unsupported"},
 		{name: "queued_task_api", taskAPI: true},
 		{name: "cloud_execution", taskAPI: true, cloudExecution: true},
+		{name: "project_budget_execution", taskAPI: true, cloudExecution: true, projectBudgetExecution: true},
 		{name: "hub", hub: true},
 		{name: "personal_sync", personalSync: true},
 	} {
@@ -219,6 +223,16 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 		}
 		if scenario.cloudExecution {
 			deps.ExecutionControl = &executionControlServiceStub{}
+		}
+		if scenario.projectBudgetExecution {
+			deps.ProjectBudgetExecutionReady = true
+			deps.Projects = &projectRoutesStub{}
+			deps.ProjectContent = &projectContentRoutesStub{}
+			deps.ProjectConversations = &projectConversationRoutesStub{}
+			deps.ProjectWorkItems = &projectWorkItemRoutesStub{}
+			deps.ProjectBudget = &projectBudgetRoutesServiceStub{}
+			deps.ModelConnections = &modelConnectionManagerStub{}
+			deps.ModelGateway = &modelGatewayHTTPTest{}
 		}
 		options := validOptions()
 		options.ServiceInstanceID = expected.ServiceInstanceID

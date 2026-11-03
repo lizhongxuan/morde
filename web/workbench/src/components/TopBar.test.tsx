@@ -57,6 +57,10 @@ describe('TopBar countdown', () => {
         host_id: 'h1234567',
         control_state: 'ai',
         control_version: 0,
+        control_actor_user_id: '',
+        control_lease_expires_at: null,
+        control_lease_active: false,
+        control_lease_held_by_me: false,
         active_transition: null,
       }}
       controlActionLabel="接管电脑"
@@ -64,6 +68,8 @@ describe('TopBar countdown', () => {
     />);
 
     expect(container.querySelector('.control-state')).toHaveTextContent('当前控制者：AI · 桌面只读');
+    expect(screen.getByText('控制版本 0')).toBeInTheDocument();
+    expect(container.querySelector('.desktop-sharing-notice')).toHaveTextContent('桌面画面可能显示此电脑上的文件');
     const takeOver = screen.getByRole('button', { name: '接管电脑' });
     expect(takeOver).toHaveClass('button');
     expect(takeOver).not.toHaveClass('button-secondary');
@@ -81,16 +87,64 @@ describe('TopBar countdown', () => {
         host_id: 'h1234567',
         control_state: 'taking_over',
         control_version: 1,
+        control_actor_user_id: '',
+        control_lease_expires_at: null,
+        control_lease_active: false,
+        control_lease_held_by_me: false,
         active_transition: {
           request_id: 'handoff-1',
           action: 'take_over',
           phase: 'draining',
+          failure_reason: '',
           expected_control_version: 0,
+          blocked_control_version: 1,
+          target_control_version: 2,
+          created_at: '',
+          updated_at: '',
         },
       }}
     />);
 
     expect(container.querySelector('.control-state')).toHaveTextContent('正在接管电脑，请稍候…');
-    expect(screen.queryByText('当前控制者：你')).not.toBeInTheDocument();
+    expect(screen.queryByText('当前控制者：用户身份未提供')).not.toBeInTheDocument();
+  });
+
+  it('shows the other operator and lease countdown when the server returns them', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-19T00:00:00.000Z'));
+    render(<TopBar
+      host={null}
+      renewing={false}
+      onRenew={vi.fn()}
+      {...controlProps}
+      control={{
+        host_id: 'h1234567',
+        control_state: 'user',
+        control_version: 8,
+        control_actor_user_id: 'u7654321',
+        control_lease_expires_at: '2026-10-19T00:00:08.000Z',
+        control_lease_active: true,
+        control_lease_held_by_me: false,
+        active_transition: null,
+      }}
+    />);
+
+    expect(screen.getByText('当前操作账号：u7654321')).toBeInTheDocument();
+    expect(screen.getByText('操作租约有效 · 剩余 00:00:08')).toBeInTheDocument();
+    expect(screen.getByText('控制版本 8')).toBeInTheDocument();
+  });
+
+  it('marks an expired control lease read-only', () => {
+    render(<TopBar
+      host={null}
+      renewing={false}
+      onRenew={vi.fn()}
+      {...controlProps}
+      control={{ host_id: 'h1234567', control_state: 'user', control_version: 8, control_actor_user_id: '',
+        control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null }}
+    />);
+
+    expect(screen.getByText('操作租约已失效 · 桌面只读')).toBeInTheDocument();
+    expect(screen.getByText('当前没有有效操作租约')).toBeInTheDocument();
   });
 });

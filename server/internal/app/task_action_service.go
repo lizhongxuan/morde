@@ -58,7 +58,12 @@ func (s *TaskService) RequestAction(
 	if err != nil {
 		return TaskActionResult{}, err
 	}
-	if result.Task.ID != taskID || result.Task.OwnerID != principal.UserID || result.Action != action {
+	initiatorID := result.Task.InitiatorID
+	if initiatorID == "" {
+		initiatorID = result.Task.OwnerID
+	}
+	if result.Task.ID != taskID || initiatorID != principal.UserID ||
+		(result.Task.ProjectID == "" && result.Task.OwnerID != principal.UserID) || result.Action != action {
 		return TaskActionResult{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	for _, operationID := range result.UnsettledOperationIDs {

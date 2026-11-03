@@ -45,7 +45,7 @@ func TestControlServiceTakeoverAndReleaseUseOneRuntimeFence(t *testing.T) {
 	if result.Status.ControlState != host.ControlUser || result.Status.ControlVersion != 2 || result.Status.ActiveTransition != nil || len(result.PendingOperationIDs) != 0 {
 		t.Fatalf("takeover result = %#v", result)
 	}
-	if transitionStore.value == nil || transitionStore.value.Phase != control.PhaseCompleted || !transitionStore.value.TaskIDsSaved || len(transitionStore.value.TaskIDs) != 3 ||
+	if transitionStore.value == nil || transitionStore.value.ActorUserID != "u1234567" || transitionStore.value.Phase != control.PhaseCompleted || !transitionStore.value.TaskIDsSaved || len(transitionStore.value.TaskIDs) != 3 ||
 		transitionStore.value.TaskIDs[0] != "q0000001" || transitionStore.value.TaskIDs[1] != "q0000002" || transitionStore.value.TaskIDs[2] != "q0000003" || len(transitionStore.value.DrainedReceipt) == 0 {
 		t.Fatalf("stored takeover transition = %#v", transitionStore.value)
 	}
@@ -75,6 +75,46 @@ func TestControlServiceTakeoverAndReleaseUseOneRuntimeFence(t *testing.T) {
 	}
 	if len(auditWriter.entries) != 2 {
 		t.Fatalf("control audit entries = %d, want 2", len(auditWriter.entries))
+	}
+}
+
+type controlLeaseStatusStoreStub struct{ lease HostControlLease }
+
+func (s controlLeaseStatusStoreStub) GetHostControlLease(context.Context, string) (HostControlLease, error) {
+	return s.lease, nil
+}
+
+func (s controlLeaseStatusStoreStub) RenewHostControlLease(context.Context, string, string, int64) (HostControlLease, error) {
+	return s.lease, nil
+}
+
+func (controlLeaseStatusStoreStub) CheckHostControlLease(context.Context, string, string, int64, int64) error {
+	return nil
+}
+
+func (controlLeaseStatusStoreStub) WithHostControlPermit(_ context.Context, _ host.Ref, _ string, _ host.Permission, forward func() error) error {
+	return forward()
+}
+
+func TestControlLeaseStatusIdentifiesOnlyTheCurrentActor(t *testing.T) {
+	expires := time.Now().UTC().Add(30 * time.Second)
+	service := &ControlService{leases: controlLeaseStatusStoreStub{lease: HostControlLease{
+		HostID: "h1234567", ActorUserID: "u1234567", ControlVersion: 8, ExpiresAt: &expires, Active: true,
+	}}}
+	status := ControlStatus{HostID: "h1234567", ControlState: host.ControlUser, ControlVersion: 8}
+	if err := service.populateControlLeaseStatus(context.Background(), &status, "u1234567"); err != nil {
+		t.Fatal(err)
+	}
+	if !status.ControlLeaseActive || !status.ControlLeaseHeldByMe || status.ControlActorUserID != "u1234567" {
+		t.Fatalf("holder lease status = %+v; want active and held by authenticated user", status)
+	}
+
+	status.ControlLeaseHeldByMe = false
+	if err := service.populateControlLeaseStatus(context.Background(), &status, "u7654321"); err != nil {
+		t.Fatal(err)
+	}
+	if !status.ControlLeaseActive || status.ControlLeaseHeldByMe {
+		t.Fatalf("observer lease status = %+v; want active lease held by another user", status)
 	}
 }
 
@@ -180,6 +220,29 @@ type controlActivityDrainerStub struct {
 	calls   int
 }
 
+func (s *hostServiceTestHostStore) GetHostControlLease(ctx context.Context, hostID string) (HostControlLease, error) {
+	value, err := s.GetHost(ctx, hostID)
+	if err != nil {
+		return HostControlLease{}, err
+	}
+	return HostControlLease{HostID: hostID, ControlVersion: value.ControlVersion}, nil
+}
+
+func (s *hostServiceTestHostStore) RenewHostControlLease(context.Context, string, string, int64) (HostControlLease, error) {
+	return HostControlLease{}, domain.NewError(domain.CodeConflict, "Host control lease is absent")
+}
+
+func (s *hostServiceTestHostStore) CheckHostControlLease(context.Context, string, string, int64, int64) error {
+	return domain.NewError(domain.CodeConflict, "Host control lease is absent")
+}
+
+func (s *hostServiceTestHostStore) WithHostControlPermit(_ context.Context, _ host.Ref, _ string, _ host.Permission, forward func() error) error {
+	if forward == nil {
+		return domain.InvalidArgument("control_lease", "input forwarder is required")
+	}
+	return forward()
+}
+
 func (s *controlActivityDrainerStub) HasOutstandingControlTransitionLeases(context.Context, string, int64) (bool, error) {
 	s.calls++
 	return s.pending, s.err
@@ -218,7 +281,7 @@ type controlTransitionStoreStub struct {
 
 func (s *controlTransitionStoreStub) BeginControlTransition(_ context.Context, request control.BeginRequest) (control.Transition, error) {
 	if s.value != nil && s.value.HostID == request.HostID && s.value.RequestID == request.RequestID {
-		if s.value.OwnerID != request.OwnerID || s.value.Action != request.Action || s.value.ExpectedControlVersion != request.ExpectedControlVersion {
+		if s.value.OwnerID != request.OwnerID || s.value.ActorUserID != request.ActorUserID || s.value.Action != request.Action || s.value.ExpectedControlVersion != request.ExpectedControlVersion {
 			return control.Transition{}, domain.NewError(domain.CodeIdempotencyConflict, "control request conflicts")
 		}
 		return cloneControlTransition(*s.value), nil
@@ -246,7 +309,7 @@ func (s *controlTransitionStoreStub) BeginControlTransition(_ context.Context, r
 	value.ControlVersion++
 	s.hosts.addHost(value)
 	transition := control.Transition{
-		HostID: request.HostID, OwnerID: request.OwnerID, RequestID: request.RequestID, Action: request.Action,
+		HostID: request.HostID, OwnerID: request.OwnerID, ActorUserID: request.ActorUserID, RequestID: request.RequestID, Action: request.Action,
 		Phase: control.PhaseBlocking, ExpectedControlVersion: request.ExpectedControlVersion,
 		BlockedControlVersion: request.ExpectedControlVersion + 1, TargetControlVersion: request.ExpectedControlVersion + 2,
 		TaskIDs: []string{}, CreatedAt: time.Now(), UpdatedAt: time.Now(),

@@ -15,7 +15,7 @@ func TestPostgresTaskWorkspaceViewDeletionWaitsForCurrentHostReceipt(t *testing.
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-view-delete")
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
 		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,

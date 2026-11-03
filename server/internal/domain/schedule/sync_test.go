@@ -28,3 +28,28 @@ func TestSyncDefinitionOmitsAuthorizationAndRuntimeState(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncDefinitionAllowsOnlyHostlessModelSchedules(t *testing.T) {
+	value := Schedule{
+		ID: "j1234567", OwnerID: "u1234567", Version: 1, Status: StatusDisabled,
+		HostID: "h1234567", ModelID: "model-a", Objective: "check report",
+		Timing:        Timing{Kind: TimingDaily, StartsOn: "2026-11-02", LocalTime: "09:00", TimeZone: "Asia/Shanghai"},
+		Budget:        task.Budget{ActiveSeconds: 60, ToolCalls: 2, ModelTokens: 100},
+		MisfirePolicy: MisfireSkip, NotificationEvents: []NotificationEvent{NotifyCompleted},
+	}
+	definition := NewSyncDefinition(value)
+	definition.HostID = nil
+	if err := ValidateSyncDefinition(value.ID, definition); err != nil {
+		t.Fatalf("valid hostless sync definition rejected: %v", err)
+	}
+	definition.Observation = &ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: ObservationText}
+	if err := ValidateSyncDefinition(value.ID, definition); err == nil {
+		t.Fatal("hostless sync definition accepted computer observation")
+	}
+	definition.Observation = nil
+	badHostID := "bad-host"
+	definition.HostID = &badHostID
+	if err := ValidateSyncDefinition(value.ID, definition); err == nil {
+		t.Fatal("sync definition accepted malformed Host ID")
+	}
+}

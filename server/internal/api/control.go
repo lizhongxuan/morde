@@ -18,22 +18,31 @@ import (
 // ControlService is the user-facing Host handoff workflow.
 type ControlService interface {
 	Status(context.Context, identity.Principal, string) (app.ControlStatus, error)
+	RenewLease(context.Context, identity.Principal, string, int64) (app.ControlStatus, error)
 	Act(context.Context, identity.Principal, string, app.ControlActionCommand) (app.ControlActionResult, error)
 }
 
 type controlStatusResponse struct {
-	HostID           string                     `json:"host_id"`
-	ControlState     host.ControlState          `json:"control_state"`
-	ControlVersion   int64                      `json:"control_version"`
-	ActiveTransition *controlTransitionResponse `json:"active_transition"`
+	HostID                string                     `json:"host_id"`
+	ControlState          host.ControlState          `json:"control_state"`
+	ControlVersion        int64                      `json:"control_version"`
+	ControlActorUserID    string                     `json:"control_actor_user_id"`
+	ControlLeaseExpiresAt *time.Time                 `json:"control_lease_expires_at"`
+	ControlLeaseActive    bool                       `json:"control_lease_active"`
+	ControlLeaseHeldByMe  bool                       `json:"control_lease_held_by_me"`
+	ActiveTransition      *controlTransitionResponse `json:"active_transition"`
 }
 
 type controlActionResponse struct {
-	HostID              string                     `json:"host_id"`
-	ControlState        host.ControlState          `json:"control_state"`
-	ControlVersion      int64                      `json:"control_version"`
-	ActiveTransition    *controlTransitionResponse `json:"active_transition"`
-	PendingOperationIDs []string                   `json:"pending_operation_ids"`
+	HostID                string                     `json:"host_id"`
+	ControlState          host.ControlState          `json:"control_state"`
+	ControlVersion        int64                      `json:"control_version"`
+	ControlActorUserID    string                     `json:"control_actor_user_id"`
+	ControlLeaseExpiresAt *time.Time                 `json:"control_lease_expires_at"`
+	ControlLeaseActive    bool                       `json:"control_lease_active"`
+	ControlLeaseHeldByMe  bool                       `json:"control_lease_held_by_me"`
+	ActiveTransition      *controlTransitionResponse `json:"active_transition"`
+	PendingOperationIDs   []string                   `json:"pending_operation_ids"`
 }
 
 // The public transition intentionally omits task snapshots and runtime receipts.
@@ -55,12 +64,50 @@ type controlActionRequest struct {
 	ExpectedControlVersion *int64         `json:"expected_control_version"`
 }
 
+type controlLeaseRenewRequest struct {
+	ExpectedControlVersion *int64 `json:"expected_control_version"`
+}
+
 func (h *api) registerControl(group *gin.RouterGroup, service ControlService) {
 	if service == nil {
 		return
 	}
 	group.GET("/hosts/:id/control", h.getControl(service))
 	group.POST("/hosts/:id/control/actions", h.actOnControl(service))
+	group.POST("/hosts/:id/control/lease/renew", h.renewControlLease(service))
+}
+
+func (h *api) renewControlLease(service ControlService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		hostID, ok := safeID(c, "id", domain.ValidHostID)
+		if !ok {
+			return
+		}
+		var request controlLeaseRenewRequest
+		if !decodeStrictJSON(c, &request) {
+			return
+		}
+		if request.ExpectedControlVersion == nil || *request.ExpectedControlVersion < 0 {
+			writeError(c, domain.InvalidArgument("expected_control_version", "control version is out of range"))
+			return
+		}
+		status, err := service.RenewLease(c.Request.Context(), principal, hostID, *request.ExpectedControlVersion)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toControlStatusResponse(status)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, response)
+	}
 }
 
 func (h *api) getControl(service ControlService) gin.HandlerFunc {
@@ -137,7 +184,11 @@ func (h *api) actOnControl(service ControlService) gin.HandlerFunc {
 }
 
 func toControlStatusResponse(value app.ControlStatus) (controlStatusResponse, error) {
-	if !domain.ValidHostID(value.HostID) || !validControlState(value.ControlState) || value.ControlVersion < 0 {
+	if !domain.ValidHostID(value.HostID) || !validControlState(value.ControlState) || value.ControlVersion < 0 ||
+		(value.ControlActorUserID != "" && !domain.ValidUserID(value.ControlActorUserID)) ||
+		(value.ControlLeaseExpiresAt != nil && value.ControlLeaseExpiresAt.IsZero()) ||
+		(value.ControlLeaseActive && (value.ControlState != host.ControlUser || value.ControlActorUserID == "" || value.ControlLeaseExpiresAt == nil)) ||
+		(value.ControlLeaseHeldByMe && (!value.ControlLeaseActive || value.ControlActorUserID == "")) {
 		return controlStatusResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	var transition *controlTransitionResponse
@@ -150,7 +201,10 @@ func toControlStatusResponse(value app.ControlStatus) (controlStatusResponse, er
 	}
 	return controlStatusResponse{
 		HostID: value.HostID, ControlState: value.ControlState,
-		ControlVersion: value.ControlVersion, ActiveTransition: transition,
+		ControlVersion: value.ControlVersion, ControlActorUserID: value.ControlActorUserID,
+		ControlLeaseExpiresAt: value.ControlLeaseExpiresAt, ControlLeaseActive: value.ControlLeaseActive,
+		ControlLeaseHeldByMe: value.ControlLeaseHeldByMe,
+		ActiveTransition:     transition,
 	}, nil
 }
 
@@ -173,7 +227,10 @@ func toControlActionResponse(value app.ControlActionResult) (controlActionRespon
 	}
 	return controlActionResponse{
 		HostID: status.HostID, ControlState: status.ControlState, ControlVersion: status.ControlVersion,
-		ActiveTransition: status.ActiveTransition, PendingOperationIDs: pending,
+		ControlActorUserID: status.ControlActorUserID, ControlLeaseExpiresAt: status.ControlLeaseExpiresAt,
+		ControlLeaseActive: status.ControlLeaseActive, ControlLeaseHeldByMe: status.ControlLeaseHeldByMe,
+		ActiveTransition:    status.ActiveTransition,
+		PendingOperationIDs: pending,
 	}, nil
 }
 

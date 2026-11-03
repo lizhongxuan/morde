@@ -14,21 +14,26 @@ import (
 )
 
 type notificationStoreFake struct {
-	events        []notification.TaskEvent
-	page          NotificationPage
-	marked        notification.Notification
-	listEventsErr error
-	consumeErr    error
-	listErr       error
-	markErr       error
-	limit         int32
-	ownerID       string
-	pageRequest   PageRequest
-	unreadOnly    bool
-	markedOwner   string
-	markedID      string
-	consumed      []notification.TaskEvent
-	effects       []notification.EventEffect
+	events           []notification.TaskEvent
+	sourceEvents     []notification.SourceEvent
+	page             NotificationPage
+	marked           notification.Notification
+	listEventsErr    error
+	consumeErr       error
+	sourceEventsErr  error
+	sourceConsumeErr error
+	listErr          error
+	markErr          error
+	limit            int32
+	ownerID          string
+	pageRequest      PageRequest
+	unreadOnly       bool
+	markedOwner      string
+	markedID         string
+	consumed         []notification.TaskEvent
+	effects          []notification.EventEffect
+	sourceConsumed   []notification.SourceEvent
+	sourceNotices    []notification.Notification
 }
 
 func (s *notificationStoreFake) ListUnprocessedNotificationEvents(_ context.Context, limit int32) ([]notification.TaskEvent, error) {
@@ -42,6 +47,19 @@ func (s *notificationStoreFake) ConsumeTaskNotificationEvent(_ context.Context, 
 	}
 	s.consumed = append(s.consumed, event)
 	s.effects = append(s.effects, notification.EventEffect{Notification: value, ClosePending: closePending})
+	return true, nil
+}
+
+func (s *notificationStoreFake) ListUnprocessedNotificationSourceEvents(_ context.Context, _ int32) ([]notification.SourceEvent, error) {
+	return append([]notification.SourceEvent(nil), s.sourceEvents...), s.sourceEventsErr
+}
+
+func (s *notificationStoreFake) ConsumeNotificationSourceEvent(_ context.Context, event notification.SourceEvent, value notification.Notification) (bool, error) {
+	if s.sourceConsumeErr != nil {
+		return false, s.sourceConsumeErr
+	}
+	s.sourceConsumed = append(s.sourceConsumed, event)
+	s.sourceNotices = append(s.sourceNotices, value)
 	return true, nil
 }
 
@@ -116,6 +134,29 @@ func TestNotificationServiceConsumesUnsubscribedEventsWithoutCreatingNotice(t *t
 	processed, err := service.ProcessPending(context.Background(), 1)
 	if err != nil || processed != 1 || len(store.effects) != 1 || store.effects[0].Notification != nil || !store.effects[0].ClosePending {
 		t.Fatalf("unsubscribed result processing = %d effects %#v err=%v", processed, store.effects, err)
+	}
+}
+
+func TestNotificationServiceConsumesGoalAndProjectSourceEventsWithoutCopyingContent(t *testing.T) {
+	created := time.Now().UTC()
+	store := &notificationStoreFake{sourceEvents: []notification.SourceEvent{
+		{ID: 1, RecipientID: "u1234567", SourceKind: notification.SourceGoal, SourceID: "goal-1", SourceVersion: 2,
+			Kind: notification.KindGoalStepBlocked, CreatedAt: created},
+		{ID: 2, RecipientID: "u2234567", SourceKind: notification.SourceProjectWorkItem, SourceID: "j9234567", SourceVersion: 4,
+			ProjectID: "j1234567", Kind: notification.KindProjectItemDelivered, CreatedAt: created},
+	}}
+	service, err := NewNotificationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := service.ProcessPending(context.Background(), 2)
+	if err != nil || processed != 2 || len(store.sourceNotices) != 2 {
+		t.Fatalf("ProcessPending() = %d, %v; notices=%#v", processed, err, store.sourceNotices)
+	}
+	if store.sourceNotices[0].Summary != "目标步骤遇到阻塞" || store.sourceNotices[1].Summary != "项目工作项已交付" ||
+		store.sourceNotices[0].SourceID != "goal-1" || store.sourceNotices[1].ProjectID != "j1234567" ||
+		store.sourceNotices[0].TaskID != "" || store.sourceNotices[1].TaskID != "" {
+		t.Fatalf("source notifications contain incorrect identity or content: %#v", store.sourceNotices)
 	}
 }
 

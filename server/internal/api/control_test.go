@@ -20,6 +20,11 @@ type controlServiceStub struct {
 	statusCalls  int
 	statusHostID string
 	statusUserID string
+	renewCalls   int
+	renewHostID  string
+	renewActor   identity.Principal
+	renewVersion int64
+	renewErr     error
 	result       app.ControlActionResult
 	actErr       error
 	actCalls     int
@@ -32,6 +37,12 @@ func (s *controlServiceStub) Status(_ context.Context, principal identity.Princi
 	s.statusCalls++
 	s.statusHostID, s.statusUserID = hostID, principal.UserID
 	return s.status, s.statusErr
+}
+
+func (s *controlServiceStub) RenewLease(_ context.Context, principal identity.Principal, hostID string, expectedControlVersion int64) (app.ControlStatus, error) {
+	s.renewCalls++
+	s.renewHostID, s.renewActor, s.renewVersion = hostID, principal, expectedControlVersion
+	return s.status, s.renewErr
 }
 
 func (s *controlServiceStub) Act(_ context.Context, principal identity.Principal, hostID string, command app.ControlActionCommand) (app.ControlActionResult, error) {
@@ -83,7 +94,7 @@ func TestGetControlReturnsPublicTransitionSummary(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"host_id", "control_state", "control_version", "active_transition"} {
+	for _, field := range []string{"host_id", "control_state", "control_version", "control_lease_held_by_me", "active_transition"} {
 		if len(body[field]) == 0 {
 			t.Errorf("response is missing %q: %s", field, response.Body)
 		}
@@ -93,6 +104,37 @@ func TestGetControlReturnsPublicTransitionSummary(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"failure_reason":"operations_pending"`) {
 		t.Fatalf("control response omitted the safe failure reason: %s", response.Body)
+	}
+}
+
+func TestControlLeaseRenewRequiresExpectedVersionAndReturnsStatus(t *testing.T) {
+	expires := time.Now().UTC().Add(30 * time.Second)
+	service := &controlServiceStub{status: app.ControlStatus{
+		HostID: testHostID, ControlState: host.ControlUser, ControlVersion: 5,
+		ControlActorUserID: testUserID, ControlLeaseExpiresAt: &expires, ControlLeaseActive: true, ControlLeaseHeldByMe: true,
+	}}
+	router := controlRouter(t, service)
+	for _, body := range []string{`{}`, `{"expected_control_version":-1}`, `{"expected_control_version":5,"extra":true}`} {
+		assertError(t, request(router, http.MethodPost, "/api/hosts/"+testHostID+"/control/lease/renew", body, "Bearer "+apiKeyCredential(), ""), http.StatusBadRequest, "invalid_argument")
+	}
+	if service.renewCalls != 0 {
+		t.Fatalf("invalid renew calls = %d; want 0", service.renewCalls)
+	}
+	response := request(router, http.MethodPost, "/api/hosts/"+testHostID+"/control/lease/renew", `{"expected_control_version":5}`, "Bearer "+apiKeyCredential(), "")
+	if response.Code != http.StatusOK || service.renewCalls != 1 || service.renewHostID != testHostID || service.renewVersion != 5 || service.renewActor.UserID != testUserID {
+		t.Fatalf("renew = %d calls=%d host=%q version=%d actor=%#v body=%s", response.Code, service.renewCalls, service.renewHostID, service.renewVersion, service.renewActor, response.Body)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"control_actor_user_id", "control_lease_expires_at", "control_lease_active", "control_lease_held_by_me"} {
+		if len(body[field]) == 0 {
+			t.Errorf("response missing %q: %s", field, response.Body)
+		}
+	}
+	if string(body["control_lease_held_by_me"]) != "true" {
+		t.Errorf("renew response held-by-me = %s; want true", body["control_lease_held_by_me"])
 	}
 }
 

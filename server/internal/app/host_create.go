@@ -28,6 +28,8 @@ type HostServiceOptions struct {
 	Hosts             HostStore
 	Users             UserStore
 	Workspaces        WorkspaceStore
+	WorkspaceVolumes  HostWorkspaceVolumeResolver
+	DefaultWorkspaces HostDefaultWorkspaceProvider
 	Tokens            TokenStore
 	Sandboxes         SandboxRouter
 	Volumes           VolumeDeleter
@@ -58,6 +60,8 @@ type hostService struct {
 	hosts             HostStore
 	users             UserStore
 	workspaces        WorkspaceStore
+	workspaceVolumes  HostWorkspaceVolumeResolver
+	defaultWorkspaces HostDefaultWorkspaceProvider
 	tokens            TokenStore
 	sandboxes         SandboxRouter
 	volumes           VolumeDeleter
@@ -83,10 +87,24 @@ type hostService struct {
 	logger            *zap.Logger
 }
 
+// HostDefaultWorkspaceProvider returns the owner's reusable default Workspace
+// or creates and initializes one through WorkspaceService.
+type HostDefaultWorkspaceProvider interface {
+	EnsureDefaultWorkspace(context.Context, string) (workspace.Workspace, error)
+}
+
+type hostDefaultWorkspaceLookup interface {
+	GetDefaultHostForOwner(context.Context, string) (host.Host, bool, error)
+}
+
+type hostDefaultCreationLocker interface {
+	AcquireDefaultHostLock(context.Context, string) (func() error, error)
+}
+
 // NewHostService constructs the one HostService implementation shared by
 // HTTP and MCP adapters. Worker creation progress is exposed by AdvanceCreate.
 func NewHostService(options HostServiceOptions) (*hostService, error) {
-	if options.Hosts == nil || options.Users == nil || options.Workspaces == nil || options.Tokens == nil ||
+	if options.Hosts == nil || options.Users == nil || options.Workspaces == nil || options.WorkspaceVolumes == nil || options.Tokens == nil ||
 		options.Sandboxes == nil || options.Volumes == nil || options.DiskCapacity == nil || options.Probe == nil || options.Runtime == nil ||
 		options.Audit == nil || options.CreateLocks == nil || options.Sealer == nil || options.NotifyCreate == nil ||
 		options.ObserveHostReady == nil || options.CountAuditFailure == nil {
@@ -126,7 +144,8 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 		templates[id] = value
 	}
 	return &hostService{
-		hosts: options.Hosts, users: options.Users, workspaces: options.Workspaces, tokens: options.Tokens,
+		hosts: options.Hosts, users: options.Users, workspaces: options.Workspaces, workspaceVolumes: options.WorkspaceVolumes,
+		defaultWorkspaces: options.DefaultWorkspaces, tokens: options.Tokens,
 		sandboxes: options.Sandboxes, volumes: options.Volumes, diskCapacity: options.DiskCapacity,
 		probe: options.Probe, runtime: options.Runtime, audit: options.Audit, createLocks: options.CreateLocks, sealer: options.Sealer,
 		templates: templates, defaultTemplateID: options.DefaultTemplateID, capacity: options.Capacity, instance: options.Instance,
@@ -159,14 +178,17 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		name = tmpl.Name
 	}
 
-	if len(command.WorkspaceIDs) > workspace.MaxBindingsPerHost {
-		return host.Host{}, domain.InvalidArgument("workspace_ids", "at most 64 workspaces can be bound to a host")
+	if len(command.WorkspaceIDs) != 1 {
+		return host.Host{}, domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
 	}
 	sortedWorkspaceIDs := append([]string(nil), command.WorkspaceIDs...)
 	seenWorkspaceIDs := make(map[string]struct{}, len(sortedWorkspaceIDs))
 	for _, workspaceID := range sortedWorkspaceIDs {
 		if !domain.ValidWorkspaceID(workspaceID) {
 			return host.Host{}, domain.InvalidArgument("workspace_ids", "workspace id is invalid")
+		}
+		if !principal.AllowsWorkspace(workspaceID) {
+			return host.Host{}, domain.NewError(domain.CodeForbidden, "workspace is outside the credential authorization scope")
 		}
 		if _, exists := seenWorkspaceIDs[workspaceID]; exists {
 			return host.Host{}, domain.InvalidArgument("workspace_ids", "workspace ids must be unique")
@@ -205,7 +227,7 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 		if err != nil || value.OwnerID != principal.UserID {
 			return host.Host{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
-		if value.State != workspace.StateReady {
+		if value.State != workspace.StateReady || value.DeletedAt != nil {
 			return host.Host{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace is not ready")
 		}
 	}
@@ -224,6 +246,14 @@ func (s *hostService) Create(ctx context.Context, principal identity.Principal, 
 			return host.Host{}, err
 		}
 		return host.Host{}, domain.NewError(domain.CodeUpstreamError, "host storage capacity is unavailable")
+	}
+	volumeCheckHostID, err := domain.NewHostID()
+	if err != nil {
+		return host.Host{}, fmt.Errorf("generate Host volume validation id: %w", err)
+	}
+	if _, err := s.workspaceVolumes.PrepareHostWorkspaceVolume(ctx, principal.UserID, volumeCheckHostID,
+		sortedWorkspaceIDs[0], tmpl.Workspace.MountPath, tmpl.Workspace.Size); err != nil {
+		return host.Host{}, err
 	}
 
 	value, err := s.newHostRecord(principal.UserID, name, tmpl, host.StateCreating,
@@ -317,6 +347,79 @@ func (s *hostService) EnsureDefaultStopped(ctx context.Context, user identity.Us
 		user.DefaultHostCPUMilli > math.MaxInt32 || user.DefaultHostMemMiB > math.MaxInt32 {
 		return host.Host{}, false, domain.NewError(domain.CodeInvalidState, "default host resources are invalid")
 	}
+	unlock := func() error { return nil }
+	if locker, ok := s.hosts.(hostDefaultCreationLocker); ok {
+		unlock, err = locker.AcquireDefaultHostLock(ctx, user.ID)
+		if err != nil {
+			return host.Host{}, false, err
+		}
+		if unlock == nil {
+			return host.Host{}, false, domain.NewError(domain.CodeInternal, "default Host lock is unavailable")
+		}
+	}
+	created, didCreate, ensureErr := s.ensureDefaultStoppedLocked(ctx, user)
+	if unlockErr := unlock(); unlockErr != nil {
+		return host.Host{}, false, errors.Join(ensureErr, fmt.Errorf("release default Host lock: %w", unlockErr))
+	}
+	return created, didCreate, ensureErr
+}
+
+func (s *hostService) ensureDefaultStoppedLocked(ctx context.Context, user identity.User) (host.Host, bool, error) {
+	if lookup, ok := s.hosts.(hostDefaultWorkspaceLookup); ok {
+		existing, found, err := lookup.GetDefaultHostForOwner(ctx, user.ID)
+		if domain.CodeOf(err) == domain.CodeConflict {
+			return host.Host{}, false, nil
+		}
+		if err != nil {
+			return host.Host{}, false, err
+		}
+		if found {
+			if existing.OwnerID != user.ID {
+				return host.Host{}, false, domain.NewError(domain.CodeInternal, "default Host owner is inconsistent")
+			}
+			bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, existing.ID)
+			if err != nil {
+				return host.Host{}, false, err
+			}
+			activeCount := 0
+			for _, binding := range bindings {
+				if binding.State != workspace.BindingDetached {
+					activeCount++
+				}
+			}
+			if activeCount > 1 {
+				return host.Host{}, false, domain.NewError(domain.CodeWorkspaceConflict, "default Host has multiple active workspace bindings")
+			}
+			if activeCount == 1 {
+				binding, err := s.requireUsableHostWorkspace(ctx, identity.Principal{UserID: user.ID, Role: user.Role, Kind: identity.KindSession}, existing.ID, user.ID)
+				if err != nil {
+					return host.Host{}, false, err
+				}
+				return s.ensureDefaultHostForWorkspace(ctx, user, binding.Workspace.ID)
+			}
+			if existing.State != host.StateStopped {
+				return host.Host{}, false, domain.NewError(domain.CodeWorkspaceConflict, "default Host is missing its workspace binding")
+			}
+		}
+	}
+	if user.QuotaHosts == 0 {
+		return host.Host{}, false, nil
+	}
+	if s.defaultWorkspaces == nil {
+		return host.Host{}, false, domain.NewError(domain.CodeInternal, "default workspace provider is unavailable")
+	}
+	defaultWorkspace, err := s.defaultWorkspaces.EnsureDefaultWorkspace(ctx, user.ID)
+	if err != nil {
+		return host.Host{}, false, err
+	}
+	if !domain.ValidWorkspaceID(defaultWorkspace.ID) || defaultWorkspace.OwnerID != user.ID ||
+		defaultWorkspace.State != workspace.StateReady || defaultWorkspace.DeletedAt != nil {
+		return host.Host{}, false, domain.NewError(domain.CodeInvalidState, "default workspace is unavailable")
+	}
+	return s.ensureDefaultHostForWorkspace(ctx, user, defaultWorkspace.ID)
+}
+
+func (s *hostService) ensureDefaultHostForWorkspace(ctx context.Context, user identity.User, workspaceID string) (host.Host, bool, error) {
 	tmpl := s.templates[s.defaultTemplateID]
 	value, err := s.newHostRecord(user.ID, tmpl.Name, tmpl, host.StateStopped,
 		user.DefaultHostCPUMilli, user.DefaultHostMemMiB, user.DefaultHostCPUMilli, user.DefaultHostMemMiB)
@@ -328,7 +431,9 @@ func (s *hostService) EnsureDefaultStopped(ctx context.Context, user identity.Us
 		if err != nil {
 			return host.Host{}, false, fmt.Errorf("generate host id: %w", err)
 		}
-		created, didCreate, createErr := s.hosts.EnsureDefaultHost(ctx, CreateHostParams{Host: value, Capacity: s.capacity})
+		created, didCreate, createErr := s.hosts.EnsureDefaultHost(ctx, CreateHostParams{
+			Host: value, WorkspaceIDs: []string{workspaceID}, Capacity: s.capacity,
+		})
 		if createErr == nil {
 			return created, didCreate, nil
 		}
@@ -460,6 +565,20 @@ func (s *hostService) createRequest(ctx context.Context, value host.Host) (Sandb
 	if !ok {
 		return SandboxCreateRequest{}, domain.NewError(domain.CodeNotFound, "template not found")
 	}
+	binding, err := s.requireUsableHostWorkspace(ctx,
+		identity.Principal{UserID: value.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}, value.ID, value.OwnerID)
+	if err != nil {
+		return SandboxCreateRequest{}, err
+	}
+	workspaceVolume, err := s.workspaceVolumes.PrepareHostWorkspaceVolume(ctx, value.OwnerID, value.ID,
+		binding.Workspace.ID, tmpl.Workspace.MountPath, tmpl.Workspace.Size)
+	if err != nil {
+		return SandboxCreateRequest{}, err
+	}
+	workspaceLayout := "legacy"
+	if workspaceVolume.ClaimName == WorkspaceNamedVolumeName(binding.Workspace.ID) {
+		workspaceLayout = "workspace"
+	}
 	key, err := s.sealer.Open(value.AIOKeyEnc)
 	if err != nil {
 		return SandboxCreateRequest{}, fmt.Errorf("open host api key: %w", err)
@@ -480,7 +599,7 @@ func (s *hostService) createRequest(ctx context.Context, value host.Host) (Sandb
 			"SANDBOX_API_KEY": string(key), "MORDE_RUNTIME_BOOTSTRAP_KEY": runtimeCredentialString,
 			"MORDE_HOST_REPLICA_KEY": replicaCredential, "MORDE_PORTAL_URL": s.portalURL,
 			"MORDE_HOST_ID": value.ID, "MORDE_RUNTIME_GENERATION": strconv.FormatInt(value.RuntimeGeneration, 10),
-			"WORKSPACE": tmpl.Workspace.MountPath, "TZ": "Asia/Shanghai",
+			"WORKSPACE": tmpl.Workspace.MountPath, "MORDE_WORKSPACE_LAYOUT": workspaceLayout, "TZ": "Asia/Shanghai",
 		},
 		Metadata: map[string]string{
 			"ch-env": s.instance, "ch-host": value.ID, "ch-owner": value.OwnerID,
@@ -491,17 +610,10 @@ func (s *hostService) createRequest(ctx context.Context, value host.Host) (Sandb
 				Name: "profile-data", MountPath: ProfileVolumeMountPath,
 				ClaimName: domain.ProfileVolumeName(value.ID), Storage: ProfileVolumeStorage,
 			},
-			{
-				Name: "workspace-root", MountPath: tmpl.Workspace.MountPath,
-				ClaimName: domain.WorkspaceRootVolumeName(value.ID), Storage: tmpl.Workspace.Size,
-			},
+			workspaceVolume,
 			{
 				Name: "runtime-data", MountPath: RuntimeDataVolumeMountPath,
 				ClaimName: domain.RuntimeVolumeName(value.ID), Storage: RuntimeDataVolumeStorage,
-			},
-			{
-				Name: "host-apps", MountPath: HostAppsVolumeMountPath,
-				ClaimName: domain.HostAppsVolumeName(value.ID), Storage: HostAppsVolumeStorage,
 			},
 		},
 	}, nil

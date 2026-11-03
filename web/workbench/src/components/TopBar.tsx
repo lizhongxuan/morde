@@ -58,7 +58,9 @@ export default function TopBar({
     : controlLoading && !control ? '正在读取控制状态…'
       : transitionFailure ? control?.active_transition?.action === 'take_over' ? '接管未完成，可重试' : '交回未完成，可重试'
         : control?.control_state === 'ai' ? '当前控制者：AI · 桌面只读'
-          : control?.control_state === 'user' ? '当前控制者：你'
+          : control?.control_state === 'user' ? control.control_lease_active
+            ? control.control_lease_held_by_me ? '你持有电脑操作权' : control.control_actor_user_id ? `当前操作账号：${control.control_actor_user_id}` : '其他用户持有电脑操作权'
+            : '操作租约已失效 · 桌面只读'
             : control?.control_state === 'taking_over' ? '正在接管电脑，请稍候…'
               : control?.control_state === 'returning' ? '正在交回 AI，请稍候…' : '控制状态未知';
 
@@ -75,6 +77,13 @@ export default function TopBar({
         <span className="control-state" data-state={control?.control_state || 'loading'} role="status">
           {controlLabel}
         </span>
+        {control && <span className="control-version">控制版本 {control.control_version}</span>}
+        {control?.control_state === 'user' && <span className="control-lease">
+          {control.control_lease_active
+            ? `操作租约${control.control_lease_held_by_me ? '由你持有' : '有效'} · ${formatRemaining(control.control_lease_expires_at, now)}`
+            : '当前没有有效操作租约'}
+        </span>}
+        <p className="desktop-sharing-notice">桌面画面可能显示此电脑上的文件，获准查看桌面的成员也能看到。</p>
       </div>
       <div className="top-actions">
         {controlActionError && <span className="control-error" role="alert">{controlActionError}</span>}

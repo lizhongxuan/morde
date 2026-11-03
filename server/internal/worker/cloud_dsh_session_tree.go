@@ -10,9 +10,13 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
 
@@ -51,7 +55,7 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 }
 
 func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through int64) app.ModelTaskFence {
-	return app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, LeaseOwner: fence.LeaseOwner,
+	return app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, LeaseOwner: fence.LeaseOwner,
 		LeaseVersion: fence.LeaseVersion, AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
 		AgentSessionID: sessionID, AgentRootSessionID: fence.AgentSessionID, AuthorizationVersion: fence.AuthorizationVersion,
 		ThroughSequence: through, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion}
@@ -62,11 +66,127 @@ func cloudDSHModelFencePointer(fence app.AgentInstanceFence, sessionID string, t
 	return &modelFence
 }
 
+func cloudDSHInitialPrompt(value task.Task) (string, error) {
+	contextValue := value.ConversationContext
+	if contextValue == nil {
+		return value.Objective, nil
+	}
+	validScope := contextValue.Scope == "personal" && contextValue.ProjectID == "" &&
+		contextValue.InitiatorID == value.OwnerID && value.ProjectID == "" && value.InitiatorID == value.OwnerID
+	if contextValue.Scope == "project" && project.ValidID(value.ProjectID) && domain.ValidUserID(value.InitiatorID) {
+		validScope = contextValue.ProjectID == value.ProjectID && contextValue.InitiatorID == value.InitiatorID
+	}
+	if contextValue.OwnerID != value.OwnerID || contextValue.ConversationID != value.ConversationID || !validScope || contextValue.ThroughSequence < 0 ||
+		len(contextValue.Messages) > task.MaxConversationContextMessages || len(contextValue.Digest) != sha256.Size {
+		return "", errors.New("dsh conversation context is invalid")
+	}
+	previousSequence := int64(0)
+	for _, message := range contextValue.Messages {
+		if message.ID == "" || message.Sequence <= previousSequence || message.Sequence > contextValue.ThroughSequence ||
+			(message.Role != "user" && message.Role != "assistant") || strings.TrimSpace(message.Content) == "" || !utf8.ValidString(message.Content) {
+			return "", errors.New("dsh conversation context messages are invalid")
+		}
+		previousSequence = message.Sequence
+	}
+	if len(contextValue.Messages) == 0 {
+		return value.Objective, nil
+	}
+	var prompt strings.Builder
+	if contextValue.Scope == "project" {
+		prompt.WriteString("Confirmed project conversation history (oldest to newest):\n")
+	} else {
+		prompt.WriteString("Confirmed conversation history (personal scope, oldest to newest):\n")
+	}
+	for _, message := range contextValue.Messages {
+		if message.Role == "assistant" {
+			prompt.WriteString("Assistant: ")
+		} else {
+			prompt.WriteString("User: ")
+		}
+		prompt.WriteString(message.Content)
+		if message.Truncated {
+			prompt.WriteString(" [part of this older message was omitted]")
+		}
+		prompt.WriteByte('\n')
+	}
+	prompt.WriteString("\nCurrent request:\n")
+	prompt.WriteString(value.Objective)
+	return prompt.String(), nil
+}
+
 func checkpointFenceForSession(fence app.AgentInstanceFence, sessionID string) app.AgentCheckpointFence {
-	return app.AgentCheckpointFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
+	return app.AgentCheckpointFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, AgentInstanceID: fence.AgentInstanceID,
 		AgentGeneration: fence.AgentGeneration, AgentSessionID: sessionID, AgentRootSessionID: fence.AgentSessionID,
 		AuthorizationVersion: fence.AuthorizationVersion, LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
 		EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion}
+}
+
+type cloudDSHSerializedWriter struct {
+	mu sync.Mutex
+	io.WriteCloser
+}
+
+type cloudDSHInitialContextProvider interface {
+	InitialContext(context.Context, task.Task) (string, error)
+}
+
+func (w *cloudDSHSerializedWriter) Write(value []byte) (int, error) {
+	return w.WriteCloser.Write(value)
+}
+
+func (w *cloudDSHSerializedWriter) writeFrame(ctx context.Context, frame any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return writeCloudDSHFrame(ctx, w.WriteCloser, frame)
+}
+
+func (w *cloudDSHSerializedWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.WriteCloser.Close()
+}
+
+func (e *CloudDSHExecutor) deliverPendingMessages(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser, seen map[string]string) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-ticker.C:
+			if err := e.deliverPendingMessagesOnce(ctx, fence, input, seen); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser, seen map[string]string) error {
+	messages, err := e.options.Checkpoints.PendingMessages(ctx, checkpointFence(fence))
+	if err != nil {
+		return err
+	}
+	for _, message := range messages {
+		if !cloudDSHID.MatchString(message.ID) || message.Content == "" || utf8.RuneCountInString(message.Content) > 32768 ||
+			!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') {
+			return errors.New("pending conversation message is invalid")
+		}
+		if content, ok := seen[message.ID]; ok {
+			if content != message.Content {
+				return errors.New("pending conversation message identity changed")
+			}
+			continue
+		}
+		frame := map[string]any{"type": "message_delivery", "version": 1,
+			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
+			"generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion,
+			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": message.Content}
+		if err := writeCloudDSHFrame(ctx, input, frame); err != nil {
+			return err
+		}
+		seen[message.ID] = message.Content
+	}
+	return nil
 }
 
 func cloudDSHNamespacedToolCallID(taskID, sessionID, callID string) string {
@@ -89,6 +209,9 @@ func sameWorkerToolNames(left, right []string) bool {
 
 func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
 	input io.WriteCloser, output io.ReadCloser, resume bool, completion *app.CloudDSHTaskCompletion, onStart func()) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	input = &cloudDSHSerializedWriter{WriteCloser: input}
 	rootIdentity := cloudDSHIdentity{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentID: fence.AgentInstanceID,
 		SessionID: fence.AgentSessionID, Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion}
 	baseDefinitions := []app.AgentToolDefinition{}
@@ -184,6 +307,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}
 	frames := make(chan cloudDSHRead, 1)
 	go readCloudDSHFrames(ctx, output, frames)
+	deliveryDone := make(chan struct{})
+	var deliveryCancel context.CancelFunc
+	defer func() {
+		if deliveryCancel != nil {
+			deliveryCancel()
+			<-deliveryDone
+		}
+	}()
 	pendingCancels := make(map[string]cloudDSHJobCancelPending)
 	ready := false
 	for {
@@ -220,11 +351,39 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				start["checkpoint_through_seq"] = rootThrough
 				start["checkpoint_sha256"] = hex.EncodeToString(rootDigest)
 			} else {
-				start["prompt"] = value.Objective
+				prompt, err := cloudDSHInitialPrompt(value)
+				if err != nil {
+					return err
+				}
+				if provider, ok := e.options.Tools.(cloudDSHInitialContextProvider); ok {
+					personalContext, err := provider.InitialContext(ctx, value)
+					if err != nil {
+						return errors.New("authorized Task context is unavailable")
+					}
+					if personalContext != "" {
+						prompt += "\n\n" + personalContext
+					}
+				}
+				if !utf8.ValidString(prompt) || len(prompt) > cloudDSHMaxText {
+					return errors.New("dsh initial prompt exceeds its size limit")
+				}
+				start["prompt"] = prompt
 			}
 			if err := writeCloudDSHFrame(ctx, input, start); err != nil {
 				return err
 			}
+			seenDeliveries := make(map[string]string)
+			if err := e.deliverPendingMessagesOnce(ctx, fence, input, seenDeliveries); err != nil {
+				return errors.New("pending conversation messages are unavailable")
+			}
+			deliveryCtx, cancelDelivery := context.WithCancel(ctx)
+			deliveryCancel = cancelDelivery
+			go func() {
+				defer close(deliveryDone)
+				if err := e.deliverPendingMessages(deliveryCtx, fence, input, seenDeliveries); err != nil && deliveryCtx.Err() == nil {
+					cancel(err)
+				}
+			}()
 			if onStart != nil {
 				onStart()
 			}

@@ -5,17 +5,86 @@ import { enterHostInNewTab, portalApi } from './api';
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-  it('sends an optional trimmed invitation code during registration', async () => {
+  it('normalizes empty non-ready main-conversation IDs from the API contract', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'selection_required', conversation_id: '', version: 0 })));
+
+    await expect(portalApi.mainConversation()).resolves.toEqual({ status: 'selection_required', conversation_id: null, version: 0 });
+  });
+
+  it('sends only the username and password during registration', async () => {
     let request: Request | undefined;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       request = new Request(input, init);
       return Response.json({ user: { id: 'u1234567', name: 'new-user', role: 'user', status: 'pending' } }, { status: 201 });
     }));
 
-    await portalApi.register('new-user', 'secret-pass', '  0123456789abcdef0123456789abcdef  ');
+    await portalApi.register('new-user', 'secret-pass');
 
     expect([request!.method, new URL(request!.url).pathname]).toEqual(['POST', '/api/auth/register']);
-    expect(await request!.json()).toEqual({ name: 'new-user', password: 'secret-pass', invite_code: '0123456789abcdef0123456789abcdef' });
+    expect(await request!.json()).toEqual({ name: 'new-user', password: 'secret-pass' });
+  });
+
+  it('saves the default model budget with its expected version', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ configured: true, token_limit: 500_000, max_concurrent: 8, version: 1 });
+    }));
+
+    await portalApi.updateAdminModelBudgetDefault({ expected_version: 0, token_limit: 500_000, max_concurrent: 8 });
+
+    expect([request!.method, new URL(request!.url).pathname]).toEqual(['PUT', '/api/admin/settings/model-budget-default']);
+    expect(await request!.json()).toEqual({ expected_version: 0, token_limit: 500_000, max_concurrent: 8 });
+  });
+
+  it('reads and updates the server-owned main conversation with stable idempotency headers', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      requests.push(request);
+      return Response.json({ status: 'ready', conversation_id: 'c1234567', version: requests.length === 1 ? 1 : 2 });
+    }));
+
+    await portalApi.mainConversation();
+    await portalApi.ensureMainConversation('main-ensure-001');
+    await portalApi.setMainConversation('c1234567', 1, 'main-set-0001');
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['GET', '/api/me/main-conversation'],
+      ['POST', '/api/me/main-conversation/ensure'],
+      ['PUT', '/api/me/main-conversation'],
+    ]);
+    expect(requests[1]?.headers.get('Idempotency-Key')).toBe('main-ensure-001');
+    expect(requests[2]?.headers.get('Idempotency-Key')).toBe('main-set-0001');
+    expect(await requests[2]!.json()).toEqual({ conversation_id: 'c1234567', expected_version: 1 });
+    expect(requests.every((request) => request.credentials === 'include' && request.headers.has('X-Request-Id'))).toBe(true);
+  });
+
+  it('rejects an invalid main-conversation response instead of trusting its shape', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'ready', conversation_id: null, version: 1 })));
+    await expect(portalApi.mainConversation()).rejects.toThrow('主会话响应格式无效');
+  });
+
+  it('requests server Workspace diffs and restores selected paths with an idempotency key', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(input instanceof Request
+        ? new Request(input, init)
+        : new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init));
+      return Response.json({ workspace_id: 'w1234567', target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false });
+    }));
+
+    await portalApi.workspaceDiff('w1234567', 1, 2);
+    await portalApi.restoreWorkspacePaths('w1234567', {
+      target_revision: 1, expected_current_revision: 2, paths: ['README.md'],
+    }, 'workspace-restore-key-01');
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname, new URL(request.url).search])).toEqual([
+      ['GET', '/api/workspaces/w1234567/diff', '?from_revision=1&to_revision=2'],
+      ['POST', '/api/workspaces/w1234567/restore', ''],
+    ]);
+    expect(requests[1]?.headers.get('Idempotency-Key')).toBe('workspace-restore-key-01');
+    expect(await requests[1]!.json()).toEqual({ target_revision: 1, expected_current_revision: 2, paths: ['README.md'] });
   });
 
   it('opens a visible same-origin Host handoff page in a new tab', async () => {
@@ -158,8 +227,11 @@ describe('typed Portal API client', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
-      if (request.method === 'GET') return Response.json({ host_id: 'h1234567', control_state: 'ai', control_version: 3, active_transition: null });
-      return Response.json({ host_id: 'h1234567', control_state: 'user', control_version: 5, active_transition: null, pending_operation_ids: [] });
+      if (request.method === 'GET') return Response.json({ host_id: 'h1234567', control_state: 'ai', control_version: 3,
+        control_actor_user_id: '', control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null });
+      return Response.json({ host_id: 'h1234567', control_state: 'user', control_version: 5,
+        control_actor_user_id: 'u1234567', control_lease_expires_at: '2026-11-02T00:00:30Z', control_lease_active: true,
+        control_lease_held_by_me: true, active_transition: null, pending_operation_ids: [] });
     }));
 
     await expect(portalApi.hostControl('h1234567')).resolves.toMatchObject({ control_state: 'ai', control_version: 3 });
@@ -172,6 +244,21 @@ describe('typed Portal API client', () => {
       ['POST', '/api/hosts/h1234567/control/actions'],
     ]);
     expect(await requests[1]!.json()).toEqual({ action: 'take_over', request_id: 'host-takeover-retry-01', expected_control_version: 3 });
+  });
+
+  it('renews the current Host control lease with its expected control version', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ host_id: 'h1234567', control_state: 'user', control_version: 7,
+        control_actor_user_id: 'u1234567', control_lease_expires_at: '2026-11-02T00:00:30Z',
+        control_lease_active: true, control_lease_held_by_me: true, active_transition: null });
+    }));
+
+    await expect(portalApi.renewHostControlLease('h1234567', 7)).resolves.toMatchObject({ control_lease_held_by_me: true });
+    expect([request!.method, new URL(request!.url).pathname, await request!.json()]).toEqual([
+      'POST', '/api/hosts/h1234567/control/lease/renew', { expected_control_version: 7 },
+    ]);
   });
 
   it('reads the account Runtime separately from Host state', async () => {
@@ -257,6 +344,24 @@ describe('typed Portal API client', () => {
     ]);
     expect(await requests[2]!.json()).toEqual({ user_id: 'u7654321', permissions: ['desktop:view'] });
     expect(requests.every((request) => request.credentials === 'include' && request.headers.has('X-Request-Id'))).toBe(true);
+  });
+
+  it('issues a Task-bound short-lived Workbench observation ticket through the Portal session', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(new URL(String(input), window.location.origin), init);
+      return Response.json({ ticket: 'opaque-one-time-ticket-123', task_id: 'q1234567', host_id: 'h1234567',
+        expires_at: new Date(Date.now() + 30_000).toISOString() });
+    }));
+
+    await expect(portalApi.taskWorkbenchObservationTicket('q1234567')).resolves.toMatchObject({
+      task_id: 'q1234567', host_id: 'h1234567', ticket: 'opaque-one-time-ticket-123',
+    });
+    expect([request!.method, new URL(request!.url).pathname, request!.credentials]).toEqual([
+      'POST', '/api/tasks/q1234567/workbench-observation-ticket', 'include',
+    ]);
+    expect(request!.headers.has('X-Request-Id')).toBe(true);
+    expect(await request!.clone().text()).toBe('');
   });
 
   it('reuses a host idempotency key after a lost create response', async () => {

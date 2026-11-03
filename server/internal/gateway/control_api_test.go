@@ -22,6 +22,12 @@ type testGatewayControlService struct {
 	statusCalls              int
 	statusHostID             string
 	statusActor              identity.Principal
+	renewResult              app.ControlStatus
+	renewErr                 error
+	renewCalls               int
+	renewHostID              string
+	renewActor               identity.Principal
+	renewVersion             int64
 	result                   app.ControlActionResult
 	actErr                   error
 	actCalls                 int
@@ -73,6 +79,12 @@ func (s *testGatewayControlService) Status(_ context.Context, principal identity
 	s.statusCalls++
 	s.statusHostID, s.statusActor = hostID, principal
 	return s.status, s.statusErr
+}
+
+func (s *testGatewayControlService) RenewLease(_ context.Context, principal identity.Principal, hostID string, expectedControlVersion int64) (app.ControlStatus, error) {
+	s.renewCalls++
+	s.renewHostID, s.renewActor, s.renewVersion = hostID, principal, expectedControlVersion
+	return s.renewResult, s.renewErr
 }
 
 func (s *testGatewayControlService) Act(_ context.Context, principal identity.Principal, hostID string, command app.ControlActionCommand) (app.ControlActionResult, error) {
@@ -192,10 +204,52 @@ func TestGatewayControlStatusUsesHostCookieAndOmitsRuntimeSecrets(t *testing.T) 
 			t.Fatalf("control status leaked %q: %s", secret, response.Body)
 		}
 	}
-	for _, field := range []string{`"host_id":"` + testHostID + `"`, `"control_state":"taking_over"`, `"phase":"draining"`} {
+	for _, field := range []string{`"host_id":"` + testHostID + `"`, `"control_state":"taking_over"`, `"control_lease_held_by_me":false`, `"phase":"draining"`} {
 		if !strings.Contains(response.Body.String(), field) {
 			t.Fatalf("control status omitted %s: %s", field, response.Body)
 		}
+	}
+}
+
+func TestGatewayControlLeaseRenewRequiresVersionAndReturnsHolderIdentity(t *testing.T) {
+	expires := time.Now().UTC().Add(30 * time.Second)
+	service := &testGatewayControlService{renewResult: app.ControlStatus{
+		HostID: testHostID, ControlState: host.ControlUser, ControlVersion: 9,
+		ControlActorUserID: testUserID, ControlLeaseExpiresAt: &expires,
+		ControlLeaseActive: true, ControlLeaseHeldByMe: true,
+	}}
+	handler, g := newTestGateway(t, &testRuntime{ref: host.Ref{ID: testHostID, OwnerID: testUserID, State: host.StateRunning}},
+		&testVerifier{}, &testHostService{}, func(d *Deps) { d.Control = service })
+	path := "/__ch/api/control/lease/renew"
+	for _, body := range []string{`{}`, `{"expected_control_version":-1}`, `{"expected_control_version":8,"extra":true}`} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Host = hostAuthority()
+		req.Header.Set("Cookie", hostCookieName+"="+hostCookie(g, testHostID, testUserID, time.Hour))
+		req.Header.Set("Origin", "https://"+hostAuthority())
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("invalid lease renewal %s = %d %s; want 400", body, response.Code, response.Body)
+		}
+	}
+	if service.renewCalls != 0 {
+		t.Fatalf("invalid lease renewal calls = %d; want 0", service.renewCalls)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"expected_control_version":8}`))
+	req.Host = hostAuthority()
+	req.Header.Set("Cookie", hostCookieName+"="+hostCookie(g, testHostID, testUserID, time.Hour))
+	req.Header.Set("Origin", "https://"+hostAuthority())
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || service.renewCalls != 1 || service.renewHostID != testHostID ||
+		service.renewVersion != 8 || service.renewActor.UserID != testUserID {
+		t.Fatalf("lease renewal = %d calls=%d host=%q version=%d actor=%+v body=%s", response.Code,
+			service.renewCalls, service.renewHostID, service.renewVersion, service.renewActor, response.Body)
+	}
+	if !strings.Contains(response.Body.String(), `"control_lease_held_by_me":true`) {
+		t.Fatalf("lease renewal omitted authenticated holder flag: %s", response.Body)
 	}
 }
 

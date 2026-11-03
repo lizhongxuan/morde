@@ -9,7 +9,9 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/host"
@@ -21,15 +23,18 @@ import (
 const controlTransitionSelect = `
 SELECT host_id, owner_id, request_id, action, phase,
        expected_control_version, blocked_control_version, target_control_version,
-       task_ids, task_ids_saved, drained_receipt, failure_reason, created_at, updated_at
+       task_ids, task_ids_saved, drained_receipt, failure_reason, created_at, updated_at, actor_user_id
 FROM host_control_transitions`
 
 type controlHostSnapshot struct {
-	ID             string
-	OwnerID        string
-	State          host.State
-	ControlState   host.ControlState
-	ControlVersion int64
+	ID                      string
+	OwnerID                 string
+	State                   host.State
+	ControlState            host.ControlState
+	ControlVersion          int64
+	ControlActorID          string
+	LeaseExpiresAt          *time.Time
+	ControlActorLeaseActive bool
 }
 
 // BeginControlTransition installs the fail-closed Host fence and its durable
@@ -51,7 +56,7 @@ func (s *Store) BeginControlTransition(ctx context.Context, request control.Begi
 
 		existing, err := loadControlTransition(ctx, tx, request.HostID, request.RequestID, true)
 		if err == nil {
-			if existing.OwnerID != request.OwnerID || existing.Action != request.Action || existing.ExpectedControlVersion != request.ExpectedControlVersion {
+			if existing.OwnerID != request.OwnerID || existing.ActorUserID != request.ActorUserID || existing.Action != request.Action || existing.ExpectedControlVersion != request.ExpectedControlVersion {
 				return controlIdempotencyConflict()
 			}
 			result = existing
@@ -74,12 +79,21 @@ func (s *Store) BeginControlTransition(ctx context.Context, request control.Begi
 		if current.ControlState != sourceState {
 			return controlStateConflict("host control state does not allow this action")
 		}
+		allowed, err := hasControlPermission(ctx, tx, request.HostID, current.OwnerID, request.ActorUserID, "")
+		if err != nil {
+			return fmt.Errorf("authorize Host control transition: %w", err)
+		}
+		releaseAllowed := current.ControlActorID == request.ActorUserID && current.ControlActorLeaseActive ||
+			request.ActorUserID == current.OwnerID && (current.ControlActorID == "" || !current.ControlActorLeaseActive)
+		if !allowed || request.Action == control.ActionRelease && !releaseAllowed {
+			return controlStateConflict("Host control lease is held by another user")
+		}
 
 		blockedVersion := request.ExpectedControlVersion + 1
 		targetVersion := blockedVersion + 1
 		updated, err := tx.Exec(ctx, `
 UPDATE hosts
-SET control_state=$3, control_version=$4, updated_at=clock_timestamp()
+SET control_state=$3, control_version=$4, control_actor_id=NULL, control_lease_expires_at=NULL, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND state='running' AND deleted_at IS NULL
   AND control_state=$5 AND control_version=$6`,
 			request.HostID, request.OwnerID, string(transitionState), blockedVersion,
@@ -94,10 +108,10 @@ WHERE id=$1 AND owner_id=$2 AND state='running' AND deleted_at IS NULL
 		_, err = tx.Exec(ctx, `
 INSERT INTO host_control_transitions (
   host_id, owner_id, request_id, action, phase, expected_control_version,
-  blocked_control_version, target_control_version, task_ids, task_ids_saved
-) VALUES ($1,$2,$3,$4,'blocking',$5,$6,$7,'[]'::jsonb,false)`,
+  blocked_control_version, target_control_version, task_ids, task_ids_saved, actor_user_id
+) VALUES ($1,$2,$3,$4,'blocking',$5,$6,$7,'[]'::jsonb,false,$8)`,
 			request.HostID, request.OwnerID, request.RequestID, string(request.Action),
-			request.ExpectedControlVersion, blockedVersion, targetVersion)
+			request.ExpectedControlVersion, blockedVersion, targetVersion, request.ActorUserID)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return controlStateConflict("host already has an active control transition")
@@ -316,12 +330,23 @@ func (s *Store) CompleteControlTransition(ctx context.Context, hostID, requestID
 			return controlStateConflict("control task snapshot is not saved")
 		}
 		var finalState host.ControlState
+		var finalActor any
+		var leaseTTL any = 0.0
 		switch value.Action {
 		case control.ActionTakeOver:
 			if value.Phase != control.PhaseDrained || len(value.DrainedReceipt) == 0 {
 				return controlStateConflict("takeover requires a persisted drained receipt")
 			}
 			finalState = host.ControlUser
+			allowed, err := hasControlPermission(ctx, tx, hostID, value.OwnerID, value.ActorUserID, "")
+			if err != nil {
+				return fmt.Errorf("revalidate Host control actor: %w", err)
+			}
+			if !allowed {
+				return controlStateConflict("Host control actor authorization changed")
+			}
+			finalActor = value.ActorUserID
+			leaseTTL = app.HostControlLeaseTTL.Seconds()
 		case control.ActionRelease:
 			if value.Phase != control.PhaseDrained {
 				return controlStateConflict("release transition is not ready to complete")
@@ -332,11 +357,13 @@ func (s *Store) CompleteControlTransition(ctx context.Context, hostID, requestID
 		}
 
 		updated, err := tx.Exec(ctx, `UPDATE hosts
-SET control_state=$4, control_version=$5, updated_at=clock_timestamp()
+SET control_state=$4, control_version=$5, control_actor_id=$7,
+    control_lease_expires_at=CASE WHEN $7::text IS NULL THEN NULL ELSE clock_timestamp()+($8 * interval '1 second') END,
+    updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND state='running' AND deleted_at IS NULL
   AND control_state=$3 AND control_version=$6`,
 			hostID, value.OwnerID, string(transitionStateForAction(value.Action)),
-			string(finalState), value.TargetControlVersion, value.BlockedControlVersion)
+			string(finalState), value.TargetControlVersion, value.BlockedControlVersion, finalActor, leaseTTL)
 		if err != nil {
 			return fmt.Errorf("complete host control transition: %w", err)
 		}
@@ -414,7 +441,8 @@ func lockTransitionAndHost(ctx context.Context, tx pgx.Tx, hostID, requestID str
 }
 
 func lockControlHost(ctx context.Context, tx pgx.Tx, hostID, ownerID string) (controlHostSnapshot, error) {
-	query := `SELECT id, owner_id, state, control_state, control_version FROM hosts WHERE id=$1`
+	query := `SELECT id, owner_id, state, control_state, control_version, COALESCE(control_actor_id,''), control_lease_expires_at,
+COALESCE(control_lease_expires_at > clock_timestamp(), false) FROM hosts WHERE id=$1`
 	args := []any{hostID}
 	if ownerID != "" {
 		query += ` AND owner_id=$2`
@@ -422,7 +450,8 @@ func lockControlHost(ctx context.Context, tx pgx.Tx, hostID, ownerID string) (co
 	}
 	query += ` FOR UPDATE`
 	var result controlHostSnapshot
-	err := tx.QueryRow(ctx, query, args...).Scan(&result.ID, &result.OwnerID, &result.State, &result.ControlState, &result.ControlVersion)
+	err := tx.QueryRow(ctx, query, args...).Scan(&result.ID, &result.OwnerID, &result.State, &result.ControlState,
+		&result.ControlVersion, &result.ControlActorID, &result.LeaseExpiresAt, &result.ControlActorLeaseActive)
 	return result, err
 }
 
@@ -440,16 +469,20 @@ func scanControlTransition(row pgx.Row) (control.Transition, error) {
 	var value control.Transition
 	var action, phase string
 	var taskIDsJSON, receiptJSON []byte
+	var actorUserID *string
 	if err := row.Scan(
 		&value.HostID, &value.OwnerID, &value.RequestID, &action, &phase,
 		&value.ExpectedControlVersion, &value.BlockedControlVersion, &value.TargetControlVersion,
 		&taskIDsJSON, &value.TaskIDsSaved, &receiptJSON, &value.FailureReason,
-		&value.CreatedAt, &value.UpdatedAt,
+		&value.CreatedAt, &value.UpdatedAt, &actorUserID,
 	); err != nil {
 		return control.Transition{}, err
 	}
 	value.Action = control.Action(action)
 	value.Phase = control.Phase(phase)
+	if actorUserID != nil {
+		value.ActorUserID = *actorUserID
+	}
 	if err := json.Unmarshal(taskIDsJSON, &value.TaskIDs); err != nil {
 		return control.Transition{}, fmt.Errorf("decode control task snapshot: %w", err)
 	}

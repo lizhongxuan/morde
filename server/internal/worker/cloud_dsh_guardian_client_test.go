@@ -14,7 +14,7 @@ import (
 )
 
 func TestUnixSocketGuardianRecoveryUsesExactFenceAndNonceDigest(t *testing.T) {
-	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 3,
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 3,
 		AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1", LeaseVersion: 7,
 		AuthorizationVersion: 2, EngineVersion: "engine-v1", ProfileVersion: "profile-v1"}
 	attestation := app.AgentGuardianStopAttestation{Fence: fence, ContainerID: "container", NonceSHA256: "nonce-digest", Destroyed: true, DestroyedAt: time.Now().UTC()}

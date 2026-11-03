@@ -68,6 +68,21 @@ func TestHandlerBindsOwnerAndReservesValidatedRelativePath(t *testing.T) {
 	}
 }
 
+func TestHandlerAllowsRootDirectoryMetadataUpsert(t *testing.T) {
+	service := &fakeService{}
+	handler, err := NewHandler("u1234567", service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/reservations", strings.NewReader(`{"workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"root-metadata","path":".","operation":"directory_upsert","size_bytes":0}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || service.reserveCall != 1 || service.request.Path != "." || service.request.Operation != OperationDirectoryUpsert {
+		t.Fatalf("root directory metadata reserve = status %d calls=%d request=%+v", response.Code, service.reserveCall, service.request)
+	}
+}
+
 func TestHandlerRejectsInvalidReservationBeforeCallingService(t *testing.T) {
 	tests := []struct {
 		name string
@@ -80,6 +95,7 @@ func TestHandlerRejectsInvalidReservationBeforeCallingService(t *testing.T) {
 		{"invalid operation id", `{"workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"bad/id","path":"file","operation":"upsert","size_bytes":1}`},
 		{"unknown owner field", `{"owner_id":"u7654321","workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"id1","path":"file","operation":"upsert","size_bytes":1}`},
 		{"delete with size", `{"workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"id1","path":"file","operation":"delete","size_bytes":1}`},
+		{"root directory delete", `{"workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"id1","path":".","operation":"directory_delete","size_bytes":0}`},
 		{"over single-file limit", `{"workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"id1","path":"file","operation":"upsert","size_bytes":314572801}`},
 		{"trailing JSON", `{"workspace_id":"w1234567","folder_id":"morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"id1","path":"file","operation":"upsert","size_bytes":1}{}`},
 	}

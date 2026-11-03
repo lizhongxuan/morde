@@ -42,10 +42,14 @@ type MCPRuntimeTaskIDReader interface {
 // ControlStatus is the authoritative Host control fence plus the durable
 // transition, if a handoff is still in progress.
 type ControlStatus struct {
-	HostID           string              `json:"host_id"`
-	ControlState     host.ControlState   `json:"control_state"`
-	ControlVersion   int64               `json:"control_version"`
-	ActiveTransition *control.Transition `json:"active_transition,omitempty"`
+	HostID                string              `json:"host_id"`
+	ControlState          host.ControlState   `json:"control_state"`
+	ControlVersion        int64               `json:"control_version"`
+	ControlActorUserID    string              `json:"control_actor_user_id"`
+	ControlLeaseExpiresAt *time.Time          `json:"control_lease_expires_at"`
+	ControlLeaseActive    bool                `json:"control_lease_active"`
+	ControlLeaseHeldByMe  bool                `json:"control_lease_held_by_me"`
+	ActiveTransition      *control.Transition `json:"active_transition,omitempty"`
 }
 
 type ApplicationsStatus struct {
@@ -81,6 +85,7 @@ type ControlActionResult struct {
 // runtime mode is durably reconciled.
 type ControlService struct {
 	hosts             HostStore
+	leases            HostControlLeaseStore
 	authorizer        TaskAuthorizer
 	tasks             TaskStore
 	transitions       ControlTransitionStore
@@ -96,8 +101,12 @@ func NewControlService(hosts HostStore, authorizer TaskAuthorizer, tasks TaskSto
 	if hosts == nil || authorizer == nil || tasks == nil || transitions == nil || activity == nil || runtime == nil || writer == nil || mcpTaskIDs == nil {
 		return nil, errors.New("control service dependencies are required")
 	}
+	leases, ok := hosts.(HostControlLeaseStore)
+	if !ok {
+		return nil, errors.New("host control lease store is required")
+	}
 	return &ControlService{
-		hosts: hosts, authorizer: authorizer, tasks: tasks, transitions: transitions,
+		hosts: hosts, leases: leases, authorizer: authorizer, tasks: tasks, transitions: transitions,
 		activity: activity, mcpTaskIDs: mcpTaskIDs, runtime: runtime, audit: writer,
 		drainTimeout: controlConnectionDrainTimeout, drainPollInterval: controlConnectionDrainPollInterval,
 	}, nil
@@ -107,14 +116,14 @@ func (s *ControlService) Status(ctx context.Context, principal identity.Principa
 	if err := validateTaskPrincipal(principal); err != nil {
 		return ControlStatus{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, hostID, controlObserveScope); err != nil {
-		return ControlStatus{}, hideTaskAccessError(err)
-	}
-	value, err := s.hosts.GetHost(ctx, hostID)
-	if err != nil || value.OwnerID != principal.UserID || value.State != host.StateRunning || value.DeletedAt != nil {
+	value, err := s.authorizeControlHost(ctx, principal, hostID, false)
+	if err != nil || value.State != host.StateRunning {
 		return ControlStatus{}, domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	status := controlStatusForHost(value)
+	if err := s.populateControlLeaseStatus(ctx, &status, principal.UserID); err != nil {
+		return ControlStatus{}, err
+	}
 	transition, err := s.transitions.GetActiveControlTransition(ctx, hostID)
 	if err == nil {
 		if transition.OwnerID != value.OwnerID {
@@ -266,11 +275,12 @@ func (s *ControlService) Act(ctx context.Context, principal identity.Principal, 
 	if err := validateTaskPrincipal(principal); err != nil {
 		return ControlActionResult{}, err
 	}
-	if _, err := authorizeTaskHost(ctx, s.authorizer, principal, hostID, controlOperateScope); err != nil {
+	hostValue, err := s.authorizeControlHost(ctx, principal, hostID, true)
+	if err != nil {
 		return ControlActionResult{}, hideTaskAccessError(err)
 	}
 	request := control.BeginRequest{
-		HostID: hostID, OwnerID: principal.UserID, RequestID: command.RequestID,
+		HostID: hostID, OwnerID: hostValue.OwnerID, ActorUserID: principal.UserID, RequestID: command.RequestID,
 		Action: command.Action, ExpectedControlVersion: command.ExpectedControlVersion,
 	}
 	transition, err := s.transitions.BeginControlTransition(ctx, request)
@@ -284,12 +294,66 @@ func (s *ControlService) Act(ctx context.Context, principal identity.Principal, 
 		_ = s.transitions.RecordControlTransitionFailure(ctx, hostID, transition.RequestID, "audit_unavailable")
 		return ControlActionResult{}, fmt.Errorf("write control transition audit: %w", err)
 	}
-	return s.resume(ctx, transition)
+	return s.resume(ctx, transition, principal.UserID)
 }
 
-func (s *ControlService) resume(ctx context.Context, transition control.Transition) (ControlActionResult, error) {
+func (s *ControlService) RenewLease(ctx context.Context, principal identity.Principal, hostID string, expectedControlVersion int64) (ControlStatus, error) {
+	if err := validateTaskPrincipal(principal); err != nil {
+		return ControlStatus{}, err
+	}
+	_, err := s.authorizeControlHost(ctx, principal, hostID, true)
+	if err != nil {
+		return ControlStatus{}, hideTaskAccessError(err)
+	}
+	if _, err := s.leases.RenewHostControlLease(ctx, hostID, principal.UserID, expectedControlVersion); err != nil {
+		return ControlStatus{}, err
+	}
+	return s.Status(ctx, principal, hostID)
+}
+
+func (s *ControlService) authorizeControlHost(ctx context.Context, principal identity.Principal, hostID string, operate bool) (host.Host, error) {
+	if !domain.ValidHostID(hostID) {
+		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	value, err := s.hosts.GetHost(ctx, hostID)
+	if err != nil || value.OwnerID == "" || value.DeletedAt != nil {
+		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if principal.UserID == value.OwnerID {
+		scope := controlObserveScope
+		if operate {
+			scope = controlOperateScope
+		}
+		if _, err := authorizeTaskHost(ctx, s.authorizer, principal, hostID, scope); err != nil {
+			return host.Host{}, hideTaskAccessError(err)
+		}
+		return value, nil
+	}
+	if principal.Kind != identity.KindSession {
+		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	sharing, ok := s.hosts.(HostSharingStore)
+	if !ok {
+		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	access, err := sharing.GetHostActorAccess(ctx, hostID, principal.UserID)
+	if err != nil || access.OwnerID != value.OwnerID || access.Disabled {
+		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	for _, permission := range access.Permissions {
+		if permission == host.PermissionDesktopView || permission == host.PermissionDesktopControl ||
+			permission == host.PermissionTerminalControl || permission == host.PermissionMCPControl {
+			if !operate || permission != host.PermissionDesktopView {
+				return value, nil
+			}
+		}
+	}
+	return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
+}
+
+func (s *ControlService) resume(ctx context.Context, transition control.Transition, viewerUserID string) (ControlActionResult, error) {
 	if transition.Phase == control.PhaseCompleted {
-		status, err := s.statusForTransition(ctx, transition)
+		status, err := s.statusForTransition(ctx, transition, viewerUserID)
 		return ControlActionResult{Status: status, PendingOperationIDs: []string{}}, err
 	}
 	if !transition.TaskIDsSaved {
@@ -331,7 +395,7 @@ func (s *ControlService) resume(ctx context.Context, transition control.Transiti
 				_ = s.transitions.RecordControlTransitionFailure(ctx, transition.HostID, transition.RequestID, "transition_persistence_failed")
 				return ControlActionResult{}, completeErr
 			}
-			status, statusErr := s.statusForTransition(ctx, completed)
+			status, statusErr := s.statusForTransition(ctx, completed, viewerUserID)
 			return ControlActionResult{Status: status, PendingOperationIDs: []string{}}, statusErr
 		}
 		if session.Mode != runtimeclient.ModeBlocked || session.Fence.ControlVersion != transition.BlockedControlVersion {
@@ -352,7 +416,7 @@ func (s *ControlService) resume(ctx context.Context, transition control.Transiti
 		if quiesced.Status == runtimeclient.QuiesceDraining || len(quiesced.PendingOperationIDs) != 0 {
 			_ = s.transitions.RecordControlTransitionFailure(ctx, transition.HostID, transition.RequestID, "operations_pending")
 			transition.FailureReason = "operations_pending"
-			status, statusErr := s.statusForTransition(ctx, transition)
+			status, statusErr := s.statusForTransition(ctx, transition, viewerUserID)
 			return ControlActionResult{Status: status, PendingOperationIDs: append([]string{}, quiesced.PendingOperationIDs...)}, statusErr
 		}
 		if quiesced.Status != runtimeclient.QuiesceDrained || quiesced.DrainedReceipt == nil {
@@ -393,7 +457,7 @@ func (s *ControlService) resume(ctx context.Context, transition control.Transiti
 		_ = s.transitions.RecordControlTransitionFailure(ctx, transition.HostID, transition.RequestID, "transition_persistence_failed")
 		return ControlActionResult{}, err
 	}
-	status, err := s.statusForTransition(ctx, completed)
+	status, err := s.statusForTransition(ctx, completed, viewerUserID)
 	return ControlActionResult{Status: status, PendingOperationIDs: []string{}}, err
 }
 
@@ -518,18 +582,33 @@ func (s *ControlService) failTransition(ctx context.Context, transition control.
 	return ControlActionResult{}, cause
 }
 
-func (s *ControlService) statusForTransition(ctx context.Context, transition control.Transition) (ControlStatus, error) {
+func (s *ControlService) statusForTransition(ctx context.Context, transition control.Transition, viewerUserID string) (ControlStatus, error) {
 	value, err := s.hosts.GetHost(ctx, transition.HostID)
 	if err != nil || value.OwnerID != transition.OwnerID || value.State != host.StateRunning || value.DeletedAt != nil {
 		return ControlStatus{}, domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	status := controlStatusForHost(value)
+	if err := s.populateControlLeaseStatus(ctx, &status, viewerUserID); err != nil {
+		return ControlStatus{}, err
+	}
 	if transition.Phase != control.PhaseCompleted {
 		status.ActiveTransition = &transition
 	} else {
 		status.ActiveTransition = nil
 	}
 	return status, nil
+}
+
+func (s *ControlService) populateControlLeaseStatus(ctx context.Context, status *ControlStatus, viewerUserID string) error {
+	lease, err := s.leases.GetHostControlLease(ctx, status.HostID)
+	if err != nil {
+		return err
+	}
+	status.ControlActorUserID = lease.ActorUserID
+	status.ControlLeaseExpiresAt = lease.ExpiresAt
+	status.ControlLeaseActive = lease.Active
+	status.ControlLeaseHeldByMe = lease.Active && lease.ActorUserID == viewerUserID
+	return nil
 }
 
 func controlStatusForHost(value host.Host) ControlStatus {

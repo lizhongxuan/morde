@@ -15,6 +15,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
 	templatedomain "morde/server/internal/domain/template"
 )
 
@@ -155,7 +157,23 @@ type SiteStorage struct {
 }
 
 type Models struct {
-	AllowedHosts []string `yaml:"allowed_hosts"`
+	AllowedHosts []string           `yaml:"allowed_hosts"`
+	ProjectRates []ProjectModelRate `yaml:"project_rates"`
+}
+
+type ProjectModelRate struct {
+	ModelID                string `yaml:"model_id"`
+	Provider               string `yaml:"provider"`
+	Model                  string `yaml:"model"`
+	Currency               string `yaml:"currency"`
+	Version                int64  `yaml:"version"`
+	InputMicrosPerMillion  int64  `yaml:"input_micros_per_million"`
+	OutputMicrosPerMillion int64  `yaml:"output_micros_per_million"`
+}
+
+func (r ProjectModelRate) Snapshot() project.RateSnapshot {
+	return project.RateSnapshot{ModelID: r.ModelID, Provider: r.Provider, Model: r.Model, Currency: r.Currency,
+		Version: r.Version, InputMicrosPerMillion: r.InputMicrosPerMillion, OutputMicrosPerMillion: r.OutputMicrosPerMillion}
 }
 
 type CloudDSH struct {
@@ -338,6 +356,16 @@ func (c Config) validate() error {
 			return fmt.Errorf("config.models.allowed_hosts contains a duplicate host")
 		}
 		seenModelHosts[host] = struct{}{}
+	}
+	seenProjectRates := make(map[string]struct{}, len(c.Models.ProjectRates))
+	for _, rate := range c.Models.ProjectRates {
+		if !domain.ValidModelConnectionID(rate.ModelID) || rate.Snapshot().Validate() != nil {
+			return fmt.Errorf("config.models.project_rates contains an invalid rate")
+		}
+		if _, exists := seenProjectRates[rate.ModelID]; exists {
+			return fmt.Errorf("config.models.project_rates contains a duplicate model_id")
+		}
+		seenProjectRates[rate.ModelID] = struct{}{}
 	}
 	if len(c.Orchestrator.Profiles) == 0 {
 		return fmt.Errorf("config.orchestrator.profiles must not be empty")

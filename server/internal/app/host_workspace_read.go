@@ -162,6 +162,9 @@ func (s *WorkspaceSyncService) StreamHostWorkspaceFile(
 	if file.SizeBytes > workspace.MaxSyncFileBytes || workspace.ValidateFile(file) != nil {
 		return workspace.File{}, domain.NewError(domain.CodeWorkspaceConflict, "workspace file manifest is invalid")
 	}
+	if file.Kind == "symlink" {
+		return workspace.File{}, domain.NewError(domain.CodeForbidden, "workspace symlinks cannot be streamed as regular file contents")
+	}
 	if err := verifyHostWorkspaceFile(ctx, s.blocks, workspaceID, file); err != nil {
 		return workspace.File{}, err
 	}

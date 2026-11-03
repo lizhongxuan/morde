@@ -56,7 +56,7 @@ func TestPostgresAgentCheckpointFencingAndIdempotency(t *testing.T) {
 	nonce := make([]byte, 32)
 	nonce[0] = 1
 	started, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
-		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID, AgentInstanceID: "agent-1",
+		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: owner.ID, AgentInstanceID: "agent-1",
 			AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1",
 			LeaseVersion: claimed.Lease.Version, AuthorizationVersion: 1, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
 		SupervisorNonce: nonce, LeaseDuration: 10 * time.Second,
@@ -72,7 +72,7 @@ func TestPostgresAgentCheckpointFencingAndIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := app.AgentCheckpointFence{TaskID: claimed.ID, OwnerID: owner.ID, AgentInstanceID: started.Fence.AgentInstanceID,
+	fence := app.AgentCheckpointFence{TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: started.Fence.InitiatorID, AgentInstanceID: started.Fence.AgentInstanceID,
 		AgentGeneration: started.Fence.AgentGeneration, AgentSessionID: started.Fence.AgentSessionID,
 		AuthorizationVersion: started.Fence.AuthorizationVersion, LeaseOwner: started.Fence.LeaseOwner,
 		LeaseVersion: started.Fence.LeaseVersion, EngineVersion: started.Fence.EngineVersion, ProfileVersion: started.Fence.ProfileVersion}
@@ -177,7 +177,7 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 		nonce := make([]byte, 32)
 		nonce[0] = nonceByte
 		lease, replayed, err := instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
-			TaskID: current.ID, OwnerID: owner.ID, AgentInstanceID: instanceID, AgentSessionID: "session-page-1",
+			TaskID: current.ID, OwnerID: owner.ID, InitiatorID: owner.ID, AgentInstanceID: instanceID, AgentSessionID: "session-page-1",
 			SupervisorID: "supervisor-1", LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 			AuthorizationVersion: 1, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1",
 		}, SupervisorNonce: nonce, LeaseDuration: 10 * time.Second})
@@ -196,7 +196,7 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 		t.Fatal(err)
 	}
 	checkpointFence := func(lease app.AgentInstanceLease) app.AgentCheckpointFence {
-		return app.AgentCheckpointFence{TaskID: lease.Fence.TaskID, OwnerID: lease.Fence.OwnerID,
+		return app.AgentCheckpointFence{TaskID: lease.Fence.TaskID, OwnerID: lease.Fence.OwnerID, InitiatorID: lease.Fence.InitiatorID,
 			AgentInstanceID: lease.Fence.AgentInstanceID, AgentGeneration: lease.Fence.AgentGeneration,
 			AgentSessionID: lease.Fence.AgentSessionID, AuthorizationVersion: lease.Fence.AuthorizationVersion,
 			LeaseOwner: lease.Fence.LeaseOwner, LeaseVersion: lease.Fence.LeaseVersion,

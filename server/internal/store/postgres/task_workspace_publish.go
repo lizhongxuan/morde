@@ -51,6 +51,9 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			Scan(&workspaceOwner, &workspaceState); err != nil {
 			return storeError("lock Workspace for Task publish reservation", "workspace", err)
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
 		if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
@@ -208,13 +211,17 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock
 	return receipt, nil
 }
 
-func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, manifestSHA string) (app.TaskWorkspacePublishReceipt, error) {
+func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string,
+	directories []workspace.Directory, manifestSHA string) (app.TaskWorkspacePublishReceipt, error) {
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return app.TaskWorkspacePublishReceipt{}, err
 	}
-	actualManifestSHA, err := workspace.ManifestTreeSHA256(files, emptyDirectories)
+	actualManifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
 	if err != nil || actualManifestSHA != manifestSHA {
 		return app.TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest digest changed")
+	}
+	if _, _, err := validateWorkspaceCopySnapshot(files, emptyDirectories, directories, true); err != nil {
+		return app.TaskWorkspacePublishReceipt{}, err
 	}
 	var receipt app.TaskWorkspacePublishReceipt
 	var rejected error
@@ -285,6 +292,9 @@ FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).Scan(&hostOwner, &hostState, &h
 			Scan(&workspaceOwner, &workspaceState, &currentRevision, &currentBytes, &quotaBytes); err != nil {
 			return storeError("lock Workspace for Task publish", "workspace", err)
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
 		if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
@@ -317,18 +327,19 @@ FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, value.
 			return markTaskWorkspacePublishRejected(ctx, tx, value, &receipt, &rejected,
 				domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed before Task publish"), app.TaskWorkspacePublishConflict)
 		}
-		mutations, directoryMutations, err := taskWorkspacePublishMutations(ctx, tx, value.WorkspaceID, currentRevision, files, emptyDirectories)
+		mutations, directoryMutations, directoryMetadataMutations, err := taskWorkspacePublishMutations(ctx, tx, value.WorkspaceID, currentRevision, files, emptyDirectories, directories)
 		if err != nil {
 			return err
 		}
 		if err := ensureWorkspaceMutationsBlockUsageStored(ctx, tx, value.WorkspaceID, mutations); err != nil {
 			return err
 		}
-		if len(mutations)+len(directoryMutations) > 0 {
+		if len(mutations)+len(directoryMutations)+len(directoryMetadataMutations) > 0 {
 			if _, err := tx.Exec(ctx, `SAVEPOINT task_workspace_publish_apply`); err != nil {
 				return fmt.Errorf("start Task Workspace publish savepoint: %w", err)
 			}
-			if err := applyWorkspaceSyncTreeMutations(ctx, tx, value.WorkspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, mutations, directoryMutations); err != nil {
+			if err := applyWorkspaceSyncTreeMutations(ctx, tx, value.WorkspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes,
+				mutations, directoryMutations, directories, directoryMetadataMutations); err != nil {
 				if domain.CodeOf(err) != domain.CodeQuotaExceeded {
 					return err
 				}
@@ -339,7 +350,7 @@ FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, value.
 			}
 		}
 		publishedRevision := currentRevision
-		if len(mutations)+len(directoryMutations) > 0 {
+		if len(mutations)+len(directoryMutations)+len(directoryMetadataMutations) > 0 {
 			publishedRevision++
 		}
 		if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, value.WorkspaceID, publishedRevision); err != nil {
@@ -398,6 +409,9 @@ func (s *Store) ReserveTaskWorkspaceBlockUsage(ctx context.Context, workspaceID 
 		if err := tx.QueryRow(ctx, `SELECT owner_id, state FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&ownerID, &state); err != nil {
 			return storeError("lock Workspace before reserving Task output blocks", "workspace", err)
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		if state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
@@ -408,33 +422,38 @@ func (s *Store) ReserveTaskWorkspaceBlockUsage(ctx context.Context, workspaceID 
 	})
 }
 
-func taskWorkspacePublishMutations(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string) ([]syncMutation, []syncDirectoryMutation, error) {
-	rows, err := tx.Query(ctx, `SELECT file_path, size_bytes, sha256, mode, chunks FROM workspace_revision_files
+func taskWorkspacePublishMutations(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string,
+	directories []workspace.Directory) ([]syncMutation, []syncDirectoryMutation, []syncDirectoryMetadataMutation, error) {
+	rows, err := tx.Query(ctx, `SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
 ORDER BY file_path`, workspaceID, revision)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read current Workspace files for Task publish: %w", err)
+		return nil, nil, nil, fmt.Errorf("read current Workspace files for Task publish: %w", err)
 	}
 	currentFiles := make([]workspace.File, 0)
 	for rows.Next() {
-		var filePath, digest string
+		var filePath, digest, kind string
 		var size int64
 		var mode int32
-		var chunks []byte
-		if err := rows.Scan(&filePath, &size, &digest, &mode, &chunks); err != nil {
+		var symlinkTarget pgtype.Text
+		var modTimeNS pgtype.Int8
+		var hardlinkTo pgtype.Text
+		var chunks, xattrs, acl []byte
+		var metadataKnown bool
+		if err := rows.Scan(&filePath, &size, &digest, &mode, &kind, &symlinkTarget, &modTimeNS, &hardlinkTo, &chunks, &xattrs, &acl, &metadataKnown); err != nil {
 			rows.Close()
-			return nil, nil, fmt.Errorf("scan current Workspace file for Task publish: %w", err)
+			return nil, nil, nil, fmt.Errorf("scan current Workspace file for Task publish: %w", err)
 		}
-		file, err := workspaceFileFromRow(filePath, size, digest, mode, chunks)
+		file, err := workspaceFileFromRow(filePath, size, digest, mode, kind, symlinkTarget, modTimeNS, hardlinkTo, chunks, xattrs, acl, metadataKnown)
 		if err != nil {
 			rows.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		currentFiles = append(currentFiles, file)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, nil, fmt.Errorf("iterate current Workspace files for Task publish: %w", err)
+		return nil, nil, nil, fmt.Errorf("iterate current Workspace files for Task publish: %w", err)
 	}
 	rows.Close()
 	currentByPath := fileMapByFoldedPath(currentFiles)
@@ -461,20 +480,20 @@ ORDER BY file_path`, workspaceID, revision)
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
 ORDER BY directory_path`, workspaceID, revision)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read current Workspace directories for Task publish: %w", err)
+		return nil, nil, nil, fmt.Errorf("read current Workspace directories for Task publish: %w", err)
 	}
 	currentDirectories := make([]string, 0)
 	for directoryRows.Next() {
 		var directory string
 		if err := directoryRows.Scan(&directory); err != nil {
 			directoryRows.Close()
-			return nil, nil, fmt.Errorf("scan current Workspace directory for Task publish: %w", err)
+			return nil, nil, nil, fmt.Errorf("scan current Workspace directory for Task publish: %w", err)
 		}
 		currentDirectories = append(currentDirectories, directory)
 	}
 	if err := directoryRows.Err(); err != nil {
 		directoryRows.Close()
-		return nil, nil, fmt.Errorf("iterate current Workspace directories for Task publish: %w", err)
+		return nil, nil, nil, fmt.Errorf("iterate current Workspace directories for Task publish: %w", err)
 	}
 	directoryRows.Close()
 	currentDirectoriesByPath := make(map[string]string, len(currentDirectories))
@@ -501,5 +520,39 @@ ORDER BY directory_path`, workspaceID, revision)
 			directoryMutations = append(directoryMutations, syncDirectoryMutation{path: output})
 		}
 	}
-	return mutations, directoryMutations, nil
+	currentItems := make([]workspaceManifestItem, 0, len(currentFiles)+len(currentDirectories))
+	for index := range currentFiles {
+		file := currentFiles[index]
+		currentItems = append(currentItems, workspaceManifestItem{path: file.Path, file: &file})
+	}
+	for _, path := range currentDirectories {
+		currentItems = append(currentItems, workspaceManifestItem{path: path})
+	}
+	currentDirectoryPaths := workspaceDirectoryAncestors(currentItems)
+	currentDirectoryPaths = append(currentDirectoryPaths, ".")
+	currentDirectoryMetadata, err := loadWorkspaceRevisionDirectories(ctx, tx, workspaceID, revision, uniqueWorkspacePaths(currentDirectoryPaths))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	currentMetadataByPath := workspaceDirectoryMapByFoldedPath(currentDirectoryMetadata)
+	outputMetadataByPath := workspaceDirectoryMapByFoldedPath(directories)
+	metadataMutations := make([]syncDirectoryMetadataMutation, 0, len(currentMetadataByPath)+len(outputMetadataByPath))
+	for key, current := range currentMetadataByPath {
+		output, exists := outputMetadataByPath[key]
+		if !exists {
+			metadataMutations = append(metadataMutations, syncDirectoryMetadataMutation{path: current.Path, delete: true})
+			continue
+		}
+		if !workspace.SameDirectoryMetadata(current, output) {
+			copy := output
+			metadataMutations = append(metadataMutations, syncDirectoryMetadataMutation{path: output.Path, directory: &copy})
+		}
+	}
+	for key, output := range outputMetadataByPath {
+		if _, exists := currentMetadataByPath[key]; !exists {
+			copy := output
+			metadataMutations = append(metadataMutations, syncDirectoryMetadataMutation{path: output.Path, directory: &copy})
+		}
+	}
+	return mutations, directoryMutations, metadataMutations, nil
 }

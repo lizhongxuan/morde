@@ -62,13 +62,7 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID)
-	if _, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
 
 	hostRoot := t.TempDir()
 	workspaceDirectory := filepath.Join(hostRoot, workspaceValue.ID)
@@ -79,8 +73,8 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	approvalDesktop := &f01ApprovalDesktopHandler{}
-	runtimeHandlers := append(taskWorkspace.Handlers(), approvalDesktop)
+	approvalCommand := &f01ApprovalWorkspaceCommandHandler{}
+	runtimeHandlers := append(taskWorkspace.Handlers(), approvalCommand)
 	defer func() {
 		if err := taskWorkspace.Close(); err != nil {
 			t.Errorf("close Host Task Workspace views: %v", err)
@@ -167,7 +161,10 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolBroker, err := app.NewCloudDSHToolBroker(store, runtimeTools, nil, nil)
+	completionSyncReceipts := make(chan int64, 4)
+	toolBroker, err := app.NewCloudDSHToolBroker(&f01WorkspaceSyncCompletionGateTaskStore{
+		TaskStore: store, appliedRevisions: completionSyncReceipts, requiredRevision: 1,
+	}, runtimeTools, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +265,7 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	postCtx, cancelPost := context.WithCancel(ctx)
 	postBody, err := json.Marshal(map[string]any{
 		"host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(0),
-		"model_id": "p1234567", "objective": "Click the test desktop target, then write a short note in the attached Workspace.",
+		"model_id": "p1234567", "objective": "Run an approved bounded Workspace command, then write a short note in the attached Workspace.",
 		"budget": map[string]int64{"active_seconds": 120, "tool_calls": 5, "model_tokens": 1000},
 	})
 	if err != nil {
@@ -354,6 +351,10 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 				case liveReceipts <- result.Session.TargetRevision:
 				default:
 				}
+				select {
+				case completionSyncReceipts <- result.Session.TargetRevision:
+				default:
+				}
 			},
 		})
 	}()
@@ -408,11 +409,23 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		approvalID = current.PendingRequest.ID
 		approvalVersion = current.PendingRequest.Version
 		return true, nil
-	}, nil, nil); err != nil {
-		t.Fatalf("sensitive Host action did not wait for approval: %v", err)
+	}, executionErrors, nil); err != nil {
+		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelDiagnostic()
+		current, taskErr := store.GetTask(diagnosticCtx, accepted.ID, owner.ID)
+		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
+		var executionErr error
+		select {
+		case executionErr = <-executionErrors:
+		default:
+		}
+		t.Fatalf("sensitive Host action did not wait for approval: wait_error=%v execution_error=%v task_status=%s waiting_reason=%s host=%s workspace=%s input_revision=%v checkpoint_revision=%v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s task_error=%v binding_error=%v",
+			err, executionErr, current.Task.Status, current.Task.WaitingReason, current.Task.HostID, current.Task.WorkspaceID,
+			current.Task.InputRevision, current.Task.WorkspaceCheckpointRevision, model.callCount(), binding.State, binding.BindingVersion,
+			binding.DesiredRevision, binding.AppliedRevision, binding.SyncState, taskErr, bindingErr)
 	}
-	if approvalDesktop.calls.Load() != 0 {
-		t.Fatalf("Host desktop action ran before approval: calls=%d", approvalDesktop.calls.Load())
+	if approvalCommand.calls.Load() != 0 {
+		t.Fatalf("Host Workspace command ran before approval: calls=%d", approvalCommand.calls.Load())
 	}
 	secondClientCredential := createF01Session(t, ctx, store, owner.ID)
 	getTask, err := http.NewRequest(http.MethodGet, portal.URL+"/api/tasks/"+accepted.ID, nil)
@@ -493,14 +506,24 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil || details.Task.Status != task.StatusRunning && details.Task.Status != task.StatusCompleted {
 		t.Fatalf("task after client stream disconnect = %s, %v; want running or completed", details.Task.Status, err)
 	}
-	if approvalDesktop.calls.Load() != 1 {
-		t.Fatalf("approved Host desktop operation ran %d times, want exactly once", approvalDesktop.calls.Load())
+	if approvalCommand.calls.Load() != 1 {
+		t.Fatalf("approved Host Workspace command ran %d times, want exactly once", approvalCommand.calls.Load())
 	}
 	if err := waitF01(t, ctx, func() (bool, error) {
 		current, err := store.GetTask(ctx, accepted.ID, owner.ID)
 		return err == nil && current.Task.Status == task.StatusCompleted, err
 	}, executionErrors, nil); err != nil {
-		t.Fatalf("Cloud Task did not complete after publishing its private view: %v", err)
+		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelDiagnostic()
+		current, taskErr := store.GetTask(diagnosticCtx, accepted.ID, owner.ID)
+		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
+		approvalOperation, approvalOperationErr := store.GetOperation(diagnosticCtx, owner.ID, accepted.ID, f01OperationKey("f01-workspace-command-001"))
+		writeOperation, writeOperationErr := store.GetOperation(diagnosticCtx, owner.ID, accepted.ID, f01OperationKey("f01-write-note-001"))
+		t.Fatalf("Cloud Task did not complete after publishing its private view: wait_error=%v status=%s waiting_reason=%s pending_request=%#v checkpoint_revision=%v checkpoint_sequence=%d agent_session=%s agent_generation=%d steps=%#v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s approval_operation=%#v approval_operation_error=%v write_operation=%#v write_operation_error=%v task_error=%v binding_error=%v",
+			err, current.Task.Status, current.Task.WaitingReason, current.PendingRequest, current.Task.WorkspaceCheckpointRevision,
+			current.Task.CheckpointThroughSequence, current.Task.AgentSessionID, current.Task.AgentGeneration, current.Steps, model.callCount(),
+			binding.State, binding.BindingVersion, binding.DesiredRevision, binding.AppliedRevision, binding.SyncState,
+			approvalOperation, approvalOperationErr, writeOperation, writeOperationErr, taskErr, bindingErr)
 	}
 
 	if err := waitF01(t, ctx, func() (bool, error) {
@@ -516,12 +539,12 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	approvalOperation, approvalOperationErr := store.GetOperation(ctx, owner.ID, accepted.ID, f01OperationKey("f01-desktop-click-001"))
+	approvalOperation, approvalOperationErr := store.GetOperation(ctx, owner.ID, accepted.ID, f01OperationKey("f01-workspace-command-001"))
 	if details.PendingRequest == nil || details.PendingRequest.Status != task.PendingRequestApproved ||
 		details.PendingRequest.Decision != task.PendingDecisionApprove || approvalOperationErr != nil ||
-		approvalOperation.Status != task.OperationSucceeded || approvalDesktop.calls.Load() != 1 || model.callCount() != 3 {
+		approvalOperation.Status != task.OperationSucceeded || approvalCommand.calls.Load() != 1 || model.callCount() != 3 {
 		t.Fatalf("approval recovery = pending=%#v operation=%#v operation_error=%v Host_calls=%d model_calls=%d",
-			details.PendingRequest, approvalOperation, approvalOperationErr, approvalDesktop.calls.Load(), model.callCount())
+			details.PendingRequest, approvalOperation, approvalOperationErr, approvalCommand.calls.Load(), model.callCount())
 	}
 	digest := sha256.Sum256([]byte(model.content))
 	wantDigest := hex.EncodeToString(digest[:])
@@ -620,11 +643,19 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 	if backgroundResponse.StatusCode != http.StatusAccepted || backgroundAccepted.ID == "" || backgroundAccepted.Status != string(task.StatusQueued) {
 		t.Fatalf("background POST /api/tasks acceptance = status %d, response %#v", backgroundResponse.StatusCode, backgroundAccepted)
 	}
-	if err := waitF01(t, ctx, func() (bool, error) {
+	childWaitCtx, cancelChildWait := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelChildWait()
+	if err := waitF01(t, childWaitCtx, func() (bool, error) {
 		current, err := store.GetTask(ctx, backgroundAccepted.ID, owner.ID)
 		return err == nil && current.Task.Status == task.StatusCompleted, err
 	}, executionErrors, nil); err != nil {
-		t.Fatalf("background child Task did not finish with its private-view output: %v", err)
+		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelDiagnostic()
+		current, taskErr := store.GetTask(diagnosticCtx, backgroundAccepted.ID, owner.ID)
+		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
+		t.Fatalf("background Task did not finish: wait=%v status=%s reason=%s steps=%#v model_calls=%d workspace_revision=%d desired_revision=%d applied_revision=%d sync_state=%s task_error=%v binding_error=%v",
+			err, current.Task.Status, current.Task.WaitingReason, current.Steps, model.callCount(), binding.Workspace.Revision,
+			binding.DesiredRevision, binding.AppliedRevision, binding.SyncState, taskErr, bindingErr)
 	}
 	if err := waitF01(t, ctx, func() (bool, error) {
 		binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
@@ -677,6 +708,37 @@ WHERE task_id=$1 AND owner_id=$2 AND parent_session_id IS NOT NULL AND is_backgr
 func f01OperationKey(callID string) string {
 	digest := sha256.Sum256([]byte(callID))
 	return "agent:" + hex.EncodeToString(digest[:])
+}
+
+// f01WorkspaceSyncCompletionGateTaskStore keeps this test's final commit
+// behind the real Host applied-revision receipt, so the completion path does
+// not race into a later DSH recovery with an already-advanced Workspace view.
+type f01WorkspaceSyncCompletionGateTaskStore struct {
+	app.TaskStore
+	appliedRevisions <-chan int64
+	requiredRevision int64
+}
+
+func (s *f01WorkspaceSyncCompletionGateTaskStore) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
+	if progress.Status == task.StatusCompleted && len(progress.Artifacts) > 0 {
+		requiredRevision := s.requiredRevision
+		for _, artifact := range progress.Artifacts {
+			if artifact.Revision > requiredRevision {
+				requiredRevision = artifact.Revision
+			}
+		}
+		for {
+			select {
+			case revision := <-s.appliedRevisions:
+				if revision >= requiredRevision {
+					return s.TaskStore.CommitTaskProgress(ctx, progress)
+				}
+			case <-ctx.Done():
+				return task.Event{}, ctx.Err()
+			}
+		}
+	}
+	return s.TaskStore.CommitTaskProgress(ctx, progress)
 }
 
 type f01CloudTaskModel struct {
@@ -914,11 +976,18 @@ func (m *f01CloudTaskModel) Complete(ctx context.Context, call app.ModelCall) (a
 	usage := app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 2}
 	if callNumber == 1 {
 		if m.approvalFirst {
+			approvalCall := app.ModelToolCall{
+				CallID: "f01-desktop-click-001", Name: "desktop_click",
+				Arguments: `{"window_id":"0x1","x":1,"y":2,"button":"left"}`,
+			}
+			if m.workspaceID != "" {
+				approvalCall = app.ModelToolCall{
+					CallID: "f01-workspace-command-001", Name: "shell_exec",
+					Arguments: fmt.Sprintf(`{"workspace_id":%q,"command":"printf approved"}`, m.workspaceID),
+				}
+			}
 			return app.ModelResponse{
-				ToolCalls: []app.ModelToolCall{{
-					CallID: "f01-desktop-click-001", Name: "desktop_click",
-					Arguments: `{"window_id":"0x1","x":1,"y":2,"button":"left"}`,
-				}}, StopReason: "tool_calls", Usage: usage,
+				ToolCalls: []app.ModelToolCall{approvalCall}, StopReason: "tool_calls", Usage: usage,
 			}, nil
 		}
 		return app.ModelResponse{
@@ -1068,6 +1137,23 @@ func f01ToolResult(raw json.RawMessage, callID string) (string, bool) {
 	return "", false
 }
 
+type f01ApprovalWorkspaceCommandHandler struct{ calls atomic.Int32 }
+
+func (*f01ApprovalWorkspaceCommandHandler) Capability() string { return "shell.exec" }
+func (*f01ApprovalWorkspaceCommandHandler) Action() string     { return "run" }
+func (h *f01ApprovalWorkspaceCommandHandler) Execute(ctx context.Context, _ contract.ExecuteRequest) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	h.calls.Add(1)
+	return json.RawMessage(`{"exit_code":0,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`), nil
+}
+func (*f01ApprovalWorkspaceCommandHandler) Stop(context.Context, contract.Operation) (runtimecore.StopResult, error) {
+	return runtimecore.StopResult{VerifiedStopped: true}, nil
+}
+
+// f01ApprovalDesktopHandler is shared with the Host control-fence test, whose
+// hostless Task intentionally exercises a desktop approval decision.
 type f01ApprovalDesktopHandler struct{ calls atomic.Int32 }
 
 func (*f01ApprovalDesktopHandler) Capability() string { return "desktop.input" }
@@ -1224,7 +1310,7 @@ func createF01Workspace(t *testing.T, ctx context.Context, store *storepostgres.
 	return value
 }
 
-func createF01Host(t *testing.T, ctx context.Context, store *storepostgres.Store, sealer *app.Sealer, ownerID string) (host.Host, string, string) {
+func createF01Host(t *testing.T, ctx context.Context, store *storepostgres.Store, sealer *app.Sealer, ownerID, workspaceID string) (host.Host, string, string) {
 	t.Helper()
 	hostID, err := domain.NewHostID()
 	if err != nil {
@@ -1246,7 +1332,7 @@ func createF01Host(t *testing.T, ctx context.Context, store *storepostgres.Store
 			RuntimeProfile: "f01-local", State: host.StateCreating, CPUMilli: 1000, MemMiB: 2048,
 			CPULimitMilli: 2000, MemLimitMiB: 4096, AIOKeyEnc: []byte("test-only-encrypted-aio-key"),
 			RuntimeCredentialEnc: sealedCredential, RuntimeGeneration: 1,
-		}, Capacity: app.Capacity{CPUMilli: 100_000, MemMiB: 200_000},
+		}, WorkspaceIDs: []string{workspaceID}, Capacity: app.Capacity{CPUMilli: 100_000, MemMiB: 200_000},
 	})
 	if err != nil {
 		t.Fatalf("create Host fixture: %v", err)
@@ -1383,7 +1469,7 @@ func waitF01(t *testing.T, ctx context.Context, check func() (bool, error), erro
 		}
 		select {
 		case err := <-errors:
-			return fmt.Errorf("Host replica live-sync receipt: %w", err)
+			return fmt.Errorf("asynchronous E2E error: %w", err)
 		case <-receipts:
 		case <-ticker.C:
 		case <-ctx.Done():

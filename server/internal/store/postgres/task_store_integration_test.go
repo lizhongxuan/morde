@@ -18,6 +18,7 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 
@@ -132,6 +133,111 @@ func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
 	}
 }
 
+func TestProjectTaskUsesInitiatorResourcesAndRechecksMembership(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	projectOwner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
+	conversationOwner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
+	initiator := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
+	projectValue := createProjectStoreFixture(t, ctx, store, projectOwner.ID, "Shared work", "Task actor boundary", "project-task-actor-create")
+	if _, err := inviteAndAcceptProjectStoreMember(t, ctx, store, projectOwner.ID, conversationOwner.ID, projectValue,
+		project.RoleMember, projectValue.Version, "project-conv-owner-invite", "project-conv-owner-accept"); err != nil {
+		t.Fatalf("add conversation creator to project: %v", err)
+	}
+	currentProject, err := store.GetProject(ctx, projectOwner.ID, projectValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inviteAndAcceptProjectStoreMember(t, ctx, store, projectOwner.ID, initiator.ID, projectValue,
+		project.RoleMember, currentProject.Version, "project-task-actor-invite", "project-task-actor-accept"); err != nil {
+		t.Fatalf("add task initiator to project: %v", err)
+	}
+	conversationID := mustID(t, domain.NewConversationID)
+	sharedConversation, replayed, err := store.CreateProjectConversation(ctx, conversationOwner.ID, conversation.Conversation{
+		ID: conversationID, OwnerID: conversationOwner.ID, ProjectID: projectValue.ID, Title: "Member shared task",
+	}, testIdempotency(conversationOwner.ID, "project_conversation.create", "project-conversation-create-01"))
+	if err != nil || replayed || sharedConversation.OwnerID != conversationOwner.ID || sharedConversation.ProjectID != projectValue.ID {
+		t.Fatalf("create shared conversation = %#v replay=%t err=%v", sharedConversation, replayed, err)
+	}
+	initiatorHost := createRunningControlHost(t, ctx, store, initiator.ID, host.ControlAI, 0)
+	submission := newTestTaskSubmission(t, conversationOwner.ID, initiatorHost.ID, "project-task-message-01", "member task")
+	submission.Task.ProjectID = projectValue.ID
+	submission.Task.InitiatorID = initiator.ID
+	submission.Task.ConversationID = sharedConversation.ID
+	submission.Task.ExecutionLocation = "server"
+	submission.Task.Authorization.TokenID = testSessionTokenID(initiator.ID)
+	submission.Message.ConversationID = sharedConversation.ID
+	submission.Message.ActorID = initiator.ID
+	submission.Idempotency = testIdempotency(initiator.ID, "conversation.append_message", "project-task-message-01")
+	created, err := store.AppendMessage(ctx, submission)
+	if err != nil {
+		t.Fatalf("append project task message as member: %v", err)
+	}
+	if created.Task.OwnerID != conversationOwner.ID || created.Task.InitiatorID != initiator.ID || created.Task.ProjectID != projectValue.ID ||
+		created.Task.HostID != initiatorHost.ID || created.Message.OwnerID != conversationOwner.ID || created.Message.ActorID != initiator.ID {
+		t.Fatalf("project task/message identities = task %#v message %#v", created.Task, created.Message)
+	}
+
+	claimed, found, err := store.ClaimNextTask(ctx, "project-task-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID || claimed.OwnerID != conversationOwner.ID || claimed.InitiatorID != initiator.ID ||
+		claimed.HostID != initiatorHost.ID {
+		t.Fatalf("claim project task = %#v found=%t err=%v", claimed, found, err)
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, conversationOwner.ID)
+	if err != nil || details.Task.OwnerID != conversationOwner.ID || details.Task.InitiatorID != initiator.ID {
+		t.Fatalf("conversation creator read project task = %#v err=%v", details.Task, err)
+	}
+	page, err := store.ListProjectConversationMessages(ctx, initiator.ID, projectValue.ID, sharedConversation.ID, app.PageRequest{Limit: 20})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ActorID != initiator.ID || page.Items[0].OwnerID != conversationOwner.ID {
+		t.Fatalf("initiator shared message read = %#v err=%v", page, err)
+	}
+	secondConversationID := mustID(t, domain.NewConversationID)
+	secondConversation, _, err := store.CreateProjectConversation(ctx, conversationOwner.ID, conversation.Conversation{
+		ID: secondConversationID, OwnerID: conversationOwner.ID, ProjectID: projectValue.ID, Title: "Revocation claim fence",
+	}, testIdempotency(conversationOwner.ID, "project_conversation.create", "project-conversation-create-02"))
+	if err != nil {
+		t.Fatalf("create second shared conversation: %v", err)
+	}
+	queuedAfterRevocation := submission
+	queuedAfterRevocation.Task.ID = mustID(t, domain.NewTaskID)
+	queuedAfterRevocation.Task.ConversationID = secondConversation.ID
+	queuedAfterRevocation.Task.Objective = "queued project task for membership revocation"
+	queuedAfterRevocation.Message.ID = mustID(t, domain.NewMessageID)
+	queuedAfterRevocation.Message.ConversationID = secondConversation.ID
+	queuedAfterRevocation.Message.Content = queuedAfterRevocation.Task.Objective
+	queuedAfterRevocation.Idempotency = testIdempotency(initiator.ID, "conversation.append_message", "project-task-message-queued")
+	if _, err := store.AppendMessage(ctx, queuedAfterRevocation); err != nil {
+		t.Fatalf("queue second project task before revocation: %v", err)
+	}
+
+	currentProject, err = store.GetProject(ctx, projectOwner.ID, projectValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveProjectMember(ctx, projectOwner.ID, projectValue.ID, initiator.ID, currentProject.Version, "project-task-actor-remove"); err != nil {
+		t.Fatalf("remove task initiator from project: %v", err)
+	}
+	if claimed, found, err := store.ClaimNextTask(ctx, "project-task-worker-after-revocation", time.Minute); err != nil || found {
+		t.Fatalf("claim after task initiator revocation = %#v found=%t err=%v, want no task", claimed, found, err)
+	}
+	if _, err := store.GetTask(ctx, created.Task.ID, conversationOwner.ID); err != nil {
+		t.Fatalf("remaining project member lost Task history after initiator revocation: %v", err)
+	}
+	if _, err := store.ListProjectConversationMessages(ctx, initiator.ID, projectValue.ID, sharedConversation.ID, app.PageRequest{Limit: 20}); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked initiator conversation read = %v, want not found", err)
+	}
+	if _, err := store.ListProjectConversationMessages(ctx, conversationOwner.ID, projectValue.ID, sharedConversation.ID, app.PageRequest{Limit: 20}); err != nil {
+		t.Fatalf("remaining project member cannot read shared history: %v", err)
+	}
+	appendAfterRevocation := submission
+	appendAfterRevocation.Message.ID = mustID(t, domain.NewMessageID)
+	appendAfterRevocation.Message.Content = "must not be accepted after revocation"
+	appendAfterRevocation.Idempotency = testIdempotency(initiator.ID, "conversation.append_message", "project-task-message-revoked")
+	if _, err := store.AppendMessage(ctx, appendAfterRevocation); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked initiator append = %v, want not found", err)
+	}
+}
+
 func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -204,7 +310,7 @@ func TestPostgresTaskSubmissionFencesWorkspaceRevisionAndHostBinding(t *testing.
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-input")
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
 		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
@@ -269,12 +375,167 @@ func TestPostgresTaskSubmissionFencesWorkspaceRevisionAndHostBinding(t *testing.
 	}
 }
 
+func TestPostgresWorkspaceTransferFreezeBlocksWorkspaceTasksButAllowsCloudTasks(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	target := createTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-transfer-freeze")
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision); err != nil {
+		t.Fatalf("activate Workspace binding: %v", err)
+	}
+	revision := workspaceValue.Revision
+	workspaceTask := newTestTaskSubmission(t, owner.ID, hostValue.ID, "transfer-freeze-existing", "read the Workspace")
+	workspaceTask.Task.WorkspaceID = workspaceValue.ID
+	workspaceTask.Task.InputRevision = &revision
+	workspaceTask.Task.ContextDigest = hashBytes("transfer freeze Workspace input")
+	created, err := store.SubmitTask(ctx, workspaceTask)
+	if err != nil {
+		t.Fatalf("create Workspace Task before transfer: %v", err)
+	}
+	transferID := mustID(t, workspace.NewOwnershipTransferID)
+	if _, err := pool.Exec(ctx, `INSERT INTO workspace_ownership_transfers
+(id, workspace_id, from_owner_id, to_owner_id, state, expected_revision)
+VALUES ($1,$2,$3,$4,'pending',$5)`, transferID, workspaceValue.ID, owner.ID, target.ID, workspaceValue.Revision); err != nil {
+		t.Fatalf("start pending Workspace transfer: %v", err)
+	}
+
+	newWorkspaceTask := newTestTaskSubmission(t, owner.ID, hostValue.ID, "transfer-freeze-new", "start more Workspace work")
+	newWorkspaceTask.Task.WorkspaceID = workspaceValue.ID
+	newWorkspaceTask.Task.InputRevision = &revision
+	newWorkspaceTask.Task.ContextDigest = hashBytes("transfer freeze Workspace input")
+	if _, err := store.SubmitTask(ctx, newWorkspaceTask); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("new Workspace Task during transfer error = %v, want workspace busy", err)
+	}
+
+	appendTask := app.TaskSubmission{
+		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID,
+			WorkspaceID: workspaceValue.ID, InputRevision: &revision, ContextDigest: created.Task.ContextDigest, ModelID: created.Task.ModelID},
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
+			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue Workspace work"},
+		Idempotency: testIdempotency(owner.ID, "conversation.append_message", "transfer-freeze-append"),
+	}
+	if _, err := store.AppendMessage(ctx, appendTask); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("continue Workspace Task during transfer error = %v, want workspace busy", err)
+	}
+	var taskCount, messageCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE workspace_id=$1`, workspaceValue.ID).Scan(&taskCount); err != nil || taskCount != 1 {
+		t.Fatalf("Workspace Task count after freeze rejections = %d, err=%v", taskCount, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1`, created.Task.ID).Scan(&messageCount); err != nil || messageCount != 1 {
+		t.Fatalf("Workspace Task message count after freeze rejection = %d, err=%v", messageCount, err)
+	}
+
+	cloudSubmission := newTestTaskSubmission(t, owner.ID, "", "transfer-freeze-cloud-only", "answer without a Workspace")
+	cloudTask, err := store.SubmitTask(ctx, cloudSubmission)
+	if err != nil || cloudTask.Task.WorkspaceID != "" {
+		t.Fatalf("create cloud-only Task during Workspace transfer = %#v, err=%v", cloudTask.Task, err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "transfer-freeze-cloud-worker", time.Minute)
+	if err != nil || !found || claimed.ID != cloudTask.Task.ID {
+		t.Fatalf("claim cloud-only Task while Workspace is frozen = %#v, found=%t, err=%v", claimed, found, err)
+	}
+}
+
+func TestPostgresWorkspaceTransferFreezeBlocksExistingTaskProgressAndOperations(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	target := createTestUser(t, store, 8, 20_000, 40_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-transfer-freeze-running")
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, workspaceValue.Revision); err != nil {
+		t.Fatal(err)
+	}
+	revision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "transfer-freeze-running-task", "read the Workspace")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("transfer freeze running Workspace input")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Workspace Task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "transfer-freeze-running-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Workspace Task = %#v, found=%t, err=%v", claimed, found, err)
+	}
+	const runtimeInstanceID = "ri_transfer"
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2 WHERE id=$1`, hostValue.ID, runtimeInstanceID); err != nil {
+		t.Fatal(err)
+	}
+	transferID := mustID(t, workspace.NewOwnershipTransferID)
+	// Simulate a recovered persisted freeze with an older in-flight Task.
+	if _, err := pool.Exec(ctx, `INSERT INTO workspace_ownership_transfers
+(id, workspace_id, from_owner_id, to_owner_id, state, expected_revision)
+VALUES ($1,$2,$3,$4,'pending',$5)`, transferID, workspaceValue.ID, owner.ID, target.ID, workspaceValue.Revision); err != nil {
+		t.Fatalf("insert pending Workspace transfer freeze: %v", err)
+	}
+	before, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || before.Task.Status != task.StatusRunning || before.Task.Lease.ExpiresAt == nil {
+		t.Fatalf("running Workspace Task before blocked writes = %#v, err=%v", before.Task, err)
+	}
+	if _, err := store.RenewTaskLease(ctx, created.Task.ID, claimed.Lease.Owner, claimed.Lease.Version, time.Minute); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("renew running Workspace Task during transfer = %v, want workspace busy", err)
+	}
+	if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
+		TaskID: created.Task.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		MessageID: mustID(t, domain.NewMessageID), TurnID: mustID(t, domain.NewStepID), Delta: "must remain uncommitted",
+	}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("append assistant delta during transfer = %v, want workspace busy", err)
+	}
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusRunning, Event: task.Event{Type: "task.step", Payload: []byte(`{}`)},
+	}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("commit Task progress during transfer = %v, want workspace busy", err)
+	}
+	operationID := mustID(t, domain.NewOperationID)
+	if _, _, err := store.CreateOperation(ctx, task.Operation{
+		ID: operationID, TaskID: created.Task.ID, Key: "host.write", RequestHash: hashBytes("host write"),
+		HostID: hostValue.ID, WorkspaceID: workspaceValue.ID, BindingVersion: binding.BindingVersion,
+		InputRevision: &revision, WorkspaceCheckpointRevision: &revision, RuntimeGeneration: hostValue.RuntimeGeneration,
+		RuntimeInstanceID: runtimeInstanceID, ControlVersion: hostValue.ControlVersion,
+		LeaseVersion: claimed.Lease.Version, RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared,
+	}, claimed.Lease.Owner); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("create Host operation during transfer = %v, want workspace busy", err)
+	}
+	if _, err := store.GetOperation(ctx, owner.ID, created.Task.ID, "host.write"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("Host operation persisted during transfer = %v, want not found", err)
+	}
+	after, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || after.Task.Status != before.Task.Status || after.Task.EventSequence != before.Task.EventSequence ||
+		after.Task.Lease.Owner != before.Task.Lease.Owner || after.Task.Lease.Version != before.Task.Lease.Version ||
+		after.Task.Lease.ExpiresAt == nil || !after.Task.Lease.ExpiresAt.Equal(*before.Task.Lease.ExpiresAt) {
+		t.Fatalf("Task changed after transfer freeze rejected writes: before=%#v after=%#v err=%v", before.Task, after.Task, err)
+	}
+}
+
 func TestPostgresWorkspaceTaskWaitsForHostAppliedRevisionThenResumes(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "task-waits-for-host-revision")
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	recordHeartbeat := func() {
 		t.Helper()
 		if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
@@ -469,6 +730,22 @@ WHERE host_id=$1`, hostValue.ID, host.RuntimeHeartbeatFreshness.Seconds()+1); er
 	}
 }
 
+func createRunningControlHostForWorkspace(t *testing.T, ctx context.Context, store *Store, ownerID string,
+	workspaceValue workspace.Workspace, controlState host.ControlState, controlVersion int64) (host.Host, workspace.Binding) {
+	t.Helper()
+	hostValue := createTestHost(t, ctx, store, ownerID,
+		app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET state='running', control_state=$2, control_version=$3 WHERE id=$1`,
+		hostValue.ID, string(controlState), controlVersion); err != nil {
+		t.Fatalf("prepare running control Host: %v", err)
+	}
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+	if err != nil {
+		t.Fatalf("get Host-created Workspace binding: %v", err)
+	}
+	return hostValue, binding
+}
+
 func TestPostgresWorkspaceSyncCommitSerializesWithTaskSubmission(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -478,15 +755,7 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskSubmission(t *testing.T) {
 	prepare := func(t *testing.T, name, key string) (app.TaskSubmission, workspace.Workspace, workspace.SyncSession) {
 		t.Helper()
 		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, name)
-		hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
-		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-			SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
-		})
-		if err != nil {
-			t.Fatalf("create Workspace binding: %v", err)
-		}
+		hostValue, binding := createRunningControlHostForWorkspace(t, ctx, store, owner.ID, workspaceValue, host.ControlAI, 0)
 		if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
 			t.Fatalf("activate Workspace binding: %v", err)
@@ -524,6 +793,16 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskSubmission(t *testing.T) {
 
 	t.Run("task submission wins then sync commit advances revision", func(t *testing.T) {
 		submission, workspaceValue, session := prepare(t, "task-first", "task-task-first")
+		// Conversation creation locks the owner row; do it before the race so the
+		// synchronization under test is the Workspace row lock.
+		conversationValue, _, err := store.CreateConversation(ctx, conversation.Conversation{
+			ID: mustID(t, domain.NewConversationID), OwnerID: owner.ID, HostID: submission.Task.HostID, ModelID: submission.Task.ModelID,
+		}, testIdempotency(owner.ID, "conversation.create", "task-first-sync-race"))
+		if err != nil {
+			t.Fatalf("prepare Task conversation before sync race: %v", err)
+		}
+		submission.Task.ConversationID = conversationValue.ID
+		submission.Message.ConversationID = conversationValue.ID
 		const advisoryLockKey int64 = 824726194
 		if _, err := pool.Exec(ctx, `CREATE FUNCTION wait_for_task_submission_test_release() RETURNS trigger AS $$
 BEGIN
@@ -616,16 +895,8 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskOperationAdmission(t *test
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "operation-admission")
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+	hostValue, binding := createRunningControlHostForWorkspace(t, ctx, store, owner.ID, workspaceValue, host.ControlAI, 0)
+	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -1274,7 +1545,7 @@ func TestPostgresAssistantTextDeltasAreOrderedLeasedAndFinalizedAtomically(t *te
 	}
 	finalMessage := conversation.Message{
 		ID: messageID, ConversationID: created.Conversation.ID, OwnerID: owner.ID,
-		Role: conversation.RoleAssistant, Content: "Hello world.", TaskID: claimed.ID,
+		ActorID: claimed.InitiatorID, Role: conversation.RoleAssistant, Content: "Hello world.", TaskID: claimed.ID,
 	}
 	progress := app.TaskProgress{
 		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
@@ -1471,7 +1742,7 @@ func TestPostgresAssistantMessageSnapshotSupportsNonStreamingCommit(t *testing.T
 	turnID := mustID(t, domain.NewStepID)
 	message := conversation.Message{
 		ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID, OwnerID: owner.ID,
-		Role: conversation.RoleAssistant, Content: "A complete non-streamed answer.", TaskID: claimed.ID,
+		ActorID: claimed.InitiatorID, Role: conversation.RoleAssistant, Content: "A complete non-streamed answer.", TaskID: claimed.ID,
 	}
 	step := task.Step{ID: turnID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded, Title: "Ask the model", Summary: "Received a complete response."}
 	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
@@ -1962,7 +2233,7 @@ func TestPostgresTaskWritesDuringUserTakeoverAndPreserveReplays(t *testing.T) {
 	}
 
 	transition, err := store.BeginControlTransition(ctx, control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "task-write-fence",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "task-write-fence",
 		Action: control.ActionTakeOver, ExpectedControlVersion: 0,
 	})
 	if err != nil || transition.Phase != control.PhaseBlocking {
@@ -2218,17 +2489,9 @@ func TestPostgresWorkspaceSyncCommitWinsConcurrentTaskOperationAdmission(t *test
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "operation-commit-race")
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+	hostValue, binding := createRunningControlHostForWorkspace(t, ctx, store, owner.ID, workspaceValue, host.ControlAI, 0)
+	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -2340,7 +2603,7 @@ func TestPostgresTaskLeaseFencesOperationAndRecoversUnknown(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "lease-task")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -2681,7 +2944,7 @@ func TestPostgresTaskBatchItemAndValidatedArtifactPersistence(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "durable-primitives", "generate a report")
 	artifactWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "artifact proof")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
@@ -2843,7 +3106,7 @@ func TestPostgresTaskCompletionRejectsArtifactAfterWorkspaceRevisionChanges(t *t
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "batch artifact completion")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -2916,7 +3179,7 @@ func TestPostgresTaskArtifactsMustMatchWorkspaceCheckpoint(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "artifact checkpoint")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -2973,6 +3236,12 @@ func TestPostgresTaskArtifactsMustMatchWorkspaceCheckpoint(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET workspace_checkpoint_revision=1 WHERE id=$1`, created.Task.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET desired_revision=1,applied_revision=1 WHERE host_id=$1 AND workspace_id=$2`, hostValue.ID, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
+		t.Fatal(err)
+	}
 	stale := artifact
 	stale.ID = mustID(t, domain.NewArtifactID)
 	if _, err := store.RecordValidatedArtifact(ctx, owner.ID, stale, claimed.Lease.Owner, claimed.Lease.Version); domain.CodeOf(err) != domain.CodeInvalidState {
@@ -2990,7 +3259,7 @@ func TestPostgresTaskCompletionCommitsOnlyProvedArtifactsAtomically(t *testing.T
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	recordHeartbeat := func() {
 		t.Helper()
 		if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
@@ -3150,7 +3419,7 @@ func TestPostgresTaskCompletionRejectsFailedBatchAttemptArtifacts(t *testing.T) 
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "batch artifact proof")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -3210,6 +3479,9 @@ func TestPostgresTaskCompletionRejectsFailedBatchAttemptArtifacts(t *testing.T) 
 	}, proofs["output/item.txt"])
 	if _, err := store.RecordValidatedArtifact(ctx, owner.ID, artifact, "worker-batch-artifact", claimed.Lease.Version); err != nil {
 		t.Fatalf("persist failed attempt artifact evidence: %v", err)
+	}
+	if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
 		TaskID: created.Task.ID, LeaseOwner: "worker-batch-artifact", LeaseVersion: claimed.Lease.Version,

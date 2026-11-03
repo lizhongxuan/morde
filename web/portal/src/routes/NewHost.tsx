@@ -63,6 +63,7 @@ export function NewHost() {
   const [recoveryPending, setRecoveryPending] = useState(!!restored.pending);
   const [recoveryError, setRecoveryError] = useState(restored.invalid);
   const readyWorkspaces = workspaces.data?.items.filter((workspace) => workspace.state === 'ready') ?? [];
+  const selectedWorkspaceReady = workspaceIds.length === 1 && readyWorkspaces.some((workspace) => workspace.id === workspaceIds[0]);
 
   const create = useMutation({
     mutationFn: async (pending: PendingHostCreate) => {
@@ -101,7 +102,12 @@ export function NewHost() {
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (create.isPending || recoveryError || !user) return;
-    const input = { ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: workspaceMode, workspace_ids: workspaceIds };
+    if (recoveryPending && pendingCreate.current) {
+      create.mutate(pendingCreate.current);
+      return;
+    }
+    if (workspaceMode === 'existing' && !selectedWorkspaceReady) return;
+    const input = { ...(name.trim() ? { name: name.trim() } : {}), workspace_mode: workspaceMode, workspace_ids: workspaceMode === 'existing' ? workspaceIds.slice(0, 1) : [] };
     const fingerprint = JSON.stringify(input);
     if (!pendingCreate.current || pendingCreate.current.fingerprint !== fingerprint) {
       pendingCreate.current = {
@@ -125,6 +131,7 @@ export function NewHost() {
     if (!user) return;
     try {
       localStorage.removeItem(pendingCreateKey(user.id));
+      if ((pendingCreate.current?.input.workspace_ids.length ?? 0) > 1) setWorkspaceIds([]);
       pendingCreate.current = null;
       setRecoveryPending(false);
       setRecoveryError(false);
@@ -141,18 +148,20 @@ export function NewHost() {
     {recoveryError && <div className="notice notice-warning" role="alert">无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></div>}
     <form className="form-card form-stack" onSubmit={submit}>
       {recoveryPending && !create.isPending && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会用相同请求编号核对结果；若已在主机列表确认，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}
+      <p className="notice notice-info">默认工作和下载目录位于 <code>/home/gem/workspace</code>。在应用中手动保存到 Workspace 以外的数据属于容器临时数据；旧电脑数据是否迁移需单独核对。</p>
       <label htmlFor="host-name">主机名称 <span className="muted">（可选）</span></label>
       <input id="host-name" value={name} maxLength={100} disabled={recoveryPending || recoveryError} onChange={(event) => setName(event.target.value)} placeholder="例如：数据分析" />
       <fieldset className="fieldset"><legend>工作目录</legend>
         <label className="radio-row"><input type="radio" name="workspace-mode" value="new" checked={workspaceMode === 'new'} disabled={recoveryPending || recoveryError} onChange={() => setWorkspaceMode('new')} />创建新的独立工作区</label>
         <label className="radio-row"><input type="radio" name="workspace-mode" value="existing" checked={workspaceMode === 'existing'} onChange={() => setWorkspaceMode('existing')} disabled={recoveryPending || recoveryError || workspaces.isPending || workspaces.isError} />绑定已有工作区</label>
-        {workspaceMode === 'existing' && <div className="form-stack"><span>选择要绑定的工作区</span>{readyWorkspaces.map((workspace) => <label className="checkbox-row" key={workspace.id}><input type="checkbox" checked={workspaceIds.includes(workspace.id)} disabled={recoveryPending || recoveryError} onChange={(event) => setWorkspaceIds((current) => event.target.checked ? [...current, workspace.id] : current.filter((id) => id !== workspace.id))} />{workspace.name || workspace.id} · {formatBytes(workspace.used_bytes)} · 版本 {workspace.revision}</label>)}</div>}
+        {workspaceMode === 'existing' && <div className="form-stack"><span>选择一个要绑定的工作区</span>{readyWorkspaces.map((workspace) => <label className="radio-row" key={workspace.id}><input type="radio" name="host-workspace" value={workspace.id} checked={workspaceIds.includes(workspace.id)} disabled={recoveryPending || recoveryError} onChange={() => setWorkspaceIds([workspace.id])} />{workspace.name || workspace.id} · {formatBytes(workspace.used_bytes)} · 版本 {workspace.revision}</label>)}</div>}
         {workspaces.isPending && <p className="muted" role="status">正在加载工作目录…</p>}
         {workspaces.isError && <div className="error-card" role="alert">{errorDetails(workspaces.error).message}<button type="button" className="button button-secondary" onClick={() => void workspaces.refetch()}>重试</button></div>}
         {workspaceMode === 'existing' && !workspaces.isPending && !workspaces.isError && !readyWorkspaces.length && <p className="muted">目前没有可用的工作区。</p>}
+        {workspaceMode === 'existing' && workspaceIds.length === 1 && !selectedWorkspaceReady && <p className="notice notice-warning" role="status">所选工作区当前不可用；请选择一个已就绪的工作区。</p>}
       </fieldset>
       <div className="notice notice-info">新工作区会先独立保存，再绑定到主机；删除主机时工作区内容仍会保留。</div>
-      <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryError || (workspaceMode === 'existing' && !workspaceIds.length)}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建主机'}</button></div>
+      <div className="form-actions"><Link to="/hosts" className="button button-secondary">取消</Link><button className="button button-primary" type="submit" disabled={create.isPending || recoveryError || (!recoveryPending && workspaceMode === 'existing' && !selectedWorkspaceReady)}>{create.isPending ? '提交中…' : recoveryPending ? '继续上次创建' : '创建主机'}</button></div>
     </form>
   </section>;
 }

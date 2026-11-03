@@ -122,6 +122,22 @@ func (s *Store) DeleteMCPConnector(ctx context.Context, ownerID, id string, expe
 		return err
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockProjectsUsingMCPConnector(ctx, tx, ownerID, id); err != nil {
+			return err
+		}
+		var currentRevision int64
+		if err := tx.QueryRow(ctx, `SELECT revision FROM mcp_connectors WHERE owner_id=$1 AND id=$2 FOR UPDATE`, ownerID, id).
+			Scan(&currentRevision); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "MCP connector not found")
+		} else if err != nil {
+			return fmt.Errorf("lock MCP connector before deletion: %w", err)
+		}
+		if currentRevision != expectedRevision {
+			return domain.NewError(domain.CodeConflict, "MCP connector changed before deletion")
+		}
+		if err := revokeProjectMCPConnectorOwnerInTx(ctx, tx, ownerID, id); err != nil {
+			return err
+		}
 		queries := sqlcgen.New(tx)
 		if _, err := queries.DeleteMCPConnector(ctx, sqlcgen.DeleteMCPConnectorParams{OwnerID: ownerID, ID: id, ExpectedRevision: expectedRevision}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -143,6 +159,28 @@ func (s *Store) DeleteMCPConnector(ctx context.Context, ownerID, id string, expe
 		}
 		return nil
 	})
+}
+
+// Keep connector deletion in the same project-then-connector lock order used
+// by project grants so a concurrent grant cannot survive deletion.
+func lockProjectsUsingMCPConnector(ctx context.Context, tx pgx.Tx, ownerID, connectorID string) error {
+	rows, err := tx.Query(ctx, `SELECT p.id FROM projects p
+JOIN project_mcp_connector_grants g ON g.project_id=p.id
+WHERE g.connector_owner_id=$1 AND g.connector_id=$2 ORDER BY p.id FOR UPDATE OF p`, ownerID, connectorID)
+	if err != nil {
+		return fmt.Errorf("lock projects before deleting MCP connector: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			return fmt.Errorf("scan projects before deleting MCP connector: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read projects before deleting MCP connector: %w", err)
+	}
+	return nil
 }
 
 func fenceMCPConnectorOperations(ctx context.Context, tx pgx.Tx, ownerID, connectorID string) error {

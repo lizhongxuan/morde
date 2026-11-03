@@ -14,7 +14,7 @@ func TestCatalogExposesOnlyVerifiedApplication(t *testing.T) {
 	if !SupportsApplication(WeChatApplicationID) {
 		t.Fatal("verified WeChat manifest is missing from the catalog")
 	}
-	for _, id := range []string{"qq", "", "codex", "wechat ", "WECHAT"} {
+	for _, id := range []string{"qq", "", "codex", "claude", "wechat ", "WECHAT"} {
 		if SupportsApplication(id) {
 			t.Fatalf("unsupported application %q was exposed", id)
 		}
@@ -31,11 +31,13 @@ func TestCatalogExposesOnlyVerifiedApplication(t *testing.T) {
 	if items := catalog.Statuses(); len(items) != 1 || items[0].ID != WeChatApplicationID {
 		t.Fatalf("catalog statuses = %#v", items)
 	}
-	if _, err := catalog.Install("qq", "req-qq-01"); !errors.Is(err, ErrUnsupportedApplication) {
-		t.Fatalf("unverified install error = %v", err)
-	}
-	if _, err := catalog.Launch("qq", contract.HostFence{}, "launch_qq_01"); !errors.Is(err, ErrUnsupportedApplication) {
-		t.Fatalf("unverified launch error = %v", err)
+	for _, id := range []string{"codex", "claude", "qq"} {
+		if _, err := catalog.Install(id, "req-"+id+"-01"); !errors.Is(err, ErrUnsupportedApplication) {
+			t.Fatalf("unverified %s install error = %v", id, err)
+		}
+		if _, err := catalog.Launch(id, launchTestFence(), "launch_"+id+"_01"); !errors.Is(err, ErrUnsupportedApplication) {
+			t.Fatalf("unverified %s launch error = %v", id, err)
+		}
 	}
 }
 

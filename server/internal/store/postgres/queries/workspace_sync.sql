@@ -21,7 +21,7 @@ WHERE wr.workspace_id=$1
 ORDER BY wr.revision DESC LIMIT 1;
 
 -- name: ListWorkspaceRevisionFilesPage :many
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
   AND ($3::text = '' OR file_path=$3 OR starts_with(file_path, $3 || '/'))
@@ -39,7 +39,7 @@ ORDER BY directory_path
 LIMIT $5;
 
 -- name: GetWorkspaceRevisionFile :one
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2) AND file_path=$3
 ORDER BY valid_from_revision DESC LIMIT 1;
@@ -81,14 +81,14 @@ WHERE workspace_id=sqlc.arg(workspace_id)
   AND state IN ('planned','transferring','verifying','applying');
 
 -- name: ListWorkspaceRevisionFiles :many
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2 AND (valid_to_revision IS NULL OR valid_to_revision > $2)
 ORDER BY file_path;
 
 -- name: InsertWorkspaceRevisionFile :exec
-INSERT INTO workspace_revision_files (workspace_id, valid_from_revision, file_path, folded_path, size_bytes, sha256, mode, chunks)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+INSERT INTO workspace_revision_files (workspace_id, valid_from_revision, file_path, folded_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);
 
 -- name: ListWorkspaceRevisionEmptyDirectories :many
 SELECT directory_path
@@ -105,11 +105,11 @@ INSERT INTO workspace_revision_empty_directories (workspace_id, valid_from_revis
 VALUES ($1, $2, $3, $4);
 
 -- name: InsertWorkspaceChange :exec
-INSERT INTO workspace_changes (workspace_id, revision, file_path, action, file)
-VALUES ($1, $2, $3, $4, $5);
+INSERT INTO workspace_changes (workspace_id, revision, file_path, action, file, directory)
+VALUES ($1, $2, $3, $4, $5, $6);
 
 -- name: ListWorkspaceChangesPage :many
-SELECT revision, file_path, action, file
+SELECT revision, file_path, action, file, directory
 FROM workspace_changes
 WHERE workspace_id=$1 AND (revision > $2 OR (revision=$2 AND file_path > $3))
 ORDER BY revision, file_path

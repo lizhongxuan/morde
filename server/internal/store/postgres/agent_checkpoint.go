@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -22,59 +23,32 @@ func (s *Store) SaveAgentCheckpoint(ctx context.Context, value app.StoredAgentCh
 		fence.AgentRootSessionID = rootSessionID
 		value.Fence = fence
 	}
-	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) || fence.AgentInstanceID == "" ||
+	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) || !domain.ValidUserID(fence.InitiatorID) || fence.AgentInstanceID == "" ||
 		fence.AgentSessionID == "" || fence.AgentRootSessionID == "" || fence.AgentGeneration < 1 || fence.AuthorizationVersion < 1 ||
 		fence.LeaseOwner == "" || fence.LeaseVersion < 1 || fence.EngineVersion == "" || fence.ProfileVersion == "" ||
 		value.From < 0 || value.Through < value.From || len(value.Digest) != 32 || len(value.Ciphertext) == 0 || len(value.Ciphertext) > (1<<20)+64 {
 		return false, domain.InvalidArgument("checkpoint", "checkpoint fields are invalid")
 	}
 	var replayed bool
+	var deliveryErr error
 	// Lock authorization and the task with the checkpoint row in one transaction.
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		gate, err := requireOwnerExecutionEnabled(ctx, tx, fence.OwnerID, nil)
+		current, err := lockAuthorizedAgentTask(ctx, tx, agentCheckpointInstanceFence(fence, rootSessionID))
 		if err != nil {
 			return err
 		}
-		var userStatus string
-		if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id=$1 FOR SHARE`, fence.OwnerID).Scan(&userStatus); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
-			}
-			return fmt.Errorf("lock checkpoint owner: %w", err)
-		}
-		if userStatus != string(identity.StatusApproved) {
+		if current.InstanceID != fence.AgentInstanceID || current.Generation != fence.AgentGeneration || current.SessionID != rootSessionID ||
+			current.EngineVersion != fence.EngineVersion || current.ProfileVersion != fence.ProfileVersion {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
 		}
-		var taskThrough int64
-		var taskDigest []byte
-		var authKind, tokenID, installationID string
-		var authScopes []string
-		err = tx.QueryRow(ctx, `SELECT checkpoint_through_seq,checkpoint_digest,auth_kind,auth_token_id,auth_scopes,COALESCE(auth_client_installation_id,'')
-FROM tasks
-WHERE id=$1 AND owner_id=$2 AND status='running' AND execution_location='server' AND execution_epoch=$3
-  AND lease_owner=$4 AND lease_version=$5 AND lease_expires_at>clock_timestamp()
-		AND agent_instance_id=$6 AND agent_generation=$7 AND agent_session_id=$8
-  AND auth_version=$9 AND (auth_kind='schedule_task' OR auth_expires_at>clock_timestamp())
-  AND agent_engine_version=$10 AND agent_profile_version=$11
-FOR UPDATE`, fence.TaskID, fence.OwnerID, gate.epoch, fence.LeaseOwner, fence.LeaseVersion,
-			fence.AgentInstanceID, fence.AgentGeneration, rootSessionID, fence.AuthorizationVersion,
-			fence.EngineVersion, fence.ProfileVersion).Scan(&taskThrough, &taskDigest, &authKind, &tokenID, &authScopes, &installationID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
-		}
-		if err != nil {
-			return fmt.Errorf("lock checkpoint task: %w", err)
-		}
+		taskThrough, taskDigest := current.CheckpointThrough, current.CheckpointDigest
 		if err := lockActiveAgentLease(ctx, tx, app.AgentInstanceFence{
-			TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
+			TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, AgentInstanceID: fence.AgentInstanceID,
 			AgentGeneration: fence.AgentGeneration, AgentSessionID: rootSessionID,
 			LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
 			AuthorizationVersion: fence.AuthorizationVersion, EngineVersion: fence.EngineVersion,
 			ProfileVersion: fence.ProfileVersion,
 		}); err != nil {
-			return err
-		}
-		if err := checkAgentCheckpointAuthorization(ctx, tx, fence.OwnerID, fence.TaskID, authKind, tokenID, authScopes, installationID); err != nil {
 			return err
 		}
 		var parentSessionID string
@@ -134,6 +108,43 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 		if sessionThrough == int64(^uint64(0)>>1) || value.From != sessionThrough+1 {
 			return domain.NewError(domain.CodeConflict, "checkpoint event sequence is not contiguous")
 		}
+		if fence.AgentSessionID == rootSessionID && value.ConversationMessagesInvalid {
+			if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
+				return err
+			}
+			deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint user message could not be matched safely")
+			return nil
+		}
+		pendingMessageIDs := make([]string, 0, len(value.ConversationMessages))
+		if fence.AgentSessionID == rootSessionID {
+			for _, message := range value.ConversationMessages {
+				var role, content, deliveryStatus string
+				err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status FROM conversation_messages AS message JOIN tasks AS task
+ON task.id=message.task_id AND task.owner_id=message.owner_id AND task.conversation_id=message.conversation_id
+WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3
+FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &content, &deliveryStatus)
+				if errors.Is(err, pgx.ErrNoRows) {
+					if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
+						return err
+					}
+					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint user message could not be matched safely")
+					return nil
+				}
+				if err != nil {
+					return fmt.Errorf("lock checkpoint user message: %w", err)
+				}
+				if role != "user" || content != message.Content {
+					if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
+						return err
+					}
+					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint user message could not be matched safely")
+					return nil
+				}
+				if deliveryStatus == "pending" {
+					pendingMessageIDs = append(pendingMessageIDs, message.ID)
+				}
+			}
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO task_agent_checkpoints
 (task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,from_seq,through_seq,digest,ciphertext,
  engine_version,profile_version,auth_version,lease_version)
@@ -153,10 +164,104 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, fence.TaskID, fence.OwnerID
 WHERE id=$1`, fence.TaskID, value.Through, value.Digest); err != nil {
 				return fmt.Errorf("advance task checkpoint: %w", err)
 			}
+			for _, messageID := range pendingMessageIDs {
+				result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied'
+WHERE id=$1 AND owner_id=$2 AND task_id=$3 AND role='user' AND delivery_status='pending'`,
+					messageID, fence.OwnerID, fence.TaskID)
+				if err != nil {
+					return fmt.Errorf("apply checkpointed user message: %w", err)
+				}
+				if result.RowsAffected() != 1 {
+					return domain.NewError(domain.CodeInvalidState, "checkpoint user message changed before commit")
+				}
+			}
 		}
 		return nil
 	})
+	if err == nil && deliveryErr != nil {
+		return false, deliveryErr
+	}
 	return replayed, err
+}
+
+func (s *Store) PendingMessages(ctx context.Context, fence app.AgentCheckpointFence) ([]app.AgentConversationMessage, error) {
+	rootSessionID := fence.AgentRootSessionID
+	if rootSessionID == "" {
+		rootSessionID = fence.AgentSessionID
+		fence.AgentRootSessionID = rootSessionID
+	}
+	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) || !domain.ValidUserID(fence.InitiatorID) || fence.AgentInstanceID == "" ||
+		fence.AgentSessionID == "" || fence.AgentSessionID != rootSessionID || fence.AgentGeneration < 1 || fence.AuthorizationVersion < 1 ||
+		fence.LeaseOwner == "" || fence.LeaseVersion < 1 || fence.EngineVersion == "" || fence.ProfileVersion == "" {
+		return nil, domain.InvalidArgument("checkpoint", "pending message identity is invalid")
+	}
+	messages := make([]app.AgentConversationMessage, 0, 128)
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		current, err := lockAuthorizedAgentTask(ctx, tx, agentCheckpointInstanceFence(fence, rootSessionID))
+		if err != nil {
+			return err
+		}
+		if current.InstanceID != fence.AgentInstanceID || current.Generation != fence.AgentGeneration || current.SessionID != rootSessionID ||
+			current.EngineVersion != fence.EngineVersion || current.ProfileVersion != fence.ProfileVersion {
+			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
+		}
+		taskThrough, taskDigest := current.CheckpointThrough, current.CheckpointDigest
+		if err := lockActiveAgentLease(ctx, tx, agentCheckpointInstanceFence(fence, rootSessionID)); err != nil {
+			return err
+		}
+		var parentSessionID string
+		var sessionThrough int64
+		var sessionDigest []byte
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(parent_session_id,''),checkpoint_through_seq,checkpoint_digest
+FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`,
+			fence.TaskID, fence.OwnerID, rootSessionID).Scan(&parentSessionID, &sessionThrough, &sessionDigest); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeUnauthenticated, "checkpoint session is unavailable")
+		} else if err != nil {
+			return fmt.Errorf("lock pending message checkpoint session: %w", err)
+		}
+		if parentSessionID != "" || sessionThrough != taskThrough || !bytes.Equal(sessionDigest, taskDigest) {
+			return domain.NewError(domain.CodeInvalidState, "root checkpoint head changed")
+		}
+		rows, err := tx.Query(ctx, `SELECT id,content FROM conversation_messages
+WHERE task_id=$1 AND owner_id=$2 AND conversation_id=(SELECT conversation_id FROM tasks WHERE id=$1 AND owner_id=$2)
+  AND role='user' AND delivery_status='pending'
+ORDER BY sequence LIMIT 128`, fence.TaskID, fence.OwnerID)
+		if err != nil {
+			return fmt.Errorf("list pending task messages: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var message app.AgentConversationMessage
+			if err := rows.Scan(&message.ID, &message.Content); err != nil {
+				return fmt.Errorf("scan pending task message: %w", err)
+			}
+			messages = append(messages, message)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate pending task messages: %w", err)
+		}
+		return nil
+	})
+	return messages, err
+}
+
+func agentCheckpointInstanceFence(fence app.AgentCheckpointFence, rootSessionID string) app.AgentInstanceFence {
+	return app.AgentInstanceFence{
+		TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, AgentInstanceID: fence.AgentInstanceID,
+		AgentGeneration: fence.AgentGeneration, AgentSessionID: rootSessionID,
+		LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
+		AuthorizationVersion: fence.AuthorizationVersion, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion,
+	}
+}
+
+func markPendingConversationMessagesUnknown(ctx context.Context, tx pgx.Tx, taskID, ownerID string) error {
+	if _, err := tx.Exec(ctx, `UPDATE conversation_messages AS message SET delivery_status='unknown'
+FROM tasks task
+WHERE task.id=$1 AND task.owner_id=$2 AND message.task_id=task.id AND message.owner_id=task.owner_id
+  AND message.conversation_id=task.conversation_id AND message.role='user' AND message.delivery_status='pending'`, taskID, ownerID); err != nil {
+		return fmt.Errorf("mark unmatched pending task messages unknown: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ReadAgentCheckpointPage(ctx context.Context, request app.AgentCheckpointPageRequest) (app.StoredAgentCheckpoint, error) {
@@ -252,7 +357,7 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		if err != nil {
 			return fmt.Errorf("read checkpoint page: %w", err)
 		}
-		result.Fence.TaskID, result.Fence.OwnerID = fence.TaskID, fence.OwnerID
+		result.Fence.TaskID, result.Fence.OwnerID, result.Fence.InitiatorID = fence.TaskID, fence.OwnerID, fence.InitiatorID
 		return nil
 	})
 	return result, err
@@ -281,12 +386,19 @@ func checkAgentCheckpointAuthorization(ctx context.Context, tx pgx.Tx, ownerID, 
 		if !scheduleTaskScopeStringsValid(scopes) || !schedule.ValidRunID(tokenID) || installationID != "" {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
 		}
-		var linked bool
-		err := tx.QueryRow(ctx, `SELECT EXISTS (
-  SELECT 1 FROM schedule_runs r JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
-  WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3
-)`, tokenID, ownerID, taskID).Scan(&linked)
-		if err != nil || !linked {
+		var scheduleHostID, taskHostID pgtype.Text
+		var taskScopes []string
+		var taskAuthKind, taskAuthTokenID string
+		err := tx.QueryRow(ctx, `SELECT s.host_id,t.host_id,t.auth_scopes,t.auth_kind,t.auth_token_id
+FROM schedule_runs r
+JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+JOIN tasks t ON t.id=r.task_id AND t.owner_id=r.owner_id AND t.initiator_id=r.owner_id
+WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND t.execution_location='server'`, tokenID, ownerID, taskID).
+			Scan(&scheduleHostID, &taskHostID, &taskScopes, &taskAuthKind, &taskAuthTokenID)
+		if err != nil || scheduleHostID.Valid != taskHostID.Valid ||
+			scheduleHostID.Valid && scheduleHostID.String != taskHostID.String ||
+			!scheduleTaskScopeStringsValidForHost(taskScopes, taskHostID.Valid) || !sameStringSlices(taskScopes, scopes) ||
+			taskAuthKind != string(identity.KindScheduleTask) || taskAuthTokenID != tokenID {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
 		}
 		return nil

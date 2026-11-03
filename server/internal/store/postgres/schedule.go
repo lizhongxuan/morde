@@ -63,6 +63,9 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 		if err := schedule.Validate(value); err != nil {
 			return domain.InvalidArgument("schedule", err.Error())
 		}
+		if err := validateScheduleTaskFields(value); err != nil {
+			return err
+		}
 		timing, err := json.Marshal(value.Timing)
 		if err != nil {
 			return fmt.Errorf("encode schedule timing: %w", err)
@@ -77,7 +80,7 @@ budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_t
 auth_client_installation_id, misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
 observation_config_hash, baseline_fingerprint
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
-			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, value.HostID, value.ModelID, value.Objective, timing,
+			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Objective, timing,
 			value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens, value.Authorization.Kind,
 			value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 			notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey,
@@ -207,6 +210,9 @@ func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, record app.I
 		if err := schedule.Validate(value); err != nil {
 			return domain.InvalidArgument("schedule", err.Error())
 		}
+		if err := validateScheduleTaskFields(value); err != nil {
+			return err
+		}
 		previousContentBytes, err := personalScheduleContentBytesInTx(ctx, tx, ownerID, value.ID)
 		if err != nil {
 			return err
@@ -297,6 +303,9 @@ func (s *Store) SetScheduleStatus(ctx context.Context, record app.IdempotencyRec
 			}
 			if err := schedule.Validate(value); err != nil {
 				return domain.InvalidArgument("schedule", err.Error())
+			}
+			if err := validateScheduleTaskFields(value); err != nil {
+				return err
 			}
 			if err := updateScheduleRow(ctx, tx, record.OwnerID, value); err != nil {
 				return err
@@ -524,27 +533,40 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 			}
 		}
 		if occurrence.Status == schedule.RunQueued {
-			if err := lockAIHost(ctx, tx, value.HostID, value.OwnerID); err != nil {
-				return err
+			if value.HostID != "" {
+				if err := lockAIHost(ctx, tx, value.HostID, value.OwnerID); err != nil {
+					return err
+				}
 			}
 			if err := validateScheduleTaskFields(value); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO conversations (id,owner_id,host_id,title) VALUES ($1,$2,$3,$4)`,
-				conversationID, value.OwnerID, value.HostID, truncateScheduleTitle(value.Objective)); err != nil {
+				conversationID, value.OwnerID, nullableText(value.HostID), truncateScheduleTitle(value.Objective)); err != nil {
 				return fmt.Errorf("create scheduled conversation: %w", err)
 			}
 			scheduledScopes := identity.ScheduleTaskExecutionScopes()
+			if value.HostID == "" {
+				scheduledScopes = identity.HostlessScheduleTaskExecutionScopes()
+			}
 			internalAuthorization := task.Authorization{Kind: string(identity.KindScheduleTask), TokenID: runID, Scopes: make([]string, 0, len(scheduledScopes)), Version: 1}
 			for _, scope := range scheduledScopes {
 				internalAuthorization.Scopes = append(internalAuthorization.Scopes, string(scope))
 			}
 			taskValue := normalizeNewTask(task.Task{
-				ID: taskID, OwnerID: value.OwnerID, ConversationID: conversationID, HostID: value.HostID,
+				ID: taskID, OwnerID: value.OwnerID, InitiatorID: value.OwnerID, ConversationID: conversationID, HostID: value.HostID,
 				ExecutionLocation: "server", ModelID: value.ModelID, Objective: value.Objective, Status: task.StatusQueued,
 				Authorization: internalAuthorization, Budget: value.Budget,
 			})
 			if err := validateTask(taskValue); err != nil {
+				return err
+			}
+			_, contextManifest, err := captureTaskConversationContext(ctx, tx, value.OwnerID, conversationID)
+			if err != nil {
+				return err
+			}
+			initialEventPayload, err := attachTaskConversationContextManifest([]byte(`{"status":"queued"}`), contextManifest)
+			if err != nil {
 				return err
 			}
 			if err := insertTask(ctx, tx, taskValue, 1, gate.epoch); err != nil {
@@ -560,7 +582,7 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 			if err := insertMessage(ctx, tx, message); err != nil {
 				return err
 			}
-			if err := insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: 1, Type: "task.status", Payload: []byte(`{"status":"queued"}`)}); err != nil {
+			if err := insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: 1, Type: "task.status", Payload: initialEventPayload}); err != nil {
 				return err
 			}
 		}
@@ -728,7 +750,8 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	var timingJSON, observationJSON []byte
 	var authScopes, notificationEvents []string
 	var nextRunAt, nextCheckAt, createdAt, updatedAt pgtype.Timestamptz
-	err := row.Scan(&value.ID, &value.OwnerID, &value.Version, &status, &value.ExecutionEpoch, &value.HostID, &value.ModelID,
+	var hostID pgtype.Text
+	err := row.Scan(&value.ID, &value.OwnerID, &value.Version, &status, &value.ExecutionEpoch, &hostID, &value.ModelID,
 		&value.Objective, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
 		&authKind, &value.Authorization.TokenID, &authScopes, &authClientInstallationID, &policy, &notificationEvents, &value.NextOccurrenceKey,
 		&nextRunAt, &nextCheckAt, &observationJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt)
@@ -746,6 +769,7 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 		value.Observation = &observation
 	}
 	value.Status = schedule.Status(status)
+	value.HostID = hostID.String
 	value.MisfirePolicy = schedule.MisfirePolicy(policy)
 	value.Authorization.Kind = authKind
 	value.Authorization.Scopes = append([]string(nil), authScopes...)
@@ -822,7 +846,7 @@ func updateScheduleRow(ctx context.Context, tx pgx.Tx, ownerID string, value sch
 budget_active_seconds=$10,budget_tool_calls=$11,budget_model_tokens=$12,auth_kind=$13,auth_token_id=$14,auth_scopes=$15,
 auth_client_installation_id=$16,misfire_policy=$17,notification_events=$18,next_occurrence_key=$19,next_run_at=$20,next_check_at=$21,observation_spec=$22,
 observation_config_hash=$23,baseline_fingerprint=$24,updated_at=clock_timestamp()
-WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Status), value.ExecutionEpoch, value.HostID, value.ModelID,
+		WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID,
 		value.Objective, timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
 		value.Authorization.Kind, value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 		notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey, nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt),
@@ -876,7 +900,8 @@ func prefixScheduleColumns(alias string) string {
 
 func validateScheduleTaskFields(value schedule.Schedule) error {
 	if value.Authorization.Kind == "" || strings.TrimSpace(value.Objective) == "" || value.ModelID == "" ||
-		!domain.ValidHostID(value.HostID) || !domain.ValidUserID(value.OwnerID) {
+		(value.HostID != "" && !domain.ValidHostID(value.HostID)) || !domain.ValidUserID(value.OwnerID) ||
+		(value.HostID == "" && (value.Observation != nil || app.ClassifyFileDeliveryIntent(value.Objective, false) != task.FileDeliveryNone)) {
 		return domain.InvalidArgument("schedule", "scheduled task fields are invalid")
 	}
 	if err := value.Budget.Validate(); err != nil {

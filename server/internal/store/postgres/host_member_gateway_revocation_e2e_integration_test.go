@@ -29,6 +29,7 @@ import (
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/gateway"
 )
 
@@ -48,6 +49,20 @@ type hostMemberRevocationAPIHost struct{ app.HostService }
 type hostMemberRevocationAPIAuth struct{ api.AuthService }
 type hostMemberRevocationGatewayHost struct{ app.HostService }
 type hostMemberRevocationGatewayControl struct{ gateway.ControlService }
+
+type hostMemberRevocationWorkspaceFiles struct{}
+
+func (hostMemberRevocationWorkspaceFiles) ListHostWorkspaceBindings(context.Context, string, string) ([]workspace.Binding, error) {
+	return []workspace.Binding{}, nil
+}
+
+func (hostMemberRevocationWorkspaceFiles) GetHostWorkspaceManifest(context.Context, string, string, string, int64, string, string, int32) (workspace.ManifestPage, error) {
+	return workspace.ManifestPage{}, nil
+}
+
+func (hostMemberRevocationWorkspaceFiles) StreamHostWorkspaceFile(context.Context, string, string, string, int64, string, func(workspace.File, []byte) error) (workspace.File, error) {
+	return workspace.File{}, nil
+}
 
 type hostMemberRevocationTLS struct{}
 
@@ -170,7 +185,7 @@ func TestHostMemberRevocationAPIClosesExistingGatewayWebSocket(t *testing.T) {
 		},
 		Domains:  config.Domains{Scheme: "https", Portal: "portal.example.test", HostSuffix: "example.test", CookieSecure: true},
 		Security: config.Security{CookieKeyFile: keyPath, HostCookieTTL: time.Hour},
-		Hosts:    hostMemberRevocationGatewayHost{}, HostSharing: sharing,
+		Hosts:    hostMemberRevocationGatewayHost{}, HostSharing: sharing, WorkspaceFiles: hostMemberRevocationWorkspaceFiles{},
 		Control:        hostMemberRevocationGatewayControl{},
 		Runtime:        hostMemberRevocationGatewayRuntime{ref: ref, upstream: app.Upstream{BaseURL: echo.URL}},
 		ActivityLeases: store, InputPermits: store, TerminalSessions: store,

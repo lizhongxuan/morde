@@ -2,7 +2,9 @@ package runtimeclient
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,7 @@ func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 	inputDigest := strings.Repeat("b", 64)
 	manifestDigest := strings.Repeat("c", 64)
 	blockDigest := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	modTimeNS := int64(1_700_000_000_123_456_789)
 	var corrupt atomic.Bool
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -69,9 +72,12 @@ func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 				BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
 				WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
 				ViewID: viewID, ManifestSHA256: manifestDigest,
-				Files: []contract.TaskWorkspaceManifestFile{{Path: "hello.txt", SizeBytes: 5, SHA256: blockDigest, Mode: 0o600,
-					Chunks: []contract.TaskWorkspaceManifestChunk{{SHA256: blockDigest, SizeBytes: 5}}}},
-				EmptyDirectories: []string{"empty"},
+				Files: []contract.TaskWorkspaceManifestFile{{Path: "hello.txt", SizeBytes: 5, SHA256: blockDigest, Mode: 0o600, ModTimeNS: &modTimeNS,
+					MetadataKnown: true, Chunks: []contract.TaskWorkspaceManifestChunk{{SHA256: blockDigest, SizeBytes: 5}}}},
+				EmptyDirectories: []string{"empty"}, Directories: []contract.TaskWorkspaceManifestDirectory{
+					{Path: ".", Mode: 0o750, ModTimeNS: &modTimeNS, MetadataKnown: true},
+					{Path: "empty", Mode: 0o750, ModTimeNS: &modTimeNS, MetadataKnown: true},
+				},
 			})
 		case "/runtime/v1/tasks/" + taskID + "/workspace-view/block":
 			var request TaskWorkspaceBlockRequest
@@ -98,6 +104,9 @@ func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 	page, err := client.TaskWorkspaceManifestPage(context.Background(), taskID, manifestRequest)
 	if err != nil || len(page.Files) != 1 || len(page.EmptyDirectories) != 1 || page.ManifestSHA256 != manifestDigest {
 		t.Fatalf("TaskWorkspaceManifestPage() = %#v, %v", page, err)
+	}
+	if page.Files[0].ModTimeNS == nil || *page.Files[0].ModTimeNS != modTimeNS {
+		t.Fatalf("TaskWorkspaceManifestPage() modification time = %#v; want %d", page.Files[0].ModTimeNS, modTimeNS)
 	}
 	blockRequest := TaskWorkspaceBlockRequest{
 		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
@@ -131,7 +140,7 @@ func TestTaskWorkspaceManifestResponseValidatesDirectoryOnlyPages(t *testing.T) 
 		BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
 		WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
 		ViewID: viewID, ManifestSHA256: strings.Repeat("c", 64),
-		Files: []contract.TaskWorkspaceManifestFile{}, EmptyDirectories: []string{"docs"}, NextCursor: "docs",
+		Files: []contract.TaskWorkspaceManifestFile{}, EmptyDirectories: []string{"docs"}, Directories: []contract.TaskWorkspaceManifestDirectory{}, NextCursor: "docs",
 	}
 	if !taskWorkspaceManifestResponseMatches(response, taskID, request) {
 		t.Fatal("directory-only page with its path cursor was rejected")
@@ -144,6 +153,64 @@ func TestTaskWorkspaceManifestResponseValidatesDirectoryOnlyPages(t *testing.T) 
 	response.EmptyDirectories = []string{"../outside"}
 	if taskWorkspaceManifestResponseMatches(response, taskID, request) {
 		t.Fatal("page with an unsafe directory path was accepted")
+	}
+}
+
+func TestTaskWorkspaceManifestResponseValidatesSymlinkMetadataWithoutBlocks(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	viewID := "v" + strings.Repeat("a", 64)
+	target := "../README.md"
+	digest := sha256.Sum256([]byte(target))
+	request := TaskWorkspaceManifestRequest{
+		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, InputManifestSHA256: strings.Repeat("b", 64), ViewID: viewID, Limit: 1,
+	}
+	response := TaskWorkspaceManifestResponse{
+		ProtocolVersion: ProtocolVersion, HostFence: fence, TaskID: taskID, WorkspaceID: request.WorkspaceID,
+		BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
+		WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
+		ViewID: viewID, ManifestSHA256: strings.Repeat("c", 64), EmptyDirectories: []string{}, Directories: []contract.TaskWorkspaceManifestDirectory{},
+		Files: []contract.TaskWorkspaceManifestFile{{Path: "docs/current", Kind: "symlink", SymlinkTarget: target,
+			SizeBytes: int64(len(target)), SHA256: hex.EncodeToString(digest[:]), Mode: 0, Chunks: []contract.TaskWorkspaceManifestChunk{}}},
+	}
+	if !taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("valid symlink metadata without blocks was rejected")
+	}
+	response.Files[0].SymlinkTarget = "../../outside"
+	if taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("symlink target escaping the Workspace was accepted")
+	}
+}
+
+func TestTaskWorkspaceManifestResponseAcceptsHardlinkAnchorOnEarlierPage(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	viewID := "v" + strings.Repeat("a", 64)
+	request := TaskWorkspaceManifestRequest{
+		HostFence: fence, TaskID: taskID, WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, InputManifestSHA256: strings.Repeat("b", 64), ViewID: viewID, AfterPath: "a.txt", Limit: 1,
+	}
+	content := []byte("shared")
+	digest := sha256.Sum256(content)
+	sha := hex.EncodeToString(digest[:])
+	response := TaskWorkspaceManifestResponse{
+		ProtocolVersion: ProtocolVersion, HostFence: fence, TaskID: taskID, WorkspaceID: request.WorkspaceID,
+		BindingVersion: request.BindingVersion, InputRevision: request.InputRevision,
+		WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision, InputManifestSHA256: request.InputManifestSHA256,
+		ViewID: viewID, ManifestSHA256: strings.Repeat("c", 64), EmptyDirectories: []string{}, Directories: []contract.TaskWorkspaceManifestDirectory{},
+		Files: []contract.TaskWorkspaceManifestFile{{Path: "z.txt", Kind: "file", HardlinkTo: "a.txt", SizeBytes: int64(len(content)),
+			SHA256: sha, Mode: 0644, Chunks: []contract.TaskWorkspaceManifestChunk{{SHA256: sha, SizeBytes: int64(len(content))}}}},
+	}
+	if !taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("valid hardlink alias whose anchor appeared on the earlier page was rejected")
+	}
+	response.Files[0].HardlinkTo = "../outside"
+	if taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("hardlink target escaping the Workspace was accepted")
+	}
+	response.Files[0].HardlinkTo = "a.txt"
+	response.Files[0].Kind = "symlink"
+	if taskWorkspaceManifestResponseMatches(response, taskID, request) {
+		t.Fatal("symlink with hardlink metadata was accepted")
 	}
 }
 
@@ -308,7 +375,7 @@ func TestSetTaskWorkspaceViewEchoesTheExactTaskCheckpoint(t *testing.T) {
 func TestApplicationsUsesCurrentFenceAndRejectsUnvalidatedResponses(t *testing.T) {
 	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
 	checkedAt := "2026-10-21T03:04:05Z"
-	validBody := `{"protocol_version":"1.0","host_id":"` + hostID + `","runtime_generation":2,"runtime_instance_id":"ri_current","control_version":9,"checked_at":"` + checkedAt + `","items":[{"id":"codex","installed":true,"version":"1.2.3","login_status":"logged_in"},{"id":"wechat","installed":false,"version":"","login_status":"not_applicable","installable":true,"install_operation":null}]}`
+	validBody := `{"protocol_version":"2.0","host_id":"` + hostID + `","runtime_generation":2,"runtime_instance_id":"ri_current","control_version":9,"checked_at":"` + checkedAt + `","items":[{"id":"codex","installed":true,"version":"1.2.3","login_status":"logged_in"},{"id":"wechat","installed":false,"version":"","login_status":"not_applicable","installable":true,"install_operation":null}]}`
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/runtime/v1/applications" || r.ContentLength != 0 {
 			t.Errorf("applications request = %s %s content_length=%d", r.Method, r.URL.String(), r.ContentLength)
@@ -396,7 +463,7 @@ func TestInstallApplicationUsesCurrentFenceAndRejectsMalformedResponses(t *testi
 	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
 	requestID := "install-wechat-01"
 	createdAt := "2026-10-21T03:04:05Z"
-	validBody := `{"protocol_version":"1.0","host_id":"` + hostID + `","runtime_generation":2,"runtime_instance_id":"ri_current","control_version":9,"operation":{"id":"app_1234","application_id":"wechat","status":"accepted","progress_percent":0,"error_code":"","created_at":"` + createdAt + `","updated_at":"` + createdAt + `"}}`
+	validBody := `{"protocol_version":"2.0","host_id":"` + hostID + `","runtime_generation":2,"runtime_instance_id":"ri_current","control_version":9,"operation":{"id":"app_1234","application_id":"wechat","status":"accepted","progress_percent":0,"error_code":"","created_at":"` + createdAt + `","updated_at":"` + createdAt + `"}}`
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/runtime/v1/applications/wechat/install" || r.URL.RawQuery != "" {
 			t.Errorf("install request = %s %s", r.Method, r.URL.String())
@@ -480,7 +547,7 @@ func TestInstallApplicationRejectsInvalidRequestsBeforeNetwork(t *testing.T) {
 		{name: "unsupported app", appID: "codex", request: ApplicationInstallRequest{HostFence: fence, RequestID: "install-1"}, wantCode: ErrorInvalidRequest},
 		{name: "invalid request id", appID: "wechat", request: ApplicationInstallRequest{HostFence: fence, RequestID: "bad key"}, wantCode: ErrorInvalidRequest},
 		{name: "invalid fence", appID: "wechat", request: ApplicationInstallRequest{HostFence: HostFence{HostID: "bad"}, RequestID: "install-1"}, wantCode: ErrorInvalidRequest},
-		{name: "wrong protocol", appID: "wechat", request: ApplicationInstallRequest{ProtocolVersion: "2.0", HostFence: fence, RequestID: "install-1"}, wantCode: ErrorProtocolIncompatible},
+		{name: "wrong protocol", appID: "wechat", request: ApplicationInstallRequest{ProtocolVersion: "1.0", HostFence: fence, RequestID: "install-1"}, wantCode: ErrorProtocolIncompatible},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := client.InstallApplication(context.Background(), test.appID, test.request)
@@ -536,8 +603,8 @@ func TestErrorStatusMismatchAndWrongProtocolFailClosed(t *testing.T) {
 		body string
 		code string
 	}{
-		{name: "status mismatch", body: `{"protocol_version":"1.0","code":"capability_unavailable"}`, code: ErrorInvalidResponse},
-		{name: "protocol mismatch", body: `{"protocol_version":"2.0","code":"protocol_incompatible"}`, code: ErrorProtocolIncompatible},
+		{name: "status mismatch", body: `{"protocol_version":"2.0","code":"capability_unavailable"}`, code: ErrorInvalidResponse},
+		{name: "protocol mismatch", body: `{"protocol_version":"1.0","code":"protocol_incompatible"}`, code: ErrorProtocolIncompatible},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -562,7 +629,7 @@ func TestErrorStatusMismatchAndWrongProtocolFailClosed(t *testing.T) {
 func TestResponseBodyIsBounded(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"protocol_version":"1.0","host_id":"`+hostID+`","runtime_generation":2,"runtime_instance_id":"ri_current","control_version":9,"mode":"blocked","operation_store_ready":true,"capabilities":[]}`)
+		_, _ = io.WriteString(w, `{"protocol_version":"2.0","host_id":"`+hostID+`","runtime_generation":2,"runtime_instance_id":"ri_current","control_version":9,"mode":"blocked","operation_store_ready":true,"capabilities":[]}`)
 		_, _ = io.WriteString(w, strings.Repeat(" ", maxResponseBodyBytes+1))
 	}))
 	defer server.Close()
@@ -791,7 +858,7 @@ func TestTransportAndSuccessfulResponseValidationFailClosed(t *testing.T) {
 	})
 	t.Run("wrong success protocol", func(t *testing.T) {
 		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSON(t, w, CapabilitiesResponse{ProtocolVersion: "2.0", HostID: hostID, RuntimeGeneration: 1, RuntimeInstanceID: "ri_1", Mode: ModeBlocked, OperationStoreReady: true, Capabilities: []string{}})
+			writeJSON(t, w, CapabilitiesResponse{ProtocolVersion: "1.0", HostID: hostID, RuntimeGeneration: 1, RuntimeInstanceID: "ri_1", Mode: ModeBlocked, OperationStoreReady: true, Capabilities: []string{}})
 		}))
 		defer server.Close()
 		client, err := New(server.URL, runtimeCredential, server.Client())

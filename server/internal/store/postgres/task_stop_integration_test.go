@@ -210,7 +210,7 @@ func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "stop-cancel-task")
 	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,

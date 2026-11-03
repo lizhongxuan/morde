@@ -26,7 +26,80 @@ const workspaceSyncCreateQuotaRejectedResource = "workspace_sync_create_quota_re
 
 const maxWorkspaceSyncPage int32 = 1000
 
+type workspaceManifestItem struct {
+	path string
+	file *workspace.File
+}
+
+func completedHostWorkspaceCheckpoint(ctx context.Context, tx pgx.Tx, workspaceID, replicaID string, revision int64, excludeSessionID string) (bool, error) {
+	var completed bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+	SELECT 1 FROM workspace_sync_sessions
+	WHERE workspace_id=$1 AND replica_id=$2 AND state='completed' AND direction='bidirectional' AND policy='live'
+	AND target_revision=$3 AND conflicts='[]'::jsonb AND task_id IS NULL AND ($4='' OR id<>$4)
+)`, workspaceID, replicaID, revision, excludeSessionID).Scan(&completed)
+	return completed, err
+}
+
 func (s *Store) GetWorkspaceManifestPage(ctx context.Context, workspaceID string, revision int64, prefix, afterPath string, limit int32) (workspace.ManifestPage, error) {
+	return s.getWorkspaceManifestPage(ctx, "", workspaceID, revision, prefix, afterPath, limit)
+}
+
+func (s *Store) GetWorkspaceManifestPageForOwner(ctx context.Context, ownerID, workspaceID string, revision int64, prefix, afterPath string, limit int32) (workspace.ManifestPage, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return s.getWorkspaceManifestPage(ctx, ownerID, workspaceID, revision, prefix, afterPath, limit)
+}
+
+func (s *Store) GetWorkspaceManifestPageForOwnershipTransfer(ctx context.Context, ownerID, workspaceID, transferID string,
+	revision int64, prefix, afterPath string, limit int32) (workspace.ManifestPage, error) {
+	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) || !workspace.ValidOwnershipTransferID(transferID) ||
+		revision < 0 || limit < 1 || limit > maxWorkspaceSyncPage {
+		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace ownership transfer not found")
+	}
+	if afterPath != "" {
+		if err := workspace.ValidateRelativePath(afterPath); err != nil {
+			return workspace.ManifestPage{}, domain.InvalidArgument("cursor", "workspace manifest cursor path is invalid")
+		}
+	}
+	if prefix != "" {
+		if err := workspace.ValidateRelativePath(prefix); err != nil {
+			return workspace.ManifestPage{}, domain.InvalidArgument("prefix", "workspace manifest prefix is invalid")
+		}
+	}
+	var page workspace.ManifestPage
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var currentOwner, workspaceState, transferOwner, transferState string
+		var currentRevision, transferRevision int64
+		var deleted bool
+		err := tx.QueryRow(ctx, `SELECT w.owner_id,w.state,w.revision,w.deleted_at IS NOT NULL,
+t.from_owner_id,t.state,t.expected_revision
+FROM workspaces w JOIN workspace_ownership_transfers t ON t.workspace_id=w.id
+WHERE w.id=$1 AND t.id=$2 FOR SHARE OF w,t`, workspaceID, transferID).Scan(
+			&currentOwner, &workspaceState, &currentRevision, &deleted, &transferOwner, &transferState, &transferRevision,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "workspace ownership transfer not found")
+		}
+		if err != nil {
+			return fmt.Errorf("lock Workspace transfer manifest scope: %w", err)
+		}
+		if (transferState != string(workspace.OwnershipTransferPending) && transferState != string(workspace.OwnershipTransferAccepting)) ||
+			transferOwner != ownerID || currentOwner != ownerID || transferRevision != revision || currentRevision != revision ||
+			workspaceState != string(workspace.StateReady) || deleted {
+			return domain.NewError(domain.CodeNotFound, "workspace ownership transfer not found")
+		}
+		page, err = getWorkspaceManifestPageTx(ctx, tx, workspaceID, revision, prefix, afterPath, limit)
+		return err
+	})
+	if err != nil {
+		return workspace.ManifestPage{}, err
+	}
+	return page, nil
+}
+
+func (s *Store) getWorkspaceManifestPage(ctx context.Context, ownerID, workspaceID string, revision int64, prefix, afterPath string, limit int32) (workspace.ManifestPage, error) {
 	if !domain.ValidWorkspaceID(workspaceID) || revision < 0 || limit < 1 || limit > maxWorkspaceSyncPage {
 		return workspace.ManifestPage{}, domain.InvalidArgument("manifest", "workspace manifest query is invalid")
 	}
@@ -40,40 +113,56 @@ func (s *Store) GetWorkspaceManifestPage(ctx context.Context, workspaceID string
 			return workspace.ManifestPage{}, domain.InvalidArgument("prefix", "workspace manifest prefix is invalid")
 		}
 	}
-	if _, err := s.q.GetWorkspaceRevision(ctx, sqlcgen.GetWorkspaceRevisionParams{WorkspaceID: workspaceID, Revision: revision}); err != nil {
+	var page workspace.ManifestPage
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		currentOwner, err := lockWorkspaceOwnershipForRead(ctx, tx, workspaceID)
+		if err != nil {
+			return err
+		}
+		if ownerID != "" && ownerID != currentOwner {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		page, err = getWorkspaceManifestPageTx(ctx, tx, workspaceID, revision, prefix, afterPath, limit)
+		return err
+	})
+	if err != nil {
+		return workspace.ManifestPage{}, err
+	}
+	return page, nil
+}
+
+func getWorkspaceManifestPageTx(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, prefix, afterPath string, limit int32) (workspace.ManifestPage, error) {
+	queries := sqlcgen.New(tx)
+	if _, err := queries.GetWorkspaceRevision(ctx, sqlcgen.GetWorkspaceRevisionParams{WorkspaceID: workspaceID, Revision: revision}); err != nil {
 		return workspace.ManifestPage{}, storeError("get workspace manifest revision", "workspace revision", err)
 	}
-	fileRows, err := s.q.ListWorkspaceRevisionFilesPage(ctx, sqlcgen.ListWorkspaceRevisionFilesPageParams{
+	fileRows, err := queries.ListWorkspaceRevisionFilesPage(ctx, sqlcgen.ListWorkspaceRevisionFilesPageParams{
 		WorkspaceID: workspaceID, ValidFromRevision: revision, Column3: prefix,
 		FilePath: afterPath, Limit: limit + 1,
 	})
 	if err != nil {
 		return workspace.ManifestPage{}, fmt.Errorf("list workspace manifest page: %w", err)
 	}
-	directoryRows, err := s.q.ListWorkspaceRevisionEmptyDirectoriesPage(ctx, sqlcgen.ListWorkspaceRevisionEmptyDirectoriesPageParams{
+	directoryRows, err := queries.ListWorkspaceRevisionEmptyDirectoriesPage(ctx, sqlcgen.ListWorkspaceRevisionEmptyDirectoriesPageParams{
 		WorkspaceID: workspaceID, ValidFromRevision: revision, Column3: prefix,
 		DirectoryPath: afterPath, Limit: limit + 1,
 	})
 	if err != nil {
 		return workspace.ManifestPage{}, fmt.Errorf("list workspace empty-directory manifest page: %w", err)
 	}
-	type manifestItem struct {
-		path string
-		file *workspace.File
-	}
-	items := make([]manifestItem, 0, len(fileRows)+len(directoryRows))
+	items := make([]workspaceManifestItem, 0, len(fileRows)+len(directoryRows))
 	for _, row := range fileRows {
-		file, err := workspaceFileFromRow(row.FilePath, row.SizeBytes, row.Sha256, row.Mode, row.Chunks)
+		file, err := workspaceFileFromRow(row.FilePath, row.SizeBytes, row.Sha256, row.Mode, row.Kind, row.SymlinkTarget, row.ModTimeNs, row.HardlinkTo, row.Chunks, row.Xattrs, row.Acl, row.MetadataKnown)
 		if err != nil {
 			return workspace.ManifestPage{}, err
 		}
-		items = append(items, manifestItem{path: file.Path, file: &file})
+		items = append(items, workspaceManifestItem{path: file.Path, file: &file})
 	}
 	for _, directory := range directoryRows {
 		if err := workspace.ValidateRelativePath(directory); err != nil {
 			return workspace.ManifestPage{}, domain.NewError(domain.CodeInternal, "stored workspace empty-directory path is invalid")
 		}
-		items = append(items, manifestItem{path: directory})
+		items = append(items, workspaceManifestItem{path: directory})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].path < items[j].path })
 	for i := 1; i < len(items); i++ {
@@ -96,11 +185,45 @@ func (s *Store) GetWorkspaceManifestPage(ctx context.Context, workspaceID string
 			page.EmptyDirectories = append(page.EmptyDirectories, item.path)
 		}
 	}
+	directoryPaths := workspaceDirectoryAncestors(items)
+	if prefix == "" && afterPath == "" {
+		directoryPaths = append(directoryPaths, ".")
+		sort.Strings(directoryPaths)
+	}
+	page.Directories, err = loadWorkspaceRevisionDirectories(ctx, tx, workspaceID, revision, directoryPaths)
+	if err != nil {
+		return workspace.ManifestPage{}, err
+	}
 	if hasMore && len(items) > 0 {
 		cursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: revision, Prefix: prefix, After: items[len(items)-1].path})
 		page.NextCursor = &cursor
 	}
 	return page, nil
+}
+
+func workspaceDirectoryAncestors(items []workspaceManifestItem) []string {
+	seen := make(map[string]string)
+	for _, item := range items {
+		parts := strings.Split(item.path, "/")
+		prefix := ""
+		limit := len(parts)
+		if item.file != nil {
+			limit--
+		}
+		for index := 0; index < limit; index++ {
+			if index > 0 {
+				prefix += "/"
+			}
+			prefix += parts[index]
+			seen[strings.ToLower(prefix)] = prefix
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for _, path := range seen {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // ListWorkspaceBlockReferences returns unique blocks referenced by ready
@@ -219,54 +342,98 @@ ORDER BY b.sha256, b.size_bytes`, workspaceID)
 }
 
 func (s *Store) GetWorkspaceChangePage(ctx context.Context, workspaceID string, afterRevision int64, afterPath string, limit int32) (workspace.ChangePage, error) {
+	return s.getWorkspaceChangePage(ctx, "", workspaceID, afterRevision, afterPath, limit)
+}
+
+func (s *Store) GetWorkspaceChangePageForOwner(ctx context.Context, ownerID, workspaceID string, afterRevision int64, afterPath string, limit int32) (workspace.ChangePage, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.ChangePage{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return s.getWorkspaceChangePage(ctx, ownerID, workspaceID, afterRevision, afterPath, limit)
+}
+
+func (s *Store) getWorkspaceChangePage(ctx context.Context, ownerID, workspaceID string, afterRevision int64, afterPath string, limit int32) (workspace.ChangePage, error) {
 	if !domain.ValidWorkspaceID(workspaceID) || afterRevision < 0 || limit < 1 || limit > 500 {
 		return workspace.ChangePage{}, domain.InvalidArgument("changes", "workspace change query is invalid")
 	}
 	if afterPath != "" {
-		if err := workspace.ValidateRelativePath(afterPath); err != nil {
+		if afterPath != "." && workspace.ValidateRelativePath(afterPath) != nil {
 			return workspace.ChangePage{}, domain.InvalidArgument("after", "workspace changes cursor path is invalid")
 		}
 	}
-	if _, err := s.q.GetWorkspace(ctx, workspaceID); err != nil {
-		return workspace.ChangePage{}, storeError("get workspace changes", "workspace", err)
-	}
-	rows, err := s.q.ListWorkspaceChangesPage(ctx, sqlcgen.ListWorkspaceChangesPageParams{
-		WorkspaceID: workspaceID, Revision: afterRevision, FilePath: afterPath, Limit: limit + 1,
+	var page workspace.ChangePage
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		currentOwner, err := lockWorkspaceOwnershipForRead(ctx, tx, workspaceID)
+		if err != nil {
+			return err
+		}
+		if ownerID != "" && ownerID != currentOwner {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		rows, err := sqlcgen.New(tx).ListWorkspaceChangesPage(ctx, sqlcgen.ListWorkspaceChangesPageParams{
+			WorkspaceID: workspaceID, Revision: afterRevision, FilePath: afterPath, Limit: limit + 1,
+		})
+		if err != nil {
+			return fmt.Errorf("list workspace changes: %w", err)
+		}
+		hasMore := int32(len(rows)) > limit
+		if hasMore {
+			rows = rows[:limit]
+		}
+		items := make([]workspace.Change, 0, len(rows))
+		for _, row := range rows {
+			item := workspace.Change{Revision: row.Revision, Path: row.FilePath, Action: workspace.ChangeAction(row.Action)}
+			if row.Action == string(workspace.ChangeUpsert) {
+				if row.Directory != nil {
+					return domain.NewError(domain.CodeInternal, "stored workspace file change includes directory metadata")
+				}
+				var file workspace.File
+				if err := json.Unmarshal(row.File, &file); err != nil {
+					return fmt.Errorf("decode workspace change file: %w", err)
+				}
+				if err := workspace.ValidateFile(file); err != nil || file.Path != row.FilePath {
+					return domain.NewError(domain.CodeInternal, "stored workspace change is invalid")
+				}
+				item.File = &file
+			} else if row.Action == string(workspace.ChangeDirectoryUpsert) {
+				if row.FilePath != "." && workspace.ValidateRelativePath(row.FilePath) != nil {
+					return domain.NewError(domain.CodeInternal, "stored workspace directory change is invalid")
+				}
+				if row.File != nil {
+					return domain.NewError(domain.CodeInternal, "stored workspace directory change includes file metadata")
+				}
+				if row.Directory != nil {
+					var directory workspace.Directory
+					if err := json.Unmarshal(row.Directory, &directory); err != nil {
+						return fmt.Errorf("decode workspace change directory: %w", err)
+					}
+					if err := workspace.ValidateDirectory(directory, false); err != nil || directory.Path != row.FilePath {
+						return domain.NewError(domain.CodeInternal, "stored workspace directory change is invalid")
+					}
+					item.Directory = &directory
+				}
+			} else if row.Action != string(workspace.ChangeDelete) && row.Action != string(workspace.ChangeDirectoryDelete) {
+				return domain.NewError(domain.CodeInternal, "stored workspace change action is invalid")
+			} else if row.Action == string(workspace.ChangeDelete) || row.Action == string(workspace.ChangeDirectoryDelete) {
+				validPath := workspace.ValidateRelativePath(row.FilePath) == nil || row.Action == string(workspace.ChangeDirectoryDelete) && row.FilePath == "."
+				if !validPath || row.File != nil || row.Directory != nil {
+					return domain.NewError(domain.CodeInternal, "stored workspace directory change is invalid")
+				}
+			}
+			items = append(items, item)
+		}
+		cursor := workspace.ChangeCursor{Revision: afterRevision, Path: afterPath}
+		if len(items) > 0 {
+			last := items[len(items)-1]
+			cursor = workspace.ChangeCursor{Revision: last.Revision, Path: last.Path}
+		}
+		page = workspace.ChangePage{Items: items, NextCursor: workspace.EncodeChangeCursor(cursor)}
+		return nil
 	})
 	if err != nil {
-		return workspace.ChangePage{}, fmt.Errorf("list workspace changes: %w", err)
+		return workspace.ChangePage{}, err
 	}
-	hasMore := int32(len(rows)) > limit
-	if hasMore {
-		rows = rows[:limit]
-	}
-	items := make([]workspace.Change, 0, len(rows))
-	for _, row := range rows {
-		item := workspace.Change{Revision: row.Revision, Path: row.FilePath, Action: workspace.ChangeAction(row.Action)}
-		if row.Action == string(workspace.ChangeUpsert) {
-			var file workspace.File
-			if err := json.Unmarshal(row.File, &file); err != nil {
-				return workspace.ChangePage{}, fmt.Errorf("decode workspace change file: %w", err)
-			}
-			if err := workspace.ValidateFile(file); err != nil || file.Path != row.FilePath {
-				return workspace.ChangePage{}, domain.NewError(domain.CodeInternal, "stored workspace change is invalid")
-			}
-			item.File = &file
-		} else if row.Action != string(workspace.ChangeDelete) && row.Action != string(workspace.ChangeDirectoryUpsert) && row.Action != string(workspace.ChangeDirectoryDelete) {
-			return workspace.ChangePage{}, domain.NewError(domain.CodeInternal, "stored workspace change action is invalid")
-		} else if row.Action == string(workspace.ChangeDirectoryUpsert) || row.Action == string(workspace.ChangeDirectoryDelete) {
-			if err := workspace.ValidateRelativePath(row.FilePath); err != nil || row.File != nil {
-				return workspace.ChangePage{}, domain.NewError(domain.CodeInternal, "stored workspace directory change is invalid")
-			}
-		}
-		items = append(items, item)
-	}
-	cursor := workspace.ChangeCursor{Revision: afterRevision, Path: afterPath}
-	if len(items) > 0 {
-		last := items[len(items)-1]
-		cursor = workspace.ChangeCursor{Revision: last.Revision, Path: last.Path}
-	}
-	return workspace.ChangePage{Items: items, NextCursor: workspace.EncodeChangeCursor(cursor)}, nil
+	return page, nil
 }
 
 func (s *Store) CheckWorkspaceSyncHostReplicaAccess(ctx context.Context, principal identity.Principal) error {
@@ -352,6 +519,9 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			Scan(&ownerID, &state, &revision, &quotaBytes); err != nil {
 			return storeError("lock workspace for sync session", "workspace", err)
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
 		if ownerID != value.OwnerID || state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
@@ -383,7 +553,7 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			if row.OwnerID != value.OwnerID || row.ReplicaID != value.ReplicaID {
 				return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key is bound to another sync session")
 			}
-			created, err = syncSessionDomain(ctx, sqlcgen.New(tx), row)
+			created, err = syncSessionDomain(ctx, tx, sqlcgen.New(tx), row)
 			if err != nil {
 				return err
 			}
@@ -411,7 +581,17 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			}
 			if (value.Direction == workspace.SyncDownload || value.Direction == workspace.SyncBidirectional) &&
 				value.BaseRevision > binding.AppliedRevision {
-				return domain.NewError(domain.CodeWorkspaceConflict, "Host workspace sync base revision is ahead of its applied revision")
+				// A live Host may verify its own completed checkpoint before reporting it as applied.
+				followsOwnCheckpoint := false
+				if value.Direction == workspace.SyncBidirectional && value.Policy == workspace.SyncLive && value.BaseRevision == revision {
+					followsOwnCheckpoint, err = completedHostWorkspaceCheckpoint(ctx, tx, value.WorkspaceID, value.ReplicaID, value.BaseRevision, "")
+					if err != nil {
+						return fmt.Errorf("check Host workspace checkpoint before sync: %w", err)
+					}
+				}
+				if !followsOwnCheckpoint {
+					return domain.NewError(domain.CodeWorkspaceConflict, "Host workspace sync base revision is ahead of its applied revision")
+				}
 			}
 		}
 		if revision != value.PinnedRevision || value.TargetRevision != revision {
@@ -465,6 +645,9 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 		if err != nil {
 			return fmt.Errorf("create workspace sync session: %w", err)
 		}
+		if err := persistWorkspaceSyncSessionDirectories(ctx, tx, value); err != nil {
+			return err
+		}
 		if value.TaskID != "" {
 			if err := associateTaskHubOperationWorkspaceSyncSessionTx(ctx, tx, value.OwnerID, value.TaskID, value.TaskHubOperationKey,
 				value.WorkspaceID, deviceAccess.installationID, value.ID); err != nil {
@@ -494,7 +677,7 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 				return fmt.Errorf("persist workspace sync download action: %w", err)
 			}
 		}
-		created, err = syncSessionDomain(ctx, q, row)
+		created, err = syncSessionDomain(ctx, tx, q, row)
 		return err
 	}
 	if hostScoped {
@@ -528,50 +711,126 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND request_hash=$6`,
 }
 
 func (s *Store) GetWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string) (workspace.SyncSession, error) {
+	return s.getWorkspaceSyncSession(ctx, "", workspaceID, sessionID)
+}
+
+func (s *Store) GetWorkspaceSyncSessionForOwner(ctx context.Context, ownerID, workspaceID, sessionID string) (workspace.SyncSession, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	return s.getWorkspaceSyncSession(ctx, ownerID, workspaceID, sessionID)
+}
+
+func (s *Store) getWorkspaceSyncSession(ctx context.Context, ownerID, workspaceID, sessionID string) (workspace.SyncSession, error) {
 	if !domain.ValidWorkspaceID(workspaceID) || !workspace.ValidSessionID(sessionID) {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
-	row, err := s.q.GetWorkspaceSyncSession(ctx, sqlcgen.GetWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
+	var result workspace.SyncSession
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		currentOwner, err := lockWorkspaceOwnershipForRead(ctx, tx, workspaceID)
+		if err != nil {
+			return err
+		}
+		if ownerID != "" && ownerID != currentOwner {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		queries := sqlcgen.New(tx)
+		row, err := queries.GetWorkspaceSyncSession(ctx, sqlcgen.GetWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
+		if err != nil {
+			return storeError("get workspace sync session", "workspace sync session", err)
+		}
+		if row.OwnerID != currentOwner {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		result, err = syncSessionDomain(ctx, tx, queries, row)
+		return err
+	})
 	if err != nil {
-		return workspace.SyncSession{}, storeError("get workspace sync session", "workspace sync session", err)
+		return workspace.SyncSession{}, err
 	}
-	return syncSessionDomain(ctx, s.q, row)
+	return result, nil
 }
 
 func (s *Store) ListDeviceWorkspaceSyncProgress(ctx context.Context, ownerID, workspaceID string) ([]workspace.DeviceSyncProgress, error) {
 	if !domain.ValidUserID(ownerID) || !domain.ValidWorkspaceID(workspaceID) {
 		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
-	rows, err := s.q.ListDeviceWorkspaceSyncProgress(ctx, sqlcgen.ListDeviceWorkspaceSyncProgressParams{ID: workspaceID, OwnerID: ownerID})
+	items := make([]workspace.DeviceSyncProgress, 0)
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		currentOwner, err := lockWorkspaceOwnershipForRead(ctx, tx, workspaceID)
+		if err != nil {
+			return err
+		}
+		if currentOwner != ownerID {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		rows, err := sqlcgen.New(tx).ListDeviceWorkspaceSyncProgress(ctx, sqlcgen.ListDeviceWorkspaceSyncProgressParams{ID: workspaceID, OwnerID: ownerID})
+		if err != nil {
+			return fmt.Errorf("list device workspace sync progress: %w", err)
+		}
+		items = make([]workspace.DeviceSyncProgress, 0, len(rows))
+		for _, row := range rows {
+			items = append(items, workspace.DeviceSyncProgress{
+				WorkspaceID: row.WorkspaceID, DeviceID: row.DeviceID, SessionID: row.SessionID,
+				Direction: workspace.SyncDirection(row.Direction), State: workspace.SyncState(row.State), Stage: workspace.SyncStage(row.Stage),
+				PlannedBytes: row.PlannedBytes, ConfirmedBytes: row.ConfirmedBytes,
+				DownloadActionsTotal: row.DownloadActionsTotal, DownloadActionsDone: row.DownloadActionsDone,
+				UpdatedAt: row.UpdatedAt.Time.UTC(),
+			})
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("list device workspace sync progress: %w", err)
-	}
-	items := make([]workspace.DeviceSyncProgress, 0, len(rows))
-	for _, row := range rows {
-		items = append(items, workspace.DeviceSyncProgress{
-			WorkspaceID: row.WorkspaceID, DeviceID: row.DeviceID, SessionID: row.SessionID,
-			Direction: workspace.SyncDirection(row.Direction), State: workspace.SyncState(row.State), Stage: workspace.SyncStage(row.Stage),
-			PlannedBytes: row.PlannedBytes, ConfirmedBytes: row.ConfirmedBytes,
-			DownloadActionsTotal: row.DownloadActionsTotal, DownloadActionsDone: row.DownloadActionsDone,
-			UpdatedAt: row.UpdatedAt.Time.UTC(),
-		})
+		return nil, err
 	}
 	return items, nil
 }
 
 func (s *Store) ListWorkspaceSyncTransferBlocks(ctx context.Context, workspaceID, sessionID string) ([]workspace.TransferBlock, error) {
+	return s.listWorkspaceSyncTransferBlocks(ctx, "", workspaceID, sessionID)
+}
+
+func (s *Store) ListWorkspaceSyncTransferBlocksForOwner(ctx context.Context, ownerID, workspaceID, sessionID string) ([]workspace.TransferBlock, error) {
+	if !domain.ValidUserID(ownerID) {
+		return nil, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	return s.listWorkspaceSyncTransferBlocks(ctx, ownerID, workspaceID, sessionID)
+}
+
+func (s *Store) listWorkspaceSyncTransferBlocks(ctx context.Context, ownerID, workspaceID, sessionID string) ([]workspace.TransferBlock, error) {
 	if !domain.ValidWorkspaceID(workspaceID) || !workspace.ValidSessionID(sessionID) {
 		return nil, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 	}
-	rows, err := s.q.ListWorkspaceSyncTransferBlocks(ctx, sqlcgen.ListWorkspaceSyncTransferBlocksParams{WorkspaceID: workspaceID, SessionID: sessionID})
+	blocks := make([]workspace.TransferBlock, 0)
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		currentOwner, err := lockWorkspaceOwnershipForRead(ctx, tx, workspaceID)
+		if err != nil {
+			return err
+		}
+		if ownerID != "" && ownerID != currentOwner {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		var sessionOwner string
+		if err := tx.QueryRow(ctx, `SELECT owner_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR SHARE`, workspaceID, sessionID).Scan(&sessionOwner); err != nil {
+			return storeError("get workspace sync session for transfer blocks", "workspace sync session", err)
+		}
+		if sessionOwner != currentOwner {
+			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		rows, err := sqlcgen.New(tx).ListWorkspaceSyncTransferBlocks(ctx, sqlcgen.ListWorkspaceSyncTransferBlocksParams{WorkspaceID: workspaceID, SessionID: sessionID})
+		if err != nil {
+			return fmt.Errorf("list workspace sync transfer blocks: %w", err)
+		}
+		blocks = make([]workspace.TransferBlock, 0, len(rows))
+		for _, row := range rows {
+			blocks = append(blocks, workspace.TransferBlock{
+				Chunk: workspace.Chunk{SHA256: row.Sha256, SizeBytes: row.SizeBytes}, Role: workspace.BlockRole(row.Role), Received: row.Received,
+			})
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("list workspace sync transfer blocks: %w", err)
-	}
-	blocks := make([]workspace.TransferBlock, 0, len(rows))
-	for _, row := range rows {
-		blocks = append(blocks, workspace.TransferBlock{
-			Chunk: workspace.Chunk{SHA256: row.Sha256, SizeBytes: row.SizeBytes}, Role: workspace.BlockRole(row.Role), Received: row.Received,
-		})
+		return nil, err
 	}
 	return blocks, nil
 }
@@ -581,10 +840,10 @@ func lockWorkspaceForSyncMutation(ctx context.Context, tx pgx.Tx, workspaceID st
 	if err := tx.QueryRow(ctx, `SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&lockedID); err != nil {
 		return storeError("lock workspace before sync session mutation", "workspace", err)
 	}
-	return nil
+	return requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID)
 }
 
-func (s *Store) withWorkspaceSyncSessionMutationTx(ctx context.Context, workspaceID, sessionID string, apply func(pgx.Tx) error) error {
+func (s *Store) withWorkspaceSyncSessionMutationTx(ctx context.Context, workspaceID, sessionID string, apply func(pgx.Tx) error, allowUnbindingVersionAdvance ...bool) error {
 	var ownerID, replicaID string
 	if err := s.pool.QueryRow(ctx, `SELECT owner_id, replica_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
 		Scan(&ownerID, &replicaID); err != nil {
@@ -607,7 +866,8 @@ func (s *Store) withWorkspaceSyncSessionMutationTx(ctx context.Context, workspac
 		return domain.NewError(domain.CodeWorkspaceConflict, "Host workspace sync replica does not match its session")
 	}
 	return s.withApprovedWorkspaceSyncOwnerReadTx(ctx, ownerID, func(tx pgx.Tx) error {
-		if err := lockWorkspaceSyncHostSessionAccess(ctx, tx, ownerID, workspaceID, sessionID, replica, true); err != nil {
+		allowStaleBindingCleanup := len(allowUnbindingVersionAdvance) > 0 && allowUnbindingVersionAdvance[0]
+		if err := lockWorkspaceSyncHostSessionAccess(ctx, tx, ownerID, workspaceID, sessionID, replica, true, allowStaleBindingCleanup); err != nil {
 			return err
 		}
 		return apply(tx)
@@ -857,7 +1117,7 @@ FROM workspace_sync_commit_receipts WHERE owner_id=$1 AND operation=$2 AND key=$
 		if row.OwnerID != idempotency.OwnerID {
 			return app.WorkspaceSyncCommitReceipt{}, domain.NewError(domain.CodeInternal, "workspace sync commit receipt owner does not match")
 		}
-		receipt.Result, err = syncSessionDomain(ctx, sqlcgen.New(tx), row)
+		receipt.Result, err = syncSessionDomain(ctx, tx, sqlcgen.New(tx), row)
 		if err != nil {
 			return app.WorkspaceSyncCommitReceipt{}, err
 		}
@@ -1073,7 +1333,7 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			return nil
 		}
 		if isTerminalSyncState(workspace.SyncState(row.State)) {
-			result, err = syncSessionDomain(ctx, q, row)
+			result, err = syncSessionDomain(ctx, tx, q, row)
 			if err != nil {
 				return err
 			}
@@ -1121,8 +1381,18 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		deletions := append([]string(nil), row.UploadDeletedPaths...)
 		uploadEmptyDirectories := nonNilStrings(row.UploadEmptyDirectories)
 		deletedDirectories := nonNilStrings(row.UploadDeletedDirectories)
+		directorySession := workspace.SyncSession{WorkspaceID: workspaceID, ID: sessionID}
+		if err := loadWorkspaceSyncSessionDirectories(ctx, tx, workspaceID, sessionID, &directorySession); err != nil {
+			return err
+		}
+		uploadDirectories := directorySession.UploadDirectories
 		directoryPaths := syncDirectoryMutationPaths(uploadEmptyDirectories, deletedDirectories)
-		mutationPaths := uniqueWorkspacePaths(append(syncMutationPaths(uploadFiles, deletions), directoryPaths...))
+		metadataPaths := make([]string, 0, len(uploadDirectories)+len(deletedDirectories))
+		for _, directory := range uploadDirectories {
+			metadataPaths = append(metadataPaths, directory.Path)
+		}
+		metadataPaths = append(metadataPaths, deletedDirectories...)
+		mutationPaths := uniqueWorkspacePaths(append(append(syncMutationPaths(uploadFiles, deletions), directoryPaths...), metadataPaths...))
 		pinnedFiles, err := loadWorkspaceRevisionFiles(ctx, tx, workspaceID, row.PinnedRevision, mutationPaths)
 		if err != nil {
 			return err
@@ -1143,6 +1413,16 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		currentByPath := fileMapByFoldedPath(currentFiles)
 		pinnedDirectoriesByPath := directoryMapByFoldedPath(pinnedDirectories)
 		currentDirectoriesByPath := directoryMapByFoldedPath(currentDirectories)
+		pinnedMetadata, err := loadWorkspaceRevisionDirectories(ctx, tx, workspaceID, row.PinnedRevision, metadataPaths)
+		if err != nil {
+			return err
+		}
+		currentMetadata, err := loadWorkspaceRevisionDirectories(ctx, tx, workspaceID, currentRevision, metadataPaths)
+		if err != nil {
+			return err
+		}
+		pinnedMetadataByPath := workspaceDirectoryMapByFoldedPath(pinnedMetadata)
+		currentMetadataByPath := workspaceDirectoryMapByFoldedPath(currentMetadata)
 		conflicts, err := decodeWorkspaceConflicts(row.Conflicts)
 		if err != nil {
 			return err
@@ -1228,6 +1508,52 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			}
 			directoryMutations = append(directoryMutations, syncDirectoryMutation{path: directory})
 		}
+		directoryMetadataMutations := make([]syncDirectoryMetadataMutation, 0, len(uploadDirectories)+len(deletedDirectories))
+		for _, directory := range uploadDirectories {
+			key := strings.ToLower(directory.Path)
+			if conflictPaths[key] {
+				continue
+			}
+			if _, currentFile := currentByPath[key]; currentFile {
+				conflicts = append(conflicts, workspace.Conflict{Path: directory.Path, Reason: "type_changed"})
+				conflictPaths[key] = true
+				continue
+			}
+			current, currentOK := currentMetadataByPath[key]
+			pinned, pinnedOK := pinnedMetadataByPath[key]
+			if currentOK && workspace.SameDirectoryMetadata(current, directory) {
+				continue
+			}
+			if currentOK != pinnedOK || currentOK && !workspace.SameDirectoryMetadata(current, pinned) {
+				conflicts = append(conflicts, workspace.Conflict{Path: directory.Path, Reason: "metadata_changed"})
+				conflictPaths[key] = true
+				continue
+			}
+			directoryMetadataMutations = append(directoryMetadataMutations, syncDirectoryMetadataMutation{path: directory.Path, directory: &directory})
+		}
+		for _, directory := range deletedDirectories {
+			key := strings.ToLower(directory)
+			if conflictPaths[key] {
+				continue
+			}
+			current, currentStored, err := currentDirectoryMetadataForPath(ctx, tx, workspaceID, currentRevision, directory)
+			if err != nil {
+				return err
+			}
+			pinned, pinnedStored, err := currentDirectoryMetadataForPath(ctx, tx, workspaceID, row.PinnedRevision, directory)
+			if err != nil {
+				return err
+			}
+			if !currentStored {
+				continue
+			}
+			if !pinnedStored || !workspace.SameDirectoryMetadata(current, pinned) {
+				conflicts = append(conflicts, workspace.Conflict{Path: directory, Reason: "metadata_changed"})
+				conflictPaths[key] = true
+				continue
+			}
+			directoryMetadataMutations = append(directoryMetadataMutations, syncDirectoryMetadataMutation{path: current.Path, delete: true})
+		}
 		for _, directory := range deletedDirectories {
 			key := strings.ToLower(directory)
 			current, currentOK := currentDirectoriesByPath[key]
@@ -1254,7 +1580,7 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		if err := ensureWorkspaceMutationsBlockUsageStored(ctx, tx, workspaceID, mutations); err != nil {
 			return err
 		}
-		if len(mutations) > 0 || len(directoryMutations) > 0 {
+		if len(mutations) > 0 || len(directoryMutations) > 0 || len(directoryMetadataMutations) > 0 {
 			var blockedByTaskFence bool
 			linkedTaskID, linkedOperationKey := "", ""
 			if row.TaskID.Valid {
@@ -1280,7 +1606,8 @@ EXISTS (SELECT 1 FROM task_hub_operations o WHERE o.workspace_id=$1 AND o.action
 		if _, err := tx.Exec(ctx, `SAVEPOINT workspace_sync_apply`); err != nil {
 			return fmt.Errorf("start workspace sync apply savepoint: %w", err)
 		}
-		if err := applyWorkspaceSyncTreeMutations(ctx, tx, workspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, mutations, directoryMutations); err != nil {
+		if err := applyWorkspaceSyncTreeMutations(ctx, tx, workspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes,
+			mutations, directoryMutations, directorySession.Directories, directoryMetadataMutations); err != nil {
 			if domain.CodeOf(err) != domain.CodeQuotaExceeded {
 				return err
 			}
@@ -1299,7 +1626,7 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 			return nil
 		}
 		targetRevision := currentRevision
-		if len(mutations) > 0 || len(directoryMutations) > 0 {
+		if len(mutations) > 0 || len(directoryMutations) > 0 || len(directoryMetadataMutations) > 0 {
 			targetRevision++
 		}
 		state := workspace.SyncCompleted
@@ -1332,7 +1659,7 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 		if err != nil {
 			return fmt.Errorf("read committed workspace sync session: %w", err)
 		}
-		result, err = syncSessionDomain(ctx, q, finalRow)
+		result, err = syncSessionDomain(ctx, tx, q, finalRow)
 		if err != nil {
 			return err
 		}
@@ -1368,6 +1695,8 @@ func (s *Store) CancelWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 	}
 	var result workspace.SyncSession
 	replayed := false
+	// Beginning unbind advances the binding fence. Let cancellation clean up a
+	// session from the previous version while the binding is still unbinding.
 	err := s.withWorkspaceSyncSessionMutationTx(ctx, workspaceID, sessionID, func(tx pgx.Tx) error {
 		deviceAccess, err := prepareWorkspaceSyncDeviceSessionMutation(ctx, tx, workspaceID, sessionID)
 		if err != nil {
@@ -1395,12 +1724,12 @@ func (s *Store) CancelWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key is bound to another sync session")
 		}
 		if wasReplay {
-			result, err = syncSessionDomain(ctx, q, row)
+			result, err = syncSessionDomain(ctx, tx, q, row)
 			replayed = err == nil
 			return err
 		}
 		if isTerminalSyncState(workspace.SyncState(row.State)) {
-			result, err = syncSessionDomain(ctx, q, row)
+			result, err = syncSessionDomain(ctx, tx, q, row)
 			return err
 		}
 		cancelled, err := q.CancelWorkspaceSyncSession(ctx, sqlcgen.CancelWorkspaceSyncSessionParams{WorkspaceID: workspaceID, ID: sessionID})
@@ -1410,9 +1739,9 @@ func (s *Store) CancelWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 		if err != nil {
 			return fmt.Errorf("cancel workspace sync session: %w", err)
 		}
-		result, err = syncSessionDomain(ctx, q, cancelled)
+		result, err = syncSessionDomain(ctx, tx, q, cancelled)
 		return err
-	})
+	}, true)
 	if err != nil {
 		return workspace.SyncSession{}, false, err
 	}
@@ -1486,7 +1815,8 @@ func validateSyncSession(value workspace.SyncSession) error {
 			return domain.InvalidArgument("sync_session", "workspace sync download file is invalid")
 		}
 	}
-	expectedActions := workspace.DownloadActionsForTreePlan(value.DownloadFiles, value.DownloadDeletedPaths, value.DownloadEmptyDirectories, value.DownloadDeletedDirectories)
+	expectedActions := workspace.DownloadActionsForTreePlanWithMetadata(
+		value.DownloadFiles, value.DownloadDeletedPaths, value.DownloadEmptyDirectories, value.DownloadDeletedDirectories, value.DownloadDirectories)
 	if len(value.DownloadActions) != len(expectedActions) {
 		return domain.InvalidArgument("sync_session", "workspace sync download actions do not match its plan")
 	}
@@ -1700,7 +2030,53 @@ func workspaceSyncSessionParams(value workspace.SyncSession) (sqlcgen.CreateWork
 	}, nil
 }
 
-func syncSessionDomain(ctx context.Context, q *sqlcgen.Queries, row sqlcgen.WorkspaceSyncSession) (workspace.SyncSession, error) {
+func persistWorkspaceSyncSessionDirectories(ctx context.Context, tx pgx.Tx, value workspace.SyncSession) error {
+	directories, err := marshalNonNilJSON(value.Directories)
+	if err != nil {
+		return fmt.Errorf("encode workspace sync directories: %w", err)
+	}
+	upload, err := marshalNonNilJSON(value.UploadDirectories)
+	if err != nil {
+		return fmt.Errorf("encode workspace sync upload directories: %w", err)
+	}
+	download, err := marshalNonNilJSON(value.DownloadDirectories)
+	if err != nil {
+		return fmt.Errorf("encode workspace sync download directories: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO workspace_sync_session_directories (workspace_id,session_id,directories,upload_directories,download_directories)
+VALUES ($1,$2,$3,$4,$5)`, value.WorkspaceID, value.ID, directories, upload, download); err != nil {
+		return fmt.Errorf("persist workspace sync directories: %w", err)
+	}
+	return nil
+}
+
+func loadWorkspaceSyncSessionDirectories(ctx context.Context, tx pgx.Tx, workspaceID, sessionID string, value *workspace.SyncSession) error {
+	var directories, upload, download []byte
+	err := tx.QueryRow(ctx, `SELECT directories,upload_directories,download_directories
+FROM workspace_sync_session_directories WHERE workspace_id=$1 AND session_id=$2`, workspaceID, sessionID).
+		Scan(&directories, &upload, &download)
+	if errors.Is(err, pgx.ErrNoRows) {
+		value.Directories, value.UploadDirectories, value.DownloadDirectories = []workspace.Directory{}, []workspace.Directory{}, []workspace.Directory{}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load workspace sync directory metadata: %w", err)
+	}
+	for _, entry := range []struct {
+		encoded []byte
+		target  *[]workspace.Directory
+	}{{directories, &value.Directories}, {upload, &value.UploadDirectories}, {download, &value.DownloadDirectories}} {
+		if err := json.Unmarshal(entry.encoded, entry.target); err != nil {
+			return fmt.Errorf("decode workspace sync directory metadata: %w", err)
+		}
+		if *entry.target == nil {
+			*entry.target = []workspace.Directory{}
+		}
+	}
+	return nil
+}
+
+func syncSessionDomain(ctx context.Context, tx pgx.Tx, q *sqlcgen.Queries, row sqlcgen.WorkspaceSyncSession) (workspace.SyncSession, error) {
 	var value workspace.SyncSession
 	if err := json.Unmarshal(row.Files, &value.Files); err != nil {
 		return workspace.SyncSession{}, fmt.Errorf("decode workspace sync request files: %w", err)
@@ -1744,6 +2120,9 @@ func syncSessionDomain(ctx context.Context, q *sqlcgen.Queries, row sqlcgen.Work
 	value.DeletedDirectories = nonNilStrings(row.DeletedDirectories)
 	value.UploadDeletedDirectories = nonNilStrings(row.UploadDeletedDirectories)
 	value.DownloadDeletedDirectories = nonNilStrings(row.DownloadDeletedDirectories)
+	if err := loadWorkspaceSyncSessionDirectories(ctx, tx, row.WorkspaceID, row.ID, &value); err != nil {
+		return workspace.SyncSession{}, err
+	}
 	if row.AckCursor.Valid {
 		value.AckCursor = &row.AckCursor.String
 	}
@@ -1781,7 +2160,8 @@ func syncSessionDomain(ctx context.Context, q *sqlcgen.Queries, row sqlcgen.Work
 	return value, nil
 }
 
-func workspaceFileFromRow(path string, size int64, digest string, mode int32, encodedChunks []byte) (workspace.File, error) {
+func workspaceFileFromRow(path string, size int64, digest string, mode int32, kind string, symlinkTarget pgtype.Text,
+	modTimeNS pgtype.Int8, hardlinkTo pgtype.Text, encodedChunks, encodedXattrs, encodedACL []byte, metadataKnown bool) (workspace.File, error) {
 	var chunks []workspace.Chunk
 	if err := json.Unmarshal(encodedChunks, &chunks); err != nil {
 		return workspace.File{}, fmt.Errorf("decode workspace file chunks: %w", err)
@@ -1789,11 +2169,77 @@ func workspaceFileFromRow(path string, size int64, digest string, mode int32, en
 	if chunks == nil {
 		chunks = []workspace.Chunk{}
 	}
-	file := workspace.File{Path: path, SizeBytes: size, SHA256: digest, Mode: uint32(mode), Chunks: chunks}
+	xattrs, acl, err := workspaceNativeMetadataFromRow(encodedXattrs, encodedACL)
+	if err != nil {
+		return workspace.File{}, fmt.Errorf("decode workspace file native metadata: %w", err)
+	}
+	file := workspace.File{Path: path, SizeBytes: size, SHA256: digest, Mode: uint32(mode), Kind: kind, Chunks: chunks, Xattrs: xattrs, ACL: acl, MetadataKnown: metadataKnown}
+	if symlinkTarget.Valid {
+		file.SymlinkTarget = symlinkTarget.String
+	}
+	if modTimeNS.Valid {
+		value := modTimeNS.Int64
+		file.ModTimeNS = &value
+	}
+	if hardlinkTo.Valid {
+		file.HardlinkTo = hardlinkTo.String
+	}
 	if err := workspace.ValidateFile(file); err != nil {
 		return workspace.File{}, domain.NewError(domain.CodeInternal, "stored workspace manifest file is invalid")
 	}
 	return file, nil
+}
+
+func workspaceNativeMetadataFromRow(encodedXattrs, encodedACL []byte) ([]workspace.ExtendedAttribute, *workspace.NativeACL, error) {
+	xattrs := make([]workspace.ExtendedAttribute, 0)
+	if len(encodedXattrs) > 0 {
+		if err := json.Unmarshal(encodedXattrs, &xattrs); err != nil {
+			return nil, nil, fmt.Errorf("decode workspace extended attributes: %w", err)
+		}
+	}
+	if xattrs == nil {
+		xattrs = []workspace.ExtendedAttribute{}
+	}
+	var acl *workspace.NativeACL
+	if len(encodedACL) > 0 && string(encodedACL) != "null" {
+		acl = &workspace.NativeACL{}
+		if err := json.Unmarshal(encodedACL, acl); err != nil {
+			return nil, nil, fmt.Errorf("decode workspace native ACL: %w", err)
+		}
+	}
+	return xattrs, acl, nil
+}
+
+func workspaceNativeMetadataJSON(xattrs []workspace.ExtendedAttribute, acl *workspace.NativeACL) ([]byte, []byte, error) {
+	if xattrs == nil {
+		xattrs = []workspace.ExtendedAttribute{}
+	}
+	encodedXattrs, err := json.Marshal(xattrs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode workspace extended attributes: %w", err)
+	}
+	if acl == nil {
+		return encodedXattrs, nil, nil
+	}
+	encodedACL, err := json.Marshal(acl)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode workspace native ACL: %w", err)
+	}
+	return encodedXattrs, encodedACL, nil
+}
+
+func workspaceSymlinkTargetText(file workspace.File) pgtype.Text {
+	if workspace.CanonicalFileKind(file.Kind) != workspace.FileKindSymlink {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: file.SymlinkTarget, Valid: true}
+}
+
+func workspaceHardlinkTargetText(file workspace.File) pgtype.Text {
+	if file.HardlinkTo == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: file.HardlinkTo, Valid: true}
 }
 
 func decodeWorkspaceFiles(encoded []byte) ([]workspace.File, error) {
@@ -1850,7 +2296,7 @@ func loadWorkspaceRevisionFiles(ctx context.Context, tx pgx.Tx, workspaceID stri
 		return []workspace.File{}, nil
 	}
 	rows, err := tx.Query(ctx, `
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2
   AND (valid_to_revision IS NULL OR valid_to_revision > $2)
@@ -1861,14 +2307,18 @@ WHERE workspace_id=$1 AND valid_from_revision <= $2
 	defer rows.Close()
 	files := make([]workspace.File, 0, len(paths))
 	for rows.Next() {
-		var path, digest string
+		var path, digest, kind string
 		var size int64
 		var mode int32
-		var chunks []byte
-		if err := rows.Scan(&path, &size, &digest, &mode, &chunks); err != nil {
+		var symlinkTarget pgtype.Text
+		var modTimeNS pgtype.Int8
+		var hardlinkTo pgtype.Text
+		var chunks, xattrs, acl []byte
+		var metadataKnown bool
+		if err := rows.Scan(&path, &size, &digest, &mode, &kind, &symlinkTarget, &modTimeNS, &hardlinkTo, &chunks, &xattrs, &acl, &metadataKnown); err != nil {
 			return nil, fmt.Errorf("scan workspace revision file: %w", err)
 		}
-		file, err := workspaceFileFromRow(path, size, digest, mode, chunks)
+		file, err := workspaceFileFromRow(path, size, digest, mode, kind, symlinkTarget, modTimeNS, hardlinkTo, chunks, xattrs, acl, metadataKnown)
 		if err != nil {
 			return nil, err
 		}
@@ -1908,6 +2358,71 @@ WHERE workspace_id=$1 AND valid_from_revision <= $2
 	return directories, nil
 }
 
+func loadWorkspaceRevisionDirectories(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, paths []string) ([]workspace.Directory, error) {
+	if len(paths) == 0 {
+		return []workspace.Directory{}, nil
+	}
+	rows, err := tx.Query(ctx, `
+SELECT directory_path, mode, mod_time_ns, xattrs, acl, metadata_known
+FROM workspace_revision_directories
+WHERE workspace_id=$1 AND valid_from_revision <= $2
+  AND (valid_to_revision IS NULL OR valid_to_revision > $2)
+  AND folded_path = ANY($3::text[])
+ORDER BY directory_path`, workspaceID, revision, lowerWorkspacePaths(paths))
+	if err != nil {
+		return nil, fmt.Errorf("load workspace revision directories: %w", err)
+	}
+	defer rows.Close()
+	directoriesByPath := make(map[string]workspace.Directory, len(paths))
+	for rows.Next() {
+		var value workspace.Directory
+		var mode pgtype.Int4
+		var modified pgtype.Int8
+		var xattrs, acl []byte
+		if err := rows.Scan(&value.Path, &mode, &modified, &xattrs, &acl, &value.MetadataKnown); err != nil {
+			return nil, fmt.Errorf("scan workspace revision directory: %w", err)
+		}
+		if value.Path != "." && workspace.ValidateRelativePath(value.Path) != nil || mode.Valid && (mode.Int32 < 0 || mode.Int32 > 0o777) {
+			return nil, domain.NewError(domain.CodeInternal, "stored workspace directory metadata is invalid")
+		}
+		value.Xattrs, value.ACL, err = workspaceNativeMetadataFromRow(xattrs, acl)
+		if err != nil {
+			return nil, domain.NewError(domain.CodeInternal, "stored workspace directory metadata is invalid")
+		}
+		if mode.Valid {
+			permissions := uint32(mode.Int32)
+			value.Mode = &permissions
+		}
+		if modified.Valid {
+			value.ModTimeNS = &modified.Int64
+		}
+		if err := workspace.ValidateDirectory(value, false); err != nil {
+			return nil, domain.NewError(domain.CodeInternal, "stored workspace directory metadata is invalid")
+		}
+		directoriesByPath[strings.ToLower(value.Path)] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspace revision directories: %w", err)
+	}
+	orderedPaths := append([]string(nil), paths...)
+	sort.Strings(orderedPaths)
+	directories := make([]workspace.Directory, 0, len(orderedPaths))
+	for _, path := range orderedPaths {
+		if path != "." && workspace.ValidateRelativePath(path) != nil {
+			return nil, domain.NewError(domain.CodeInternal, "requested workspace directory metadata path is invalid")
+		}
+		if value, exists := directoriesByPath[strings.ToLower(path)]; exists {
+			if value.Path != path {
+				return nil, domain.NewError(domain.CodeInternal, "stored workspace directory path differs from the revision tree")
+			}
+			directories = append(directories, value)
+			continue
+		}
+		directories = append(directories, workspace.Directory{Path: path})
+	}
+	return directories, nil
+}
+
 func lowerWorkspacePaths(paths []string) []string {
 	lowered := make([]string, len(paths))
 	for i, path := range paths {
@@ -1924,6 +2439,14 @@ func fileMapByFoldedPath(files []workspace.File) map[string]workspace.File {
 	return result
 }
 
+func workspaceDirectoryMapByFoldedPath(directories []workspace.Directory) map[string]workspace.Directory {
+	result := make(map[string]workspace.Directory, len(directories))
+	for _, directory := range directories {
+		result[strings.ToLower(directory.Path)] = directory
+	}
+	return result
+}
+
 func directoryMapByFoldedPath(directories []string) map[string]string {
 	result := make(map[string]string, len(directories))
 	for _, directory := range directories {
@@ -1933,7 +2456,32 @@ func directoryMapByFoldedPath(directories []string) map[string]string {
 }
 
 func sameWorkspaceFile(left, right workspace.File) bool {
-	return left.Path == right.Path && left.SizeBytes == right.SizeBytes && left.SHA256 == right.SHA256 && left.Mode == right.Mode
+	if left.Path != right.Path || left.SizeBytes != right.SizeBytes || left.SHA256 != right.SHA256 || left.Mode != right.Mode ||
+		left.HardlinkTo != right.HardlinkTo || workspace.CanonicalFileKind(left.Kind) != workspace.CanonicalFileKind(right.Kind) ||
+		left.SymlinkTarget != right.SymlinkTarget || left.MetadataKnown != right.MetadataKnown ||
+		!sameWorkspaceNativeMetadata(left.Xattrs, right.Xattrs, left.ACL, right.ACL) {
+		return false
+	}
+	return left.ModTimeNS == nil && right.ModTimeNS == nil || left.ModTimeNS != nil && right.ModTimeNS != nil && *left.ModTimeNS == *right.ModTimeNS
+}
+
+func sameWorkspaceNativeMetadata(leftXattrs, rightXattrs []workspace.ExtendedAttribute, leftACL, rightACL *workspace.NativeACL) bool {
+	if len(leftXattrs) != len(rightXattrs) || (leftACL == nil) != (rightACL == nil) {
+		return false
+	}
+	for index := range leftXattrs {
+		if leftXattrs[index].Name != rightXattrs[index].Name || !bytes.Equal(leftXattrs[index].Value, rightXattrs[index].Value) {
+			return false
+		}
+	}
+	return leftACL == nil || leftACL.Platform == rightACL.Platform && leftACL.Format == rightACL.Format && bytes.Equal(leftACL.Data, rightACL.Data)
+}
+
+func workspaceFileModTimeNS(value *int64) pgtype.Int8 {
+	if value == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *value, Valid: true}
 }
 
 func stringPointer(value string) *string { return &value }
@@ -1955,13 +2503,32 @@ type syncDirectoryMutation struct {
 	delete bool
 }
 
-func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID string, revision, currentFileCount, currentBytes, quotaBytes int64, fileMutations []syncMutation, directoryMutations []syncDirectoryMutation) error {
-	if len(fileMutations)+len(directoryMutations) == 0 {
+type syncDirectoryMetadataMutation struct {
+	path      string
+	directory *workspace.Directory
+	delete    bool
+}
+
+func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID string, revision, currentFileCount, currentBytes, quotaBytes int64,
+	fileMutations []syncMutation, directoryMutations []syncDirectoryMutation, assertedDirectoryMetadata []workspace.Directory,
+	metadataMutationGroups ...[]syncDirectoryMetadataMutation) error {
+	var metadataMutations []syncDirectoryMetadataMutation
+	for _, group := range metadataMutationGroups {
+		metadataMutations = append(metadataMutations, group...)
+	}
+	if len(fileMutations)+len(directoryMutations)+len(metadataMutations) == 0 {
 		return nil
 	}
 	filePlans := make(map[string]syncMutation, len(fileMutations))
 	directoryPlans := make(map[string]syncDirectoryMutation, len(directoryMutations))
-	allPaths := make([]string, 0, len(fileMutations)+len(directoryMutations))
+	metadataPlans := make(map[string]syncDirectoryMetadataMutation, len(metadataMutations))
+	assertedDirectoryTimes := make(map[string]struct{}, len(assertedDirectoryMetadata))
+	for _, directory := range assertedDirectoryMetadata {
+		if directory.ModTimeNS != nil && (directory.Path == "." || workspace.ValidateRelativePath(directory.Path) == nil) {
+			assertedDirectoryTimes[strings.ToLower(directory.Path)] = struct{}{}
+		}
+	}
+	allPaths := make([]string, 0, len(fileMutations)+len(directoryMutations)+len(metadataMutations))
 	for _, mutation := range fileMutations {
 		if err := workspace.ValidateRelativePath(mutation.path); err != nil {
 			return domain.InvalidArgument("sync_session", "workspace file mutation path is invalid")
@@ -1981,6 +2548,19 @@ func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID
 		}
 		key := strings.ToLower(mutation.path)
 		directoryPlans[key] = mutation
+		allPaths = append(allPaths, mutation.path)
+	}
+	for _, mutation := range metadataMutations {
+		if mutation.path != "." && workspace.ValidateRelativePath(mutation.path) != nil {
+			return domain.InvalidArgument("sync_session", "workspace directory metadata path is invalid")
+		}
+		if mutation.directory != nil {
+			if err := workspace.ValidateDirectory(*mutation.directory, false); err != nil || mutation.directory.Path != mutation.path {
+				return domain.InvalidArgument("sync_session", "workspace directory metadata mutation is invalid")
+			}
+		}
+		key := strings.ToLower(mutation.path)
+		metadataPlans[key] = mutation
 		allPaths = append(allPaths, mutation.path)
 	}
 	allPaths = uniqueWorkspacePaths(allPaths)
@@ -2045,7 +2625,7 @@ func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID
 		}
 		finalStates[key] = final
 	}
-	if len(finalStates) == 0 {
+	if len(finalStates) == 0 && len(metadataPlans) == 0 {
 		return nil
 	}
 	if currentBytes < 0 || deltaBytes > 0 && currentBytes > int64(^uint64(0)>>1)-deltaBytes || deltaBytes < 0 && deltaBytes < -currentBytes || currentFileCount+deltaFiles < 0 {
@@ -2071,9 +2651,10 @@ func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID
 		return fmt.Errorf("create workspace tree revision: %w", err)
 	}
 	type changeEvent struct {
-		path   string
-		action workspace.ChangeAction
-		file   *workspace.File
+		path      string
+		action    workspace.ChangeAction
+		file      *workspace.File
+		directory *workspace.Directory
 	}
 	events := make([]changeEvent, 0, len(finalStates)+1)
 	for key, final := range finalStates {
@@ -2103,9 +2684,16 @@ func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID
 			if err != nil {
 				return fmt.Errorf("encode workspace file chunks: %w", err)
 			}
+			xattrsJSON, aclJSON, err := workspaceNativeMetadataJSON(final.file.Xattrs, final.file.ACL)
+			if err != nil {
+				return err
+			}
 			if err := q.InsertWorkspaceRevisionFile(ctx, sqlcgen.InsertWorkspaceRevisionFileParams{
 				WorkspaceID: workspaceID, ValidFromRevision: nextRevision, FilePath: final.file.Path, FoldedPath: strings.ToLower(final.file.Path),
-				SizeBytes: final.file.SizeBytes, Sha256: final.file.SHA256, Mode: int32(final.file.Mode), Chunks: chunksJSON,
+				SizeBytes: final.file.SizeBytes, Sha256: final.file.SHA256, Mode: int32(final.file.Mode),
+				Kind: workspace.CanonicalFileKind(final.file.Kind), SymlinkTarget: workspaceSymlinkTargetText(*final.file),
+				ModTimeNs: workspaceFileModTimeNS(final.file.ModTimeNS), HardlinkTo: workspaceHardlinkTargetText(*final.file),
+				Chunks: chunksJSON, Xattrs: xattrsJSON, Acl: aclJSON, MetadataKnown: final.file.MetadataKnown,
 			}); err != nil {
 				return fmt.Errorf("insert workspace file revision: %w", err)
 			}
@@ -2116,10 +2704,10 @@ func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID
 				return fmt.Errorf("insert workspace empty-directory revision: %w", err)
 			}
 		}
-		if hadFile && final.path != "" && !strings.EqualFold(oldFile.Path, final.path) {
+		if hadFile && final.path != "" && oldFile.Path != final.path {
 			events = append(events, changeEvent{path: oldFile.Path, action: workspace.ChangeDelete})
 		}
-		if hadDirectory && final.path != "" && !strings.EqualFold(oldDirectory, final.path) {
+		if hadDirectory && final.path != "" && oldDirectory != final.path {
 			events = append(events, changeEvent{path: oldDirectory, action: workspace.ChangeDirectoryDelete})
 		}
 		switch final.kind {
@@ -2140,21 +2728,91 @@ func applyWorkspaceSyncTreeMutations(ctx context.Context, tx pgx.Tx, workspaceID
 	if err := ensureWorkspaceTreeShape(ctx, tx, workspaceID, nextRevision); err != nil {
 		return err
 	}
+	if err := ensureWorkspaceHardlinkShape(ctx, tx, workspaceID, nextRevision); err != nil {
+		return err
+	}
+	for key, mutation := range metadataPlans {
+		_, exists, err := currentDirectoryMetadataForPath(ctx, tx, workspaceID, revision, mutation.path)
+		if err != nil {
+			return err
+		}
+		if exists {
+			closed, err := tx.Exec(ctx, `UPDATE workspace_revision_directories SET valid_to_revision=$3
+WHERE workspace_id=$1 AND folded_path=$2 AND valid_to_revision IS NULL AND valid_from_revision < $3`, workspaceID, key, nextRevision)
+			if err != nil {
+				return fmt.Errorf("close prior workspace directory metadata: %w", err)
+			}
+			if closed.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "workspace directory metadata changed during tree apply")
+			}
+		}
+		if mutation.directory != nil {
+			exists, err := workspaceDirectoryExistsAtRevision(ctx, tx, workspaceID, nextRevision, mutation.path)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return domain.NewError(domain.CodeWorkspaceConflict, "workspace directory metadata path is absent from the resulting tree")
+			}
+			xattrsJSON, aclJSON, err := workspaceNativeMetadataJSON(mutation.directory.Xattrs, mutation.directory.ACL)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO workspace_revision_directories
+(workspace_id,valid_from_revision,directory_path,folded_path,mode,mod_time_ns,xattrs,acl,metadata_known) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+				workspaceID, nextRevision, mutation.directory.Path, key, workspaceDirectoryMode(mutation.directory.Mode),
+				workspaceDirectoryModTime(mutation.directory.ModTimeNS), xattrsJSON, aclJSON, mutation.directory.MetadataKnown); err != nil {
+				return fmt.Errorf("insert workspace directory metadata revision: %w", err)
+			}
+			events = append(events, changeEvent{path: mutation.path, action: workspace.ChangeDirectoryUpsert})
+		} else if mutation.delete {
+			events = append(events, changeEvent{path: mutation.path, action: workspace.ChangeDirectoryDelete})
+		}
+	}
+	structuralPaths := make([]string, 0, len(fileMutations)+len(directoryMutations))
+	for _, mutation := range fileMutations {
+		structuralPaths = append(structuralPaths, mutation.path)
+	}
+	for _, mutation := range directoryMutations {
+		structuralPaths = append(structuralPaths, mutation.path)
+	}
+	invalidatedEvents, err := invalidateWorkspaceDirectoryTimes(ctx, tx, workspaceID, nextRevision, revision, structuralPaths, allPaths, metadataPlans, assertedDirectoryTimes)
+	if err != nil {
+		return err
+	}
+	for _, eventPath := range invalidatedEvents {
+		events = append(events, changeEvent{path: eventPath, action: workspace.ChangeDirectoryUpsert})
+	}
 	seenEvents := make(map[string]struct{}, len(events))
 	for _, event := range events {
 		if _, exists := seenEvents[event.path]; exists {
 			continue
 		}
 		seenEvents[event.path] = struct{}{}
-		var fileJSON []byte
+		var fileJSON, directoryJSON []byte
 		if event.file != nil {
 			fileJSON, err = json.Marshal(event.file)
 			if err != nil {
 				return fmt.Errorf("encode workspace revision change: %w", err)
 			}
+		} else if event.action == workspace.ChangeDirectoryUpsert {
+			directory := event.directory
+			if directory == nil {
+				if value, exists, err := currentDirectoryMetadataForPath(ctx, tx, workspaceID, nextRevision, event.path); err != nil {
+					return err
+				} else if exists {
+					directory = &value
+				}
+			}
+			if directory != nil {
+				directoryJSON, err = json.Marshal(directory)
+				if err != nil {
+					return fmt.Errorf("encode workspace directory revision change: %w", err)
+				}
+			}
 		}
 		if err := q.InsertWorkspaceChange(ctx, sqlcgen.InsertWorkspaceChangeParams{
-			WorkspaceID: workspaceID, Revision: nextRevision, FilePath: event.path, Action: string(event.action), File: fileJSON,
+			WorkspaceID: workspaceID, Revision: nextRevision, FilePath: event.path, Action: string(event.action), File: fileJSON, Directory: directoryJSON,
 		}); err != nil {
 			return fmt.Errorf("record workspace tree change: %w", err)
 		}
@@ -2183,6 +2841,144 @@ WHERE workspace_id=$1 AND state IN ('preparing','active','unbinding') AND desire
 		return fmt.Errorf("advance bound host workspace revisions: %w", err)
 	}
 	return nil
+}
+
+func workspaceDirectoryMode(value *uint32) pgtype.Int4 {
+	if value == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(*value), Valid: true}
+}
+
+func workspaceDirectoryModTime(value *int64) pgtype.Int8 {
+	if value == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *value, Valid: true}
+}
+
+func currentDirectoryMetadataForPath(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, path string) (workspace.Directory, bool, error) {
+	var value workspace.Directory
+	var mode pgtype.Int4
+	var modified pgtype.Int8
+	var xattrs, acl []byte
+	err := tx.QueryRow(ctx, `SELECT directory_path,mode,mod_time_ns,xattrs,acl,metadata_known FROM workspace_revision_directories
+WHERE workspace_id=$1 AND folded_path=$2 AND valid_from_revision <= $3 AND (valid_to_revision IS NULL OR valid_to_revision > $3)`,
+		workspaceID, strings.ToLower(path), revision).Scan(&value.Path, &mode, &modified, &xattrs, &acl, &value.MetadataKnown)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return workspace.Directory{}, false, nil
+	}
+	if err != nil {
+		return workspace.Directory{}, false, fmt.Errorf("read current workspace directory metadata: %w", err)
+	}
+	if mode.Valid {
+		permissions := uint32(mode.Int32)
+		value.Mode = &permissions
+	}
+	if modified.Valid {
+		value.ModTimeNS = &modified.Int64
+	}
+	value.Xattrs, value.ACL, err = workspaceNativeMetadataFromRow(xattrs, acl)
+	if err != nil || workspace.ValidateDirectory(value, false) != nil {
+		return workspace.Directory{}, false, domain.NewError(domain.CodeInternal, "stored workspace directory metadata is invalid")
+	}
+	return value, true, nil
+}
+
+func workspaceDirectoryExistsAtRevision(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64, path string) (bool, error) {
+	if path == "." {
+		return true, nil
+	}
+	var exists bool
+	err := tx.QueryRow(ctx, `SELECT
+EXISTS (SELECT 1 FROM workspace_revision_files f WHERE f.workspace_id=$1 AND f.valid_from_revision <= $2
+  AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $2) AND starts_with(f.folded_path, $3 || '/')) OR
+EXISTS (SELECT 1 FROM workspace_revision_empty_directories d WHERE d.workspace_id=$1 AND d.valid_from_revision <= $2
+  AND (d.valid_to_revision IS NULL OR d.valid_to_revision > $2) AND (d.folded_path=$3 OR starts_with(d.folded_path, $3 || '/')))`,
+		workspaceID, revision, strings.ToLower(path)).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check workspace directory in resulting tree: %w", err)
+	}
+	return exists, nil
+}
+
+func invalidateWorkspaceDirectoryTimes(ctx context.Context, tx pgx.Tx, workspaceID string, nextRevision, currentRevision int64,
+	structuralPaths, allPaths []string, metadataPlans map[string]syncDirectoryMetadataMutation, assertedDirectoryTimes map[string]struct{}) ([]string, error) {
+	candidates := make(map[string]string)
+	for _, path := range directoryAncestorPaths(structuralPaths) {
+		candidates[strings.ToLower(path)] = path
+	}
+	for _, path := range allPaths {
+		candidates[strings.ToLower(path)] = path
+	}
+	paths := make([]string, 0, len(candidates))
+	for _, path := range candidates {
+		paths = append(paths, path)
+	}
+	metadata, err := loadWorkspaceRevisionDirectories(ctx, tx, workspaceID, currentRevision, paths)
+	if err != nil {
+		return nil, err
+	}
+	byPath := workspaceDirectoryMapByFoldedPath(metadata)
+	events := make([]string, 0)
+	for key, old := range byPath {
+		if _, explicitlyChanged := metadataPlans[key]; explicitlyChanged {
+			continue
+		}
+		if _, asserted := assertedDirectoryTimes[key]; asserted {
+			continue
+		}
+		exists, err := workspaceDirectoryExistsAtRevision(ctx, tx, workspaceID, nextRevision, old.Path)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			if _, err := tx.Exec(ctx, `UPDATE workspace_revision_directories SET valid_to_revision=$3
+WHERE workspace_id=$1 AND folded_path=$2 AND valid_to_revision IS NULL AND valid_from_revision < $3`, workspaceID, key, nextRevision); err != nil {
+				return nil, fmt.Errorf("close removed workspace directory metadata: %w", err)
+			}
+			continue
+		}
+		if old.ModTimeNS == nil {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE workspace_revision_directories SET valid_to_revision=$3
+WHERE workspace_id=$1 AND folded_path=$2 AND valid_to_revision IS NULL AND valid_from_revision < $3`, workspaceID, key, nextRevision); err != nil {
+			return nil, fmt.Errorf("close stale workspace directory timestamp: %w", err)
+		}
+		xattrsJSON, aclJSON, err := workspaceNativeMetadataJSON(old.Xattrs, old.ACL)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_revision_directories
+(workspace_id,valid_from_revision,directory_path,folded_path,mode,mod_time_ns,xattrs,acl,metadata_known) VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8)`,
+			workspaceID, nextRevision, old.Path, key, workspaceDirectoryMode(old.Mode), xattrsJSON, aclJSON, old.MetadataKnown); err != nil {
+			return nil, fmt.Errorf("record unknown workspace directory timestamp: %w", err)
+		}
+		events = append(events, old.Path)
+	}
+	return events, nil
+}
+
+func directoryAncestorPaths(paths []string) []string {
+	seen := make(map[string]string)
+	for _, value := range paths {
+		seen["."] = "."
+		parts := strings.Split(value, "/")
+		prefix := ""
+		for index, part := range parts[:len(parts)-1] {
+			if index > 0 {
+				prefix += "/"
+			}
+			prefix += part
+			seen[strings.ToLower(prefix)] = prefix
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for _, path := range seen {
+		result = append(result, path)
+	}
+	return result
 }
 
 func uniqueWorkspacePaths(paths []string) []string {
@@ -2218,6 +3014,31 @@ SELECT EXISTS (
 	}
 	if invalid {
 		return domain.InvalidArgument("manifest", "workspace tree contains a file-prefix conflict or non-empty directory")
+	}
+	return nil
+}
+
+func ensureWorkspaceHardlinkShape(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64) error {
+	var invalid bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM workspace_revision_files f
+  WHERE f.workspace_id=$1 AND f.valid_from_revision <= $2 AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $2)
+    AND f.hardlink_to IS NOT NULL AND (
+      f.hardlink_to COLLATE "C" >= f.file_path COLLATE "C" OR
+      NOT EXISTS (
+        SELECT 1 FROM workspace_revision_files a
+        WHERE a.workspace_id=f.workspace_id AND a.file_path=f.hardlink_to
+          AND a.valid_from_revision <= $2 AND (a.valid_to_revision IS NULL OR a.valid_to_revision > $2)
+          AND a.kind='file' AND a.symlink_target IS NULL AND a.hardlink_to IS NULL
+          AND a.size_bytes=f.size_bytes AND a.sha256=f.sha256 AND a.mode=f.mode
+          AND a.mod_time_ns IS NOT DISTINCT FROM f.mod_time_ns AND a.chunks=f.chunks
+      )
+    )
+)`, workspaceID, revision).Scan(&invalid); err != nil {
+		return fmt.Errorf("validate workspace hardlink relations: %w", err)
+	}
+	if invalid {
+		return domain.InvalidArgument("manifest", "workspace tree contains an invalid hardlink relation")
 	}
 	return nil
 }

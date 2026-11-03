@@ -162,7 +162,7 @@ func (s *Store) populateHostWorkspaceBindings(ctx context.Context, hosts []host.
 func (s *Store) GetWorkspace(ctx context.Context, id string) (workspace.Workspace, error) {
 	row, err := s.q.GetWorkspace(ctx, id)
 	if err != nil {
-		return workspace.Workspace{}, storeError("get workspace", "workspace", err)
+		return workspace.Workspace{}, err
 	}
 	return workspaceDomain(row), nil
 }
@@ -207,6 +207,10 @@ func (s *Store) CreateWorkspace(ctx context.Context, value workspace.Workspace, 
 		if err != nil {
 			return fmt.Errorf("create workspace: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_ownership_history (workspace_id,owner_id,transfer_id)
+VALUES ($1,$2,NULL)`, value.ID, value.OwnerID); err != nil {
+			return fmt.Errorf("record initial workspace owner: %w", err)
+		}
 		if err := sqlcgen.New(tx).CreateWorkspaceRevision(ctx, sqlcgen.CreateWorkspaceRevisionParams{
 			WorkspaceID: value.ID, Revision: 0, FileCount: 0, TotalBytes: 0,
 		}); err != nil {
@@ -215,6 +219,10 @@ func (s *Store) CreateWorkspace(ctx context.Context, value workspace.Workspace, 
 		if _, err := tx.Exec(ctx, `INSERT INTO workspace_current_materializations
 (workspace_id, desired_revision, applied_revision) VALUES ($1, 0, -1)`, value.ID); err != nil {
 			return fmt.Errorf("create initial Workspace current materialization: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_volumes (workspace_id, owner_id, provisioned_owner_id, state, volume_name)
+VALUES ($1, $2, $2, 'pending', $3)`, value.ID, value.OwnerID, app.WorkspaceNamedVolumeName(value.ID)); err != nil {
+			return fmt.Errorf("register pending workspace volume: %w", err)
 		}
 		created = workspaceDomain(row)
 		return nil
@@ -301,7 +309,7 @@ func (s *Store) UpdateUserWithAudit(ctx context.Context, actorID string, expecte
 	return s.updateUser(ctx, actorID, expectedStatus, value, &params, disableRelay)
 }
 
-func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, auditParams *sqlcgen.CreateAuditLogParams, disableRelay func(context.Context) error) (identity.User, error) {
+func (s *Store) updateUser(ctx context.Context, actorID string, expectedStatus identity.AccountStatus, value identity.User, userUpdateAudit *sqlcgen.CreateAuditLogParams, disableRelay func(context.Context) error) (identity.User, error) {
 	if !domain.ValidUserID(value.ID) || !expectedStatus.Valid() || !value.Status.Valid() ||
 		(value.Role != identity.RoleUser && value.Role != identity.RoleAdmin && value.Role != identity.RoleSuperAdmin) ||
 		value.QuotaHosts < 0 || value.QuotaCPUMilli < 0 || value.QuotaMemMiB < 0 || value.DefaultHostCPUMilli <= 0 || value.DefaultHostMemMiB <= 0 {
@@ -335,6 +343,16 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 		}
 		if value.Status != current.Status && !current.Status.CanTransitionTo(value.Status) {
 			return domain.NewError(domain.CodeConflict, "account status transition is not allowed")
+		}
+		firstApproval := userUpdateAudit != nil && value.Status == identity.StatusApproved &&
+			(current.Status == identity.StatusPending || current.Status == identity.StatusRejected)
+		var defaultModelBudget app.ModelBudgetDefault
+		if firstApproval {
+			var err error
+			defaultModelBudget, err = loadModelBudgetDefaultInTx(ctx, tx)
+			if err != nil {
+				return err
+			}
 		}
 		if value.Role != current.Role && (current.Status != identity.StatusApproved || value.Status != identity.StatusApproved) {
 			return domain.NewError(domain.CodeConflict, "only approved accounts may change role")
@@ -380,6 +398,27 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 			return storeError("update user", "user", err)
 		}
 		updated = userDomain(row)
+		if firstApproval {
+			result, err := tx.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent)
+VALUES ($1,$2,$3) ON CONFLICT (owner_id) DO NOTHING`, value.ID, defaultModelBudget.TokenLimit, defaultModelBudget.MaxConcurrent)
+			if err != nil {
+				return fmt.Errorf("grant default model budget during account approval: %w", err)
+			}
+			if result.RowsAffected() == 1 {
+				grantAudit, err := auditParams(audit.Entry{
+					ActorID: userUpdateAudit.ActorID, ActorKind: audit.ActorKind(userUpdateAudit.ActorKind),
+					Action: audit.ActionModelBudgetUpdate, Target: value.ID, IP: userUpdateAudit.Ip,
+					Detail: map[string]any{"configured": false, "token_limit": defaultModelBudget.TokenLimit,
+						"max_concurrent": defaultModelBudget.MaxConcurrent, "source": "registration_review"},
+				})
+				if err != nil {
+					return err
+				}
+				if _, err := sqlcgen.New(tx).CreateAuditLog(ctx, grantAudit); err != nil {
+					return fmt.Errorf("audit default model budget grant: %w", err)
+				}
+			}
+		}
 		if identityChanged {
 			if err := stopAllOwnerTasks(ctx, tx, value.ID); err != nil {
 				return err
@@ -398,8 +437,8 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 				return err
 			}
 		}
-		if auditParams != nil {
-			if _, err := sqlcgen.New(tx).CreateAuditLog(ctx, *auditParams); err != nil {
+		if userUpdateAudit != nil {
+			if _, err := sqlcgen.New(tx).CreateAuditLog(ctx, *userUpdateAudit); err != nil {
 				return fmt.Errorf("write user update audit: %w", err)
 			}
 		}

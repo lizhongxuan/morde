@@ -326,6 +326,29 @@ func TestCreateCandidateReleaseRejectsOversizedRevisionBeforeReservingQuota(t *t
 	}
 }
 
+func TestCreateCandidateReleaseRejectsWorkspaceSymlink(t *testing.T) {
+	store, pool, ownerID, hostID, workspaceID := createSiteTestFixture(t)
+	ctx := context.Background()
+	siteValue := newTestSite(t, ownerID, hostID, workspaceID)
+	created, err := store.CreateSite(ctx, siteValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "../index.html"
+	digest := sha256.Sum256([]byte(target))
+	if _, err := pool.Exec(ctx, `INSERT INTO workspace_revision_files
+(workspace_id,valid_from_revision,file_path,folded_path,size_bytes,sha256,mode,kind,symlink_target,chunks)
+VALUES ($1,1,'a/link','a/link',$2,$3,0,'symlink',$4,'[]'::jsonb)`, workspaceID, len([]byte(target)), hex.EncodeToString(digest[:]), target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_revisions SET file_count=1,total_bytes=$2 WHERE workspace_id=$1 AND revision=1`, workspaceID, len([]byte(target))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateCandidateRelease(ctx, newTestCandidate(t, created.ID, workspaceID), 1<<20, testSiteOwnerMaxBytes); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("CreateCandidateRelease() with symlink = %v; want invalid state", err)
+	}
+}
+
 func TestCompleteSiteReleaseMaterializationVerifiesPinnedRevisionAndRetriesIdempotently(t *testing.T) {
 	store, pool, ownerID, hostID, workspaceID := createSiteTestFixture(t)
 	ctx := context.Background()
@@ -756,7 +779,7 @@ func createSiteTestFixture(t *testing.T) (*Store, *pgxpool.Pool, string, string,
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 20_000, 40_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "site-test")
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID}))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,7 +813,7 @@ func createSiteTestFixture(t *testing.T) (*Store, *pgxpool.Pool, string, string,
 
 func createRunningSiteTestHost(t *testing.T, ctx context.Context, store *Store, ownerID, workspaceID string) string {
 	t.Helper()
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, ownerID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceID}))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, ownerID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceID}))
 	if err != nil {
 		t.Fatal(err)
 	}

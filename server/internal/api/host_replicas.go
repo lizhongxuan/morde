@@ -65,6 +65,7 @@ type HostTaskWorkspaceViewDeletionService interface {
 func (h *api) registerHostReplicaRoutes(engine *gin.Engine) {
 	base := "/api/host-replicas/:host_id/generations/:generation"
 	group := engine.Group(base, h.authenticateHostReplica)
+	h.registerRuntimeOperationLedgerRoutes(group)
 	group.GET("/workspace-bindings", h.listHostReplicaBindings)
 	group.GET("/task-workspace-view-deletions", h.listTaskWorkspaceViewDeletions)
 	group.POST("/tasks/:task_id/workspace-view-deletions/:request_id/applied", h.completeTaskWorkspaceViewDeletion)

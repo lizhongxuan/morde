@@ -65,7 +65,7 @@ func TestAgentChildSessionServiceHashesArgumentsAndRejectsNonObject(t *testing.T
 		t.Fatal(err)
 	}
 	command := AgentChildSessionCommand{
-		Fence: AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent_1", AgentGeneration: 1,
+		Fence: AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent_1", AgentGeneration: 1,
 			AgentSessionID: "session_root", SupervisorID: "supervisor_1", LeaseOwner: "worker_1", LeaseVersion: 1,
 			AuthorizationVersion: 1, EngineVersion: "engine", ProfileVersion: "profile"},
 		ParentSessionID: "session_root", SpawnKey: "call_1", Arguments: []byte(`{"instruction":"read"}`),
@@ -118,7 +118,7 @@ func TestAgentChildSessionBackgroundListingAndCancelFenceRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent_1", AgentGeneration: 1,
+	fence := AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent_1", AgentGeneration: 1,
 		AgentSessionID: "session_root", SupervisorID: "supervisor_1", LeaseOwner: "worker_1", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: "engine", ProfileVersion: "profile"}
 	jobs, err := service.List(context.Background(), fence, fence.AgentSessionID)

@@ -36,6 +36,15 @@ import (
 	"morde/server/internal/storage/workspacefs"
 )
 
+type f01ReleaseReadbackWorkspaceVolumes struct{}
+
+func (f01ReleaseReadbackWorkspaceVolumes) PrepareHostWorkspaceVolume(_ context.Context, _, hostID, _, mountPath, storageSize string) (app.SandboxVolume, error) {
+	return app.SandboxVolume{
+		Name: "workspace-root", MountPath: mountPath, ClaimName: domain.WorkspaceRootVolumeName(hostID),
+		Storage: storageSize, RequireExisting: true,
+	}, nil
+}
+
 func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 	timeout := time.Minute
 	if os.Getenv(f01RealOpenSandboxEnv) == "1" {
@@ -53,7 +62,7 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, _, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID)
+	hostValue, _, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
 	aioKeyEnc, err := sealer.Seal([]byte("f01-release-readback-aio-key"))
 	if err != nil {
 		t.Fatal(err)
@@ -89,13 +98,7 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 		volumes.delegate = localOpenSandbox.volumes
 	}
 	sandboxes := f01ReleaseSandboxRouter{client: sandbox}
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	binding := hostValue.Workspaces[0]
 	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
 	if err != nil {
@@ -132,8 +135,9 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 	}
 	hostService, err := app.NewHostService(app.HostServiceOptions{
 		Hosts: store, Users: store, Workspaces: store, Tokens: store,
-		Sandboxes: sandboxes,
-		Volumes:   volumes, DiskCapacity: f01ReleaseNoopCapacity{},
+		WorkspaceVolumes: f01ReleaseReadbackWorkspaceVolumes{},
+		Sandboxes:        sandboxes,
+		Volumes:          volumes, DiskCapacity: f01ReleaseNoopCapacity{},
 		Probe: f01ReleaseNoopProbe{}, Runtime: f01ReleaseNoopRuntime{}, Audit: auditService,
 		CreateLocks: store, Sealer: sealer,
 		Templates:         map[string]domainTemplate.Template{"f01-local-template": template},
@@ -176,7 +180,7 @@ func TestF01HostReleaseKeepsCommittedWorkspaceReadback(t *testing.T) {
 	chunkDigest := sha256.Sum256(content)
 	digest := hex.EncodeToString(chunkDigest[:])
 	file := workspace.File{
-		Path: "reports/release-readback.txt", SizeBytes: int64(len(content)), SHA256: digest, Mode: 0o644,
+		Kind: workspace.FileKindRegular, Path: "reports/release-readback.txt", SizeBytes: int64(len(content)), SHA256: digest, Mode: 0o644,
 		Chunks: []workspace.Chunk{{SHA256: digest, SizeBytes: int64(len(content))}},
 	}
 	createUpload, err := json.Marshal(workspace.CreateSyncSession{

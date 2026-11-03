@@ -2,13 +2,16 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/worker"
 )
 
@@ -26,10 +29,10 @@ func TestTaskChatCompatibilityReplaysMigratedLegacyExchange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeProvider()
+	owner := createTestUser(t, store, 8, 20_000, 40_000)
 	if _, err := provider.DownTo(ctx, 53); err != nil {
 		t.Fatalf("prepare legacy instant-chat schema: %v", err)
 	}
-	owner := createTestUser(t, store, 8, 20_000, 40_000)
 	conversationID := mustID(t, domain.NewConversationID)
 	exchangeID := mustID(t, domain.NewMessageID)
 	userMessageID := mustID(t, domain.NewMessageID)
@@ -99,7 +102,8 @@ VALUES ($1,$2,$3,'legacy-replay-001',$4,$5,'old question','old answer')`,
 func TestTaskChatCompatibilityPersistsAndReplaysTask(t *testing.T) {
 	store, credentials, _, owner := clientLoginFixture(t)
 	pool := store.pool
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	login, err := credentials.Login(ctx, owner.Name, "client-password-123", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +126,7 @@ func TestTaskChatCompatibilityPersistsAndReplaysTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
-		Store: store, Executor: taskChatCompatTestExecutor{store: store}, WorkerID: "task-chat-compat-test",
+		Store: store, Executor: taskChatCompatExecutor{t: t, store: store}, WorkerID: "task-chat-compat-test",
 		LeaseDuration: time.Minute, PollInterval: 10 * time.Millisecond,
 	})
 	if err != nil {
@@ -146,7 +150,11 @@ func TestTaskChatCompatibilityPersistsAndReplaysTask(t *testing.T) {
 	command := app.InstantChatSend{ModelID: "p1234567", Content: "persistent chat task", RequestKey: "compat-pg-request-001"}
 	first, err := compatibility.Send(ctx, principal, command)
 	if err != nil || first.Reply.Content != "本地验收回复" {
-		t.Fatalf("Send() = %#v, %v", first, err)
+		var taskID, status, executionLocation, waitingReason string
+		_ = pool.QueryRow(context.Background(), `SELECT id,status,execution_location,waiting_reason FROM tasks
+WHERE owner_id=$1 ORDER BY created_at DESC LIMIT 1`, owner.ID).Scan(&taskID, &status, &executionLocation, &waitingReason)
+		t.Fatalf("Send() = %#v, %v; persisted task id=%q status=%q execution=%q waiting_reason=%q",
+			first, err, taskID, status, executionLocation, waitingReason)
 	}
 	second, err := compatibility.Send(ctx, principal, command)
 	if err != nil || second.Message.ID != first.Message.ID || second.Reply.ID != first.Reply.ID {
@@ -187,4 +195,51 @@ func enableTaskExecutionForTest(t testing.TB, store *Store, principal identity.P
 	if _, err := control.Enable(context.Background(), principal, current.Epoch, "test-execution-enable-0001"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type taskChatCompatExecutor struct {
+	t     *testing.T
+	store *Store
+}
+
+func (e taskChatCompatExecutor) ExecuteTask(ctx context.Context, current task.Task) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			e.t.Logf("execute Task %s: %v", current.ID, resultErr)
+		}
+	}()
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		return err
+	}
+	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded,
+		Title: "本地验收执行器", Summary: "返回固定的验收回复。"}
+	message := conversation.Message{ID: messageID, ConversationID: current.ConversationID, OwnerID: current.OwnerID,
+		ActorID: current.InitiatorID, Role: conversation.RoleAssistant, Content: "本地验收回复", TaskID: current.ID, ModelID: current.ModelID}
+	stepPayload, err := json.Marshal(map[string]string{"step_id": stepID, "status": string(task.StepSucceeded)})
+	if err != nil {
+		return err
+	}
+	if _, err := e.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: stepID, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.step", Payload: stepPayload}, AssistantMessage: &message,
+	}); err != nil {
+		return err
+	}
+	result := "本地验收回复"
+	resultPayload, err := json.Marshal(map[string]string{"status": string(task.StatusCompleted), "result": result})
+	if err != nil {
+		return err
+	}
+	_, err = e.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: stepID, Result: result, Steps: []task.Step{step},
+		Event: task.Event{Type: "task.result", Payload: resultPayload},
+	})
+	return err
 }

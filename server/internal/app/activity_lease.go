@@ -43,10 +43,12 @@ type HostActivityLeaseDrainer interface {
 	HasOutstandingControlTransitionLeases(context.Context, string, int64) (bool, error)
 }
 
-// HostInputPermitStore linearizes a bounded user input write against a Host
-// control transition. The callback must only write a parsed input message.
+// HostInputPermitStore linearizes a bounded user input write or upstream
+// request against a Host control transition. The callback runs under the Host
+// row lock and callers must keep it short and cancelable.
 type HostInputPermitStore interface {
-	WithHostInputPermit(context.Context, host.Ref, func() error) error
+	CheckHostControlLease(context.Context, string, string, int64, int64) error
+	WithHostControlPermit(context.Context, host.Ref, string, host.Permission, func() error) error
 }
 
 // ValidateHostActivityLease checks the shared lease identity and fence fields.

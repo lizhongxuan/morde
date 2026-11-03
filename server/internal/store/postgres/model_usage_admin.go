@@ -13,6 +13,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/store/postgres/sqlcgen"
 )
 
@@ -149,8 +150,9 @@ FROM users u LEFT JOIN model_account_budgets b ON b.owner_id=u.id WHERE u.id=$1`
 
 func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identity.Principal, command app.ModelUsageReconcileCommand) (bool, error) {
 	replayed := false
-	// This transaction shares the budget lock with normal settlement: the ledger,
-	// rebuilt task usage, and administrator audit record either all commit or none do.
+	quotaExceeded := false
+	// This transaction shares the account budget lock with normal settlement. A
+	// project Task also updates its project money ledger in the same transaction.
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var budget int64
 		if err := tx.QueryRow(ctx, `SELECT token_limit FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, command.OwnerID).Scan(&budget); err != nil {
@@ -159,28 +161,68 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		if err := lockModelUsageAdminUser(ctx, tx, principal); err != nil {
 			return err
 		}
-		var state, taskID string
+		var state, taskID, modelID string
 		var priorInput, priorOutput *int64
-		err := tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),input_tokens,output_tokens FROM model_call_ledger
+		var accountReserved int64
+		var accountDigest []byte
+		err := tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),model_id,reserved_tokens,input_tokens,output_tokens,request_digest FROM model_call_ledger
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, command.OwnerID, string(command.Source), command.CallID).
-			Scan(&state, &taskID, &priorInput, &priorOutput)
+			Scan(&state, &taskID, &modelID, &accountReserved, &priorInput, &priorOutput, &accountDigest)
 		if err != nil {
 			return storeError("lock model usage", "model call", err)
 		}
+		var taskOwnerID, taskProjectID string
 		if taskID != "" {
-			var location string
-			if err := tx.QueryRow(ctx, `SELECT execution_location FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, command.OwnerID).Scan(&location); err != nil {
+			var observedOwner, observedProject, location string
+			if err := tx.QueryRow(ctx, `SELECT owner_id,COALESCE(project_id,''),execution_location FROM tasks
+ WHERE id=$1 AND initiator_id=$2`, taskID, command.OwnerID).Scan(&observedOwner, &observedProject, &location); err != nil {
 				return storeError("lock model usage task", "task", err)
 			}
 			if location != "server" {
 				return domain.NewError(domain.CodeInvalidState, "task usage cannot be rebuilt from this ledger")
 			}
+			if observedProject == "" && observedOwner != command.OwnerID {
+				return domain.NewError(domain.CodeInvalidState, "personal Task actor does not match its owner")
+			}
+			if observedProject != "" {
+				if command.Source != app.ModelCallTask {
+					return domain.NewError(domain.CodeInvalidState, "project usage cannot be reconciled from a non-Task ledger")
+				}
+				if err := lockProjectByIDInTx(ctx, tx, observedProject); err != nil {
+					return err
+				}
+			}
+			if err := tx.QueryRow(ctx, `SELECT owner_id,COALESCE(project_id,''),execution_location FROM tasks
+ WHERE id=$1 AND initiator_id=$2 FOR UPDATE`, taskID, command.OwnerID).Scan(&taskOwnerID, &taskProjectID, &location); err != nil {
+				return storeError("lock model usage task", "task", err)
+			}
+			if taskOwnerID != observedOwner || taskProjectID != observedProject || location != "server" {
+				return domain.NewError(domain.CodeInvalidState, "task attribution changed during model usage reconciliation")
+			}
+		}
+		var projectCall *modelUsageProjectCall
+		if taskProjectID != "" {
+			call, err := lockProjectModelCallForReconciliation(ctx, tx, taskProjectID, command, taskID, modelID, accountDigest)
+			if err != nil {
+				return err
+			}
+			projectCall = &call
 		}
 		if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
 			return err
 		}
 		target := command.OwnerID + "/" + string(command.Source) + "/" + command.CallID
 		if state == "settled" {
+			if projectCall != nil && (projectCall.Status != "settled" || projectCall.ActualInput == nil || projectCall.ActualOutput == nil ||
+				*projectCall.ActualInput != command.InputTokens || *projectCall.ActualOutput != command.OutputTokens) {
+				return domain.NewError(domain.CodeInvalidState, "project and account model ledgers do not match")
+			}
+			if projectCall != nil {
+				actualMicros, err := projectCall.Rate.EstimateTokenCost(project.Usage{InputTokens: command.InputTokens, OutputTokens: command.OutputTokens})
+				if err != nil || projectCall.ActualMicros == nil || *projectCall.ActualMicros != actualMicros {
+					return domain.NewError(domain.CodeInvalidState, "project and account model ledgers do not match")
+				}
+			}
 			var actor string
 			var detail []byte
 			err := tx.QueryRow(ctx, `SELECT actor_id,detail FROM audit_logs WHERE action=$1 AND target=$2
@@ -204,14 +246,34 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		if state != "unknown" {
 			return domain.NewError(domain.CodeInvalidState, "model call is still dispatched or unavailable")
 		}
-		result, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=now()
- WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='unknown'`, command.OwnerID, string(command.Source), command.CallID,
-			command.InputTokens, command.OutputTokens)
-		if err != nil || result.RowsAffected() != 1 {
-			if err != nil {
-				return fmt.Errorf("reconcile model ledger: %w", err)
+		if projectCall != nil {
+			if projectCall.Status != "unknown" {
+				return domain.NewError(domain.CodeInvalidState, "project and account model ledgers do not match")
 			}
-			return domain.NewError(domain.CodeConflict, "model usage changed")
+			actualMicros, estimateErr := projectCall.Rate.EstimateTokenCost(project.Usage{InputTokens: command.InputTokens, OutputTokens: command.OutputTokens})
+			if estimateErr != nil || command.InputTokens+command.OutputTokens > accountReserved ||
+				command.InputTokens > projectCall.ReservedInput || command.OutputTokens > projectCall.ReservedOutput ||
+				actualMicros > projectCall.ReservedMicros {
+				// Keep both holds unknown when any token or money reservation is too
+				// small. The evidence audit below still commits with this decision.
+				quotaExceeded = true
+			} else {
+				if err := settleReconciledAccountLedgerInTx(ctx, tx, command); err != nil {
+					return err
+				}
+				result, err := tx.Exec(ctx, `UPDATE project_budget_ledger SET status='settled',actual_input_tokens=$4,
+actual_output_tokens=$5,actual_micros=$6,settled_at=clock_timestamp()
+WHERE project_id=$1 AND source=$2 AND call_id=$3 AND status='unknown'`, taskProjectID, string(command.Source), command.CallID,
+					command.InputTokens, command.OutputTokens, actualMicros)
+				if err != nil || result.RowsAffected() != 1 {
+					if err != nil {
+						return fmt.Errorf("reconcile project model ledger: %w", err)
+					}
+					return domain.NewError(domain.CodeConflict, "project model usage changed")
+				}
+			}
+		} else if err := settleReconciledAccountLedgerInTx(ctx, tx, command); err != nil {
+			return err
 		}
 		// The reservation path reads totals into int64. Reject a reconciliation
 		// that would make the account's settled and reserved total unrepresentable.
@@ -222,22 +284,22 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 			return fmt.Errorf("check reconciled model usage total: %w", err)
 		}
 		if !accountTotalFits {
-			return domain.InvalidArgument("model_usage", "reconciled account usage is too large")
+			quotaExceeded = true
+			if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='unknown',input_tokens=NULL,output_tokens=NULL,settled_at=clock_timestamp()
+WHERE owner_id=$1 AND source=$2 AND call_id=$3`, command.OwnerID, string(command.Source), command.CallID); err != nil {
+				return fmt.Errorf("restore unknown account model usage after total overflow: %w", err)
+			}
+			if projectCall != nil {
+				if _, err := tx.Exec(ctx, `UPDATE project_budget_ledger SET status='unknown',actual_input_tokens=NULL,actual_output_tokens=NULL,
+actual_micros=NULL,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 AND call_id=$3`, taskProjectID,
+					string(command.Source), command.CallID); err != nil {
+					return fmt.Errorf("restore unknown project usage after account total overflow: %w", err)
+				}
+			}
 		}
 		if taskID != "" {
-			var unknown bool
-			var total int64
-			if err := tx.QueryRow(ctx, `SELECT COALESCE(bool_or(state='unknown'),false),
- COALESCE(SUM(input_tokens::numeric+output_tokens::numeric) FILTER (WHERE state='settled'),0)
- FROM model_call_ledger WHERE task_id=$1 AND owner_id=$2`, taskID, command.OwnerID).Scan(&unknown, &total); err != nil {
-				return fmt.Errorf("rebuild task model usage: %w", err)
-			}
-			var usage any
-			if !unknown {
-				usage = total
-			}
-			if _, err := tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=$3,updated_at=now() WHERE id=$1 AND owner_id=$2`, taskID, command.OwnerID, usage); err != nil {
-				return fmt.Errorf("update reconciled task model usage: %w", err)
+			if err := refreshTaskModelUsageInTx(ctx, tx, taskID, command.OwnerID); err != nil {
+				return err
 			}
 		}
 		entry, err := auditParams(audit.Entry{
@@ -245,6 +307,7 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 			Target: target, IP: command.IP, Detail: map[string]any{
 				"owner_id": command.OwnerID, "source": string(command.Source), "call_id": command.CallID,
 				"input_count": command.InputTokens, "output_count": command.OutputTokens, "evidence": command.Evidence,
+				"project_id": taskProjectID, "over_reservation": quotaExceeded,
 			},
 		})
 		if err != nil {
@@ -255,7 +318,60 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		}
 		return nil
 	})
+	if err == nil && quotaExceeded {
+		return false, domain.NewError(domain.CodeQuotaExceeded, "reconciled usage exceeded a token or project reservation; both holds remain unknown")
+	}
 	return replayed, err
+}
+
+type modelUsageProjectCall struct {
+	Status         string
+	ReservedInput  int64
+	ReservedOutput int64
+	ReservedMicros int64
+	ActualInput    *int64
+	ActualOutput   *int64
+	ActualMicros   *int64
+	Rate           project.RateSnapshot
+}
+
+func lockProjectModelCallForReconciliation(ctx context.Context, tx pgx.Tx, projectID string, command app.ModelUsageReconcileCommand,
+	taskID, modelID string, accountDigest []byte) (modelUsageProjectCall, error) {
+	var call modelUsageProjectCall
+	var actorID, ledgerTaskID, ledgerModelID, currency string
+	var provider, model string
+	var rateVersion, inputRate, outputRate int64
+	var projectDigest []byte
+	err := tx.QueryRow(ctx, `SELECT actor_id,task_id,model_id,status,currency,rate_provider,rate_model,rate_version,
+input_micros_per_million,output_micros_per_million,reserved_input_tokens,reserved_output_tokens,reserved_micros,
+actual_input_tokens,actual_output_tokens,actual_micros,request_digest FROM project_budget_ledger
+WHERE project_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, projectID, string(command.Source), command.CallID).
+		Scan(&actorID, &ledgerTaskID, &ledgerModelID, &call.Status, &currency, &provider, &model, &rateVersion,
+			&inputRate, &outputRate, &call.ReservedInput, &call.ReservedOutput, &call.ReservedMicros,
+			&call.ActualInput, &call.ActualOutput, &call.ActualMicros, &projectDigest)
+	if err != nil {
+		return modelUsageProjectCall{}, storeError("lock project model usage", "project model call", err)
+	}
+	call.Rate = project.RateSnapshot{Provider: provider, ModelID: ledgerModelID, Model: model, Currency: currency,
+		Version: rateVersion, InputMicrosPerMillion: inputRate, OutputMicrosPerMillion: outputRate}
+	if actorID != command.OwnerID || ledgerTaskID != taskID || ledgerModelID != modelID || len(projectDigest) != 32 || len(accountDigest) != 32 ||
+		call.Rate.Validate() != nil || call.ReservedInput < 0 || call.ReservedOutput < 1 || call.ReservedMicros < 1 {
+		return modelUsageProjectCall{}, domain.NewError(domain.CodeInvalidState, "project and account model ledgers do not match")
+	}
+	return call, nil
+}
+
+func settleReconciledAccountLedgerInTx(ctx context.Context, tx pgx.Tx, command app.ModelUsageReconcileCommand) error {
+	result, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='settled',input_tokens=$4,output_tokens=$5,settled_at=clock_timestamp()
+WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='unknown'`, command.OwnerID, string(command.Source), command.CallID,
+		command.InputTokens, command.OutputTokens)
+	if err != nil || result.RowsAffected() != 1 {
+		if err != nil {
+			return fmt.Errorf("reconcile model ledger: %w", err)
+		}
+		return domain.NewError(domain.CodeConflict, "model usage changed")
+	}
+	return nil
 }
 
 func lockModelUsageAdminUser(ctx context.Context, tx pgx.Tx, principal identity.Principal) error {

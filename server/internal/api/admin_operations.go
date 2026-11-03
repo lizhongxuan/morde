@@ -11,12 +11,26 @@ import (
 )
 
 type adminSettingsResponse struct {
-	RegistrationReviewRequired     bool  `json:"registration_review_required"`
-	AutomaticNewUserModelBudget    bool  `json:"automatic_new_user_model_budget"`
-	AutomaticInvitationReward      bool  `json:"automatic_invitation_reward"`
-	AutomaticContributionReward    bool  `json:"automatic_contribution_reward"`
-	DefaultPersonalDataQuotaBytes  int64 `json:"default_personal_data_quota_bytes"`
-	DefaultPersonalAttachmentBytes int64 `json:"default_personal_attachment_bytes"`
+	RegistrationReviewRequired     bool                       `json:"registration_review_required"`
+	AutomaticNewUserModelBudget    bool                       `json:"automatic_new_user_model_budget"`
+	AutomaticInvitationReward      bool                       `json:"automatic_invitation_reward"`
+	AutomaticContributionReward    bool                       `json:"automatic_contribution_reward"`
+	DefaultPersonalDataQuotaBytes  int64                      `json:"default_personal_data_quota_bytes"`
+	DefaultPersonalAttachmentBytes int64                      `json:"default_personal_attachment_bytes"`
+	DefaultModelBudget             modelBudgetDefaultResponse `json:"default_model_budget"`
+}
+
+type modelBudgetDefaultRequest struct {
+	ExpectedVersion *int64 `json:"expected_version"`
+	TokenLimit      *int64 `json:"token_limit"`
+	MaxConcurrent   *int32 `json:"max_concurrent"`
+}
+
+type modelBudgetDefaultResponse struct {
+	Configured    bool  `json:"configured"`
+	TokenLimit    int64 `json:"token_limit"`
+	MaxConcurrent int32 `json:"max_concurrent"`
+	Version       int64 `json:"version"`
 }
 
 type adminInviteResponse struct {
@@ -93,15 +107,17 @@ type inviteCodeResponse struct {
 }
 
 func (h *api) registerAdminOperations(group *gin.RouterGroup) {
-	if h.deps.AdminOperations == nil {
-		return
+	if h.deps.AdminOperations != nil {
+		group.GET("/me/invite-code", h.getInviteCode)
+		group.GET("/admin/settings", h.getAdminSettings)
+		group.GET("/admin/invites", h.listAdminInvites)
+		group.GET("/admin/sites", h.listAdminSites)
+		group.GET("/admin/nudges", h.getAdminNudgePolicy)
+		group.PUT("/admin/nudges", h.updateAdminNudgePolicy)
 	}
-	group.GET("/me/invite-code", h.getInviteCode)
-	group.GET("/admin/settings", h.getAdminSettings)
-	group.GET("/admin/invites", h.listAdminInvites)
-	group.GET("/admin/sites", h.listAdminSites)
-	group.GET("/admin/nudges", h.getAdminNudgePolicy)
-	group.PUT("/admin/nudges", h.updateAdminNudgePolicy)
+	if h.deps.AdminModelBudgetDefaults != nil {
+		group.PUT("/admin/settings/model-budget-default", h.updateAdminModelBudgetDefault)
+	}
 }
 
 func (h *api) getInviteCode(c *gin.Context) {
@@ -128,6 +144,15 @@ func (h *api) getAdminSettings(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
+	if h.deps.AdminModelBudgetDefaults == nil {
+		serviceUnavailable(c)
+		return
+	}
+	modelBudget, err := h.deps.AdminModelBudgetDefaults.Get(c.Request.Context(), principal)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, adminSettingsResponse{
 		RegistrationReviewRequired:     value.RegistrationReviewRequired,
 		AutomaticNewUserModelBudget:    value.AutomaticNewUserModelBudget,
@@ -135,7 +160,40 @@ func (h *api) getAdminSettings(c *gin.Context) {
 		AutomaticContributionReward:    value.AutomaticContributionReward,
 		DefaultPersonalDataQuotaBytes:  value.DefaultPersonalDataQuotaBytes,
 		DefaultPersonalAttachmentBytes: value.DefaultPersonalAttachmentBytes,
+		DefaultModelBudget:             toModelBudgetDefaultResponse(modelBudget),
 	})
+}
+
+func (h *api) updateAdminModelBudgetDefault(c *gin.Context) {
+	principal, ok := requireAdmin(c)
+	if !ok {
+		return
+	}
+	var request modelBudgetDefaultRequest
+	if !decodeStrictJSON(c, &request) {
+		return
+	}
+	if request.ExpectedVersion == nil || request.TokenLimit == nil || request.MaxConcurrent == nil {
+		writeError(c, domain.InvalidArgument("model_budget_default", "expected_version, token_limit and max_concurrent are required"))
+		return
+	}
+	value, err := h.deps.AdminModelBudgetDefaults.Update(c.Request.Context(), principal, app.UpdateModelBudgetDefaultCommand{
+		ExpectedVersion: *request.ExpectedVersion,
+		TokenLimit:      *request.TokenLimit,
+		MaxConcurrent:   *request.MaxConcurrent,
+	}, c.ClientIP())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toModelBudgetDefaultResponse(value))
+}
+
+func toModelBudgetDefaultResponse(value app.ModelBudgetDefault) modelBudgetDefaultResponse {
+	return modelBudgetDefaultResponse{
+		Configured: value.Configured, TokenLimit: value.TokenLimit,
+		MaxConcurrent: value.MaxConcurrent, Version: value.Version,
+	}
 }
 
 func (h *api) listAdminInvites(c *gin.Context) {

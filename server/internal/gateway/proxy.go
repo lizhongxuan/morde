@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -61,14 +62,24 @@ func (g *gateway) proxy(c *gin.Context) {
 		writeNotFound(c)
 		return
 	}
+	port := 8080
+	if preview {
+		port = *parsed.PreviewPort
+	}
+	needsControlLease := ref.ControlState == host.ControlUser && !isHostObservationRequest(c.Request, port, preview)
+	principal := principalFrom(c)
+	if needsControlLease {
+		if err := g.deps.InputPermits.CheckHostControlLease(c.Request.Context(), ref.ID, principal.UserID, ref.RuntimeGeneration, ref.ControlVersion); err != nil {
+			httpserver.WriteError(c, err)
+			return
+		}
+	}
 	hostID := parsed.HostID
 	c.Set("gateway.started_at", time.Now())
 	c.Set("host_id", hostID)
 	c.Set("gateway.host_id", hostID)
 	c.Set("gateway.upstream_prefix", upstreamPrefix(c.Request.URL.Path))
-	port := 8080
 	if preview {
-		port = *parsed.PreviewPort
 		c.Set("gateway.preview_port", port)
 	}
 	kind := app.HostActivityLeaseKindGateway
@@ -76,6 +87,15 @@ func (g *gateway) proxy(c *gin.Context) {
 		kind = app.HostActivityLeaseKindPreview
 	}
 	checkAuthorization := g.memberAuthorizationCheck(c)
+	if needsControlLease {
+		checkAccess := checkAuthorization
+		checkAuthorization = func(ctx context.Context) error {
+			if err := checkAccess(ctx); err != nil {
+				return err
+			}
+			return g.deps.InputPermits.CheckHostControlLease(ctx, ref.ID, principal.UserID, ref.RuntimeGeneration, ref.ControlVersion)
+		}
+	}
 	guard, leaseCtx, err := g.acquireHostActivityLease(c.Request.Context(), ref, kind, checkAuthorization)
 	if err != nil {
 		if domain.CodeOf(err) == domain.CodeConflict {
@@ -110,7 +130,7 @@ func (g *gateway) proxy(c *gin.Context) {
 		httpserver.WriteError(c, domain.NewError(domain.CodeInternal, "gateway deadline control unavailable"))
 		return
 	}
-	g.serveProxy(c, upstream, port, preview, 0)
+	g.serveProxy(c, upstream, port, preview, needsControlLease, 0)
 }
 
 func hasNoHostCookie(r *http.Request) bool {
@@ -125,10 +145,17 @@ func (g *gateway) redirectToPreviewAuth(c *gin.Context, port int) {
 	c.Redirect(http.StatusFound, target)
 }
 
-func (g *gateway) serveProxy(c *gin.Context, upstream app.Upstream, port int, preview bool, attempt int) {
+func (g *gateway) serveProxy(c *gin.Context, upstream app.Upstream, port int, preview, needsControlLease bool, attempt int) {
 	hostID := c.GetString(hostIDKey)
+	transport := http.RoundTripper(g.transport)
+	if needsControlLease {
+		transport = &hostControlRoundTripper{
+			base: g.transport, permits: g.deps.InputPermits, ref: hostRefFrom(c),
+			actorID: principalFrom(c).UserID, permission: controlPermissionForRequest(c),
+		}
+	}
 	proxy := &httputil.ReverseProxy{
-		Transport:     g.transport,
+		Transport:     transport,
 		FlushInterval: -1,
 		Rewrite: func(request *httputil.ProxyRequest) {
 			target, err := urlForHost(upstream, request.In.URL.EscapedPath())
@@ -182,9 +209,14 @@ func (g *gateway) serveProxy(c *gin.Context, upstream app.Upstream, port int, pr
 						response.Header.Del("Sec-WebSocket-Extensions")
 						memberView, _ := c.Get("gateway.member_view")
 						readOnly := memberView == true
-						response.Body = newRFBFilteringBody(tracked, c.Request.Context(), hostRefFrom(c), g.deps.InputPermits, !readOnly, func(err error) {
+						response.Body = newRFBFilteringBody(tracked, c.Request.Context(), hostRefFrom(c), g.deps.InputPermits, principalFrom(c).UserID, !readOnly, func(err error) {
 							g.deps.Logger.Warn("gateway RFB input rejected", zap.String("host_id", hostID), zap.Error(err))
 						})
+					} else if needsControlLease {
+						response.Body = &hostControlInputBody{
+							ReadWriteCloser: tracked, ctx: c.Request.Context(), permits: g.deps.InputPermits,
+							ref: hostRefFrom(c), actorID: principalFrom(c).UserID, permission: controlPermissionForRequest(c),
+						}
 					} else {
 						response.Body = tracked
 					}
@@ -203,6 +235,10 @@ func (g *gateway) serveProxy(c *gin.Context, upstream app.Upstream, port int, pr
 				httpserver.WriteError(c, domain.NewError(domain.CodeRequestTooLarge, "request body too large"))
 				return
 			}
+			if domain.CodeOf(err) == domain.CodeConflict {
+				httpserver.WriteError(c, err)
+				return
+			}
 			g.deps.Runtime.InvalidateUpstream(hostID)
 			kind := upstreamErrorKind(err)
 			g.upstreamErrs.WithLabelValues(kind).Inc()
@@ -212,7 +248,7 @@ func (g *gateway) serveProxy(c *gin.Context, upstream app.Upstream, port int, pr
 					if preview {
 						fresh.APIKey = ""
 					}
-					g.serveProxy(c, fresh, port, preview, 1)
+					g.serveProxy(c, fresh, port, preview, needsControlLease, 1)
 					return
 				}
 			}
@@ -221,6 +257,27 @@ func (g *gateway) serveProxy(c *gin.Context, upstream app.Upstream, port int, pr
 		},
 	}
 	proxy.ServeHTTP(c.Writer, c.Request)
+}
+
+func controlPermissionForRequest(c *gin.Context) host.Permission {
+	if permission := host.Permission(c.GetString("gateway.member_permission")); permission == host.PermissionDesktopControl ||
+		permission == host.PermissionTerminalControl || permission == host.PermissionMCPControl {
+		return permission
+	}
+	return host.PermissionDesktopControl
+}
+
+func isHostObservationRequest(request *http.Request, port int, preview bool) bool {
+	if request == nil {
+		return false
+	}
+	if isRFBWebSocketRequest(request, port, preview) {
+		return true
+	}
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		return false
+	}
+	return request.URL.Path == "/vnc" || strings.HasPrefix(request.URL.Path, "/vnc/") || validHostWorkspaceReadRequest(request)
 }
 
 func startedAt(c *gin.Context) time.Time {

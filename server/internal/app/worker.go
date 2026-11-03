@@ -288,7 +288,7 @@ func (w *WorkerApp) reconcileFailedHost(ctx context.Context, value host.Host) er
 	if err := w.cleanupHostSandboxes(ctx, value); err != nil {
 		return err
 	}
-	if err := w.cleanupRuntimeVolume(ctx, value.ID); err != nil {
+	if err := w.retainLegacyHostVolumes(value.ID); err != nil {
 		return err
 	}
 	if value.SandboxID != "" {
@@ -371,13 +371,7 @@ func (w *WorkerApp) reconcileDeletingHost(ctx context.Context, value host.Host) 
 	if err := w.cleanupHostSandboxes(ctx, value); err != nil {
 		return err
 	}
-	if err := w.cleanupRuntimeVolume(ctx, value.ID); err != nil {
-		return err
-	}
-	if err := w.cleanupProfileVolume(ctx, value.ID); err != nil {
-		return err
-	}
-	if err := w.cleanupHostAppsVolume(ctx, value.ID); err != nil {
+	if err := w.retainLegacyHostVolumes(value.ID); err != nil {
 		return err
 	}
 	if value.SandboxID != "" {
@@ -386,9 +380,6 @@ func (w *WorkerApp) reconcileDeletingHost(ctx context.Context, value host.Host) 
 		}
 	}
 	if err := w.service.detachHostWorkspaces(ctx, value.ID); err != nil {
-		return err
-	}
-	if err := w.cleanupWorkspaceRootVolume(ctx, value.ID); err != nil {
 		return err
 	}
 	if _, err := w.service.hosts.TransitionHost(ctx, value.ID, host.StateDeleting, host.StateDeleted, ""); err != nil {
@@ -402,47 +393,11 @@ func (w *WorkerApp) reconcileDeletingHost(ctx context.Context, value host.Host) 
 	return nil
 }
 
-func (w *WorkerApp) cleanupRuntimeVolume(ctx context.Context, hostID string) error {
+func (w *WorkerApp) retainLegacyHostVolumes(hostID string) error {
 	if !domain.ValidHostID(hostID) {
-		return fmt.Errorf("cannot delete runtime data volume for invalid host id %q", hostID)
+		return fmt.Errorf("cannot retain volumes for invalid host id %q", hostID)
 	}
-	if err := w.service.volumes.DeleteVolume(ctx, domain.RuntimeVolumeName(hostID)); err != nil {
-		return fmt.Errorf("delete runtime data volume for host %s: %w", hostID, err)
-	}
-	w.logAction("runtime_volume_deleted", hostID)
-	return nil
-}
-
-func (w *WorkerApp) cleanupProfileVolume(ctx context.Context, hostID string) error {
-	if !domain.ValidHostID(hostID) {
-		return fmt.Errorf("cannot delete profile volume for invalid host id %q", hostID)
-	}
-	if err := w.service.volumes.DeleteVolume(ctx, domain.ProfileVolumeName(hostID)); err != nil {
-		return fmt.Errorf("delete profile volume for host %s: %w", hostID, err)
-	}
-	w.logAction("profile_volume_deleted", hostID)
-	return nil
-}
-
-func (w *WorkerApp) cleanupHostAppsVolume(ctx context.Context, hostID string) error {
-	if !domain.ValidHostID(hostID) {
-		return fmt.Errorf("cannot delete host apps volume for invalid host id %q", hostID)
-	}
-	if err := w.service.volumes.DeleteVolume(ctx, domain.HostAppsVolumeName(hostID)); err != nil {
-		return fmt.Errorf("delete host apps volume for host %s: %w", hostID, err)
-	}
-	w.logAction("host_apps_volume_deleted", hostID)
-	return nil
-}
-
-func (w *WorkerApp) cleanupWorkspaceRootVolume(ctx context.Context, hostID string) error {
-	if !domain.ValidHostID(hostID) {
-		return fmt.Errorf("cannot delete workspace root volume for invalid host id %q", hostID)
-	}
-	if err := w.service.volumes.DeleteVolume(ctx, domain.WorkspaceRootVolumeName(hostID)); err != nil {
-		return fmt.Errorf("delete workspace root volume for host %s: %w", hostID, err)
-	}
-	w.logAction("workspace_root_volume_deleted", hostID)
+	w.logAction("legacy_host_volumes_retained", hostID)
 	return nil
 }
 
@@ -552,7 +507,7 @@ func (w *WorkerApp) deleteOrphans(ctx context.Context, remotes map[string][]remo
 			}
 		}
 		if sandboxesCleaned {
-			if err := w.cleanupOrphanHostVolumes(ctx, hostID); err != nil {
+			if err := w.retainLegacyHostVolumes(hostID); err != nil {
 				failures = append(failures, err)
 				continue
 			}
@@ -596,27 +551,13 @@ func (w *WorkerApp) reconcileOrphanHostVolumeCleanups(ctx context.Context, remot
 		if activeSandbox {
 			continue
 		}
-		if err := w.cleanupOrphanHostVolumes(ctx, hostID); err != nil {
+		if err := w.retainLegacyHostVolumes(hostID); err != nil {
 			failures = append(failures, err)
 			continue
 		}
 		if err := w.cleanups.CompleteOrphanHostVolumeCleanup(ctx, w.service.instance, hostID); err != nil {
 			failures = append(failures, fmt.Errorf("complete orphan host %s volume cleanup: %w", hostID, err))
 		}
-	}
-	return errors.Join(failures...)
-}
-
-func (w *WorkerApp) cleanupOrphanHostVolumes(ctx context.Context, hostID string) error {
-	var failures []error
-	if err := w.cleanupRuntimeVolume(ctx, hostID); err != nil {
-		failures = append(failures, fmt.Errorf("clean orphan host %s runtime data: %w", hostID, err))
-	}
-	if err := w.cleanupProfileVolume(ctx, hostID); err != nil {
-		failures = append(failures, fmt.Errorf("clean orphan host %s profile data: %w", hostID, err))
-	}
-	if err := w.cleanupHostAppsVolume(ctx, hostID); err != nil {
-		failures = append(failures, fmt.Errorf("clean orphan host %s installed apps: %w", hostID, err))
 	}
 	return errors.Join(failures...)
 }

@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	mordesync "morde-sync"
+
 	"morde-runtime/contract"
 	"morde-runtime/runtimecore"
 	"morde-runtime/runtimefiles"
@@ -44,7 +46,7 @@ func TestHealthAndReadiness(t *testing.T) {
 func TestCapabilitiesAuthProtocolAndStrictQuery(t *testing.T) {
 	handler, manager, credential := newHTTPHandler(t, 1)
 	defer manager.Close()
-	validURL := "/runtime/v1/capabilities?protocol_version=1.0&host_id=h1234567&runtime_generation=1&control_version=0"
+	validURL := "/runtime/v1/capabilities?protocol_version=2.0&host_id=h1234567&runtime_generation=1&control_version=0"
 	newRequest := func() *http.Request {
 		request := httptest.NewRequest(http.MethodGet, validURL, nil)
 		request.Header.Set("Authorization", "Bearer "+credential)
@@ -57,7 +59,7 @@ func TestCapabilitiesAuthProtocolAndStrictQuery(t *testing.T) {
 	assertError(t, response, http.StatusUnauthorized, "runtime_authentication_failed")
 
 	request := newRequest()
-	request.Header.Set(contract.ProtocolHeader, "2.0")
+	request.Header.Set(contract.ProtocolHeader, "1.0")
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	assertError(t, response, http.StatusConflict, "protocol_incompatible")
@@ -130,8 +132,7 @@ func TestTaskWorkspaceExportRoutesReturnOnlyRegisteredViewBlocks(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	empty := sha256.Sum256([]byte("morde-workspace-manifest/v1\n[]"))
-	inputDigest := hex.EncodeToString(empty[:])
+	inputDigest := taskWorkspaceEmptyRootDigest(t, filepath.Join(root, "wabc1234"))
 	view, err := manager.SetTaskWorkspaceView(context.Background(), "qabc1234", contract.SetTaskWorkspaceViewRequest{
 		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, TaskID: "qabc1234", WorkspaceID: "wabc1234",
 		BindingVersion: 1, InputRevision: 0, WorkspaceCheckpointRevision: 0, ManifestSHA256: inputDigest,
@@ -139,7 +140,7 @@ func TestTaskWorkspaceExportRoutesReturnOnlyRegisteredViewBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	viewDirectory := filepath.Join(taskRoot, "qabc1234", view.ViewID)
+	viewDirectory := filepath.Join(taskRoot, "qabc1234", view.ViewID, "workspace")
 	if err := os.WriteFile(filepath.Join(viewDirectory, "result.txt"), []byte("hello"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +164,7 @@ func TestTaskWorkspaceExportRoutesReturnOnlyRegisteredViewBlocks(t *testing.T) {
 	wantBlockSHA := sha256.Sum256([]byte("hello"))
 	blockSHA := hex.EncodeToString(wantBlockSHA[:])
 	if page.HostFence != fence || page.TaskID != "qabc1234" || page.InputManifestSHA256 != inputDigest || len(page.Files) != 1 ||
+		len(page.Directories) != 1 || page.Directories[0].Path != "." ||
 		page.Files[0].Path != "result.txt" || page.Files[0].Chunks[0].SHA256 != blockSHA || page.ManifestSHA256 == inputDigest {
 		t.Fatalf("manifest page = %#v", page)
 	}
@@ -192,9 +194,56 @@ func TestTaskWorkspaceExportRoutesReturnOnlyRegisteredViewBlocks(t *testing.T) {
 	assertError(t, response, http.StatusConflict, "fence_rejected")
 }
 
+func taskWorkspaceEmptyRootDigest(t *testing.T, root string) string {
+	t.Helper()
+	manifest, err := mordesync.Scan(context.Background(), root, nil)
+	if err != nil || len(manifest.Files) != 0 || len(manifest.Directories) != 1 || manifest.Directories[0].Path != "." {
+		t.Fatalf("scan empty Task Workspace root: manifest=%#v err=%v", manifest, err)
+	}
+	type directory struct {
+		Path          string                        `json:"path"`
+		Mode          *uint32                       `json:"mode,omitempty"`
+		ModTimeNS     *int64                        `json:"mod_time_ns,omitempty"`
+		MetadataKnown bool                          `json:"metadata_known,omitempty"`
+		Xattrs        []mordesync.ExtendedAttribute `json:"xattrs,omitempty"`
+		ACL           *mordesync.NativeACL          `json:"acl,omitempty"`
+	}
+	observed := manifest.Directories[0]
+	mode, modified := observed.Mode, observed.ModTimeNS
+	encoded, err := json.Marshal([]directory{{
+		Path: observed.Path, Mode: &mode, ModTimeNS: &modified, MetadataKnown: observed.MetadataKnown,
+		Xattrs: observed.Xattrs, ACL: observed.ACL,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseDigest := sha256.Sum256([]byte("morde-workspace-manifest/v1\n[]"))
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte("morde-workspace-manifest/v4\n"))
+	_, _ = hasher.Write([]byte(hex.EncodeToString(baseDigest[:])))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write(encoded)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
 func TestDeleteTaskWorkspaceViewRouteRequiresExactFenceAndRequestID(t *testing.T) {
-	handler, manager, credential := newHTTPHandler(t, 1)
-	defer manager.Close()
+	manager, err := runtimecore.Open(runtimecore.Options{
+		StoreDir: newRuntimeDir(t), ExpectedOwnerUID: uint32(os.Geteuid()), HostID: "h1234567", Generation: 1,
+		TaskWorkspaceViews: testTaskWorkspaceViews{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil && !errors.Is(err, runtimecore.ErrOperationsPending) {
+			t.Errorf("close test runtime manager: %v", err)
+		}
+	})
+	credential := testCredential()
+	handler, err := NewHandler(manager, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fence := currentFence(t, manager, 1)
 	requestBody, err := json.Marshal(contract.DeleteTaskWorkspaceViewRequest{
 		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, TaskID: "qabc1234", RequestID: "zabc1234",
@@ -230,6 +279,24 @@ func TestDeleteTaskWorkspaceViewRouteRequiresExactFenceAndRequestID(t *testing.T
 	assertError(t, response, http.StatusConflict, "fence_rejected")
 }
 
+type testTaskWorkspaceViews struct{}
+
+func (testTaskWorkspaceViews) PrepareTaskWorkspaceView(context.Context, string, string, string, string, int64, int64, int64, string) error {
+	return nil
+}
+
+func (testTaskWorkspaceViews) DeleteTaskWorkspaceView(context.Context, string, string, string) error {
+	return nil
+}
+
+func (testTaskWorkspaceViews) ExportTaskWorkspaceManifestPage(context.Context, contract.TaskWorkspaceManifestRequest) (contract.TaskWorkspaceManifestResponse, error) {
+	return contract.TaskWorkspaceManifestResponse{}, errors.New("not implemented")
+}
+
+func (testTaskWorkspaceViews) ReadTaskWorkspaceBlock(context.Context, string, string, string, string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
 func TestApplicationsReturnsOnlyValidatedStatusAndExactFence(t *testing.T) {
 	h, manager, credential := newHTTPHandler(t, 1)
 	defer manager.Close()
@@ -240,7 +307,7 @@ func TestApplicationsReturnsOnlyValidatedStatusAndExactFence(t *testing.T) {
 	implementation.installer = &testApplications{item: contract.ApplicationStatusItem{
 		ID: "wechat", Installed: true, Version: "4.1.13.26", LoginStatus: contract.ApplicationLoginUnknown,
 	}}
-	url := "/runtime/v1/applications?protocol_version=1.0&host_id=h1234567&runtime_generation=1&control_version=0"
+	url := "/runtime/v1/applications?protocol_version=2.0&host_id=h1234567&runtime_generation=1&control_version=0"
 	request := httptest.NewRequest(http.MethodGet, url, nil)
 	request.Header.Set("Authorization", "Bearer "+credential)
 	request.Header.Set(contract.ProtocolHeader, contract.ProtocolVersion)
@@ -280,7 +347,7 @@ func TestApplicationsRejectsFenceMismatchBeforeProbeAndInvalidProbe(t *testing.T
 		return contract.ApplicationStatusItem{ID: "codex", Installed: true, Version: "1.2.3", LoginStatus: contract.ApplicationLoginLoggedIn}
 	}
 	requestURL := func(generation, control string) string {
-		return "/runtime/v1/applications?protocol_version=1.0&host_id=h1234567&runtime_generation=" + generation + "&control_version=" + control
+		return "/runtime/v1/applications?protocol_version=2.0&host_id=h1234567&runtime_generation=" + generation + "&control_version=" + control
 	}
 	for _, test := range []struct {
 		name       string
@@ -327,7 +394,7 @@ func TestApplicationsRequiresRuntimeAuthenticationAndStrictQuery(t *testing.T) {
 		t.Fatal("probe must not run for invalid or unauthenticated request")
 		return contract.ApplicationStatusItem{}
 	}
-	url := "/runtime/v1/applications?protocol_version=1.0&host_id=h1234567&runtime_generation=1&control_version=0"
+	url := "/runtime/v1/applications?protocol_version=2.0&host_id=h1234567&runtime_generation=1&control_version=0"
 	request := httptest.NewRequest(http.MethodGet, url, nil)
 	request.Header.Set(contract.ProtocolHeader, contract.ProtocolVersion)
 	response := httptest.NewRecorder()
@@ -347,7 +414,7 @@ func TestStrictJSONAndRequestLimit(t *testing.T) {
 	handler, manager, credential := newHTTPHandler(t, 1)
 	defer manager.Close()
 	fence := currentFence(t, manager, 1)
-	requestBody := `{"protocol_version":"1.0","host_id":"h1234567","runtime_generation":1,"runtime_instance_id":"` + fence.RuntimeInstanceID + `","control_version":0,"mode":"blocked","mode":"ai"}`
+	requestBody := `{"protocol_version":"2.0","host_id":"h1234567","runtime_generation":1,"runtime_instance_id":"` + fence.RuntimeInstanceID + `","control_version":0,"mode":"blocked","mode":"ai"}`
 	request := httptest.NewRequest(http.MethodPut, "/runtime/v1/control", strings.NewReader(requestBody))
 	request.Header.Set("Authorization", "Bearer "+credential)
 	request.Header.Set(contract.ProtocolHeader, contract.ProtocolVersion)
@@ -364,7 +431,7 @@ func TestStrictJSONAndRequestLimit(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	assertError(t, response, http.StatusBadRequest, "invalid_request")
 
-	request = httptest.NewRequest(http.MethodPut, "/runtime/v1/control", strings.NewReader(`{"protocol_version":"1.0"}`))
+	request = httptest.NewRequest(http.MethodPut, "/runtime/v1/control", strings.NewReader(`{"protocol_version":"2.0"}`))
 	request.Header.Set("Authorization", "Bearer "+credential)
 	request.Header.Set(contract.ProtocolHeader, contract.ProtocolVersion)
 	request.Header.Set("Content-Type", "text/plain")
@@ -501,7 +568,7 @@ func TestWeChatInstallIsOwnerFenceBoundAndPollable(t *testing.T) {
 		ProgressPercent: 42, CreatedAt: operation.CreatedAt, UpdatedAt: time.Now().UTC(),
 	}
 	applications.item.InstallRequestID = "req-123"
-	query := "/runtime/v1/applications?protocol_version=1.0&host_id=h1234567&runtime_generation=1&control_version=0"
+	query := "/runtime/v1/applications?protocol_version=2.0&host_id=h1234567&runtime_generation=1&control_version=0"
 	request := httptest.NewRequest(http.MethodGet, query, nil)
 	request.Header.Set("Authorization", "Bearer "+credential)
 	request.Header.Set(contract.ProtocolHeader, contract.ProtocolVersion)

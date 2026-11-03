@@ -57,6 +57,17 @@ async function exec(command: string) {
 }
 
 describe("workbench mock file handlers", () => {
+  it("provides a local read-only Task snapshot and an empty SSE stream", async () => {
+    const snapshot = await resolveHandler("GET", "/__ch/api/tasks/q1234567", new Request(`${baseUrl}/__ch/api/tasks/q1234567`));
+    expect(await snapshot.json()).toMatchObject({
+      task_id: "q1234567", host_id: "h1234567", status: "running", event_sequence: 0, artifacts: [],
+    });
+
+    const events = await resolveHandler("GET", "/__ch/api/tasks/q1234567/events", new Request(`${baseUrl}/__ch/api/tasks/q1234567/events?after=0`));
+    expect(events.headers.get("Content-Type")).toContain("text/event-stream");
+    expect(events.headers.get("Cache-Control")).toBe("no-cache");
+  });
+
   it("returns the safe Codex readiness summary without CLI output", async () => {
     const response = await resolveHandler("GET", "/__ch/api/applications", new Request(`${baseUrl}/__ch/api/applications`));
     expect(response.status).toBe(200);
@@ -87,6 +98,26 @@ describe("workbench mock file handlers", () => {
     const secondURL = `${baseUrl}/__ch/api/workspaces/${workspace.workspace.id}/manifest?revision=4&limit=1&cursor=${firstBody.next_cursor}`;
     const second = await resolveHandler("GET", `/__ch/api/workspaces/${workspace.workspace.id}/manifest`, new Request(secondURL));
     expect(await second.json()).toMatchObject({ workspace_id: "w1234567", revision: 4, files: [{ path: "src/main.go" }] });
+  });
+
+  it("serves only the fixed, metadata-only local Workspace diff and rejects unavailable revisions", async () => {
+    const diff = await resolveHandler("GET", "/__ch/api/workspaces/w1234567/diff", new Request(
+      `${baseUrl}/__ch/api/workspaces/w1234567/diff?from_revision=3&to_revision=4`,
+    ));
+    expect(diff.status).toBe(200);
+    expect(await diff.json()).toMatchObject({
+      workspace_id: "w1234567", from_revision: 3, to_revision: 4,
+      changes: [{ path: "README.md", action: "changed", display_status: "metadata_only", before_text: null, after_text: null }],
+    });
+
+    const unavailable = await resolveHandler("GET", "/__ch/api/workspaces/w1234567/diff", new Request(
+      `${baseUrl}/__ch/api/workspaces/w1234567/diff?from_revision=2&to_revision=4`,
+    ));
+    expect(unavailable.status).toBe(404);
+    const notReady = await resolveHandler("GET", "/__ch/api/workspaces/w7654321/diff", new Request(
+      `${baseUrl}/__ch/api/workspaces/w7654321/diff?from_revision=1&to_revision=2`,
+    ));
+    expect(notReady.status).toBe(409);
   });
 
   it("downloads a nested Workspace file through the revision-pinned Host route", async () => {

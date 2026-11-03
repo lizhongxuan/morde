@@ -41,7 +41,7 @@ func TestOrphanHostVolumeCleanupSurvivesMissingHostAndGuardsHostReuse(t *testing
 	if _, err := store.UpdateUser(ctx, admin.ID, identity.StatusPending, user); err != nil {
 		t.Fatalf("approve migrated user for cleanup checks: %v", err)
 	}
-	params := testCreateHostParams(t, user.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
+	params := testCreateHostParams(t, store, user.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
 	params.Host.ID = hostID
 	if _, _, err := store.CreateHost(ctx, params); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("create Host while volume cleanup is pending = %v, want conflict", err)

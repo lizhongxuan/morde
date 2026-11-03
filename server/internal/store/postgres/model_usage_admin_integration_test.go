@@ -9,7 +9,9 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 )
 
 func modelUsageAdminFixture(t *testing.T) (*Store, *app.ModelUsageAdminService, identity.Principal, identity.Principal, app.ModelCallReservation) {
@@ -175,6 +177,135 @@ func TestPostgresModelUsageAdminRebuildsTaskOnlyAfterAllUnknownCalls(t *testing.
 	}
 }
 
+func TestPostgresModelUsageAdminReconcilesProjectTaskAsInitiatorAcrossBothLedgers(t *testing.T) {
+	tests := []struct {
+		name           string
+		accountTokens  int64
+		reservedInput  int64
+		reservedOutput int64
+		reservedMicros int64
+		wantQuotaError bool
+	}{
+		{name: "within all reservations", accountTokens: 10, reservedInput: 5, reservedOutput: 5, reservedMicros: 10},
+		{name: "account token reservation exceeded", accountTokens: 9, reservedInput: 5, reservedOutput: 5, reservedMicros: 10, wantQuotaError: true},
+		{name: "project input reservation exceeded", accountTokens: 10, reservedInput: 4, reservedOutput: 5, reservedMicros: 10, wantQuotaError: true},
+		{name: "project output reservation exceeded", accountTokens: 10, reservedInput: 5, reservedOutput: 4, reservedMicros: 10, wantQuotaError: true},
+		{name: "project cost reservation exceeded", accountTokens: 10, reservedInput: 5, reservedOutput: 5, reservedMicros: 9, wantQuotaError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, service, admin, actor, creator, taskID, callID := projectUnknownReconciliationFixture(t, test)
+			ctx := context.Background()
+			command := app.ModelUsageReconcileCommand{OwnerID: actor.UserID, Source: app.ModelCallTask, CallID: callID,
+				InputTokens: 5, OutputTokens: 5, Evidence: "provider usage record 123", IP: "127.0.0.1"}
+			replayed, err := service.Reconcile(ctx, admin, command)
+			if test.wantQuotaError {
+				if domain.CodeOf(err) != domain.CodeQuotaExceeded || replayed {
+					t.Fatalf("over reservation reconciliation = replayed %t, err %v; want quota exceeded", replayed, err)
+				}
+				var accountState, projectState string
+				var actualInput, actualOutput, actualMicros *int64
+				var taskUsage *int64
+				if err := store.pool.QueryRow(ctx, `SELECT a.state,p.status,p.actual_input_tokens,p.actual_output_tokens,p.actual_micros,t.usage_model_tokens
+FROM model_call_ledger a JOIN project_budget_ledger p ON p.call_id=a.call_id
+JOIN tasks t ON t.id=a.task_id WHERE a.owner_id=$1 AND a.source='task' AND a.call_id=$2`, actor.UserID, callID).
+					Scan(&accountState, &projectState, &actualInput, &actualOutput, &actualMicros, &taskUsage); err != nil {
+					t.Fatal(err)
+				}
+				if accountState != "unknown" || projectState != "unknown" || actualInput != nil || actualOutput != nil || actualMicros != nil || taskUsage != nil {
+					t.Fatalf("over reservation changed a hold: account=%q project=%q actual=(%v,%v,%v) task_usage=%v",
+						accountState, projectState, actualInput, actualOutput, actualMicros, taskUsage)
+				}
+				var audited int
+				if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action=$1 AND target=$2 AND detail->>'over_reservation'='true'`,
+					string(audit.ActionModelUsageReconcile), actor.UserID+"/task/"+callID).Scan(&audited); err != nil || audited != 1 {
+					t.Fatalf("over reservation evidence audit count = %d, %v", audited, err)
+				}
+				return
+			}
+			if err != nil || replayed {
+				t.Fatalf("project reconciliation = replayed %t, err %v", replayed, err)
+			}
+			var taskOwner, initiator, accountState, projectState string
+			var taskUsage, actualInput, actualOutput, actualMicros *int64
+			if err := store.pool.QueryRow(ctx, `SELECT t.owner_id,t.initiator_id,t.usage_model_tokens,a.state,p.status,
+p.actual_input_tokens,p.actual_output_tokens,p.actual_micros FROM tasks t
+JOIN model_call_ledger a ON a.task_id=t.id JOIN project_budget_ledger p ON p.task_id=t.id WHERE t.id=$1`, taskID).
+				Scan(&taskOwner, &initiator, &taskUsage, &accountState, &projectState, &actualInput, &actualOutput, &actualMicros); err != nil {
+				t.Fatal(err)
+			}
+			if taskOwner != creator || initiator != actor.UserID || taskUsage == nil || *taskUsage != 10 || accountState != "settled" ||
+				projectState != "settled" || actualInput == nil || *actualInput != 5 || actualOutput == nil || *actualOutput != 5 || actualMicros == nil || *actualMicros != 10 {
+				t.Fatalf("reconciled project Task = owner %q initiator %q usage %v account %q project %q actual=(%v,%v,%v)",
+					taskOwner, initiator, taskUsage, accountState, projectState, actualInput, actualOutput, actualMicros)
+			}
+			replayed, err = service.Reconcile(ctx, admin, command)
+			if err != nil || !replayed {
+				t.Fatalf("project reconciliation replay = replayed %t, err %v", replayed, err)
+			}
+		})
+	}
+}
+
+func projectUnknownReconciliationFixture(t *testing.T, test struct {
+	name           string
+	accountTokens  int64
+	reservedInput  int64
+	reservedOutput int64
+	reservedMicros int64
+	wantQuotaError bool
+}) (*Store, *app.ModelUsageAdminService, identity.Principal, identity.Principal, string, string, string) {
+	t.Helper()
+	store, service, admin, actor, _ := modelUsageAdminFixture(t)
+	ctx := context.Background()
+	projectOwner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
+	conversationOwner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
+	projectValue := createProjectStoreFixture(t, ctx, store, projectOwner.ID, "Usage reconciliation", "Project model usage", "usage-reconcile-project")
+	if _, err := inviteAndAcceptProjectStoreMember(t, ctx, store, projectOwner.ID, conversationOwner.ID, projectValue,
+		project.RoleMember, projectValue.Version, "usage-reconcile-creator-invite", "usage-reconcile-creator-accept"); err != nil {
+		t.Fatalf("add conversation creator to project: %v", err)
+	}
+	currentProject, err := store.GetProject(ctx, projectOwner.ID, projectValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inviteAndAcceptProjectStoreMember(t, ctx, store, projectOwner.ID, actor.UserID, projectValue,
+		project.RoleMember, currentProject.Version, "usage-reconcile-actor-invite", "usage-reconcile-actor-accept"); err != nil {
+		t.Fatalf("add Task initiator to project: %v", err)
+	}
+	if _, err := store.SetProjectBudget(ctx, projectOwner.ID, projectValue.ID,
+		project.Budget{Currency: "USD", LimitMicros: 1_000, Version: 1}, 0, "usage-reconcile-budget-01"); err != nil {
+		t.Fatalf("configure project budget: %v", err)
+	}
+	conversationID := mustID(t, domain.NewConversationID)
+	sharedConversation, replayed, err := store.CreateProjectConversation(ctx, conversationOwner.ID, conversation.Conversation{
+		ID: conversationID, OwnerID: conversationOwner.ID, ProjectID: projectValue.ID, Title: "Usage reconciliation",
+	}, testIdempotency(conversationOwner.ID, "project_conversation.create", "usage-reconcile-conversation"))
+	if err != nil || replayed {
+		t.Fatalf("create shared conversation = %#v replayed=%t err=%v", sharedConversation, replayed, err)
+	}
+	taskID := mustID(t, domain.NewTaskID)
+	callID := "unknown-project-call-01"
+	if _, err := store.pool.Exec(ctx, `INSERT INTO tasks(id,owner_id,conversation_id,project_id,initiator_id,model_id,objective,status,auth_kind,auth_token_id,
+budget_active_seconds,budget_tool_calls,budget_model_tokens,usage_model_tokens,execution_location)
+VALUES ($1,$2,$3,$4,$5,'p1234567','project model use','queued','session',$6,600,10,500,NULL,'server')`, taskID,
+		conversationOwner.ID, sharedConversation.ID, projectValue.ID, actor.UserID, actor.TokenID); err != nil {
+		t.Fatalf("insert project Task fixture: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO model_call_ledger(owner_id,source,call_id,request_digest,model_id,provider_model,task_id,
+reserved_tokens,state,input_tokens,output_tokens,settled_at) VALUES ($1,'task',$2,decode(repeat('01',32),'hex'),'p1234567','test-model',$3,
+$4,'unknown',NULL,NULL,clock_timestamp())`, actor.UserID, callID, taskID, test.accountTokens); err != nil {
+		t.Fatalf("insert unknown account usage: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO project_budget_ledger(project_id,source,call_id,actor_id,task_id,model_id,rate_provider,rate_model,rate_version,currency,
+input_micros_per_million,output_micros_per_million,reserved_input_tokens,reserved_output_tokens,reserved_micros,status,request_digest)
+VALUES ($1,'task',$2,$3,$4,'p1234567','provider','test-model',1,'USD',1000000,1000000,$5,$6,$7,'unknown',decode(repeat('02',32),'hex'))`,
+		projectValue.ID, callID, actor.UserID, taskID, test.reservedInput, test.reservedOutput, test.reservedMicros); err != nil {
+		t.Fatalf("insert unknown project usage: %v", err)
+	}
+	return store, service, admin, actor, conversationOwner.ID, taskID, callID
+}
+
 func TestPostgresModelUsageAdminRejectsStaleAuthorityAndRollsBackWithoutAudit(t *testing.T) {
 	store, service, admin, owner, reservation := modelUsageAdminFixture(t)
 	ctx := context.Background()
@@ -196,7 +327,7 @@ func TestPostgresModelUsageAdminRejectsStaleAuthorityAndRollsBackWithoutAudit(t 
 		t.Fatal(err)
 	}
 	overflow := command
-	overflow.InputTokens, overflow.OutputTokens = math.MaxInt64, 0
+	overflow.InputTokens, overflow.OutputTokens = math.MaxInt64, 1
 	if _, err := service.Reconcile(ctx, admin, overflow); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("account usage overflow = %v", err)
 	}

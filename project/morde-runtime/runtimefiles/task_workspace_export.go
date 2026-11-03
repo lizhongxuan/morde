@@ -31,35 +31,53 @@ type TaskWorkspaceManifestChunk struct {
 
 // TaskWorkspaceManifestFile contains only workspace-relative metadata.
 type TaskWorkspaceManifestFile struct {
-	Path      string                       `json:"path"`
-	SizeBytes int64                        `json:"size_bytes"`
-	SHA256    string                       `json:"sha256"`
-	Mode      uint32                       `json:"mode"`
-	Chunks    []TaskWorkspaceManifestChunk `json:"chunks"`
+	Path          string                        `json:"path"`
+	Kind          string                        `json:"kind"`
+	SymlinkTarget string                        `json:"symlink_target,omitempty"`
+	HardlinkTo    string                        `json:"hardlink_to,omitempty"`
+	SizeBytes     int64                         `json:"size_bytes"`
+	SHA256        string                        `json:"sha256"`
+	Mode          uint32                        `json:"mode"`
+	ModTimeNS     *int64                        `json:"mod_time_ns,omitempty"`
+	MetadataKnown bool                          `json:"metadata_known,omitempty"`
+	Xattrs        []mordesync.ExtendedAttribute `json:"xattrs,omitempty"`
+	ACL           *mordesync.NativeACL          `json:"acl,omitempty"`
+	Chunks        []TaskWorkspaceManifestChunk  `json:"chunks"`
+}
+
+type TaskWorkspaceManifestDirectory struct {
+	Path          string                        `json:"path"`
+	Mode          uint32                        `json:"mode"`
+	ModTimeNS     *int64                        `json:"mod_time_ns,omitempty"`
+	MetadataKnown bool                          `json:"metadata_known,omitempty"`
+	Xattrs        []mordesync.ExtendedAttribute `json:"xattrs,omitempty"`
+	ACL           *mordesync.NativeACL          `json:"acl,omitempty"`
 }
 
 // TaskWorkspaceManifestPage is a bounded page from one immutable manifest
 // snapshot of a Task's private Workspace view. An empty manifestSHA256 starts
 // a fresh snapshot; subsequent pages must pass the returned digest.
 type TaskWorkspaceManifestPage struct {
-	TaskID                      string                      `json:"task_id"`
-	WorkspaceID                 string                      `json:"workspace_id"`
-	BindingVersion              int64                       `json:"binding_version"`
-	InputRevision               int64                       `json:"input_revision"`
-	WorkspaceCheckpointRevision int64                       `json:"workspace_checkpoint_revision"`
-	InputManifestSHA256         string                      `json:"input_manifest_sha256"`
-	ViewID                      string                      `json:"view_id"`
-	ManifestSHA256              string                      `json:"manifest_sha256"`
-	Files                       []TaskWorkspaceManifestFile `json:"files"`
-	EmptyDirectories            []string                    `json:"empty_directories"`
-	NextCursor                  string                      `json:"next_cursor,omitempty"`
+	TaskID                      string                           `json:"task_id"`
+	WorkspaceID                 string                           `json:"workspace_id"`
+	BindingVersion              int64                            `json:"binding_version"`
+	InputRevision               int64                            `json:"input_revision"`
+	WorkspaceCheckpointRevision int64                            `json:"workspace_checkpoint_revision"`
+	InputManifestSHA256         string                           `json:"input_manifest_sha256"`
+	ViewID                      string                           `json:"view_id"`
+	ManifestSHA256              string                           `json:"manifest_sha256"`
+	Files                       []TaskWorkspaceManifestFile      `json:"files"`
+	EmptyDirectories            []string                         `json:"empty_directories"`
+	Directories                 []TaskWorkspaceManifestDirectory `json:"directories"`
+	NextCursor                  string                           `json:"next_cursor,omitempty"`
 }
 
 type taskWorkspaceManifestSnapshot struct {
-	Metadata         persistedTaskView  `json:"metadata"`
-	ManifestSHA256   string             `json:"manifest_sha256"`
-	Files            []taskManifestFile `json:"files"`
-	EmptyDirectories []string           `json:"empty_directories"`
+	Metadata         persistedTaskView       `json:"metadata"`
+	ManifestSHA256   string                  `json:"manifest_sha256"`
+	Files            []taskManifestFile      `json:"files"`
+	EmptyDirectories []string                `json:"empty_directories"`
+	Directories      []taskManifestDirectory `json:"directories"`
 }
 
 type taskWorkspaceBlockLocation struct {
@@ -90,15 +108,39 @@ func (w *Workspace) ExportTaskWorkspaceManifestPage(ctx context.Context, request
 			chunks[chunkIndex] = contract.TaskWorkspaceManifestChunk{SHA256: chunk.SHA256, SizeBytes: chunk.SizeBytes}
 		}
 		files[index] = contract.TaskWorkspaceManifestFile{
-			Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, Chunks: chunks,
+			Path: file.Path, Kind: file.Kind, SymlinkTarget: file.SymlinkTarget, HardlinkTo: file.HardlinkTo,
+			SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, ModTimeNS: file.ModTimeNS,
+			MetadataKnown: file.MetadataKnown, Xattrs: contractXattrs(file.Xattrs), ACL: contractACL(file.ACL), Chunks: chunks,
+		}
+	}
+	directories := make([]contract.TaskWorkspaceManifestDirectory, len(page.Directories))
+	for index, directory := range page.Directories {
+		directories[index] = contract.TaskWorkspaceManifestDirectory{
+			Path: directory.Path, Mode: directory.Mode, ModTimeNS: directory.ModTimeNS,
+			MetadataKnown: directory.MetadataKnown, Xattrs: contractXattrs(directory.Xattrs), ACL: contractACL(directory.ACL),
 		}
 	}
 	return contract.TaskWorkspaceManifestResponse{
 		TaskID: page.TaskID, WorkspaceID: page.WorkspaceID, BindingVersion: page.BindingVersion,
 		InputRevision: page.InputRevision, WorkspaceCheckpointRevision: page.WorkspaceCheckpointRevision,
 		InputManifestSHA256: page.InputManifestSHA256, ViewID: page.ViewID, ManifestSHA256: page.ManifestSHA256,
-		Files: files, EmptyDirectories: append([]string{}, page.EmptyDirectories...), NextCursor: page.NextCursor,
+		Files: files, EmptyDirectories: append([]string{}, page.EmptyDirectories...), Directories: directories, NextCursor: page.NextCursor,
 	}, nil
+}
+
+func contractXattrs(xattrs []mordesync.ExtendedAttribute) []contract.WorkspaceExtendedAttribute {
+	converted := make([]contract.WorkspaceExtendedAttribute, len(xattrs))
+	for index, attribute := range xattrs {
+		converted[index] = contract.WorkspaceExtendedAttribute{Name: attribute.Name, Value: append([]byte(nil), attribute.Value...)}
+	}
+	return converted
+}
+
+func contractACL(acl *mordesync.NativeACL) *contract.WorkspaceNativeACL {
+	if acl == nil {
+		return nil
+	}
+	return &contract.WorkspaceNativeACL{Platform: acl.Platform, Format: acl.Format, Data: append([]byte(nil), acl.Data...)}
 }
 
 // TaskWorkspaceManifestPage returns one bounded page. The only caller-supplied
@@ -199,7 +241,7 @@ func (w *Workspace) createTaskWorkspaceManifestSnapshot(ctx context.Context, tas
 	if err != nil {
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
 	}
-	manifest, digest, err := scanTaskWorkspace(ctx, filepath.Join(w.taskRootPath, taskID, viewID))
+	manifest, digest, err := scanTaskWorkspace(ctx, filepath.Join(w.taskRootPath, taskID, viewID, taskWorkspaceContentDirectory))
 	if err != nil {
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
 	}
@@ -217,7 +259,8 @@ func (w *Workspace) createTaskWorkspaceManifestSnapshot(ctx context.Context, tas
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
 	}
 	snapshot := taskWorkspaceManifestSnapshot{
-		Metadata: metadata, ManifestSHA256: digest, Files: taskManifestFiles(manifest), EmptyDirectories: append([]string{}, manifest.EmptyDirectories...),
+		Metadata: metadata, ManifestSHA256: digest, Files: taskManifestFiles(manifest),
+		EmptyDirectories: append([]string{}, manifest.EmptyDirectories...), Directories: taskManifestDirectories(manifest),
 	}
 	if err := validateTaskWorkspaceManifestSnapshot(&snapshot); err != nil {
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
@@ -252,7 +295,19 @@ func (w *Workspace) openTaskWorkspaceView(taskID, viewID string) (*os.Root, *os.
 		_ = taskRoot.Close()
 		return nil, nil, persistedTaskView{}, ErrTaskWorkspaceView
 	}
-	viewRoot, err := openWorkspaceRoot(taskRoot, viewID, viewInfo)
+	viewContainer, err := openWorkspaceRoot(taskRoot, viewID, viewInfo)
+	if err != nil {
+		_ = taskRoot.Close()
+		return nil, nil, persistedTaskView{}, ErrTaskWorkspaceView
+	}
+	contentInfo, err := viewContainer.Lstat(taskWorkspaceContentDirectory)
+	if err != nil || !contentInfo.IsDir() || contentInfo.Mode()&os.ModeSymlink != 0 || !ownedBy(contentInfo, w.taskViewUID) {
+		_ = taskRoot.Close()
+		_ = viewContainer.Close()
+		return nil, nil, persistedTaskView{}, ErrTaskWorkspaceView
+	}
+	viewRoot, err := openWorkspaceRoot(viewContainer, taskWorkspaceContentDirectory, contentInfo)
+	_ = viewContainer.Close()
 	if err != nil {
 		_ = taskRoot.Close()
 		return nil, nil, persistedTaskView{}, ErrTaskWorkspaceView
@@ -345,13 +400,16 @@ func writeTaskWorkspaceManifestSnapshot(root *os.Root, viewID string, snapshot t
 func validateTaskWorkspaceManifestSnapshot(snapshot *taskWorkspaceManifestSnapshot) error {
 	if snapshot == nil || !validTaskWorkspaceDirectory(snapshot.Metadata.TaskID, snapshot.Metadata.ViewID) ||
 		!validPersistedTaskView(snapshot.Metadata, snapshot.Metadata.TaskID, snapshot.Metadata.ViewID) ||
-		!isLowerSHA256(snapshot.ManifestSHA256) || len(snapshot.Files)+len(snapshot.EmptyDirectories) > maxTaskViewFiles || snapshot.Files == nil {
+		!isLowerSHA256(snapshot.ManifestSHA256) || len(snapshot.Files)+max(len(snapshot.EmptyDirectories), len(snapshot.Directories)) > maxTaskViewFiles || snapshot.Files == nil {
 		return ErrTaskWorkspaceView
 	}
 	if snapshot.EmptyDirectories == nil {
 		snapshot.EmptyDirectories = []string{}
 	}
-	manifest := mordesync.Manifest{Files: make([]mordesync.File, len(snapshot.Files)), EmptyDirectories: append([]string{}, snapshot.EmptyDirectories...)}
+	manifest := mordesync.Manifest{
+		Files: make([]mordesync.File, len(snapshot.Files)), EmptyDirectories: append([]string{}, snapshot.EmptyDirectories...),
+		Directories: make([]mordesync.Directory, len(snapshot.Directories)),
+	}
 	for fileIndex, file := range snapshot.Files {
 		if file.Chunks == nil {
 			return ErrTaskWorkspaceView
@@ -363,12 +421,31 @@ func validateTaskWorkspaceManifestSnapshot(snapshot *taskWorkspaceManifestSnapsh
 			}
 		}
 		manifest.Files[fileIndex] = mordesync.File{
-			Path: file.Path, Size: file.SizeBytes, Mode: file.Mode, SHA256: file.SHA256, Blocks: blocks,
+			Path: file.Path, Kind: file.Kind, SymlinkTarget: file.SymlinkTarget, HardlinkTo: file.HardlinkTo,
+			MetadataKnown: file.MetadataKnown, Xattrs: file.Xattrs, ACL: file.ACL,
+			Size: file.SizeBytes, Mode: file.Mode, SHA256: file.SHA256, Blocks: blocks,
+		}
+		if file.ModTimeNS != nil {
+			manifest.Files[fileIndex].ModTimeNS = *file.ModTimeNS
+			manifest.Files[fileIndex].ModTimeKnown = true
 		}
 		if file.SizeBytes > maxTaskViewBytes-manifest.TotalBytes {
 			return ErrTaskWorkspaceView
 		}
 		manifest.TotalBytes += file.SizeBytes
+	}
+	for index, directory := range snapshot.Directories {
+		if directory.Mode == nil {
+			return ErrTaskWorkspaceView
+		}
+		manifest.Directories[index] = mordesync.Directory{
+			Path: directory.Path, Mode: *directory.Mode, ModeKnown: true,
+			MetadataKnown: directory.MetadataKnown, Xattrs: directory.Xattrs, ACL: directory.ACL,
+		}
+		if directory.ModTimeNS != nil {
+			manifest.Directories[index].ModTimeNS = *directory.ModTimeNS
+			manifest.Directories[index].ModTimeKnown = true
+		}
 	}
 	manifest.FileCount = int64(len(manifest.Files))
 	digest, err := taskManifestSHA256(manifest)
@@ -390,7 +467,10 @@ func pageTaskWorkspaceManifest(snapshot taskWorkspaceManifestSnapshot, afterPath
 	}
 	end := min(start+limit, len(entries))
 	for {
-		page := taskWorkspaceManifestPageRange(snapshot, entries[start:end], end < len(entries))
+		page, err := taskWorkspaceManifestPageRange(snapshot, entries[start:end], end < len(entries), start == 0)
+		if err != nil {
+			return TaskWorkspaceManifestPage{}, err
+		}
 		encoded, err := json.Marshal(page)
 		if err != nil {
 			return TaskWorkspaceManifestPage{}, ErrTaskWorkspaceView
@@ -417,7 +497,7 @@ func taskWorkspaceManifestEntries(snapshot taskWorkspaceManifestSnapshot) []task
 	return entries
 }
 
-func taskWorkspaceManifestPageRange(snapshot taskWorkspaceManifestSnapshot, entries []taskWorkspaceManifestEntry, hasMore bool) TaskWorkspaceManifestPage {
+func taskWorkspaceManifestPageRange(snapshot taskWorkspaceManifestSnapshot, entries []taskWorkspaceManifestEntry, hasMore, includeRoot bool) (TaskWorkspaceManifestPage, error) {
 	files := make([]TaskWorkspaceManifestFile, 0, len(entries))
 	emptyDirectories := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -430,21 +510,81 @@ func taskWorkspaceManifestPageRange(snapshot taskWorkspaceManifestSnapshot, entr
 		for chunkIndex, chunk := range file.Chunks {
 			chunks[chunkIndex] = TaskWorkspaceManifestChunk{SHA256: chunk.SHA256, SizeBytes: chunk.SizeBytes}
 		}
+		kind := file.Kind
+		if kind == "" {
+			kind = "file"
+		}
 		files = append(files, TaskWorkspaceManifestFile{
-			Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, Chunks: chunks,
+			Path: file.Path, Kind: kind, SymlinkTarget: file.SymlinkTarget, HardlinkTo: file.HardlinkTo,
+			SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, ModTimeNS: file.ModTimeNS,
+			MetadataKnown: file.MetadataKnown, Xattrs: file.Xattrs, ACL: file.ACL, Chunks: chunks,
 		})
+	}
+	directories, err := taskWorkspaceManifestDirectoriesForEntries(snapshot.Directories, entries, includeRoot)
+	if err != nil {
+		return TaskWorkspaceManifestPage{}, err
 	}
 	page := TaskWorkspaceManifestPage{
 		TaskID: snapshot.Metadata.TaskID, WorkspaceID: snapshot.Metadata.WorkspaceID,
 		BindingVersion: snapshot.Metadata.BindingVersion, InputRevision: snapshot.Metadata.InputRevision,
 		WorkspaceCheckpointRevision: snapshot.Metadata.WorkspaceCheckpointRevision,
 		InputManifestSHA256:         snapshot.Metadata.ManifestSHA256, ViewID: snapshot.Metadata.ViewID,
-		ManifestSHA256: snapshot.ManifestSHA256, Files: files, EmptyDirectories: emptyDirectories,
+		ManifestSHA256: snapshot.ManifestSHA256, Files: files, EmptyDirectories: emptyDirectories, Directories: directories,
 	}
 	if hasMore && len(entries) > 0 {
 		page.NextCursor = entries[len(entries)-1].Path
 	}
-	return page
+	return page, nil
+}
+
+func taskWorkspaceManifestDirectoriesForEntries(all []taskManifestDirectory, entries []taskWorkspaceManifestEntry, includeRoot bool) ([]TaskWorkspaceManifestDirectory, error) {
+	if len(all) == 0 {
+		return []TaskWorkspaceManifestDirectory{}, nil
+	}
+	wanted := make(map[string]struct{})
+	addDirectory := func(value string, includeSelf bool) {
+		if value == "." {
+			wanted["."] = struct{}{}
+			return
+		}
+		current := value
+		if includeSelf {
+			wanted[current] = struct{}{}
+		}
+		for {
+			separator := strings.LastIndexByte(current, '/')
+			if separator < 0 {
+				wanted["."] = struct{}{}
+				return
+			}
+			current = current[:separator]
+			wanted[current] = struct{}{}
+		}
+	}
+	for _, entry := range entries {
+		addDirectory(entry.Path, entry.Directory)
+	}
+	if includeRoot {
+		wanted["."] = struct{}{}
+	}
+	result := make([]TaskWorkspaceManifestDirectory, 0, len(wanted))
+	for _, directory := range all {
+		if _, ok := wanted[directory.Path]; !ok {
+			continue
+		}
+		if directory.Mode == nil {
+			return nil, ErrTaskWorkspaceView
+		}
+		result = append(result, TaskWorkspaceManifestDirectory{
+			Path: directory.Path, Mode: *directory.Mode, ModTimeNS: directory.ModTimeNS,
+			MetadataKnown: directory.MetadataKnown, Xattrs: directory.Xattrs, ACL: directory.ACL,
+		})
+	}
+	if len(result) != len(wanted) {
+		return nil, ErrTaskWorkspaceView
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result, nil
 }
 
 func taskManifestFiles(manifest mordesync.Manifest) []taskManifestFile {
@@ -454,16 +594,51 @@ func taskManifestFiles(manifest mordesync.Manifest) []taskManifestFile {
 		for chunkIndex, block := range file.Blocks {
 			chunks[chunkIndex] = taskManifestChunk{SHA256: block.SHA256, SizeBytes: block.Size}
 		}
+		kind := file.Kind
+		if kind == "file" {
+			kind = ""
+		}
 		files[fileIndex] = taskManifestFile{
-			Path: file.Path, SizeBytes: file.Size, SHA256: file.SHA256, Mode: file.Mode, Chunks: chunks,
+			Path: file.Path, Kind: kind, SymlinkTarget: file.SymlinkTarget, HardlinkTo: file.HardlinkTo,
+			SizeBytes: file.Size, SHA256: file.SHA256, Mode: file.Mode, MetadataKnown: file.MetadataKnown,
+			Xattrs: file.Xattrs, ACL: file.ACL, Chunks: chunks,
+		}
+		if file.ModTimeKnown {
+			modified := file.ModTimeNS
+			files[fileIndex].ModTimeNS = &modified
 		}
 	}
 	return files
 }
 
+func taskManifestDirectories(manifest mordesync.Manifest) []taskManifestDirectory {
+	directories := make([]taskManifestDirectory, len(manifest.Directories))
+	for index, directory := range manifest.Directories {
+		var mode *uint32
+		if directory.ModeKnown {
+			value := directory.Mode
+			mode = &value
+		}
+		var modified *int64
+		if directory.ModTimeKnown {
+			value := directory.ModTimeNS
+			modified = &value
+		}
+		directories[index] = taskManifestDirectory{
+			Path: directory.Path, Mode: mode, ModTimeNS: modified, MetadataKnown: directory.MetadataKnown,
+			Xattrs: directory.Xattrs, ACL: directory.ACL,
+		}
+	}
+	sort.Slice(directories, func(i, j int) bool { return directories[i].Path < directories[j].Path })
+	return directories
+}
+
 func taskWorkspaceBlockLocations(files []taskManifestFile, digest string) []taskWorkspaceBlockLocation {
 	var locations []taskWorkspaceBlockLocation
 	for _, file := range files {
+		if file.Kind == "symlink" {
+			continue
+		}
 		for index, chunk := range file.Chunks {
 			if chunk.SHA256 == digest {
 				locations = append(locations, taskWorkspaceBlockLocation{

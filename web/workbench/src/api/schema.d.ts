@@ -24,6 +24,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/hub": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Open an installation-bound Hub WebSocket
+         * @description Upgrade this request to a WebSocket using an active restricted client credential (`chc_`) in the Authorization header. Query parameters are rejected. If an Origin header is present, its scheme must be HTTP or HTTPS and its host must exactly match the configured Portal host. The first client text frame must be `{"type":"hello"}`; the server replies with `welcome` containing the authenticated installation ID, the user's bounded device presence list, a 65536-byte frame limit, and server time. Presence is advisory.
+         *
+         *     Client frames are strict JSON objects: `ping` and `devices` contain only `type`; `call` contains `type`, a 4–80 character `id` using only ASCII letters, digits, `.`, `_`, `:`, or `-`, a same-account installation ID in `to`, `action`, and object `args`; `result` contains `type`, `id`, `ok`, and, on success, an action-shaped object `body`, or on failure a bounded `error`; `cancel` contains only `type` and `id`. The supported actions are `info` (no arguments; result contains bounded `name`, `platform`, `os`, `version`, and `actions` metadata), `open` (`{"url":"https://…"}` only; success result is `{"opened":true}`), and `notify` (`{"title":"…","text":"…"}`; success result is `{"notified":true}`). The server relays calls only between active installations owned by the same authenticated user. Calls time out after 30 seconds; an unknown result is not reported as success. The server sends `welcome`, `devices` (up to 256 entries), `pong`, `call`, `result`, `cancel`, `cancel_pending`, and bounded `error` frames.
+         */
+        get: operations["connectHub"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/model/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -161,6 +183,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/auth/client-schedule-grant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue an installation-bound cloud schedule credential
+         * @description Requires the regular native Client credential for the active installation. Returns a separate 12-hour credential restricted to schedule read and management routes; it never grants direct task scopes and is stored by the native client in its credential store.
+         */
+        post: operations["issueClientScheduleGrant"];
+        /**
+         * Revoke cloud schedule credentials for the current installation
+         * @description Requires the regular native Client credential; revokes all schedule grants belonging to this installation without revoking the installation itself or cancelling tasks already accepted by the scheduler.
+         */
+        delete: operations["revokeClientScheduleGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/me": {
         parameters: {
             query?: never;
@@ -173,6 +219,129 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/invite-code": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get or create the current user's invitation code
+         * @description Requires an approved Portal session. The code records signup attribution only; it grants no quota or reward and does not bypass administrator review.
+         */
+        get: operations["getMyInviteCode"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/nudges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the explicitly enabled operational nudge
+         * @description Public read-only settings; disabled policies return no message or external link. No external integration is called by this endpoint.
+         */
+        get: operations["getPublicNudgePolicy"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/record-consents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read independent full-record and training-sample consents */
+        get: operations["listMyRecordConsents"];
+        /**
+         * Set one independent record-capture consent
+         * @description Consent is always account-owner controlled. Withdrawing a purpose rejects and clears its queued payloads; it does not delete already stored records.
+         */
+        put: operations["setMyRecordConsent"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/records": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the current user's own record metadata
+         * @description Requires an approved Portal session. The owner may see metadata and request deletion even after withdrawing consent; payloads and attachments are never returned by this endpoint.
+         */
+        get: operations["listMyRecords"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/record-captures": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List this account's Task record-capture statuses
+         * @description Requires the current account's Session or Client principal. Results are owner-scoped and contain queue metadata only; payloads, attachments, lease fields, and quota reservations are never returned. `queued` and `leased` mean pending; only `stored` means a durable record exists; `rejected` and `failed` are terminal capture failures with a bounded failure code. An empty page may mean capture consent is disabled or no Task capture was enqueued; read record consents for the opt-in state.
+         */
+        get: operations["listMyRecordCaptureStatuses"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/records/{record_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Request deletion of one of the current user's records
+         * @description The Portal session owner may delete their own record without current capture consent. Creates an idempotent tombstone; the record and dedicated attachments are removed asynchronously. This endpoint cannot delete personal-data objects or business attachments.
+         */
+        delete: operations["requestMyRecordDelete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -291,7 +460,7 @@ export interface paths {
         put?: never;
         /**
          * Create a host
-         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys may create only an unbound host within the account quota and default resource target.
+         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host must bind exactly one owned, ready Workspace using workspace_ids; the same ownership and availability checks apply to Portal Sessions, API keys, and internal creation paths. Reuse the Idempotency-Key only to retry the exact normalized request.
          */
         post: operations["createHost"];
         delete?: never;
@@ -326,6 +495,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/hosts/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get the current generation's Host resource usage receipt
+         * @description Host owners, administrators, and API keys with current host:read access can read aggregate CPU and estimated memory usage. This is an unpriced usage record, not an invoice; raw samples and container identities are not returned.
+         */
+        get: operations["getHostUsageReceipt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/hosts/{id}/control": {
         parameters: {
             query?: never;
@@ -337,7 +528,7 @@ export interface paths {
         };
         /**
          * Get the AI and user control state for a host
-         * @description Portal sessions can inspect their owned hosts. API keys require current account access to observe this host. The active transition omits internal task snapshots and runtime receipts.
+         * @description Portal sessions with owner or Host-sharing observation access may inspect this Host. API keys require current account access to observe it. control_actor_user_id is empty when no active user lease exists; the active transition omits internal task snapshots and runtime receipts.
          */
         get: operations["getHostControl"];
         put?: never;
@@ -405,9 +596,31 @@ export interface paths {
         put?: never;
         /**
          * Hand control of a host between AI and the user
-         * @description Portal sessions can operate their owned hosts. API keys require current account permission to operate this host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
+         * @description The Host owner or a member with a control permission may take over when no active user lease exists. Release is limited to the current active holder or the Host owner. API keys require current account permission to operate this Host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. A different active holder or stale version returns 409; pending runtime operations leave the Host fenced and return 202.
          */
         post: operations["actOnHostControl"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/hosts/{id}/control/lease/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Renew the active Host control lease
+         * @description The current Host owner or authorized control member may renew only their own active lease. The caller must provide the current control version; an expired or revoked lease cannot be revived. The response includes current actor, expiry and active state.
+         */
+        post: operations["renewHostControlLease"];
         delete?: never;
         options?: never;
         head?: never;
@@ -426,6 +639,92 @@ export interface paths {
          * @description Host-owner session only. This Host Gateway route uses the host-scoped ch_host cookie and returns only fixed, validated application status and safe installation progress.
          */
         get: operations["getHostApplications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/task-auth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Exchange a one-time Portal ticket for a short-lived Task-read cookie
+         * @description The opaque ticket is single-use and expires within 60 seconds. The Host Gateway redirects to a clean Workbench URL after setting a distinct HttpOnly, Secure, SameSite=Strict cookie scoped to /__ch/. The ticket value is never placed in a referrer or cacheable response.
+         */
+        get: operations["exchangeTaskWorkbenchObservationTicket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/api/tasks/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a narrow, read-only Task observation snapshot
+         * @description Requires the distinct short-lived Task-read cookie. Returns only Task state, event sequence, timestamps, and verified artifact metadata. It excludes objective, result text, event payloads, file paths, and all mutation or Host-control capabilities. Authorization and Host runtime generation are rechecked per request.
+         */
+        get: operations["getWorkbenchTaskObservationSnapshot"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/api/tasks/{task_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Stream safe Task observation events
+         * @description Requires the distinct short-lived Task-read cookie. Each SSE event contains only sequence, fixed event type, and timestamp; event payloads are never returned. Task read authorization and Host generation are rechecked on each poll, so revoked access ends the stream.
+         */
+        get: operations["streamWorkbenchTaskObservationEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/api/workspaces/{workspace_id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["schemas"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Compare two applied Workspace revisions from the Host owner Workbench
+         * @description Host owner ch_host cookie only; Host members with workspace:file:read cannot use this route. Requires an active, healthy, conflict-free binding whose desired and applied revision match the current confirmed revision. The bounded diff projection is the same as the Portal Workspace diff.
+         */
+        get: operations["getHostWorkspaceDiff"];
         put?: never;
         post?: never;
         delete?: never;
@@ -607,7 +906,7 @@ export interface paths {
         put?: never;
         /**
          * Grant an existing user scoped access to a host
-         * @description Owner-only. Accepts desktop:view, desktop:control, terminal:control, and mcp:control in any de-duplicated combination. desktop:control also grants desktop:view. MCP use also requires a valid caller-owned API Key and current permission to observe or operate this Host; revoked sharing access is checked again for each operation. No Workspace access, Host management, or re-sharing is granted.
+         * @description Owner-only. Accepts desktop:view, desktop:control, terminal:control, mcp:control, and workspace:file:read in any de-duplicated combination. desktop:control also grants desktop:view. workspace:file:read is independent and grants only read-only access to files in an active, applied Workspace binding; it does not grant desktop, terminal, or MCP access. MCP use also requires a valid caller-owned API Key and current permission to observe or operate this Host; revoked sharing access is checked again for each operation. No Host management or re-sharing is granted.
          */
         post: operations["inviteHostMember"];
         delete?: never;
@@ -671,8 +970,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Issue a one-time ticket for an authorized desktop or terminal user
-         * @description The current Portal user or native client must own the host or have the permission selected by target. Native clients may request desktop observation only. The default target is desktop and requires desktop:view (also implied by desktop:control); Portal sessions may request terminal when granted terminal:control. The resulting Host cookie keeps member identity separate from Host ownership; every Gateway request rechecks the exact permission and client installation state.
+         * Issue a one-time ticket for an authorized desktop, terminal, or Workspace user
+         * @description The current Portal user or native client must own the host or have the permission selected by target. Native clients may request desktop observation only. The default target is desktop and requires desktop:view (also implied by desktop:control); Portal sessions may request terminal when granted terminal:control or the Workspace tab only when granted workspace:file:read. A Workspace ticket always enters `/__ch/wb/?tab=workspace`; the Gateway then permits only that member's explicitly granted read-only Workspace access and rechecks it dynamically. workspace:file:read does not imply desktop, terminal, or MCP access. The resulting Host cookie keeps member identity separate from Host ownership; every Gateway request rechecks the exact permission and client installation state.
          */
         post: operations["issueHostObservationTicket"];
         delete?: never;
@@ -843,6 +1142,97 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/workspaces/{id}/ownership-transfers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request transfer of Workspace ownership
+         * @description Portal Session only. Only the current owner can request transfer to an approved account. The request freezes Workspace changes until it is accepted or cancelled. The current Workspace ID, revision history, current tree, and volume are retained; no file bytes are sent. Transfers are refused while a Host binding, Task write, synchronization operation, publish, project or Site reference, registered device, or unsupported legacy volume exists.
+         */
+        post: operations["requestWorkspaceOwnershipTransfer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/ownership-transfers/{transfer_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get an ownership transfer request
+         * @description Available to the current or former owner and the proposed owner. After acceptance, this endpoint exposes only the transfer receipt; Workspace and sync data access follows the new current owner.
+         */
+        get: operations["getWorkspaceOwnershipTransfer"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/ownership-transfers/{transfer_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept a Workspace ownership transfer
+         * @description Only the proposed owner's Portal Session may accept. Acceptance is an idempotent operation with a durable operation ID. A result-unknown state remains frozen for reconciliation; it cannot be cancelled or accepted as a new operation.
+         */
+        post: operations["acceptWorkspaceOwnershipTransfer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/ownership-transfers/{transfer_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a pending Workspace ownership transfer
+         * @description Only the former/current owner's Portal Session may cancel while the transfer remains pending. Acceptance or result-unknown operations cannot be cancelled.
+         */
+        post: operations["cancelWorkspaceOwnershipTransfer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/workspaces/{id}/manifest": {
         parameters: {
             query?: never;
@@ -859,6 +1249,94 @@ export interface paths {
         get: operations["getWorkspaceManifest"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Compare two committed Workspace revisions
+         * @description Portal owner sessions only. Returns changed file and directory metadata; UTF-8 text content is included only for small files. Large and binary files retain an explicit display status without content.
+         */
+        get: operations["getWorkspaceDiff"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/copies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Copy a confirmed Workspace revision
+         * @description Portal owner sessions only. Requires a ready Workspace volume, a current tree matching the confirmed revision, no Host binding or in-flight writer, and sufficient owner capacity. Unsupported file metadata fails closed. The source remains unchanged; each idempotency key creates at most one independent Workspace copy.
+         */
+        post: operations["copyWorkspace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore selected paths from an immutable revision
+         * @description Portal owner sessions only. The current Workspace revision is checked atomically; active Host bindings, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
+         */
+        post: operations["restoreWorkspacePaths"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/file-operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rename, move, or delete Workspace paths
+         * @description Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of active Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
+         */
+        post: operations["applyWorkspaceFileOperation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1167,6 +1645,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/host-replicas/{host_id}/generations/{generation}/operation-ledger/{namespace}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                namespace: "runtime_core" | "browser";
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a bounded page from this Host generation's durable operation ledger
+         * @description Host Replica credentials can read only their own Host, runtime generation, and namespace. Events are returned in sequence order for client-side hash-chain validation.
+         */
+        get: operations["listHostRuntimeOperationLedgerEvents"];
+        put?: never;
+        /**
+         * Durably append one Host Runtime operation event
+         * @description The event sequence and predecessor hash must match the current ledger head. Replaying the identical event is idempotent; a different event at an existing sequence or a stale predecessor returns conflict. The response is sent only after PostgreSQL commits the event.
+         */
+        post: operations["appendHostRuntimeOperationLedgerEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/host-replicas/{host_id}/generations/{generation}/task-workspace-view-deletions": {
         parameters: {
             query?: never;
@@ -1352,7 +1858,7 @@ export interface paths {
         };
         /**
          * List the current user's in-app notifications
-         * @description Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Related task content is redacted when current authorization no longer allows access. Marking read does not approve or execute an action.
+         * @description Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Task summaries are redacted when current authorization no longer allows access. Project work-item notices are visible only while the recipient is a current project member. Source notices expose a fixed summary and source identity, not source content. Marking read does not approve or execute an action.
          */
         get: operations["listNotifications"];
         put?: never;
@@ -1376,7 +1882,7 @@ export interface paths {
         put?: never;
         /**
          * Mark a notification as read
-         * @description Portal sessions and native client credentials may mark a historical notification read. Idempotent; this does not execute any task action.
+         * @description Portal sessions and native client credentials may mark a historical Task or source notification read. Idempotent; this does not execute any task action.
          */
         post: operations["markNotificationRead"];
         delete?: never;
@@ -1528,6 +2034,691 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me/main-conversation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the current user's main conversation pointer */
+        get: operations["getMainConversation"];
+        /** Select an owned personal conversation as the main conversation */
+        put: operations["setMainConversation"];
+        /**
+         * Idempotently initialize the current user's main conversation
+         * @description Creates and binds a conversation only when no usable personal history candidate exists; ambiguous legacy history returns selection_required without modifying or merging it.
+         */
+        post: operations["ensureMainConversation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List projects available to the current user
+         * @description Returns projects where the current user has an accepted membership. Invitations do not grant project access until accepted.
+         */
+        get: operations["listProjects"];
+        put?: never;
+        /** Create a project with the caller as its owner */
+        post: operations["createProject"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /** Read a project available to the current user */
+        get: operations["getProject"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /** List accepted project members */
+        get: operations["listProjectMembers"];
+        put?: never;
+        /**
+         * Invite an existing account to a project
+         * @description Owner only. The target must be an existing account in this service instance. This creates a pending invitation, not a membership; the invitee must accept it. No email or external message is sent.
+         */
+        post: operations["inviteProjectMember"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/members/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                user_id: components["parameters"]["ProjectMemberUserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove an accepted project member
+         * @description Owner only. Pending invitations use the separate invitation-revocation operation. The expected member version and idempotency key are checked atomically; active work must be reauthorized after removal.
+         */
+        delete: operations["removeProjectMember"];
+        options?: never;
+        head?: never;
+        /**
+         * Change an accepted member's role
+         * @description Owner only. Only member and viewer roles can be assigned here; ownership changes use the explicit owner-transfer operation.
+         */
+        patch: operations["updateProjectMemberRole"];
+        trace?: never;
+    };
+    "/api/projects/{id}/invitations/{invitation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                invitation_id: components["schemas"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke a pending project invitation
+         * @description Owner only. The invitation must still be pending; expected_version and the idempotency key are checked atomically.
+         */
+        delete: operations["revokeProjectInvitation"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/project-invitations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List invitations addressed to the current user
+         * @description Only invitations for the authenticated account are returned.
+         */
+        get: operations["listMyProjectInvitations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/project-invitations/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept an invitation addressed to the current user
+         * @description Acceptance is atomic and idempotent. A non-invitee cannot read or accept the invitation. Repeated acceptance does not create a second membership.
+         */
+        post: operations["acceptProjectInvitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/owner-transfer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Transfer ownership to an accepted member
+         * @description Current owner only. The target must already be an accepted member. The transfer atomically makes the target owner and the former owner a member, preserving exactly one owner.
+         */
+        post: operations["transferProjectOwner"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List project resource associations visible to the current user
+         * @description Association does not grant Host or Workspace access. The server returns an associated resource ID only when the reader independently has current access to it.
+         */
+        get: operations["listProjectResources"];
+        put?: never;
+        /**
+         * Associate an already accessible Host or Workspace with a project
+         * @description Owner only. The caller must already have independent access to the resource; linking it never grants resource permissions to project members.
+         */
+        post: operations["addProjectResource"];
+        /**
+         * Remove a Host or Workspace association from a project
+         * @description Owner only. The request is version checked and idempotent; removing an association does not modify the resource or its permissions.
+         */
+        delete: operations["removeProjectResource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/workspaces/{workspace_id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a project workspace directory snapshot
+         * @description Requires current project viewer membership, an active Workspace association, and independent current Workspace read permission. Returns only confirmed revision metadata and omits credential paths, file hashes, and block references.
+         */
+        get: operations["getProjectWorkspaceManifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List shared conversations available to project members
+         * @description Every request rechecks current project membership. Project conversation owner_id records who created the shared conversation; later message and Task actors are reported separately.
+         */
+        get: operations["listProjectConversations"];
+        put?: never;
+        /**
+         * Create a shared conversation in a project
+         * @description Accepted project members may create a shared conversation. The creator remains conversation owner; this does not make them the project owner or a later Task initiator.
+         */
+        post: operations["createProjectConversation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a shared project conversation
+         * @description The current accepted project membership is checked on every read.
+         */
+        get: operations["getProjectConversation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/hosts/{host_id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                host_id: components["schemas"]["HostId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get Host resource usage attributed to a project
+         * @description The caller's current accepted project membership is checked on every read and again in the usage query transaction. Only aggregate usage attributed to this project and Host is returned; raw samples, container identities, and Workspace attribution are omitted. Usage is unpriced.
+         */
+        get: operations["getProjectHostUsageReceipt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read shared project conversation history
+         * @description Returns the single shared history for accepted project members. owner_id is the conversation creator; actor_id is the account that authored each message.
+         */
+        get: operations["listProjectConversationMessages"];
+        put?: never;
+        /**
+         * Append a message and queue a Task in the shared conversation
+         * @description Accepted project members may append messages. The conversation owner remains the creator while the Task initiator is the caller; current membership and the caller's independent Host, Workspace, model, and token access are rechecked by the write transaction.
+         */
+        post: operations["appendProjectConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/project-content/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search current Muse content in projects the caller can read
+         * @description The SQL query joins current accepted memberships before matching content and always enforces a bounded result limit. Only current non-deleted project Feed posts, Ideas, Library metadata, and briefs are searched; personal records and inaccessible project excerpts are never read.
+         */
+        get: operations["searchProjectContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/content/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read versioned project content
+         * @description Available to accepted project members. Kinds include the legacy memory/goal/document records and project-scoped Feed posts, Ideas, Library metadata, and briefs. Content IDs are query values because valid IDs may contain slashes. A deleted head revision returns not found. This route reads only project_content_revisions; it never falls back to personal sync data.
+         */
+        get: operations["getProjectContent"];
+        /**
+         * Create or replace project content at an expected revision
+         * @description Owner/member only. Use base_revision 0 for first creation; updates require the current revision. Body is a strict JSON object validated for the selected kind. Each write is idempotent. Initial creation returns 201; update or replay returns 200.
+         */
+        put: operations["putProjectContent"];
+        post?: never;
+        /**
+         * Tombstone project content at an expected revision
+         * @description Owner/member only. The tombstone increments and returns the revision so a later recreation can use that revision as base_revision. The current content body is not returned.
+         */
+        delete: operations["deleteProjectContent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/content/{kind}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List comments pinned to one project content revision and row
+         * @description Accepted project members with viewer access may read. The referenced immutable content revision must exist and not be a tombstone; comments are isolated to the exact project, kind, content ID, revision, and row ID.
+         */
+        get: operations["listProjectContentRowComments"];
+        put?: never;
+        /**
+         * Add a comment pinned to a fixed project content revision and row
+         * @description Accepted project members only. Creation uses comment base version 0; each update/delete must compare the current comment version. Writes are idempotent and recheck current membership and the pinned non-deleted content revision in the transaction.
+         */
+        post: operations["createProjectContentRowComment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/content/{kind}/comments/{comment_id}": {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+                comment_id: components["schemas"]["ProjectContentCommentId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update a comment with a compare-and-swap base version
+         * @description Accepted project members only. A stale base_version returns conflict; the comment remains pinned to its original content revision and row.
+         */
+        put: operations["updateProjectContentRowComment"];
+        post?: never;
+        /** Tombstone a comment with a compare-and-swap base version */
+        delete: operations["deleteProjectContentRowComment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/budget": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a project's current budget and usage totals
+         * @description Available to accepted project members. Unconfigured budgets return configured=false, empty currency, zero limit and version, and zero totals.
+         */
+        get: operations["getProjectBudget"];
+        /**
+         * Set a project's versioned currency limit
+         * @description Owner only. expected_version 0 creates the initial budget. Limits and usage are integer micro-units in the declared currency. Stale versions, lowering below committed/reserved usage, unknown held charges, or changing currency after ledger usage exists return conflict. The project budget and the actor's existing account budget both apply to future reservations.
+         */
+        put: operations["setProjectBudget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/mcp-connectors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List personal MCP connectors explicitly authorized for a project
+         * @description Available to current project members. Returns connector references and non-secret metadata only; connector credentials and endpoints are never copied or returned. Grants whose connector owner is no longer a current project member are not available.
+         */
+        get: operations["listProjectMCPConnectors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/mcp-connectors/{connector_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                connector_id: components["parameters"]["ProjectMCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Explicitly authorize a personal connector for a project
+         * @description The authenticated user must own the personal connector and be a current project member. expected_version 0 creates a grant; a current revoked version reauthorizes it. Only a non-secret connector reference and owner authorization are stored.
+         */
+        put: operations["grantProjectMCPConnector"];
+        post?: never;
+        /**
+         * Revoke a project's personal connector grant
+         * @description Only the connector owner or project owner can revoke. The expected version fences stale requests; affected Task grants and in-flight operations are revoked or marked for unknown-result recovery in the same transaction.
+         */
+        delete: operations["revokeProjectMCPConnector"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/budget/ledger": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List project model usage attribution
+         * @description Available to accepted project members. Task model calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
+         */
+        get: operations["listProjectBudgetLedger"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /** List work items visible to project members */
+        get: operations["listProjectWorkItems"];
+        put?: never;
+        /**
+         * Create a project work item
+         * @description Owner/member only. The default assignee is the caller; any supplied assignee must be an accepted member. Task and Workspace fields are added only through separately authorized operations.
+         */
+        post: operations["createProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        /** Read one project work item */
+        get: operations["getProjectWorkItem"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Assign a work item to an accepted project member */
+        patch: operations["assignProjectWorkItem"];
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/block": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mark an open work item blocked */
+        post: operations["blockProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resume a blocked work item */
+        post: operations["resumeProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Link an independently authorized Task to a work item
+         * @description The transaction authorizer must verify that the caller can access the Task and that the Task actually belongs to this project; a task_id alone never grants access or changes personal Task ownership.
+         */
+        post: operations["linkProjectWorkItemTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/delivery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Attach a saved Workspace revision as work item delivery evidence
+         * @description The evidence Task must already be linked to the work item. The W16 authorizer must verify caller access, project/resource scope, and that the Workspace revision is confirmed and durably saved; this request does not grant Workspace access or accept file content.
+         */
+        post: operations["deliverProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations": {
         parameters: {
             query?: never;
@@ -1581,8 +2772,8 @@ export interface paths {
         get: operations["listConversationMessages"];
         put?: never;
         /**
-         * Append a message and queue a cloud task
-         * @description The selected model and optional Host apply to this task only. The server-side dsh Agent can continue after the client disconnects.
+         * Append a message to a conversation or its active cloud task
+         * @description When expected_task_id is supplied, the message is appended only if that Task is still active; a changed or finished Task returns a conflict instead of creating a new Task. Without it, a new Task may be queued. The server-side dsh Agent can continue after the client disconnects.
          */
         post: operations["appendConversationMessage"];
         delete?: never;
@@ -1625,6 +2816,28 @@ export interface paths {
         get: operations["getTask"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/workbench-observation-ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue a short-lived one-time ticket to observe a Host-bound Task in Workbench
+         * @description Portal session only. The caller must currently be able to read this Task and own its running Host. The raw ticket is returned once, expires within 60 seconds, and is persisted server-side only as a hash. It grants read-only Task status/events and verified artifact metadata; it grants no Host control or Workspace file access.
+         */
+        post: operations["issueTaskWorkbenchObservationTicket"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1791,6 +3004,415 @@ export interface paths {
          * @description Requires a portal session or native Client credential. Only an installation belonging to the current account can be revoked; its credentials are revoked together.
          */
         delete: operations["revokeClient"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the current account's client installations and Hub presence
+         * @description Requires a portal session or native Client credential. Device IDs are Client Installation IDs. Online status is advisory Hub presence.
+         */
+        get: operations["listDevices"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/devices/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ClientInstallationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke a device's complete Client Installation
+         * @description Requires a portal session or native Client credential. This revokes the selected installation and its credentials, ending its Hub and synchronization access; deleting a Device does not preserve other Morde permissions for that installation.
+         */
+        delete: operations["revokeDeviceInstallation"];
+        options?: never;
+        head?: never;
+        /**
+         * Rename a client installation
+         * @description Requires a portal session or native Client credential. The display name is shared by the Client Installation and Hub presence.
+         */
+        patch: operations["renameDevice"];
+        trace?: never;
+    };
+    "/api/goals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the current account's goals */
+        get: operations["listGoals"];
+        put?: never;
+        /**
+         * Create a goal in the personal-object ledger
+         * @description The client supplies a stable ID so an Idempotency-Key retry addresses the same object. The goal body, material references, quota, revision, and account change entry commit atomically.
+         */
+        post: operations["createGoal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/goals/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        /** Read one current-account goal */
+        get: operations["getGoal"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete a goal using its current revision
+         * @description Deletion creates a tombstone; old offline retries cannot recreate the goal.
+         */
+        delete: operations["deleteGoal"];
+        options?: never;
+        head?: never;
+        /** Replace a goal body with an optimistic revision check */
+        patch: operations["updateGoal"];
+        trace?: never;
+    };
+    "/api/schedules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List schedules owned by the current account
+         * @description Schedule-scoped Client grants can access this API; execution authorization remains server-side. Hostless schedules have host_id null. Schedules with browser observation are always Host-bound.
+         */
+        get: operations["listSchedules"];
+        put?: never;
+        /**
+         * Create and enable a schedule
+         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+         */
+        post: operations["createSchedule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/schedules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one current-account schedule
+         * @description Returns host_id as null for a hostless schedule. A schedule with browser observation always has a Host.
+         */
+        get: operations["getSchedule"];
+        /**
+         * Update a schedule definition at the expected version
+         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+         */
+        put: operations["updateSchedule"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/schedules/{id}/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Enable or disable a schedule
+         * @description Requires an Idempotency-Key and expected_version. Hostless schedules can be enabled when they do not configure browser observation. Disabling does not cancel the current run unless current_run_action is cancel.
+         */
+        post: operations["updateScheduleStatus"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/schedules/{id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        /** List run history for a schedule */
+        get: operations["listScheduleRuns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the authenticated account's personal-data quota
+         * @description Returns the authenticated owner's aggregate personal-data usage, reservations, and limits. Usage includes supported personal-object JSON, schedule definitions, and personal attachments. It excludes chat, Workspace files, and separately consented recording data. Requires an approved unbound session or eligible Client credential with task submission scope; Host-scoped credentials cannot read it.
+         */
+        get: operations["getPersonalDataQuota"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/{type}/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a current-account personal object
+         * @description Requires an approved portal session or active Client credential. Schedule definitions use the dedicated Schedule API; a missing or deleted object returns not_found. Object revision and body are read together.
+         */
+        get: operations["getPersonalObject"];
+        /**
+         * Replace a current-account personal object
+         * @description Requires an approved portal session or active Client credential. The write is an optimistic compare-and-set using base_revision. On a revision conflict, details contain only base_revision, current_revision and deleted; the server never returns the object body in the conflict.
+         */
+        put: operations["replacePersonalObject"];
+        post?: never;
+        /**
+         * Delete a current-account personal object
+         * @description Requires an approved portal session or active Client credential. Deletion records a versioned tombstone; the same profile ID cannot be recreated. The body-free receipt is idempotent through Idempotency-Key.
+         */
+        delete: operations["deletePersonalObject"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start an owner-scoped personal attachment upload
+         * @description Requires an approved portal session or active Client credential. The request is limited to 16 KiB and requires an Idempotency-Key. It reserves personal-data quota before accepting chunks; retries with the same key and request return the original upload.
+         */
+        post: operations["createPersonalAttachmentUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/uploads/{upload_id}/chunks/{sequence}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Upload or replay one bounded attachment chunk
+         * @description Requires an approved portal session or active Client credential. Send one raw chunk no larger than 4 MiB, an exact Content-Length, and exactly one X-Chunk-SHA256 header. Repeating the same sequence and bytes is idempotent; different bytes conflict.
+         */
+        put: operations["putPersonalAttachmentChunk"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/uploads/{upload_id}/commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Commit a complete personal attachment upload
+         * @description Requires an approved portal session or active Client credential, an empty request body, and an Idempotency-Key. Commit verifies the target object's current revision, all chunk hashes and the final SHA-256, then publishes an owner-scoped attachment. An exact retry returns the original receipt without publishing twice.
+         */
+        post: operations["commitPersonalAttachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/uploads/{upload_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Cancel a pending personal attachment upload
+         * @description Requires an approved portal session or active Client credential and an empty request body. Repeated cancellation is safe; reserved quota is released through an idempotent bounded cleanup path.
+         */
+        delete: operations["cancelPersonalAttachmentUpload"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/attachments/{attachment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a committed attachment owned by the current account
+         * @description Requires an approved portal session or active Client credential. The server checks owner scope and an existing readable personal reference. Responses are private and non-cacheable.
+         */
+        get: operations["getPersonalAttachment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-data/history/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import user-confirmed text history without creating tasks
+         * @description Requires an approved portal session or active Client credential. This dedicated endpoint accepts only user-confirmed user/assistant text, stable source identifiers and optional committed personal attachment IDs. It is limited to 8 MiB at the API boundary and at most 200 messages / 1 MiB of text per batch. Retries with the same source and message identifiers plus content are idempotent; changed content conflicts. Imported messages are taskless and never invoke task submission or execution.
+         */
+        post: operations["importPersonalHistory"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a keyset page of the current account's personal data
+         * @description Requires an approved Portal session or eligible active Client credential. The supported personal-object set includes profile, memory, soul, diary, goals, schedules, feed posts and preferences, idea marks, library metadata, and built-in skill and connector settings. The first page fixes the account change-feed watermark; later pages use a signed cursor bound to this account, service instance, and keyset position.
+         *
+         *     Pages are reads of the current object view, not a point-in-time snapshot: each page is read in its own database view. Writes after the watermark may appear in later pages and are also present in the change feed. Deleted objects are omitted. Clients must merge by object revision and account change sequence so an older feed event cannot replace a newer page value; preserve the local outbox until reconciliation is complete. Fetch changes only after all snapshot pages have completed, starting after this watermark.
+         *
+         *     The cursor remains valid for the lifetime of the account change log. Change-log rows are currently retained for the account lifetime; pruning requires a cursor floor and a response that directs the client to fetch a new snapshot.
+         */
+        get: operations["getPersonalDataSnapshot"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read personal-data changes after an account sequence
+         * @description Requires an approved Portal session or eligible active Client credential. Fetch changes after all snapshot pages have completed, starting with after_sequence set to the snapshot watermark. Omit through_sequence on the first request; it fixes the upper watermark for this read. While has_more is true, pass the returned through_sequence unchanged and resume from next_after_sequence.
+         *
+         *     The feed returns change metadata for supported personal objects and schedules, never object bodies or secret values. Conversation and message sequence entries are filtered out, so gaps in change_sequence are expected. On the final page, next_after_sequence advances to through_sequence even when the last returned event is earlier.
+         *
+         *     Account sequence values are owner-scoped. Change-log rows are currently retained for the account lifetime, so old cursors do not expire. Pruning must not be added without a minimum retained sequence and snapshot-recovery response.
+         */
+        get: operations["getPersonalDataChanges"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2071,6 +3693,87 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read fixed account, reward, and quota policy
+         * @description Requires an approved administrator's unbound Portal session. Token budgets are set per account; new accounts have no default model budget. This endpoint does not change account consent or issue credits.
+         */
+        get: operations["getAdminSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Morde invitation attribution and signup history
+         * @description Requires an approved administrator's unbound Portal session. Read-only; no reward, account disable, or account deletion action is exposed. No registration IP is retained.
+         */
+        get: operations["listAdminInvites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/sites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read local Site and Release statistics
+         * @description Requires an approved administrator's unbound Portal session. Site counts come only from local Morde data; GitHub analytics and external traffic are not configured or collected. This is read-only and does not publish content.
+         */
+        get: operations["listAdminSites"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/nudges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the saved operational nudge policy */
+        get: operations["getAdminNudgePolicy"];
+        /**
+         * Version-update the operational nudge policy
+         * @description Requires an approved administrator's unbound Portal session. External links must point to GitHub. The policy is disabled by default; updates are audited in the same transaction.
+         */
+        put: operations["updateAdminNudgePolicy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/hosts": {
         parameters: {
             query?: never;
@@ -2173,7 +3876,8 @@ export interface paths {
             };
             cookie?: never;
         };
-        get?: never;
+        /** Get one user without credential data */
+        get: operations["getAdminUser"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2181,6 +3885,236 @@ export interface paths {
         head?: never;
         /** Review a user's status, change their role, or update quota */
         patch: operations["updateUser"];
+        trace?: never;
+    };
+    "/api/admin/users/{id}/personal-data-quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a user's personal-data usage and limits
+         * @description Requires an approved administrator's unbound Portal session. This quota aggregates supported personal-object JSON, schedules, and personal attachments. It excludes chat, Workspace, and separately consented record data.
+         */
+        get: operations["getAdminPersonalDataQuota"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Version-update a user's personal-data quota
+         * @description Requires an approved administrator's unbound Portal session. expected_version makes the update compare-and-set; every successful change is audited. Defaults are 5 GiB total and 300 MiB per attachment. The adjustable per-file cap is bounded by the chunk-index implementation maximum. This does not change chat, Workspace, or record quotas.
+         */
+        patch: operations["setAdminPersonalDataQuota"];
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a user's record consent, quota, and all administrator grants
+         * @description Requires a super administrator session. This does not return record content or attachments.
+         */
+        get: operations["getAdminRecordSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read this administrator's own record capabilities and the user's consent state
+         * @description Returns only the caller's own grants, never other administrators' grants or quota values.
+         */
+        get: operations["getAdminRecordAccess"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Compare-and-set record retention and storage quota
+         * @description Requires a super administrator session. Current usage is preserved; updates below used plus reserved bytes are rejected. The update is audited in the same database transaction.
+         */
+        put: operations["setAdminRecordQuota"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/record-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Grant or revoke one record capability for an active administrator
+         * @description Requires a super administrator session. Grants do not enable user consent. Changes are audited in the same database transaction.
+         */
+        put: operations["setAdminRecordGrant"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List consented record and sample metadata
+         * @description Requires the caller's view grant and current enabled consent for each returned purpose. Payloads and attachments are never included.
+         */
+        get: operations["listAdminUserRecords"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one record body with the view capability
+         * @description Requires the caller's view grant and the current enabled consent. Returns only valid JSON that passes the secret-format check; denied payloads are not returned.
+         */
+        get: operations["getAdminUserRecord"];
+        put?: never;
+        post?: never;
+        /**
+         * Request deletion of a record using the delete capability
+         * @description Creates an idempotent deletion tombstone. The record and dedicated attachments are removed asynchronously; the request and completion are audited without content.
+         */
+        delete: operations["requestAdminUserRecordDelete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        /** List attachment metadata with attachment capability */
+        get: operations["listAdminUserRecordAttachments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}/attachments/{attachment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+                attachment_id: components["schemas"]["RecordAttachmentId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Download one attachment with attachment capability
+         * @description Requires both view and attachment grants plus current consent. Content is an attachment with nosniff and private no-store headers.
+         */
+        get: operations["downloadAdminUserRecordAttachment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/records/{record_id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Export one record after a strict JSON and secret-format check
+         * @description Requires the caller's export grant and current enabled consent. The export must be valid JSON, may not contain known credential fields, common credential formats, or Vault markers, and is returned with a safe generated filename. Use local synthetic records for acceptance.
+         */
+        get: operations["exportAdminUserRecord"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/admin/capacity": {
@@ -2192,6 +4126,300 @@ export interface paths {
         };
         /** Get configured and allocated cluster capacity */
         get: operations["getCapacity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get capacity, local Hub presence, Agent runtime state, and readiness
+         * @description Online installations are counted in this Portal process only. Host and Agent states are separate sources. Readiness failure details are intentionally summarized to avoid exposing infrastructure addresses.
+         */
+        get: operations["getAdminOverview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/model-connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List shared platform model connections without secrets */
+        get: operations["listAdminModelConnections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Aggregate model calls and tokens from the existing ledger
+         * @description Counts ledger rows by created_at. Input and output tokens include settled rows only. Active accounts are distinct owners with any ledger row in range. This is a read-only aggregate and does not create or charge a second ledger.
+         */
+        get: operations["getAdminUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/quality": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Report whether a consented quality sample source is available
+         * @description Does not inspect conversation content. Returns unavailable until a separately consented quality sample source is configured.
+         */
+        get: operations["getAdminQuality"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Aggregate Hub operations, task events, and audit action counts
+         * @description Returns counts by day and whitelisted category only. It excludes content, IP, user and installation identifiers, request hashes, and audit details.
+         */
+        get: operations["getAdminActivity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/places": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Report whether an approved aggregated location source is available
+         * @description Does not infer location from IP or collect new device location data.
+         */
+        get: operations["getAdminPlaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List notify-only threshold rules and local notifications
+         * @description Rules can only create notifications in the local database receiver. Global signup, sync, allowance, and device controls are not exposed.
+         */
+        get: operations["getAdminControls"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create a local notification threshold rule */
+        post: operations["createAdminControlRule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/rules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Compare-and-set a local notification threshold rule */
+        put: operations["updateAdminControlRule"];
+        post?: never;
+        /** Delete a threshold rule using its current version */
+        delete: operations["deleteAdminControlRule"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/evaluate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Manually evaluate enabled account-count rules
+         * @description Evaluation records local notifications only and is idempotent for already-fired rules.
+         */
+        post: operations["evaluateAdminControls"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/controls/notify-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Write a test event to the local notification receiver
+         * @description This does not send email, network traffic, or external notifications.
+         */
+        post: operations["adminControlNotifyTest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Aggregate account, client platform, and signup cohort counts
+         * @description Platform activity uses an unrevoked, unexpired installation with last_used_at in the trailing 30 days. Signup cohort activation means an account ever had an installation, not retention. Client versions are not stored in the current schema.
+         */
+        get: operations["getAdminStats"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/installations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List paginated installations associated with a user
+         * @description Returns installation metadata only; credentials are never included. Online presence is local to this Portal process.
+         */
+        get: operations["listAdminUserInstallations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/authorizations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List paginated client authorizations attributed to a user
+         * @description Only authorizations with an owner association are returned. User codes, credential hashes, and token material are never returned.
+         */
+        get: operations["listAdminUserAuthorizations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/model-usage/ledger": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List paginated model ledger rows for a user
+         * @description Returns model identifiers, state, token counts and timestamps only. Request digests and request or response content are never returned.
+         */
+        get: operations["listAdminUserModelCalls"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2386,7 +4614,7 @@ export interface components {
         ErrorResponse: {
             error: {
                 /** @enum {string} */
-                code: "invalid_argument" | "unauthenticated" | "forbidden" | "account_pending" | "account_rejected" | "account_disabled" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
+                code: "invalid_argument" | "unauthenticated" | "forbidden" | "account_pending" | "account_rejected" | "account_disabled" | "not_found" | "conflict" | "quota_exceeded" | "capacity_exceeded" | "workspace_busy" | "workspace_conflict" | "workspace_unavailable" | "transfer_expired" | "invalid_state" | "idempotency_conflict" | "event_cursor_expired" | "unsupported" | "request_too_large" | "result_too_large" | "rate_limited" | "internal" | "upstream_error" | "host_not_ready" | "upstream_timeout";
                 message: string;
                 details: {
                     [key: string]: unknown;
@@ -2395,14 +4623,15 @@ export interface components {
         };
         HostId: string;
         WorkspaceId: string;
+        WorkspaceOwnershipTransferId: string;
         SiteId: string;
         SiteReleaseId: string;
         UserId: string;
         /** @enum {string} */
-        HostMemberPermission: "desktop:view" | "desktop:control" | "terminal:control" | "mcp:control";
+        HostMemberPermission: "desktop:view" | "desktop:control" | "terminal:control" | "mcp:control" | "workspace:file:read";
         HostMemberInviteRequest: {
             user_id: components["schemas"]["UserId"];
-            /** @description Duplicate entries are removed; desktop:control is stored together with desktop:view. */
+            /** @description Duplicate entries are removed; desktop:control is stored together with desktop:view. workspace:file:read is independent and does not imply desktop access. */
             permissions: components["schemas"]["HostMemberPermission"][];
         };
         HostMember: {
@@ -2421,6 +4650,16 @@ export interface components {
         };
         TokenId: string;
         ClientInstallationId: string;
+        /** @enum {string} */
+        PersonalMutationObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        /** @enum {string} */
+        PersonalObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        /** @description Path-free opaque identifier; exact accepted values depend on object_type. The server rejects . and .. and enforces each type's allowlist. */
+        PersonalObjectId: string;
+        GoalId: string;
+        ScheduleId: string;
+        PersonalAttachmentUploadId: string;
+        PersonalAttachmentId: string;
         ConversationId: string;
         TaskId: string;
         TaskWorkspaceViewDeletionId: string;
@@ -2570,6 +4809,105 @@ export interface components {
         RegisterRequest: {
             name: string;
             password: string;
+            /** @description Optional Morde invitation attribution. The account remains pending review and receives no reward. */
+            invite_code?: string;
+        };
+        InviteCode: {
+            code: string;
+        };
+        AdminSettings: {
+            registration_review_required: boolean;
+            /** @constant */
+            automatic_new_user_model_budget: false;
+            /** @constant */
+            automatic_invitation_reward: false;
+            /** @constant */
+            automatic_contribution_reward: false;
+            /** Format: int64 */
+            default_personal_data_quota_bytes: number;
+            /** Format: int64 */
+            default_personal_attachment_bytes: number;
+        };
+        AdminInvite: {
+            inviter_id: components["schemas"]["UserId"];
+            inviter_name: string;
+            invitee_id: components["schemas"]["UserId"];
+            invitee_name: string;
+            invitee_status: components["schemas"]["AccountStatus"];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            inviter_invitees: number;
+        };
+        AdminInvitePage: {
+            items: components["schemas"]["AdminInvite"][];
+            /** Format: int64 */
+            total: number;
+            /** Format: int64 */
+            total_inviters: number;
+            limit: number;
+            offset: number;
+        };
+        AdminSite: {
+            id: string;
+            owner_id: components["schemas"]["UserId"];
+            owner_name: string;
+            host_id: components["schemas"]["HostId"];
+            /** @enum {string} */
+            state: "active" | "draining" | "stopped";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            release_count: number;
+            /** Format: int64 */
+            healthy_release_count: number;
+            /** Format: date-time */
+            latest_release_at: string | null;
+        };
+        AdminSiteSummary: {
+            /** Format: int64 */
+            sites: number;
+            /** Format: int64 */
+            active_sites: number;
+            /** Format: int64 */
+            releases: number;
+            /** Format: int64 */
+            healthy_releases: number;
+        };
+        AdminSiteIntegrations: {
+            /** @constant */
+            demo: "not_configured";
+            /** @constant */
+            github_stats: "not_configured";
+            /** @constant */
+            traffic: "not_collected";
+        };
+        AdminSitePage: {
+            items: components["schemas"]["AdminSite"][];
+            summary: components["schemas"]["AdminSiteSummary"];
+            integrations: components["schemas"]["AdminSiteIntegrations"];
+            /** Format: int64 */
+            total: number;
+            limit: number;
+            offset: number;
+        };
+        AdminNudgePolicy: {
+            enabled: boolean;
+            url: string;
+            text_zh: string;
+            text_en: string;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at: string | null;
+        };
+        UpdateAdminNudgePolicyRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            enabled: boolean;
+            url: string;
+            text_zh: string;
+            text_en: string;
         };
         /** @enum {string} */
         AccountStatus: "pending" | "rejected" | "approved" | "disabled";
@@ -2691,6 +5029,22 @@ export interface components {
             runtime_generation: number;
             items: components["schemas"]["HostReplicaBinding"][];
         };
+        RuntimeOperationLedgerEvent: {
+            /** @enum {integer} */
+            version: 1;
+            /** Format: uint64 */
+            sequence: number;
+            /** @enum {string} */
+            kind: "runtime_state" | "operation" | "browser.operation" | "browser.operation_binding" | "browser.operation_completed" | "browser.task_context" | "browser.target_owned" | "browser.context_closed";
+            /** @description JSON payload included in the event hash. */
+            data: unknown;
+            previous_hash: string;
+            hash: string;
+        };
+        RuntimeOperationLedgerPage: {
+            items: components["schemas"]["RuntimeOperationLedgerEvent"][];
+            has_more: boolean;
+        };
         HostTaskWorkspaceViewDeletion: {
             request_id: components["schemas"]["TaskWorkspaceViewDeletionId"];
             task_id: components["schemas"]["TaskId"];
@@ -2737,10 +5091,53 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        HostUsageReceipt: {
+            host_id: components["schemas"]["HostId"];
+            /** Format: int64 */
+            runtime_generation: number;
+            /** @enum {string} */
+            status: "unknown" | "measured" | "partial";
+            /** Format: int64 */
+            samples: number;
+            /** Format: int64 */
+            unknown_intervals: number;
+            unknown_reason?: string;
+            calculation_method: string;
+            /** Format: double */
+            cpu_seconds: number;
+            /** Format: double */
+            estimated_memory_mib_seconds: number;
+            /** @enum {string} */
+            price_status: "unknown";
+            price_unknown_reason: string;
+        };
+        ProjectHostUsageReceipt: {
+            project_id: components["schemas"]["ProjectId"];
+            host_id: components["schemas"]["HostId"];
+            /** @enum {string} */
+            status: "unknown" | "measured" | "partial";
+            /** Format: int64 */
+            samples: number;
+            /** Format: int64 */
+            unknown_intervals: number;
+            unknown_reason?: string;
+            calculation_method: string;
+            /** Format: double */
+            cpu_seconds: number;
+            /** Format: double */
+            estimated_memory_mib_seconds: number;
+            /** @enum {string} */
+            price_status: "unknown";
+            price_unknown_reason: string;
+        };
         ControlActionRequest: {
             /** @enum {string} */
             action: "take_over" | "release";
             request_id: string;
+            /** Format: int64 */
+            expected_control_version: number;
+        };
+        ControlLeaseRenewRequest: {
             /** Format: int64 */
             expected_control_version: number;
         };
@@ -2750,6 +5147,13 @@ export interface components {
             control_state: "ai" | "taking_over" | "user" | "returning";
             /** Format: int64 */
             control_version: number;
+            /** @description Empty when no user currently holds the control lease. */
+            control_actor_user_id: "" | components["schemas"]["UserId"];
+            /** Format: date-time */
+            control_lease_expires_at: string | null;
+            control_lease_active: boolean;
+            /** @description True only when this authenticated request's user currently holds the active control lease. */
+            control_lease_held_by_me: boolean;
             active_transition: components["schemas"]["ControlTransition"] | null;
         };
         ControlActionResponse: {
@@ -2758,6 +5162,13 @@ export interface components {
             control_state: "ai" | "taking_over" | "user" | "returning";
             /** Format: int64 */
             control_version: number;
+            /** @description Empty when no user currently holds the control lease. */
+            control_actor_user_id: "" | components["schemas"]["UserId"];
+            /** Format: date-time */
+            control_lease_expires_at: string | null;
+            control_lease_active: boolean;
+            /** @description True only when this authenticated request's user currently holds the active control lease. */
+            control_lease_held_by_me: boolean;
             active_transition: components["schemas"]["ControlTransition"] | null;
             pending_operation_ids: components["schemas"]["OperationId"][];
         };
@@ -2960,18 +5371,46 @@ export interface components {
             expected_binding_version: number;
         };
         WorkspaceFile: {
-            /** @description Clean relative POSIX path; absolute paths, traversal, symlinks and duplicate case-folded paths are rejected. */
+            /** @description Clean relative POSIX path; absolute paths, traversal and duplicate case-folded paths are rejected. A symlink is represented at its own path and is never followed. */
             path: string;
-            /** Format: int64 */
+            /**
+             * @description Empty or omitted kind is a regular file for compatibility with older clients.
+             * @enum {string}
+             */
+            kind?: "file" | "symlink";
+            /** @description Required for symlinks. UTF-8 relative POSIX target up to 4096 bytes; NUL, backslash, colon, absolute and root-escaping targets are rejected. Never resolved or followed by file APIs. */
+            symlink_target?: string;
+            /** @description For regular files, identifies the earlier canonical path for another name of the same inode. The anchor must be a regular file with identical content, chunks, mode and modification time. */
+            hardlink_to?: string;
+            /**
+             * Format: int64
+             * @description For symlinks, UTF-8 target byte length.
+             */
             size_bytes: number;
+            /** @description For symlinks, SHA-256 of the target bytes. */
             sha256: string;
-            /** @description Permission bits only; executable bits are preserved. */
+            /** @description Permission bits only for regular files; symlink mode is 0. */
             mode: number;
+            /**
+             * Format: int64
+             * @description Modification time as Unix nanoseconds; omitted for legacy revisions whose timestamp is unknown.
+             */
+            mod_time_ns?: number | null;
             chunks: components["schemas"]["WorkspaceChunk"][];
-        };
+        } & (unknown & unknown);
         WorkspaceChunk: {
             sha256: string;
             size_bytes: number;
+        };
+        WorkspaceDirectory: {
+            path: string;
+            /** @description Directory permission bits; omitted when the historical revision did not capture them. */
+            mode?: number | null;
+            /**
+             * Format: int64
+             * @description Modification time as Unix nanoseconds; omitted when unknown.
+             */
+            mod_time_ns?: number | null;
         };
         WorkspaceManifest: {
             workspace_id: components["schemas"]["WorkspaceId"];
@@ -2979,6 +5418,7 @@ export interface components {
             revision: number;
             files: components["schemas"]["WorkspaceFile"][];
             empty_directories: string[];
+            directories: components["schemas"]["WorkspaceDirectory"][];
             next_cursor: string | null;
         };
         WorkspaceChangePage: {
@@ -2995,6 +5435,126 @@ export interface components {
             }[];
             next_cursor: string;
         };
+        WorkspaceDiff: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            from_revision: number;
+            /** Format: int64 */
+            to_revision: number;
+            changes: components["schemas"]["WorkspaceDiffChange"][];
+        };
+        WorkspaceDiffChange: {
+            path: string;
+            /** @enum {string} */
+            action: "added" | "removed" | "changed" | "renamed";
+            before: components["schemas"]["WorkspaceDiffVersion"] | null;
+            after: components["schemas"]["WorkspaceDiffVersion"] | null;
+            /** @enum {string} */
+            display_status: "text" | "binary" | "too_large" | "metadata_only" | "not_applicable";
+            before_text: string | null;
+            after_text: string | null;
+        };
+        WorkspaceDiffVersion: {
+            /** @enum {string} */
+            kind: "file" | "symlink" | "directory";
+            path: string;
+            symlink_target?: string;
+            /** Format: int64 */
+            size_bytes?: number;
+            sha256?: string;
+            mode?: number;
+            /**
+             * Format: int64
+             * @description Directory modification time as Unix nanoseconds; omitted when unknown.
+             */
+            mod_time_ns?: number | null;
+        };
+        WorkspaceRestoreRequest: {
+            /** Format: int64 */
+            target_revision: number;
+            /** Format: int64 */
+            expected_current_revision: number;
+            paths: string[];
+        };
+        WorkspaceRestoreResult: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            target_revision: number;
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** Format: int64 */
+            revision: number;
+            replayed: boolean;
+        };
+        WorkspaceCopyRequest: {
+            name: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+        };
+        WorkspaceCopyResult: {
+            source_workspace_id: components["schemas"]["WorkspaceId"];
+            workspace: {
+                id: components["schemas"]["WorkspaceId"];
+                name: string;
+                /** Format: int64 */
+                revision: number;
+                /** @enum {string} */
+                state: "ready";
+            };
+            /** Format: int64 */
+            source_revision: number;
+            /** @enum {string} */
+            state: "completed";
+            replayed: boolean;
+        };
+        WorkspaceFileOperationRequest: {
+            /** @enum {string} */
+            action: "rename" | "move" | "delete";
+            /** @description Normalized relative path. Credential paths are rejected. */
+            source_path: string;
+            /** @description Required for rename and move; omitted for delete. */
+            target_path?: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** @description Must be explicitly true to enable this operation. */
+            write_enabled: boolean;
+        };
+        WorkspaceFileOperationResult: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** @enum {string} */
+            action: "rename" | "move" | "delete";
+            source_path: string;
+            target_path: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** Format: int64 */
+            revision: number;
+            replayed: boolean;
+        };
+        RequestWorkspaceOwnershipTransfer: {
+            target_user_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        WorkspaceOwnershipTransfer: {
+            id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            from_owner_id: components["schemas"]["UserId"];
+            to_owner_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            state: "pending" | "accepting" | "unknown" | "accepted" | "cancelled";
+            /** Format: int64 */
+            expected_revision: number;
+            operation_id?: string;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: date-time */
+            accepted_at?: string;
+        };
         CreateSyncSessionRequest: {
             /** @enum {string} */
             direction: "upload" | "download" | "bidirectional";
@@ -3005,13 +5565,14 @@ export interface components {
              * @description For Host replica downloads and bidirectional sync
              */
             base_revision: number;
-            /** @description Paired with task_hub_operation_key; accepted only for a device upload scoped to one file. */
+            /** @description Optional Task write fence. Must be paired with task_hub_operation_key and is accepted only for a device upload scoped to one file. */
             task_id?: string;
-            /** @description Durable Hub operation key associated with this Task write. */
+            /** @description The durable Hub operation key associated with this Task write; must be paired with task_id. */
             task_hub_operation_key?: string;
             scope?: string[];
             files: components["schemas"]["WorkspaceFile"][];
             empty_directories?: string[];
+            directories?: components["schemas"]["WorkspaceDirectory"][];
             deleted_paths?: string[];
             deleted_directories?: string[];
             /** @description Advance this replica's durable cursor only after this session is applied and committed. */
@@ -3241,6 +5802,458 @@ export interface components {
             /** Format: date-time */
             last_used_at: string | null;
         };
+        DeviceInstallation: {
+            id: components["schemas"]["ClientInstallationId"];
+            display_name: string;
+            /** @enum {string} */
+            platform: "desktop" | "android" | "ios";
+            /** Format: date-time */
+            expires_at: string;
+            revoked: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_used_at: string | null;
+            /** @description Advisory Hub presence for this installation. */
+            online: boolean;
+        };
+        PersonalProfile: {
+            /** @description Leading and trailing whitespace is not allowed. */
+            name: string;
+            /** @enum {string} */
+            avatar: "dragon" | "emoji";
+            /** @description Required with avatar=emoji; forbidden with avatar=dragon. */
+            emoji?: string;
+            /** @description Required with avatar=emoji; forbidden with avatar=dragon. */
+            color?: string;
+            description?: string;
+            /** @enum {string} */
+            style?: "" | "muse" | "flat" | "clay" | "watercolor" | "pixel" | "line" | "sticker";
+        };
+        PersonalMemory: {
+            content: string;
+            category?: string;
+        };
+        PersonalSoul: {
+            name: string;
+            emoji?: string;
+            style?: string;
+            lang?: string;
+            content: string;
+        };
+        PersonalDiary: {
+            /** Format: date */
+            date: string;
+            content: string;
+        };
+        GoalStep: {
+            id: string;
+            title: string;
+            /** @enum {string} */
+            status: "pending" | "in_progress" | "done" | "blocked" | "skipped";
+            note?: string;
+        };
+        GoalBody: {
+            title: string;
+            description: string;
+            /** @enum {string} */
+            status: "active" | "paused" | "done" | "cancelled";
+            steps: components["schemas"]["GoalStep"][];
+            related_material_ids: components["schemas"]["PersonalObjectId"][];
+        };
+        /** @enum {string} */
+        ScheduleStatus: "enabled" | "disabled" | "completed";
+        /** @enum {string} */
+        ScheduleNotificationEvent: "completed" | "failed" | "waiting_user";
+        /** @description Host association for a schedule; null means the schedule is hostless. Browser observation schedules require a Host. */
+        ScheduleHostId: components["schemas"]["HostId"] | null;
+        ScheduleBudget: {
+            /** Format: int64 */
+            active_seconds: number;
+            /** Format: int64 */
+            tool_calls: number;
+            /** Format: int64 */
+            model_tokens: number;
+        };
+        ScheduleObservation: {
+            /** Format: uri */
+            url: string;
+            selector: string;
+            /** @enum {string} */
+            field: "text" | "value";
+        };
+        ScheduleOnceTiming: {
+            /** @enum {string} */
+            kind: "once";
+            /**
+             * Format: date-time
+             * @description RFC3339 instant with an explicit UTC offset.
+             */
+            run_at: string;
+            /** @description IANA time-zone identifier used for display. */
+            time_zone: string;
+        };
+        ScheduleDailyTiming: {
+            /** @enum {string} */
+            kind: "daily";
+            /** Format: date */
+            starts_on: string;
+            local_time: string;
+            /** @description IANA time-zone identifier. */
+            time_zone: string;
+        };
+        ScheduleWeeklyTiming: {
+            /** @enum {string} */
+            kind: "weekly";
+            /** Format: date */
+            starts_on: string;
+            local_time: string;
+            /** @description IANA time-zone identifier. */
+            time_zone: string;
+            weekdays: number[];
+        };
+        ScheduleEveryNHoursTiming: {
+            /** @enum {string} */
+            kind: "every_n_hours";
+            /** @description Elapsed hours between occurrences. */
+            interval_hours: number;
+            /** @description Must be a valid IANA time-zone identifier; the server rejects unknown identifiers. */
+            time_zone: string;
+        };
+        ScheduleTiming: components["schemas"]["ScheduleOnceTiming"] | components["schemas"]["ScheduleDailyTiming"] | components["schemas"]["ScheduleWeeklyTiming"] | components["schemas"]["ScheduleEveryNHoursTiming"];
+        /** @enum {string} */
+        ScheduleMisfirePolicy: "skip" | "run_once";
+        ScheduleSyncDefinition: {
+            status: components["schemas"]["ScheduleStatus"];
+            host_id: components["schemas"]["ScheduleHostId"];
+            model_id: string;
+            objective: string;
+            timing: components["schemas"]["ScheduleTiming"];
+            budget: components["schemas"]["ScheduleBudget"];
+            misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events: components["schemas"]["ScheduleNotificationEvent"][];
+            observation?: components["schemas"]["ScheduleObservation"];
+        } & unknown;
+        GoalCreateRequest: {
+            id: components["schemas"]["GoalId"];
+            body: components["schemas"]["GoalBody"];
+        };
+        GoalMutationRequest: {
+            /** Format: int64 */
+            base_revision: number;
+            body: components["schemas"]["GoalBody"];
+        };
+        GoalDeleteRequest: {
+            /** Format: int64 */
+            base_revision: number;
+        };
+        GoalPage: {
+            items: components["schemas"]["PersonalObject"][];
+            next_cursor: string | null;
+        };
+        ScheduleCreateRequest: {
+            host_id?: components["schemas"]["ScheduleHostId"];
+            model_id: string;
+            objective: string;
+            timing: components["schemas"]["ScheduleTiming"];
+            budget: components["schemas"]["ScheduleBudget"];
+            misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
+            observation?: components["schemas"]["ScheduleObservation"] | null;
+        } & unknown;
+        ScheduleUpdateRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            host_id?: components["schemas"]["ScheduleHostId"];
+            model_id?: string;
+            objective?: string;
+            timing?: components["schemas"]["ScheduleTiming"];
+            budget?: components["schemas"]["ScheduleBudget"];
+            misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
+            observation?: components["schemas"]["ScheduleObservation"] | null;
+        };
+        ScheduleActionRequest: {
+            /** @enum {string} */
+            action: "enable" | "disable";
+            /** Format: int64 */
+            expected_version: number;
+            /** @enum {string} */
+            current_run_action?: "continue" | "cancel";
+        };
+        /** @enum {string} */
+        ScheduleRunStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "stopping" | "completed" | "failed" | "cancelled" | "skipped" | "missed";
+        /** @enum {string} */
+        ScheduleRunSkipReason: "dst_gap" | "overlap" | "authorization_ended";
+        ScheduleRun: {
+            id: components["schemas"]["ScheduleRunId"];
+            schedule_id: components["schemas"]["ScheduleId"];
+            /** Format: int64 */
+            schedule_version: number;
+            occurrence_key: string;
+            /** Format: date-time */
+            scheduled_at: string | null;
+            /** Format: int64 */
+            coalesced_count: number;
+            status: components["schemas"]["ScheduleRunStatus"];
+            skip_reason: components["schemas"]["ScheduleRunSkipReason"] | null;
+            task_id: components["schemas"]["TaskId"] | null;
+            notification_events: components["schemas"]["ScheduleNotificationEvent"][];
+            observation: components["schemas"]["ScheduleObservation"] | null;
+            /** @enum {string} */
+            observation_outcome: "unknown" | "baseline" | "changed" | "no_change";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: date-time */
+            finished_at: string | null;
+        };
+        Schedule: {
+            id: components["schemas"]["ScheduleId"];
+            /** Format: int64 */
+            version: number;
+            status: components["schemas"]["ScheduleStatus"];
+            host_id: components["schemas"]["ScheduleHostId"];
+            model_id: string;
+            objective: string;
+            timing: components["schemas"]["ScheduleTiming"];
+            budget: components["schemas"]["ScheduleBudget"];
+            misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
+            notification_events: components["schemas"]["ScheduleNotificationEvent"][];
+            observation: components["schemas"]["ScheduleObservation"] | null;
+            /** Format: date-time */
+            next_run_at: string | null;
+            last_run: components["schemas"]["ScheduleRun"] | null;
+            current_run: components["schemas"]["ScheduleRun"] | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & unknown;
+        SchedulePage: {
+            items: components["schemas"]["Schedule"][];
+            /** @description Empty string means there are no more pages. */
+            next_cursor: string;
+        };
+        ScheduleRunPage: {
+            items: components["schemas"]["ScheduleRun"][];
+            /** @description Empty string means there are no more pages. */
+            next_cursor: string;
+        };
+        ScheduleActionResponse: {
+            schedule: components["schemas"]["Schedule"];
+            current_run: components["schemas"]["ScheduleRun"] | null;
+        };
+        PersonalFeedPost: {
+            title: string;
+            type: string;
+            emoji?: string;
+            /** Format: date-time */
+            created_at?: string;
+            liked?: boolean;
+            body: string;
+        };
+        PersonalFeedPreferences: {
+            content: string;
+        };
+        PersonalIdeaMark: {
+            /** @enum {string} */
+            state: "saved" | "dismissed";
+        };
+        PersonalLibraryItem: {
+            name: string;
+            /** @enum {string} */
+            kind: "artifact" | "media";
+            mime?: string;
+            /** Format: int64 */
+            size_bytes?: number;
+            attachment_id?: string;
+        };
+        PersonalSkillSetting: {
+            enabled: boolean;
+        };
+        PersonalConnectorSetting: {
+            /** @enum {string} */
+            auth: "open" | "oauth" | "key";
+            enabled: boolean;
+        };
+        PersonalObjectPutRequest: {
+            /** Format: int64 */
+            base_revision: number;
+            body: components["schemas"]["PersonalProfile"] | components["schemas"]["PersonalMemory"] | components["schemas"]["PersonalSoul"] | components["schemas"]["PersonalDiary"] | components["schemas"]["GoalBody"] | components["schemas"]["PersonalFeedPost"] | components["schemas"]["PersonalFeedPreferences"] | components["schemas"]["PersonalIdeaMark"] | components["schemas"]["PersonalLibraryItem"] | components["schemas"]["PersonalSkillSetting"] | components["schemas"]["PersonalConnectorSetting"];
+        };
+        PersonalObjectDeleteRequest: {
+            /** Format: int64 */
+            base_revision: number;
+        };
+        PersonalObject: {
+            object_type: components["schemas"]["PersonalObjectType"];
+            object_id: components["schemas"]["PersonalObjectId"];
+            /** Format: int64 */
+            revision: number;
+            body: components["schemas"]["PersonalProfile"] | components["schemas"]["PersonalMemory"] | components["schemas"]["PersonalSoul"] | components["schemas"]["PersonalDiary"] | components["schemas"]["GoalBody"] | components["schemas"]["ScheduleSyncDefinition"] | components["schemas"]["PersonalFeedPost"] | components["schemas"]["PersonalFeedPreferences"] | components["schemas"]["PersonalIdeaMark"] | components["schemas"]["PersonalLibraryItem"] | components["schemas"]["PersonalSkillSetting"] | components["schemas"]["PersonalConnectorSetting"];
+        };
+        PersonalMutationReceipt: {
+            object_type: components["schemas"]["PersonalMutationObjectType"];
+            object_id: components["schemas"]["PersonalObjectId"];
+            /** Format: int64 */
+            result_revision: number;
+            /** Format: int64 */
+            account_change_sequence: number;
+            replay: boolean;
+        };
+        PersonalSnapshotPage: {
+            /**
+             * Format: int64
+             * @description Account change sequence captured on the first request; this fixes the change-feed starting point but not object values across pages.
+             */
+            watermark: number;
+            items: components["schemas"]["PersonalObject"][];
+            /** @description Signed cursor for the next current-view keyset page; null when complete. */
+            next_cursor: string | null;
+        };
+        PersonalChange: {
+            /** Format: int64 */
+            change_sequence: number;
+            object_type: components["schemas"]["PersonalObjectType"];
+            object_id: components["schemas"]["PersonalObjectId"];
+            /** Format: int64 */
+            revision: number;
+            /** @enum {string} */
+            operation: "upsert" | "delete";
+            /** @description Optional idempotency key for correlating an account's own mutation; never contains an object body. */
+            mutation_id?: string;
+        };
+        PersonalChangePage: {
+            items: components["schemas"]["PersonalChange"][];
+            /**
+             * Format: int64
+             * @description Fixed upper watermark for this change read.
+             */
+            through_sequence: number;
+            /**
+             * Format: int64
+             * @description Resume from this sequence on the next page; on the final page this advances to through_sequence
+             */
+            next_after_sequence: number;
+            has_more: boolean;
+        };
+        PersonalAttachmentUploadRequest: {
+            object_id: string;
+            /** Format: int64 */
+            base_revision: number;
+            /**
+             * Format: int64
+             * @description Defaults to a 300 MiB account limit; administrators can configure a larger limit up to the chunk-index maximum.
+             */
+            size_bytes: number;
+            sha256: string;
+            media_type: string;
+        };
+        PersonalAttachmentUploadReceipt: {
+            upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+            /** @enum {string} */
+            state: "pending" | "active" | "committed" | "cancelled" | "expired";
+            /** Format: int32 */
+            chunk_count: number;
+            replay: boolean;
+        };
+        PersonalAttachmentChunkReceipt: {
+            upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+            /** Format: int32 */
+            sequence: number;
+            replay: boolean;
+        };
+        PersonalAttachmentCommitReceipt: {
+            attachment_id: components["schemas"]["PersonalAttachmentId"];
+            object_type: components["schemas"]["PersonalObjectType"];
+            object_id: string;
+            /** Format: int64 */
+            result_revision: number;
+            /** Format: int64 */
+            account_change_sequence: number;
+            replay: boolean;
+        };
+        PersonalHistoryImportMessage: {
+            source_message_id: string;
+            /** @enum {string} */
+            role: "user" | "assistant";
+            /** @description UTF-8 text no larger than 32 KiB per message. */
+            content: string;
+            attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
+        };
+        PersonalHistoryImportRequest: {
+            source_id: string;
+            device_account_id: string;
+            source_conversation_id: string;
+            target_conversation_id?: components["schemas"]["ConversationId"];
+            title?: string;
+            messages: components["schemas"]["PersonalHistoryImportMessage"][];
+        };
+        PersonalHistoryImportReceiptMessage: {
+            source_message_id: string;
+            message_id: components["schemas"]["MessageId"];
+            conversation_id: components["schemas"]["ConversationId"];
+            /** @enum {string} */
+            role: "user" | "assistant";
+            content: string;
+            /** Format: int64 */
+            sequence: number;
+            attachment_ids: components["schemas"]["PersonalAttachmentId"][] | null;
+            replay: boolean;
+        };
+        PersonalHistoryImportReceipt: {
+            conversation_id: components["schemas"]["ConversationId"];
+            title: string;
+            replay: boolean;
+            messages: components["schemas"]["PersonalHistoryImportReceiptMessage"][];
+        };
+        SetAdminPersonalDataQuotaRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            /** Format: int64 */
+            max_attachment_bytes: number;
+        };
+        AdminPersonalDataQuota: {
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            reserved_bytes: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            /** Format: int64 */
+            max_attachment_bytes: number;
+            /** Format: int64 */
+            version: number;
+            /**
+             * Format: int64
+             * @constant
+             */
+            default_quota_bytes: 5368709120;
+            /**
+             * Format: int64
+             * @constant
+             */
+            default_max_attachment_bytes: 314572800;
+        };
+        PersonalDataQuota: {
+            owner_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            reserved_bytes: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            /** Format: int64 */
+            max_attachment_bytes: number;
+            /** Format: int64 */
+            remaining_bytes: number;
+            /** Format: int64 */
+            version: number;
+        };
         ClientLoginRequest: {
             name: string;
             password: string;
@@ -3285,6 +6298,11 @@ export interface components {
             /** Format: date-time */
             web_session_expires_at: string;
         };
+        ClientScheduleGrantResponse: {
+            credential: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
         DeviceWorkspace: {
             id: components["schemas"]["WorkspaceId"];
             name: string;
@@ -3327,7 +6345,7 @@ export interface components {
         };
         CreateHostRequest: {
             name?: string;
-            workspace_ids?: components["schemas"]["WorkspaceId"][];
+            workspace_ids: components["schemas"]["WorkspaceId"][];
         };
         CreateAPIKeyRequest: {
             name: string;
@@ -3369,12 +6387,434 @@ export interface components {
         };
         Conversation: {
             id: components["schemas"]["ConversationId"];
+            /** @enum {string} */
+            scope: "personal";
+            is_main: boolean;
             host_id?: components["schemas"]["HostId"];
             title: string;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        MainConversation: {
+            /** @enum {string} */
+            status: "ready" | "uninitialized" | "selection_required";
+            /** @description Empty unless status is ready. */
+            conversation_id: string;
+            /** Format: int64 */
+            version: number;
+        };
+        SetMainConversationRequest: {
+            conversation_id: components["schemas"]["ConversationId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectId: string;
+        ProjectInvitationId: string;
+        ProjectWorkItemId: string;
+        /** @enum {string} */
+        ProjectRole: "owner" | "member" | "viewer";
+        /** @enum {string} */
+        ProjectContentKind: "memory" | "goal" | "document" | "feed_post" | "idea" | "library_item" | "brief";
+        /** @enum {string} */
+        ProjectMuseContentKind: "feed_post" | "idea" | "library_item" | "brief";
+        ProjectContentCommentId: string;
+        /** @enum {string} */
+        ProjectResourceKind: "host" | "workspace";
+        CreateProjectConversationRequest: {
+            title?: string;
+        };
+        ProjectConversation: {
+            id: components["schemas"]["ConversationId"];
+            project_id: components["schemas"]["ProjectId"];
+            owner_id: components["schemas"]["UserId"];
+            title: string;
+            model_id?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        ProjectConversationPage: {
+            items: components["schemas"]["ProjectConversation"][];
+            next_cursor: string | null;
+        };
+        ProjectConversationMessage: components["schemas"]["ConversationMessage"] & {
+            owner_id: components["schemas"]["UserId"];
+            actor_id: components["schemas"]["UserId"];
+        };
+        ProjectConversationMessagePage: {
+            items: components["schemas"]["ProjectConversationMessage"][];
+            next_cursor: string | null;
+        };
+        AppendProjectConversationMessageRequest: components["schemas"]["AppendConversationMessageRequest"];
+        AppendProjectConversationMessageResponse: {
+            message: components["schemas"]["ProjectConversationMessage"];
+            task: components["schemas"]["ProjectConversationTask"];
+        };
+        ProjectConversationTask: components["schemas"]["Task"] & {
+            project_id: components["schemas"]["ProjectId"];
+            initiator_id: components["schemas"]["UserId"];
+        };
+        CreateProjectRequest: {
+            name: string;
+            description?: string;
+        };
+        Project: {
+            id: components["schemas"]["ProjectId"];
+            owner_id: components["schemas"]["UserId"];
+            name: string;
+            description: string;
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectPage: {
+            items: components["schemas"]["Project"][];
+            next_cursor: string | null;
+        };
+        ProjectMember: {
+            project_id: components["schemas"]["ProjectId"];
+            user_id: components["schemas"]["UserId"];
+            role: components["schemas"]["ProjectRole"];
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectMemberPage: {
+            items: components["schemas"]["ProjectMember"][];
+            next_cursor: string | null;
+        };
+        InviteProjectMemberRequest: {
+            user_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            role: "member" | "viewer";
+            /** Format: int64 */
+            expected_version: number;
+        };
+        UpdateProjectMemberRequest: {
+            /** @enum {string} */
+            role: "member" | "viewer";
+            /** Format: int64 */
+            expected_version: number;
+        };
+        RemoveProjectMemberRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        RevokeProjectInvitationRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectInvitation: {
+            id: components["schemas"]["ProjectInvitationId"];
+            project_id: components["schemas"]["ProjectId"];
+            inviter_id: components["schemas"]["UserId"];
+            invitee_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            role: "member" | "viewer";
+            /** @enum {string} */
+            state: "pending" | "accepted" | "revoked";
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectInvitationPage: {
+            items: components["schemas"]["ProjectInvitation"][];
+            next_cursor: string | null;
+        };
+        TransferProjectOwnerRequest: {
+            user_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectResourceMutationRequest: {
+            kind: components["schemas"]["ProjectResourceKind"];
+            /** @description Must be a HostId when kind=host or a WorkspaceId when kind=workspace. */
+            resource_id: string;
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectResource: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectResourceKind"];
+            resource_id: string;
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectResourcePage: {
+            items: components["schemas"]["ProjectResource"][];
+            next_cursor: string | null;
+        };
+        ProjectWorkspaceManifest: {
+            project_id: components["schemas"]["ProjectId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+            files: {
+                path: string;
+                /**
+                 * @description The entry type; symlink targets are intentionally hidden from project viewers.
+                 * @enum {string}
+                 */
+                kind: "file" | "symlink";
+                size_bytes: number;
+                mode: number;
+            }[];
+            empty_directories: string[];
+            next_cursor: string | null;
+        };
+        ProjectContent: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectContentKind"];
+            id: string;
+            /** Format: int64 */
+            revision: number;
+            body: components["schemas"]["ProjectFeedPost"] | components["schemas"]["ProjectIdea"] | components["schemas"]["ProjectLibraryMetadata"] | components["schemas"]["ProjectBrief"] | {
+                [key: string]: unknown;
+            };
+            updated_by: components["schemas"]["UserId"];
+        };
+        ProjectFeedPost: {
+            title: string;
+            type: string;
+            emoji?: string;
+            /** Format: date-time */
+            created_at?: string;
+            liked?: boolean;
+            body: string;
+        };
+        ProjectIdea: {
+            title: string;
+            content: string;
+            tags?: string[];
+        };
+        /** @description Project-local metadata only. Personal attachment IDs and bytes are not copied or resolved by this API. */
+        ProjectLibraryMetadata: {
+            name: string;
+            /** @enum {string} */
+            kind: "artifact" | "media";
+            mime?: string;
+            /** Format: int64 */
+            size_bytes?: number;
+        };
+        ProjectBrief: {
+            title: string;
+            summary?: string;
+            content: string;
+            tags?: string[];
+        };
+        ProjectContentTombstone: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectContentKind"];
+            id: string;
+            /** Format: int64 */
+            revision: number;
+            updated_by: components["schemas"]["UserId"];
+            /** @constant */
+            deleted: true;
+        };
+        ProjectContentSearchResponse: {
+            items: components["schemas"]["ProjectContentSearchResult"][];
+        };
+        ProjectContentSearchResult: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectMuseContentKind"];
+            content_id: string;
+            /** Format: int64 */
+            revision: number;
+            title: string;
+            excerpt: string;
+        };
+        ProjectContentComment: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectMuseContentKind"];
+            content_id: string;
+            /** Format: int64 */
+            content_revision: number;
+            row_id: string;
+            id: components["schemas"]["ProjectContentCommentId"];
+            /** Format: int64 */
+            revision: number;
+            body?: string;
+            updated_by: components["schemas"]["UserId"];
+            deleted?: boolean;
+        };
+        ProjectContentCommentPage: {
+            items: components["schemas"]["ProjectContentComment"][];
+        };
+        CreateProjectContentCommentRequest: {
+            content_id: string;
+            /** Format: int64 */
+            content_revision: number;
+            row_id: string;
+            body: string;
+        };
+        UpdateProjectContentCommentRequest: {
+            /** Format: int64 */
+            base_version: number;
+            body: string;
+        };
+        DeleteProjectContentCommentRequest: {
+            /** Format: int64 */
+            base_version: number;
+        };
+        ProjectMCPConnector: {
+            /** @description Owner of the personal connector that explicitly authorized this project reference. */
+            connector_owner_id: components["schemas"]["UserId"];
+            connector_id: components["schemas"]["MCPConnectorId"];
+            /** @description Non-secret display name; omitted if the connector was deleted before revocation. */
+            name?: string;
+            enabled: boolean;
+            /**
+             * Format: int64
+             * @description Non-secret connector revision; zero if the connector was deleted before revocation.
+             */
+            connector_revision?: number;
+            /** Format: int64 */
+            grant_version: number;
+            active: boolean;
+            /** Format: date-time */
+            revoked_at?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        ProjectMCPConnectorPage: {
+            items: components["schemas"]["ProjectMCPConnector"][];
+        };
+        ProjectMCPConnectorGrantRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectMCPConnectorRevokeRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        PutProjectContentRequest: {
+            content_id: string;
+            /** Format: int64 */
+            base_revision: number;
+            /** @description Strict kind-specific project JSON object; maximum 1 MiB after request decoding. */
+            body: {
+                [key: string]: unknown;
+            };
+        };
+        DeleteProjectContentRequest: {
+            content_id: string;
+            /** Format: int64 */
+            base_revision: number;
+        };
+        ProjectBudget: {
+            configured: boolean;
+            currency: string;
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            version: number;
+            /** Format: int64 */
+            spent_micros: number;
+            /** Format: int64 */
+            reserved_micros: number;
+            has_unknown: boolean;
+        };
+        SetProjectBudgetRequest: {
+            currency: string;
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectTokenUsage: {
+            /** Format: int64 */
+            input_tokens: number;
+            /** Format: int64 */
+            output_tokens: number;
+        };
+        ProjectBudgetLedgerEntry: {
+            call_id: string;
+            actor_id: components["schemas"]["UserId"];
+            /** @description Present only for source=task. */
+            task_id?: components["schemas"]["TaskId"];
+            /** @enum {string} */
+            source: "client" | "chat" | "task";
+            model_id: components["schemas"]["ModelConnectionId"];
+            /** Format: int64 */
+            rate_version: number;
+            currency: string;
+            /** @enum {string} */
+            status: "reserved" | "settled" | "unknown";
+            reserved_usage: components["schemas"]["ProjectTokenUsage"];
+            actual_usage?: components["schemas"]["ProjectTokenUsage"];
+            /** Format: int64 */
+            reserved_micros: number;
+            /** Format: int64 */
+            actual_micros?: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        ProjectBudgetLedgerPage: {
+            items: components["schemas"]["ProjectBudgetLedgerEntry"][];
+            next_cursor: string | null;
+        };
+        /** @enum {string} */
+        ProjectWorkItemState: "open" | "blocked" | "delivered";
+        ProjectWorkItemDelivery: {
+            task_id: components["schemas"]["TaskId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+        };
+        ProjectWorkItem: {
+            id: components["schemas"]["ProjectWorkItemId"];
+            project_id: components["schemas"]["ProjectId"];
+            title: string;
+            description: string;
+            acceptance_criteria: string[];
+            assignee_id: components["schemas"]["UserId"];
+            state: components["schemas"]["ProjectWorkItemState"];
+            blocked_reason: string;
+            task_ids: components["schemas"]["TaskId"][];
+            delivery?: components["schemas"]["ProjectWorkItemDelivery"] | null;
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectWorkItemPage: {
+            items: components["schemas"]["ProjectWorkItem"][];
+            next_cursor: string | null;
+        };
+        CreateProjectWorkItemRequest: {
+            title: string;
+            description?: string;
+            acceptance_criteria?: string[];
+            /** @description Defaults to the caller. */
+            assignee_id?: components["schemas"]["UserId"];
+        };
+        AssignProjectWorkItemRequest: {
+            assignee_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        BlockProjectWorkItemRequest: {
+            blocked_reason: string;
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectWorkItemVersionRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        LinkProjectWorkItemTaskRequest: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        DeliverProjectWorkItemRequest: {
+            task_id: components["schemas"]["TaskId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            expected_version: number;
         };
         ConversationPage: {
             items: components["schemas"]["Conversation"][];
@@ -3386,7 +6826,10 @@ export interface components {
             /** @enum {string} */
             role: "user" | "assistant";
             content: string;
-            task_id: components["schemas"]["TaskId"];
+            task_id?: components["schemas"]["TaskId"];
+            attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
+            /** @enum {string} */
+            delivery_status: "pending" | "applied" | "unknown";
             /** Format: date-time */
             created_at: string;
         };
@@ -3399,6 +6842,8 @@ export interface components {
             title?: string;
         };
         AppendConversationMessageRequest: {
+            /** @description Active Task that must receive this message; if it is no longer active */
+            expected_task_id?: components["schemas"]["TaskId"];
             host_id?: components["schemas"]["HostId"];
             workspace_id?: components["schemas"]["WorkspaceId"];
             /** @description Immutable committed Workspace revision used by this task. Required with workspace_id. */
@@ -3433,6 +6878,8 @@ export interface components {
         TaskSummary: {
             id: components["schemas"]["TaskId"];
             owner_id: components["schemas"]["UserId"];
+            /** @description Account that actually submitted this Task; for project Tasks */
+            initiator_id: components["schemas"]["UserId"];
             /** @description Optional target Host for computer operations; the dsh Agent runs independently on the server. */
             host_id?: components["schemas"]["HostId"];
             /** @enum {string} */
@@ -3483,6 +6930,21 @@ export interface components {
             /** @description Workspace-relative path */
             path: string;
             media_type: string;
+            workspace_id: string | null;
+            /**
+             * Format: int64
+             * @description Confirmed immutable Workspace revision; null for legacy artifacts without a proof.
+             */
+            workspace_revision: number | null;
+            /**
+             * Format: int64
+             * @description Verified file size; null for legacy artifacts without a proof.
+             */
+            size_bytes: number | null;
+            /** @description Verified file digest; null for legacy artifacts without a proof. */
+            sha256: string | null;
+            /** @description True only when all Workspace proof fields are present and valid. */
+            verified: boolean;
             batch_item_id: components["schemas"]["BatchItemId"] | null;
             batch_attempt: number;
             /** Format: date-time */
@@ -3513,6 +6975,51 @@ export interface components {
             safe_after: string;
             unsettled_operation_ids: components["schemas"]["OperationId"][];
         };
+        /** @description The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text. */
+        TaskAssistantMessage: {
+            id: components["schemas"]["MessageId"];
+            conversation_id: components["schemas"]["ConversationId"];
+            task_id: components["schemas"]["TaskId"];
+            /** @constant */
+            role: "assistant";
+            content: string;
+            /** @enum {string} */
+            status: "streaming" | "completed" | "interrupted";
+            /** Format: date-time */
+            created_at: string;
+        };
+        TaskWorkbenchObservationTicket: {
+            ticket: string;
+            task_id: components["schemas"]["TaskId"];
+            host_id: components["schemas"]["HostId"];
+            /** Format: date-time */
+            expires_at: string;
+        };
+        /** @description Read-only Task projection. It contains no objective, Task result, event payload, file path, mutation field, or Host control capability. */
+        TaskWorkbenchObservationSnapshot: {
+            task_id: components["schemas"]["TaskId"];
+            host_id: components["schemas"]["HostId"];
+            status: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            event_sequence: number;
+            /** Format: date-time */
+            updated_at: string;
+            artifacts: components["schemas"]["TaskWorkbenchObservationArtifact"][];
+        };
+        /** @description Metadata for a Task artifact with a complete verified Workspace proof. File paths and contents are never exposed. */
+        TaskWorkbenchObservationArtifact: {
+            id: components["schemas"]["ArtifactId"];
+            label: string;
+            media_type: string;
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
+            /** Format: date-time */
+            created_at: string;
+        };
         Task: components["schemas"]["TaskSummary"] & {
             /**
              * Format: int64
@@ -3527,6 +7034,7 @@ export interface components {
             pending_request: components["schemas"]["TaskPendingRequest"] | null;
             clarification_request: components["schemas"]["TaskClarificationRequest"] | null;
             stop_request: components["schemas"]["TaskStopRequest"] | null;
+            assistant_message: components["schemas"]["TaskAssistantMessage"] | null;
             /** Format: date-time */
             finished_at: string | null;
         };
@@ -3593,12 +7101,28 @@ export interface components {
             created_at: string;
             payload: unknown;
         };
+        /** @description Task-backed notices have a task_id and positive event_sequence. Goal and project work-item source notices have task_id null, event_sequence 0, and source identity fields; project_id is present only for project work-item notices. source_event_id is an internal deduplication key and is not returned. */
         Notification: {
             id: components["schemas"]["NotificationId"];
             /** @enum {string} */
-            kind: "completed" | "failed" | "waiting_user";
+            kind: "completed" | "failed" | "waiting_user" | "goal_step_blocked" | "goal_completed" | "project_work_item_blocked" | "project_work_item_delivered";
             task_id: components["schemas"]["TaskId"] | null;
+            /** @description Positive for Task-backed notices and 0 for source notices. */
             event_sequence: number;
+            /**
+             * @description Omitted for Task-backed notices.
+             * @enum {string}
+             */
+            source_kind?: "goal" | "project_work_item";
+            /** @description Omitted for Task-backed notices. */
+            source_id?: string;
+            /**
+             * Format: int64
+             * @description Omitted for Task-backed notices.
+             */
+            source_version?: number;
+            /** @description Present only for project work-item notices. */
+            project_id?: components["schemas"]["ProjectId"];
             /** @description Null when current authorization no longer permits disclosure. */
             summary: string | null;
             redacted: boolean;
@@ -3646,6 +7170,464 @@ export interface components {
             default_host_resources: components["schemas"]["HostResourcesTarget"];
             /** Format: date-time */
             created_at: string;
+        };
+        AdminOverview: {
+            /** Format: date-time */
+            checked_at: string;
+            health: components["schemas"]["AdminHealth"];
+            /** @description Count from the current Portal process Hub only. */
+            online_installations: number;
+            limit: components["schemas"]["Quota"];
+            allocated: components["schemas"]["Usage"];
+            hosts_by_state: {
+                [key: string]: number;
+            };
+            agents_by_state: {
+                [key: string]: number;
+            };
+        };
+        AdminHealth: {
+            ready: boolean;
+            /** @description Generic readiness summary without infrastructure details. */
+            problem?: string;
+        };
+        AdminInstallation: {
+            id: components["schemas"]["ClientInstallationId"];
+            display_name: string;
+            /** @enum {string} */
+            platform: "desktop" | "android" | "ios";
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_used_at: string | null;
+            /** Format: date-time */
+            expires_at: string | null;
+            /** Format: date-time */
+            revoked_at: string | null;
+            /** @description Current-process Hub presence only. */
+            online: boolean;
+        };
+        /** @description User authorization codes and credential hashes are not returned. */
+        AdminAuthorization: {
+            id: components["schemas"]["TokenId"];
+            display_name: string;
+            /** @enum {string} */
+            platform: "desktop" | "android" | "ios";
+            /** @enum {string} */
+            state: "pending" | "approved" | "denied" | "claimed";
+            installation_id: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: date-time */
+            claimed_at: string | null;
+        };
+        /** @description Request digests and prompt or response content are not returned. */
+        AdminModelCall: {
+            /** @enum {string} */
+            source: "client" | "chat" | "task" | "probe";
+            call_id: string;
+            model_id: string;
+            provider_model: string;
+            task_id?: string;
+            /** Format: int64 */
+            reserved_tokens: number;
+            /** @enum {string} */
+            state: "dispatched" | "settled" | "unknown";
+            /** Format: int64 */
+            input_tokens: number | null;
+            /** Format: int64 */
+            output_tokens: number | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            settled_at: string | null;
+        };
+        AdminInstallationPage: {
+            items: components["schemas"]["AdminInstallation"][];
+            /** Format: int64 */
+            total: number;
+            limit: number;
+            offset: number;
+        };
+        AdminAuthorizationPage: {
+            items: components["schemas"]["AdminAuthorization"][];
+            /** Format: int64 */
+            total: number;
+            limit: number;
+            offset: number;
+        };
+        AdminModelCallPage: {
+            items: components["schemas"]["AdminModelCall"][];
+            /** Format: int64 */
+            total: number;
+            limit: number;
+            offset: number;
+        };
+        AdminUsage: {
+            /** @enum {integer} */
+            days: 7 | 30 | 90;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            summary: components["schemas"]["AdminUsageSummary"];
+            by_day: components["schemas"]["AdminUsageDay"][];
+            by_model: components["schemas"]["AdminUsageModel"][];
+        };
+        AdminQuality: {
+            /** @enum {integer} */
+            days: 7 | 30 | 90;
+            available: boolean;
+            unavailable_reason?: string;
+            /**
+             * Format: int64
+             * @description Count of unexpired samples with currently enabled
+             */
+            sample_count: number;
+            /**
+             * Format: int64
+             * @description Failed tasks by updated_at in the selected window.
+             */
+            failed_tasks: number;
+            /** Format: int64 */
+            failed_hub_operations: number;
+            /** Format: int64 */
+            unknown_hub_operations: number;
+        };
+        AdminPlaces: {
+            /** @enum {integer} */
+            days: 7 | 30 | 90;
+            available: boolean;
+            unavailable_reason?: string;
+        };
+        AdminActivity: {
+            /** @enum {integer} */
+            days: 7 | 30 | 90;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            by_day: components["schemas"]["AdminActivityDay"][];
+            hub_operations: components["schemas"]["AdminHubOperationCount"][];
+            task_events: components["schemas"]["AdminTaskEventCount"][];
+            audit_events: components["schemas"]["AdminAuditEventCount"][];
+        };
+        AdminActivityDay: {
+            /** Format: date */
+            date: string;
+            /** Format: int64 */
+            hub_operations: number;
+            /** Format: int64 */
+            task_events: number;
+            /** Format: int64 */
+            audit_events: number;
+        };
+        AdminHubOperationCount: {
+            /** @enum {string} */
+            action: "screenshot" | "files" | "file.get" | "command";
+            /** @enum {string} */
+            status: "prepared" | "dispatched" | "succeeded" | "failed" | "unknown";
+            /** Format: int64 */
+            count: number;
+        };
+        AdminTaskEventCount: {
+            /** @enum {string} */
+            type: "task.status" | "task.step" | "task.operation" | "task.message" | "task.batch_item" | "task.artifact" | "task.waiting_user" | "task.response" | "task.result";
+            /** Format: int64 */
+            count: number;
+        };
+        AdminAuditEventCount: {
+            action: string;
+            /** Format: int64 */
+            count: number;
+        };
+        AdminControls: {
+            rules: components["schemas"]["AdminControlRule"][];
+            /** Format: int64 */
+            accounts_total: number;
+            next_threshold: number | null;
+            notify_configured: boolean;
+            notifications: components["schemas"]["AdminControlNotification"][];
+        };
+        AdminControlRule: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            threshold: number;
+            enabled: boolean;
+            note: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_fired_at: string | null;
+            /** Format: int64 */
+            fired_accounts: number;
+            /** Format: int64 */
+            version: number;
+        };
+        AdminControlNotification: {
+            /** @enum {string} */
+            kind: "rule_fired" | "test";
+            /** Format: int64 */
+            rule_id: number | null;
+            /** Format: int64 */
+            accounts_total: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        AdminControlEvaluation: {
+            /** Format: int64 */
+            accounts_total: number;
+            fired: components["schemas"]["AdminControlRule"][];
+        };
+        AdminControlNotifyTest: {
+            /** @constant */
+            sent: true;
+            /** @constant */
+            configured: true;
+            /** Format: date-time */
+            created_at: string;
+        };
+        /** @enum {string} */
+        RecordPurpose: "full_record" | "training_contribution";
+        /** @enum {string} */
+        RecordCapability: "view" | "attachment" | "export" | "delete";
+        RecordId: string;
+        RecordAttachmentId: string;
+        RecordCaptureQueueId: string;
+        RecordConsent: {
+            owner_id: components["schemas"]["UserId"];
+            purpose: components["schemas"]["RecordPurpose"];
+            enabled: boolean;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        RecordConsents: {
+            items: components["schemas"]["RecordConsent"][];
+        };
+        SetRecordConsentRequest: {
+            purpose: components["schemas"]["RecordPurpose"];
+            enabled: boolean;
+        };
+        RecordQuota: {
+            owner_id: components["schemas"]["UserId"];
+            /** Format: int32 */
+            retention_days: number;
+            /** Format: int64 */
+            limit_bytes: number;
+            /** Format: int64 */
+            used_bytes: number;
+            /** Format: int64 */
+            reserved_bytes: number;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        RecordAdminGrant: {
+            owner_id: components["schemas"]["UserId"];
+            admin_id: components["schemas"]["UserId"];
+            capability: components["schemas"]["RecordCapability"];
+            granted: boolean;
+            granted_by: components["schemas"]["UserId"];
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        AdminRecordSettings: {
+            owner_id: components["schemas"]["UserId"];
+            consents: components["schemas"]["RecordConsent"][];
+            quota: components["schemas"]["RecordQuota"];
+            grants: components["schemas"]["RecordAdminGrant"][];
+        };
+        AdminRecordAccess: {
+            capabilities: components["schemas"]["RecordCapability"][];
+            consents: components["schemas"]["RecordConsent"][];
+        };
+        SetAdminRecordQuotaRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            /** Format: int32 */
+            retention_days: number;
+            /** Format: int64 */
+            limit_bytes: number;
+        };
+        SetAdminRecordGrantRequest: {
+            admin_id: components["schemas"]["UserId"];
+            capability: components["schemas"]["RecordCapability"];
+            granted: boolean;
+        };
+        RecordMetadata: {
+            id: components["schemas"]["RecordId"];
+            owner_id: components["schemas"]["UserId"];
+            purpose: components["schemas"]["RecordPurpose"];
+            /** @enum {string} */
+            kind: "turn" | "sample";
+            /** Format: int64 */
+            consent_version: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: int64 */
+            payload_bytes: number;
+            /** Format: int64 */
+            attachment_bytes: number;
+            /** Format: int32 */
+            attachment_count: number;
+            /** @enum {string} */
+            state: "active";
+        };
+        RecordPage: {
+            items: components["schemas"]["RecordMetadata"][];
+            next_before: string;
+        };
+        RecordCaptureStatus: {
+            id: components["schemas"]["RecordCaptureQueueId"];
+            task_id: components["schemas"]["TaskId"];
+            purpose: components["schemas"]["RecordPurpose"];
+            /** @enum {string} */
+            kind: "turn" | "sample";
+            /** @enum {string} */
+            state: "queued" | "leased" | "stored" | "rejected" | "failed";
+            failure_code: string;
+            /** Format: date-time */
+            captured_at: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        RecordCaptureStatusPage: {
+            items: components["schemas"]["RecordCaptureStatus"][];
+            next_before: string;
+        };
+        RecordContent: {
+            metadata: components["schemas"]["RecordMetadata"];
+            /** @description Valid JSON record payload with known secret formats and Vault markers rejected. */
+            payload: unknown;
+        };
+        RecordAttachment: {
+            id: components["schemas"]["RecordAttachmentId"];
+            record_id: components["schemas"]["RecordId"];
+            file_name: string;
+            media_type: string;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
+        };
+        RecordAttachmentPage: {
+            items: components["schemas"]["RecordAttachment"][];
+        };
+        RecordDeleteTombstone: {
+            id: string;
+            owner_id: components["schemas"]["UserId"];
+            record_id: components["schemas"]["RecordId"];
+            /** @enum {string} */
+            state: "pending" | "failed" | "completed";
+            /** Format: int32 */
+            attempts: number;
+            /** Format: date-time */
+            requested_at: string;
+            /** Format: date-time */
+            completed_at?: string;
+        };
+        CreateAdminControlRuleRequest: {
+            /** Format: int64 */
+            threshold: number;
+            note?: string;
+        };
+        UpdateAdminControlRuleRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            /** Format: int64 */
+            threshold?: number;
+            enabled?: boolean;
+            note?: string;
+            /** @default false */
+            rearm: boolean;
+        };
+        AdminUsageSummary: {
+            /** Format: int64 */
+            calls: number;
+            /** Format: int64 */
+            settled_calls: number;
+            /** Format: int64 */
+            unknown_calls: number;
+            /** Format: int64 */
+            input_tokens: number;
+            /** Format: int64 */
+            output_tokens: number;
+            /** Format: int64 */
+            active_accounts: number;
+        };
+        AdminUsageDay: {
+            /** Format: date */
+            date: string;
+            /** Format: int64 */
+            calls: number;
+            /** Format: int64 */
+            input_tokens: number;
+            /** Format: int64 */
+            output_tokens: number;
+            /** Format: int64 */
+            active_accounts: number;
+        };
+        AdminUsageModel: {
+            model_id: string;
+            /** Format: int64 */
+            calls: number;
+            /** Format: int64 */
+            input_tokens: number;
+            /** Format: int64 */
+            output_tokens: number;
+        };
+        AdminStats: {
+            users: components["schemas"]["AdminUserStats"];
+            platforms: components["schemas"]["AdminPlatformStats"][];
+            cohorts: components["schemas"]["AdminCohortStats"][];
+            version_tracking_available: boolean;
+        };
+        AdminUserStats: {
+            /** Format: int64 */
+            total: number;
+            /** Format: int64 */
+            approved: number;
+            /** Format: int64 */
+            pending: number;
+            /** Format: int64 */
+            rejected: number;
+            /** Format: int64 */
+            disabled: number;
+        };
+        AdminPlatformStats: {
+            /** @enum {string} */
+            platform: "desktop" | "android" | "ios";
+            /**
+             * Format: int64
+             * @description Total installation records
+             */
+            installations: number;
+            /**
+             * Format: int64
+             * @description Unrevoked
+             */
+            active_installations: number;
+            /** Format: int64 */
+            users: number;
+        };
+        AdminCohortStats: {
+            week: string;
+            /** Format: int64 */
+            signups: number;
+            /**
+             * Format: int64
+             * @description Accounts which ever had a client installation; not a retention measure.
+             */
+            with_installation: number;
         };
         AdminWorkspaceBinding: {
             host_id: components["schemas"]["HostId"];
@@ -3801,7 +7783,13 @@ export interface components {
         SiteReleaseId: components["schemas"]["SiteReleaseId"];
         ModelConnectionId: components["schemas"]["ModelConnectionId"];
         MCPConnectorId: components["schemas"]["MCPConnectorId"];
+        ProjectMCPConnectorId: components["schemas"]["MCPConnectorId"];
         NotificationId: components["schemas"]["NotificationId"];
+        ProjectId: components["schemas"]["ProjectId"];
+        ProjectConversationId: components["schemas"]["ConversationId"];
+        ProjectInvitationId: components["schemas"]["ProjectInvitationId"];
+        ProjectMemberUserId: components["schemas"]["UserId"];
+        ProjectWorkItemId: components["schemas"]["ProjectWorkItemId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
         PageLimit: number;
@@ -3837,13 +7825,36 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, both project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
                     };
                 };
             };
+            503: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    connectHub: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket connection established; subsequent traffic follows the Hub frame contract in this operation's description. */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             503: components["responses"]["Error"];
             default: components["responses"]["Error"];
         };
@@ -4097,6 +8108,50 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    issueClientScheduleGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Credential returned once for the current installation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientScheduleGrantResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeClientScheduleGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule grants revoked for the current installation */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     getMe: {
         parameters: {
             query?: never;
@@ -4116,6 +8171,179 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getMyInviteCode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation code */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InviteCode"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPublicNudgePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Public nudge policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminNudgePolicy"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyRecordConsents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current consent state; both purposes default to disabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordConsents"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setMyRecordConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetRecordConsentRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated consent state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordConsent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyRecords: {
+        parameters: {
+            query?: {
+                purpose?: components["schemas"]["RecordPurpose"];
+                before_id?: components["schemas"]["RecordId"];
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of this account's record metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyRecordCaptureStatuses: {
+        parameters: {
+            query?: {
+                before_id?: components["schemas"]["RecordCaptureQueueId"];
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of this account's Task-linked capture statuses */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordCaptureStatusPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    requestMyRecordDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion tombstone */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordDeleteTombstone"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -4382,6 +8610,33 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getHostUsageReceipt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate resource usage for the current Host runtime generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostUsageReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getHostControl: {
         parameters: {
             query?: never;
@@ -4514,6 +8769,38 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    renewHostControlLease: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ControlLeaseRenewRequest"];
+            };
+        };
+        responses: {
+            /** @description Current control status after lease renewal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ControlStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getHostApplications: {
         parameters: {
             query?: never;
@@ -4537,6 +8824,121 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    exchangeTaskWorkbenchObservationTicket: {
+        parameters: {
+            query: {
+                ticket: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ticket exchanged; browser should follow the clean Workbench location. */
+            303: {
+                headers: {
+                    /** @description Clean `/__ch/wb/?task_id={task_id}` URL with no ticket query parameter. */
+                    Location?: string;
+                    /** @description Separate ch_task_read cookie; never a ch_host cookie. */
+                    "Set-Cookie"?: string;
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getWorkbenchTaskObservationSnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current safe Task observation projection */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkbenchObservationSnapshot"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    streamWorkbenchTaskObservationEvents: {
+        parameters: {
+            query?: {
+                after?: number;
+            };
+            header?: {
+                "Last-Event-ID"?: string;
+            };
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent safe Task observation events; cursor expiry emits task.snapshot_required and closes the stream. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getHostWorkspaceDiff: {
+        parameters: {
+            query: {
+                from_revision: number;
+                to_revision: number;
+            };
+            header?: never;
+            path: {
+                workspace_id: components["schemas"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded Workspace revision comparison */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDiff"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -4859,7 +9261,7 @@ export interface operations {
         parameters: {
             query?: {
                 /** @description Entry surface. Unknown or repeated query parameters are rejected. */
-                target?: "desktop" | "terminal";
+                target?: "desktop" | "terminal" | "workspace";
             };
             header?: never;
             path: {
@@ -5209,6 +9611,151 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    requestWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestWorkspaceOwnershipTransfer"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay of the transfer request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            /** @description Transfer request created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            /** @description Workspace references or volume state cannot be transferred safely */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ownership transfer status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acceptWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted transfer receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled transfer receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
     getWorkspaceManifest: {
         parameters: {
             query?: {
@@ -5237,6 +9784,154 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getWorkspaceDiff: {
+        parameters: {
+            query: {
+                from_revision: number;
+                to_revision: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded Workspace revision comparison */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDiff"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    copyWorkspace: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceCopyRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed copy returned for an idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceCopyResult"];
+                };
+            };
+            /** @description Newly completed independent Workspace copy */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceCopyResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    restoreWorkspacePaths: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceRestoreRequest"];
+            };
+        };
+        responses: {
+            /** @description Restore result and resulting immutable revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceRestoreResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    applyWorkspaceFileOperation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceFileOperationRequest"];
+            };
+        };
+        responses: {
+            /** @description Operation receipt and resulting immutable revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceFileOperationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -5730,6 +10425,70 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listHostRuntimeOperationLedgerEvents: {
+        parameters: {
+            query?: {
+                after_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                namespace: "runtime_core" | "browser";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Events following the requested sequence */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeOperationLedgerPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    appendHostRuntimeOperationLedgerEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                namespace: "runtime_core" | "browser";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RuntimeOperationLedgerEvent"];
+            };
+        };
+        responses: {
+            /** @description Durably committed event acknowledgement */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeOperationLedgerEvent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -6275,6 +11034,1550 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getMainConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Main conversation selection state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MainConversation"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    setMainConversation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetMainConversationRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated main conversation selection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MainConversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    ensureMainConversation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Main conversation selection state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MainConversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjects: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Projects visible to the current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProject: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the created project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            /** @description Project created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectMembers: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted members of the project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMemberPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    inviteProjectMember: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InviteProjectMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the invitation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectInvitation"];
+                };
+            };
+            /** @description Pending invitation created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectInvitation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    removeProjectMember: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                user_id: components["parameters"]["ProjectMemberUserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoveProjectMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted project member removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateProjectMemberRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                user_id: components["parameters"]["ProjectMemberUserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProjectMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated member role and version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMember"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeProjectInvitation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                invitation_id: components["schemas"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeProjectInvitationRequest"];
+            };
+        };
+        responses: {
+            /** @description Pending invitation revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyProjectInvitations: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitations addressed to the current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectInvitationPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acceptProjectInvitation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact idempotent replay of the accepted membership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMember"];
+                };
+            };
+            /** @description Membership created from the accepted invitation */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMember"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    transferProjectOwner: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransferProjectOwnerRequest"];
+            };
+        };
+        responses: {
+            /** @description Project with the new owner and incremented version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectResources: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Independently authorized project resource associations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResourcePage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    addProjectResource: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectResourceMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the association */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResource"];
+                };
+            };
+            /** @description Resource association created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResource"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    removeProjectResource: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectResourceMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Resource association removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectWorkspaceManifest: {
+        parameters: {
+            query?: {
+                revision?: number;
+                prefix?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized Workspace directory metadata at a confirmed revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkspaceManifest"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectConversations: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Shared project conversations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectConversation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectConversationRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversation"];
+                };
+            };
+            /** @description Project conversation created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Shared project conversation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversation"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectHostUsageReceipt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                host_id: components["schemas"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate project-attributed Host resource usage */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectHostUsageReceipt"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectConversationMessages: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Messages in chronological order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationMessagePage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    appendProjectConversationMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AppendProjectConversationMessageRequest"];
+            };
+        };
+        responses: {
+            /** @description Shared message and queued project Task */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppendProjectConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    searchProjectContent: {
+        parameters: {
+            query: {
+                q: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded matches from currently readable projects */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentSearchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectContent: {
+        parameters: {
+            query: {
+                content_id: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current non-deleted content revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putProjectContent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutProjectContentRequest"];
+            };
+        };
+        responses: {
+            /** @description Content updated or exact idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContent"];
+                };
+            };
+            /** @description Content created at revision 1 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteProjectContent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteProjectContentRequest"];
+            };
+        };
+        responses: {
+            /** @description Tombstone revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentTombstone"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectContentRowComments: {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current comments for this exact row and revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentCommentPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectContentRowComment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectContentCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            /** @description Created comment at version 1 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateProjectContentRowComment: {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+                comment_id: components["schemas"]["ProjectContentCommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProjectContentCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated comment revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteProjectContentRowComment: {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+                comment_id: components["schemas"]["ProjectContentCommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteProjectContentCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description Comment tombstone revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectBudget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current budget and held/settled totals in integer micro-units */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBudget"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setProjectBudget: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetProjectBudgetRequest"];
+            };
+        };
+        responses: {
+            /** @description Current budget and usage totals after the update */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBudget"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectMCPConnectors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active project connector grants */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMCPConnectorPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    grantProjectMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                connector_id: components["parameters"]["ProjectMCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectMCPConnectorGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Active project connector grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeProjectMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                connector_id: components["parameters"]["ProjectMCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectMCPConnectorRevokeRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoked project connector grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectBudgetLedger: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stable page of project usage entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBudgetLedgerPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectWorkItems: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stable project-scoped page ordered by creation time and ID */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItemPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the created work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            /** @description Work item created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    assignProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    blockProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BlockProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Blocked work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resumeProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectWorkItemVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description Resumed work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    linkProjectWorkItemTask: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LinkProjectWorkItemTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description Work item with the Task linked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deliverProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliverProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Delivered work item with saved revision evidence */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
     listConversations: {
         parameters: {
             query?: {
@@ -6498,6 +12801,33 @@ export interface operations {
                     "application/json": components["schemas"]["Task"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    issueTaskWorkbenchObservationTicket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One-time Workbench observation ticket */
+            201: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkbenchObservationTicket"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
@@ -6769,6 +13099,773 @@ export interface operations {
                 };
                 content?: never;
             };
+            default: components["responses"]["Error"];
+        };
+    };
+    listDevices: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Client installations without credentials */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["DeviceInstallation"][];
+                    };
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeDeviceInstallation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ClientInstallationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installation and its credentials revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    renameDevice: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ClientInstallationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    display_name: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Installation renamed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listGoals: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Owner-scoped goals */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GoalCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Goal created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getGoal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Goal body and revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalObject"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GoalDeleteRequest"];
+            };
+        };
+        responses: {
+            /** @description Body-free mutation receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateGoal: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["GoalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GoalMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Body-free mutation receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listSchedules: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["ScheduleStatus"];
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchedulePage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createSchedule: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Created schedule */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSchedule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule definition and current run summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateSchedule: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated schedule */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Schedule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateScheduleStatus: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated schedule and current run state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listScheduleRuns: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["ScheduleId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule run history page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScheduleRunPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalDataQuota: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authenticated owner's current personal-data usage and available space */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalDataQuota"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalObject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current object and revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalObject"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    replacePersonalObject: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalObjectPutRequest"];
+            };
+        };
+        responses: {
+            /** @description Body-free mutation receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deletePersonalObject: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                type: components["schemas"]["PersonalMutationObjectType"];
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                id: components["schemas"]["PersonalObjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalObjectDeleteRequest"];
+            };
+        };
+        responses: {
+            /** @description Body-free mutation receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalMutationReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createPersonalAttachmentUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalAttachmentUploadRequest"];
+            };
+        };
+        responses: {
+            /** @description Existing or newly created upload reservation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAttachmentUploadReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putPersonalAttachmentChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                "Content-Length": number;
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Chunk stored or exact retry acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAttachmentChunkReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitPersonalAttachment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Attachment commit receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAttachmentCommitReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelPersonalAttachmentUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                upload_id: components["schemas"]["PersonalAttachmentUploadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Upload cancelled or already inactive */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalAttachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                attachment_id: components["schemas"]["PersonalAttachmentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Attachment bytes */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "Content-Disposition"?: "attachment";
+                    ETag?: string;
+                    "X-Content-Type-Options"?: "nosniff";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                    "image/*": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    importPersonalHistory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalHistoryImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Canonical conversation and imported message mappings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalHistoryImportReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalDataSnapshot: {
+        parameters: {
+            query?: {
+                /** @description Omit on the first page; pass next_cursor unchanged for subsequent pages. */
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One current-view page and the fixed account change-feed watermark */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalSnapshotPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getPersonalDataChanges: {
+        parameters: {
+            query: {
+                /** @description Last account sequence already committed by the client. */
+                after_sequence: number;
+                /** @description Fixed upper watermark returned by the first page; omit on the first request. */
+                through_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal-data change metadata through a fixed account watermark */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalChangePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             default: components["responses"]["Error"];
         };
     };
@@ -7328,6 +14425,136 @@ export interface operations {
             };
         };
     };
+    getAdminSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current fixed policy and personal-data quota defaults */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminInvites: {
+        parameters: {
+            query?: {
+                search?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation history */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminInvitePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminSites: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local Site and Release summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSitePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminNudgePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Saved policy and version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminNudgePolicy"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminNudgePolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminNudgePolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminNudgePolicy"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     listAllHosts: {
         parameters: {
             query?: never;
@@ -7466,6 +14693,8 @@ export interface operations {
         parameters: {
             query?: {
                 status?: components["schemas"]["AccountStatus"];
+                limit?: number;
+                offset?: number;
             };
             header?: never;
             path?: never;
@@ -7481,11 +14710,41 @@ export interface operations {
                 content: {
                     "application/json": {
                         items: components["schemas"]["AdminUser"][];
+                        /** Format: int64 */
+                        total: number;
+                        limit: number;
+                        offset: number;
                     };
                 };
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description User and resource usage summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -7521,6 +14780,346 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getAdminPersonalDataQuota: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal-data usage and configured/default limits */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminPersonalDataQuota"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setAdminPersonalDataQuota: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAdminPersonalDataQuotaRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated personal-data quota and usage */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminPersonalDataQuota"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminRecordSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record capture settings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRecordSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminRecordAccess: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current caller record access */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminRecordAccess"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setAdminRecordQuota: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAdminRecordQuotaRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated record quota */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordQuota"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setAdminRecordGrant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAdminRecordGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated capability grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordAdminGrant"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserRecords: {
+        parameters: {
+            query?: {
+                purpose?: components["schemas"]["RecordPurpose"];
+                before_id?: components["schemas"]["RecordId"];
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page of record metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminUserRecord: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record metadata and JSON payload */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordContent"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    requestAdminUserRecordDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion tombstone */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordDeleteTombstone"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserRecordAttachments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Attachment metadata only */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordAttachmentPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    downloadAdminUserRecordAttachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+                attachment_id: components["schemas"]["RecordAttachmentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Dedicated record attachment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    exportAdminUserRecord: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+                record_id: components["schemas"]["RecordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Safe JSON attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     getCapacity: {
         parameters: {
             query?: never;
@@ -7541,6 +15140,426 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminOverview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current management overview */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminOverview"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminModelConnections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Shared platform model connections */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelConnectionList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminUsage: {
+        parameters: {
+            query?: {
+                days?: 7 | 30 | 90;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ledger usage for the requested trailing period */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUsage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminQuality: {
+        parameters: {
+            query?: {
+                days?: 7 | 30 | 90;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Quality source availability for the requested period */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminQuality"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminActivity: {
+        parameters: {
+            query?: {
+                days?: 7 | 30 | 90;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregated activity for the requested period */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminActivity"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminPlaces: {
+        parameters: {
+            query?: {
+                days?: 7 | 30 | 90;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Place aggregation source availability for the requested period */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminPlaces"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminControls: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rule configuration and aggregate account count */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControls"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createAdminControlRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAdminControlRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Created threshold rule */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlRule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminControlRule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminControlRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated threshold rule */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlRule"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteAdminControlRule: {
+        parameters: {
+            query: {
+                expected_version: number;
+            };
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rule deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    evaluateAdminControls: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Evaluation result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlEvaluation"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    adminControlNotifyTest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local notification test result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminControlNotifyTest"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminStats: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current platform statistics and the latest 12 signup weeks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminStats"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserInstallations: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description User installations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminInstallationPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserAuthorizations: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description User-associated client authorizations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminAuthorizationPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminUserModelCalls: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Existing model call ledger rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminModelCallPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

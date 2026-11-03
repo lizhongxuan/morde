@@ -121,7 +121,7 @@ func (s *AdminOperationsService) Settings(ctx context.Context, principal identit
 	}
 	return AdminSettings{
 		RegistrationReviewRequired:     true,
-		AutomaticNewUserModelBudget:    false,
+		AutomaticNewUserModelBudget:    true,
 		AutomaticInvitationReward:      false,
 		AutomaticContributionReward:    false,
 		DefaultPersonalDataQuotaBytes:  DefaultPersonalDataQuotaBytes,

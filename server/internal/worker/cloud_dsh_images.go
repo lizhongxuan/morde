@@ -141,7 +141,7 @@ func (r *cloudDSHImageRegistry) add(images []app.ModelImage) ([]cloudDSHToolImag
 }
 
 func (r *cloudDSHImageRegistry) ResolveTaskModelImage(_ context.Context, fence app.ModelTaskFence, raw json.RawMessage) (app.ModelImage, error) {
-	if fence.TaskID != r.fence.TaskID || fence.OwnerID != r.fence.OwnerID || fence.LeaseOwner != r.fence.LeaseOwner ||
+	if fence.TaskID != r.fence.TaskID || fence.OwnerID != r.fence.OwnerID || fence.InitiatorID != r.fence.InitiatorID || fence.LeaseOwner != r.fence.LeaseOwner ||
 		fence.LeaseVersion != r.fence.LeaseVersion || fence.AgentInstanceID != r.fence.AgentInstanceID ||
 		fence.AgentGeneration != r.fence.AgentGeneration || fence.AgentSessionID != r.fence.AgentSessionID ||
 		fence.AuthorizationVersion != r.fence.AuthorizationVersion || fence.ThroughSequence < 0 ||

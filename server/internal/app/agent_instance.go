@@ -20,6 +20,7 @@ const MaxAgentLease = 30 * time.Second
 type AgentInstanceFence struct {
 	TaskID               string `json:"task_id"`
 	OwnerID              string `json:"owner_id"`
+	InitiatorID          string `json:"initiator_id"`
 	AgentInstanceID      string `json:"agent_instance_id"`
 	AgentGeneration      int64  `json:"agent_generation"`
 	AgentSessionID       string `json:"agent_session_id"`
@@ -43,7 +44,7 @@ func (r AgentInstanceStart) Validate() error {
 		return err
 	}
 	if r.RuntimeFence != nil {
-		if err := r.RuntimeFence.Validate(); err != nil || r.RuntimeFence.OwnerID != r.Fence.OwnerID {
+		if err := r.RuntimeFence.Validate(); err != nil || r.RuntimeFence.OwnerID != r.Fence.InitiatorID {
 			return domain.InvalidArgument("agent_instance", "account runtime fence is invalid")
 		}
 	}
@@ -412,7 +413,7 @@ func isLowerHex(value string) bool {
 }
 
 func validateAgentInstanceFence(fence AgentInstanceFence, existing bool) error {
-	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) ||
+	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) || !domain.ValidUserID(fence.InitiatorID) ||
 		!agentCheckpointIDPattern.MatchString(fence.AgentInstanceID) || !agentCheckpointIDPattern.MatchString(fence.AgentSessionID) ||
 		!agentCheckpointIDPattern.MatchString(fence.SupervisorID) || invalidCheckpointLabel(fence.LeaseOwner, 255) ||
 		fence.LeaseVersion < 1 || fence.AuthorizationVersion < 1 || invalidCheckpointLabel(fence.EngineVersion, 128) ||

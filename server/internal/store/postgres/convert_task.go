@@ -13,7 +13,7 @@ import (
 
 func conversationDomain(row sqlcgen.Conversation) conversation.Conversation {
 	return conversation.Conversation{
-		ID: row.ID, OwnerID: row.OwnerID, HostID: row.HostID.String, ModelID: row.ModelID, Title: row.Title,
+		ID: row.ID, OwnerID: row.OwnerID, ProjectID: row.ProjectID.String, HostID: row.HostID.String, ModelID: row.ModelID, Title: row.Title,
 		MessageSequence: row.MessageSeq,
 		CreatedAt:       row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
@@ -22,7 +22,8 @@ func conversationDomain(row sqlcgen.Conversation) conversation.Conversation {
 func messageDomain(row sqlcgen.ConversationMessage) conversation.Message {
 	return conversation.Message{
 		ID: row.ID, ConversationID: row.ConversationID, OwnerID: row.OwnerID,
-		Role: conversation.Role(row.Role), Content: row.Content, TaskID: row.TaskID.String,
+		ActorID: row.ActorID,
+		Role:    conversation.Role(row.Role), Content: row.Content, TaskID: row.TaskID.String,
 		ModelID: row.ModelID, Sequence: row.Sequence, SourceKind: row.SourceKind,
 		SourceExchangeID: row.SourceExchangeID, RequestedConversationID: row.RequestedConversationID,
 		CreatedAt: row.CreatedAt.Time,
@@ -31,7 +32,8 @@ func messageDomain(row sqlcgen.ConversationMessage) conversation.Message {
 
 func taskDomain(row sqlcgen.Task) task.Task {
 	return task.Task{
-		ID: row.ID, OwnerID: row.OwnerID, ConversationID: row.ConversationID, HostID: row.HostID.String,
+		ID: row.ID, OwnerID: row.OwnerID, ProjectID: row.ProjectID.String, InitiatorID: row.InitiatorID,
+		ConversationID: row.ConversationID, HostID: row.HostID.String,
 		ExecutionLocation: row.ExecutionLocation, WorkspaceID: row.WorkspaceID.String,
 		InputRevision: int64Pointer(row.InputRevision), WorkspaceCheckpointRevision: int64Pointer(row.WorkspaceCheckpointRevision),
 		ContextDigest:   append([]byte(nil), row.ContextDigest...),

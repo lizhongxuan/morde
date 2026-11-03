@@ -38,14 +38,24 @@ type AgentHostFenceReader interface {
 	ReadTaskFence(ctx context.Context, ownerID, hostID string) (AgentHostFence, error)
 }
 
+const agentAskUserToolName = "ask_user"
+
+var agentAskUserTool = AgentToolDefinition{
+	ModelTool: ModelTool{
+		Name:        agentAskUserToolName,
+		Description: "Ask the user for one missing detail needed to complete the task. Use alone; execution pauses until the user answers.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"question":{"type":"string","minLength":1,"maxLength":4096}},"required":["question"],"additionalProperties":false}`),
+		Strict:      true,
+	},
+	RequiredScope: identity.ScopeComputerObserve,
+}
+
+func validUTF8(value string) bool { return utf8.ValidString(value) }
+
 func sameAgentControlFence(left, right AgentHostFence) bool {
 	return left.RuntimeGeneration == right.RuntimeGeneration && left.ControlVersion == right.ControlVersion &&
 		left.AIAllowed == right.AIAllowed &&
 		(left.RuntimeInstanceID == "" || right.RuntimeInstanceID == "" || left.RuntimeInstanceID == right.RuntimeInstanceID)
-}
-
-type AgentModelResolver interface {
-	ResolveEndpoint(ctx context.Context, ownerID, modelID string) (ModelEndpoint, error)
 }
 
 type AgentToolRequest struct {
@@ -187,6 +197,22 @@ type AgentVerifiedArtifact struct {
 
 const maxAgentVerifiedArtifacts = 64
 
+func agentOperationKey(callID string) string {
+	sum := sha256.Sum256([]byte(callID))
+	return "agent:" + hex.EncodeToString(sum[:])
+}
+
+func agentOperationHash(name string, arguments json.RawMessage) ([32]byte, error) {
+	encoded, err := json.Marshal(struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}{Name: name, Arguments: arguments})
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("encode task operation: %w", err)
+	}
+	return sha256.Sum256(encoded), nil
+}
+
 func validateAgentVerificationArtifacts(result AgentVerificationResult) error {
 	if len(result.Artifacts) > maxAgentVerifiedArtifacts || (result.Status != AgentVerified && len(result.Artifacts) != 0) {
 		return errors.New("verification artifacts are not valid for this result")
@@ -214,7 +240,7 @@ func validateAgentVerificationArtifacts(result AgentVerificationResult) error {
 // agentFileWriteEvidence accepts only a unique, ordered function_call and
 // function_call_output pair whose successful runtime output agrees with the
 // original path, byte count, and any returned digest. Model text is ignored.
-func agentFileWriteEvidence(inputs []ModelInput, batchScope *agentBatchScope) ([]AgentFileEvidence, error) {
+func agentFileWriteEvidence(inputs []ModelInput) ([]AgentFileEvidence, error) {
 	type indexedInput struct {
 		index int
 		item  ModelInput
@@ -266,7 +292,7 @@ func agentFileWriteEvidence(inputs []ModelInput, batchScope *agentBatchScope) ([
 			continue
 		}
 
-		operationKey := agentOperationKeyForBatch(outputItem.CallID, batchScope)
+		operationKey := agentOperationKey(outputItem.CallID)
 		requestHash, err := agentOperationHash(runtimeToolFileWrite, argumentBytes)
 		if err != nil || operationKey == "" || len(operationKey) > 255 {
 			continue
@@ -308,25 +334,6 @@ func agentFileWriteEvidence(inputs []ModelInput, batchScope *agentBatchScope) ([
 func validWorkspaceRelativePath(value string) bool {
 	return value != "" && len(value) <= 4096 && !strings.ContainsRune(value, '\x00') && !strings.Contains(value, "\\") &&
 		!path.IsAbs(value) && value != "." && value != ".." && path.Clean(value) == value && !strings.HasPrefix(value, "../")
-}
-
-// ToolExecutor is the only path from the Agent into a Host. Prepare is
-// side-effect free. Both Prepare and Execute must recheck current user
-// authorization, remaining budget, Host control state, and the expected fence;
-// Execute must atomically reject stale fences and never replay an unknown result.
-// Verify must independently inspect Host/runtime evidence and must not treat the
-// model's claim as proof of completion.
-type ToolExecutor interface {
-	Definitions(context.Context, task.Task) ([]AgentToolDefinition, error)
-	Prepare(context.Context, AgentToolRequest) (AgentToolPreparation, error)
-	Execute(context.Context, AgentToolRequest, AgentToolPreparation) (AgentToolResult, error)
-	Verify(context.Context, AgentVerificationRequest) (AgentVerificationResult, error)
-}
-
-// AgentOperationReconciler checks the durable runtime journal for an operation
-// left unresolved by a worker crash. It must never dispatch the operation.
-type AgentOperationReconciler interface {
-	ReconcileOperation(context.Context, AgentToolRequest, task.Operation) (AgentToolResult, error)
 }
 
 var agentToolNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)

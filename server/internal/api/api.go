@@ -35,54 +35,68 @@ const (
 )
 
 type Deps struct {
-	Hosts                 app.HostService
-	HostSharing           app.HostSharingService
-	HostReplicas          app.HostReplicaService
-	TLSAuthorizer         app.HostTLSAuthorizer
-	Verifier              app.Verifier
-	Auth                  AuthService
-	WorkspaceOps          WorkspaceService
-	WorkspaceSync         WorkspaceSyncService
-	WorkspaceSyncDevices  WorkspaceSyncDeviceService
-	Sites                 SiteService
-	Templates             TemplateReader
-	Tokens                TokenService
-	ClientLogin           ClientLoginService
-	Notifications         NotificationService
-	Control               ControlService
-	ExecutionControl      ExecutionControlService
-	Tasks                 TaskService
-	Conversations         ConversationService
-	InstantChat           InstantChatService
-	ModelConnections      ModelConnectionManager
-	MCPConnectors         MCPConnectorManager
-	ModelGateway          ModelGateway
-	ModelUsageAdmin       ModelUsageAdmin
-	Hub                   app.HubConnectionService
-	Devices               deviceService
-	PersonalData          personalDataService
-	PersonalSync          personalSyncService
-	Goals                 goalRoutesService
-	Schedules             scheduleRoutesService
-	PersonalDataQuotaUser personalDataQuotaUserService
-	PersonalDataQuota     AdminPersonalDataQuotaService
-	PersonalAttachments   *app.PersonalAttachmentService
-	PersonalHistoryImport *app.PersonalHistoryImportService
-	Onboarding            OnboardingManager
-	Admin                 AdminService
-	AdminConsole          AdminConsoleService
-	AdminQualityActivity  AdminQualityActivityService
-	AdminControls         AdminControlsService
-	AdminOperations       AdminOperationsService
-	RecordConsents        RecordConsentService
-	RecordAccess          RecordAccessService
-	RecordCaptureStatus   RecordCaptureStatusService
-	AdminHostResources    AdminHostResourcesService
-	AdminWorkspaces       AdminWorkspaceService
-	AdminAudit            AdminAuditWriter
-	Readiness             ReadinessChecker
-	MCP                   http.Handler
-	MCPDisabled           bool
+	Hosts                       app.HostService
+	HostSharing                 app.HostSharingService
+	HostReplicas                app.HostReplicaService
+	HostUsage                   HostUsageReceiptService
+	TLSAuthorizer               app.HostTLSAuthorizer
+	Verifier                    app.Verifier
+	Auth                        AuthService
+	WorkspaceOps                WorkspaceService
+	WorkspaceSync               WorkspaceSyncService
+	WorkspaceSyncDevices        WorkspaceSyncDeviceService
+	WorkspaceDiff               WorkspaceDiffService
+	WorkspaceCopies             WorkspaceCopyEndpointService
+	WorkspaceTransfers          WorkspaceOwnershipTransferService
+	Sites                       SiteService
+	Templates                   TemplateReader
+	Tokens                      TokenService
+	ClientLogin                 ClientLoginService
+	Notifications               NotificationService
+	Control                     ControlService
+	ExecutionControl            ExecutionControlService
+	Tasks                       TaskService
+	TaskObservationTickets      TaskWorkbenchObservationTicketService
+	Conversations               ConversationService
+	ProjectConversations        projectConversationRoutesService
+	ProjectWorkItems            projectWorkItemRoutesService
+	ProjectBudget               projectBudgetRoutesService
+	ProjectMCPConnectors        projectMCPConnectorRoutesService
+	ProjectBudgetExecutionReady bool
+	RuntimeOperationLedger      app.RuntimeOperationLedgerService
+	Projects                    projectRoutesService
+	ProjectContent              projectContentRoutesService
+	InstantChat                 InstantChatService
+	ModelConnections            ModelConnectionManager
+	MCPConnectors               MCPConnectorManager
+	ModelGateway                ModelGateway
+	ModelUsageAdmin             ModelUsageAdmin
+	Hub                         app.HubConnectionService
+	Devices                     deviceService
+	PersonalData                personalDataService
+	PersonalSync                personalSyncService
+	Goals                       goalRoutesService
+	Schedules                   scheduleRoutesService
+	PersonalDataQuotaUser       personalDataQuotaUserService
+	PersonalDataQuota           AdminPersonalDataQuotaService
+	PersonalAttachments         *app.PersonalAttachmentService
+	PersonalHistoryImport       *app.PersonalHistoryImportService
+	Onboarding                  OnboardingManager
+	Admin                       AdminService
+	AdminConsole                AdminConsoleService
+	AdminQualityActivity        AdminQualityActivityService
+	AdminControls               AdminControlsService
+	AdminOperations             AdminOperationsService
+	AdminModelBudgetDefaults    AdminModelBudgetDefaultService
+	RecordConsents              RecordConsentService
+	RecordAccess                RecordAccessService
+	RecordCaptureStatus         RecordCaptureStatusService
+	AdminHostResources          AdminHostResourcesService
+	AdminWorkspaces             AdminWorkspaceService
+	AdminAudit                  AdminAuditWriter
+	Readiness                   ReadinessChecker
+	MCP                         http.Handler
+	MCPDisabled                 bool
 }
 
 type Options struct {
@@ -167,10 +181,23 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerControl(group, deps.Control)
 	h.registerExecutionControl(group, deps.ExecutionControl)
 	h.registerConversations(group, deps.Conversations, deps.Tasks)
+	RegisterProjectRoutes(group, deps.Projects)
+	RegisterProjectHostUsageRoutes(group, deps.HostUsage)
+	RegisterProjectConversationRoutes(group, deps.ProjectConversations)
+	RegisterProjectWorkItemRoutes(group, deps.ProjectWorkItems)
+	RegisterProjectContentRoutes(group, deps.ProjectContent)
+	RegisterProjectBudgetRoutes(group, deps.ProjectBudget)
+	RegisterProjectMCPConnectorRoutes(group, deps.ProjectMCPConnectors)
 	h.registerTasks(group, deps.Tasks)
+	h.registerTaskWorkbenchObservationTickets(group, deps.TaskObservationTickets)
 	h.registerResources(group)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync)
 	h.registerWorkspaceSyncDeviceRoutes(group, deps.WorkspaceSyncDevices)
+	h.registerWorkspaceDiff(group, deps.WorkspaceDiff)
+	h.registerWorkspaceCopies(group, deps.WorkspaceCopies)
+	h.registerWorkspaceOwnershipTransfers(group, deps.WorkspaceTransfers)
+	workspaceFileOperations, _ := deps.WorkspaceSync.(workspaceFileOperationService)
+	h.registerWorkspaceFileOperations(group, workspaceFileOperations)
 	h.registerSites(group)
 	h.registerClients(group)
 	registerDeviceRoutes(group, deps.Devices)

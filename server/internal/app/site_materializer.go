@@ -190,6 +190,9 @@ func (m *SiteRevisionMaterializer) Materialize(ctx context.Context, release site
 }
 
 func materializeSiteFile(ctx context.Context, blocks WorkspaceBlockReader, workspaceID string, writer SiteArtifactWriter, file workspace.File) error {
+	if file.Kind == "symlink" {
+		return errors.New("site releases do not support Workspace symlinks")
+	}
 	output, err := writer.CreateFile(file.Path, file.Mode)
 	if err != nil {
 		return err

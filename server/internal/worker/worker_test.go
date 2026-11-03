@@ -255,6 +255,45 @@ func TestWorkerReleasesLeaderLockOnShutdownAndRecordsActions(t *testing.T) {
 	}
 }
 
+func TestWorkerCollectsHostUsageOnlyInLeaderLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base := &applicationStub{
+		lock:         &leaderLockStub{released: make(chan struct{})},
+		lockAcquired: true,
+	}
+	app := &usageApplicationStub{Application: base, calls: make(chan struct{}, 1)}
+	queue := NewCreateQueue()
+	registry := prometheus.NewRegistry()
+	worker, err := New(Options{
+		Application: app, CreateQueue: queue, Interval: time.Hour,
+		ActivityFlushInterval: time.Hour, HostUsageInterval: 5 * time.Millisecond,
+		Registerer: registry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := startWorker(ctx, worker)
+	waitFor(t, app.calls)
+	cancel()
+	if err := waitFor(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+type usageApplicationStub struct {
+	Application
+	calls chan struct{}
+}
+
+func (a *usageApplicationStub) CollectHostUsage(context.Context) error {
+	select {
+	case a.calls <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func waitPendingRemoved(t *testing.T, queue *CreateQueue, hostID string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

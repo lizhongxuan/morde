@@ -393,7 +393,8 @@ func (h *api) ackWorkspaceSyncDownloadAction(service WorkspaceSyncService) gin.H
 		if !decodeWorkspaceSyncJSON(c, &request) {
 			return
 		}
-		if workspace.ValidateRelativePath(request.Path) != nil || request.SizeBytes == nil || *request.SizeBytes < 0 {
+		validPath := workspace.ValidateRelativePath(request.Path) == nil || request.Action == workspace.ChangeDirectoryUpsert && request.Path == "."
+		if !validPath || request.SizeBytes == nil || *request.SizeBytes < 0 {
 			writeError(c, domain.InvalidArgument("download_action", "download action is invalid"))
 			return
 		}
@@ -408,6 +409,11 @@ func (h *api) ackWorkspaceSyncDownloadAction(service WorkspaceSyncService) gin.H
 		case workspace.ChangeDelete:
 			if request.SHA256 != nil || *request.SizeBytes != 0 {
 				writeError(c, domain.InvalidArgument("download_action", "delete action must not include a hash or size"))
+				return
+			}
+		case workspace.ChangeDirectoryUpsert, workspace.ChangeDirectoryDelete:
+			if request.SHA256 != nil || *request.SizeBytes != 0 {
+				writeError(c, domain.InvalidArgument("download_action", "directory action must not include a hash or size"))
 				return
 			}
 		default:

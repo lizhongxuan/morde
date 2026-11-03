@@ -166,7 +166,7 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 	if err != nil {
 		t.Fatalf("read root recovery checkpoint: %v", err)
 	}
-	fence := app.AgentInstanceFence{TaskID: submitted.Task.ID, OwnerID: owner.ID,
+	fence := app.AgentInstanceFence{TaskID: submitted.Task.ID, OwnerID: owner.ID, InitiatorID: rootBeforeRestart.Task.InitiatorID,
 		AgentInstanceID: rootBeforeRestart.Task.AgentInstanceID, AgentGeneration: rootBeforeRestart.Task.AgentGeneration,
 		AgentSessionID: rootBeforeRestart.Task.AgentSessionID, SupervisorID: "f01-child-cancel-supervisor",
 		LeaseOwner: rootBeforeRestart.Task.Lease.Owner, LeaseVersion: rootBeforeRestart.Task.Lease.Version,

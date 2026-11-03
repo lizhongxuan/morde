@@ -154,15 +154,17 @@ type testVerifier struct {
 }
 
 type testActivityLeaseStore struct {
-	mu         sync.Mutex
-	acquireErr error
-	renewErr   error
-	releaseErr error
-	inputErr   error
-	acquired   []app.HostActivityLease
-	renewed    []app.HostActivityLease
-	released   []app.HostActivityLease
-	inputRefs  []host.Ref
+	mu            sync.Mutex
+	acquireErr    error
+	renewErr      error
+	releaseErr    error
+	inputErr      error
+	controlErr    error
+	acquired      []app.HostActivityLease
+	renewed       []app.HostActivityLease
+	released      []app.HostActivityLease
+	inputRefs     []host.Ref
+	controlActors []string
 }
 
 func (s *testActivityLeaseStore) AcquireHostActivityLease(_ context.Context, lease app.HostActivityLease) error {
@@ -190,9 +192,17 @@ func (s *testActivityLeaseStore) HasActiveHostActivityLease(context.Context, str
 	return false, nil
 }
 
-func (s *testActivityLeaseStore) WithHostInputPermit(_ context.Context, ref host.Ref, forward func() error) error {
+func (s *testActivityLeaseStore) CheckHostControlLease(_ context.Context, _ string, actorID string, _ int64, _ int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.controlActors = append(s.controlActors, actorID)
+	return s.controlErr
+}
+
+func (s *testActivityLeaseStore) WithHostControlPermit(_ context.Context, ref host.Ref, actorID string, _ host.Permission, forward func() error) error {
 	s.mu.Lock()
 	s.inputRefs = append(s.inputRefs, ref)
+	s.controlActors = append(s.controlActors, actorID)
 	err := s.inputErr
 	s.mu.Unlock()
 	if err != nil {

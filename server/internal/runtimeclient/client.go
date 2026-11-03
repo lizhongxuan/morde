@@ -454,35 +454,76 @@ func taskWorkspaceManifestResponseMatches(response TaskWorkspaceManifestResponse
 		response.WorkspaceID != request.WorkspaceID || response.BindingVersion != request.BindingVersion ||
 		response.InputRevision != request.InputRevision || response.WorkspaceCheckpointRevision != request.WorkspaceCheckpointRevision ||
 		response.InputManifestSHA256 != request.InputManifestSHA256 || !validTaskWorkspaceViewID(response.ViewID) || response.ViewID != request.ViewID ||
-		!validSHA256(response.ManifestSHA256) || response.Files == nil || response.EmptyDirectories == nil ||
-		len(response.Files)+len(response.EmptyDirectories) > request.Limit || len(response.NextCursor) > 4096 ||
-		response.NextCursor != "" && len(response.Files)+len(response.EmptyDirectories) == 0 {
+		!validSHA256(response.ManifestSHA256) || response.Files == nil || response.EmptyDirectories == nil || response.Directories == nil || len(response.NextCursor) > 4096 {
 		return false
 	}
-	paths := make([]string, 0, len(response.Files)+len(response.EmptyDirectories))
+	pathsByFolded := make(map[string]string, len(response.Files)+len(response.EmptyDirectories)+len(response.Directories))
+	filePaths := make(map[string]struct{}, len(response.Files))
 	files := make([]workspace.File, 0, len(response.Files))
+	hasHardlinks := false
 	for _, file := range response.Files {
 		chunks := make([]workspace.Chunk, len(file.Chunks))
 		for index, chunk := range file.Chunks {
 			chunks[index] = workspace.Chunk{SHA256: chunk.SHA256, SizeBytes: chunk.SizeBytes}
 		}
+		xattrs, acl := workspaceNativeMetadataFromContract(file.Xattrs, file.ACL)
 		converted := workspace.File{
-			Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, Chunks: chunks,
+			Path: file.Path, Kind: file.Kind, SymlinkTarget: file.SymlinkTarget, HardlinkTo: file.HardlinkTo,
+			SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, ModTimeNS: file.ModTimeNS,
+			MetadataKnown: file.MetadataKnown, Xattrs: xattrs, ACL: acl, Chunks: chunks,
 		}
 		if workspace.ValidateFile(converted) != nil {
 			return false
 		}
-		paths = append(paths, file.Path)
+		hasHardlinks = hasHardlinks || converted.HardlinkTo != ""
+		key := strings.ToLower(file.Path)
+		if _, exists := pathsByFolded[key]; exists {
+			return false
+		}
+		pathsByFolded[key] = file.Path
+		filePaths[key] = struct{}{}
 		files = append(files, converted)
 	}
 	for _, directory := range response.EmptyDirectories {
 		if workspace.ValidateRelativePath(directory) != nil {
 			return false
 		}
-		paths = append(paths, directory)
+		key := strings.ToLower(directory)
+		if _, exists := filePaths[key]; exists {
+			return false
+		}
+		if previous, exists := pathsByFolded[key]; exists && previous != directory {
+			return false
+		}
+		pathsByFolded[key] = directory
 	}
-	if _, err := workspace.ManifestTreeSHA256(files, response.EmptyDirectories); err != nil {
+	directories := make([]workspace.Directory, 0, len(response.Directories))
+	for _, directory := range response.Directories {
+		mode := directory.Mode
+		xattrs, acl := workspaceNativeMetadataFromContract(directory.Xattrs, directory.ACL)
+		converted := workspace.Directory{
+			Path: directory.Path, Mode: &mode, ModTimeNS: directory.ModTimeNS,
+			MetadataKnown: directory.MetadataKnown, Xattrs: xattrs, ACL: acl,
+		}
+		if workspace.ValidateDirectory(converted, true) != nil {
+			return false
+		}
+		key := strings.ToLower(directory.Path)
+		if _, exists := filePaths[key]; exists {
+			return false
+		}
+		if previous, exists := pathsByFolded[key]; exists && previous != directory.Path {
+			return false
+		}
+		pathsByFolded[key] = directory.Path
+		directories = append(directories, converted)
+	}
+	if len(pathsByFolded) > request.Limit || response.NextCursor != "" && len(pathsByFolded) == 0 {
 		return false
+	}
+	paths := make([]string, 0, len(pathsByFolded))
+	for _, path := range pathsByFolded {
+		paths = append(paths, path)
 	}
 	sort.Strings(paths)
 	previous := request.AfterPath
@@ -492,7 +533,30 @@ func taskWorkspaceManifestResponseMatches(response TaskWorkspaceManifestResponse
 		}
 		previous = path
 	}
+	if !hasHardlinks {
+		if _, err := workspace.ManifestTreeSHA256(files, response.EmptyDirectories); err != nil {
+			return false
+		}
+	}
+	manifestDirectories := append([]string(nil), response.EmptyDirectories...)
+	for _, directory := range directories {
+		manifestDirectories = append(manifestDirectories, directory.Path)
+	}
+	if workspace.ValidateNoSymlinkDescendants(files, manifestDirectories) != nil {
+		return false
+	}
 	return response.NextCursor == "" || len(paths) > 0 && response.NextCursor == paths[len(paths)-1]
+}
+
+func workspaceNativeMetadataFromContract(xattrs []contract.WorkspaceExtendedAttribute, acl *contract.WorkspaceNativeACL) ([]workspace.ExtendedAttribute, *workspace.NativeACL) {
+	converted := make([]workspace.ExtendedAttribute, len(xattrs))
+	for index, attribute := range xattrs {
+		converted[index] = workspace.ExtendedAttribute{Name: attribute.Name, Value: attribute.Value}
+	}
+	if acl == nil {
+		return converted, nil
+	}
+	return converted, &workspace.NativeACL{Platform: acl.Platform, Format: acl.Format, Data: acl.Data}
 }
 
 func validBlockSHA256(data []byte, expected string) bool {

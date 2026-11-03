@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"morde-runtime/contract"
+	"morde-runtime/internal/operationstore"
 	"morde-runtime/runtimecore"
 )
 
@@ -32,9 +33,12 @@ const (
 	browserStartupRetry         = 200 * time.Millisecond
 )
 
+var ErrOperationLedgerUnavailable = errors.New("browser operation ledger is unavailable")
+
 type Options struct {
 	StoreDir         string
 	ExpectedOwnerUID uint32
+	Store            operationstore.EventStore
 	Endpoint         string
 
 	connector browserConnector
@@ -76,9 +80,9 @@ func NewHandlers(options Options) (*Controller, error) {
 			return nil, err
 		}
 	}
-	registry, err := openRegistry(options.StoreDir, options.ExpectedOwnerUID)
+	registry, err := openRegistry(options.StoreDir, options.ExpectedOwnerUID, options.Store)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrOperationLedgerUnavailable, err)
 	}
 	controller := &Controller{
 		connector: connector, registry: registry,
@@ -96,7 +100,7 @@ func NewHandlers(options Options) (*Controller, error) {
 	defer cancel()
 	if err := controller.reconcilePreviousContexts(ctx); err != nil {
 		_ = registry.Close()
-		return nil, errors.New("previous browser operation could not be reconciled")
+		return nil, fmt.Errorf("previous browser operation could not be reconciled: %w", err)
 	}
 	if err := controller.healthProbe(ctx); err != nil {
 		_ = registry.Close()

@@ -339,12 +339,12 @@ func TestHostCreateMapsDTOAndDoesNotExposeCredentialMaterial(t *testing.T) {
 	services.hosts.item.SandboxID = "private-sandbox-id"
 	services.hosts.item.AIOKeyEnc = []byte("encrypted-aio-key")
 	router := newRouter(t, services, Options{CookieSecure: true})
-	body := `{"name":"work"}`
+	body := `{"name":"work","workspace_ids":["w1234567"]}`
 	response := requestWithHeader(router, http.MethodPost, "/api/hosts", body, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-host-create-01")
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
-	if services.hosts.created.Name != "work" || len(services.hosts.created.WorkspaceIDs) != 0 || services.hosts.created.IdempotencyKey != "route-host-create-01" {
+	if services.hosts.created.Name != "work" || len(services.hosts.created.WorkspaceIDs) != 1 || services.hosts.created.WorkspaceIDs[0] != testWorkspaceID || services.hosts.created.IdempotencyKey != "route-host-create-01" {
 		t.Fatalf("create command = %#v", services.hosts.created)
 	}
 	if services.hosts.principal.Kind != identity.KindAPIKey || services.hosts.principal.UserID != testUserID {
@@ -373,7 +373,7 @@ func TestHostCreateMapsDTOAndDoesNotExposeCredentialMaterial(t *testing.T) {
 func TestHostCreateRequiresOneValidIdempotencyKey(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{})
-	body := `{"template_id":"std-2c4g"}`
+	body := `{"template_id":"std-2c4g","workspace_ids":["w1234567"]}`
 	key := "Bearer " + apiKeyCredential()
 
 	assertError(t, request(router, http.MethodPost, "/api/hosts", body, key, ""), http.StatusBadRequest, "invalid_argument")
@@ -483,7 +483,7 @@ func TestAuthRequiredAndApplicationErrorsAreSafe(t *testing.T) {
 	assertError(t, response, http.StatusUnauthorized, "unauthenticated")
 
 	services.hosts.err = &domain.Error{Code: domain.CodeQuotaExceeded, Message: "private-aio-key must not appear", Details: map[string]any{"key": "private-aio-key"}}
-	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-error-host-01")
+	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-error-host-01")
 	assertError(t, response, http.StatusConflict, "quota_exceeded")
 	if strings.Contains(response.Body.String(), "private-aio-key") || strings.Contains(response.Body.String(), "key\"") {
 		t.Fatalf("error response leaked secret details: %s", response.Body)
@@ -687,6 +687,9 @@ func TestHostValidationAndServiceErrors(t *testing.T) {
 	checks := []struct {
 		method, path, body string
 	}{
+		{http.MethodPost, "/api/hosts", `{}`},
+		{http.MethodPost, "/api/hosts", `{"workspace_ids":[]}`},
+		{http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567","w7654321"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["bad"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["w1234567","w1234567"]}`},
 		{http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace":{"mode":"new"}}`},
@@ -1076,6 +1079,11 @@ func TestPublicRegistrationCreatesAccountWithoutSession(t *testing.T) {
 		services.auth.registerInviteCode != "0123456789abcdef0123456789abcdef" || strings.Contains(response.Body.String(), "long-secret") {
 		t.Fatal("registration arguments or response were invalid")
 	}
+	withoutInvite := request(router, http.MethodPost, "/api/auth/register", `{"name":"plain-user","password":"long-secret"}`, "", "")
+	if withoutInvite.Code != http.StatusCreated || len(withoutInvite.Result().Cookies()) != 0 || services.auth.registerName != "plain-user" ||
+		services.auth.registerPass != "long-secret" || services.auth.registerInviteCode != "" {
+		t.Fatalf("registration without invitation = %d %s, invite=%q", withoutInvite.Code, withoutInvite.Body, services.auth.registerInviteCode)
+	}
 	services.auth.registerErr = domain.NewError(domain.CodeRateLimited, "registration rate limit reached")
 	assertError(t, request(router, http.MethodPost, "/api/auth/register", `{"name":"new-user","password":"long-secret"}`, "", ""), http.StatusTooManyRequests, "rate_limited")
 }
@@ -1137,14 +1145,14 @@ func TestReleaseHostPassesOptionalProcessTerminationConfirmation(t *testing.T) {
 func TestInvalidRequestsAndOriginAreRejected(t *testing.T) {
 	services := newServices()
 	router := newRouter(t, services, Options{APIMaxBodyBytes: 80})
-	response := requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"Bad"}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-invalid-host-02")
+	response := requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"Bad","workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-invalid-host-02")
 	assertError(t, response, http.StatusBadRequest, "invalid_argument")
 	largeBody := `{"template_id":"std-2c4g","pad":"` + strings.Repeat("x", 100) + `"}`
 	response = requestWithHeader(router, http.MethodPost, "/api/hosts", largeBody, "Bearer "+apiKeyCredential(), "", "Idempotency-Key", "route-invalid-host-03")
 	assertError(t, response, http.StatusRequestEntityTooLarge, "request_too_large")
 	response = request(router, http.MethodGet, "/api/hosts/bad", "", "Bearer "+apiKeyCredential(), "")
 	assertError(t, response, http.StatusBadRequest, "invalid_argument")
-	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g"}`, "Bearer "+apiKeyCredential(), "https://evil.example", "Idempotency-Key", "route-invalid-host-04")
+	response = requestWithHeader(router, http.MethodPost, "/api/hosts", `{"template_id":"std-2c4g","workspace_ids":["w1234567"]}`, "Bearer "+apiKeyCredential(), "https://evil.example", "Idempotency-Key", "route-invalid-host-04")
 	assertError(t, response, http.StatusForbidden, "forbidden")
 }
 
@@ -1397,7 +1405,7 @@ func TestServiceErrorsAreSanitizedAcrossRoutes(t *testing.T) {
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	for _, route := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/hosts", ""},
-		{http.MethodPost, "/api/hosts", `{}`},
+		{http.MethodPost, "/api/hosts", `{"workspace_ids":["w1234567"]}`},
 		{http.MethodDelete, "/api/hosts/" + testHostID, ""},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/renew", ""},
 		{http.MethodPost, "/api/hosts/" + testHostID + "/enter", ""},

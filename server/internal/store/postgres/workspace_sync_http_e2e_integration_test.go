@@ -30,6 +30,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
 	"morde/server/internal/store/postgres/sqlcgen"
 )
@@ -291,6 +292,34 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	})
 	if err != nil || remoteEdit.Session.State != "completed" || remoteEdit.Session.TargetRevision != handoffRevision+1 {
 		t.Fatalf("remote-to-local handoff source update = %#v, %v", remoteEdit.Session, err)
+	}
+	updatedManifest, err := store.GetWorkspaceManifestPage(ctx, value.ID, remoteEdit.Session.TargetRevision, "", "", 100)
+	if err != nil || len(updatedManifest.Directories) < len(manifest.Directories) {
+		t.Fatalf("remote file content update lost unchanged directory metadata: %#v, %v", updatedManifest.Directories, err)
+	}
+	for _, prior := range manifest.Directories {
+		if prior.Mode == nil && prior.ModTimeNS == nil && !prior.MetadataKnown {
+			continue
+		}
+		found := false
+		for _, current := range updatedManifest.Directories {
+			if current.Path == prior.Path && workspace.SameDirectoryMetadata(current, prior) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("remote file content update changed directory metadata for %q: before=%#v after=%#v", prior.Path, prior, updatedManifest.Directories)
+		}
+	}
+	rootKnown := false
+	for _, current := range updatedManifest.Directories {
+		if current.Path == "." && current.Mode != nil && current.ModTimeNS != nil && current.MetadataKnown {
+			rootKnown = true
+		}
+	}
+	if !rootKnown {
+		t.Fatalf("remote content update lost known Workspace root metadata: %#v", updatedManifest.Directories)
 	}
 	returnedRevision, err := recoveredClient.HandoffCheckpoint(ctx, client.LiveSyncOptions{WorkspaceID: value.ID, Directory: liveOne})
 	if err != nil || returnedRevision != handoffRevision+1 {
@@ -1002,7 +1031,7 @@ func waitWorkspaceSyncFile(t *testing.T, root, name, expected string, runs ...*w
 			select {
 			case <-run.finished:
 				data, readErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
-				t.Fatalf("live sync %s stopped before applying %q: %v (%s); local=%q read_error=%v", run.name, name, run.err, run.resultSummary(), data, readErr)
+				t.Fatalf("live sync %s stopped before applying %q: %v (%s); local_bytes=%d local_sha256=%x read_error=%v", run.name, name, run.err, run.resultSummary(), len(data), sha256.Sum256(data), readErr)
 			default:
 			}
 		}

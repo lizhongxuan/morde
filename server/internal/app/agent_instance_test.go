@@ -80,7 +80,7 @@ func (s *agentInstanceStoreStub) MarkAccountAgentTaskStopAttestationAcknowledged
 }
 
 func agentInstanceTestFence() AgentInstanceFence {
-	return AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1",
+	return AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1",
 		AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"}
 }
@@ -120,7 +120,7 @@ func signedAccountAgentTaskStopTestAttestation(t *testing.T, key ed25519.Private
 	attestation := AccountAgentTaskStopAttestation{
 		RuntimeFence: AccountAgentRuntimeFence{ServiceInstanceID: "12345678-1234-1234-1234-123456789abc", OwnerID: "u1234567",
 			RuntimeID: "runtime-1", RuntimeGeneration: 1, LeaseOwner: "runtime-worker", LeaseVersion: 1, ExecutionEpoch: 1},
-		TaskFence: AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
+		TaskFence: AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
 			AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1", LeaseVersion: 1,
 			AuthorizationVersion: 1, EngineVersion: "v1", ProfileVersion: "p1"},
 		RuntimeContainerID: strings.Repeat("a", 64), ContainerPID: 2, HostPID: 3, StartTimeTick: 4,

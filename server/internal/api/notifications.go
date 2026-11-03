@@ -22,6 +22,10 @@ type notificationResponse struct {
 	Kind          string     `json:"kind"`
 	TaskID        *string    `json:"task_id"`
 	EventSequence int64      `json:"event_sequence"`
+	SourceKind    *string    `json:"source_kind,omitempty"`
+	SourceID      *string    `json:"source_id,omitempty"`
+	SourceVersion *int64     `json:"source_version,omitempty"`
+	ProjectID     *string    `json:"project_id,omitempty"`
 	Summary       *string    `json:"summary"`
 	Redacted      bool       `json:"redacted"`
 	Actionable    bool       `json:"actionable"`
@@ -95,7 +99,7 @@ func (h *api) markNotificationRead(service NotificationService) gin.HandlerFunc 
 }
 
 func toNotificationResponse(principal identity.Principal, item notification.Notification) (notificationResponse, error) {
-	if !notification.ValidID(item.ID) || !domain.ValidTaskID(item.TaskID) || item.OwnerID != principal.UserID || item.EventSequence < 1 || item.CreatedAt.IsZero() {
+	if notification.Validate(item) != nil || item.OwnerID != principal.UserID {
 		return notificationResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	kind := "waiting_user"
@@ -105,6 +109,14 @@ func toNotificationResponse(principal identity.Principal, item notification.Noti
 	case notification.KindFailed:
 		kind = "failed"
 	case notification.KindApprovalRequired, notification.KindClarification, notification.KindAttentionRequired:
+	case notification.KindGoalStepBlocked:
+		kind = "goal_step_blocked"
+	case notification.KindGoalCompleted:
+		kind = "goal_completed"
+	case notification.KindProjectItemBlocked:
+		kind = "project_work_item_blocked"
+	case notification.KindProjectItemDelivered:
+		kind = "project_work_item_delivered"
 	default:
 		return notificationResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
@@ -123,6 +135,13 @@ func toNotificationResponse(principal identity.Principal, item notification.Noti
 	if item.TaskID != "" {
 		taskID := item.TaskID
 		response.TaskID = &taskID
+	} else {
+		sourceKind, sourceID, sourceVersion := item.SourceKind, item.SourceID, item.SourceVersion
+		response.SourceKind, response.SourceID, response.SourceVersion = &sourceKind, &sourceID, &sourceVersion
+		if item.ProjectID != "" {
+			projectID := item.ProjectID
+			response.ProjectID = &projectID
+		}
 	}
 	return response, nil
 }

@@ -160,6 +160,52 @@ func TestScheduleCreatePassesTypedCommandPrincipalAndIdempotencyKey(t *testing.T
 	}
 }
 
+func TestScheduleCreateAndUpdateSupportHostlessSchedules(t *testing.T) {
+	principal := identity.Principal{UserID: "u1234567", Kind: identity.KindSession, TokenID: "t1234567"}
+	createService := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
+	createService.value.HostID = ""
+	create := httptest.NewRequest(http.MethodPost, "/api/schedules", strings.NewReader(
+		`{"model_id":"model-a","objective":"check the weekly goal","timing":{"kind":"daily","starts_on":"2026-11-02","local_time":"09:30","time_zone":"Asia/Shanghai"}}`))
+	create.Header.Set("Content-Type", "application/json")
+	create.Header.Set("Idempotency-Key", "schedule-hostless-create")
+	created := httptest.NewRecorder()
+	scheduleRoutesRouter(&principal, createService).ServeHTTP(created, create)
+	if created.Code != http.StatusCreated || createService.create.HostID != "" || !strings.Contains(created.Body.String(), `"host_id":null`) {
+		t.Fatalf("hostless create status=%d command=%+v response=%s", created.Code, createService.create, created.Body)
+	}
+
+	for _, test := range []struct {
+		name string
+		body string
+		want *string
+	}{
+		{name: "omitted host preserves it", body: `{"expected_version":2}`, want: nil},
+		{name: "null host unbinds", body: `{"expected_version":2,"host_id":null}`, want: new(string)},
+		{name: "string host binds", body: `{"expected_version":2,"host_id":"h8765432"}`, want: stringPointer("h8765432")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
+			request := httptest.NewRequest(http.MethodPut, "/api/schedules/j1234567", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", "schedule-hostless-update")
+			response := httptest.NewRecorder()
+			scheduleRoutesRouter(&principal, service).ServeHTTP(response, request)
+			if response.Code != http.StatusOK || service.updateCalls != 1 {
+				t.Fatalf("host update status=%d response=%s", response.Code, response.Body)
+			}
+			if test.want == nil {
+				if service.update.HostID != nil {
+					t.Fatalf("omitted host update = %#v, want nil", service.update.HostID)
+				}
+				return
+			}
+			if service.update.HostID == nil || *service.update.HostID != *test.want {
+				t.Fatalf("host update = %#v, want %q", service.update.HostID, *test.want)
+			}
+		})
+	}
+}
+
 func TestScheduleGetAndUpdateRoutes(t *testing.T) {
 	service := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
 	principal := identity.Principal{UserID: "u1234567", Kind: identity.KindClient, TokenID: "t1234567"}

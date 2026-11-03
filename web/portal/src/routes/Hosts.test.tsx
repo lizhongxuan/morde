@@ -15,10 +15,23 @@ const pollingHostCases: [Host['state'], string][] = [
   ['stopping', '停止中'],
   ['deleting', '删除中'],
 ];
+const hostWorkspaceBinding: Host['workspaces'][number] = {
+  workspace: { id: 'w1234567', name: '项目工作区', revision: 2, used_bytes: 0, state: 'ready' },
+  directory: 'projects/w1234567', state: 'active', binding_version: 1, desired_revision: 2, applied_revision: 2,
+  sync_state: 'healthy', sync_conflicts: [],
+};
 const ownedHost: Host = {
   id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: 'https://h1234567.hosts.test',
-  workspaces: [], resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
+  workspaces: [hostWorkspaceBinding], resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
 };
+const aiControl = (control_version: number) => ({
+  host_id: ownedHost.id, control_state: 'ai' as const, control_version, control_actor_user_id: '',
+  control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null,
+});
+const userControl = (control_version: number) => ({
+  host_id: ownedHost.id, control_state: 'user' as const, control_version, control_actor_user_id: ownedHost.owner_id,
+  control_lease_expires_at: '2026-11-02T00:00:30.000Z', control_lease_active: true, control_lease_held_by_me: true, active_transition: null,
+});
 
 describe('Hosts', () => {
   beforeEach(() => { vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [] }); });
@@ -27,13 +40,13 @@ describe('Hosts', () => {
   it('deletes a host without consulting templates and retains its independent workspaces', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{
       id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '',
-      workspaces: [],
+      workspaces: [hostWorkspaceBinding],
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 },
       expires_at: null, last_active_at: null, created_at: '',
     }] });
     vi.spyOn(portalApi, 'templates');
     const deleteHost = vi.spyOn(portalApi, 'deleteHost').mockResolvedValue({
-      id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'deleting', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '', workspaces: [],
+      id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'deleting', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '', workspaces: [hostWorkspaceBinding],
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -74,10 +87,72 @@ describe('Hosts', () => {
     expect(screen.getByRole('button', { name: '删除主机 他人主机' })).toBeEnabled();
   });
 
+  it('requires one fully applied Workspace before opening or restoring an owned host', async () => {
+    const runningHost = { ...ownedHost, id: 'h0000001', name: '未绑定运行中主机', workspaces: [] };
+    const multipleBindingHost = { ...ownedHost, id: 'h0000003', name: '多绑定运行中主机', workspaces: [hostWorkspaceBinding,
+      { ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, id: 'w7654321', name: '另一个工作区' } }] };
+    const stoppedHost = { ...ownedHost, id: 'h0000002', name: '未绑定已停止主机', state: 'stopped' as const, workspaces: [] };
+    const staleRevisionHost = { ...ownedHost, id: 'h0000004', name: '工作区版本未同步主机', workspaces: [{
+      ...hostWorkspaceBinding, workspace: { ...hostWorkspaceBinding.workspace, revision: 3 },
+    }] };
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [runningHost, multipleBindingHost, stoppedHost, staleRevisionHost] });
+    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByRole('button', { name: '查看主机 未绑定运行中主机' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '查看主机 多绑定运行中主机' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '查看主机 工作区版本未同步主机' })).toBeDisabled();
+    expect(screen.getByText('Workspace 正在准备、同步或存在冲突；打开和移交操作暂不可用。')).toBeInTheDocument();
+    expect(screen.getAllByText(/请先绑定恰好一个已就绪的工作区/)).toHaveLength(3);
+    expect(screen.getByRole('button', { name: '恢复主机 未绑定已停止主机' })).toBeDisabled();
+    expect(screen.getByLabelText('恢复前选择一个工作区')).toBeInTheDocument();
+  });
+
+  it('binds one ready Workspace to a stopped legacy host before enabling restore', async () => {
+    const stoppedHost = { ...ownedHost, state: 'stopped' as const, workspaces: [] };
+    const workspace = {
+      id: 'w7654321', name: '旧电脑工作区', revision: 4, used_bytes: 0, quota_bytes: 1024,
+      state: 'ready' as const, created_at: '', updated_at: '',
+    };
+    const preparingBinding: Host['workspaces'][number] = {
+      workspace: { id: workspace.id, name: workspace.name, revision: workspace.revision, used_bytes: workspace.used_bytes, state: workspace.state },
+      directory: workspace.id, state: 'preparing', binding_version: 1, desired_revision: workspace.revision,
+      applied_revision: 0, sync_state: 'healthy', sync_conflicts: [],
+    };
+    let currentHost: Host = stoppedHost;
+    vi.spyOn(portalApi, 'hosts').mockImplementation(async () => ({ items: [currentHost] }));
+    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [workspace] });
+    const bind = vi.spyOn(portalApi, 'bindWorkspaceToHost').mockImplementation(async (hostID, request) => {
+      expect(hostID).toBe(stoppedHost.id);
+      expect(request).toEqual({ workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 });
+      currentHost = { ...stoppedHost, workspaces: [preparingBinding] };
+      return preparingBinding;
+    });
+    const restore = vi.spyOn(portalApi, 'restoreHost').mockResolvedValue({ ...stoppedHost, state: 'creating', workspaces: [preparingBinding] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    const workspaceSelect = await screen.findByLabelText('恢复前选择一个工作区');
+    await screen.findByRole('option', { name: /旧电脑工作区/ });
+    await user.selectOptions(workspaceSelect, workspace.id);
+    await user.click(screen.getByRole('button', { name: '绑定所选工作区' }));
+    expect(await screen.findByText(/已绑定 旧电脑工作区；恢复电脑后会继续应用/)).toBeInTheDocument();
+    const restoreButton = await screen.findByRole('button', { name: `恢复主机 ${stoppedHost.name}` });
+    expect(restoreButton).toBeEnabled();
+
+    await user.click(restoreButton);
+    await user.click(screen.getByRole('button', { name: '恢复主机' }));
+    await waitFor(() => expect(restore).toHaveBeenCalledWith(stoppedHost.id));
+    expect(bind).toHaveBeenCalledOnce();
+  });
+
   it('confirms compute release and calls the release endpoint', async () => {
     const host: Host = {
       id: 'h1234567', name: '我的云端电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 0, control_state: 'ai', url: '',
-      workspaces: [],
+      workspaces: [hostWorkspaceBinding],
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 },
       expires_at: '', last_active_at: '', created_at: '',
     };
@@ -101,7 +176,7 @@ describe('Hosts', () => {
   it('offers restore for a stopped host', async () => {
     const host: Host = {
       id: 'h1234567', name: '我的云端电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'stopped', state_reason: 'user_release', runtime_generation: 1, control_version: 0, control_state: 'ai', url: '',
-      workspaces: [],
+      workspaces: [hostWorkspaceBinding],
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 },
       expires_at: '', last_active_at: '', created_at: '',
     };
@@ -214,24 +289,24 @@ describe('Hosts', () => {
     let firstRequest: Parameters<typeof portalApi.hostControlAction>[1] | undefined;
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     vi.spyOn(portalApi, 'hostControl')
-      .mockResolvedValueOnce({ host_id: ownedHost.id, control_state: 'ai', control_version: 4, active_transition: null })
-      .mockImplementationOnce(async () => ({ host_id: ownedHost.id, control_state: 'taking_over', control_version: 5, active_transition: {
+      .mockResolvedValueOnce(aiControl(4))
+      .mockImplementationOnce(async () => ({ ...aiControl(5), control_state: 'taking_over', active_transition: {
         request_id: firstRequest!.request_id, action: 'take_over', phase: 'draining', failure_reason: 'operations_pending',
         expected_control_version: firstRequest!.expected_control_version, blocked_control_version: 5, target_control_version: 6, created_at: '', updated_at: '',
       } }))
-      .mockResolvedValue({ host_id: ownedHost.id, control_state: 'user', control_version: 6, active_transition: null });
+      .mockResolvedValue(userControl(6));
     const controlAction = vi.spyOn(portalApi, 'hostControlAction')
       .mockImplementationOnce(async (hostID, body) => {
         firstRequest = body;
         return {
-          host_id: hostID, control_state: 'taking_over', control_version: 5,
+          ...aiControl(5), host_id: hostID, control_state: 'taking_over',
           active_transition: {
             request_id: body.request_id, action: 'take_over', phase: 'draining', failure_reason: 'operations_pending',
             expected_control_version: body.expected_control_version, blocked_control_version: 5, target_control_version: 6, created_at: '', updated_at: '',
           }, pending_operation_ids: ['op1234567'],
         };
       })
-      .mockResolvedValue({ host_id: ownedHost.id, control_state: 'user', control_version: 6, active_transition: null, pending_operation_ids: [] });
+      .mockResolvedValue({ ...userControl(6), pending_operation_ids: [] });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
@@ -248,21 +323,22 @@ describe('Hosts', () => {
     await waitFor(() => expect(controlAction).toHaveBeenCalledTimes(2));
     expect(controlAction.mock.calls[1]![1]).toEqual(controlAction.mock.calls[0]![1]);
     expect(await screen.findByText('接管已完成，现在可以操作电脑。')).toBeInTheDocument();
-    expect(await screen.findByText('电脑控制：你正在操作')).toBeInTheDocument();
+    expect(await screen.findByText('电脑控制：人工控制')).toBeInTheDocument();
+    expect(screen.getByText(`当前由你人工控制。交还完成后，云端 AI 才能恢复操作。`)).toBeInTheDocument();
   });
 
   it('confirms handing control back to AI and refreshes Host and Workspace versions', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{ ...ownedHost, control_state: 'user', control_version: 7 }] });
-    vi.spyOn(portalApi, 'hostControl').mockResolvedValue({ host_id: ownedHost.id, control_state: 'user', control_version: 7, active_transition: null });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue(userControl(7));
     const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockResolvedValue({
-      host_id: ownedHost.id, control_state: 'ai', control_version: 9, active_transition: null, pending_operation_ids: [],
+      ...aiControl(9), pending_operation_ids: [],
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     client.setQueryData(['workspaces'], { items: [] });
     const user = userEvent.setup();
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByText('电脑控制：你正在操作')).toBeInTheDocument();
+    expect(await screen.findByText('电脑控制：人工控制')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '交还 AI' }));
     expect(screen.getByText(/重新读取主机和工作区版本/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '交还给 AI' }));
@@ -271,5 +347,88 @@ describe('Hosts', () => {
     }));
     await waitFor(() => expect(client.getQueryState(['workspaces'])?.isInvalidated).toBe(true));
     expect(await screen.findByText('已交还 AI，主机和工作区版本已刷新。')).toBeInTheDocument();
+  });
+
+  it('shows shared desktop control state to viewers without exposing control actions', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{
+      id: ownedHost.id, name: '共享电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:view'],
+    }] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue({
+      ...userControl(22), control_actor_user_id: 'u8765432', control_lease_held_by_me: false,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('控制版本：v22')).toBeInTheDocument();
+    expect(screen.getByText(/当前由账号 u8765432人工控制/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看桌面' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '接管操作' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '交还 AI' })).not.toBeInTheDocument();
+  });
+
+  it('offers takeover to a shared desktop controller only after reading the current control state', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{
+      id: ownedHost.id, name: '可操作共享电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:control'],
+    }] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue(aiControl(8));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('控制版本：v8')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '接管操作' }));
+    expect(screen.getByRole('button', { name: '开始接管' })).toBeInTheDocument();
+  });
+
+  it('does not let a shared controller release another account’s active lease', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [{
+      id: ownedHost.id, name: '他人正在操作的电脑', state: 'running', url: ownedHost.url, permissions: ['desktop:control'],
+    }] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue({
+      ...userControl(23), control_actor_user_id: 'u8765432', control_lease_held_by_me: false,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('控制版本：v23')).toBeInTheDocument();
+    expect(screen.getByText(/当前由账号 u8765432人工控制/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '交还 AI' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '接管操作' })).not.toBeInTheDocument();
+  });
+
+  it('refreshes control state after a stale control version conflict', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue(aiControl(9));
+    const staleVersion = Object.assign(new Error('stale control version'), { code: 'conflict', status: 409 });
+    const controlAction = vi.spyOn(portalApi, 'hostControlAction').mockRejectedValue(staleVersion);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const user = userEvent.setup();
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('控制版本：v9')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '接管操作' }));
+    await user.click(screen.getByRole('button', { name: '开始接管' }));
+    await waitFor(() => expect(controlAction).toHaveBeenCalledWith(ownedHost.id, {
+      action: 'take_over', request_id: expect.any(String), expected_control_version: 9,
+    }));
+    expect(await screen.findByText('控制状态已变化，已刷新最新状态，请重新操作。')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始接管' })).not.toBeInTheDocument();
+  });
+
+  it('renews the owner’s active control lease while the host list stays open', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    vi.spyOn(portalApi, 'hostControl').mockResolvedValue(userControl(7));
+    const renew = vi.spyOn(portalApi, 'renewHostControlLease').mockResolvedValue(userControl(7));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText(/操作租约：由你持有/)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+
+    expect(renew).toHaveBeenCalledWith(ownedHost.id, 7);
   });
 });

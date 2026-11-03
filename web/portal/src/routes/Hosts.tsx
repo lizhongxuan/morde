@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, enterHostInNewTab, newIdempotencyKey, portalApi } from '../app/api';
@@ -11,11 +11,12 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { HostMemberManager } from '../components/HostMemberManager';
 
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
+type Workspace = Awaited<ReturnType<typeof portalApi.workspaces>>['items'][number];
 type ControlActionRequest = components['schemas']['ControlActionRequest'];
 type ControlStatus = Awaited<ReturnType<typeof portalApi.hostControl>>;
 const unsettled = new Set(['creating', 'stopping', 'deleting']);
 const controlStateLabels: Record<ControlStatus['control_state'], string> = {
-  ai: '云端 AI 控制', taking_over: '正在接管', user: '你正在操作', returning: '正在交还 AI',
+  ai: '云端 AI 控制', taking_over: '正在接管', user: '人工控制', returning: '正在交还 AI',
 };
 const controlPhaseLabels: Record<components['schemas']['ControlTransition']['phase'], string> = {
   blocking: '阻止新的 AI 操作', draining: '等待在途工具停止', drained: '工具已停止，正在切换控制权', completed: '已完成',
@@ -54,6 +55,11 @@ export function Hosts() {
     queryKey: ['hosts'], queryFn: portalApi.hosts,
     refetchInterval: (query) => query.state.data?.items.some((host) => unsettled.has(host.state)) ? 3000 : query.state.data?.items.length ? 30000 : false,
   });
+  const workspaces = useQuery({
+    queryKey: ['workspaces'], queryFn: portalApi.workspaces,
+    enabled: hosts.data?.items.some((host) => host.owner_id === user?.id && host.state === 'stopped'
+      && !host.workspaces.some((binding) => binding.state !== 'detached')) ?? false,
+  });
   const atLimit = !!user && (hosts.data?.items.length ?? 0) >= user.quota.hosts;
   const [deleting, setDeleting] = useState<Host | null>(null);
   const [lifecycleAction, setLifecycleAction] = useState<{ host: Host; action: 'release' | 'restore' } | null>(null);
@@ -74,6 +80,29 @@ export function Hosts() {
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
   });
+  const bindWorkspace = useMutation({
+    mutationFn: ({ host, workspace }: { host: Host; workspace: Workspace }) => portalApi.bindWorkspaceToHost(host.id, {
+      workspace_id: workspace.id,
+      expected_revision: workspace.revision,
+      expected_binding_version: host.workspaces.find((binding) => binding.workspace.id === workspace.id)?.binding_version ?? 0,
+    }),
+    onSuccess: async (binding) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['hosts'] }),
+        queryClient.invalidateQueries({ queryKey: ['workspaces'] }),
+      ]);
+      notify(binding.state === 'preparing'
+        ? `已绑定 ${binding.workspace.name}；恢复电脑后会继续应用。`
+        : `已绑定 ${binding.workspace.name}。`, 'success');
+    },
+    onError: async (error) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['hosts'] }),
+        queryClient.invalidateQueries({ queryKey: ['workspaces'] }),
+      ]);
+      notify(errorDetails(error).message, 'error');
+    },
+  });
   const enter = async (host: Host) => {
     try { await enterHostInNewTab(host.id); }
     catch (error) { notify(errorDetails(error).message, 'error'); }
@@ -89,7 +118,30 @@ export function Hosts() {
     <div className="page-heading"><div><p className="eyebrow">你的云端电脑</p><h1>云端电脑</h1><p className="muted">电脑与文件都保存在你的云端空间。</p></div><div className="inline-actions"><Link className="button button-secondary" to="/workspaces">工作目录</Link>{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>创建电脑</button> : <Link className="button button-primary" to="/hosts/new">创建电脑</Link>}</div></div>
     {hosts.isPending ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError ? <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div> : !hosts.data?.items.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <div className="host-list">
       {hosts.data.items.map((host) => {
-        return <HostCard key={host.id} host={host} busy={update.isPending && update.variables?.host.id === host.id} canEnter={host.owner_id === user?.id} onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ host, action: 'restore' })} onDelete={() => setDeleting(host)} />;
+        const ownsHost = host.owner_id === user?.id;
+        const workspaceReady = hasSingleReadyWorkspace(host);
+        const workspaceRestorable = hasSingleRestorableWorkspace(host);
+        const blockedBinding = host.workspaces.find((binding) => binding.state !== 'detached' && (
+          binding.state !== 'active' || binding.workspace.state !== 'ready' || binding.sync_state !== 'healthy'
+          || binding.sync_conflicts.length > 0 || binding.applied_revision !== binding.desired_revision
+          || binding.applied_revision !== binding.workspace.revision
+        ));
+        const bindableWorkspaces = workspaces.data?.items.filter((workspace) => workspace.state === 'ready'
+          && !hosts.data.items.some((other) => other.id !== host.id && other.workspaces.some((binding) => binding.workspace.id === workspace.id && binding.state !== 'detached'))) ?? [];
+        const canBindWorkspace = ownsHost && host.state === 'stopped' && !host.workspaces.some((binding) => binding.state !== 'detached');
+        return <HostCard key={host.id} host={host} busy={update.isPending && update.variables?.host.id === host.id}
+          canEnter={ownsHost && workspaceReady}
+          enterReason={!ownsHost ? '仅主机所有者可以进入工作环境。' : blockedBinding
+            ? 'Workspace 正在准备、同步或存在冲突；打开和移交操作暂不可用。'
+            : !workspaceReady ? '请先绑定恰好一个已就绪的工作区，再打开这台主机。' : undefined}
+          workspaceRestorable={workspaceRestorable}
+          canBindWorkspace={canBindWorkspace}
+          bindableWorkspaces={bindableWorkspaces}
+          bindWorkspacesLoading={workspaces.isPending}
+          bindWorkspacesError={workspaces.isError ? errorDetails(workspaces.error).message : undefined}
+          bindPending={bindWorkspace.isPending && bindWorkspace.variables?.host.id === host.id}
+          onBindWorkspace={(workspace) => bindWorkspace.mutate({ host, workspace })}
+          onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ action: 'restore', host })} onDelete={() => setDeleting(host)} />;
       })}
     </div>}
     <div className="shared-hosts-section">
@@ -110,6 +162,11 @@ export function Hosts() {
                 {canReadWorkspace && <button type="button" className="button button-secondary" disabled={host.state !== 'running'} onClick={() => void enterShared(host, 'workspace')}>{host.state === 'running' ? '查看工作区' : '主机运行后可查看工作区'}</button>}
                 {host.permissions.includes('mcp:control') && <Link className="button button-secondary" to="/apikeys">配置 MCP API Key</Link>}
               </div>
+              {canViewDesktop && host.state === 'running' && <HostControlPanel
+                host={host}
+                canControl={host.permissions.includes('desktop:control')}
+                canReleaseAnyLease={false}
+              />}
             </article>;
             })}</div>}
     </div>
@@ -127,36 +184,79 @@ export function Hosts() {
   </section>;
 }
 
-function HostCard({ host, busy, canEnter, onEnter, onRenew, onRelease, onRestore, onDelete }: {
-  host: Host; busy: boolean; canEnter: boolean; onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
+function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canBindWorkspace, bindableWorkspaces, bindWorkspacesLoading, bindWorkspacesError, bindPending, onBindWorkspace, onEnter, onRenew, onRelease, onRestore, onDelete }: {
+  host: Host; busy: boolean; canEnter: boolean; enterReason?: string; workspaceRestorable: boolean; canBindWorkspace: boolean;
+  bindableWorkspaces: Workspace[]; bindWorkspacesLoading: boolean; bindWorkspacesError?: string; bindPending: boolean;
+  onBindWorkspace: (workspace: Workspace) => void; onEnter: () => void; onRenew: () => void; onRelease: () => void; onRestore: () => void; onDelete: () => void;
 }) {
+  const [workspaceID, setWorkspaceID] = useState('');
   const name = host.name || host.id;
   const enterHelpID = `host-enter-help-${host.id}`;
+  const hasWorkspaceBinding = host.workspaces.some((binding) => binding.state !== 'detached');
+  const selectedWorkspace = bindableWorkspaces.find((workspace) => workspace.id === workspaceID);
   return <article className="host-card">
     <div className="host-card-heading"><div><h2>{host.name || '未命名主机'}</h2><p className="muted mono">{host.id} · {host.template_id}</p></div><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
     <div className="host-facts">
       <div><span>规格</span><strong>{formatCpu(host.resources?.cpu_limit_milli)} / {formatMemory(host.resources?.mem_limit_mib)}</strong></div>
       <div><span>到期时间</span><strong>{formatDate(host.expires_at)}</strong></div>
       <div><span>工作区</span><strong>{host.workspaces.length ? host.workspaces.map((binding) => binding.workspace.name || binding.workspace.id).join('、') : '无'}</strong>
-        {host.workspaces.map((binding) => <small className="table-sub" key={binding.workspace.id}>{binding.state === 'active' && binding.applied_revision === binding.desired_revision ? `已应用 v${binding.applied_revision}` : binding.state === 'preparing' ? `正在应用 v${binding.desired_revision}` : binding.state === 'unbinding' ? '正在解绑' : binding.state === 'failed' ? '应用失败' : binding.state}</small>)}
+        {host.workspaces.map((binding) => <small className="table-sub" key={binding.workspace.id}>{binding.sync_state === 'conflict' || binding.sync_conflicts.length
+          ? '同步冲突（打开、恢复和移交已锁定）'
+          : binding.state === 'active' && binding.applied_revision === binding.desired_revision ? `已应用 v${binding.applied_revision}`
+            : binding.state === 'preparing' ? `正在应用 v${binding.desired_revision}`
+              : binding.state === 'unbinding' ? '正在解绑（操作已锁定）'
+                : binding.state === 'failed' ? '应用失败（操作已锁定）' : binding.state}</small>)}
       </div>
       <div><span>运行状态</span><strong>{hostReasonLabel[host.state_reason] || host.state_reason || (host.state === 'running' ? '运行正常' : host.state === 'stopped' ? '可恢复' : '等待状态更新')}</strong></div>
+      <div><span>默认工作/下载目录</span><strong>/home/gem/workspace</strong></div>
+      <div><span>旧容器数据迁移</span><strong>状态未知</strong><small className="table-sub">当前服务未提供迁移状态，不能据此确认旧数据已进入 Workspace。</small></div>
     </div>
     <div className="host-actions">
       <button type="button" className="button button-primary" onClick={onEnter} disabled={!canEnter || host.state !== 'running' || busy || host.control_state === 'taking_over' || host.control_state === 'returning'} aria-label={`${host.control_state === 'user' ? '操作' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看'}主机 ${name}`} aria-describedby={!canEnter ? enterHelpID : undefined}>{host.control_state === 'user' ? '操作电脑' : host.control_state === 'taking_over' || host.control_state === 'returning' ? '控制切换中' : '查看电脑'}</button>
-      {!canEnter && <span className="muted" id={enterHelpID}>仅主机所有者可以进入工作环境。</span>}
+      {!canEnter && <span className="muted" id={enterHelpID}>{enterReason}{enterReason?.startsWith('请先') && <> <Link to="/workspaces">管理工作区</Link></>}</span>}
       <button type="button" className="button button-secondary" onClick={onRenew} disabled={host.state !== 'running' || busy} aria-label={`续期主机 ${name}`}>续期</button>
       {host.state === 'running' && <button type="button" className="button button-secondary" onClick={onRelease} disabled={busy} aria-label={`释放运行资源 ${name}`}>释放运行资源</button>}
-      {host.state === 'stopped' && <button type="button" className="button button-primary" onClick={onRestore} disabled={busy} aria-label={`恢复主机 ${name}`}>恢复</button>}
+      {host.state === 'stopped' && <button type="button" className="button button-primary" onClick={onRestore} disabled={busy || !workspaceRestorable} aria-label={`恢复主机 ${name}`} title={!workspaceRestorable ? '恢复前需要选择一个就绪工作区' : undefined}>恢复</button>}
+      {host.state === 'stopped' && !workspaceRestorable && <span className="muted" role="status">恢复前需绑定并准备好一个工作区。<Link to="/workspaces">查看工作区</Link></span>}
       <button type="button" className="button button-danger-quiet" onClick={onDelete} disabled={host.state === 'deleting' || host.state === 'creating' || host.state === 'stopping' || busy} aria-label={`删除主机 ${name}`}>删除</button>
     </div>
+    {canBindWorkspace && !hasWorkspaceBinding && <form onSubmit={(event) => { event.preventDefault(); if (selectedWorkspace) onBindWorkspace(selectedWorkspace); }} className="host-workspace-bind">
+      <label htmlFor={`bind-workspace-${host.id}`}>恢复前选择一个工作区</label>
+      <select id={`bind-workspace-${host.id}`} value={workspaceID} onChange={(event) => setWorkspaceID(event.target.value)} disabled={bindWorkspacesLoading || bindPending}>
+        <option value="">选择已就绪的工作区</option>
+        {bindableWorkspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · v{workspace.revision}</option>)}
+      </select>
+      <button type="submit" className="button button-secondary" disabled={!selectedWorkspace || bindPending}>{bindPending ? '绑定中…' : '绑定所选工作区'}</button>
+      {bindWorkspacesLoading && <span className="muted" role="status">正在读取可用工作区…</span>}
+      {bindWorkspacesError && <span className="panel-error" role="alert">无法读取工作区：{bindWorkspacesError}</span>}
+      {!bindWorkspacesLoading && !bindWorkspacesError && !bindableWorkspaces.length && <span className="muted">没有可绑定的已就绪工作区。<Link to="/workspaces">创建工作区</Link></span>}
+    </form>}
     {canEnter && <HostMemberManager hostId={host.id} />}
-    {canEnter && host.state === 'running' && <HostControlPanel host={host} />}
+    {canEnter && host.state === 'running' && <HostControlPanel host={host} canControl canReleaseAnyLease />}
   </article>;
 }
 
-function HostControlPanel({ host }: { host: Host }) {
+function hasSingleReadyWorkspace(host: Host) {
+  const bindings = host.workspaces.filter((binding) => binding.state !== 'detached');
+  const binding = bindings[0];
+  return bindings.length === 1 && binding?.state === 'active' && binding.workspace.state === 'ready' &&
+    binding.sync_state === 'healthy' && binding.sync_conflicts.length === 0 && binding.applied_revision === binding.desired_revision &&
+    binding.applied_revision === binding.workspace.revision;
+}
+
+function hasSingleRestorableWorkspace(host: Host) {
+  const bindings = host.workspaces.filter((binding) => binding.state !== 'detached');
+  const binding = bindings[0];
+  return bindings.length === 1 && !!binding && binding.workspace.state === 'ready'
+    && binding.workspace.revision === binding.desired_revision && binding.sync_state === 'healthy' && binding.sync_conflicts.length === 0
+    && (binding.state === 'preparing' || (binding.state === 'active' && binding.applied_revision === binding.desired_revision));
+}
+
+function HostControlPanel({ host, canControl, canReleaseAnyLease }: {
+  host: { id: string; name?: string; control_state?: Host['control_state'] }; canControl: boolean; canReleaseAnyLease: boolean;
+}) {
   const queryClient = useQueryClient();
+  const { user } = useAuth();
   const { notify } = useToast();
   const [confirmAction, setConfirmAction] = useState<ControlActionRequest | null>(null);
   const [pendingOperationCount, setPendingOperationCount] = useState(0);
@@ -176,6 +276,10 @@ function HostControlPanel({ host }: { host: Host }) {
         host_id: result.host_id,
         control_state: result.control_state,
         control_version: result.control_version,
+        control_actor_user_id: result.control_actor_user_id,
+        control_lease_expires_at: result.control_lease_expires_at,
+        control_lease_active: result.control_lease_active,
+        control_lease_held_by_me: result.control_lease_held_by_me,
         active_transition: result.active_transition,
       });
       setConfirmAction(null);
@@ -205,9 +309,29 @@ function HostControlPanel({ host }: { host: Host }) {
     },
   });
   const status = control.data;
+  const refetchControl = control.refetch;
   const state = status?.control_state ?? host.control_state;
   const transition = status?.active_transition;
   const transitioning = state === 'taking_over' || state === 'returning';
+  const operator = status?.control_lease_active && status.control_actor_user_id
+    ? status.control_actor_user_id === user?.id ? '你' : `账号 ${status.control_actor_user_id}`
+    : '未知';
+  const canRelease = canControl && state === 'user' && !!status
+    && (canReleaseAnyLease || status.control_lease_held_by_me);
+
+  useEffect(() => {
+    if (state !== 'user' || !status?.control_lease_active || !status.control_lease_held_by_me) return;
+    let renewing = false;
+    const timer = window.setInterval(() => {
+      if (renewing) return;
+      renewing = true;
+      void portalApi.renewHostControlLease(host.id, status.control_version)
+        .then((next) => queryClient.setQueryData<ControlStatus>(['host-control', host.id], next))
+        .catch(() => void refetchControl())
+        .finally(() => { renewing = false; });
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [host.id, queryClient, refetchControl, state, status?.control_lease_active, status?.control_lease_held_by_me, status?.control_version]);
 
   const startAction = (action: ControlActionRequest['action']) => {
     if (!status) return;
@@ -225,16 +349,25 @@ function HostControlPanel({ host }: { host: Host }) {
   return <section className="host-control" aria-label={`电脑控制状态 ${host.name || host.id}`}>
     <div className="host-control-summary">
       <div>
-        <strong>电脑控制：{controlStateLabels[state]}</strong>
-        <p className="muted">{state === 'ai'
-          ? '当前由云端 AI 控制。工作台仅供查看；接管完成并确认工具停止后，才允许人工操作。'
-          : state === 'user'
-            ? '当前由你控制。交还完成后，云端 AI 才能恢复操作。'
-            : '控制权切换期间，工作台操作会保持受限。'}</p>
+        <strong>电脑控制：{state ? controlStateLabels[state] : '读取中'}</strong>
+        <p className="muted">{!state
+          ? '正在读取控制状态；状态确认前不会开放人工操作。'
+          : state === 'ai'
+            ? '当前由云端 AI 控制。工作台仅供查看；接管完成并确认工具停止后，才允许人工操作。'
+            : state === 'user'
+              ? status?.control_lease_active
+                ? `当前由${operator}人工控制。交还完成后，云端 AI 才能恢复操作。`
+                : '操作租约已失效；工作台保持只读，请重新读取控制状态。'
+              : '控制权切换期间，工作台操作会保持受限。'}</p>
+        {state === 'user' && status && <p className="muted">操作租约：{status.control_lease_active
+          ? `${status.control_lease_held_by_me ? '由你持有' : `由${operator}持有`}，到期时间 ${status.control_lease_expires_at ? formatDate(status.control_lease_expires_at) : '未知'}`
+          : '当前无有效租约'}</p>}
+        {status && <p className="muted">控制版本：v{status.control_version}</p>}
+        <p className="muted">桌面画面可能显示工作区内容，获准查看桌面的共享成员也能看到。</p>
       </div>
-      {!control.isPending && !control.isError && status && !transitioning && state === 'ai' && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('take_over')}>接管操作</button>}
-      {!control.isPending && !control.isError && status && !transitioning && state === 'user' && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('release')}>交还 AI</button>}
-      {transition && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={resumeTransition}>{transition.action === 'take_over' ? '继续接管确认' : '继续交还确认'}</button>}
+      {canControl && !control.isPending && !control.isError && status && !transitioning && state === 'ai' && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('take_over')}>接管操作</button>}
+      {canRelease && !transitioning && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={() => startAction('release')}>交还 AI</button>}
+      {canControl && transition && <button type="button" className="button button-secondary" disabled={updateControl.isPending} onClick={resumeTransition}>{transition.action === 'take_over' ? '继续接管确认' : '继续交还确认'}</button>}
       {control.isError && <button type="button" className="button button-secondary" onClick={() => void control.refetch()}>重试读取控制状态</button>}
       {control.isPending && <span className="muted" role="status">正在读取控制状态…</span>}
     </div>

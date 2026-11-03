@@ -40,6 +40,7 @@ type Deps struct {
 	Hosts            app.HostService
 	HostSharing      app.HostSharingService
 	WorkspaceFiles   hostWorkspaceFileService
+	TaskObservation  taskWorkbenchObservationService
 	Control          ControlService
 	Runtime          app.HostRuntime
 	ActivityLeases   app.HostActivityLeaseStore
@@ -131,16 +132,23 @@ func New(d Deps) (http.Handler, error) {
 	g.engine.Use(base...)
 	g.engine.Use(g.parseRequestHost())
 	g.engine.GET("/__ch/auth", g.consumeTicket)
+	if d.TaskObservation != nil {
+		g.engine.GET("/__ch/task-auth", g.exchangeTaskObservationTicket)
+		g.engine.GET("/__ch/api/tasks/:task_id", g.taskObservationReadAuth(), g.getTaskObservationSnapshot)
+		g.engine.GET("/__ch/api/tasks/:task_id/events", g.taskObservationReadAuth(), g.streamTaskObservationEvents)
+	}
 	g.engine.POST("/__ch/logout", g.cookieAuthMiddleware(), g.logout)
-	g.engine.GET("/__ch/wb/*filepath", g.cookieAuthMiddleware(), g.workbench)
+	g.engine.GET("/__ch/wb/*filepath", g.workbenchAuthMiddleware(), g.workbench)
 	g.engine.GET("/__ch/terminal", g.cookieAuthMiddleware(), g.terminalEntry)
 	g.engine.GET("/__ch/terminal/", g.cookieAuthMiddleware(), g.terminalEntry)
 	g.engine.GET("/__ch/api/host", g.cookieAuthMiddleware(), g.getHost)
 	g.engine.GET("/__ch/api/workspaces", g.cookieAuthMiddleware(), g.listHostWorkspaces)
 	g.engine.GET("/__ch/api/workspaces/:workspace_id/manifest", g.cookieAuthMiddleware(), g.getHostWorkspaceManifest)
+	g.engine.GET("/__ch/api/workspaces/:workspace_id/diff", g.cookieAuthMiddleware(), g.getHostWorkspaceDiff)
 	g.engine.GET("/__ch/api/workspaces/:workspace_id/files/*path", g.cookieAuthMiddleware(), g.downloadHostWorkspaceFile)
 	g.engine.POST("/__ch/api/renew", g.cookieAuthMiddleware(), g.renewHost)
 	g.engine.GET("/__ch/api/control", g.cookieAuthMiddleware(), g.getControl)
+	g.engine.POST("/__ch/api/control/lease/renew", g.cookieAuthMiddleware(), g.renewControlLease)
 	g.engine.GET("/__ch/api/applications", g.cookieAuthMiddleware(), g.getApplications)
 	g.engine.POST("/__ch/api/applications/:app_id/install", g.cookieAuthMiddleware(), g.installApplication)
 	g.engine.POST("/__ch/api/applications/:app_id/launch", g.cookieAuthMiddleware(), g.launchApplication)

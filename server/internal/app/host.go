@@ -116,8 +116,24 @@ func (s *hostService) BindWorkspace(ctx context.Context, principal identity.Prin
 	if err != nil {
 		return workspace.Binding{}, err
 	}
-	if hostValue.State != host.StateRunning {
-		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "host must be running to bind a workspace")
+	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return workspace.Binding{}, err
+	}
+	var currentBindings []workspace.Binding
+	for _, binding := range bindings {
+		if binding.State != workspace.BindingDetached {
+			currentBindings = append(currentBindings, binding)
+		}
+	}
+	if len(currentBindings) > 1 {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host has multiple active workspace bindings")
+	}
+	if hostValue.State != host.StateRunning && hostValue.State != host.StateStopped {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "host must be running or stopped to bind a workspace")
+	}
+	if len(currentBindings) == 1 && currentBindings[0].Workspace.ID != workspaceID {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host already has a workspace binding")
 	}
 	value, err := s.workspaces.GetWorkspace(ctx, workspaceID)
 	if err != nil {
@@ -436,6 +452,9 @@ func (s *hostService) Restore(ctx context.Context, principal identity.Principal,
 	if err := rejectHostCredential(principal); err != nil {
 		return host.Host{}, err
 	}
+	if _, err := s.requireUsableHostWorkspace(ctx, principal, value.ID, value.OwnerID); err != nil {
+		return host.Host{}, err
+	}
 	if value.State == host.StateRunning {
 		return value, nil
 	}
@@ -494,6 +513,35 @@ func (s *hostService) Restore(ctx context.Context, principal identity.Principal,
 	return updated, nil
 }
 
+func (s *hostService) requireUsableHostWorkspace(ctx context.Context, principal identity.Principal, hostID, ownerID string) (workspace.Binding, error) {
+	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, hostID)
+	if err != nil {
+		return workspace.Binding{}, err
+	}
+	var active workspace.Binding
+	count := 0
+	for _, binding := range bindings {
+		if binding.State == workspace.BindingDetached {
+			continue
+		}
+		count++
+		active = binding
+	}
+	if count != 1 {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
+	}
+	if active.OwnerID != ownerID || active.Workspace.OwnerID != ownerID || active.Workspace.State != workspace.StateReady ||
+		active.Workspace.DeletedAt != nil ||
+		(active.State != workspace.BindingPreparing && active.State != workspace.BindingActive) ||
+		active.SyncState != workspace.BindingSyncHealthy {
+		return workspace.Binding{}, domain.NewError(domain.CodeWorkspaceBusy, "host workspace binding is not available")
+	}
+	if principal.Kind == identity.KindAPIKey && !principal.AllowsWorkspace(active.Workspace.ID) {
+		return workspace.Binding{}, domain.NewError(domain.CodeForbidden, "workspace is outside the credential authorization scope")
+	}
+	return active, nil
+}
+
 func (s *hostService) Renew(ctx context.Context, principal identity.Principal, hostID string) (host.Host, error) {
 	if err := authorizeHostScope(principal, hostID, identity.ScopeHostManage); err != nil {
 		return host.Host{}, err
@@ -544,6 +592,9 @@ func (s *hostService) IssueTicket(ctx context.Context, principal identity.Princi
 	if value.OwnerID != principal.UserID {
 		return EnterInfo{}, domain.NewError(domain.CodeNotFound, "host not found")
 	}
+	if _, err := s.requireUsableHostWorkspace(ctx, principal, value.ID, value.OwnerID); err != nil {
+		return EnterInfo{}, err
+	}
 	if value.State != host.StateRunning {
 		return EnterInfo{}, invalidHostState(value.State)
 	}
@@ -582,6 +633,9 @@ func (s *hostService) IssuePreviewTicket(ctx context.Context, principal identity
 	}
 	if value.OwnerID != principal.UserID {
 		return EnterInfo{}, domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if _, err := s.requireUsableHostWorkspace(ctx, principal, value.ID, value.OwnerID); err != nil {
+		return EnterInfo{}, err
 	}
 	if value.State != host.StateRunning {
 		return EnterInfo{}, invalidHostState(value.State)

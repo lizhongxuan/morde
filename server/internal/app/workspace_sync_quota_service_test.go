@@ -263,7 +263,9 @@ func TestQuotaSettlePersistsOwnerStoragePauseBeforeAborting(t *testing.T) {
 	}
 
 	syncService := newQuotaReceiveTestService(t, store)
-	if err := syncService.SetWorkspaceCurrentMaterializer(func(context.Context, string, string, int64, []workspace.File, []string) error { return nil }); err != nil {
+	if err := syncService.SetWorkspaceCurrentMaterializer(func(context.Context, string, string, int64, []workspace.File, []string, []workspace.Directory) error {
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	quotaService, err := NewWorkspaceSyncQuotaService(syncService, current, quotaServiceNoopCapacity{})
@@ -310,7 +312,7 @@ func TestReconcileRecoversActiveReceiveWithoutPendingMaterialization(t *testing.
 		t.Fatal(err)
 	}
 	materialized := false
-	if err := service.SetWorkspaceCurrentMaterializer(func(context.Context, string, string, int64, []workspace.File, []string) error {
+	if err := service.SetWorkspaceCurrentMaterializer(func(context.Context, string, string, int64, []workspace.File, []string, []workspace.Directory) error {
 		materialized = true
 		return nil
 	}); err != nil {
@@ -379,7 +381,7 @@ func TestStartupReconcileVerifiesProjectionBeforeSkippingMaterialization(t *test
 				t.Fatal(err)
 			}
 			materializations := 0
-			if err := service.SetWorkspaceCurrentMaterializer(func(_ context.Context, _ string, _ string, revision int64, files []workspace.File, _ []string) error {
+			if err := service.SetWorkspaceCurrentMaterializer(func(_ context.Context, _ string, _ string, revision int64, files []workspace.File, _ []string, _ []workspace.Directory) error {
 				materializations++
 				if revision != 1 || len(files) != 1 || files[0].Path != file.Path {
 					t.Fatalf("materialization revision/files = %d/%+v", revision, files)
@@ -392,7 +394,7 @@ func TestStartupReconcileVerifiesProjectionBeforeSkippingMaterialization(t *test
 				t.Fatal(err)
 			}
 			verifications := 0
-			if err := service.SetWorkspaceCurrentManifestVerifier(func(_ context.Context, ownerID, workspaceID string, files []workspace.File, _ []string) (bool, error) {
+			if err := service.SetWorkspaceCurrentManifestVerifier(func(_ context.Context, ownerID, workspaceID string, files []workspace.File, _ []string, _ []workspace.Directory) (bool, error) {
 				verifications++
 				if ownerID != base.workspace.OwnerID || workspaceID != base.workspace.ID || len(files) != 1 || files[0].SHA256 != file.SHA256 {
 					t.Fatalf("verified Workspace manifest = %s/%s/%+v", ownerID, workspaceID, files)

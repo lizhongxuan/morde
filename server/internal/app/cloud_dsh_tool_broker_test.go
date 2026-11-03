@@ -35,6 +35,19 @@ type cloudDSHRecordCaptureStore struct {
 	err             error
 }
 
+type cloudDSHSkillTaskAuthorizationRecorder struct {
+	userID  string
+	tokenID string
+	hostID  string
+	scope   identity.Scope
+}
+
+func (r *cloudDSHSkillTaskAuthorizationRecorder) AuthorizeTaskAction(_ context.Context, userID string, _ identity.Kind,
+	tokenID, hostID string, _ []identity.Scope, scope identity.Scope) error {
+	r.userID, r.tokenID, r.hostID, r.scope = userID, tokenID, hostID, scope
+	return nil
+}
+
 func (s *cloudDSHRecordCaptureStore) EnqueueRecordCapture(_ context.Context, principal identity.Principal, input record.CaptureInput) (record.QueueItem, error) {
 	s.calls++
 	s.principal = principal
@@ -248,6 +261,33 @@ func TestCloudDSHToolBrokerLoadsFixedSkillForHostlessServerTask(t *testing.T) {
 		store.details.Task.Usage.ToolCalls != 1 || len(store.events) != 1 {
 		t.Fatalf("hostless server skill read = %#v, err=%v, usage=%+v events=%d", result, err,
 			store.details.Task.Usage, len(store.events))
+	}
+}
+
+func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	authorizer := &cloudDSHSkillTaskAuthorizationRecorder{}
+	fixture.executor.authorizer = authorizer
+	current := store.details.Task
+	current.OwnerID, current.InitiatorID, current.ProjectID = "u1234567", "u2234567", "j1234567"
+	expiresAt := time.Now().Add(time.Hour)
+	current.Authorization = task.Authorization{
+		Kind: string(identity.KindSession), TokenID: "t1234567", Version: 1,
+		Scopes:    []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)},
+		ExpiresAt: &expiresAt,
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.authorizeSkillTask(context.Background(), current); err != nil {
+		t.Fatalf("authorize project skill task: %v", err)
+	}
+	if authorizer.userID != current.InitiatorID || authorizer.tokenID != current.Authorization.TokenID ||
+		authorizer.hostID != current.HostID || authorizer.scope != identity.ScopeTaskRead {
+		t.Fatalf("skill Host authorization used the wrong Task actor: %#v", authorizer)
 	}
 }
 
@@ -1068,7 +1108,7 @@ func TestCloudDSHFileWriteEvidenceCoversEveryWriteAttempt(t *testing.T) {
 		Arguments: `{"workspace_id":"w1234567","path":"notes/today.txt","content":"hello"}`}
 	goodOutput := ModelInput{Type: "function_call_output", CallID: "write-1",
 		Output: `{"path":"notes/today.txt","bytes_written":5}`}
-	evidence, err := agentFileWriteEvidence([]ModelInput{goodCall, goodOutput}, nil)
+	evidence, err := agentFileWriteEvidence([]ModelInput{goodCall, goodOutput})
 	if err != nil || cloudDSHHasUnverifiedFileWrite([]ModelInput{goodCall, goodOutput}, evidence) {
 		t.Fatalf("matching write evidence = %#v, %v; want all writes accounted for", evidence, err)
 	}
@@ -1080,7 +1120,7 @@ func TestCloudDSHFileWriteEvidenceCoversEveryWriteAttempt(t *testing.T) {
 		{Type: "function_call", CallID: "write-2", Name: runtimeToolFileWrite,
 			Arguments: `{"workspace_id":"w1234567","path":"notes/other.txt","content":"pending"}`},
 	}
-	evidence, err = agentFileWriteEvidence(inputs, nil)
+	evidence, err = agentFileWriteEvidence(inputs)
 	if err != nil || !cloudDSHHasUnverifiedFileWrite(inputs, evidence) {
 		t.Fatalf("partially accounted write history = %#v, %v; want unresolved second write", evidence, err)
 	}

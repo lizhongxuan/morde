@@ -25,13 +25,47 @@ func (s *Store) UpsertHostMember(ctx context.Context, value host.Member) (host.M
 		}
 		permissions = append(permissions, string(permission))
 	}
-	row, err := s.q.UpsertHostMember(ctx, sqlcgen.UpsertHostMemberParams{
-		HostID: value.HostID, OwnerID: value.OwnerID, UserID: value.UserID, Permissions: permissions,
+	var result host.Member
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var controlActor string
+		var controlVersion int64
+		err := tx.QueryRow(ctx, `SELECT COALESCE(control_actor_id,''), control_version FROM hosts WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL FOR UPDATE`,
+			value.HostID, value.OwnerID).Scan(&controlActor, &controlVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "host not found")
+		}
+		if err != nil {
+			return fmt.Errorf("lock Host before member permission update: %w", err)
+		}
+		row, err := sqlcgen.New(tx).UpsertHostMember(ctx, sqlcgen.UpsertHostMemberParams{
+			HostID: value.HostID, OwnerID: value.OwnerID, UserID: value.UserID, Permissions: permissions,
+		})
+		if err != nil {
+			return fmt.Errorf("upsert host member: %w", err)
+		}
+		result = hostMemberDomain(row)
+		if controlActor == value.UserID {
+			allowed, err := hasControlPermission(ctx, tx, value.HostID, value.OwnerID, value.UserID, "")
+			if err != nil {
+				return fmt.Errorf("revalidate Host control actor after permission update: %w", err)
+			}
+			if !allowed {
+				if controlVersion == int64(^uint64(0)>>1) {
+					return domain.NewError(domain.CodeInvalidState, "Host control version cannot be advanced")
+				}
+				if _, err := tx.Exec(ctx, `UPDATE hosts SET control_actor_id=NULL, control_lease_expires_at=NULL,
+control_version=control_version+1, updated_at=clock_timestamp() WHERE id=$1 AND control_actor_id=$2 AND control_version=$3`,
+					value.HostID, value.UserID, controlVersion); err != nil {
+					return fmt.Errorf("clear Host control lease after member permission update: %w", err)
+				}
+			}
+		}
+		return nil
 	})
 	if err != nil {
-		return host.Member{}, fmt.Errorf("upsert host member: %w", err)
+		return host.Member{}, err
 	}
-	return hostMemberDomain(row), nil
+	return result, nil
 }
 
 func (s *Store) ListHostMembers(ctx context.Context, hostID, ownerID string) ([]host.Member, error) {
@@ -51,13 +85,21 @@ func (s *Store) RevokeHostMember(ctx context.Context, hostID, ownerID, userID st
 		if _, err := lockOwnerExecutionControl(ctx, tx, ownerID, true); err != nil {
 			return err
 		}
-		var hostOwnerID string
-		err := tx.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, hostID, ownerID).Scan(&hostOwnerID)
+		var hostOwnerID, controlActor string
+		var controlVersion int64
+		err := tx.QueryRow(ctx, `SELECT owner_id, COALESCE(control_actor_id,''), control_version FROM hosts WHERE id=$1 AND owner_id=$2 FOR UPDATE`, hostID, ownerID).Scan(&hostOwnerID, &controlActor, &controlVersion)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "host member not found")
 		}
 		if err != nil {
 			return fmt.Errorf("lock host for member revocation: %w", err)
+		}
+		var transitionActive bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_control_transitions WHERE host_id=$1 AND phase <> 'completed')`, hostID).Scan(&transitionActive); err != nil {
+			return fmt.Errorf("check active Host control transition before member revocation: %w", err)
+		}
+		if transitionActive {
+			return domain.NewError(domain.CodeConflict, "Host control transition must finish before member revocation")
 		}
 		if err := requestMCPRuntimeCancellationsForHostMember(ctx, tx, hostOwnerID, userID, hostID); err != nil {
 			return err
@@ -68,6 +110,16 @@ func (s *Store) RevokeHostMember(ctx context.Context, hostID, ownerID, userID st
 		}
 		if rows == 0 {
 			return domain.NewError(domain.CodeNotFound, "host member not found")
+		}
+		if controlActor == userID {
+			if controlVersion == int64(^uint64(0)>>1) {
+				return domain.NewError(domain.CodeInvalidState, "Host control version cannot be advanced")
+			}
+			if _, err := tx.Exec(ctx, `UPDATE hosts SET control_actor_id=NULL, control_lease_expires_at=NULL,
+control_version=control_version+1, updated_at=clock_timestamp() WHERE id=$1 AND control_actor_id=$2 AND control_version=$3`,
+				hostID, userID, controlVersion); err != nil {
+				return fmt.Errorf("revoke Host control lease: %w", err)
+			}
 		}
 		return nil
 	})

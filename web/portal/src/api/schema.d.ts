@@ -460,7 +460,7 @@ export interface paths {
         put?: never;
         /**
          * Create a host
-         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys may create only an unbound host within the account quota and default resource target.
+         * @description Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host must bind exactly one owned, ready Workspace using workspace_ids; the same ownership and availability checks apply to Portal Sessions, API keys, and internal creation paths. Reuse the Idempotency-Key only to retry the exact normalized request.
          */
         post: operations["createHost"];
         delete?: never;
@@ -495,6 +495,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/hosts/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get the current generation's Host resource usage receipt
+         * @description Host owners, administrators, and API keys with current host:read access can read aggregate CPU and estimated memory usage. This is an unpriced usage record, not an invoice; raw samples and container identities are not returned.
+         */
+        get: operations["getHostUsageReceipt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/hosts/{id}/control": {
         parameters: {
             query?: never;
@@ -506,7 +528,7 @@ export interface paths {
         };
         /**
          * Get the AI and user control state for a host
-         * @description Portal sessions can inspect their owned hosts. API keys require current account access to observe this host. The active transition omits internal task snapshots and runtime receipts.
+         * @description Portal sessions with owner or Host-sharing observation access may inspect this Host. API keys require current account access to observe it. control_actor_user_id is empty when no active user lease exists; the active transition omits internal task snapshots and runtime receipts.
          */
         get: operations["getHostControl"];
         put?: never;
@@ -574,9 +596,31 @@ export interface paths {
         put?: never;
         /**
          * Hand control of a host between AI and the user
-         * @description Portal sessions can operate their owned hosts. API keys require current account permission to operate this host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
+         * @description The Host owner or a member with a control permission may take over when no active user lease exists. Release is limited to the current active holder or the Host owner. API keys require current account permission to operate this Host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. A different active holder or stale version returns 409; pending runtime operations leave the Host fenced and return 202.
          */
         post: operations["actOnHostControl"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/hosts/{id}/control/lease/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Renew the active Host control lease
+         * @description The current Host owner or authorized control member may renew only their own active lease. The caller must provide the current control version; an expired or revoked lease cannot be revived. The response includes current actor, expiry and active state.
+         */
+        post: operations["renewHostControlLease"];
         delete?: never;
         options?: never;
         head?: never;
@@ -595,6 +639,92 @@ export interface paths {
          * @description Host-owner session only. This Host Gateway route uses the host-scoped ch_host cookie and returns only fixed, validated application status and safe installation progress.
          */
         get: operations["getHostApplications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/task-auth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Exchange a one-time Portal ticket for a short-lived Task-read cookie
+         * @description The opaque ticket is single-use and expires within 60 seconds. The Host Gateway redirects to a clean Workbench URL after setting a distinct HttpOnly, Secure, SameSite=Strict cookie scoped to /__ch/. The ticket value is never placed in a referrer or cacheable response.
+         */
+        get: operations["exchangeTaskWorkbenchObservationTicket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/api/tasks/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a narrow, read-only Task observation snapshot
+         * @description Requires the distinct short-lived Task-read cookie. Returns only Task state, event sequence, timestamps, and verified artifact metadata. It excludes objective, result text, event payloads, file paths, and all mutation or Host-control capabilities. Authorization and Host runtime generation are rechecked per request.
+         */
+        get: operations["getWorkbenchTaskObservationSnapshot"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/api/tasks/{task_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Stream safe Task observation events
+         * @description Requires the distinct short-lived Task-read cookie. Each SSE event contains only sequence, fixed event type, and timestamp; event payloads are never returned. Task read authorization and Host generation are rechecked on each poll, so revoked access ends the stream.
+         */
+        get: operations["streamWorkbenchTaskObservationEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/__ch/api/workspaces/{workspace_id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["schemas"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Compare two applied Workspace revisions from the Host owner Workbench
+         * @description Host owner ch_host cookie only; Host members with workspace:file:read cannot use this route. Requires an active, healthy, conflict-free binding whose desired and applied revision match the current confirmed revision. The bounded diff projection is the same as the Portal Workspace diff.
+         */
+        get: operations["getHostWorkspaceDiff"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1012,6 +1142,97 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/workspaces/{id}/ownership-transfers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request transfer of Workspace ownership
+         * @description Portal Session only. Only the current owner can request transfer to an approved account. The request freezes Workspace changes until it is accepted or cancelled. The current Workspace ID, revision history, current tree, and volume are retained; no file bytes are sent. Transfers are refused while a Host binding, Task write, synchronization operation, publish, project or Site reference, registered device, or unsupported legacy volume exists.
+         */
+        post: operations["requestWorkspaceOwnershipTransfer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/ownership-transfers/{transfer_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get an ownership transfer request
+         * @description Available to the current or former owner and the proposed owner. After acceptance, this endpoint exposes only the transfer receipt; Workspace and sync data access follows the new current owner.
+         */
+        get: operations["getWorkspaceOwnershipTransfer"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/ownership-transfers/{transfer_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept a Workspace ownership transfer
+         * @description Only the proposed owner's Portal Session may accept. Acceptance is an idempotent operation with a durable operation ID. A result-unknown state remains frozen for reconciliation; it cannot be cancelled or accepted as a new operation.
+         */
+        post: operations["acceptWorkspaceOwnershipTransfer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/ownership-transfers/{transfer_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a pending Workspace ownership transfer
+         * @description Only the former/current owner's Portal Session may cancel while the transfer remains pending. Acceptance or result-unknown operations cannot be cancelled.
+         */
+        post: operations["cancelWorkspaceOwnershipTransfer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/workspaces/{id}/manifest": {
         parameters: {
             query?: never;
@@ -1028,6 +1249,94 @@ export interface paths {
         get: operations["getWorkspaceManifest"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Compare two committed Workspace revisions
+         * @description Portal owner sessions only. Returns changed file and directory metadata; UTF-8 text content is included only for small files. Large and binary files retain an explicit display status without content.
+         */
+        get: operations["getWorkspaceDiff"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/copies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Copy a confirmed Workspace revision
+         * @description Portal owner sessions only. Requires a ready Workspace volume, a current tree matching the confirmed revision, no Host binding or in-flight writer, and sufficient owner capacity. Unsupported file metadata fails closed. The source remains unchanged; each idempotency key creates at most one independent Workspace copy.
+         */
+        post: operations["copyWorkspace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore selected paths from an immutable revision
+         * @description Portal owner sessions only. The current Workspace revision is checked atomically; active Host bindings, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
+         */
+        post: operations["restoreWorkspacePaths"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspaces/{id}/file-operations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rename, move, or delete Workspace paths
+         * @description Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of active Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
+         */
+        post: operations["applyWorkspaceFileOperation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1336,6 +1645,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/host-replicas/{host_id}/generations/{generation}/operation-ledger/{namespace}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                namespace: "runtime_core" | "browser";
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a bounded page from this Host generation's durable operation ledger
+         * @description Host Replica credentials can read only their own Host, runtime generation, and namespace. Events are returned in sequence order for client-side hash-chain validation.
+         */
+        get: operations["listHostRuntimeOperationLedgerEvents"];
+        put?: never;
+        /**
+         * Durably append one Host Runtime operation event
+         * @description The event sequence and predecessor hash must match the current ledger head. Replaying the identical event is idempotent; a different event at an existing sequence or a stale predecessor returns conflict. The response is sent only after PostgreSQL commits the event.
+         */
+        post: operations["appendHostRuntimeOperationLedgerEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/host-replicas/{host_id}/generations/{generation}/task-workspace-view-deletions": {
         parameters: {
             query?: never;
@@ -1521,7 +1858,7 @@ export interface paths {
         };
         /**
          * List the current user's in-app notifications
-         * @description Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Related task content is redacted when current authorization no longer allows access. Marking read does not approve or execute an action.
+         * @description Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Task summaries are redacted when current authorization no longer allows access. Project work-item notices are visible only while the recipient is a current project member. Source notices expose a fixed summary and source identity, not source content. Marking read does not approve or execute an action.
          */
         get: operations["listNotifications"];
         put?: never;
@@ -1545,7 +1882,7 @@ export interface paths {
         put?: never;
         /**
          * Mark a notification as read
-         * @description Portal sessions and native client credentials may mark a historical notification read. Idempotent; this does not execute any task action.
+         * @description Portal sessions and native client credentials may mark a historical Task or source notification read. Idempotent; this does not execute any task action.
          */
         post: operations["markNotificationRead"];
         delete?: never;
@@ -1697,6 +2034,691 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me/main-conversation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the current user's main conversation pointer */
+        get: operations["getMainConversation"];
+        /** Select an owned personal conversation as the main conversation */
+        put: operations["setMainConversation"];
+        /**
+         * Idempotently initialize the current user's main conversation
+         * @description Creates and binds a conversation only when no usable personal history candidate exists; ambiguous legacy history returns selection_required without modifying or merging it.
+         */
+        post: operations["ensureMainConversation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List projects available to the current user
+         * @description Returns projects where the current user has an accepted membership. Invitations do not grant project access until accepted.
+         */
+        get: operations["listProjects"];
+        put?: never;
+        /** Create a project with the caller as its owner */
+        post: operations["createProject"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /** Read a project available to the current user */
+        get: operations["getProject"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /** List accepted project members */
+        get: operations["listProjectMembers"];
+        put?: never;
+        /**
+         * Invite an existing account to a project
+         * @description Owner only. The target must be an existing account in this service instance. This creates a pending invitation, not a membership; the invitee must accept it. No email or external message is sent.
+         */
+        post: operations["inviteProjectMember"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/members/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                user_id: components["parameters"]["ProjectMemberUserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove an accepted project member
+         * @description Owner only. Pending invitations use the separate invitation-revocation operation. The expected member version and idempotency key are checked atomically; active work must be reauthorized after removal.
+         */
+        delete: operations["removeProjectMember"];
+        options?: never;
+        head?: never;
+        /**
+         * Change an accepted member's role
+         * @description Owner only. Only member and viewer roles can be assigned here; ownership changes use the explicit owner-transfer operation.
+         */
+        patch: operations["updateProjectMemberRole"];
+        trace?: never;
+    };
+    "/api/projects/{id}/invitations/{invitation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                invitation_id: components["schemas"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke a pending project invitation
+         * @description Owner only. The invitation must still be pending; expected_version and the idempotency key are checked atomically.
+         */
+        delete: operations["revokeProjectInvitation"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/project-invitations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List invitations addressed to the current user
+         * @description Only invitations for the authenticated account are returned.
+         */
+        get: operations["listMyProjectInvitations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/project-invitations/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept an invitation addressed to the current user
+         * @description Acceptance is atomic and idempotent. A non-invitee cannot read or accept the invitation. Repeated acceptance does not create a second membership.
+         */
+        post: operations["acceptProjectInvitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/owner-transfer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Transfer ownership to an accepted member
+         * @description Current owner only. The target must already be an accepted member. The transfer atomically makes the target owner and the former owner a member, preserving exactly one owner.
+         */
+        post: operations["transferProjectOwner"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List project resource associations visible to the current user
+         * @description Association does not grant Host or Workspace access. The server returns an associated resource ID only when the reader independently has current access to it.
+         */
+        get: operations["listProjectResources"];
+        put?: never;
+        /**
+         * Associate an already accessible Host or Workspace with a project
+         * @description Owner only. The caller must already have independent access to the resource; linking it never grants resource permissions to project members.
+         */
+        post: operations["addProjectResource"];
+        /**
+         * Remove a Host or Workspace association from a project
+         * @description Owner only. The request is version checked and idempotent; removing an association does not modify the resource or its permissions.
+         */
+        delete: operations["removeProjectResource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/workspaces/{workspace_id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a project workspace directory snapshot
+         * @description Requires current project viewer membership, an active Workspace association, and independent current Workspace read permission. Returns only confirmed revision metadata and omits credential paths, file hashes, and block references.
+         */
+        get: operations["getProjectWorkspaceManifest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List shared conversations available to project members
+         * @description Every request rechecks current project membership. Project conversation owner_id records who created the shared conversation; later message and Task actors are reported separately.
+         */
+        get: operations["listProjectConversations"];
+        put?: never;
+        /**
+         * Create a shared conversation in a project
+         * @description Accepted project members may create a shared conversation. The creator remains conversation owner; this does not make them the project owner or a later Task initiator.
+         */
+        post: operations["createProjectConversation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a shared project conversation
+         * @description The current accepted project membership is checked on every read.
+         */
+        get: operations["getProjectConversation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/hosts/{host_id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                host_id: components["schemas"]["HostId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get Host resource usage attributed to a project
+         * @description The caller's current accepted project membership is checked on every read and again in the usage query transaction. Only aggregate usage attributed to this project and Host is returned; raw samples, container identities, and Workspace attribution are omitted. Usage is unpriced.
+         */
+        get: operations["getProjectHostUsageReceipt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read shared project conversation history
+         * @description Returns the single shared history for accepted project members. owner_id is the conversation creator; actor_id is the account that authored each message.
+         */
+        get: operations["listProjectConversationMessages"];
+        put?: never;
+        /**
+         * Append a message and queue a Task in the shared conversation
+         * @description Accepted project members may append messages. The conversation owner remains the creator while the Task initiator is the caller; current membership and the caller's independent Host, Workspace, model, and token access are rechecked by the write transaction.
+         */
+        post: operations["appendProjectConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/project-content/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search current Muse content in projects the caller can read
+         * @description The SQL query joins current accepted memberships before matching content and always enforces a bounded result limit. Only current non-deleted project Feed posts, Ideas, Library metadata, and briefs are searched; personal records and inaccessible project excerpts are never read.
+         */
+        get: operations["searchProjectContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/content/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read versioned project content
+         * @description Available to accepted project members. Kinds include the legacy memory/goal/document records and project-scoped Feed posts, Ideas, Library metadata, and briefs. Content IDs are query values because valid IDs may contain slashes. A deleted head revision returns not found. This route reads only project_content_revisions; it never falls back to personal sync data.
+         */
+        get: operations["getProjectContent"];
+        /**
+         * Create or replace project content at an expected revision
+         * @description Owner/member only. Use base_revision 0 for first creation; updates require the current revision. Body is a strict JSON object validated for the selected kind. Each write is idempotent. Initial creation returns 201; update or replay returns 200.
+         */
+        put: operations["putProjectContent"];
+        post?: never;
+        /**
+         * Tombstone project content at an expected revision
+         * @description Owner/member only. The tombstone increments and returns the revision so a later recreation can use that revision as base_revision. The current content body is not returned.
+         */
+        delete: operations["deleteProjectContent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/content/{kind}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List comments pinned to one project content revision and row
+         * @description Accepted project members with viewer access may read. The referenced immutable content revision must exist and not be a tombstone; comments are isolated to the exact project, kind, content ID, revision, and row ID.
+         */
+        get: operations["listProjectContentRowComments"];
+        put?: never;
+        /**
+         * Add a comment pinned to a fixed project content revision and row
+         * @description Accepted project members only. Creation uses comment base version 0; each update/delete must compare the current comment version. Writes are idempotent and recheck current membership and the pinned non-deleted content revision in the transaction.
+         */
+        post: operations["createProjectContentRowComment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/content/{kind}/comments/{comment_id}": {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+                comment_id: components["schemas"]["ProjectContentCommentId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update a comment with a compare-and-swap base version
+         * @description Accepted project members only. A stale base_version returns conflict; the comment remains pinned to its original content revision and row.
+         */
+        put: operations["updateProjectContentRowComment"];
+        post?: never;
+        /** Tombstone a comment with a compare-and-swap base version */
+        delete: operations["deleteProjectContentRowComment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/budget": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a project's current budget and usage totals
+         * @description Available to accepted project members. Unconfigured budgets return configured=false, empty currency, zero limit and version, and zero totals.
+         */
+        get: operations["getProjectBudget"];
+        /**
+         * Set a project's versioned currency limit
+         * @description Owner only. expected_version 0 creates the initial budget. Limits and usage are integer micro-units in the declared currency. Stale versions, lowering below committed/reserved usage, unknown held charges, or changing currency after ledger usage exists return conflict. The project budget and the actor's existing account budget both apply to future reservations.
+         */
+        put: operations["setProjectBudget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/mcp-connectors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List personal MCP connectors explicitly authorized for a project
+         * @description Available to current project members. Returns connector references and non-secret metadata only; connector credentials and endpoints are never copied or returned. Grants whose connector owner is no longer a current project member are not available.
+         */
+        get: operations["listProjectMCPConnectors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/mcp-connectors/{connector_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                connector_id: components["parameters"]["ProjectMCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Explicitly authorize a personal connector for a project
+         * @description The authenticated user must own the personal connector and be a current project member. expected_version 0 creates a grant; a current revoked version reauthorizes it. Only a non-secret connector reference and owner authorization are stored.
+         */
+        put: operations["grantProjectMCPConnector"];
+        post?: never;
+        /**
+         * Revoke a project's personal connector grant
+         * @description Only the connector owner or project owner can revoke. The expected version fences stale requests; affected Task grants and in-flight operations are revoked or marked for unknown-result recovery in the same transaction.
+         */
+        delete: operations["revokeProjectMCPConnector"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/budget/ledger": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * List project model usage attribution
+         * @description Available to accepted project members. Task model calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
+         */
+        get: operations["listProjectBudgetLedger"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        /** List work items visible to project members */
+        get: operations["listProjectWorkItems"];
+        put?: never;
+        /**
+         * Create a project work item
+         * @description Owner/member only. The default assignee is the caller; any supplied assignee must be an accepted member. Task and Workspace fields are added only through separately authorized operations.
+         */
+        post: operations["createProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        /** Read one project work item */
+        get: operations["getProjectWorkItem"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Assign a work item to an accepted project member */
+        patch: operations["assignProjectWorkItem"];
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/block": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mark an open work item blocked */
+        post: operations["blockProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resume a blocked work item */
+        post: operations["resumeProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Link an independently authorized Task to a work item
+         * @description The transaction authorizer must verify that the caller can access the Task and that the Task actually belongs to this project; a task_id alone never grants access or changes personal Task ownership.
+         */
+        post: operations["linkProjectWorkItemTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/delivery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Attach a saved Workspace revision as work item delivery evidence
+         * @description The evidence Task must already be linked to the work item. The W16 authorizer must verify caller access, project/resource scope, and that the Workspace revision is confirmed and durably saved; this request does not grant Workspace access or accept file content.
+         */
+        post: operations["deliverProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations": {
         parameters: {
             query?: never;
@@ -1750,8 +2772,8 @@ export interface paths {
         get: operations["listConversationMessages"];
         put?: never;
         /**
-         * Append a message and queue a cloud task
-         * @description The selected model and optional Host apply to this task only. The server-side dsh Agent can continue after the client disconnects.
+         * Append a message to a conversation or its active cloud task
+         * @description When expected_task_id is supplied, the message is appended only if that Task is still active; a changed or finished Task returns a conflict instead of creating a new Task. Without it, a new Task may be queued. The server-side dsh Agent can continue after the client disconnects.
          */
         post: operations["appendConversationMessage"];
         delete?: never;
@@ -1794,6 +2816,28 @@ export interface paths {
         get: operations["getTask"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/workbench-observation-ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue a short-lived one-time ticket to observe a Host-bound Task in Workbench
+         * @description Portal session only. The caller must currently be able to read this Task and own its running Host. The raw ticket is returned once, expires within 60 seconds, and is persisted server-side only as a hash. It grants read-only Task status/events and verified artifact metadata; it grants no Host control or Workspace file access.
+         */
+        post: operations["issueTaskWorkbenchObservationTicket"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2065,13 +3109,13 @@ export interface paths {
         };
         /**
          * List schedules owned by the current account
-         * @description Schedule-scoped Client grants can access this API; execution authorization remains server-side.
+         * @description Schedule-scoped Client grants can access this API; execution authorization remains server-side. Hostless schedules have host_id null. Schedules with browser observation are always Host-bound.
          */
         get: operations["listSchedules"];
         put?: never;
         /**
          * Create and enable a schedule
-         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
          */
         post: operations["createSchedule"];
         delete?: never;
@@ -2089,9 +3133,15 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read one current-account schedule */
+        /**
+         * Read one current-account schedule
+         * @description Returns host_id as null for a hostless schedule. A schedule with browser observation always has a Host.
+         */
         get: operations["getSchedule"];
-        /** Update a schedule definition at the expected version */
+        /**
+         * Update a schedule definition at the expected version
+         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+         */
         put: operations["updateSchedule"];
         post?: never;
         delete?: never;
@@ -2113,7 +3163,7 @@ export interface paths {
         put?: never;
         /**
          * Enable or disable a schedule
-         * @description Requires an Idempotency-Key and expected_version. Disabling does not cancel the current run unless current_run_action is cancel.
+         * @description Requires an Idempotency-Key and expected_version. Hostless schedules can be enabled when they do not configure browser observation. Disabling does not cancel the current run unless current_run_action is cancel.
          */
         post: operations["updateScheduleStatus"];
         delete?: never;
@@ -2651,11 +3701,31 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read fixed account, reward, and quota policy
-         * @description Requires an approved administrator's unbound Portal session. Token budgets are set per account; new accounts have no default model budget. This endpoint does not change account consent or issue credits.
+         * Read account, model budget, reward, and quota policy
+         * @description Requires an approved administrator's unbound Portal session. Newly registered accounts receive the configured default model budget only on their first approval; administrators must configure a positive default before approving any new account. Invitation and contribution rewards remain disabled.
          */
         get: operations["getAdminSettings"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/settings/model-budget-default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Version-update the default model budget for newly approved accounts
+         * @description Requires an approved administrator's unbound Portal session. The default must be positive and is applied to a new account only on its first approval. Existing account budgets are never overwritten. expected_version is 0 when no default has been configured and increments after each successful update. The setting and audit record are committed atomically.
+         */
+        put: operations["updateAdminModelBudgetDefault"];
         post?: never;
         delete?: never;
         options?: never;
@@ -2833,7 +3903,10 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Review a user's status, change their role, or update quota */
+        /**
+         * Review a user's status, change their role, or update quota
+         * @description Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, the configured default model budget is created in the same transaction as the status change and audit. If no valid default is configured, approval fails and the account remains unchanged. Disabling and restoring an account does not grant or reset a budget.
+         */
         patch: operations["updateUser"];
         trace?: never;
     };
@@ -3573,6 +4646,7 @@ export interface components {
         };
         HostId: string;
         WorkspaceId: string;
+        WorkspaceOwnershipTransferId: string;
         SiteId: string;
         SiteReleaseId: string;
         UserId: string;
@@ -3767,7 +4841,7 @@ export interface components {
         AdminSettings: {
             registration_review_required: boolean;
             /** @constant */
-            automatic_new_user_model_budget: false;
+            automatic_new_user_model_budget: true;
             /** @constant */
             automatic_invitation_reward: false;
             /** @constant */
@@ -3776,6 +4850,22 @@ export interface components {
             default_personal_data_quota_bytes: number;
             /** Format: int64 */
             default_personal_attachment_bytes: number;
+            default_model_budget: components["schemas"]["AdminModelBudgetDefault"];
+        };
+        AdminModelBudgetDefault: {
+            configured: boolean;
+            /** Format: int64 */
+            token_limit: number;
+            max_concurrent: number;
+            /** Format: int64 */
+            version: number;
+        };
+        UpdateAdminModelBudgetDefaultRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            /** Format: int64 */
+            token_limit: number;
+            max_concurrent: number;
         };
         AdminInvite: {
             inviter_id: components["schemas"]["UserId"];
@@ -3978,6 +5068,22 @@ export interface components {
             runtime_generation: number;
             items: components["schemas"]["HostReplicaBinding"][];
         };
+        RuntimeOperationLedgerEvent: {
+            /** @enum {integer} */
+            version: 1;
+            /** Format: uint64 */
+            sequence: number;
+            /** @enum {string} */
+            kind: "runtime_state" | "operation" | "browser.operation" | "browser.operation_binding" | "browser.operation_completed" | "browser.task_context" | "browser.target_owned" | "browser.context_closed";
+            /** @description JSON payload included in the event hash. */
+            data: unknown;
+            previous_hash: string;
+            hash: string;
+        };
+        RuntimeOperationLedgerPage: {
+            items: components["schemas"]["RuntimeOperationLedgerEvent"][];
+            has_more: boolean;
+        };
         HostTaskWorkspaceViewDeletion: {
             request_id: components["schemas"]["TaskWorkspaceViewDeletionId"];
             task_id: components["schemas"]["TaskId"];
@@ -4024,10 +5130,53 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        HostUsageReceipt: {
+            host_id: components["schemas"]["HostId"];
+            /** Format: int64 */
+            runtime_generation: number;
+            /** @enum {string} */
+            status: "unknown" | "measured" | "partial";
+            /** Format: int64 */
+            samples: number;
+            /** Format: int64 */
+            unknown_intervals: number;
+            unknown_reason?: string;
+            calculation_method: string;
+            /** Format: double */
+            cpu_seconds: number;
+            /** Format: double */
+            estimated_memory_mib_seconds: number;
+            /** @enum {string} */
+            price_status: "unknown";
+            price_unknown_reason: string;
+        };
+        ProjectHostUsageReceipt: {
+            project_id: components["schemas"]["ProjectId"];
+            host_id: components["schemas"]["HostId"];
+            /** @enum {string} */
+            status: "unknown" | "measured" | "partial";
+            /** Format: int64 */
+            samples: number;
+            /** Format: int64 */
+            unknown_intervals: number;
+            unknown_reason?: string;
+            calculation_method: string;
+            /** Format: double */
+            cpu_seconds: number;
+            /** Format: double */
+            estimated_memory_mib_seconds: number;
+            /** @enum {string} */
+            price_status: "unknown";
+            price_unknown_reason: string;
+        };
         ControlActionRequest: {
             /** @enum {string} */
             action: "take_over" | "release";
             request_id: string;
+            /** Format: int64 */
+            expected_control_version: number;
+        };
+        ControlLeaseRenewRequest: {
             /** Format: int64 */
             expected_control_version: number;
         };
@@ -4037,6 +5186,13 @@ export interface components {
             control_state: "ai" | "taking_over" | "user" | "returning";
             /** Format: int64 */
             control_version: number;
+            /** @description Empty when no user currently holds the control lease. */
+            control_actor_user_id: "" | components["schemas"]["UserId"];
+            /** Format: date-time */
+            control_lease_expires_at: string | null;
+            control_lease_active: boolean;
+            /** @description True only when this authenticated request's user currently holds the active control lease. */
+            control_lease_held_by_me: boolean;
             active_transition: components["schemas"]["ControlTransition"] | null;
         };
         ControlActionResponse: {
@@ -4045,6 +5201,13 @@ export interface components {
             control_state: "ai" | "taking_over" | "user" | "returning";
             /** Format: int64 */
             control_version: number;
+            /** @description Empty when no user currently holds the control lease. */
+            control_actor_user_id: "" | components["schemas"]["UserId"];
+            /** Format: date-time */
+            control_lease_expires_at: string | null;
+            control_lease_active: boolean;
+            /** @description True only when this authenticated request's user currently holds the active control lease. */
+            control_lease_held_by_me: boolean;
             active_transition: components["schemas"]["ControlTransition"] | null;
             pending_operation_ids: components["schemas"]["OperationId"][];
         };
@@ -4247,18 +5410,74 @@ export interface components {
             expected_binding_version: number;
         };
         WorkspaceFile: {
-            /** @description Clean relative POSIX path; absolute paths, traversal, symlinks and duplicate case-folded paths are rejected. */
+            /** @description Clean relative POSIX path; absolute paths, traversal and duplicate case-folded paths are rejected. A symlink is represented at its own path and is never followed. */
             path: string;
-            /** Format: int64 */
+            /**
+             * @description Empty or omitted kind is a regular file for compatibility with older clients.
+             * @enum {string}
+             */
+            kind?: "file" | "symlink";
+            /** @description Required for symlinks. UTF-8 relative POSIX target up to 4096 bytes; NUL, backslash, colon, absolute and root-escaping targets are rejected. Never resolved or followed by file APIs. */
+            symlink_target?: string;
+            /** @description For regular files, identifies the earlier canonical path for another name of the same inode. The anchor must be a regular file with identical content, chunks, mode and modification time. */
+            hardlink_to?: string;
+            /**
+             * Format: int64
+             * @description For symlinks, UTF-8 target byte length.
+             */
             size_bytes: number;
+            /** @description For symlinks, SHA-256 of the target bytes. */
             sha256: string;
-            /** @description Permission bits only; executable bits are preserved. */
+            /** @description Permission bits only for regular files; symlink mode is 0. */
             mode: number;
+            /**
+             * Format: int64
+             * @description Modification time as Unix nanoseconds; omitted for legacy revisions whose timestamp is unknown.
+             */
+            mod_time_ns?: number | null;
+            /** @description True when this revision explicitly captured an empty or non-empty xattr/ACL set; false means legacy/unknown. */
+            metadata_known?: boolean;
+            xattrs?: components["schemas"]["WorkspaceExtendedAttribute"][];
+            acl?: components["schemas"]["WorkspaceNativeACL"];
             chunks: components["schemas"]["WorkspaceChunk"][];
+        } & (unknown & unknown);
+        WorkspaceExtendedAttribute: {
+            name: string;
+            /**
+             * Format: byte
+             * @description Raw extended-attribute value encoded as base64.
+             */
+            value: string;
+        };
+        WorkspaceNativeACL: {
+            /** @enum {string} */
+            platform: "linux" | "darwin";
+            /** @enum {string} */
+            format: "linux-posix-acl-v1" | "darwin-filesec-v1";
+            /**
+             * Format: byte
+             * @description Opaque platform-native ACL payload encoded as base64; restored only by a compatible platform/filesystem.
+             */
+            data: string;
         };
         WorkspaceChunk: {
             sha256: string;
             size_bytes: number;
+        };
+        WorkspaceDirectory: {
+            /** @description Clean relative directory path; `.` denotes the Workspace root. */
+            path: string;
+            /** @description Directory permission bits; omitted when the historical revision did not capture them. */
+            mode?: number | null;
+            /**
+             * Format: int64
+             * @description Modification time as Unix nanoseconds; omitted when unknown.
+             */
+            mod_time_ns?: number | null;
+            /** @description True when this revision explicitly captured an empty or non-empty xattr/ACL set; false means legacy/unknown. */
+            metadata_known?: boolean;
+            xattrs?: components["schemas"]["WorkspaceExtendedAttribute"][];
+            acl?: components["schemas"]["WorkspaceNativeACL"];
         };
         WorkspaceManifest: {
             workspace_id: components["schemas"]["WorkspaceId"];
@@ -4266,6 +5485,7 @@ export interface components {
             revision: number;
             files: components["schemas"]["WorkspaceFile"][];
             empty_directories: string[];
+            directories: components["schemas"]["WorkspaceDirectory"][];
             next_cursor: string | null;
         };
         WorkspaceChangePage: {
@@ -4274,13 +5494,134 @@ export interface components {
                 revision: number;
                 path: string;
                 /**
-                 * @description Directory actions have file=null; directory_upsert creates an empty leaf directory.
+                 * @description Directory actions have file=null; directory_upsert carries the captured directory metadata when known.
                  * @enum {string}
                  */
                 action: "upsert" | "delete" | "directory_upsert" | "directory_delete";
                 file: components["schemas"]["WorkspaceFile"] | null;
+                directory: components["schemas"]["WorkspaceDirectory"] | null;
             }[];
             next_cursor: string;
+        };
+        WorkspaceDiff: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            from_revision: number;
+            /** Format: int64 */
+            to_revision: number;
+            changes: components["schemas"]["WorkspaceDiffChange"][];
+        };
+        WorkspaceDiffChange: {
+            path: string;
+            /** @enum {string} */
+            action: "added" | "removed" | "changed" | "renamed";
+            before: components["schemas"]["WorkspaceDiffVersion"] | null;
+            after: components["schemas"]["WorkspaceDiffVersion"] | null;
+            /** @enum {string} */
+            display_status: "text" | "binary" | "too_large" | "metadata_only" | "not_applicable";
+            before_text: string | null;
+            after_text: string | null;
+        };
+        WorkspaceDiffVersion: {
+            /** @enum {string} */
+            kind: "file" | "symlink" | "directory";
+            path: string;
+            symlink_target?: string;
+            /** Format: int64 */
+            size_bytes?: number;
+            sha256?: string;
+            mode?: number;
+            /**
+             * Format: int64
+             * @description Directory modification time as Unix nanoseconds; omitted when unknown.
+             */
+            mod_time_ns?: number | null;
+        };
+        WorkspaceRestoreRequest: {
+            /** Format: int64 */
+            target_revision: number;
+            /** Format: int64 */
+            expected_current_revision: number;
+            paths: string[];
+        };
+        WorkspaceRestoreResult: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            target_revision: number;
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** Format: int64 */
+            revision: number;
+            replayed: boolean;
+        };
+        WorkspaceCopyRequest: {
+            name: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+        };
+        WorkspaceCopyResult: {
+            source_workspace_id: components["schemas"]["WorkspaceId"];
+            workspace: {
+                id: components["schemas"]["WorkspaceId"];
+                name: string;
+                /** Format: int64 */
+                revision: number;
+                /** @enum {string} */
+                state: "ready";
+            };
+            /** Format: int64 */
+            source_revision: number;
+            /** @enum {string} */
+            state: "completed";
+            replayed: boolean;
+        };
+        WorkspaceFileOperationRequest: {
+            /** @enum {string} */
+            action: "rename" | "move" | "delete";
+            /** @description Normalized relative path. Credential paths are rejected. */
+            source_path: string;
+            /** @description Required for rename and move; omitted for delete. */
+            target_path?: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** @description Must be explicitly true to enable this operation. */
+            write_enabled: boolean;
+        };
+        WorkspaceFileOperationResult: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** @enum {string} */
+            action: "rename" | "move" | "delete";
+            source_path: string;
+            target_path: string;
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** Format: int64 */
+            revision: number;
+            replayed: boolean;
+        };
+        RequestWorkspaceOwnershipTransfer: {
+            target_user_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        WorkspaceOwnershipTransfer: {
+            id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            from_owner_id: components["schemas"]["UserId"];
+            to_owner_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            state: "pending" | "accepting" | "unknown" | "accepted" | "cancelled";
+            /** Format: int64 */
+            expected_revision: number;
+            operation_id?: string;
+            /** Format: int64 */
+            version: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: date-time */
+            accepted_at?: string;
         };
         CreateSyncSessionRequest: {
             /** @enum {string} */
@@ -4299,6 +5640,7 @@ export interface components {
             scope?: string[];
             files: components["schemas"]["WorkspaceFile"][];
             empty_directories?: string[];
+            directories?: components["schemas"]["WorkspaceDirectory"][];
             deleted_paths?: string[];
             deleted_directories?: string[];
             /** @description Advance this replica's durable cursor only after this session is applied and committed. */
@@ -4591,6 +5933,8 @@ export interface components {
         ScheduleStatus: "enabled" | "disabled" | "completed";
         /** @enum {string} */
         ScheduleNotificationEvent: "completed" | "failed" | "waiting_user";
+        /** @description Host association for a schedule; null means the schedule is hostless. Browser observation schedules require a Host. */
+        ScheduleHostId: components["schemas"]["HostId"] | null;
         ScheduleBudget: {
             /** Format: int64 */
             active_seconds: number;
@@ -4649,7 +5993,7 @@ export interface components {
         ScheduleMisfirePolicy: "skip" | "run_once";
         ScheduleSyncDefinition: {
             status: components["schemas"]["ScheduleStatus"];
-            host_id: components["schemas"]["HostId"];
+            host_id: components["schemas"]["ScheduleHostId"];
             model_id: string;
             objective: string;
             timing: components["schemas"]["ScheduleTiming"];
@@ -4657,7 +6001,7 @@ export interface components {
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"];
-        };
+        } & unknown;
         GoalCreateRequest: {
             id: components["schemas"]["GoalId"];
             body: components["schemas"]["GoalBody"];
@@ -4676,7 +6020,7 @@ export interface components {
             next_cursor: string | null;
         };
         ScheduleCreateRequest: {
-            host_id: components["schemas"]["HostId"];
+            host_id?: components["schemas"]["ScheduleHostId"];
             model_id: string;
             objective: string;
             timing: components["schemas"]["ScheduleTiming"];
@@ -4684,11 +6028,11 @@ export interface components {
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
-        };
+        } & unknown;
         ScheduleUpdateRequest: {
             /** Format: int64 */
             expected_version: number;
-            host_id?: components["schemas"]["HostId"];
+            host_id?: components["schemas"]["ScheduleHostId"];
             model_id?: string;
             objective?: string;
             timing?: components["schemas"]["ScheduleTiming"];
@@ -4738,7 +6082,7 @@ export interface components {
             /** Format: int64 */
             version: number;
             status: components["schemas"]["ScheduleStatus"];
-            host_id: components["schemas"]["HostId"];
+            host_id: components["schemas"]["ScheduleHostId"];
             model_id: string;
             objective: string;
             timing: components["schemas"]["ScheduleTiming"];
@@ -4754,7 +6098,7 @@ export interface components {
             created_at: string;
             /** Format: date-time */
             updated_at: string;
-        };
+        } & unknown;
         SchedulePage: {
             items: components["schemas"]["Schedule"][];
             /** @description Empty string means there are no more pages. */
@@ -5069,7 +6413,7 @@ export interface components {
         };
         CreateHostRequest: {
             name?: string;
-            workspace_ids?: components["schemas"]["WorkspaceId"][];
+            workspace_ids: components["schemas"]["WorkspaceId"][];
         };
         CreateAPIKeyRequest: {
             name: string;
@@ -5111,12 +6455,434 @@ export interface components {
         };
         Conversation: {
             id: components["schemas"]["ConversationId"];
+            /** @enum {string} */
+            scope: "personal";
+            is_main: boolean;
             host_id?: components["schemas"]["HostId"];
             title: string;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        MainConversation: {
+            /** @enum {string} */
+            status: "ready" | "uninitialized" | "selection_required";
+            /** @description Empty unless status is ready. */
+            conversation_id: string;
+            /** Format: int64 */
+            version: number;
+        };
+        SetMainConversationRequest: {
+            conversation_id: components["schemas"]["ConversationId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectId: string;
+        ProjectInvitationId: string;
+        ProjectWorkItemId: string;
+        /** @enum {string} */
+        ProjectRole: "owner" | "member" | "viewer";
+        /** @enum {string} */
+        ProjectContentKind: "memory" | "goal" | "document" | "feed_post" | "idea" | "library_item" | "brief";
+        /** @enum {string} */
+        ProjectMuseContentKind: "feed_post" | "idea" | "library_item" | "brief";
+        ProjectContentCommentId: string;
+        /** @enum {string} */
+        ProjectResourceKind: "host" | "workspace";
+        CreateProjectConversationRequest: {
+            title?: string;
+        };
+        ProjectConversation: {
+            id: components["schemas"]["ConversationId"];
+            project_id: components["schemas"]["ProjectId"];
+            owner_id: components["schemas"]["UserId"];
+            title: string;
+            model_id?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        ProjectConversationPage: {
+            items: components["schemas"]["ProjectConversation"][];
+            next_cursor: string | null;
+        };
+        ProjectConversationMessage: components["schemas"]["ConversationMessage"] & {
+            owner_id: components["schemas"]["UserId"];
+            actor_id: components["schemas"]["UserId"];
+        };
+        ProjectConversationMessagePage: {
+            items: components["schemas"]["ProjectConversationMessage"][];
+            next_cursor: string | null;
+        };
+        AppendProjectConversationMessageRequest: components["schemas"]["AppendConversationMessageRequest"];
+        AppendProjectConversationMessageResponse: {
+            message: components["schemas"]["ProjectConversationMessage"];
+            task: components["schemas"]["ProjectConversationTask"];
+        };
+        ProjectConversationTask: components["schemas"]["Task"] & {
+            project_id: components["schemas"]["ProjectId"];
+            initiator_id: components["schemas"]["UserId"];
+        };
+        CreateProjectRequest: {
+            name: string;
+            description?: string;
+        };
+        Project: {
+            id: components["schemas"]["ProjectId"];
+            owner_id: components["schemas"]["UserId"];
+            name: string;
+            description: string;
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectPage: {
+            items: components["schemas"]["Project"][];
+            next_cursor: string | null;
+        };
+        ProjectMember: {
+            project_id: components["schemas"]["ProjectId"];
+            user_id: components["schemas"]["UserId"];
+            role: components["schemas"]["ProjectRole"];
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectMemberPage: {
+            items: components["schemas"]["ProjectMember"][];
+            next_cursor: string | null;
+        };
+        InviteProjectMemberRequest: {
+            user_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            role: "member" | "viewer";
+            /** Format: int64 */
+            expected_version: number;
+        };
+        UpdateProjectMemberRequest: {
+            /** @enum {string} */
+            role: "member" | "viewer";
+            /** Format: int64 */
+            expected_version: number;
+        };
+        RemoveProjectMemberRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        RevokeProjectInvitationRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectInvitation: {
+            id: components["schemas"]["ProjectInvitationId"];
+            project_id: components["schemas"]["ProjectId"];
+            inviter_id: components["schemas"]["UserId"];
+            invitee_id: components["schemas"]["UserId"];
+            /** @enum {string} */
+            role: "member" | "viewer";
+            /** @enum {string} */
+            state: "pending" | "accepted" | "revoked";
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectInvitationPage: {
+            items: components["schemas"]["ProjectInvitation"][];
+            next_cursor: string | null;
+        };
+        TransferProjectOwnerRequest: {
+            user_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectResourceMutationRequest: {
+            kind: components["schemas"]["ProjectResourceKind"];
+            /** @description Must be a HostId when kind=host or a WorkspaceId when kind=workspace. */
+            resource_id: string;
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectResource: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectResourceKind"];
+            resource_id: string;
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectResourcePage: {
+            items: components["schemas"]["ProjectResource"][];
+            next_cursor: string | null;
+        };
+        ProjectWorkspaceManifest: {
+            project_id: components["schemas"]["ProjectId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+            files: {
+                path: string;
+                /**
+                 * @description The entry type; symlink targets are intentionally hidden from project viewers.
+                 * @enum {string}
+                 */
+                kind: "file" | "symlink";
+                size_bytes: number;
+                mode: number;
+            }[];
+            empty_directories: string[];
+            next_cursor: string | null;
+        };
+        ProjectContent: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectContentKind"];
+            id: string;
+            /** Format: int64 */
+            revision: number;
+            body: components["schemas"]["ProjectFeedPost"] | components["schemas"]["ProjectIdea"] | components["schemas"]["ProjectLibraryMetadata"] | components["schemas"]["ProjectBrief"] | {
+                [key: string]: unknown;
+            };
+            updated_by: components["schemas"]["UserId"];
+        };
+        ProjectFeedPost: {
+            title: string;
+            type: string;
+            emoji?: string;
+            /** Format: date-time */
+            created_at?: string;
+            liked?: boolean;
+            body: string;
+        };
+        ProjectIdea: {
+            title: string;
+            content: string;
+            tags?: string[];
+        };
+        /** @description Project-local metadata only. Personal attachment IDs and bytes are not copied or resolved by this API. */
+        ProjectLibraryMetadata: {
+            name: string;
+            /** @enum {string} */
+            kind: "artifact" | "media";
+            mime?: string;
+            /** Format: int64 */
+            size_bytes?: number;
+        };
+        ProjectBrief: {
+            title: string;
+            summary?: string;
+            content: string;
+            tags?: string[];
+        };
+        ProjectContentTombstone: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectContentKind"];
+            id: string;
+            /** Format: int64 */
+            revision: number;
+            updated_by: components["schemas"]["UserId"];
+            /** @constant */
+            deleted: true;
+        };
+        ProjectContentSearchResponse: {
+            items: components["schemas"]["ProjectContentSearchResult"][];
+        };
+        ProjectContentSearchResult: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectMuseContentKind"];
+            content_id: string;
+            /** Format: int64 */
+            revision: number;
+            title: string;
+            excerpt: string;
+        };
+        ProjectContentComment: {
+            project_id: components["schemas"]["ProjectId"];
+            kind: components["schemas"]["ProjectMuseContentKind"];
+            content_id: string;
+            /** Format: int64 */
+            content_revision: number;
+            row_id: string;
+            id: components["schemas"]["ProjectContentCommentId"];
+            /** Format: int64 */
+            revision: number;
+            body?: string;
+            updated_by: components["schemas"]["UserId"];
+            deleted?: boolean;
+        };
+        ProjectContentCommentPage: {
+            items: components["schemas"]["ProjectContentComment"][];
+        };
+        CreateProjectContentCommentRequest: {
+            content_id: string;
+            /** Format: int64 */
+            content_revision: number;
+            row_id: string;
+            body: string;
+        };
+        UpdateProjectContentCommentRequest: {
+            /** Format: int64 */
+            base_version: number;
+            body: string;
+        };
+        DeleteProjectContentCommentRequest: {
+            /** Format: int64 */
+            base_version: number;
+        };
+        ProjectMCPConnector: {
+            /** @description Owner of the personal connector that explicitly authorized this project reference. */
+            connector_owner_id: components["schemas"]["UserId"];
+            connector_id: components["schemas"]["MCPConnectorId"];
+            /** @description Non-secret display name; omitted if the connector was deleted before revocation. */
+            name?: string;
+            enabled: boolean;
+            /**
+             * Format: int64
+             * @description Non-secret connector revision; zero if the connector was deleted before revocation.
+             */
+            connector_revision?: number;
+            /** Format: int64 */
+            grant_version: number;
+            active: boolean;
+            /** Format: date-time */
+            revoked_at?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        ProjectMCPConnectorPage: {
+            items: components["schemas"]["ProjectMCPConnector"][];
+        };
+        ProjectMCPConnectorGrantRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectMCPConnectorRevokeRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        PutProjectContentRequest: {
+            content_id: string;
+            /** Format: int64 */
+            base_revision: number;
+            /** @description Strict kind-specific project JSON object; maximum 1 MiB after request decoding. */
+            body: {
+                [key: string]: unknown;
+            };
+        };
+        DeleteProjectContentRequest: {
+            content_id: string;
+            /** Format: int64 */
+            base_revision: number;
+        };
+        ProjectBudget: {
+            configured: boolean;
+            currency: string;
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            version: number;
+            /** Format: int64 */
+            spent_micros: number;
+            /** Format: int64 */
+            reserved_micros: number;
+            has_unknown: boolean;
+        };
+        SetProjectBudgetRequest: {
+            currency: string;
+            /** Format: int64 */
+            limit_micros: number;
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectTokenUsage: {
+            /** Format: int64 */
+            input_tokens: number;
+            /** Format: int64 */
+            output_tokens: number;
+        };
+        ProjectBudgetLedgerEntry: {
+            call_id: string;
+            actor_id: components["schemas"]["UserId"];
+            /** @description Present only for source=task. */
+            task_id?: components["schemas"]["TaskId"];
+            /** @enum {string} */
+            source: "client" | "chat" | "task";
+            model_id: components["schemas"]["ModelConnectionId"];
+            /** Format: int64 */
+            rate_version: number;
+            currency: string;
+            /** @enum {string} */
+            status: "reserved" | "settled" | "unknown";
+            reserved_usage: components["schemas"]["ProjectTokenUsage"];
+            actual_usage?: components["schemas"]["ProjectTokenUsage"];
+            /** Format: int64 */
+            reserved_micros: number;
+            /** Format: int64 */
+            actual_micros?: number;
+            /** Format: date-time */
+            created_at: string;
+        };
+        ProjectBudgetLedgerPage: {
+            items: components["schemas"]["ProjectBudgetLedgerEntry"][];
+            next_cursor: string | null;
+        };
+        /** @enum {string} */
+        ProjectWorkItemState: "open" | "blocked" | "delivered";
+        ProjectWorkItemDelivery: {
+            task_id: components["schemas"]["TaskId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+        };
+        ProjectWorkItem: {
+            id: components["schemas"]["ProjectWorkItemId"];
+            project_id: components["schemas"]["ProjectId"];
+            title: string;
+            description: string;
+            acceptance_criteria: string[];
+            assignee_id: components["schemas"]["UserId"];
+            state: components["schemas"]["ProjectWorkItemState"];
+            blocked_reason: string;
+            task_ids: components["schemas"]["TaskId"][];
+            delivery?: components["schemas"]["ProjectWorkItemDelivery"] | null;
+            /** Format: int64 */
+            version: number;
+        };
+        ProjectWorkItemPage: {
+            items: components["schemas"]["ProjectWorkItem"][];
+            next_cursor: string | null;
+        };
+        CreateProjectWorkItemRequest: {
+            title: string;
+            description?: string;
+            acceptance_criteria?: string[];
+            /** @description Defaults to the caller. */
+            assignee_id?: components["schemas"]["UserId"];
+        };
+        AssignProjectWorkItemRequest: {
+            assignee_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        BlockProjectWorkItemRequest: {
+            blocked_reason: string;
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ProjectWorkItemVersionRequest: {
+            /** Format: int64 */
+            expected_version: number;
+        };
+        LinkProjectWorkItemTaskRequest: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        DeliverProjectWorkItemRequest: {
+            task_id: components["schemas"]["TaskId"];
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            expected_version: number;
         };
         ConversationPage: {
             items: components["schemas"]["Conversation"][];
@@ -5128,7 +6894,10 @@ export interface components {
             /** @enum {string} */
             role: "user" | "assistant";
             content: string;
-            task_id: components["schemas"]["TaskId"];
+            task_id?: components["schemas"]["TaskId"];
+            attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
+            /** @enum {string} */
+            delivery_status: "pending" | "applied" | "unknown";
             /** Format: date-time */
             created_at: string;
         };
@@ -5141,6 +6910,8 @@ export interface components {
             title?: string;
         };
         AppendConversationMessageRequest: {
+            /** @description Active Task that must receive this message; if it is no longer active */
+            expected_task_id?: components["schemas"]["TaskId"];
             host_id?: components["schemas"]["HostId"];
             workspace_id?: components["schemas"]["WorkspaceId"];
             /** @description Immutable committed Workspace revision used by this task. Required with workspace_id. */
@@ -5175,6 +6946,8 @@ export interface components {
         TaskSummary: {
             id: components["schemas"]["TaskId"];
             owner_id: components["schemas"]["UserId"];
+            /** @description Account that actually submitted this Task; for project Tasks */
+            initiator_id: components["schemas"]["UserId"];
             /** @description Optional target Host for computer operations; the dsh Agent runs independently on the server. */
             host_id?: components["schemas"]["HostId"];
             /** @enum {string} */
@@ -5225,6 +6998,21 @@ export interface components {
             /** @description Workspace-relative path */
             path: string;
             media_type: string;
+            workspace_id: string | null;
+            /**
+             * Format: int64
+             * @description Confirmed immutable Workspace revision; null for legacy artifacts without a proof.
+             */
+            workspace_revision: number | null;
+            /**
+             * Format: int64
+             * @description Verified file size; null for legacy artifacts without a proof.
+             */
+            size_bytes: number | null;
+            /** @description Verified file digest; null for legacy artifacts without a proof. */
+            sha256: string | null;
+            /** @description True only when all Workspace proof fields are present and valid. */
+            verified: boolean;
             batch_item_id: components["schemas"]["BatchItemId"] | null;
             batch_attempt: number;
             /** Format: date-time */
@@ -5265,6 +7053,38 @@ export interface components {
             content: string;
             /** @enum {string} */
             status: "streaming" | "completed" | "interrupted";
+            /** Format: date-time */
+            created_at: string;
+        };
+        TaskWorkbenchObservationTicket: {
+            ticket: string;
+            task_id: components["schemas"]["TaskId"];
+            host_id: components["schemas"]["HostId"];
+            /** Format: date-time */
+            expires_at: string;
+        };
+        /** @description Read-only Task projection. It contains no objective, Task result, event payload, file path, mutation field, or Host control capability. */
+        TaskWorkbenchObservationSnapshot: {
+            task_id: components["schemas"]["TaskId"];
+            host_id: components["schemas"]["HostId"];
+            status: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            event_sequence: number;
+            /** Format: date-time */
+            updated_at: string;
+            artifacts: components["schemas"]["TaskWorkbenchObservationArtifact"][];
+        };
+        /** @description Metadata for a Task artifact with a complete verified Workspace proof. File paths and contents are never exposed. */
+        TaskWorkbenchObservationArtifact: {
+            id: components["schemas"]["ArtifactId"];
+            label: string;
+            media_type: string;
+            workspace_id: components["schemas"]["WorkspaceId"];
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
             /** Format: date-time */
             created_at: string;
         };
@@ -5349,12 +7169,28 @@ export interface components {
             created_at: string;
             payload: unknown;
         };
+        /** @description Task-backed notices have a task_id and positive event_sequence. Goal and project work-item source notices have task_id null, event_sequence 0, and source identity fields; project_id is present only for project work-item notices. source_event_id is an internal deduplication key and is not returned. */
         Notification: {
             id: components["schemas"]["NotificationId"];
             /** @enum {string} */
-            kind: "completed" | "failed" | "waiting_user";
+            kind: "completed" | "failed" | "waiting_user" | "goal_step_blocked" | "goal_completed" | "project_work_item_blocked" | "project_work_item_delivered";
             task_id: components["schemas"]["TaskId"] | null;
+            /** @description Positive for Task-backed notices and 0 for source notices. */
             event_sequence: number;
+            /**
+             * @description Omitted for Task-backed notices.
+             * @enum {string}
+             */
+            source_kind?: "goal" | "project_work_item";
+            /** @description Omitted for Task-backed notices. */
+            source_id?: string;
+            /**
+             * Format: int64
+             * @description Omitted for Task-backed notices.
+             */
+            source_version?: number;
+            /** @description Present only for project work-item notices. */
+            project_id?: components["schemas"]["ProjectId"];
             /** @description Null when current authorization no longer permits disclosure. */
             summary: string | null;
             redacted: boolean;
@@ -6015,7 +7851,13 @@ export interface components {
         SiteReleaseId: components["schemas"]["SiteReleaseId"];
         ModelConnectionId: components["schemas"]["ModelConnectionId"];
         MCPConnectorId: components["schemas"]["MCPConnectorId"];
+        ProjectMCPConnectorId: components["schemas"]["MCPConnectorId"];
         NotificationId: components["schemas"]["NotificationId"];
+        ProjectId: components["schemas"]["ProjectId"];
+        ProjectConversationId: components["schemas"]["ConversationId"];
+        ProjectInvitationId: components["schemas"]["ProjectInvitationId"];
+        ProjectMemberUserId: components["schemas"]["UserId"];
+        ProjectWorkItemId: components["schemas"]["ProjectWorkItemId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
         PageLimit: number;
@@ -6051,7 +7893,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, both project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
@@ -6836,6 +8678,33 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getHostUsageReceipt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate resource usage for the current Host runtime generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostUsageReceipt"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getHostControl: {
         parameters: {
             query?: never;
@@ -6968,6 +8837,38 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    renewHostControlLease: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ControlLeaseRenewRequest"];
+            };
+        };
+        responses: {
+            /** @description Current control status after lease renewal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ControlStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getHostApplications: {
         parameters: {
             query?: never;
@@ -6991,6 +8892,121 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    exchangeTaskWorkbenchObservationTicket: {
+        parameters: {
+            query: {
+                ticket: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ticket exchanged; browser should follow the clean Workbench location. */
+            303: {
+                headers: {
+                    /** @description Clean `/__ch/wb/?task_id={task_id}` URL with no ticket query parameter. */
+                    Location?: string;
+                    /** @description Separate ch_task_read cookie; never a ch_host cookie. */
+                    "Set-Cookie"?: string;
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getWorkbenchTaskObservationSnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current safe Task observation projection */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkbenchObservationSnapshot"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    streamWorkbenchTaskObservationEvents: {
+        parameters: {
+            query?: {
+                after?: number;
+            };
+            header?: {
+                "Last-Event-ID"?: string;
+            };
+            path: {
+                task_id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent safe Task observation events; cursor expiry emits task.snapshot_required and closes the stream. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getHostWorkspaceDiff: {
+        parameters: {
+            query: {
+                from_revision: number;
+                to_revision: number;
+            };
+            header?: never;
+            path: {
+                workspace_id: components["schemas"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded Workspace revision comparison */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDiff"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -7663,6 +9679,151 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    requestWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestWorkspaceOwnershipTransfer"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay of the transfer request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            /** @description Transfer request created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            /** @description Workspace references or volume state cannot be transferred safely */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ownership transfer status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acceptWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted transfer receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelWorkspaceOwnershipTransfer: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+                transfer_id: components["schemas"]["WorkspaceOwnershipTransferId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancelled transfer receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceOwnershipTransfer"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
     getWorkspaceManifest: {
         parameters: {
             query?: {
@@ -7691,6 +9852,154 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getWorkspaceDiff: {
+        parameters: {
+            query: {
+                from_revision: number;
+                to_revision: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded Workspace revision comparison */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDiff"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    copyWorkspace: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceCopyRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed copy returned for an idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceCopyResult"];
+                };
+            };
+            /** @description Newly completed independent Workspace copy */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceCopyResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    restoreWorkspacePaths: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceRestoreRequest"];
+            };
+        };
+        responses: {
+            /** @description Restore result and resulting immutable revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceRestoreResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    applyWorkspaceFileOperation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceFileOperationRequest"];
+            };
+        };
+        responses: {
+            /** @description Operation receipt and resulting immutable revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceFileOperationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -8184,6 +10493,70 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listHostRuntimeOperationLedgerEvents: {
+        parameters: {
+            query?: {
+                after_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                namespace: "runtime_core" | "browser";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Events following the requested sequence */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeOperationLedgerPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    appendHostRuntimeOperationLedgerEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_id: components["schemas"]["HostId"];
+                generation: number;
+                namespace: "runtime_core" | "browser";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RuntimeOperationLedgerEvent"];
+            };
+        };
+        responses: {
+            /** @description Durably committed event acknowledgement */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeOperationLedgerEvent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
             default: components["responses"]["Error"];
         };
     };
@@ -8729,6 +11102,1550 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getMainConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Main conversation selection state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MainConversation"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    setMainConversation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetMainConversationRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated main conversation selection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MainConversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    ensureMainConversation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Main conversation selection state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MainConversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjects: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Projects visible to the current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProject: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the created project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            /** @description Project created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProject: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectMembers: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted members of the project */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMemberPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    inviteProjectMember: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InviteProjectMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the invitation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectInvitation"];
+                };
+            };
+            /** @description Pending invitation created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectInvitation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    removeProjectMember: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                user_id: components["parameters"]["ProjectMemberUserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoveProjectMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted project member removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateProjectMemberRole: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                user_id: components["parameters"]["ProjectMemberUserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProjectMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated member role and version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMember"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeProjectInvitation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                invitation_id: components["schemas"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeProjectInvitationRequest"];
+            };
+        };
+        responses: {
+            /** @description Pending invitation revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listMyProjectInvitations: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitations addressed to the current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectInvitationPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acceptProjectInvitation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectInvitationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact idempotent replay of the accepted membership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMember"];
+                };
+            };
+            /** @description Membership created from the accepted invitation */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMember"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    transferProjectOwner: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransferProjectOwnerRequest"];
+            };
+        };
+        responses: {
+            /** @description Project with the new owner and incremented version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectResources: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Independently authorized project resource associations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResourcePage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    addProjectResource: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectResourceMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the association */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResource"];
+                };
+            };
+            /** @description Resource association created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectResource"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    removeProjectResource: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectResourceMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Resource association removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectWorkspaceManifest: {
+        parameters: {
+            query?: {
+                revision?: number;
+                prefix?: string;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sanitized Workspace directory metadata at a confirmed revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkspaceManifest"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectConversations: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Shared project conversations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectConversation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectConversationRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversation"];
+                };
+            };
+            /** @description Project conversation created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Shared project conversation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversation"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectHostUsageReceipt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                host_id: components["schemas"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate project-attributed Host resource usage */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectHostUsageReceipt"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectConversationMessages: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Messages in chronological order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationMessagePage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    appendProjectConversationMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AppendProjectConversationMessageRequest"];
+            };
+        };
+        responses: {
+            /** @description Shared message and queued project Task */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppendProjectConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    searchProjectContent: {
+        parameters: {
+            query: {
+                q: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded matches from currently readable projects */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentSearchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectContent: {
+        parameters: {
+            query: {
+                content_id: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current non-deleted content revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putProjectContent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutProjectContentRequest"];
+            };
+        };
+        responses: {
+            /** @description Content updated or exact idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContent"];
+                };
+            };
+            /** @description Content created at revision 1 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["RequestTooLarge"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteProjectContent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteProjectContentRequest"];
+            };
+        };
+        responses: {
+            /** @description Tombstone revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentTombstone"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectContentRowComments: {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current comments for this exact row and revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentCommentPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectContentRowComment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectContentCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            /** @description Created comment at version 1 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateProjectContentRowComment: {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+                comment_id: components["schemas"]["ProjectContentCommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProjectContentCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated comment revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteProjectContentRowComment: {
+        parameters: {
+            query: {
+                content_id: string;
+                content_revision: number;
+                row_id: string;
+            };
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                kind: components["schemas"]["ProjectMuseContentKind"];
+                comment_id: components["schemas"]["ProjectContentCommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteProjectContentCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description Comment tombstone revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectContentComment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectBudget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current budget and held/settled totals in integer micro-units */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBudget"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    setProjectBudget: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetProjectBudgetRequest"];
+            };
+        };
+        responses: {
+            /** @description Current budget and usage totals after the update */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBudget"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectMCPConnectors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active project connector grants */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMCPConnectorPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    grantProjectMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                connector_id: components["parameters"]["ProjectMCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectMCPConnectorGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Active project connector grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    revokeProjectMCPConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                connector_id: components["parameters"]["ProjectMCPConnectorId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectMCPConnectorRevokeRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoked project connector grant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMCPConnector"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectBudgetLedger: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stable page of project usage entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectBudgetLedgerPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectWorkItems: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stable project-scoped page ordered by creation time and ID */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItemPage"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    createProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact idempotent replay of the created work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            /** @description Work item created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    assignProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssignProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    blockProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BlockProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Blocked work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resumeProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectWorkItemVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description Resumed work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    linkProjectWorkItemTask: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LinkProjectWorkItemTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description Work item with the Task linked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deliverProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliverProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Delivered work item with saved revision evidence */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
     listConversations: {
         parameters: {
             query?: {
@@ -8952,6 +12869,33 @@ export interface operations {
                     "application/json": components["schemas"]["Task"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    issueTaskWorkbenchObservationTicket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One-time Workbench observation ticket */
+            201: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    "Referrer-Policy"?: "no-referrer";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskWorkbenchObservationTicket"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
@@ -10558,7 +14502,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current fixed policy and personal-data quota defaults */
+            /** @description Current policy, default model budget configuration, and personal-data quota defaults */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -10569,6 +14513,35 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminModelBudgetDefault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminModelBudgetDefaultRequest"];
+            };
+        };
+        responses: {
+            /** @description Saved default model budget and version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminModelBudgetDefault"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

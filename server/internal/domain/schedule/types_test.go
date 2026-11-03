@@ -200,7 +200,7 @@ func TestScheduleEnumsAndValidation(t *testing.T) {
 		func(value *Schedule) { value.OwnerID = "" },
 		func(value *Schedule) { value.Version = 0 },
 		func(value *Schedule) { value.Status = "unknown" },
-		func(value *Schedule) { value.HostID = "" },
+		func(value *Schedule) { value.HostID = "bad-host" },
 		func(value *Schedule) { value.ModelID = "" },
 		func(value *Schedule) { value.Objective = "  " },
 		func(value *Schedule) { value.Authorization.Kind = "" },
@@ -217,6 +217,18 @@ func TestScheduleEnumsAndValidation(t *testing.T) {
 		if err := Validate(invalid); err == nil {
 			t.Errorf("Validate(%#v) accepted invalid schedule", invalid)
 		}
+	}
+
+	hostless := base
+	hostless.HostID = ""
+	if err := Validate(hostless); err != nil {
+		t.Fatalf("valid hostless schedule rejected: %v", err)
+	}
+	observation := ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: ObservationText}
+	hostless.Observation = &observation
+	hostless.ObservationConfigHash = observation.ConfigHash()
+	if err := Validate(hostless); err == nil {
+		t.Fatal("hostless schedule accepted computer observation")
 	}
 }
 

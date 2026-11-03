@@ -137,10 +137,12 @@ func (s *cloudDSHTestInstanceStore) ConfirmAgentStopped(_ context.Context, proof
 }
 
 type cloudDSHTestCheckpoints struct {
-	commands  []app.AgentCheckpointCommand
-	reads     []app.AgentCheckpointPageRequest
-	err       error
-	afterSave func(app.AgentCheckpointCommand)
+	commands      []app.AgentCheckpointCommand
+	reads         []app.AgentCheckpointPageRequest
+	pending       []app.AgentConversationMessage
+	pendingFences []app.AgentCheckpointFence
+	err           error
+	afterSave     func(app.AgentCheckpointCommand)
 }
 
 func (s *cloudDSHTestCheckpoints) Save(_ context.Context, command app.AgentCheckpointCommand) (bool, error) {
@@ -173,6 +175,11 @@ func (s *cloudDSHTestCheckpoints) ReadPage(_ context.Context, request app.AgentC
 	return app.AgentCheckpointPage{}, errors.New("checkpoint page not found")
 }
 
+func (s *cloudDSHTestCheckpoints) PendingMessages(_ context.Context, fence app.AgentCheckpointFence) ([]app.AgentConversationMessage, error) {
+	s.pendingFences = append(s.pendingFences, fence)
+	return append([]app.AgentConversationMessage(nil), s.pending...), nil
+}
+
 type cloudDSHTestModels struct {
 	calls     []app.ModelCall
 	response  app.ModelResponse
@@ -199,6 +206,17 @@ type cloudDSHTestTools struct {
 	recoveryExpected  []*string
 	pauseRecoveryCall int
 	afterExecute      func()
+}
+
+type cloudDSHTestToolsWithContext struct {
+	*cloudDSHTestTools
+	context string
+	calls   int
+}
+
+func (t *cloudDSHTestToolsWithContext) InitialContext(context.Context, task.Task) (string, error) {
+	t.calls++
+	return t.context, nil
 }
 
 type cloudDSHTestChildSessions struct {
@@ -354,7 +372,7 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 		t.Fatal(err)
 	}
 	expires := time.Now().Add(time.Minute)
-	value := task.Task{ID: "q1234567", OwnerID: "u1234567", ModelID: "p1234567", Objective: "local test", Status: task.StatusRunning,
+	value := task.Task{ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", ModelID: "p1234567", Objective: "local test", Status: task.StatusRunning,
 		ExecutionLocation: "server", Lease: task.Lease{Owner: "worker-test", Version: 1, ExpiresAt: &expires},
 		Authorization: task.Authorization{Version: 1}, Budget: task.Budget{ActiveSeconds: 20, ToolCalls: 1, ModelTokens: 1000}, CheckpointThroughSequence: -1}
 	return executor, supervisor, store, checkpoints, models, value
@@ -385,6 +403,135 @@ func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T)
 	}
 	if supervisor.launch.Fence.TaskID != value.ID || supervisor.launch.ExpiresAt.IsZero() {
 		t.Fatal("supervisor lease fence missing")
+	}
+}
+
+func TestCloudDSHFreshSessionReceivesBoundedConversationHistoryOnce(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	tools := &cloudDSHTestToolsWithContext{cloudDSHTestTools: &cloudDSHTestTools{}, context: "Authorized personal profile: Cedar."}
+	executor.options.Tools = tools
+	value.ConversationID = "c1234567"
+	value.Objective = "Use the earlier name in the next step."
+	value.InitiatorID = value.OwnerID
+	value.ConversationContext = &task.ConversationContext{
+		OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, ConversationID: value.ConversationID,
+		Scope: "personal", ThroughSequence: 2, Digest: bytes.Repeat([]byte{3}, sha256.Size),
+		Messages: []task.ConversationContextMessage{
+			{ID: "m1234567", Sequence: 1, Role: "user", Content: "The draft name is Cedar."},
+			{ID: "m2345678", Sequence: 2, Role: "assistant", Content: "I will use Cedar."},
+		},
+	}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("fresh run = %v", err)
+	}
+	if len(models.calls) != 1 {
+		t.Fatalf("model calls = %d; want one fresh model call", len(models.calls))
+	}
+	prompt := cloudDSHTestUserPrompt(t, models.calls[0])
+	if !strings.Contains(prompt, "The draft name is Cedar.") ||
+		strings.Index(prompt, "I will use Cedar.") < strings.Index(prompt, "The draft name is Cedar.") ||
+		strings.Count(prompt, value.Objective) != 1 || strings.Index(prompt, "Current request:") < strings.Index(prompt, "Confirmed conversation history") {
+		t.Fatalf("fresh model prompt did not contain ordered history and one current request: %q", prompt)
+	}
+	if !strings.Contains(prompt, tools.context) || tools.calls != 1 {
+		t.Fatalf("fresh model prompt omitted authorized personal context or loaded it %d times: %q", tools.calls, prompt)
+	}
+}
+
+func TestCloudDSHExecutorDeliversPendingConversationMessageOnce(t *testing.T) {
+	executor, _, _, checkpoints, models, value := cloudDSHFixture(t)
+	checkpoints.pending = []app.AgentConversationMessage{{ID: "m1234567", Content: "Use the revised detail."}}
+	models.responses = []app.ModelResponse{
+		{Text: "I will apply the update.", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}},
+		{Text: "Updated result.", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}},
+	}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("run = %v", err)
+	}
+	if len(models.calls) != 2 {
+		t.Fatalf("live message produced %d model calls; want the original and one followup", len(models.calls))
+	}
+	prompt := cloudDSHTestUserPrompt(t, models.calls[1])
+	if !strings.Contains(prompt, "Use the revised detail.") {
+		t.Fatalf("followup model request omitted the live message: %q", prompt)
+	}
+	if len(checkpoints.pendingFences) == 0 {
+		t.Fatal("worker did not poll for messages")
+	}
+	for _, fence := range checkpoints.pendingFences {
+		if fence.TaskID != value.ID || fence.OwnerID != value.OwnerID || fence.AgentSessionID == "" ||
+			fence.AgentRootSessionID != fence.AgentSessionID || fence.AgentGeneration < 1 || fence.LeaseOwner != value.Lease.Owner ||
+			fence.LeaseVersion != value.Lease.Version || fence.AuthorizationVersion != value.Authorization.Version ||
+			fence.EngineVersion != cloudDSHEngineVersion || fence.ProfileVersion != cloudDSHProfileVersion {
+			t.Fatalf("pending message poll was not root/task fenced: %+v", fence)
+		}
+	}
+	var messageEvents int
+	for _, command := range checkpoints.commands {
+		var body struct {
+			Events []struct {
+				Type string `json:"type"`
+				Data struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			} `json:"events"`
+		}
+		if err := json.Unmarshal(command.Payload, &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range body.Events {
+			if event.Type == "user/message" && event.Data.ID == "m1234567" {
+				messageEvents++
+			}
+		}
+	}
+	if messageEvents != 1 {
+		t.Fatalf("persisted live user/message count = %d; want 1", messageEvents)
+	}
+}
+
+func cloudDSHTestUserPrompt(t *testing.T, call app.ModelCall) string {
+	t.Helper()
+	var request struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(call.RawRequest, &request); err != nil {
+		t.Fatalf("decode dsh model request: %v", err)
+	}
+	var prompt strings.Builder
+	for _, message := range request.Messages {
+		if message.Role != "user" {
+			continue
+		}
+		for _, part := range message.Content {
+			if part.Type == "text" {
+				prompt.WriteString(part.Text)
+			}
+		}
+	}
+	return prompt.String()
+}
+
+func TestCloudDSHInitialPromptRejectsInvalidConversationContext(t *testing.T) {
+	value := task.Task{OwnerID: "u1234567", InitiatorID: "u1234567", ConversationID: "c1234567", Objective: "current request", ConversationContext: &task.ConversationContext{
+		OwnerID: "u1234567", InitiatorID: "u1234567", ConversationID: "c1234567", Scope: "personal", ThroughSequence: 3, Digest: bytes.Repeat([]byte{4}, sha256.Size),
+		Messages: []task.ConversationContextMessage{
+			{ID: "m1234567", Sequence: 2, Role: "user", Content: "first"},
+			{ID: "m2345678", Sequence: 2, Role: "assistant", Content: "duplicate sequence"},
+		},
+	}}
+	if _, err := cloudDSHInitialPrompt(value); err == nil {
+		t.Fatal("non-increasing history sequence was accepted")
+	}
+	value.ConversationContext.Messages[1].Sequence = 4
+	if _, err := cloudDSHInitialPrompt(value); err == nil {
+		t.Fatal("history sequence beyond the fixed boundary was accepted")
 	}
 }
 
@@ -958,8 +1105,23 @@ func TestCloudDSHExecutorRejectsIncompleteRecoveryMetadata(t *testing.T) {
 
 func TestCloudDSHExecutorRecoversCompletedCheckpointWithoutReplayingModel(t *testing.T) {
 	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+	value.ConversationID = "c1234567"
+	value.Objective = "continue after recovering the completed local run"
+	value.InitiatorID = value.OwnerID
+	value.ConversationContext = &task.ConversationContext{
+		OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, ConversationID: value.ConversationID,
+		Scope: "personal", ThroughSequence: 1, Digest: bytes.Repeat([]byte{5}, sha256.Size),
+		Messages: []task.ConversationContextMessage{{ID: "m3456789", Sequence: 1, Role: "user", Content: "the earlier fact is Birch"}},
+	}
 	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
 		t.Fatalf("initial run = %v", err)
+	}
+	if len(models.calls) != 1 {
+		t.Fatalf("first run model calls = %d; want one", len(models.calls))
+	}
+	firstPrompt := cloudDSHTestUserPrompt(t, models.calls[0])
+	if strings.Count(firstPrompt, value.Objective) != 1 || !strings.Contains(firstPrompt, "the earlier fact is Birch") {
+		t.Fatalf("first run prompt did not contain one current request and fixed history: %q", firstPrompt)
 	}
 	if len(checkpoints.commands) == 0 {
 		t.Fatal("initial run did not persist checkpoint history")
@@ -1021,7 +1183,7 @@ func TestCloudDSHExecutorReconcilesEveryPinnedToolCallBeforeSettling(t *testing.
 	digest := sha256.Sum256(payload)
 	value.CheckpointDigest = append([]byte(nil), digest[:]...)
 	checkpoints.commands = []app.AgentCheckpointCommand{{From: 0, Through: 7, Digest: digest[:], Payload: payload}}
-	previousFence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, AgentInstanceID: value.AgentInstanceID,
+	previousFence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, AgentInstanceID: value.AgentInstanceID,
 		AgentSessionID: value.AgentSessionID, SupervisorID: "supervisor-test", AgentGeneration: 1,
 		AuthorizationVersion: value.Authorization.Version, LeaseOwner: "previous-worker", LeaseVersion: value.Lease.Version - 1,
 		EngineVersion: value.AgentEngineVersion, ProfileVersion: value.AgentProfileVersion}

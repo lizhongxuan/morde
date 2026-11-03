@@ -54,14 +54,15 @@ type operationBinding struct {
 
 type registry struct {
 	mu         sync.Mutex
-	store      *operationstore.Store
+	store      operationstore.EventStore
+	legacy     *operationstore.Store
 	tasks      map[string]taskContext
 	targets    map[string]ownedTarget
 	operations map[string]operationBinding
 	closed     bool
 }
 
-func openRegistry(storeDir string, expectedUID uint32) (*registry, error) {
+func openRegistry(storeDir string, expectedUID uint32, replacement operationstore.EventStore) (*registry, error) {
 	if !filepath.IsAbs(storeDir) || filepath.Clean(storeDir) != storeDir {
 		return nil, errors.New("browser registry path is invalid")
 	}
@@ -83,22 +84,41 @@ func openRegistry(storeDir string, expectedUID uint32) (*registry, error) {
 	if err := ownedByUID(info, expectedUID); err != nil {
 		return nil, err
 	}
-	store, err := operationstore.Open(dir, expectedUID)
+	legacy, err := operationstore.Open(dir, expectedUID)
 	if err != nil {
 		return nil, fmt.Errorf("open browser registry: %w", err)
 	}
+	store := operationstore.EventStore(legacy)
+	var preservedLegacy *operationstore.Store
+	if replacement != nil {
+		reconciler, ok := replacement.(interface {
+			Reconcile(operationstore.EventStore) error
+		})
+		if !ok {
+			_ = legacy.Close()
+			_ = replacement.Close()
+			return nil, errors.New("browser operation ledger cannot reconcile its legacy journal")
+		}
+		if err := reconciler.Reconcile(legacy); err != nil {
+			_ = legacy.Close()
+			_ = replacement.Close()
+			return nil, fmt.Errorf("reconcile browser operation ledger: %w", err)
+		}
+		store = replacement
+		preservedLegacy = legacy
+	}
 	r := &registry{
-		store: store, tasks: make(map[string]taskContext), targets: make(map[string]ownedTarget),
+		store: store, legacy: preservedLegacy, tasks: make(map[string]taskContext), targets: make(map[string]ownedTarget),
 		operations: make(map[string]operationBinding),
 	}
 	events, err := store.Events()
 	if err != nil {
-		_ = store.Close()
+		_ = r.closeStores()
 		return nil, fmt.Errorf("read browser registry: %w", err)
 	}
 	for _, event := range events {
 		if err := r.apply(event.Kind, event.Data); err != nil {
-			_ = store.Close()
+			_ = r.closeStores()
 			return nil, fmt.Errorf("replay browser registry: %w", err)
 		}
 	}
@@ -417,7 +437,18 @@ func (r *registry) Close() error {
 		return nil
 	}
 	r.closed = true
-	return r.store.Close()
+	return r.closeStores()
+}
+
+func (r *registry) closeStores() error {
+	var err error
+	if r.store != nil {
+		err = errors.Join(err, r.store.Close())
+	}
+	if r.legacy != nil {
+		err = errors.Join(err, r.legacy.Close())
+	}
+	return err
 }
 
 func (r *registry) healthy() bool {

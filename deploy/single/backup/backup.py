@@ -22,13 +22,18 @@ from typing import Any
 
 
 FORMAT = "morde-single-node-backup"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
+LEGACY_FORMAT_VERSION = 3
 MAX_WORKSPACE_BLOCK_BYTES = 4 * 1024 * 1024
 DOCKER_BIN = "docker"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_COMPOSE_FILE = SCRIPT_DIR.parent / "docker-compose.yml"
 LOCAL_FILESYSTEMS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs"}
 WORKSPACE_ID = re.compile(r"^w[a-z0-9]{7}$")
+SANDBOX_VOLUME_NAME = re.compile(
+    r"^(?:cloudhost_)?(?:workspace-root|profile-data|runtime-data|host-apps|workspace-w[a-z0-9]{7}|(?:workspaces|profile|runtime|apps)-h[a-z0-9]{7})$"
+)
+COMPOSE_VOLUME_NAMES = {"cloudhost_caddy_data": "caddy_data", "cloudhost_caddy_config": "caddy_config"}
 BLOCK_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 SITE_ID = re.compile(r"^site_[0-9a-f]{16}$")
 RELEASE_ID = re.compile(r"^rel_[0-9a-f]{16}$")
@@ -404,10 +409,113 @@ def require_no_running_container_mounts(sources: dict[str, Path]) -> None:
                 )
 
 
-def check_services_stopped(env_file: Path, compose_file: Path, sources: dict[str, Path]) -> str:
+def docker_volume_names(*filters: str) -> set[str]:
+    args = [DOCKER_BIN, "volume", "ls", "--quiet"]
+    for value in filters:
+        args.extend(("--filter", value))
+    names = run(args).splitlines()
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) for name in names) or len(names) != len(set(names)):
+        raise BackupError("Docker returned invalid named volume data")
+    return set(names)
+
+
+def volume_label_map(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or any(not isinstance(key, str) or not isinstance(label, str) for key, label in value.items()):
+        raise BackupError("Docker returned invalid named volume labels")
+    return value
+
+
+def deployment_volume_name(name: str) -> bool:
+    return bool(SANDBOX_VOLUME_NAME.fullmatch(name) or name in COMPOSE_VOLUME_NAMES)
+
+
+def validate_compose_volume_labels(name: str, labels: dict[str, str]) -> None:
+    if not any(key.startswith("com.docker.compose.") for key in labels):
+        return
+    if (
+        labels.get("com.docker.compose.project") != "cloudhost"
+        or labels.get("com.docker.compose.volume") != COMPOSE_VOLUME_NAMES.get(name)
+    ):
+        raise BackupError("Docker Compose volume identity cannot be verified")
+
+
+def validate_workspace_volume_labels(name: str, labels: dict[str, str]) -> None:
+    match = re.search(r"(?:^|_)workspace-(w[a-z0-9]{7})$", name)
+    required = {
+        "morde.managed_by",
+        "morde.service_instance_id",
+        "morde.owner_id",
+        "morde.workspace_id",
+    }
+    if not match or set(labels) != required or labels["morde.managed_by"] != "portal":
+        raise BackupError("Morde Workspace volume identity or labels cannot be verified")
+    if labels["morde.workspace_id"] != match.group(1) or not re.fullmatch(r"u[a-z0-9]{7}", labels["morde.owner_id"]):
+        raise BackupError("Morde Workspace volume identity or labels cannot be verified")
+    if not labels["morde.service_instance_id"] or len(labels["morde.service_instance_id"]) > 128:
+        raise BackupError("Morde Workspace volume identity or labels cannot be verified")
+
+
+def docker_volume_snapshot() -> dict[str, Any]:
+    try:
+        names = docker_volume_names()
+        managed = docker_volume_names("label=morde.managed_by")
+        compose_project = docker_volume_names("label=com.docker.compose.project=cloudhost")
+        confirmed = docker_volume_names()
+        if names != confirmed or not (managed | compose_project).issubset(names):
+            raise BackupError("Docker volume inventory changed while it was being checked")
+        relevant = managed | compose_project | {name for name in names if deployment_volume_name(name)}
+        volumes = []
+        for name in sorted(relevant):
+            try:
+                raw = json.loads(run([DOCKER_BIN, "volume", "inspect", name]))
+            except (BackupError, json.JSONDecodeError) as exc:
+                raise BackupError("could not inspect a deployment Docker volume") from exc
+            if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], dict):
+                raise BackupError("Docker returned invalid named volume metadata")
+            item = raw[0]
+            labels = volume_label_map(item.get("Labels"))
+            if any(key.startswith("com.docker.compose.") for key in labels) and labels.get("com.docker.compose.project") != "cloudhost":
+                if "morde.managed_by" in labels:
+                    raise BackupError("Docker volume has conflicting Morde and Compose identities")
+                continue
+            validate_compose_volume_labels(name, labels)
+            if item.get("Name") != name or not deployment_volume_name(name) and not any(
+                key in labels for key in ("morde.managed_by", "com.docker.compose.project")
+            ):
+                raise BackupError("Docker volume inventory selection cannot be verified")
+            if re.search(r"(?:^|_)workspace-w[a-z0-9]{7}$", name) or "morde.managed_by" in labels:
+                validate_workspace_volume_labels(name, labels)
+            driver = item.get("Driver")
+            options = item.get("Options")
+            if driver != "local" or options not in (None, {}):
+                raise BackupError("deployment Docker volume driver or options cannot be verified")
+            attached = run([DOCKER_BIN, "ps", "--all", "--quiet", "--filter", f"volume={name}"]).splitlines()
+            if any(not re.fullmatch(r"[0-9a-f]{12,64}", container_id) for container_id in attached):
+                raise BackupError("Docker returned invalid container references for a named volume")
+            if attached:
+                raise BackupError(f"deployment Docker volume {name} is still attached to a container; remove stopped containers before backup or restore")
+            volumes.append({"name": name, "driver": driver, "options": {}, "labels": labels})
+        return {"names": frozenset(names), "volumes": volumes}
+    except BackupError as exc:
+        if "complete volume inventory" in str(exc) or "inventory changed" in str(exc):
+            raise
+        raise BackupError("could not inventory or safely verify Docker deployment volumes") from exc
+
+
+def check_services_stopped(
+    env_file: Path,
+    compose_file: Path,
+    sources: dict[str, Path],
+    *,
+    check_deployment_volumes: bool = True,
+) -> str:
     require_portal_stopped()
     require_postgres_stopped(env_file, compose_file)
     require_no_running_container_mounts(sources)
+    if check_deployment_volumes:
+        docker_volume_snapshot()
     return compose_postgres_image(env_file, compose_file)
 
 
@@ -818,6 +926,186 @@ def make_tar(source: Path, destination: Path) -> None:
         os.fsync(archive.fileno())
 
 
+def docker_volume_archive_args(name: str, image: str) -> list[str]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise BackupError("Docker volume name is invalid")
+    return [
+        DOCKER_BIN,
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "DAC_OVERRIDE",
+        "--cap-add",
+        "DAC_READ_SEARCH",
+        "--security-opt",
+        "no-new-privileges",
+        "--user",
+        "0:0",
+        "--mount",
+        f"type=volume,source={name},target=/volume,readonly",
+        "--entrypoint",
+        "tar",
+        image,
+        "--create",
+        "--file",
+        "-",
+        "--format=pax",
+        "--numeric-owner",
+        "--xattrs",
+        "--acls",
+        "--selinux",
+        "--sparse",
+        "--sort=name",
+        "--pax-option=delete=atime,delete=ctime",
+        "--directory",
+        "/volume",
+        ".",
+    ]
+
+
+def create_docker_volume_archive(name: str, image: str, destination: Path) -> None:
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as target:
+            try:
+                result = subprocess.run(
+                    docker_volume_archive_args(name, image),
+                    stdout=target,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            except OSError as exc:
+                raise BackupError("could not archive a deployment Docker volume") from exc
+            if result.returncode != 0:
+                raise BackupError("Docker volume archive command failed")
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(destination, 0o600)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def restore_docker_volume(name: str, image: str, archive: Path) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or "," in str(archive):
+        raise BackupError("Docker volume restore identity or archive path is invalid")
+    try:
+        info = archive.lstat()
+    except OSError as exc:
+        raise BackupError("Docker volume archive cannot be inspected") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise BackupError("Docker volume archive must be a regular file")
+    command = (
+        "find /volume -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && "
+        "exec tar --extract --file /archive.tar --directory /volume --numeric-owner --same-owner "
+        "--same-permissions --xattrs --acls --selinux --delay-directory-restore"
+    )
+    run([
+        DOCKER_BIN,
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--cap-add",
+        "FOWNER",
+        "--cap-add",
+        "DAC_OVERRIDE",
+        "--security-opt",
+        "no-new-privileges",
+        "--user",
+        "0:0",
+        "--mount",
+        f"type=volume,source={name},target=/volume",
+        "--mount",
+        f"type=bind,source={archive.resolve(strict=True)},target=/archive.tar,readonly",
+        "--entrypoint",
+        "/bin/sh",
+        image,
+        "-ec",
+        command,
+    ])
+
+
+def verify_docker_volume_archive(name: str, image: str, archive: Path, expected_sha256: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="morde-volume-verify-") as temporary:
+        current = Path(temporary) / "current.tar"
+        create_docker_volume_archive(name, image, current)
+        if file_sha256(current) != expected_sha256:
+            raise BackupError(f"restored Docker volume {name} does not match its verified archive")
+
+
+def restore_follow_up_volumes(
+    journal: Path,
+    state: dict[str, Any],
+    image: str,
+    bundle: Path,
+    volumes: list[dict[str, Any]],
+) -> None:
+    for volume in volumes:
+        name = volume["name"]
+        require_live_volume_inventory(volumes)
+        state["status"] = "restoring_volumes"
+        state["volume_progress"][name] = "restoring"
+        write_json_replace(journal, state)
+        archive = bundle / volume["archive"]
+        restore_docker_volume(name, image, archive)
+        verify_docker_volume_archive(name, image, archive, volume["sha256"])
+        state["volume_progress"][name] = "restored"
+        write_json_replace(journal, state)
+    if volumes:
+        require_live_volume_inventory(volumes)
+    state["status"] = "volumes_restored"
+    write_json_replace(journal, state)
+
+
+def rollback_changed_volumes(
+    journal: Path,
+    state: dict[str, Any],
+    image: str,
+    rollback_bundle: Path,
+    volumes: list[dict[str, Any]],
+) -> list[str]:
+    failures: list[str] = []
+    state["status"] = "rolling_back_volumes"
+    try:
+        write_json_replace(journal, state)
+    except OSError:
+        return ["restore journal"]
+    for volume in reversed(volumes):
+        name = volume["name"]
+        if state["volume_progress"].get(name) not in {"restoring", "restored", "rolling_back"}:
+            continue
+        state["volume_progress"][name] = "rolling_back"
+        try:
+            write_json_replace(journal, state)
+            require_live_volume_inventory(volumes)
+            archive = rollback_bundle / volume["archive"]
+            restore_docker_volume(name, image, archive)
+            verify_docker_volume_archive(name, image, archive, volume["sha256"])
+            state["volume_progress"][name] = "rolled_back"
+            write_json_replace(journal, state)
+        except (BackupError, OSError):
+            failures.append(name)
+    if volumes and not failures:
+        try:
+            require_live_volume_inventory(volumes)
+        except BackupError:
+            failures.append("Docker volume inventory")
+    return failures
+
+
 def write_json_private(path: Path, value: dict[str, Any]) -> None:
     data = json.dumps(value, sort_keys=True, indent=2) + "\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -838,6 +1126,7 @@ def write_json_replace(path: Path, value: dict[str, Any]) -> None:
 def create_bundle(bundle: Path, sources: dict[str, Path], image: str) -> None:
     if bundle.exists():
         raise BackupError("backup bundle already exists; refusing to overwrite it")
+    volume_snapshot = docker_volume_snapshot()
     ensure_local_filesystem(bundle.parent.resolve(strict=True), "backup destination")
     for key, _ in BACKUP_TARGETS:
         path = sources[key]
@@ -865,9 +1154,27 @@ def create_bundle(bundle: Path, sources: dict[str, Path], image: str) -> None:
     try:
         for key, archive in BACKUP_TARGETS:
             make_tar(sources[key], bundle / archive)
+        volume_manifest = []
+        if volume_snapshot["volumes"]:
+            volume_dir = bundle / "docker-volumes"
+            volume_dir.mkdir(mode=0o700)
+            for volume in volume_snapshot["volumes"]:
+                archive = f"docker-volumes/{volume['name']}.tar"
+                archive_path = bundle / archive
+                create_docker_volume_archive(volume["name"], image, archive_path)
+                volume_manifest.append({
+                    **volume,
+                    "archive": archive,
+                    "size_bytes": validate_archive(archive_path),
+                    "sha256": file_sha256(archive_path),
+                })
+            fsync_directory(volume_dir)
+        if docker_volume_snapshot() != volume_snapshot:
+            raise BackupError("Docker volume inventory changed while the backup was being created")
         metadata = {
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
+            "deployment_volume_inventory": {"version": 1, "volumes": volume_manifest},
             "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             "source_paths": {key: str(sources[key]) for key, _ in BACKUP_TARGETS},
             "postgres": {"major_version": pg_major, "image": image, **control},
@@ -877,7 +1184,7 @@ def create_bundle(bundle: Path, sources: dict[str, Path], image: str) -> None:
             "archives": {key: archive for key, archive in BACKUP_TARGETS},
         }
         write_json_private(bundle / "metadata.json", metadata)
-        entries = [archive for _, archive in BACKUP_TARGETS] + ["metadata.json"]
+        entries = [archive for _, archive in BACKUP_TARGETS] + [item["archive"] for item in volume_manifest] + ["metadata.json"]
         sums = "".join(f"{file_sha256(bundle / name)}  {name}\n" for name in entries)
         fd = os.open(bundle / "SHA256SUMS", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="ascii") as target:
@@ -899,12 +1206,102 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def manifest_volumes(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    if metadata.get("format_version") == LEGACY_FORMAT_VERSION:
+        return []
+    inventory = metadata.get("deployment_volume_inventory")
+    if not isinstance(inventory, dict) or type(inventory.get("version")) is not int or inventory["version"] != 1 or not isinstance(inventory.get("volumes"), list):
+        raise BackupError("backup deployment volume inventory is invalid")
+    volumes = inventory["volumes"]
+    previous_name = ""
+    required = {"name", "driver", "options", "labels", "archive", "size_bytes", "sha256"}
+    for volume in volumes:
+        if not isinstance(volume, dict) or set(volume) != required:
+            raise BackupError("backup deployment volume entry is invalid")
+        name = volume.get("name")
+        labels = volume_label_map(volume.get("labels"))
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+        ):
+            raise BackupError("backup deployment volume identity is invalid")
+        validate_compose_volume_labels(name, labels)
+        if (
+            name <= previous_name
+            or not deployment_volume_name(name) and not any(
+                key in labels for key in ("morde.managed_by", "com.docker.compose.project")
+            )
+        ):
+            raise BackupError("backup deployment volume identity is invalid")
+        if re.search(r"(?:^|_)workspace-w[a-z0-9]{7}$", name) or "morde.managed_by" in labels:
+            validate_workspace_volume_labels(name, labels)
+        if (
+            volume.get("driver") != "local"
+            or volume.get("options") != {}
+            or volume.get("archive") != f"docker-volumes/{name}.tar"
+            or type(volume.get("size_bytes")) is not int
+            or volume["size_bytes"] < 0
+            or not isinstance(volume.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", volume["sha256"])
+        ):
+            raise BackupError("backup deployment volume archive metadata is invalid")
+        previous_name = name
+    return volumes
+
+
+def volume_identity_list(volumes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: volume[key] for key in ("name", "driver", "options", "labels")} for volume in volumes]
+
+
+def require_live_volume_inventory(expected: list[dict[str, Any]]) -> None:
+    actual = docker_volume_snapshot()["volumes"]
+    if volume_identity_list(actual) != volume_identity_list(expected):
+        raise BackupError("live Docker deployment volume identities do not match the verified bundle")
+
+
 def load_and_verify_manifest(bundle: Path) -> dict[str, Any]:
     if bundle.is_symlink() or not bundle.is_dir():
         raise BackupError("backup bundle must be a real directory")
     archive_names = {archive for _, archive in BACKUP_TARGETS}
-    required = archive_names | {"metadata.json", "SHA256SUMS"}
-    for name in required:
+    for name in archive_names | {"metadata.json", "SHA256SUMS"}:
+        target = bundle / name
+        try:
+            info = target.lstat()
+        except OSError as exc:
+            raise BackupError(f"backup bundle is missing {name}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise BackupError(f"backup bundle entry {name} is not a regular file")
+    try:
+        metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BackupError("backup metadata is invalid") from exc
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("format") != FORMAT
+        or type(metadata.get("format_version")) is not int
+        or metadata["format_version"] not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION}
+    ):
+        raise BackupError("unsupported backup format")
+    volumes = manifest_volumes(metadata)
+    archive_names.update(volume["archive"] for volume in volumes)
+    if volumes:
+        volume_dir = bundle / "docker-volumes"
+        try:
+            info = volume_dir.lstat()
+        except OSError as exc:
+            raise BackupError("backup Docker volume archives are missing") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise BackupError("backup Docker volume archive directory is invalid")
+        try:
+            actual = {entry.name for entry in volume_dir.iterdir()}
+        except OSError as exc:
+            raise BackupError("backup Docker volume archive directory cannot be read") from exc
+        expected = {Path(volume["archive"]).name for volume in volumes}
+        if actual != expected:
+            raise BackupError("backup Docker volume archive inventory does not match metadata")
+    elif (bundle / "docker-volumes").exists() or (bundle / "docker-volumes").is_symlink():
+        raise BackupError("backup contains unlisted Docker volume archives")
+    for name in archive_names - {archive for _, archive in BACKUP_TARGETS}:
         target = bundle / name
         try:
             info = target.lstat()
@@ -928,12 +1325,8 @@ def load_and_verify_manifest(bundle: Path) -> dict[str, Any]:
     for name, expected in found.items():
         if file_sha256(bundle / name) != expected:
             raise BackupError(f"backup checksum verification failed for {name}")
-    try:
-        metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise BackupError("backup metadata is invalid") from exc
-    if not isinstance(metadata, dict) or metadata.get("format") != FORMAT or metadata.get("format_version") != FORMAT_VERSION:
-        raise BackupError("unsupported backup format")
+    if any(found[volume["archive"]] != volume["sha256"] for volume in volumes):
+        raise BackupError("backup Docker volume archive digest does not match metadata")
     if metadata.get("archives") != {key: archive for key, archive in BACKUP_TARGETS}:
         raise BackupError("backup archive metadata is invalid")
     paths = metadata.get("source_paths")
@@ -982,17 +1375,38 @@ def require_private_bundle(bundle: Path) -> None:
     directory = bundle.lstat()
     if directory.st_uid != 0 or stat.S_IMODE(directory.st_mode) & 0o077:
         raise BackupError("destructive operations require a root-owned backup directory with no group/other access")
-    for name in [archive for _, archive in BACKUP_TARGETS] + ["metadata.json", "SHA256SUMS"]:
+    try:
+        metadata_info = (bundle / "metadata.json").lstat()
+        if not stat.S_ISREG(metadata_info.st_mode):
+            raise BackupError("destructive operations require a regular backup metadata file")
+        metadata = json.loads((bundle / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BackupError("destructive operations require readable backup metadata") from exc
+    if not isinstance(metadata, dict):
+        raise BackupError("destructive operations require valid backup metadata")
+    volumes = manifest_volumes(metadata)
+    if volumes:
+        try:
+            volume_dir = (bundle / "docker-volumes").lstat()
+        except OSError as exc:
+            raise BackupError("destructive operations require a private Docker volume archive directory") from exc
+        if not stat.S_ISDIR(volume_dir.st_mode) or volume_dir.st_uid != 0 or stat.S_IMODE(volume_dir.st_mode) & 0o077:
+            raise BackupError("destructive operations require a root-owned private Docker volume archive directory")
+    names = [archive for _, archive in BACKUP_TARGETS] + [volume["archive"] for volume in volumes] + ["metadata.json", "SHA256SUMS"]
+    for name in names:
         info = (bundle / name).lstat()
         if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
             raise BackupError(f"destructive operations require root-owned private bundle files: {name}")
 
 
-def validate_archive(path: Path) -> None:
+def validate_archive(path: Path) -> int:
     try:
         with tarfile.open(path, "r:") as archive:
             seen: set[tuple[str, ...]] = set()
-            for member in archive:
+            entries = list(archive)
+            symlinks: set[tuple[str, ...]] = set()
+            content_bytes = 0
+            for member in entries:
                 name = member.name
                 pure = PurePosixPath(name)
                 if pure.is_absolute() or any(part == ".." for part in pure.parts):
@@ -1001,8 +1415,33 @@ def validate_archive(path: Path) -> None:
                 if normalized in seen:
                     raise BackupError("backup archive contains duplicate paths")
                 seen.add(normalized)
-                if not (member.isdir() or member.isfile()):
-                    raise BackupError("backup archive contains a symlink, hardlink, or special file")
+                if not normalized and not member.isdir():
+                    raise BackupError("backup archive root must be a directory")
+                if member.issym():
+                    target = PurePosixPath(member.linkname)
+                    if not member.linkname or target.is_absolute():
+                        raise BackupError("backup archive contains an unsafe symlink")
+                    resolved = list(normalized[:-1])
+                    for part in target.parts:
+                        if part in ("", "."):
+                            continue
+                        if part == "..":
+                            if not resolved:
+                                raise BackupError("backup archive contains an escaping symlink")
+                            resolved.pop()
+                        else:
+                            resolved.append(part)
+                    symlinks.add(normalized)
+                elif member.isfile():
+                    if member.size < 0:
+                        raise BackupError("backup archive contains an invalid file size")
+                    content_bytes += member.size
+                elif not member.isdir():
+                    raise BackupError("backup archive contains a hardlink or special file")
+            for normalized in seen:
+                if any(normalized[:index] in symlinks for index in range(1, len(normalized))):
+                    raise BackupError("backup archive contains a path beneath a symlink")
+            return content_bytes
     except (tarfile.TarError, OSError) as exc:
         raise BackupError("backup tar archive is invalid") from exc
 
@@ -1046,6 +1485,10 @@ def extract_tar(archive: Path, destination: Path, *, preserve_owner: bool) -> No
                     target.mkdir(parents=True, exist_ok=True)
                 directory_modes.append((target, member.mode & 0o777))
                 continue
+            if member.issym():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(member.linkname, target)
+                continue
             if not parts:
                 raise BackupError("backup archive contains a file at the archive root")
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1061,6 +1504,7 @@ def extract_tar(archive: Path, destination: Path, *, preserve_owner: bool) -> No
 
 def verify_bundle(bundle: Path) -> dict[str, Any]:
     metadata = load_and_verify_manifest(bundle)
+    volumes = manifest_volumes(metadata)
     postgres_tar = bundle / "postgres-data.tar"
     wal_archive_tar = bundle / "postgres-wal-archive.tar"
     workspace_tar = bundle / "workspace-blocks.tar"
@@ -1069,6 +1513,10 @@ def verify_bundle(bundle: Path) -> dict[str, Any]:
     validate_archive(wal_archive_tar)
     validate_archive(workspace_tar)
     validate_archive(site_tar)
+    for volume in volumes:
+        archive = bundle / volume["archive"]
+        if validate_archive(archive) != volume["size_bytes"]:
+            raise BackupError(f"Docker volume {volume['name']} size does not match backup metadata")
     with tempfile.TemporaryDirectory(prefix="morde-backup-verify-") as temporary:
         root = Path(temporary)
         pg_stage = root / "postgres"
@@ -1191,7 +1639,17 @@ def verify_command(args: argparse.Namespace) -> None:
     print(f"PostgreSQL major: {metadata['postgres']['major_version']}")
     print(f"Workspace blocks: {metadata['workspace_store']['block_count']}")
     print(f"Site releases: {metadata['site_store']['release_count']}")
+    if metadata["format_version"] == LEGACY_FORMAT_VERSION:
+        print("WARNING: format v3 has no Docker volume inventory; this bundle is not eligible for destructive restore.")
+    else:
+        print(f"Docker deployment volumes: {len(manifest_volumes(metadata))} archived.")
     print("This verifies bundle integrity; it does not connect to or change a live service.")
+
+
+def require_restorable_bundle(metadata: dict[str, Any]) -> None:
+    if metadata.get("format_version") != FORMAT_VERSION:
+        raise BackupError("destructive restore requires a format v4 bundle with a verified Docker volume inventory")
+    manifest_volumes(metadata)
 
 
 def validate_live_sources(sources: dict[str, Path], image: str, major: str) -> dict[str, Any]:
@@ -1258,6 +1716,12 @@ def restore_command(args: argparse.Namespace) -> None:
     metadata = verify_bundle(bundle)
     require_private_bundle(follow_up_bundle)
     follow_up_metadata = verify_bundle(follow_up_bundle)
+    require_restorable_bundle(metadata)
+    require_restorable_bundle(follow_up_metadata)
+    base_volumes = manifest_volumes(metadata)
+    follow_up_volumes = manifest_volumes(follow_up_metadata)
+    if volume_identity_list(base_volumes) != volume_identity_list(follow_up_volumes):
+        raise BackupError("base and follow-up bundles must contain the same Docker volume identities")
     env_file, compose_file, sources = get_args_paths(args)
     ensure_bundle_outside_sources(bundle, sources)
     ensure_bundle_outside_sources(follow_up_bundle, sources)
@@ -1268,10 +1732,11 @@ def restore_command(args: argparse.Namespace) -> None:
     image = check_services_stopped(env_file, compose_file, sources)
     if image != metadata["postgres"]["image"] or image != follow_up_metadata["postgres"]["image"]:
         raise BackupError("restore requires the exact digest-pinned PostgreSQL image recorded in the backup")
+    require_live_volume_inventory(follow_up_volumes)
     live_control = validate_live_sources(sources, image, str(metadata["postgres"]["major_version"]))
     require_follow_up_covers_live(live_control, follow_up_metadata["postgres"])
     preflight_follow_up_wal(metadata["postgres"], follow_up_metadata["postgres"], follow_up_bundle)
-    confirm_restore(args, *(sources[key] for key, _ in BACKUP_TARGETS))
+    confirm_restore(args, *(sources[key] for key, _ in BACKUP_TARGETS), volume_names=[volume["name"] for volume in follow_up_volumes])
 
     rollback_text = args.rollback_dir or str(bundle.parent / f"{bundle.name}.pre-restore.{timestamp()}")
     rollback_bundle = bundle_path(rollback_text)
@@ -1281,7 +1746,10 @@ def restore_command(args: argparse.Namespace) -> None:
     if rollback_bundle.exists():
         raise BackupError("rollback bundle already exists; refusing to overwrite it")
     create_bundle(rollback_bundle, sources, image)
-    verify_bundle(rollback_bundle)
+    rollback_metadata = verify_bundle(rollback_bundle)
+    rollback_volumes = manifest_volumes(rollback_metadata)
+    if volume_identity_list(rollback_volumes) != volume_identity_list(follow_up_volumes):
+        raise BackupError("live Docker volume identities changed while the rollback bundle was being created")
 
     paths = new_restore_paths(sources, bundle, follow_up_bundle)
     journal = rollback_bundle / "RESTORE-JOURNAL.json"
@@ -1292,6 +1760,8 @@ def restore_command(args: argparse.Namespace) -> None:
         "follow_up_bundle": str(follow_up_bundle),
         "rollback_bundle": str(rollback_bundle),
         "targets": {key: str(sources[key]) for key, _ in BACKUP_TARGETS},
+        "volume_targets": volume_identity_list(follow_up_volumes),
+        "volume_progress": {volume["name"]: "pending" for volume in follow_up_volumes},
         "temporary_paths": {
             **{f"{key}_stage": str(stage) for key, _, _, stage, _ in paths},
             **{f"{key}_before_restore": str(hold) for key, _, hold, _, _ in paths},
@@ -1299,6 +1769,7 @@ def restore_command(args: argparse.Namespace) -> None:
     }
     moved: list[tuple[Path, Path]] = []
     installed: list[tuple[Path, Path]] = []
+    preserve_stages = False
     try:
         write_json_private(journal, state)
         for key, _, _, stage, archive in paths:
@@ -1322,6 +1793,8 @@ def restore_command(args: argparse.Namespace) -> None:
         state["status"] = "ready_to_swap"
         write_json_replace(journal, state)
 
+        restore_follow_up_volumes(journal, state, image, follow_up_bundle, follow_up_volumes)
+
         for _, target, hold, _, _ in paths:
             os.rename(target, hold)
             moved.append((target, hold))
@@ -1337,21 +1810,28 @@ def restore_command(args: argparse.Namespace) -> None:
         state["status"] = "restored"
         write_json_replace(journal, state)
     except Exception as exc:
+        volume_rollback_failures = rollback_changed_volumes(journal, state, image, rollback_bundle, rollback_volumes)
+        rollback_failures = restore_original_paths(moved, installed)
+        if volume_rollback_failures or rollback_failures:
+            preserve_stages = True
+            reason = "restore failed and automatic rollback could not restore every original Docker volume or directory; inspect all targets and keep the rollback bundle"
+            try:
+                mark_manual_recovery_required(journal, state, reason)
+            except OSError:
+                pass
+            raise BackupError(
+                "restore failed and automatic rollback could not restore every original volume and directory; "
+                "keep the rollback bundle and staging paths, then use recover after inspection"
+            ) from exc
         state["status"] = "failed_restore_original_data_retained"
         try:
             write_json_replace(journal, state)
         except OSError:
             pass
-        rollback_failures = restore_original_paths(moved, installed)
-        if rollback_failures:
-            raise BackupError(
-                "restore failed and automatic rollback could not restore every original directory; "
-                "keep the rollback bundle and sibling directories, then use recover after inspection"
-            ) from exc
         raise
     finally:
         for _, _, _, stage, _ in paths:
-            if stage.exists():
+            if stage.exists() and not preserve_stages:
                 shutil.rmtree(stage, ignore_errors=True)
 
     # Keep the verified rollback bundle as the durable pre-restore copy. Remove
@@ -1373,7 +1853,8 @@ def recover_command(args: argparse.Namespace) -> None:
     expected_paths = metadata["source_paths"]
     if {key: str(sources[key]) for key, _ in BACKUP_TARGETS} != expected_paths:
         raise BackupError("recovery requires the exact PostgreSQL, WAL, Workspace, and Site paths recorded in the rollback bundle")
-    image = check_services_stopped(env_file, compose_file, sources)
+    rollback_volumes = manifest_volumes(metadata)
+    image = check_services_stopped(env_file, compose_file, sources, check_deployment_volumes=bool(rollback_volumes))
     if image != metadata["postgres"]["image"]:
         raise BackupError("recovery requires the exact digest-pinned PostgreSQL image recorded in the rollback bundle")
 
@@ -1395,13 +1876,32 @@ def recover_command(args: argparse.Namespace) -> None:
         return
     if state.get("status") == "manual_recovery_required":
         raise BackupError("journal status is manual_recovery_required; inspect the targets, sibling directories, and rollback bundle before further recovery")
-    allowed_statuses = {"staging", "ready_to_swap", "old_data_preserved_at_sibling_paths", "failed_restore_original_data_retained", "recovering_original_data"}
+    allowed_statuses = {
+        "staging",
+        "ready_to_swap",
+        "restoring_volumes",
+        "volumes_restored",
+        "old_data_preserved_at_sibling_paths",
+        "rolling_back_volumes",
+        "failed_restore_original_data_retained",
+        "recovering_original_data",
+    }
     if state.get("status") not in allowed_statuses:
         raise BackupError("restore journal has an unknown state; refusing automatic recovery")
     target_record = state.get("targets")
     temp_record = state.get("temporary_paths")
     if target_record != {key: str(sources[key]) for key, _ in BACKUP_TARGETS} or not isinstance(temp_record, dict):
         raise BackupError("restore journal target paths do not match the selected deployment")
+
+    volume_targets = state.get("volume_targets", [])
+    volume_progress = state.get("volume_progress", {})
+    expected_volume_targets = volume_identity_list(rollback_volumes)
+    if volume_targets != expected_volume_targets or not isinstance(volume_progress, dict) or set(volume_progress) != {volume["name"] for volume in rollback_volumes}:
+        raise BackupError("restore journal Docker volume targets do not match the verified rollback bundle")
+    if any(value not in {"pending", "restoring", "restored", "rolling_back", "rolled_back"} for value in volume_progress.values()):
+        raise BackupError("restore journal Docker volume progress is invalid")
+    if rollback_volumes:
+        require_live_volume_inventory(rollback_volumes)
 
     paths: list[tuple[str, Path, Path, Path, Path]] = []
     for key, archive in BACKUP_TARGETS:
@@ -1426,15 +1926,18 @@ def recover_command(args: argparse.Namespace) -> None:
     # Validate recoverability before moving anything. Ambiguous trees are
     # journaled as manual-only so a later retry cannot guess which tree is old.
     validate_recovery_candidates(paths, journal, state)
-    confirm_recovery(args, *(sources[key] for key, _ in BACKUP_TARGETS))
+    confirm_recovery(args, *(sources[key] for key, _ in BACKUP_TARGETS), volume_names=[volume["name"] for volume in rollback_volumes])
 
     state["status"] = "recovering_original_data"
     write_json_replace(journal, state)
     try:
+        volume_failures = rollback_changed_volumes(journal, state, image, rollback_bundle, rollback_volumes)
+        if volume_failures:
+            raise BackupError("one or more Docker volumes could not be restored from the rollback bundle")
         recover_original_directories(paths)
         validate_live_sources(sources, image, str(metadata["postgres"]["major_version"]))
     except (BackupError, OSError) as exc:
-        reason = "automatic recovery stopped during filesystem replacement or validation; inspect all targets, sibling directories, and interrupted-restore directories manually"
+        reason = "automatic recovery stopped during volume or filesystem replacement/validation; inspect all targets, sibling directories, and interrupted-restore directories manually"
         try:
             mark_manual_recovery_required(journal, state, reason)
         except OSError as journal_exc:
@@ -1486,13 +1989,14 @@ def recover_original_directories(paths: list[tuple[str, Path, Path, Path, Path]]
     return interrupted
 
 
-def confirm_restore(args: argparse.Namespace, *targets: Path) -> None:
+def confirm_restore(args: argparse.Namespace, *targets: Path, volume_names: list[str] | None = None) -> None:
     if not args.confirm_restore:
         raise BackupError("restore is destructive; pass --confirm-restore and type the exact confirmation phrase")
     if not sys.stdin.isatty():
         raise BackupError("restore confirmation requires an interactive terminal")
-    phrase = "RESTORE " + " ".join(str(path) for path in targets)
-    print(f"This replaces all four data directories. Type exactly:\n{phrase}", flush=True)
+    volume_text = ",".join(volume_names or []) or "none"
+    phrase = "RESTORE " + " ".join(str(path) for path in targets) + " DOCKER_VOLUMES " + volume_text
+    print(f"This replaces all four data directories and the listed Docker volumes. Type exactly:\n{phrase}", flush=True)
     try:
         entered = input("Confirm: ")
     except EOFError as exc:
@@ -1501,13 +2005,14 @@ def confirm_restore(args: argparse.Namespace, *targets: Path) -> None:
         raise BackupError("restore confirmation did not match the exact target paths")
 
 
-def confirm_recovery(args: argparse.Namespace, *targets: Path) -> None:
+def confirm_recovery(args: argparse.Namespace, *targets: Path, volume_names: list[str] | None = None) -> None:
     if not args.confirm_recover:
         raise BackupError("recovery can replace interrupted data; pass --confirm-recover and type the exact confirmation phrase")
     if not sys.stdin.isatty():
         raise BackupError("recovery confirmation requires an interactive terminal")
-    phrase = "ROLLBACK " + " ".join(str(path) for path in targets)
-    print(f"This restores the preserved pre-restore directories. Type exactly:\n{phrase}", flush=True)
+    volume_text = ",".join(volume_names or []) or "none"
+    phrase = "ROLLBACK " + " ".join(str(path) for path in targets) + " DOCKER_VOLUMES " + volume_text
+    print(f"This restores the preserved pre-restore directories and listed Docker volumes. Type exactly:\n{phrase}", flush=True)
     try:
         entered = input("Confirm: ")
     except EOFError as exc:

@@ -53,7 +53,7 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 	nonce := make([]byte, 32)
 	nonce[0] = 1
 	lease, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
-		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID, AgentInstanceID: "agent-job-1",
+		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: owner.ID, AgentInstanceID: "agent-job-1",
 			AgentSessionID: "session-job-root", SupervisorID: "supervisor-1", LeaseOwner: "worker-1",
 			LeaseVersion: claimed.Lease.Version, AuthorizationVersion: 1, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
 		SupervisorNonce: nonce, LeaseDuration: 10 * time.Second,
@@ -153,7 +153,7 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 	payload := []byte(fmt.Sprintf(`{"header":{"id":%q},"from_seq":0,"events":[{"seq":0,"text":"started"}]}`, job.SessionID))
 	digest := sha256.Sum256(payload)
 	if _, err := checkpoints.Save(ctx, app.AgentCheckpointCommand{Fence: app.AgentCheckpointFence{TaskID: claimed.ID,
-		OwnerID: owner.ID, AgentInstanceID: lease.Fence.AgentInstanceID, AgentGeneration: lease.Fence.AgentGeneration,
+		OwnerID: owner.ID, InitiatorID: lease.Fence.InitiatorID, AgentInstanceID: lease.Fence.AgentInstanceID, AgentGeneration: lease.Fence.AgentGeneration,
 		AgentSessionID: job.SessionID, AgentRootSessionID: lease.Fence.AgentSessionID,
 		AuthorizationVersion: lease.Fence.AuthorizationVersion, LeaseOwner: lease.Fence.LeaseOwner,
 		LeaseVersion: lease.Fence.LeaseVersion, EngineVersion: lease.Fence.EngineVersion, ProfileVersion: lease.Fence.ProfileVersion},

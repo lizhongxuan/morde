@@ -69,7 +69,7 @@ func newAgentLifecycleFixture(t *testing.T) agentLifecycleFixture {
 	nonce := make([]byte, 32)
 	nonce[0] = 1
 	return agentLifecycleFixture{store: store, service: service, clients: clients, principal: principal, key: key,
-		request: app.AgentInstanceStart{Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID,
+		request: app.AgentInstanceStart{Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: claimed.InitiatorID,
 			AgentInstanceID: "agent-1", AgentSessionID: "session-1", SupervisorID: "supervisor-1",
 			LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AuthorizationVersion: 1,
 			EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"}, SupervisorNonce: nonce, LeaseDuration: 30 * time.Second}}

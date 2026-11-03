@@ -70,6 +70,7 @@ type StopResult struct {
 type Options struct {
 	StoreDir           string
 	ExpectedOwnerUID   uint32
+	Store              operationstore.EventStore
 	HostID             string
 	Generation         int64
 	ProtocolVersion    string
@@ -142,7 +143,8 @@ type Manager struct {
 	closeMu                   sync.Mutex
 	mu                        sync.Mutex
 	workspaceBindingMu        sync.Mutex
-	store                     *operationstore.Store
+	store                     operationstore.EventStore
+	legacyStore               *operationstore.Store
 	state                     runtimeState
 	stateSet                  bool
 	workspaceBindings         map[string]contract.WorkspaceBinding
@@ -183,12 +185,31 @@ func Open(options Options) (*Manager, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	store, err := operationstore.Open(options.StoreDir, options.ExpectedOwnerUID)
+	legacyStore, err := operationstore.Open(options.StoreDir, options.ExpectedOwnerUID)
 	if err != nil {
 		return nil, ErrRuntimeStateUnavailable
 	}
+	store := operationstore.EventStore(legacyStore)
+	var preservedLegacy *operationstore.Store
+	if options.Store != nil {
+		reconciler, ok := options.Store.(interface {
+			Reconcile(operationstore.EventStore) error
+		})
+		if !ok {
+			_ = legacyStore.Close()
+			_ = options.Store.Close()
+			return nil, ErrRuntimeStateUnavailable
+		}
+		if err := reconciler.Reconcile(legacyStore); err != nil {
+			_ = legacyStore.Close()
+			_ = options.Store.Close()
+			return nil, ErrRuntimeStateUnavailable
+		}
+		store = options.Store
+		preservedLegacy = legacyStore
+	}
 	m := &Manager{
-		store: store, ops: make(map[string]operationRecord), handlers: make(map[string]ActionHandler),
+		store: store, legacyStore: preservedLegacy, ops: make(map[string]operationRecord), handlers: make(map[string]ActionHandler),
 		active: make(map[string]activeOperation), protocol: options.ProtocolVersion, now: options.Now,
 		workspaceBindings: make(map[string]contract.WorkspaceBinding), workspaceBindingVersions: make(map[string]workspaceBindingVersion),
 		taskWorkspaceViews: make(map[string]taskWorkspaceView), taskWorkspaceAdvancing: make(map[string]bool),
@@ -200,42 +221,48 @@ func Open(options Options) (*Manager, error) {
 	}
 	for _, handler := range options.Handlers {
 		if handler == nil || strings.TrimSpace(handler.Capability()) == "" || strings.TrimSpace(handler.Action()) == "" {
-			_ = store.Close()
+			m.closeStores()
 			return nil, ErrInvalidRequest
 		}
 		key := handlerKey(handler.Capability(), handler.Action())
 		if _, exists := m.handlers[key]; exists {
-			_ = store.Close()
+			m.closeStores()
 			return nil, ErrInvalidRequest
 		}
 		m.handlers[key] = handler
 	}
 	events, err := store.Events()
 	if err != nil {
-		_ = store.Close()
+		m.closeStores()
 		return nil, ErrRuntimeStateUnavailable
 	}
 	for _, event := range events {
 		if err := m.applyEvent(event); err != nil {
-			_ = store.Close()
+			m.closeStores()
+			return nil, ErrRuntimeStateUnavailable
+		}
+	}
+	for _, record := range m.ops {
+		if record.Operation.Status == contract.OperationUnknown {
+			m.closeStores()
 			return nil, ErrRuntimeStateUnavailable
 		}
 	}
 	instanceID, err := randomID("ri_")
 	if err != nil {
-		_ = store.Close()
+		m.closeStores()
 		return nil, ErrRuntimeStateUnavailable
 	}
 	if !m.stateSet {
 		m.state = runtimeState{HostID: options.HostID, Generation: options.Generation, InstanceID: instanceID, Mode: contract.ModeBlocked, Leases: make(map[string]taskLease)}
 		if err := m.appendStateLocked(); err != nil {
-			_ = store.Close()
+			m.closeStores()
 			return nil, ErrRuntimeStateUnavailable
 		}
 		return m, nil
 	}
 	if m.state.HostID != options.HostID || options.Generation < m.state.Generation {
-		_ = store.Close()
+		m.closeStores()
 		return nil, ErrFenceRejected
 	}
 	for id, op := range m.ops {
@@ -244,15 +271,21 @@ func Open(options Options) (*Manager, error) {
 			// accepted proves that no side effect started. Since the prior instance
 			// fence is obsolete, close this attempt without replaying it.
 			if err := m.setOperationLocked(id, contract.OperationFailed, errorResult(ErrFenceRejected.Code)); err != nil {
-				_ = store.Close()
+				m.closeStores()
 				return nil, ErrRuntimeStateUnavailable
 			}
 		case contract.OperationRunning, contract.OperationCancelling:
 			// The process state cannot be inferred after a runtime restart.
 			if err := m.setOperationLocked(id, contract.OperationUnknown, nil); err != nil {
-				_ = store.Close()
+				m.closeStores()
 				return nil, ErrRuntimeStateUnavailable
 			}
+		}
+	}
+	for _, record := range m.ops {
+		if record.Operation.Status == contract.OperationUnknown {
+			m.closeStores()
+			return nil, ErrRuntimeStateUnavailable
 		}
 	}
 	m.state.Generation = options.Generation
@@ -263,7 +296,7 @@ func Open(options Options) (*Manager, error) {
 	// reissue its current lease after the fresh capabilities handshake.
 	m.state.Leases = make(map[string]taskLease)
 	if err := m.appendStateLocked(); err != nil {
-		_ = store.Close()
+		m.closeStores()
 		return nil, ErrRuntimeStateUnavailable
 	}
 	return m, nil
@@ -405,6 +438,31 @@ func (m *Manager) SetWorkspaceBindings(ctx context.Context, request contract.Set
 	}
 	m.mu.Unlock()
 	return response, nil
+}
+
+// RegisterHandlers installs optional capability providers before the HTTP
+// listener starts. It rejects registration after any operation has become
+// active so that a capability cannot change under an executing request.
+func (m *Manager) RegisterHandlers(handlers []ActionHandler) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.readyLocked(); err != nil {
+		return err
+	}
+	if len(m.active) != 0 {
+		return ErrOperationsPending
+	}
+	for _, handler := range handlers {
+		if handler == nil || strings.TrimSpace(handler.Capability()) == "" || strings.TrimSpace(handler.Action()) == "" {
+			return ErrInvalidRequest
+		}
+		key := handlerKey(handler.Capability(), handler.Action())
+		if _, exists := m.handlers[key]; exists {
+			return ErrInvalidRequest
+		}
+		m.handlers[key] = handler
+	}
+	return nil
 }
 
 func (m *Manager) hasPendingWorkspaceOperationLocked(workspaceID string) bool {
@@ -1387,10 +1445,20 @@ func (m *Manager) Close() error {
 		return ErrOperationsPending
 	}
 	m.closed = true
-	store := m.store
 	m.mu.Unlock()
 	m.wg.Wait()
-	return store.Close()
+	return m.closeStores()
+}
+
+func (m *Manager) closeStores() error {
+	var err error
+	if m.store != nil {
+		err = errors.Join(err, m.store.Close())
+	}
+	if m.legacyStore != nil {
+		err = errors.Join(err, m.legacyStore.Close())
+	}
+	return err
 }
 
 func (m *Manager) runOperation(ctx context.Context, id string, handler ActionHandler, request contract.ExecuteRequest, active activeOperation) {

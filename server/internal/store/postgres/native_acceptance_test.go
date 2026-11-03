@@ -272,7 +272,7 @@ func (e taskChatCompatTestExecutor) ExecuteTask(ctx context.Context, current tas
 	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded,
 		Title: "本地验收执行器", Summary: "返回固定的验收回复。"}
 	message := conversation.Message{ID: messageID, ConversationID: current.ConversationID, OwnerID: current.OwnerID,
-		Role: conversation.RoleAssistant, Content: "本地验收回复", TaskID: current.ID, ModelID: current.ModelID}
+		ActorID: current.InitiatorID, Role: conversation.RoleAssistant, Content: "本地验收回复", TaskID: current.ID, ModelID: current.ModelID}
 	stepPayload, err := json.Marshal(map[string]string{"step_id": stepID, "status": string(task.StepSucceeded)})
 	if err != nil {
 		return err

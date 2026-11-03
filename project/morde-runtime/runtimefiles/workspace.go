@@ -161,11 +161,23 @@ func (w *Workspace) getTaskWorkspaceRoot(taskID, viewID, directory string) (*os.
 		return nil, ErrFileUnavailable
 	}
 	viewInfo, err := taskRoot.Lstat(viewID)
-	if err != nil || !viewInfo.IsDir() || viewInfo.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !viewInfo.IsDir() || viewInfo.Mode()&os.ModeSymlink != 0 || viewInfo.Mode().Perm() != 0o770 || !ownedBy(viewInfo, w.taskViewUID) {
 		_ = taskRoot.Close()
 		return nil, ErrFileUnavailable
 	}
-	viewRoot, err := openWorkspaceRoot(taskRoot, viewID, viewInfo)
+	viewContainer, err := openWorkspaceRoot(taskRoot, viewID, viewInfo)
+	if err != nil {
+		_ = taskRoot.Close()
+		return nil, ErrFileUnavailable
+	}
+	contentInfo, err := viewContainer.Lstat(taskWorkspaceContentDirectory)
+	if err != nil || !contentInfo.IsDir() || contentInfo.Mode()&os.ModeSymlink != 0 || !ownedBy(contentInfo, w.taskViewUID) {
+		_ = taskRoot.Close()
+		_ = viewContainer.Close()
+		return nil, ErrFileUnavailable
+	}
+	viewRoot, err := openWorkspaceRoot(viewContainer, taskWorkspaceContentDirectory, contentInfo)
+	_ = viewContainer.Close()
 	_ = taskRoot.Close()
 	if err != nil {
 		return nil, ErrFileUnavailable

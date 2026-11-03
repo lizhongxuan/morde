@@ -216,6 +216,8 @@ func TestValidateToolArguments(t *testing.T) {
 		{name: "runtime idempotency key invalid", spec: toolByName("window_list"), json: `{"host_id":"h1234567","idempotency_key":"short"}`, wantErr: true},
 		{name: "invalid port", spec: toolByName("preview_url"), json: `{"host_id":"host_test","port":65536}`, wantErr: true},
 		{name: "valid workspace IDs", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567"],"idempotency_key":"host-create-key-001"}`},
+		{name: "host create workspace required", spec: toolByName("host_create"), json: `{"idempotency_key":"host-create-key-001"}`, wantErr: true},
+		{name: "host create one workspace only", spec: toolByName("host_create"), json: `{"workspace_ids":["w1234567","w7654321"],"idempotency_key":"host-create-key-001"}`, wantErr: true},
 		{name: "host create idempotency key required", spec: toolByName("host_create"), json: `{}`, wantErr: true},
 		{name: "host create idempotency key invalid", spec: toolByName("host_create"), json: `{"idempotency_key":"short"}`, wantErr: true},
 		{name: "legacy template rejected", spec: toolByName("host_create"), json: `{"template_id":"python","idempotency_key":"host-create-key-001"}`, wantErr: true},

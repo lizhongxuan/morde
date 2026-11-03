@@ -1,6 +1,6 @@
 import { http, HttpResponse } from "msw";
 import type { components } from "../api/schema";
-import type { HostMemberPermission } from "../app/api";
+import type { ConversationDeliveryStatus, HostMemberPermission, MainConversation } from "../app/api";
 
 type User = { id: string; name: string; role: components["schemas"]["UserRole"]; status: components["schemas"]["AccountStatus"]; must_change_password: boolean; quota: { hosts: number; cpu_milli: number; mem_mib: number }; usage: { hosts: number; cpu_milli: number; mem_mib: number }; default_host_resources: { cpu_milli: number; mem_mib: number }; created_at?: string };
 type AuditLog = { id: number; at: string; actor_id: string; actor_kind: string; action: string; target: string; detail: Record<string, unknown>; ip: string };
@@ -15,7 +15,20 @@ type HostMember = { user_id: string; permissions: HostMemberPermission[]; create
 type ModelConnection = components["schemas"]["ModelConnection"];
 type Conversation = components["schemas"]["Conversation"];
 type ConversationMessage = components["schemas"]["ConversationMessage"];
+type MockConversationMessage = ConversationMessage & { delivery_status?: ConversationDeliveryStatus };
 type Task = components["schemas"]["Task"];
+type Project = components["schemas"]["Project"];
+type ProjectMember = components["schemas"]["ProjectMember"];
+type ProjectInvitation = components["schemas"]["ProjectInvitation"];
+type ProjectResource = components["schemas"]["ProjectResource"];
+type ProjectWorkspaceManifest = components["schemas"]["ProjectWorkspaceManifest"];
+type ProjectBudget = components["schemas"]["ProjectBudget"];
+type ProjectBudgetLedgerEntry = components["schemas"]["ProjectBudgetLedgerEntry"];
+type ProjectWorkItem = components["schemas"]["ProjectWorkItem"];
+type ProjectConversation = components["schemas"]["ProjectConversation"];
+type ProjectConversationMessage = components["schemas"]["ProjectConversationMessage"];
+type ProjectConversationTask = components["schemas"]["ProjectConversationTask"];
+type ProjectConversationAppendResponse = components["schemas"]["AppendProjectConversationMessageResponse"];
 type Schedule = components["schemas"]["Schedule"];
 type ScheduleCreateRequest = components["schemas"]["ScheduleCreateRequest"];
 type UserPreferences = components["schemas"]["UserPreferences"];
@@ -24,6 +37,7 @@ type ClientInstallation = components["schemas"]["ClientInstallation"];
 type AdminWorkspace = components["schemas"]["AdminWorkspace"];
 type VisibleAdminWorkspace = Omit<Workspace, "state"> & { state: "ready" | "deleting" };
 type ModelAccountBudget = { owner_id: string; configured: boolean; token_limit: number; max_concurrent: number; used_tokens: number; in_flight: number; has_unknown: boolean };
+type AdminModelBudgetDefault = components["schemas"]["AdminModelBudgetDefault"];
 type PersonalDataQuota = components["schemas"]["AdminPersonalDataQuota"];
 type AdminControlRule = components["schemas"]["AdminControlRule"];
 type AdminControlNotification = components["schemas"]["AdminControlNotification"];
@@ -62,17 +76,32 @@ let apiKeys: Array<Record<string, unknown>> = [];
 let modelConnections: ModelConnection[] = [];
 let schedules: Array<{ ownerID: string; value: Schedule }> = [];
 let conversations: Conversation[] = [];
-let conversationMessages: ConversationMessage[] = [];
+let conversationMessages: MockConversationMessage[] = [];
 let conversationOwners = new Map<string, string>();
+let mainConversations = new Map<string, MainConversation>();
 let tasks = new Map<string, Task>();
+let projects: Project[] = [];
+let projectMembers: ProjectMember[] = [];
+let projectInvitations: ProjectInvitation[] = [];
+let projectResources: ProjectResource[] = [];
+let projectWorkspaceManifests = new Map<string, ProjectWorkspaceManifest>();
+let projectBudgets = new Map<string, ProjectBudget>();
+let projectLedgers = new Map<string, ProjectBudgetLedgerEntry[]>();
+let projectWorkItems: ProjectWorkItem[] = [];
+let projectConversations: ProjectConversation[] = [];
+let projectConversationMessages: ProjectConversationMessage[] = [];
+const projectConversationCreates = new Map<string, { request: string; response: ProjectConversation }>();
+const projectConversationAppends = new Map<string, { request: string; response: ProjectConversationAppendResponse }>();
 const taskSubmitReplays = new Map<string, { request: string; response: Task }>();
 const taskMessageReplays = new Map<string, { request: string; response: { message: ConversationMessage; task: Task } }>();
 const taskActionReplays = new Map<string, { request: string; response: components["schemas"]["TaskActionResponse"] }>();
+const mainConversationReplays = new Map<string, { request: string; response: MainConversation }>();
 let userPreferences = new Map<string, UserPreferences>();
 let notifications: Notification[] = [];
 let clients: ClientInstallation[] = [];
 const clientOwners = new Map<string, string>();
 const modelBudgets = new Map<string, ModelAccountBudget>();
+let defaultModelBudget: AdminModelBudgetDefault = { configured: false, token_limit: 0, max_concurrent: 0, version: 0 };
 const personalDataQuotas = new Map<string, PersonalDataQuota>();
 const recordConsents = new Map<string, RecordConsent[]>();
 const recordQuotas = new Map<string, RecordQuota>();
@@ -82,9 +111,11 @@ let adminControlNotifications: AdminControlNotification[] = [];
 let nextAdminControlRuleId = 1;
 let notificationOwners = new Map<string, string>();
 const workspaceCreateReplays = new Map<string, { request: string; response: Workspace }>();
+const workspaceRestoreReplays = new Map<string, { request: string; response: components["schemas"]["WorkspaceRestoreResult"] }>();
 const hostCreateReplays = new Map<string, { request: string; response: Host }>();
 const hostControlTransitions = new Map<string, ControlTransition>();
 const hostControlActionReplays = new Map<string, { request: string; response: ControlActionResponse }>();
+const hostControlLeases = new Map<string, string>();
 const workspaceBindReplays = new Map<string, { request: string; response: WorkspaceBinding }>();
 const workspaceUnbindReplays = new Map<string, { request: string; response: WorkspaceBinding }>();
 const workspaceUnbindingStartedAt = new Map<string, number>();
@@ -187,8 +218,9 @@ type PersistedAssistantState = {
   workspaceOwners: Array<[string, string]>;
   userPreferences: Array<[string, UserPreferences]>;
   conversations?: Conversation[];
-  conversationMessages?: ConversationMessage[];
+  conversationMessages?: MockConversationMessage[];
   conversationOwners?: Array<[string, string]>;
+  mainConversations?: Array<[string, MainConversation]>;
   tasks?: Task[];
   notifications?: Notification[];
   notificationOwners?: Array<[string, string]>;
@@ -211,6 +243,7 @@ function persistAssistantState() {
     conversations,
     conversationMessages,
     conversationOwners: Array.from(conversationOwners.entries()),
+    mainConversations: Array.from(mainConversations.entries()),
     tasks: Array.from(tasks.values()),
     notifications,
     notificationOwners: Array.from(notificationOwners.entries()),
@@ -255,16 +288,31 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   conversations = [];
   conversationMessages = [];
   conversationOwners = new Map();
+  mainConversations = new Map();
   tasks = new Map();
+  projects = [{ id: "pdem0001", owner_id: demoUser.id, name: "本地项目演示", description: "仅用于本机 Portal/MSW 验收。", version: 1 }];
+  projectMembers = [{ project_id: "pdem0001", user_id: demoUser.id, role: "owner", version: 1 }];
+  projectInvitations = [{ id: "rinvite1", project_id: "pdem0001", inviter_id: demoUser.id, invitee_id: memberUser.id, role: "member", state: "pending", version: 1 }];
+  projectResources = [];
+  projectWorkspaceManifests = new Map();
+  projectBudgets = new Map([["pdem0001", { configured: true, currency: "USD", limit_micros: 10_000_000, version: 1, spent_micros: 0, reserved_micros: 500_000, has_unknown: true }]]);
+  projectLedgers = new Map([["pdem0001", [{ call_id: "c-demo01", actor_id: demoUser.id, source: "client", model_id: "pmodel01", rate_version: 1, currency: "USD", status: "unknown", reserved_usage: { input_tokens: 100, output_tokens: 25 }, reserved_micros: 500_000, created_at: now() }]]]);
+  projectWorkItems = [{ id: "jdem0001", project_id: "pdem0001", title: "确认交付范围", description: "本机演示工作项；不会启动 Task。", acceptance_criteria: ["确认负责人", "确认验收条件"], assignee_id: demoUser.id, state: "open", blocked_reason: "", task_ids: [], version: 1 }];
+  projectConversations = [];
+  projectConversationMessages = [];
+  projectConversationCreates.clear();
+  projectConversationAppends.clear();
   taskSubmitReplays.clear();
   taskMessageReplays.clear();
   taskActionReplays.clear();
+  mainConversationReplays.clear();
   userPreferences = new Map();
   notifications = [];
   clients = [{ id: "cli_demo01", platform: "desktop", display_name: "Morde 演示电脑", expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(), revoked: false, created_at: now(), last_used_at: null } as ClientInstallation];
   clientOwners.clear();
   clientOwners.set(clients[0]!.id, demoUser.id);
   modelBudgets.clear();
+  defaultModelBudget = { configured: false, token_limit: 0, max_concurrent: 0, version: 0 };
   personalDataQuotas.clear();
   recordConsents.clear();
   recordQuotas.clear();
@@ -274,9 +322,11 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   nextAdminControlRuleId = 1;
   notificationOwners = new Map();
   workspaceCreateReplays.clear();
+  workspaceRestoreReplays.clear();
   hostCreateReplays.clear();
   hostControlTransitions.clear();
   hostControlActionReplays.clear();
+  hostControlLeases.clear();
   workspaceBindReplays.clear();
   workspaceUnbindReplays.clear();
   workspaceUnbindingStartedAt.clear();
@@ -313,6 +363,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
       conversations = persisted.conversations;
       conversationMessages = persisted.conversationMessages;
       conversationOwners = new Map(persisted.conversationOwners);
+      if (Array.isArray(persisted.mainConversations)) mainConversations = new Map(persisted.mainConversations);
       tasks = new Map((persisted.tasks ?? []).map((task) => [task.id, task]));
     }
     if (Array.isArray(persisted.hostMembers)) hostMembers = new Map(persisted.hostMembers);
@@ -355,6 +406,21 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
       }
     }
     if (hasPendingDeletion) scheduleDeletionCompletion();
+  }
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1" && !workspaceOwners.has("wlocal01")) {
+    const timestamp = now();
+    workspaces = [{ id: "wlocal01", name: "本地差异演示工作区", revision: 2, used_bytes: 1024, quota_bytes: 20 * 1024 * 1024 * 1024,
+      state: "ready", created_at: timestamp, updated_at: timestamp }, ...workspaces.filter((workspace) => workspace.id !== "wlocal01")];
+    workspaceOwners.set("wlocal01", demoUser.id);
+    projectResources = [{ project_id: "pdem0001", kind: "workspace", resource_id: "wlocal01", version: 1 }];
+    projectWorkspaceManifests.set("wlocal01", {
+      project_id: "pdem0001", workspace_id: "wlocal01", revision: 2,
+      files: [
+        { path: "README.md", kind: "file", size_bytes: 84, mode: 420 },
+        { path: "src/main.go", kind: "file", size_bytes: 940, mode: 420 },
+      ],
+      empty_directories: ["docs/empty"], next_cursor: null,
+    });
   }
   if (!notifications.length) {
     const timestamp = now();
@@ -427,11 +493,41 @@ function sessionUser(cookies: Record<string, string>): User | null {
   return session.name === user.name ? user : { ...user, name: session.name };
 }
 
+function projectMemberFor(projectID: string, userID: string) {
+  return projectMembers.find((member) => member.project_id === projectID && member.user_id === userID);
+}
+
+function readableProject(projectID: string, user: User) {
+  const project = projects.find((item) => item.id === projectID);
+  return project && projectMemberFor(projectID, user.id) ? project : undefined;
+}
+
+function editableProject(projectID: string, user: User) {
+  const project = readableProject(projectID, user);
+  const member = projectMemberFor(projectID, user.id);
+  return project && (member?.role === "owner" || member?.role === "member") ? project : undefined;
+}
+
+function ownedProject(projectID: string, user: User) {
+  const project = readableProject(projectID, user);
+  return project && projectMemberFor(projectID, user.id)?.role === "owner" ? project : undefined;
+}
+
+function canReadProjectWorkspace(workspaceID: string, user: User) {
+  if (workspaceOwners.get(workspaceID) === user.id) return true;
+  return hosts.some((host) => {
+    if (host.state === "deleting" || host.state === "deleted"
+      || !host.workspaces.some((binding) => binding.workspace.id === workspaceID && binding.state === "active")) return false;
+    return hostMembers.get(host.id)?.some((member) => member.user_id === user.id
+      && member.permissions.includes("workspace:file:read")) ?? false;
+  });
+}
+
 function createTaskMessage(user: User, conversation: Conversation, modelID: string, content: string, request: Record<string, unknown>) {
   const timestamp = now();
   const budget = request.budget as { active_seconds: number; tool_calls: number; model_tokens: number } | undefined;
   const task: Task = {
-    id: id("q"), owner_id: user.id, host_id: typeof request.host_id === "string" ? request.host_id : undefined,
+    id: id("q"), owner_id: user.id, initiator_id: user.id, host_id: typeof request.host_id === "string" ? request.host_id : undefined,
     workspace_id: typeof request.workspace_id === "string" ? request.workspace_id : undefined,
     input_revision: typeof request.input_revision === "number" && Number.isSafeInteger(request.input_revision) ? request.input_revision : undefined,
     execution_location: "server", conversation_id: conversation.id, model_id: modelID, objective: content,
@@ -441,8 +537,9 @@ function createTaskMessage(user: User, conversation: Conversation, modelID: stri
     result: null, waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null,
     clarification_request: null, stop_request: null, assistant_message: null, finished_at: null,
   };
-  const message: ConversationMessage = {
+  const message: MockConversationMessage = {
     id: id("m"), conversation_id: conversation.id, role: "user", content, task_id: task.id, created_at: timestamp,
+    delivery_status: "applied",
   };
   conversation.updated_at = timestamp;
   tasks.set(task.id, task);
@@ -490,6 +587,9 @@ function materializeHost(host: Host) {
   if (host.state === "creating" && Date.now() - new Date(host.created_at).getTime() > 900) {
     host.state = "running";
     host.state_reason = "";
+    host.workspaces = host.workspaces.map((binding) => binding.state === "preparing"
+      ? { ...binding, state: "active", applied_revision: binding.desired_revision, sync_state: "healthy", sync_conflicts: [] }
+      : binding);
     persistAssistantState();
   }
   return host;
@@ -628,6 +728,416 @@ export const handlers = [
     return empty({ "Set-Cookie": `${sessionCookieName}=; Path=/; Max-Age=0; SameSite=Lax` });
   }),
   http.get("/api/me", ({ cookies }) => json(userWithUsage(sessionUser(cookies)!))),
+  http.get("/api/projects", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    return json({ items: projects.filter((project) => projectMemberFor(project.id, user.id)), next_cursor: null });
+  }),
+  http.post("/api/projects", async ({ request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const body = await request.json().catch(() => null) as components["schemas"]["CreateProjectRequest"] | null;
+    if (!body || typeof body.name !== "string" || !body.name.trim() || body.name.length > 120 || (body.description?.length ?? 0) > 2000) {
+      return failure("invalid_argument", "项目名称或说明无效", 400);
+    }
+    const project: Project = { id: id("p"), owner_id: user.id, name: body.name.trim(), description: body.description?.trim() ?? "", version: 1 };
+    projects.push(project);
+    projectMembers.push({ project_id: project.id, user_id: user.id, role: "owner", version: 1 });
+    projectBudgets.set(project.id, { configured: false, currency: "USD", limit_micros: 0, version: 1, spent_micros: 0, reserved_micros: 0, has_unknown: false });
+    projectLedgers.set(project.id, []);
+    return json(project, 201);
+  }),
+  http.get("/api/projects/:projectID", ({ params, cookies }) => {
+    const project = readableProject(String(params.projectID), sessionUser(cookies)!);
+    return project ? json(project) : failure("not_found", "项目不存在或无权访问", 404);
+  }),
+  http.get("/api/projects/:projectID/conversations", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    return json({ items: projectConversations.filter((item) => item.project_id === projectID), next_cursor: null });
+  }),
+  http.post("/api/projects/:projectID/conversations", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["CreateProjectConversationRequest"] | null;
+    if (!body || (body.title !== undefined && (typeof body.title !== "string" || body.title.length > 120))) return failure("invalid_argument", "共享对话标题无效", 400);
+    const key = request.headers.get("Idempotency-Key")?.trim() ?? "";
+    if (!key) return failure("invalid_argument", "缺少 Idempotency-Key", 400);
+    const normalizedBody = { ...(body.title?.trim() ? { title: body.title.trim() } : {}) };
+    const fingerprint = JSON.stringify(normalizedBody);
+    const replayKey = `${user.id}:${projectID}:${key}`;
+    const replay = projectConversationCreates.get(replayKey);
+    if (replay) return replay.request === fingerprint
+      ? json(replay.response, 200)
+      : failure("conflict", "幂等键已用于不同的共享对话请求", 409);
+    const timestamp = now();
+    const value: ProjectConversation = {
+      id: id("c"), project_id: projectID, owner_id: user.id,
+      title: normalizedBody.title ?? "项目共享对话", created_at: timestamp, updated_at: timestamp,
+    };
+    projectConversations.push(value);
+    projectConversationCreates.set(replayKey, { request: fingerprint, response: value });
+    return json(value, 201);
+  }),
+  http.get("/api/projects/:projectID/conversations/:conversationID/messages", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    if (!projectConversations.some((item) => item.project_id === projectID && item.id === conversationID)) return failure("not_found", "项目共享对话不存在", 404);
+    return json({
+      items: projectConversationMessages.filter((item) => item.conversation_id === conversationID),
+      next_cursor: null,
+    });
+  }),
+  http.post("/api/projects/:projectID/conversations/:conversationID/messages", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    const conversation = projectConversations.find((item) => item.project_id === projectID && item.id === conversationID);
+    if (!conversation) return failure("not_found", "项目共享对话不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["AppendProjectConversationMessageRequest"] | null;
+    if (!body || typeof body.model_id !== "string" || !body.model_id.trim() || body.model_id.length > 256
+      || typeof body.content !== "string" || !body.content.trim() || body.content.length > 32768
+      || (body.workspace_id !== undefined && (!Number.isSafeInteger(body.input_revision) || body.input_revision! < 0))) {
+      return failure("invalid_argument", "项目提示或输入 Workspace 版本无效", 400);
+    }
+    const model = modelConnections.find((item) => item.id === body.model_id && item.checked_at && item.capabilities.text);
+    if (!model) return failure("forbidden", "所选模型未通过文本能力检查", 403);
+    if (body.host_id) {
+      const host = hosts.find((item) => item.id === body.host_id && item.owner_id === user.id);
+      if (!projectResources.some((item) => item.project_id === projectID && item.kind === "host" && item.resource_id === body.host_id)
+        || !host || host.state !== "running" || host.control_state !== "ai") return failure("forbidden", "目标 Host 未关联到项目或当前账号无权使用", 403);
+    }
+    if (body.workspace_id) {
+      const workspace = workspaces.find((item) => item.id === body.workspace_id && workspaceOwners.get(item.id) === user.id && item.state === "ready");
+      if (!projectResources.some((item) => item.project_id === projectID && item.kind === "workspace" && item.resource_id === body.workspace_id)
+        || !workspace || workspace.revision !== body.input_revision) return failure("forbidden", "目标 Workspace 未关联到项目、当前账号无权访问或 revision 已变化", 403);
+      if (body.host_id) {
+        const host = hosts.find((item) => item.id === body.host_id);
+        const binding = host?.workspaces.find((item) => item.workspace.id === workspace.id);
+        if (!binding || binding.state !== "active" || binding.sync_state !== "healthy"
+          || binding.desired_revision !== workspace.revision || binding.applied_revision !== workspace.revision) {
+          return failure("conflict", "目标 Host 尚未应用所选 Workspace revision", 409);
+        }
+      }
+    }
+    const key = request.headers.get("Idempotency-Key")?.trim() ?? "";
+    if (!key) return failure("invalid_argument", "缺少 Idempotency-Key", 400);
+    const fingerprint = JSON.stringify(body);
+    const replayKey = `${user.id}:${projectID}:${conversationID}:${key}`;
+    const replay = projectConversationAppends.get(replayKey);
+    if (replay) return replay.request === fingerprint
+      ? json(replay.response, 202)
+      : failure("conflict", "幂等键已用于不同的项目 Task 请求", 409);
+    const timestamp = now();
+    const taskID = id("q");
+    const task: ProjectConversationTask = {
+      id: taskID, owner_id: conversation.owner_id, initiator_id: user.id, project_id: projectID,
+      ...(body.host_id ? { host_id: body.host_id } : {}),
+      ...(body.workspace_id ? { workspace_id: body.workspace_id } : {}),
+      ...(body.workspace_id && body.input_revision !== undefined ? { input_revision: body.input_revision } : {}),
+      execution_location: "server", conversation_id: conversationID, model_id: body.model_id,
+      objective: body.content, status: "queued", current_step: null,
+      budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
+      usage: { active_seconds: 0, tool_calls: 0, model_tokens: null },
+      created_at: timestamp, updated_at: timestamp, event_sequence: 0, result: null, waiting_reason: null,
+      steps: [], batch_items: [], artifacts: [], pending_request: null, clarification_request: null,
+      stop_request: null, assistant_message: null, finished_at: null,
+    };
+    const message: ProjectConversationMessage = {
+        id: id("m"), conversation_id: conversationID, owner_id: conversation.owner_id, actor_id: user.id,
+        role: "user", content: body.content, task_id: taskID, delivery_status: "applied", created_at: timestamp,
+    };
+    const response: ProjectConversationAppendResponse = { message, task };
+    conversation.updated_at = timestamp;
+    projectConversationMessages.push(message);
+    projectConversationAppends.set(replayKey, { request: fingerprint, response });
+    return json(response, 202);
+  }),
+  http.get("/api/projects/:projectID/members", ({ params, cookies }) => {
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
+    return json({ items: projectMembers.filter((member) => member.project_id === projectID), next_cursor: null });
+  }),
+  http.post("/api/projects/:projectID/members", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const project = ownedProject(projectID, user);
+    if (!project) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以邀请成员", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["InviteProjectMemberRequest"] | null;
+    if (!body || !["member", "viewer"].includes(body.role) || typeof body.user_id !== "string" || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "邀请信息无效", 400);
+    if (body.expected_version !== project.version) return failure("conflict", "项目版本已变化，请刷新后重试", 409);
+    const invitee = users.find((item) => item.id === body.user_id);
+    if (!invitee) return failure("not_found", "目标账号不存在", 404);
+    if (projectMemberFor(projectID, invitee.id) || projectInvitations.some((item) => item.project_id === projectID && item.invitee_id === invitee.id && item.state === "pending")) return failure("conflict", "目标账号已有项目成员关系或待处理邀请", 409);
+    const invitation: ProjectInvitation = { id: id("r"), project_id: projectID, inviter_id: user.id, invitee_id: invitee.id, role: body.role, state: "pending", version: 1 };
+    projectInvitations.push(invitation);
+    project.version += 1;
+    return json(invitation, 201);
+  }),
+  http.patch("/api/projects/:projectID/members/:userID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!ownedProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以修改成员角色", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const member = projectMemberFor(projectID, String(params.userID));
+    if (!member || member.role === "owner") return failure("not_found", "项目成员不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["UpdateProjectMemberRequest"] | null;
+    if (!body || !["member", "viewer"].includes(body.role) || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "成员角色更新信息无效", 400);
+    if (body.expected_version !== member.version) return failure("conflict", "成员版本已变化，请刷新后重试", 409);
+    member.role = body.role;
+    member.version += 1;
+    return json(member);
+  }),
+  http.delete("/api/projects/:projectID/members/:userID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!ownedProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以移除成员", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const member = projectMemberFor(projectID, String(params.userID));
+    if (!member || member.role === "owner") return failure("not_found", "项目成员不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["RemoveProjectMemberRequest"] | null;
+    if (!body || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "成员版本无效", 400);
+    if (body.expected_version !== member.version) return failure("conflict", "成员版本已变化，请刷新后重试", 409);
+    projectMembers = projectMembers.filter((item) => item !== member);
+    return empty();
+  }),
+  http.delete("/api/projects/:projectID/invitations/:invitationID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!ownedProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以撤回邀请", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const invitation = projectInvitations.find((item) => item.project_id === projectID && item.id === params.invitationID);
+    if (!invitation || invitation.state !== "pending") return failure("not_found", "待处理邀请不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["RevokeProjectInvitationRequest"] | null;
+    if (!body || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "邀请版本无效", 400);
+    if (body.expected_version !== invitation.version) return failure("conflict", "邀请版本已变化，请刷新后重试", 409);
+    invitation.state = "revoked";
+    invitation.version += 1;
+    return empty();
+  }),
+  http.get("/api/me/project-invitations", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    return json({ items: projectInvitations.filter((item) => item.invitee_id === user.id), next_cursor: null });
+  }),
+  http.post("/api/project-invitations/:invitationID/accept", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const invitation = projectInvitations.find((item) => item.id === params.invitationID && item.invitee_id === user.id);
+    if (!invitation) return failure("not_found", "项目邀请不存在", 404);
+    if (invitation.state === "accepted") {
+      const member = projectMemberFor(invitation.project_id, user.id);
+      return member ? json(member) : failure("conflict", "邀请状态与成员关系不一致", 409);
+    }
+    if (invitation.state !== "pending") return failure("conflict", "邀请已撤回", 409);
+    const member: ProjectMember = { project_id: invitation.project_id, user_id: user.id, role: invitation.role, version: 1 };
+    projectMembers.push(member);
+    invitation.state = "accepted";
+    invitation.version += 1;
+    return json(member, 201);
+  }),
+  http.post("/api/projects/:projectID/owner-transfer", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const project = ownedProject(projectID, user);
+    if (!project) return readableProject(projectID, user) ? failure("forbidden", "只有当前负责人可以移交项目", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["TransferProjectOwnerRequest"] | null;
+    if (!body || typeof body.user_id !== "string" || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "负责人移交信息无效", 400);
+    if (body.expected_version !== project.version) return failure("conflict", "项目版本已变化，请刷新后重试", 409);
+    const newOwner = projectMemberFor(projectID, body.user_id);
+    const oldOwner = projectMemberFor(projectID, user.id);
+    if (!newOwner || !oldOwner || newOwner.role === "owner") return failure("conflict", "目标必须是已接受的项目成员", 409);
+    oldOwner.role = "member";
+    oldOwner.version += 1;
+    newOwner.role = "owner";
+    newOwner.version += 1;
+    project.owner_id = newOwner.user_id;
+    project.version += 1;
+    return json(project);
+  }),
+  http.get("/api/projects/:projectID/resources", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    const items = projectResources.filter((resource) => resource.project_id === projectID && (resource.kind === "host"
+      ? hosts.some((host) => host.id === resource.resource_id && (isAdmin(user) || host.owner_id === user.id))
+      : canReadProjectWorkspace(resource.resource_id, user)));
+    return json({ items, next_cursor: null });
+  }),
+  http.get("/api/projects/:projectID/workspaces/:workspaceID/manifest", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const projectID = String(params.projectID);
+    const workspaceID = String(params.workspaceID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    if (!projectResources.some((resource) => resource.project_id === projectID
+      && resource.kind === "workspace" && resource.resource_id === workspaceID)) {
+      return failure("not_found", "项目工作区不存在", 404);
+    }
+    const workspace = workspaces.find((item) => item.id === workspaceID && item.state === "ready");
+    if (!workspace || !canReadProjectWorkspace(workspaceID, user)) return failure("not_found", "项目工作区不存在", 404);
+
+    const query = new URL(request.url).searchParams;
+    const revisionText = query.get("revision");
+    const revision = revisionText === null ? workspace.revision : Number(revisionText);
+    if (!Number.isSafeInteger(revision) || revision < 0) return failure("invalid_argument", "revision 无效", 400);
+    if (revision > workspace.revision || (revision !== 0 && revision !== workspace.revision)) {
+      return failure("not_found", "工作区版本不存在", 404);
+    }
+    const limit = query.has("limit") ? Number(query.get("limit")) : 500;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) return failure("invalid_argument", "limit 无效", 400);
+    const rawPrefix = query.get("prefix") ?? "";
+    const prefix = rawPrefix.endsWith("/") ? rawPrefix.slice(0, -1) : rawPrefix;
+    if (prefix.startsWith("/") || prefix.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) {
+      if (prefix !== "") return failure("invalid_argument", "prefix 无效", 400);
+    }
+    const source = projectWorkspaceManifests.get(workspaceID) ?? {
+      project_id: projectID, workspace_id: workspaceID, revision: workspace.revision, files: [], empty_directories: [], next_cursor: null,
+    };
+    if (source.project_id !== projectID || source.revision !== workspace.revision) {
+      return failure("conflict", "演示工作区目录快照已变化", 409);
+    }
+    const filteredFiles = source.files.filter((file) => !prefix || file.path === prefix || file.path.startsWith(`${prefix}/`));
+    const cursor = query.get("cursor") ?? "";
+    const offset = cursor === "" ? 0 : Number(cursor);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset >= filteredFiles.length) {
+      if (cursor !== "" || filteredFiles.length > 0) return failure("invalid_argument", "cursor 无效", 400);
+    }
+    const files = filteredFiles.slice(offset, offset + limit);
+    const nextOffset = offset + files.length;
+    const emptyDirectories = source.empty_directories.filter((path) => !prefix || path === prefix || path.startsWith(`${prefix}/`));
+    return json({
+      project_id: projectID, workspace_id: workspaceID, revision: workspace.revision, files,
+      empty_directories: emptyDirectories, next_cursor: nextOffset < filteredFiles.length ? String(nextOffset) : null,
+    });
+  }),
+  http.post("/api/projects/:projectID/resources", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const project = ownedProject(projectID, user);
+    if (!project) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以关联资源", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["ProjectResourceMutationRequest"] | null;
+    if (!body || !["host", "workspace"].includes(body.kind) || typeof body.resource_id !== "string" || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "资源关联信息无效", 400);
+    if (body.expected_version !== project.version) return failure("conflict", "项目版本已变化，请刷新后重试", 409);
+    const accessible = body.kind === "host" ? Boolean(findHost(body.resource_id, user)) : workspaceOwners.get(body.resource_id) === user.id;
+    if (!accessible) return failure("not_found", "资源不存在或当前账号无权访问", 404);
+    if (projectResources.some((item) => item.project_id === projectID && item.kind === body.kind && item.resource_id === body.resource_id)) return failure("conflict", "资源已关联", 409);
+    const resource: ProjectResource = { project_id: projectID, kind: body.kind, resource_id: body.resource_id, version: project.version + 1 };
+    projectResources.push(resource);
+    project.version += 1;
+    return json(resource, 201);
+  }),
+  http.delete("/api/projects/:projectID/resources", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const project = ownedProject(projectID, user);
+    if (!project) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以移除资源关联", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["ProjectResourceMutationRequest"] | null;
+    if (!body || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "资源关联信息无效", 400);
+    if (body.expected_version !== project.version) return failure("conflict", "项目版本已变化，请刷新后重试", 409);
+    const resource = projectResources.find((item) => item.project_id === projectID && item.kind === body.kind && item.resource_id === body.resource_id);
+    if (!resource) return failure("not_found", "资源关联不存在", 404);
+    projectResources = projectResources.filter((item) => item !== resource);
+    project.version += 1;
+    return empty();
+  }),
+  http.get("/api/projects/:projectID/budget", ({ params, cookies }) => {
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
+    return json(projectBudgets.get(projectID) ?? { configured: false, currency: "USD", limit_micros: 0, version: 1, spent_micros: 0, reserved_micros: 0, has_unknown: false });
+  }),
+  http.put("/api/projects/:projectID/budget", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!ownedProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "只有项目负责人可以设置预算", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["SetProjectBudgetRequest"] | null;
+    if (!body || !/^[A-Z]{3}$/.test(body.currency) || !Number.isSafeInteger(body.limit_micros) || body.limit_micros < 1 || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "预算信息无效", 400);
+    const current = projectBudgets.get(projectID) ?? { configured: false, currency: "USD", limit_micros: 0, version: 1, spent_micros: 0, reserved_micros: 0, has_unknown: false };
+    if (body.expected_version !== current.version) return failure("conflict", "预算版本已变化，请刷新后重试", 409);
+    const updated: ProjectBudget = { ...current, configured: true, currency: body.currency, limit_micros: body.limit_micros, version: current.version + 1 };
+    projectBudgets.set(projectID, updated);
+    return json(updated);
+  }),
+  http.get("/api/projects/:projectID/budget/ledger", ({ params, cookies }) => {
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
+    return json({ items: projectLedgers.get(projectID) ?? [], next_cursor: null });
+  }),
+  http.get("/api/projects/:projectID/work-items", ({ params, cookies }) => {
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
+    return json({ items: projectWorkItems.filter((item) => item.project_id === projectID), next_cursor: null });
+  }),
+  http.post("/api/projects/:projectID/work-items", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能修改工作项", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["CreateProjectWorkItemRequest"] | null;
+    if (!body || typeof body.title !== "string" || !body.title.trim() || body.title.length > 200 || (body.description?.length ?? 0) > 4096 || (body.acceptance_criteria && body.acceptance_criteria.some((criterion) => !criterion.trim() || criterion.length > 1000))) return failure("invalid_argument", "工作项信息无效", 400);
+    const assigneeID = body.assignee_id ?? user.id;
+    if (!projectMemberFor(projectID, assigneeID)) return failure("invalid_argument", "负责人必须是已接受的项目成员", 400);
+    const item: ProjectWorkItem = { id: id("j"), project_id: projectID, title: body.title.trim(), description: body.description ?? "", acceptance_criteria: body.acceptance_criteria ?? [], assignee_id: assigneeID, state: "open", blocked_reason: "", task_ids: [], version: 1 };
+    projectWorkItems.push(item);
+    return json(item, 201);
+  }),
+  http.get("/api/projects/:projectID/work-items/:workItemID", ({ params, cookies }) => {
+    const projectID = String(params.projectID);
+    if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
+    const item = projectWorkItems.find((workItem) => workItem.project_id === projectID && workItem.id === params.workItemID);
+    return item ? json(item) : failure("not_found", "工作项不存在", 404);
+  }),
+  http.patch("/api/projects/:projectID/work-items/:workItemID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能修改工作项", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const item = projectWorkItems.find((workItem) => workItem.project_id === projectID && workItem.id === params.workItemID);
+    if (!item) return failure("not_found", "工作项不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["AssignProjectWorkItemRequest"] | null;
+    if (!body || typeof body.assignee_id !== "string" || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "工作项负责人信息无效", 400);
+    if (body.expected_version !== item.version) return failure("conflict", "工作项版本已变化，请刷新后重试", 409);
+    if (!projectMemberFor(projectID, body.assignee_id)) return failure("invalid_argument", "负责人必须是已接受的项目成员", 400);
+    item.assignee_id = body.assignee_id;
+    item.version += 1;
+    return json(item);
+  }),
+  http.post("/api/projects/:projectID/work-items/:workItemID/block", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能修改工作项", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const item = projectWorkItems.find((workItem) => workItem.project_id === projectID && workItem.id === params.workItemID);
+    if (!item) return failure("not_found", "工作项不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["BlockProjectWorkItemRequest"] | null;
+    if (!body || typeof body.blocked_reason !== "string" || !body.blocked_reason.trim() || body.blocked_reason.length > 2000 || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "阻塞原因或工作项版本无效", 400);
+    if (body.expected_version !== item.version || item.state !== "open") return failure("conflict", "工作项状态或版本已变化", 409);
+    item.state = "blocked";
+    item.blocked_reason = body.blocked_reason.trim();
+    item.version += 1;
+    return json(item);
+  }),
+  http.post("/api/projects/:projectID/work-items/:workItemID/resume", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能修改工作项", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const item = projectWorkItems.find((workItem) => workItem.project_id === projectID && workItem.id === params.workItemID);
+    if (!item) return failure("not_found", "工作项不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["ProjectWorkItemVersionRequest"] | null;
+    if (!body || !Number.isSafeInteger(body.expected_version)) return failure("invalid_argument", "工作项版本无效", 400);
+    if (body.expected_version !== item.version || item.state !== "blocked") return failure("conflict", "工作项状态或版本已变化", 409);
+    item.state = "open";
+    item.blocked_reason = "";
+    item.version += 1;
+    return json(item);
+  }),
+  http.post("/api/projects/:projectID/work-items/:workItemID/tasks", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能关联 Task", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    return failure("unsupported", "本地替身未实现项目 Task 授权关系；不建立未经验证的关联", 501);
+  }),
+  http.post("/api/projects/:projectID/work-items/:workItemID/delivery", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能提交交付", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    return failure("unsupported", "本地替身无法验证 Workspace 修订是否已保存，不会确认交付", 501);
+  }),
   http.get("/api/me/invite-code", ({ cookies }) => {
     const user = sessionUser(cookies)!;
     let code = Array.from(inviteCodes).find(([, ownerID]) => ownerID === user.id)?.[0];
@@ -879,10 +1389,36 @@ export const handlers = [
     const user = sessionUser(cookies)!;
     const host = findHost(String(params.hostId), user);
     if (!host || host.owner_id !== user.id || host.state !== "running") return failure("not_found", "主机不存在", 404);
+    const expiresAt = hostControlLeases.get(host.id) ?? null;
+    const leaseActive = host.control_state === "user" && !!expiresAt && Date.parse(expiresAt) > Date.now();
+    if (!leaseActive) hostControlLeases.delete(host.id);
     return json({
       host_id: host.id,
       control_state: host.control_state,
       control_version: host.control_version,
+      control_actor_user_id: leaseActive ? host.owner_id : "",
+      control_lease_expires_at: leaseActive ? expiresAt : null,
+      control_lease_active: leaseActive,
+      control_lease_held_by_me: leaseActive && user.id === host.owner_id,
+      active_transition: hostControlTransitions.get(host.id) ?? null,
+    });
+  }),
+  http.post("/api/hosts/:hostId/control/lease/renew", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const host = findHost(String(params.hostId), user);
+    if (!host || host.owner_id !== user.id || host.state !== "running") return failure("not_found", "主机不存在", 404);
+    const body = await request.json().catch(() => null) as { expected_control_version?: unknown } | null;
+    if (!body || Object.keys(body).length !== 1 || !Number.isSafeInteger(body.expected_control_version)
+      || Number(body.expected_control_version) < 0) return failure("invalid_argument", "控制租约续期请求无效", 400);
+    const expiresAt = hostControlLeases.get(host.id);
+    if (body.expected_control_version !== host.control_version || host.control_state !== "user"
+      || !expiresAt || Date.parse(expiresAt) <= Date.now()) return failure("conflict", "控制租约已变化或过期", 409);
+    const renewedExpiry = new Date(Date.now() + 30_000).toISOString();
+    hostControlLeases.set(host.id, renewedExpiry);
+    return json({
+      host_id: host.id, control_state: host.control_state, control_version: host.control_version,
+      control_actor_user_id: host.owner_id, control_lease_expires_at: renewedExpiry,
+      control_lease_active: true, control_lease_held_by_me: true,
       active_transition: hostControlTransitions.get(host.id) ?? null,
     });
   }),
@@ -913,8 +1449,14 @@ export const handlers = [
       host.control_state = command.action === "take_over" ? "user" : "ai";
       host.control_version = active.target_control_version;
       hostControlTransitions.delete(host.id);
+      if (host.control_state === "user") hostControlLeases.set(host.id, new Date(Date.now() + 30_000).toISOString());
+      else hostControlLeases.delete(host.id);
+      const expiresAt = hostControlLeases.get(host.id) ?? null;
       const response: ControlActionResponse = {
         host_id: host.id, control_state: host.control_state, control_version: host.control_version,
+        control_actor_user_id: expiresAt ? host.owner_id : "",
+        control_lease_expires_at: expiresAt, control_lease_active: !!expiresAt,
+        control_lease_held_by_me: !!expiresAt && user.id === host.owner_id,
         active_transition: null, pending_operation_ids: [],
       };
       hostControlActionReplays.set(replayKey, { request: requestBody, response });
@@ -936,6 +1478,8 @@ export const handlers = [
     hostControlTransitions.set(host.id, transition);
     const response: ControlActionResponse = {
       host_id: host.id, control_state: host.control_state, control_version: host.control_version,
+      control_actor_user_id: "",
+      control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false,
       active_transition: transition, pending_operation_ids: [`op-${host.id}`],
     };
     return json({ ...response }, 202);
@@ -971,6 +1515,12 @@ export const handlers = [
     if (host.state === "creating" && host.runtime_generation > 1) return json(host, 202);
     if (host.state === "running") return json(host, 202);
     if (host.state !== "stopped") return failure("invalid_state", "主机当前不能恢复", 409, { state: host.state });
+    const bindings = host.workspaces.filter((binding) => binding.state !== "detached");
+    if (bindings.length !== 1 || bindings[0]!.workspace.state !== "ready" || bindings[0]!.sync_state !== "healthy"
+      || bindings[0]!.desired_revision !== bindings[0]!.workspace.revision
+      || (bindings[0]!.state !== "active" && bindings[0]!.state !== "preparing")) {
+      return failure("workspace_conflict", "恢复前需要一个就绪工作区绑定", 409);
+    }
     host.state = "creating";
     host.state_reason = "restore_pending";
     host.runtime_generation += 1;
@@ -983,6 +1533,79 @@ export const handlers = [
   http.post("/api/hosts/:hostId/renew", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state === "deleting") return failure("invalid_state", "主机正在删除", 409, { state: host.state }); host.expires_at = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(); return json(host); }),
   http.post("/api/hosts/:hostId/enter", ({ params, cookies }) => { const host = findHost(String(params.hostId), sessionUser(cookies)!); if (!host) return failure("not_found", "主机不存在", 404); if (host.state === "deleting") return failure("invalid_state", "主机正在删除", 409, { state: host.state }); const url = new URL("/__ch/auth", host.url); url.searchParams.set("t", `mock-${host.id}-${Date.now()}`); return json({ url: url.href, expires_at: new Date(Date.now() + 60_000).toISOString() }); }),
   http.get("/api/workspaces", ({ cookies }) => { const user = sessionUser(cookies)!; completeDeletions(); return json({ items: workspaces.filter((workspace) => workspaceOwners.get(workspace.id) === user.id && workspace.state !== "deleted") }); }),
+  http.get("/api/workspaces/:workspaceId/manifest", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const workspace = workspaces.find((item) => item.id === String(params.workspaceId) && workspaceOwners.get(item.id) === user.id && item.state !== "deleted");
+    if (!workspace) return failure("not_found", "工作区不存在", 404);
+    const query = new URL(request.url).searchParams;
+    const revisionText = query.get("revision");
+    const revision = revisionText === null ? workspace.revision : Number(revisionText);
+    if (!Number.isSafeInteger(revision) || revision < 0) return failure("invalid_argument", "revision 无效", 400);
+    if (revision > workspace.revision) return failure("not_found", "revision 不存在", 404);
+    const cursor = query.get("cursor");
+    if (query.has("cursor") && (!cursor || cursor.length > 512)) return failure("invalid_argument", "manifest 游标无效", 400);
+    return json({ workspace_id: workspace.id, revision, files: [], empty_directories: [], next_cursor: null });
+  }),
+  http.get("/api/workspaces/:workspaceId/diff", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const workspace = workspaces.find((item) => item.id === String(params.workspaceId) && workspaceOwners.get(item.id) === user.id && item.state !== "deleted");
+    if (!workspace) return failure("not_found", "工作区不存在", 404);
+    const query = new URL(request.url).searchParams;
+    const fromRevision = Number(query.get("from_revision"));
+    const toRevision = Number(query.get("to_revision"));
+    if (!Number.isSafeInteger(fromRevision) || !Number.isSafeInteger(toRevision) || fromRevision < 0 || toRevision < 0) {
+      return failure("invalid_argument", "revision 无效", 400);
+    }
+    if (fromRevision > workspace.revision || toRevision > workspace.revision) return failure("not_found", "revision 不存在", 404);
+    const changes: components["schemas"]["WorkspaceDiffChange"][] = fromRevision === toRevision ? [] : [{
+      path: "README.md", action: "changed",
+      before: { kind: "file", path: "README.md", size_bytes: 12, sha256: "a".repeat(64), mode: 420 },
+      after: { kind: "file", path: "README.md", size_bytes: 13, sha256: "b".repeat(64), mode: 420 },
+      display_status: "text", before_text: `本地合成 revision v${fromRevision}`, after_text: `本地合成 revision v${toRevision}`,
+    }];
+    return json({ workspace_id: workspace.id, from_revision: fromRevision, to_revision: toRevision, changes });
+  }),
+  http.post("/api/workspaces/:workspaceId/restore", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const workspace = workspaces.find((item) => item.id === String(params.workspaceId) && workspaceOwners.get(item.id) === user.id && item.state !== "deleted");
+    if (!workspace) return failure("not_found", "工作区不存在", 404);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    const body = await request.json().catch(() => null) as components["schemas"]["WorkspaceRestoreRequest"] | null;
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key) || !body || Object.keys(body).some((field) =>
+      !["target_revision", "expected_current_revision", "paths"].includes(field))
+      || !Number.isSafeInteger(body.target_revision) || !Number.isSafeInteger(body.expected_current_revision)
+      || !Array.isArray(body.paths) || body.paths.length < 1 || body.paths.length > 1000
+      || body.paths.some((path) => typeof path !== "string" || !path || path.startsWith("/") || path.includes("\\")
+        || path.split("/").some((part) => !part || part === "." || part === ".."))) {
+      return failure("invalid_argument", "Workspace 恢复请求无效", 400);
+    }
+    const replayKey = `${user.id}:${workspace.id}:${key}`;
+    const serialized = JSON.stringify(body);
+    const replay = workspaceRestoreReplays.get(replayKey);
+    if (replay) return replay.request === serialized
+      ? json({ ...replay.response, replayed: true })
+      : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    if (workspace.state !== "ready" || body.expected_current_revision !== workspace.revision
+      || body.target_revision < 0 || body.target_revision > workspace.revision) {
+      return failure("workspace_conflict", "Workspace 已变化或恢复版本不可用", 409);
+    }
+    if (hosts.some((host) => host.workspaces.some((binding) => binding.workspace.id === workspace.id && binding.state !== "detached"))) {
+      return failure("workspace_busy", "请先解除 Workspace 主机绑定", 409);
+    }
+    if (body.paths.some((path) => path !== "README.md")) return failure("not_found", "恢复路径不在本地合成版本中", 404);
+    const result: components["schemas"]["WorkspaceRestoreResult"] = {
+      workspace_id: workspace.id, target_revision: body.target_revision, expected_current_revision: workspace.revision,
+      revision: workspace.revision + 1, replayed: false,
+    };
+    workspace.revision = result.revision;
+    workspace.updated_at = now();
+    workspaceRestoreReplays.set(replayKey, { request: serialized, response: result });
+    persistAssistantState();
+    return json(result);
+  }),
   http.get("/api/sites", ({ cookies }) => { sessionUser(cookies)!; return json({ items: [], next_cursor: null }); }),
   http.get("/api/sites/:siteId/releases", () => failure("not_found", "网站不存在", 404)),
   http.post("/api/workspaces", async ({ request, cookies }) => {
@@ -1026,7 +1649,7 @@ export const handlers = [
     if (workspace.state !== "ready") return failure("workspace_busy", "工作区正在删除", 409);
     if (body.expected_revision !== undefined && body.expected_revision !== workspace.revision) return failure("workspace_conflict", "工作区版本已变化", 409);
     materializeHost(host);
-    if (host.state !== "running") return failure("host_not_ready", "主机尚未就绪", 409);
+    if (host.state !== "running" && host.state !== "stopped") return failure("host_not_ready", "主机尚未就绪", 409);
 
     const history = host.workspaces.filter((item) => item.workspace.id === workspace.id);
     const currentVersion = Math.max(0, ...history.map((item) => item.binding_version));
@@ -1042,9 +1665,10 @@ export const handlers = [
     }
 
     const bindingVersion = currentVersion + 1;
+    const stopped = host.state === "stopped";
     const binding: WorkspaceBinding = {
-      workspace: toWorkspaceRef(workspace), directory: `projects/${workspace.id}`, state: "active",
-      binding_version: bindingVersion, desired_revision: workspace.revision, applied_revision: workspace.revision,
+      workspace: toWorkspaceRef(workspace), directory: `projects/${workspace.id}`, state: stopped ? "preparing" : "active",
+      binding_version: bindingVersion, desired_revision: workspace.revision, applied_revision: stopped ? 0 : workspace.revision,
       sync_state: "healthy", sync_conflicts: [],
     };
     host.workspaces = [...host.workspaces, binding];
@@ -1131,10 +1755,78 @@ export const handlers = [
       runtime: { state: "stopped", runtime_generation: 0, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: now(),
     });
   }),
+  http.get("/api/me/main-conversation", ({ cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const state = mainConversations.get(user.id) ?? { status: "uninitialized" as const, conversation_id: null, version: 0 };
+    return json({ ...state, conversation_id: state.conversation_id ?? "" });
+  }),
+  http.post("/api/me/main-conversation/ensure", ({ request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
+    const replayKey = `${user.id}:${key}`;
+    const previous = mainConversationReplays.get(replayKey);
+    if (previous) return json(previous.response);
+    let state = mainConversations.get(user.id) ?? { status: "uninitialized" as const, conversation_id: null, version: 0 };
+    if (state.status === "uninitialized") {
+      const candidates = conversations.filter((item) => conversationOwners.get(item.id) === user.id);
+      if (candidates.length > 1) state = { status: "selection_required", conversation_id: null, version: 0 };
+      else {
+        let conversation = candidates[0];
+        if (conversation) conversation.is_main = true;
+        else {
+          const timestamp = now();
+          conversation = { id: id("c"), scope: "personal", is_main: true, title: "主会话", created_at: timestamp, updated_at: timestamp };
+          conversations.push(conversation);
+          conversationOwners.set(conversation.id, user.id);
+        }
+        state = { status: "ready", conversation_id: conversation.id, version: 1 };
+      }
+      mainConversations.set(user.id, state);
+      persistAssistantState();
+    }
+    mainConversationReplays.set(replayKey, { request: "ensure", response: state });
+    return json({ ...state, conversation_id: state.conversation_id ?? "" });
+  }),
+  http.put("/api/me/main-conversation", async ({ request, cookies }) => {
+    const user = sessionUser(cookies);
+    if (!user) return failure("unauthenticated", "请先登录", 401);
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
+    const body = await request.json().catch(() => null) as { conversation_id?: unknown; expected_version?: unknown } | null;
+    if (!body || Object.keys(body).some((field) => field !== "conversation_id" && field !== "expected_version")
+      || typeof body.conversation_id !== "string" || typeof body.expected_version !== "number"
+      || !Number.isSafeInteger(body.expected_version) || body.expected_version < 0) {
+      return failure("invalid_argument", "主会话更新请求无效", 400);
+    }
+    const replayKey = `${user.id}:${key}`;
+    const requestText = JSON.stringify(body);
+    const previous = mainConversationReplays.get(replayKey);
+    if (previous) return previous.request === requestText ? json(previous.response) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    const current = mainConversations.get(user.id) ?? { status: "uninitialized" as const, conversation_id: null, version: 0 };
+    if (body.expected_version !== current.version) return failure("conflict", "主会话版本已变化", 409);
+    const conversation = conversations.find((item) => item.id === body.conversation_id && conversationOwners.get(item.id) === user.id);
+    if (!conversation) return failure("not_found", "对话不存在", 404);
+    for (const item of conversations) {
+      if (conversationOwners.get(item.id) === user.id) item.is_main = item.id === conversation.id;
+    }
+    const state: MainConversation = { status: "ready", conversation_id: conversation.id, version: current.version + 1 };
+    mainConversations.set(user.id, state);
+    mainConversationReplays.set(replayKey, { request: requestText, response: state });
+    persistAssistantState();
+    return json(state);
+  }),
   http.get("/api/conversations", ({ cookies }) => {
     const user = sessionUser(cookies)!;
     return json({ items: conversations.filter((item) => conversationOwners.get(item.id) === user.id)
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at)), next_cursor: null });
+  }),
+  http.get("/api/conversations/:conversationID", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversation = conversations.find((item) => item.id === String(params.conversationID) && conversationOwners.get(item.id) === user.id);
+    return conversation ? json(conversation) : failure("not_found", "对话不存在", 404);
   }),
   http.get("/api/conversations/:conversationID/messages", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -1166,7 +1858,7 @@ export const handlers = [
     if (conversation && activeConversationTask(conversation.id)) return failure("task_busy", "对话中已有任务正在运行", 409);
     if (!conversation) {
       const timestamp = now();
-      conversation = { id: id("c"), title: Array.from(body.objective.trim()).slice(0, 120).join(""), created_at: timestamp, updated_at: timestamp };
+      conversation = { id: id("c"), scope: "personal", is_main: false, title: Array.from(body.objective.trim()).slice(0, 120).join(""), created_at: timestamp, updated_at: timestamp };
       conversations.push(conversation);
       conversationOwners.set(conversation.id, user.id);
     }
@@ -1183,20 +1875,41 @@ export const handlers = [
     const key = request.headers.get("Idempotency-Key") ?? "";
     if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
     const body = await request.json().catch(() => null) as {
-      host_id?: string; workspace_id?: string; input_revision?: number; application_id?: string; model_id?: string;
+      expected_task_id?: string; host_id?: string; workspace_id?: string; input_revision?: number; application_id?: string; model_id?: string;
       content?: string; budget?: { active_seconds: number; tool_calls: number; model_tokens: number };
     } | null;
-    const allowed = ["host_id", "workspace_id", "input_revision", "application_id", "model_id", "content", "budget"];
+    const allowed = ["expected_task_id", "host_id", "workspace_id", "input_revision", "application_id", "model_id", "content", "budget"];
     if (!body || Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.model_id !== "string"
       || typeof body.content !== "string" || !body.content.trim() || Array.from(body.content).length > 32768) {
       return failure("invalid_argument", "对话内容无效", 400);
     }
+    if (body.expected_task_id !== undefined && typeof body.expected_task_id !== "string") return failure("invalid_argument", "expected_task_id 无效", 400);
     const requestText = JSON.stringify({ conversation_id: conversationID, ...body, content: body.content.trim() });
     const replayKey = `${user.id}:${key}`;
     const replay = taskMessageReplays.get(replayKey);
     if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
     if (!modelConnections.some((item) => item.id === body.model_id && item.checked_at && item.capabilities.text)) return failure("not_found", "模型不存在", 404);
-    if (activeConversationTask(conversationID)) return failure("task_busy", "对话中已有任务正在运行", 409);
+    const activeTask = activeConversationTask(conversationID);
+    if (body.expected_task_id && activeTask?.id !== body.expected_task_id) return failure("conflict", "活动任务已变化", 409);
+    if (activeTask) {
+      if (["pausing", "cancelling"].includes(activeTask.status) || activeTask.pending_request || activeTask.clarification_request
+        || activeTask.model_id !== body.model_id || (activeTask.host_id ?? "") !== (body.host_id ?? "")
+        || (activeTask.application_id ?? "") !== (body.application_id ?? "")
+        || (body.workspace_id !== undefined && (activeTask.workspace_id !== body.workspace_id || activeTask.input_revision !== body.input_revision))) {
+        return failure("conflict", "活动任务状态或目标已变化", 409);
+      }
+      const message: MockConversationMessage = {
+        id: id("m"), conversation_id: conversationID, role: "user", content: body.content.trim(),
+        task_id: activeTask.id, created_at: now(), delivery_status: "pending",
+      };
+      conversation.updated_at = message.created_at;
+      conversationMessages.push(message);
+      const result = { task: activeTask, message };
+      taskMessageReplays.set(replayKey, { request: requestText, response: result });
+      persistAssistantState();
+      return json(result, 202);
+    }
+    if (body.expected_task_id) return failure("conflict", "活动任务已结束", 409);
     const result = createTaskMessage(user, conversation, body.model_id, body.content.trim(), body);
     taskMessageReplays.set(replayKey, { request: requestText, response: result });
     persistAssistantState();
@@ -1211,28 +1924,46 @@ export const handlers = [
     if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
     const body = await request.json().catch(() => null) as { action?: unknown; expected_status?: unknown } | null;
     if (!body || Object.keys(body).some((field) => field !== "action" && field !== "expected_status")
-      || body.action !== "cancel" || typeof body.expected_status !== "string") {
-      return failure("invalid_argument", "停止请求无效", 400);
+      || !["pause", "resume", "cancel"].includes(String(body.action)) || typeof body.expected_status !== "string") {
+      return failure("invalid_argument", "任务操作请求无效", 400);
     }
+    const action = body.action as "pause" | "resume" | "cancel";
     const replayKey = `${user.id}:${key}`;
     const requestText = JSON.stringify({ taskID, ...body });
     const replay = taskActionReplays.get(replayKey);
     if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
-    if (!["queued", "running", "waiting_user", "paused"].includes(body.expected_status)) {
-      return failure("invalid_argument", "当前任务状态不能停止", 400);
-    }
+    const allowedExpectedStatuses = action === "resume" ? ["paused"]
+      : action === "pause" ? ["queued", "running", "waiting_user"]
+        : ["queued", "running", "waiting_user", "paused"];
+    if (!allowedExpectedStatuses.includes(body.expected_status)) return failure("invalid_argument", "当前任务状态不允许此操作", 400);
     if (task.status !== body.expected_status) return failure("conflict", "任务状态已变化", 409);
     const timestamp = now();
-    task.status = "cancelling";
-    task.stop_request = { id: id("s"), action: "cancel", status: "pending", safe_after: timestamp, unsettled_operation_ids: [] };
+    const nextStatus = action === "pause" ? "pausing" : action === "resume" ? "queued" : "cancelling";
+    task.status = nextStatus;
+    task.stop_request = action === "resume" ? null : {
+      id: id("s"), action, status: "pending", safe_after: timestamp, unsettled_operation_ids: [],
+    };
     task.updated_at = timestamp;
     task.event_sequence += 1;
     const response: components["schemas"]["TaskActionResponse"] = {
-      task_id: taskID, action: "cancel", status: "cancelling", unsettled_operation_ids: [],
+      task_id: taskID, action, status: nextStatus, unsettled_operation_ids: [],
     };
     taskActionReplays.set(replayKey, { request: requestText, response });
     persistAssistantState();
     return json(response, 202);
+  }),
+  http.get("/api/tasks", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    return json({ items: Array.from(tasks.values()).filter((task) => task.owner_id === user.id), next_cursor: null });
+  }),
+  http.post("/api/tasks/:taskID/workbench-observation-ticket", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const task = tasks.get(String(params.taskID));
+    if (!task || task.owner_id !== user.id || !task.host_id) return failure("not_found", "任务不存在", 404);
+    const host = hosts.find((item) => item.id === task.host_id);
+    if (!host || host.state !== "running") return failure("invalid_state", "任务目标电脑不可用", 409);
+    return json({ ticket: `mock-one-time-task-ticket-${task.id}`, task_id: task.id, host_id: host.id,
+      expires_at: new Date(Date.now() + 60_000).toISOString() });
   }),
   http.get("/api/tasks/:taskID", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -1240,12 +1971,21 @@ export const handlers = [
     if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
     return json(task);
   }),
-  http.get("/api/model-connections", () => json({ items: modelConnections })),
+  http.get("/api/tasks/:taskID/events", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const task = tasks.get(String(params.taskID));
+    if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
+    if (["completed", "failed", "cancelled"].includes(task.status)) return new HttpResponse(null, { status: 204 });
+    return new HttpResponse(new ReadableStream<Uint8Array>({ start() {} }), {
+      headers: { "Cache-Control": "no-cache", "Content-Type": "text/event-stream; charset=utf-8" },
+    });
+  }),
+  http.get("/api/model-connections", () => json({ items: modelConnections.filter((item) => item.shared) })),
   http.post("/api/model-connections", async ({ request, cookies }) => {
     const body = await request.json().catch(() => null) as components["schemas"]["CreateModelConnectionRequest"] | null;
     if (!body || !body.name?.trim() || !body.model_name?.trim() || !body.api_key?.trim()) return failure("invalid_argument", "模型连接信息不完整", 400);
     const actor = sessionUser(cookies)!;
-    if (body.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!body.shared || !isAdmin(actor)) return failure("forbidden", "只有管理员可配置团队模型", 403);
     let parsedURL: URL;
     try { parsedURL = new URL(body.base_url); } catch { return failure("invalid_argument", "服务地址无效", 400); }
     if (parsedURL.protocol !== "https:") return failure("invalid_argument", "服务地址必须使用 HTTPS", 400);
@@ -1257,9 +1997,8 @@ export const handlers = [
   }),
   http.put("/api/model-connections/:connectionID", async ({ params, request, cookies }) => {
     const connection = modelConnections.find((item) => item.id === String(params.connectionID));
-    if (!connection) return failure("not_found", "模型连接不存在", 404);
     const actor = sessionUser(cookies)!;
-    if (connection.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!connection?.shared || !isAdmin(actor)) return failure("not_found", "模型连接不存在", 404);
     const body = await request.json().catch(() => null) as components["schemas"]["UpdateModelConnectionRequest"] | null;
     if (!body || !body.name.trim() || !body.model_name.trim()) return failure("invalid_argument", "模型连接信息不完整", 400);
     let parsedURL: URL;
@@ -1277,23 +2016,21 @@ export const handlers = [
   }),
   http.delete("/api/model-connections/:connectionID", ({ params, cookies }) => {
     const index = modelConnections.findIndex((item) => item.id === String(params.connectionID));
-    if (index < 0) return failure("not_found", "模型连接不存在", 404);
-    const connection = modelConnections[index]!;
     const actor = sessionUser(cookies)!;
-    if (connection.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const connection = modelConnections[index];
+    if (!connection?.shared || !isAdmin(actor)) return failure("not_found", "模型连接不存在", 404);
     modelConnections.splice(index, 1);
-    if (connection.shared) recordMockAudit(actor, "model.connection.delete", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname });
+    recordMockAudit(actor, "model.connection.delete", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname });
     return empty();
   }),
   http.post("/api/model-connections/:connectionID/check", ({ params, cookies }) => {
     const connection = modelConnections.find((item) => item.id === String(params.connectionID));
-    if (!connection) return failure("not_found", "模型连接不存在", 404);
     const actor = sessionUser(cookies)!;
-    if (connection.shared && !isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    if (!connection?.shared || !isAdmin(actor)) return failure("not_found", "模型连接不存在", 404);
     connection.capabilities = { text: true, tools: true, vision: false };
     connection.checked_at = now();
     connection.updated_at = now();
-    if (connection.shared) recordMockAudit(actor, "model.connection.check", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname, capabilities: connection.capabilities });
+    recordMockAudit(actor, "model.connection.check", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname, capabilities: connection.capabilities });
     return json(connection.capabilities);
   }),
   http.get("/api/notifications", ({ request, cookies }) => {
@@ -1382,12 +2119,32 @@ export const handlers = [
   }),
   http.get("/api/admin/settings", ({ cookies }) => isAdmin(sessionUser(cookies)!) ? json({
     registration_review_required: true,
-    automatic_new_user_model_budget: false,
+    automatic_new_user_model_budget: true,
     automatic_invitation_reward: false,
     automatic_contribution_reward: false,
     default_personal_data_quota_bytes: 5 * 1024 ** 3,
     default_personal_attachment_bytes: 300 * 1024 ** 2,
+    default_model_budget: defaultModelBudget,
   }) : failure("forbidden", "没有执行此操作的权限", 403)),
+  http.put("/api/admin/settings/model-budget-default", async ({ request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const body = await request.json().catch(() => null) as { expected_version?: unknown; token_limit?: unknown; max_concurrent?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 0
+      || !Number.isSafeInteger(body.token_limit) || Number(body.token_limit) < 1
+      || !Number.isInteger(body.max_concurrent) || Number(body.max_concurrent) < 1 || Number(body.max_concurrent) > 100) {
+      return failure("invalid_argument", "新用户默认模型额度无效", 400);
+    }
+    if (Number(body.expected_version) !== defaultModelBudget.version) return failure("conflict", "默认模型额度版本已变化，请刷新后重试", 409);
+    defaultModelBudget = {
+      configured: true,
+      token_limit: Number(body.token_limit),
+      max_concurrent: Number(body.max_concurrent),
+      version: defaultModelBudget.version + 1,
+    };
+    recordMockAudit(actor, "model.budget.default.update", "platform", { token_limit: defaultModelBudget.token_limit, max_concurrent: defaultModelBudget.max_concurrent, version: defaultModelBudget.version });
+    return json(defaultModelBudget);
+  }),
   http.get("/api/admin/invites", ({ request, cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
     const query = new URL(request.url).searchParams;
@@ -1833,6 +2590,10 @@ export const handlers = [
     if (body.status === undefined && body.role === undefined && body.quota === undefined && body.default_host_resources === undefined) return failure("invalid_argument", "至少需要一个更新字段", 400);
     const nextStatus = body.status ?? user.status;
     if (body.status !== undefined && !nextAccountStatuses[user.status].includes(body.status)) return failure("conflict", "不允许此账号状态转换", 409);
+    const firstApproval = nextStatus === "approved" && (user.status === "pending" || user.status === "rejected");
+    if (firstApproval && !defaultModelBudget.configured) {
+      return failure("invalid_state", "请先配置新用户默认模型额度，再批准账号", 409);
+    }
     if (body.status !== undefined && actor.id === user.id) return failure("forbidden", "不能修改自己的账号状态", 403);
     if (body.role !== undefined) {
       if (user.status !== "approved" || nextStatus !== "approved") return failure("conflict", "只有已通过账号可以调整角色", 409);
@@ -1846,6 +2607,15 @@ export const handlers = [
       return failure("invalid_argument", "默认电脑规格无效", 400);
     }
     const credentialsChanged = nextStatus !== user.status || body.role !== undefined;
+    if (firstApproval && !modelBudgets.has(user.id)) modelBudgets.set(user.id, {
+      owner_id: user.id,
+      configured: true,
+      token_limit: defaultModelBudget.token_limit,
+      max_concurrent: defaultModelBudget.max_concurrent,
+      used_tokens: 0,
+      in_flight: 0,
+      has_unknown: false,
+    });
     user.status = nextStatus;
     if (body.role !== undefined) user.role = body.role;
     if (body.quota !== undefined) user.quota = body.quota;

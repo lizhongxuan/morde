@@ -306,6 +306,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND account_runtime_id=$3 AND
 		return fmt.Errorf("count active account Runtime tasks: %w", err)
 	}
 	*target = execution.Runtime{State: state, RuntimeID: runtime.Fence.RuntimeID,
+		FailureReason:     runtime.FailureReason,
 		RuntimeGeneration: runtime.Fence.RuntimeGeneration, MaxConcurrentTasks: runtime.MaxConcurrentTasks,
 		ActiveTaskCount: activeTaskCount}
 	return nil

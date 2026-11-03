@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -120,11 +121,67 @@ func (s *WorkspaceService) ListWorkspaces(ctx context.Context, principal identit
 	}
 	result := make([]workspace.Workspace, 0, len(values))
 	for _, value := range values {
-		if value.State != workspace.StateDeleted && value.DeletedAt == nil {
+		if value.State != workspace.StateDeleted && value.State != workspace.StateCopying && value.DeletedAt == nil {
 			result = append(result, value)
 		}
 	}
 	return result, nil
+}
+
+func (s *WorkspaceService) EnsureDefaultWorkspace(ctx context.Context, ownerID string) (workspace.Workspace, error) {
+	if !domain.ValidUserID(ownerID) {
+		return workspace.Workspace{}, domain.InvalidArgument("user_id", "user id is invalid")
+	}
+	values, err := s.store.ListWorkspacesByOwner(ctx, ownerID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	sort.Slice(values, func(i, j int) bool {
+		if values[i].CreatedAt.Equal(values[j].CreatedAt) {
+			return values[i].ID < values[j].ID
+		}
+		return values[i].CreatedAt.Before(values[j].CreatedAt)
+	})
+	for _, value := range values {
+		if value.OwnerID != ownerID || value.State != workspace.StateReady || value.DeletedAt != nil {
+			continue
+		}
+		if registryStore, ok := s.store.(WorkspaceVolumeRegistryStore); ok {
+			registered, err := registryStore.GetWorkspaceVolumeRegistry(ctx, value.ID)
+			if domain.CodeOf(err) == domain.CodeNotFound {
+				continue
+			}
+			if err != nil {
+				return workspace.Workspace{}, err
+			}
+			if registered.WorkspaceID != value.ID || registered.OwnerID != ownerID {
+				return workspace.Workspace{}, domain.NewError(domain.CodeInternal, "Workspace volume registration is inconsistent")
+			}
+			if registered.State != WorkspaceVolumePending && registered.State != WorkspaceVolumeReady {
+				continue
+			}
+		}
+		bindings, err := s.store.GetWorkspaceBindingsByWorkspace(ctx, value.ID)
+		if err != nil {
+			return workspace.Workspace{}, err
+		}
+		available := true
+		for _, binding := range bindings {
+			if binding.State != workspace.BindingDetached {
+				available = false
+				break
+			}
+		}
+		if available {
+			return value, nil
+		}
+	}
+	key, err := domain.NewWorkspaceID()
+	if err != nil {
+		return workspace.Workspace{}, fmt.Errorf("generate default Workspace idempotency key: %w", err)
+	}
+	return s.CreateWorkspace(ctx, identity.Principal{UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindSession},
+		CreateWorkspaceCommand{Name: "Default Workspace"}, "default-host-workspace-"+key)
 }
 
 func (s *WorkspaceService) ListDeviceWorkspaces(ctx context.Context, principal identity.Principal) ([]DeviceWorkspaceInfo, error) {

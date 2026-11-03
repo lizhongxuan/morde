@@ -22,6 +22,8 @@ type syncServiceStore struct {
 	workspace                                workspace.Workspace
 	binding                                  workspace.Binding
 	snapshots                                map[int64][]workspace.File
+	directorySnapshots                       map[int64][]workspace.Directory
+	emptyDirectorySnapshots                  map[int64][]string
 	sessions                                 map[string]workspace.SyncSession
 	commitReceipts                           map[string]WorkspaceSyncCommitReceipt
 	taskWorkspacePublishReceipts             map[string]TaskWorkspacePublishReceipt
@@ -69,7 +71,8 @@ func (lock syncServiceBlockLock) Release(context.Context) error {
 func newSyncServiceStore() *syncServiceStore {
 	return &syncServiceStore{
 		workspace: workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", Name: "test", State: workspace.StateReady, QuotaBytes: 1 << 30},
-		snapshots: map[int64][]workspace.File{0: {}}, sessions: map[string]workspace.SyncSession{}, commitReceipts: map[string]WorkspaceSyncCommitReceipt{},
+		snapshots: map[int64][]workspace.File{0: {}}, directorySnapshots: map[int64][]workspace.Directory{0: {}}, emptyDirectorySnapshots: map[int64][]string{0: {}},
+		sessions: map[string]workspace.SyncSession{}, commitReceipts: map[string]WorkspaceSyncCommitReceipt{},
 		blocks: map[string][]workspace.TransferBlock{}, changes: []workspace.Change{},
 		taskWorkspacePublishReceipts: map[string]TaskWorkspacePublishReceipt{}, taskWorkspacePublishCommands: map[string]TaskWorkspacePublishCommand{},
 	}
@@ -116,8 +119,7 @@ func (s *syncServiceStore) FindTaskWorkspacePublishReceipt(_ context.Context, ow
 	return receipt, nil
 }
 
-func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
-	_ = emptyDirectories
+func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
 	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
 	receipt, exists := s.taskWorkspacePublishReceipts[key]
 	if !exists || receipt.State != TaskWorkspacePublishPending {
@@ -129,12 +131,16 @@ func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value T
 		return receipt, nil
 	}
 	revision := value.BaseRevision
-	if !reflect.DeepEqual(s.snapshots[value.BaseRevision], files) {
+	if !reflect.DeepEqual(s.snapshots[value.BaseRevision], files) ||
+		!reflect.DeepEqual(s.emptyDirectorySnapshots[value.BaseRevision], emptyDirectories) ||
+		!reflect.DeepEqual(s.directorySnapshots[value.BaseRevision], directories) {
 		revision++
 	}
 	receipt.State, receipt.ManifestSHA256, receipt.PublishedRevision = TaskWorkspacePublishSucceeded, manifestSHA, revision
 	s.taskWorkspacePublishReceipts[key] = receipt
 	s.workspace.Revision, s.snapshots[revision] = revision, append([]workspace.File(nil), files...)
+	s.emptyDirectorySnapshots[revision] = append([]string(nil), emptyDirectories...)
+	s.directorySnapshots[revision] = append([]workspace.Directory(nil), directories...)
 	return receipt, nil
 }
 
@@ -277,13 +283,39 @@ func (s *syncServiceStore) GetWorkspaceManifestPage(_ context.Context, id string
 		}
 		result = append(result, file)
 	}
+	emptyDirectories := make([]string, 0)
+	for _, directory := range s.emptyDirectorySnapshots[revision] {
+		if after != "" && directory <= after {
+			continue
+		}
+		if prefix != "" && directory != prefix && !strings.HasPrefix(directory, prefix+"/") {
+			continue
+		}
+		emptyDirectories = append(emptyDirectories, directory)
+	}
+	directories := make([]workspace.Directory, 0)
+	for _, directory := range s.directorySnapshots[revision] {
+		if prefix != "" && directory.Path != prefix && !strings.HasPrefix(directory.Path, prefix+"/") && !strings.HasPrefix(prefix, directory.Path+"/") {
+			continue
+		}
+		directories = append(directories, directory)
+	}
 	if int32(len(result)) > limit {
 		result = result[:limit]
 		last := result[len(result)-1].Path
 		cursor := workspace.EncodeManifestCursor(workspace.ManifestCursor{Revision: revision, Prefix: prefix, After: last})
-		return workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: result, NextCursor: &cursor}, nil
+		return workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: result, EmptyDirectories: emptyDirectories,
+			Directories: directories, NextCursor: &cursor}, nil
 	}
-	return workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: result}, nil
+	return workspace.ManifestPage{WorkspaceID: id, Revision: revision, Files: result, EmptyDirectories: emptyDirectories, Directories: directories}, nil
+}
+
+func (s *syncServiceStore) GetWorkspaceManifestPageForOwnershipTransfer(ctx context.Context, ownerID, workspaceID, transferID string,
+	revision int64, prefix, after string, limit int32) (workspace.ManifestPage, error) {
+	if ownerID != s.workspace.OwnerID || !workspace.ValidOwnershipTransferID(transferID) {
+		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace ownership transfer not found")
+	}
+	return s.GetWorkspaceManifestPage(ctx, workspaceID, revision, prefix, after, limit)
 }
 
 func (s *syncServiceStore) GetWorkspaceChangePage(_ context.Context, _ string, revision int64, after string, limit int32) (workspace.ChangePage, error) {
@@ -1446,5 +1478,22 @@ func TestWorkspaceSyncServiceStopsHostChangesPollAfterBindingVersionRevocation(t
 	_, err = service.GetChanges(context.Background(), principal, store.workspace.ID, cursor, time.Second, 10)
 	if domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("Host changes poll after binding revocation = %v; want not found", err)
+	}
+}
+
+func TestVerifyUploadedFilesAcceptsSymlinkMetadataWithoutContentBlocks(t *testing.T) {
+	store := newSyncServiceStore()
+	service, err := NewWorkspaceSyncService(store, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "README.md"
+	digest := sha256.Sum256([]byte(target))
+	file := workspace.File{Path: "current", Kind: "symlink", SymlinkTarget: target, SizeBytes: int64(len(target)),
+		SHA256: hex.EncodeToString(digest[:]), Mode: 0, Chunks: []workspace.Chunk{}}
+	if err := service.verifyUploadedFiles(context.Background(), store.workspace.ID, workspace.SyncSession{
+		ID: "sync-test", UploadFiles: []workspace.File{file},
+	}); err != nil {
+		t.Fatalf("verifyUploadedFiles() = %v; want link-target integrity without block reads", err)
 	}
 }

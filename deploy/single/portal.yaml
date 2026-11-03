@@ -28,6 +28,8 @@ security:
   login_rate_limit: 5/min
 models:
   allowed_hosts: [api.openai.com]
+  # Add one explicit, versioned rate per model before enabling project model calls.
+  project_rates: []
 orchestrator:
   profiles:
     container:

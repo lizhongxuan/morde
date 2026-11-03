@@ -30,7 +30,7 @@ type cloudDSHMCPOutput struct {
 }
 
 func (b *CloudDSHToolBroker) currentServerTask(ctx context.Context, claimed task.Task) (TaskDetails, error) {
-	details, err := (&Agent{store: b.store}).refreshTask(ctx, claimed)
+	details, err := b.currentTaskDetails(ctx, claimed)
 	if err != nil {
 		return TaskDetails{}, err
 	}
@@ -69,11 +69,15 @@ func (b *CloudDSHToolBroker) mcpDefinitions(ctx context.Context, claimed task.Ta
 		if !principal.HasScope(identity.ScopeMCPControl) {
 			return nil, domain.NewError(domain.CodeForbidden, "task authorization does not allow MCP connector tools")
 		}
-		if grant.TaskID != details.Task.ID || grant.OwnerID != details.Task.OwnerID || !domain.ValidMCPConnectorID(grant.ConnectorID) ||
+		if grant.TaskID != details.Task.ID || grant.OwnerID != details.Task.OwnerID || !domain.ValidUserID(grant.ConnectorOwnerID) ||
+			!domain.ValidMCPConnectorID(grant.ConnectorID) ||
 			grant.ConnectorRevision < 1 || grant.CredentialVersion < 0 || grant.GrantVersion < 1 {
 			return nil, domain.NewError(domain.CodeInternal, "stored MCP connector grant is invalid")
 		}
-		connector, err := connectors.GetMCPConnector(ctx, grant.OwnerID, grant.ConnectorID)
+		if err := authorizeTaskMCPProjectConnector(ctx, b.store, details.Task, grant); err != nil {
+			return nil, err
+		}
+		connector, err := connectors.GetMCPConnector(ctx, grant.ConnectorOwnerID, grant.ConnectorID)
 		if err != nil {
 			return nil, err
 		}
@@ -84,9 +88,17 @@ func (b *CloudDSHToolBroker) mcpDefinitions(ctx context.Context, claimed task.Ta
 		if err != nil {
 			return nil, err
 		}
+		if err := authorizeTaskMCPProjectConnector(ctx, b.store, details.Task, grant); err != nil {
+			return nil, err
+		}
 		remoteTools, err := b.mcpClient.ListTools(ctx, connector.EndpointURL, headers)
 		if err != nil {
 			return nil, domain.NewError(domain.CodeUpstreamError, "MCP connector tools could not be loaded")
+		}
+		// Discovery crosses the network boundary after the first authorization
+		// check. Recheck before pinning or exposing the returned tool catalog.
+		if err := authorizeTaskMCPProjectConnector(ctx, b.store, details.Task, grant); err != nil {
+			return nil, err
 		}
 		encoded, digest, err := canonicalMCPToolSchema(remoteTools)
 		if err != nil {
@@ -179,6 +191,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		!domain.ValidMCPConnectorID(definition.MCPConnectorID) || definition.MCPRemoteToolName == "" {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow this MCP connector tool")
 	}
+	actorID := taskActorID(current)
 	grants, err := grantStore.ListTaskMCPConnectorGrants(ctx, current.OwnerID, current.ID)
 	if err != nil {
 		return AgentToolResult{}, err
@@ -190,11 +203,14 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 			break
 		}
 	}
-	if grant == nil || grant.TaskID != current.ID || grant.OwnerID != current.OwnerID || grant.GrantVersion < 1 ||
+	if grant == nil || grant.TaskID != current.ID || grant.OwnerID != current.OwnerID || !domain.ValidUserID(grant.ConnectorOwnerID) || grant.GrantVersion < 1 ||
 		!bytes.Equal(grant.ToolSchemaSHA256, sha256Bytes(grant.ToolSchema)) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "MCP connector was not granted to this task")
 	}
-	connector, err := connectorStore.GetMCPConnector(ctx, current.OwnerID, grant.ConnectorID)
+	if err := authorizeTaskMCPProjectConnector(ctx, b.store, current, *grant); err != nil {
+		return AgentToolResult{}, err
+	}
+	connector, err := connectorStore.GetMCPConnector(ctx, grant.ConnectorOwnerID, grant.ConnectorID)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -286,7 +302,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		if err != nil {
 			return AgentToolResult{}, err
 		}
-		if binding.OwnerID != current.OwnerID || binding.HostID != current.HostID || binding.Workspace.ID != current.WorkspaceID || binding.BindingVersion <= 0 {
+		if binding.OwnerID != actorID || binding.HostID != current.HostID || binding.Workspace.ID != current.WorkspaceID || binding.BindingVersion <= 0 {
 			return AgentToolResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed before MCP operation preparation")
 		}
 		preparedFence.BindingVersion = binding.BindingVersion
@@ -345,7 +361,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	if _, err := operationStore.MarkMCPConnectorOperationDispatched(ctx, operation, current.Lease.Owner); err != nil {
 		if latest, getErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, grant.ConnectorID, key); getErr == nil &&
 			(latest.Status == task.OperationCancelled || latest.Status == task.OperationUnknown) {
-			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant changed before dispatch.")
+			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant changed before dispatch.", latest.Status)
 		}
 		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
 			return b.pauseMCPWorkspaceInputChange(ctx, current, step, usage, call.Name)
@@ -359,7 +375,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 			if markErr := b.markMCPUnknown(ctx, current, operation, "MCP call ended after connector revocation."); markErr != nil {
 				return AgentToolResult{}, markErr
 			}
-			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant or task was revoked while the MCP call was running.")
+			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant or task was revoked while the MCP call was running.", task.OperationUnknown)
 		}
 		if markErr := b.markMCPUnknown(ctx, current, operation, "MCP call outcome could not be confirmed."); markErr != nil {
 			return AgentToolResult{}, errors.Join(callErr, markErr)
@@ -383,13 +399,24 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	cancel()
 	if completeErr != nil {
 		latest, getErr := operationStore.GetMCPConnectorOperation(context.WithoutCancel(ctx), current.OwnerID, current.ID, grant.ConnectorID, key)
-		if getErr == nil && latest.CancelRequested {
-			if markErr := b.markMCPUnknown(ctx, current, operation, "MCP result was discarded after connector revocation."); markErr != nil {
-				return AgentToolResult{}, errors.Join(completeErr, markErr)
+		if getErr == nil && latest.Status == operationStatus && latest.Result == output {
+			// The commit may have succeeded even if its confirmation was lost.
+			completed = latest
+		} else {
+			if getErr == nil && latest.Status == task.OperationDispatched {
+				unknownReason := "MCP result could not be committed after the connector returned."
+				if latest.CancelRequested {
+					unknownReason = "MCP result was discarded after connector authorization was revoked."
+				}
+				if markErr := b.markMCPUnknown(ctx, current, operation, unknownReason); markErr != nil {
+					return AgentToolResult{}, errors.Join(completeErr, markErr)
+				}
+				if latest.CancelRequested {
+					return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant or task was revoked while the MCP call was running.", task.OperationUnknown)
+				}
 			}
-			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant or task was revoked while the MCP call was running.")
+			return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP call returned, but its result could not be committed safely.")
 		}
-		return AgentToolResult{}, completeErr
 	}
 	if completed.Status != operationStatus || completed.Result != output {
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector result could not be verified in the operation ledger.")
@@ -401,6 +428,31 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		return AgentToolResult{Status: AgentToolUnknown}, ctx.Err()
 	}
 	return b.commitMCPResult(ctx, current, step, usage, call.Name, AgentToolResult{Status: resultStatus, Output: output})
+}
+
+func taskActorID(value task.Task) string {
+	if value.InitiatorID != "" {
+		return value.InitiatorID
+	}
+	return value.OwnerID
+}
+
+func authorizeTaskMCPProjectConnector(ctx context.Context, store any, current task.Task, grant TaskMCPConnectorGrant) error {
+	if current.ProjectID == "" {
+		if grant.ProjectID != "" || grant.ProjectGrantVersion != 0 || grant.ConnectorOwnerID != grant.OwnerID {
+			return domain.NewError(domain.CodeForbidden, "personal MCP connector grant has an invalid project scope")
+		}
+		return nil
+	}
+	if grant.ProjectID != current.ProjectID || grant.ProjectGrantVersion < 1 {
+		return domain.NewError(domain.CodeForbidden, "MCP connector was not granted to this project")
+	}
+	authorizer, ok := store.(ProjectMCPConnectorAuthorizationStore)
+	if !ok {
+		return domain.NewError(domain.CodeUnsupported, "project MCP connector authorization is unavailable")
+	}
+	return authorizer.AuthorizeProjectMCPConnector(ctx, current.ProjectID, taskActorID(current), grant.ConnectorOwnerID,
+		grant.ConnectorID, grant.ProjectGrantVersion)
 }
 
 func sameMCPConnectorOperationTaskSnapshot(operation MCPConnectorOperation, current task.Task) bool {
@@ -530,12 +582,13 @@ func (b *CloudDSHToolBroker) pauseMCPUnknown(ctx context.Context, current task.T
 	return AgentToolResult{Status: AgentToolUnknown}, err
 }
 
-func (b *CloudDSHToolBroker) pauseMCPNeedsUser(ctx context.Context, current task.Task, step task.Step, usage task.Usage, key, summary string) (AgentToolResult, error) {
+func (b *CloudDSHToolBroker) pauseMCPNeedsUser(ctx context.Context, current task.Task, step task.Step, usage task.Usage, key, summary string,
+	operationStatus task.OperationStatus) (AgentToolResult, error) {
 	step.Status, step.Summary = task.StepUnknown, summary
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
 	defer cancel()
 	err := b.commitProgress(persistCtx, current, step, usage, task.StatusWaitingUser, "mcp_connector_revoked", "task.waiting_user", map[string]any{
-		"operation_key": key, "operation_status": task.OperationCancelled,
+		"operation_key": key, "operation_status": operationStatus,
 	})
 	return AgentToolResult{Status: AgentToolNeedsUser}, err
 }

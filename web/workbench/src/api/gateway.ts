@@ -30,22 +30,12 @@ export type GatewayWorkspaceBinding = {
 };
 
 export type GatewayWorkspaceManifest = components['schemas']['WorkspaceManifest'];
+export type GatewayWorkspaceDiff = components['schemas']['WorkspaceDiff'];
+export type GatewayTaskObservationSnapshot = components['schemas']['TaskWorkbenchObservationSnapshot'];
 
 export type GatewayControlAction = 'take_over' | 'release';
 export type GatewayControlState = 'ai' | 'taking_over' | 'user' | 'returning';
-export type GatewayControl = {
-  host_id: string;
-  control_state: GatewayControlState;
-  control_version: number;
-  active_transition: {
-    request_id: string;
-    action: GatewayControlAction;
-    phase: string;
-    failure_reason?: string;
-    expected_control_version: number;
-  } | null;
-  pending_operation_ids?: string[];
-};
+export type GatewayControl = components['schemas']['ControlStatus'] & { pending_operation_ids?: string[] };
 export type GatewayControlRequest = {
   action: GatewayControlAction;
   request_id: string;
@@ -84,8 +74,29 @@ type GatewayPaths = {
       responses: JsonResponse<GatewayWorkspaceManifest>['responses'];
     };
   };
+  '/__ch/api/workspaces/{workspace_id}/diff': {
+    get: {
+      parameters: {
+        path: { workspace_id: string };
+        query: { from_revision: number; to_revision: number };
+      };
+      responses: JsonResponse<GatewayWorkspaceDiff>['responses'];
+    };
+  };
+  '/__ch/api/tasks/{task_id}': {
+    get: {
+      parameters: { path: { task_id: string } };
+      responses: JsonResponse<GatewayTaskObservationSnapshot>['responses'];
+    };
+  };
   '/__ch/api/renew': { post: JsonResponse<GatewayHost> };
   '/__ch/api/control': { get: JsonResponse<GatewayControl> };
+  '/__ch/api/control/lease/renew': {
+    post: {
+      requestBody: { content: { 'application/json': components['schemas']['ControlLeaseRenewRequest'] } };
+      responses: JsonResponse<GatewayControl>['responses'];
+    };
+  };
   '/__ch/api/applications': paths['/__ch/api/applications'];
   '/__ch/api/applications/{app_id}/install': {
     post: {
@@ -197,6 +208,19 @@ export const gatewayApi = {
       },
     }));
   },
+  async workspaceDiff(workspaceID: string, fromRevision: number, toRevision: number) {
+    return unwrap(await client.GET('/__ch/api/workspaces/{workspace_id}/diff', {
+      params: { path: { workspace_id: workspaceID }, query: { from_revision: fromRevision, to_revision: toRevision } },
+    }));
+  },
+  async taskObservation(taskID: string) {
+    return unwrap(await client.GET('/__ch/api/tasks/{task_id}', { params: { path: { task_id: taskID } } }));
+  },
+  taskObservationEventsURL(taskID: string, after: number) {
+    const url = new URL(`/__ch/api/tasks/${encodeURIComponent(taskID)}/events`, window.location.origin);
+    url.searchParams.set('after', String(after));
+    return url.href;
+  },
   async downloadWorkspaceFile(workspaceID: string, revision: number, relativePath: string) {
     const response = await requestFetch(workspaceFileURL(workspaceID, revision, relativePath), { method: 'GET', credentials: 'same-origin' });
     if (!response.ok) await throwResponseError(response);
@@ -218,6 +242,9 @@ export const gatewayApi = {
   },
   async control() {
     return unwrap(await client.GET('/__ch/api/control'));
+  },
+  async renewControlLease(expected_control_version: number) {
+    return unwrap(await client.POST('/__ch/api/control/lease/renew', { body: { expected_control_version } }));
   },
   async applications() {
     return unwrap(await client.GET('/__ch/api/applications'));

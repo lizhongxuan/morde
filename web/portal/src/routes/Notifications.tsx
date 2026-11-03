@@ -5,7 +5,10 @@ import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 
 type Notification = components['schemas']['Notification'];
-const kindLabel: Record<Notification['kind'], string> = { completed: '已完成', failed: '失败', waiting_user: '待处理（已停用）' };
+const kindLabel: Record<Notification['kind'], string> = {
+  completed: '已完成', failed: '失败', waiting_user: '待处理（已停用）', goal_step_blocked: '目标步骤受阻', goal_completed: '目标已完成',
+  project_work_item_blocked: '项目工作项受阻', project_work_item_delivered: '项目工作项已交付',
+};
 
 export function Notifications() {
   const client = useQueryClient();

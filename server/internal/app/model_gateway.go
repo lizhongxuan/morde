@@ -15,6 +15,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 )
 
 type ModelCallSource string
@@ -29,6 +30,7 @@ const (
 type ModelTaskFence struct {
 	TaskID               string
 	OwnerID              string
+	InitiatorID          string
 	LeaseOwner           string
 	LeaseVersion         int64
 	AgentInstanceID      string
@@ -39,6 +41,12 @@ type ModelTaskFence struct {
 	ThroughSequence      int64
 	EngineVersion        string
 	ProfileVersion       string
+}
+
+// ModelTaskProjectResolver reads the project scope from the persisted Task so
+// a missing fence field can never turn a project call into personal billing.
+type ModelTaskProjectResolver interface {
+	ModelTaskProjectID(context.Context, ModelTaskFence) (string, error)
 }
 
 type ModelCall struct {
@@ -56,6 +64,7 @@ type ModelCallReservation struct {
 	Source            ModelCallSource
 	Principal         identity.Principal
 	Task              *ModelTaskFence
+	ProjectID         string
 	OwnerID           string
 	ModelID           string
 	ProviderModel     string
@@ -88,9 +97,10 @@ type ModelGatewayResolver interface {
 }
 
 type ModelGatewayService struct {
-	store  ModelCallStore
-	models ModelGatewayResolver
-	client ModelClient
+	store         ModelCallStore
+	models        ModelGatewayResolver
+	client        ModelClient
+	projectBudget *ProjectBudgetService
 }
 
 type ModelGatewayEndpoint struct {
@@ -98,11 +108,15 @@ type ModelGatewayEndpoint struct {
 	Version  time.Time
 }
 
-func NewModelGatewayService(store ModelCallStore, models ModelGatewayResolver, client ModelClient) (*ModelGatewayService, error) {
-	if store == nil || models == nil || client == nil {
+func NewModelGatewayService(store ModelCallStore, models ModelGatewayResolver, client ModelClient, projectBudgets ...*ProjectBudgetService) (*ModelGatewayService, error) {
+	if store == nil || models == nil || client == nil || len(projectBudgets) > 1 || len(projectBudgets) == 1 && projectBudgets[0] == nil {
 		return nil, errors.New("model gateway dependencies are required")
 	}
-	return &ModelGatewayService{store: store, models: models, client: client}, nil
+	service := &ModelGatewayService{store: store, models: models, client: client}
+	if len(projectBudgets) == 1 {
+		service.projectBudget = projectBudgets[0]
+	}
+	return service, nil
 }
 
 var dshModelIdentityPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -135,6 +149,20 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
+	projectID := ""
+	if call.Source == ModelCallTask {
+		resolver, ok := s.store.(ModelTaskProjectResolver)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "task project scope is unavailable")
+		}
+		projectID, err = resolver.ModelTaskProjectID(ctx, *call.Task)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+		if projectID != "" && s.projectBudget == nil {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
+		}
+	}
 	needsTools := len(call.Request.Tools) != 0
 	needsVision := false
 	for _, input := range call.Request.Input {
@@ -155,10 +183,17 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	reservation := ModelCallReservation{
 		Source: call.Source, Principal: call.Principal, Task: call.Task, OwnerID: ownerID,
-		ModelID: call.ModelID, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
+		ProjectID: projectID,
+		ModelID:   call.ModelID, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
 		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
 	}
-	if err := s.store.ReserveModelCall(ctx, reservation); err != nil {
+	projectCall := projectID != ""
+	if projectCall {
+		usage := projectUsageReservation(call.Request, reserve)
+		if _, _, err := s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage); err != nil {
+			return ModelResponse{}, err
+		}
+	} else if err := s.store.ReserveModelCall(ctx, reservation); err != nil {
 		return ModelResponse{}, err
 	}
 	request := call.Request
@@ -177,8 +212,17 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := s.store.SettleModelCall(settleCtx, settlement); err != nil {
-		return ModelResponse{}, fmt.Errorf("settle model call: %w", err)
+	var settleErr error
+	if projectCall {
+		settleErr = s.projectBudget.SettleModelCall(settleCtx, SettleProjectModelCallCommand{
+			ProjectID: projectID, Source: call.Source, CallID: call.CallID,
+			Usage: project.Usage{InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens}, Unknown: settlement.Unknown,
+		})
+	} else {
+		settleErr = s.store.SettleModelCall(settleCtx, settlement)
+	}
+	if settleErr != nil {
+		return ModelResponse{}, fmt.Errorf("settle model call: %w", settleErr)
 	}
 	if callErr != nil {
 		return ModelResponse{}, modelConnectionCheckError(callErr)
@@ -190,6 +234,11 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.NewError(domain.CodeQuotaExceeded, "model provider usage exceeded the reserved budget")
 	}
 	return response, nil
+}
+
+func projectUsageReservation(request ModelRequest, reservedTokens int64) project.Usage {
+	output := int64(request.MaxOutputTokens)
+	return project.Usage{InputTokens: reservedTokens - output, OutputTokens: output}
 }
 
 func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
@@ -213,7 +262,7 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		if call.Task != nil && call.Task.AgentRootSessionID == "" {
 			call.Task.AgentRootSessionID = call.Task.AgentSessionID
 		}
-		if call.Task == nil || !domain.ValidUserID(call.Task.OwnerID) || call.Task.LeaseOwner == "" || call.Task.LeaseVersion < 1 ||
+		if call.Task == nil || !domain.ValidUserID(call.Task.OwnerID) || !domain.ValidUserID(call.Task.InitiatorID) || call.Task.LeaseOwner == "" || call.Task.LeaseVersion < 1 ||
 			call.Task.AgentInstanceID == "" || call.Task.AgentGeneration < 1 || call.Task.AuthorizationVersion < 1 ||
 			!dshModelIdentityPattern.MatchString(call.Task.AgentRootSessionID) ||
 			invalidCheckpointLabel(call.Task.EngineVersion, 128) || invalidCheckpointLabel(call.Task.ProfileVersion, 128) {
@@ -223,7 +272,7 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		if err != nil || id != call.CallID || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
 		}
-		ownerID = call.Task.OwnerID
+		ownerID = call.Task.InitiatorID
 	default:
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call source")
 	}

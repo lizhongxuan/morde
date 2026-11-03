@@ -474,6 +474,9 @@ WHERE id=$1 AND owner_id=$2 `+lock, workspaceID, ownerID).Scan(&ready)
 	if err != nil {
 		return fmt.Errorf("lock workspace for sync device: %w", err)
 	}
+	if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+		return err
+	}
 	return nil
 }
 

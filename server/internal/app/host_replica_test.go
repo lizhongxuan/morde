@@ -105,6 +105,50 @@ func TestHostReplicaAppliesAndActivatesOnlyCurrentBindingRevision(t *testing.T) 
 	}
 }
 
+func TestHostReplicaRejectsHostWithMultipleWorkspaceBindings(t *testing.T) {
+	ctx := context.Background()
+	sealer, err := NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostValue := hostServiceTestHost(host.StateRunning)
+	sealHostServiceTestKey(t, sealer, &hostValue)
+	firstWorkspace := workspace.Workspace{ID: "w1234567", OwnerID: hostValue.OwnerID, State: workspace.StateReady}
+	secondWorkspace := workspace.Workspace{ID: "w7654321", OwnerID: hostValue.OwnerID, State: workspace.StateReady}
+	firstBinding := testWorkspaceBinding(hostValue.ID, hostValue.OwnerID, firstWorkspace.ID, workspace.BindingActive)
+	firstBinding.Workspace = firstWorkspace
+	secondBinding := testWorkspaceBinding(hostValue.ID, hostValue.OwnerID, secondWorkspace.ID, workspace.BindingPreparing)
+	secondBinding.Workspace = secondWorkspace
+	workspaces := &hostServiceTestWorkspaceStore{
+		values: map[string]workspace.Workspace{firstWorkspace.ID: firstWorkspace, secondWorkspace.ID: secondWorkspace},
+		bindings: map[string]workspace.Binding{
+			hostValue.ID + "/" + firstWorkspace.ID:  firstBinding,
+			hostValue.ID + "/" + secondWorkspace.ID: secondBinding,
+		},
+	}
+	users := &credentialUsers{values: map[string]identity.User{hostValue.OwnerID: {ID: hostValue.OwnerID, Role: identity.RoleUser, Status: identity.StatusApproved}}}
+	hosts := &hostServiceTestHostStore{values: map[string]host.Host{hostValue.ID: hostValue}}
+	service, err := NewHostReplicaService(hosts, workspaces, users, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCredential, err := sealer.Open(hostValue.RuntimeCredentialEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := service.Authenticate(ctx, hostValue.ID, hostValue.RuntimeGeneration, hostReplicaCredential(runtimeCredential))
+	clear(runtimeCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ScopeWorkspace(ctx, principal, firstWorkspace.ID, firstBinding.BindingVersion); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("ScopeWorkspace() with multiple bindings error = %v, want workspace conflict", err)
+	}
+	if _, err := service.ListBindings(ctx, principal); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("ListBindings() with multiple bindings error = %v, want workspace conflict", err)
+	}
+}
+
 func TestHostReplicaReportsWorkspaceSyncConflictAndRecovery(t *testing.T) {
 	ctx := context.Background()
 	sealer, err := NewSealer(make([]byte, 32))

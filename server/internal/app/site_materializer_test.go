@@ -222,6 +222,18 @@ func TestSiteRevisionMaterializerStreamsPinnedRevisionAndVerifiesFiles(t *testin
 	}
 }
 
+func TestSiteMaterializerRejectsWorkspaceSymlinksWithoutCreatingFiles(t *testing.T) {
+	target := "index.html"
+	digest := sha256.Sum256([]byte(target))
+	file := workspace.File{Path: "current", Kind: "symlink", SymlinkTarget: target, SizeBytes: int64(len(target)),
+		SHA256: hex.EncodeToString(digest[:]), Mode: 0, Chunks: []workspace.Chunk{}}
+	writer := &fakeSiteArtifactWriter{files: make(map[string][]byte), modes: make(map[string]uint32)}
+	err := materializeSiteFile(context.Background(), siteMaterializerBlocks{}, siteMaterializerWorkspaceID, writer, file)
+	if err == nil || !strings.Contains(err.Error(), "do not support Workspace symlinks") || len(writer.files) != 0 {
+		t.Fatalf("materializeSiteFile() = %v, files=%v; want a safe rejection before file creation", err, writer.files)
+	}
+}
+
 func TestSiteRevisionMaterializerRejectsCorruptionAndAborts(t *testing.T) {
 	file := siteFile("index.html", 0644, "expected")
 	manifestSHA256, err := workspace.ManifestSHA256([]workspace.File{file})

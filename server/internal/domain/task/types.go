@@ -127,8 +127,13 @@ type Lease struct {
 }
 
 type Task struct {
-	ID                          string
-	OwnerID                     string
+	ID      string
+	OwnerID string
+	// ProjectID is set only for a Task in the project's shared conversation.
+	ProjectID string
+	// InitiatorID is the account whose authorization and resources execute this Task.
+	// OwnerID remains the conversation owner so the historical association is stable.
+	InitiatorID                 string
 	ConversationID              string
 	HostID                      string
 	ExecutionLocation           string
@@ -147,6 +152,7 @@ type Task struct {
 	CheckpointThroughSequence   int64
 	EventSequence               int64
 	Objective                   string
+	ConversationContext         *ConversationContext
 	FileDeliveryIntent          FileDeliveryIntent
 	Status                      Status
 	Authorization               Authorization
@@ -159,6 +165,31 @@ type Task struct {
 	CreatedAt                   time.Time
 	UpdatedAt                   time.Time
 	FinishedAt                  *time.Time
+}
+
+// ConversationContext is the authorized, bounded history snapshot loaded for
+// a freshly claimed Task. It is transient: the durable boundary and digest are
+// stored with the Task's initial event, while Messages are rebuilt and checked
+// by the Store on each claim. Resumed agent sessions use their own checkpoint.
+type ConversationContext struct {
+	OwnerID         string
+	ProjectID       string
+	InitiatorID     string
+	ConversationID  string
+	Scope           string
+	ThroughSequence int64
+	Digest          []byte
+	Messages        []ConversationContextMessage
+}
+
+const MaxConversationContextMessages = 128
+
+type ConversationContextMessage struct {
+	ID        string
+	Sequence  int64
+	Role      string
+	Content   string
+	Truncated bool
 }
 
 type Step struct {

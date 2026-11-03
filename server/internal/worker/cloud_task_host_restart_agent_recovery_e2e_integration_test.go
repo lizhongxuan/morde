@@ -46,7 +46,8 @@ func TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, _, _ := createF01Host(t, ctx, store, sealer, owner.ID)
+	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
+	hostValue, _, _ := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
 	const oldRuntimeInstanceID = "f01-runtime-generation-one"
 	if err := store.SetRuntimeInstanceID(ctx, hostValue.ID, hostValue.RuntimeGeneration, hostValue.ControlVersion, "", oldRuntimeInstanceID); err != nil {
 		t.Fatalf("set original persisted Host runtime identity: %v", err)
@@ -97,7 +98,7 @@ func TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint(t *testing.T)
 		t.Helper()
 		nonce := bytes32(nonceByte)
 		lease, replayed, err := instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
-			TaskID: current.ID, OwnerID: owner.ID, AgentInstanceID: instanceID,
+			TaskID: current.ID, OwnerID: owner.ID, InitiatorID: current.InitiatorID, AgentInstanceID: instanceID,
 			AgentSessionID: "session_host_generation_recovery", SupervisorID: "f01-host-generation-supervisor",
 			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 			AuthorizationVersion: current.Authorization.Version, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1",
@@ -128,7 +129,7 @@ func TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint(t *testing.T)
 	}
 	if _, err := checkpoints.Save(ctx, app.AgentCheckpointCommand{
 		Fence: app.AgentCheckpointFence{
-			TaskID: firstAgent.Fence.TaskID, OwnerID: firstAgent.Fence.OwnerID,
+			TaskID: firstAgent.Fence.TaskID, OwnerID: firstAgent.Fence.OwnerID, InitiatorID: firstAgent.Fence.InitiatorID,
 			AgentInstanceID: firstAgent.Fence.AgentInstanceID, AgentGeneration: firstAgent.Fence.AgentGeneration,
 			AgentSessionID: child.SessionID, AgentRootSessionID: firstAgent.Fence.AgentSessionID,
 			AuthorizationVersion: firstAgent.Fence.AuthorizationVersion, LeaseOwner: firstAgent.Fence.LeaseOwner,

@@ -32,8 +32,15 @@ func TestNotificationHTTPRoutesUseSessionAndSafeResponses(t *testing.T) {
 	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
 	notices := &notificationAPITestService{page: app.NotificationPage{Items: []notification.Notification{{
 		ID: "n1234567", OwnerID: testUserID, TaskID: "q1234567", EventSequence: 2,
-		Kind: notification.KindApprovalRequired, Summary: "任务需要你处理", RequestID: "private-request-id", RequestVersion: 8,
+		Kind: notification.KindApprovalRequired, Summary: "任务等待审批", RequestID: "r1234567", RequestVersion: 8,
 		Actionable: true, CreatedAt: now,
+	}, {
+		ID: "n2234567", OwnerID: testUserID, SourceEventID: 2, SourceKind: notification.SourceGoal,
+		SourceID: "goal-1", SourceVersion: 3, Kind: notification.KindGoalCompleted, Summary: "目标已完成", CreatedAt: now,
+	}, {
+		ID: "n3234567", OwnerID: testUserID, SourceEventID: 3, SourceKind: notification.SourceProjectWorkItem,
+		SourceID: "j3234567", SourceVersion: 4, ProjectID: "j2234567", Kind: notification.KindProjectItemDelivered,
+		Summary: "项目工作项已交付", CreatedAt: now,
 	}}}}
 	services := newServices()
 	deps := services.deps()
@@ -44,8 +51,12 @@ func TestNotificationHTTPRoutesUseSessionAndSafeResponses(t *testing.T) {
 	}
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	listed := requestWithCookie(router, http.MethodGet, "/api/notifications?unread_only=true", cookie, "")
-	if listed.Code != http.StatusOK || strings.Contains(listed.Body.String(), "private-request-id") ||
-		strings.Contains(listed.Body.String(), "request_version") || !strings.Contains(listed.Body.String(), "任务需要你处理") ||
+	if listed.Code != http.StatusOK || strings.Contains(listed.Body.String(), "r1234567") ||
+		strings.Contains(listed.Body.String(), "request_version") || !strings.Contains(listed.Body.String(), "任务等待审批") ||
+		!strings.Contains(listed.Body.String(), `"task_id":null`) || !strings.Contains(listed.Body.String(), `"event_sequence":0`) ||
+		!strings.Contains(listed.Body.String(), `"source_kind":"goal"`) || !strings.Contains(listed.Body.String(), `"source_id":"goal-1"`) ||
+		!strings.Contains(listed.Body.String(), `"kind":"goal_completed"`) || !strings.Contains(listed.Body.String(), `"project_id":"j2234567"`) ||
+		!strings.Contains(listed.Body.String(), `"kind":"project_work_item_delivered"`) ||
 		notices.principal.Kind != identity.KindSession {
 		t.Fatalf("notification response exposed internal request data or lost session: status=%d body=%s principal=%+v", listed.Code, listed.Body, notices.principal)
 	}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
 
@@ -335,9 +336,12 @@ func (t Timing) Validate() error {
 
 func Validate(s Schedule) error {
 	if !ValidID(s.ID) || s.OwnerID == "" || s.Version < 1 || !s.Status.Valid() ||
-		s.HostID == "" || s.ModelID == "" || strings.TrimSpace(s.Objective) == "" || len(s.Objective) > 32768 ||
+		(s.HostID != "" && !domain.ValidHostID(s.HostID)) || s.ModelID == "" || strings.TrimSpace(s.Objective) == "" || len(s.Objective) > 32768 ||
 		s.Authorization.Kind == "" || !s.MisfirePolicy.Valid() || s.ExecutionEpoch < 1 {
 		return errors.New("schedule fields are invalid")
+	}
+	if s.HostID == "" && s.Observation != nil {
+		return errors.New("hostless schedule cannot configure computer observation")
 	}
 	if err := s.Timing.Validate(); err != nil {
 		return err

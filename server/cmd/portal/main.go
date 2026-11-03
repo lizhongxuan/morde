@@ -32,6 +32,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/config"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/gateway"
 	"morde/server/internal/httpserver"
@@ -195,11 +196,6 @@ func serve(ctx context.Context, configPath string) error {
 	if err := app.EnsureInitialAdmin(ctx, store); err != nil {
 		return fmt.Errorf("initialize administrator: %w", err)
 	}
-	if !cfg.CloudDSH.Enabled {
-		if err := store.RetireTaskExecution(ctx); err != nil {
-			return fmt.Errorf("retire task execution before serving: %w", err)
-		}
-	}
 	workspaceBlocks, err := workspacefs.Open(cfg.WorkspaceStorage.RootDir)
 	if err != nil {
 		return fmt.Errorf("open workspace block storage: %w", err)
@@ -232,8 +228,9 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := workspaceSync.SetWorkspaceCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string) error {
-		return workspaceCurrent.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, workspaceBlocks)
+	if err := workspaceSync.SetWorkspaceCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64,
+		files []workspace.File, emptyDirectories []string, directories []workspace.Directory) error {
+		return workspaceCurrent.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, directories, workspaceBlocks)
 	}); err != nil {
 		return fmt.Errorf("configure Workspace current-file materializer: %w", err)
 	}
@@ -242,6 +239,21 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	if err := workspaceSync.SetWorkspaceCurrentManifestVerifier(workspaceCurrent.MatchesManifest); err != nil {
 		return fmt.Errorf("configure Workspace current manifest verifier: %w", err)
+	}
+	workspaceOwnershipTransfers, err := app.NewWorkspaceTransferService(store, cfg.WorkspaceStorage.MaxOwnerBytes)
+	if err != nil {
+		return fmt.Errorf("initialize Workspace ownership transfer service: %w", err)
+	}
+	if err := workspaceOwnershipTransfers.SetWorkspaceOwnershipTransferProjection(app.WorkspaceOwnershipTransferProjection{
+		PrepareRecipient: workspaceSync.PrepareWorkspaceOwnershipTransferProjection,
+		DiscardRecipient: func(ctx context.Context, transfer workspace.OwnershipTransfer) error {
+			return workspaceCurrent.Delete(ctx, transfer.ToOwnerID, transfer.WorkspaceID)
+		},
+		RetireFormer: func(ctx context.Context, transfer workspace.OwnershipTransfer) error {
+			return workspaceCurrent.Delete(ctx, transfer.FromOwnerID, transfer.WorkspaceID)
+		},
+	}); err != nil {
+		return fmt.Errorf("configure Workspace ownership transfer projection: %w", err)
 	}
 	workspaceCapacity, err := storage.NewWorkspaceCapacity(cfg.WorkspaceStorage.RootDir, cfg.WorkspaceStorage.MinFreeBytes)
 	if err != nil {
@@ -282,12 +294,32 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize model connections: %w", err)
 	}
+	projects, err := app.NewProjectService(store)
+	if err != nil {
+		return fmt.Errorf("initialize project service: %w", err)
+	}
+	projectMCPConnectors, err := app.NewProjectMCPConnectorService(store, projects)
+	if err != nil {
+		return fmt.Errorf("initialize project MCP connectors: %w", err)
+	}
+	projectRates := make([]project.RateSnapshot, 0, len(cfg.Models.ProjectRates))
+	for _, rate := range cfg.Models.ProjectRates {
+		projectRates = append(projectRates, rate.Snapshot())
+	}
+	configuredProjectRates, err := app.NewConfiguredProjectRates(projectRates)
+	if err != nil {
+		return fmt.Errorf("initialize project model rates: %w", err)
+	}
+	projectBudgets, err := app.NewProjectBudgetService(store, projects, configuredProjectRates)
+	if err != nil {
+		return fmt.Errorf("initialize project budget service: %w", err)
+	}
 	mcpConnectors, err := app.NewMCPConnectorService(store, sealer,
 		cfg.Domains.Scheme+"://"+cfg.Domains.Portal+"/api/mcp/oauth/callback")
 	if err != nil {
 		return fmt.Errorf("initialize MCP connectors: %w", err)
 	}
-	modelGateway, err := app.NewModelGatewayService(store, modelConnections, modelClient)
+	modelGateway, err := app.NewModelGatewayService(store, modelConnections, modelClient, projectBudgets)
 	if err != nil {
 		return fmt.Errorf("initialize model gateway: %w", err)
 	}
@@ -306,6 +338,10 @@ func serve(ctx context.Context, configPath string) error {
 	adminOperations, err := app.NewAdminOperationsService(store)
 	if err != nil {
 		return fmt.Errorf("initialize admin operations: %w", err)
+	}
+	adminModelBudgetDefaults, err := app.NewAdminModelBudgetDefaultService(store)
+	if err != nil {
+		return fmt.Errorf("initialize admin model budget defaults: %w", err)
 	}
 	recordConsents, err := app.NewRecordConsentService(store)
 	if err != nil {
@@ -327,6 +363,25 @@ func serve(ctx context.Context, configPath string) error {
 	volumes, err := newVolumeDeleter(cfg.Storage)
 	if err != nil {
 		return err
+	}
+	hostUsageService, err := app.NewHostUsageService(store, store, volumes, projects, cfg.Instance, nil)
+	if err != nil {
+		return fmt.Errorf("initialize Host usage service: %w", err)
+	}
+	workspaceVolumes, err := app.NewWorkspaceVolumeService(store, volumes, serviceInstanceID)
+	if err != nil {
+		return fmt.Errorf("initialize Workspace volume service: %w", err)
+	}
+	workspaceCopies, err := app.NewWorkspaceCopyService(store, workspaceSync, workspaceBlocks, volumes, volumes,
+		serviceInstanceID, cfg.WorkspaceStorage.MaxOwnerBytes, cfg.WorkspaceStorage.MaxWorkspaceBytes)
+	if err != nil {
+		return fmt.Errorf("initialize Workspace copy service: %w", err)
+	}
+	if err := workspaceCopies.SetCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64,
+		files []workspace.File, emptyDirectories []string, directories []workspace.Directory) error {
+		return workspaceCurrent.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, directories, workspaceBlocks)
+	}); err != nil {
+		return fmt.Errorf("configure Workspace copy materializer: %w", err)
 	}
 	auditService, err := app.NewAuditService(store)
 	if err != nil {
@@ -354,8 +409,18 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	workspaces, err := app.NewWorkspaceService(
+		store, workspaceBlocks, workspaceCurrent, workspaceCapacity, countedAudit,
+		cfg.WorkspaceStorage.MaxWorkspaceBytes,
+	)
+	if err != nil {
+		return err
+	}
+	if err := workspaces.SetWorkspaceCurrentInitializer(workspaceSync.InitializeWorkspaceCurrent); err != nil {
+		return fmt.Errorf("configure Workspace current initializer: %w", err)
+	}
 	hosts, err := app.NewHostService(app.HostServiceOptions{
-		Hosts: store, Users: store, Workspaces: store, Tokens: store,
+		Hosts: store, Users: store, Workspaces: store, DefaultWorkspaces: workspaces, WorkspaceVolumes: workspaceVolumes, Tokens: store,
 		Sandboxes: router, Probe: aioClient, Runtime: runtimeControl, Audit: auditService, CreateLocks: store, Sealer: sealer, Volumes: volumes, DiskCapacity: volumes,
 		Templates: templates, DefaultTemplateID: cfg.Templates.Default, Capacity: app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB},
 		Instance: cfg.Instance, Scheme: cfg.Domains.Scheme, PortalURL: cfg.Domains.Scheme + "://" + cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
@@ -456,7 +521,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	tasks, err := app.NewTaskService(store, credentials, modelConnections)
+	tasks, err := app.NewTaskService(store, credentials, modelConnections, projects)
 	if err != nil {
 		return fmt.Errorf("initialize task service: %w", err)
 	}
@@ -472,15 +537,15 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize task chat compatibility: %w", err)
 	}
-	workspaces, err := app.NewWorkspaceService(
-		store, workspaceBlocks, workspaceCurrent, workspaceCapacity, countedAudit,
-		cfg.WorkspaceStorage.MaxWorkspaceBytes,
-	)
+	executionAdapters := cloudDSHAdaptersForRuntime(cfg.CloudDSH.Enabled, tasks, schedules, instantChat, schedules)
+	projectConversations, err := app.NewProjectConversationService(store, projects, projectConversationTaskAppender{tasks: executionAdapters.tasks})
 	if err != nil {
-		return err
+		return fmt.Errorf("initialize project conversation service: %w", err)
 	}
-	if err := workspaces.SetWorkspaceCurrentInitializer(workspaceSync.InitializeWorkspaceCurrent); err != nil {
-		return fmt.Errorf("configure Workspace current initializer: %w", err)
+	projectWorkItems, err := app.NewProjectWorkItemService(store, projects, projectWorkItemTaskLinkAuthorizer{tasks: tasks},
+		projectWorkItemDeliveryAuthorizer{tasks: tasks, projects: projects, savedProof: store})
+	if err != nil {
+		return fmt.Errorf("initialize project work item service: %w", err)
 	}
 	adminWorkspaces, err := app.NewAdminWorkspaceService(store)
 	if err != nil {
@@ -576,7 +641,8 @@ func serve(ctx context.Context, configPath string) error {
 			return err
 		}
 		taskWorker, err = newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
-			modelGateway, sealer, mcpConnectors, recordCapture, hubService, workerSuffix, logger)
+			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService, goalService, projects,
+			hubService, workerSuffix, logger)
 		if err != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", err)
 		}
@@ -603,7 +669,7 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	gatewayHandler, err := gateway.New(gateway.Deps{
 		Config: cfg.Gateway, Domains: cfg.Domains, Security: cfg.Security,
-		Hosts: hosts, HostSharing: hostSharing, WorkspaceFiles: workspaceSync, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
+		Hosts: hosts, HostSharing: hostSharing, WorkspaceFiles: workspaceSync, TaskObservation: tasks, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
 		TerminalSessions: store, TerminalAIO: aioClient, Auth: credentials, Audit: auditService,
 		Logger: logger, Metrics: registry,
 	})
@@ -612,20 +678,29 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	admin := adminAdapter{users: users, audit: auditService, capacity: hosts, workspaceSyncReconciler: workspaceSyncNodeOwnerReconciler}
 	apiHandler, err := api.New(api.Deps{
-		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
-		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices,
+		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, HostUsage: hostUsageService, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
+		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices, WorkspaceDiff: workspaceSync,
+		WorkspaceCopies: workspaceCopies, WorkspaceTransfers: workspaceOwnershipTransfers,
 		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
-		Control:       controlService, ExecutionControl: executionControlService, Tasks: tasks, Conversations: conversations, InstantChat: instantChat,
+		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskObservationTickets: tasks, Conversations: conversations,
+		ProjectConversations:        projectConversations,
+		ProjectWorkItems:            projectWorkItems,
+		ProjectBudget:               projectBudgets,
+		ProjectMCPConnectors:        projectMCPConnectors,
+		ProjectBudgetExecutionReady: len(cfg.Models.ProjectRates) > 0,
+		RuntimeOperationLedger:      store,
+		Projects:                    projects, ProjectContent: projects, InstantChat: executionAdapters.instantChat,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
-		Goals: goalService, Schedules: schedules,
+		Goals: goalService, Schedules: executionAdapters.schedules,
 		PersonalDataQuota: personalDataQuotaService, PersonalDataQuotaUser: personalDataQuotaUserService,
 		PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
 		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
-		AdminOperations: adminOperations,
-		RecordConsents:  recordConsents, RecordAccess: recordAccess, RecordCaptureStatus: recordCapture,
+		AdminOperations:          adminOperations,
+		AdminModelBudgetDefaults: adminModelBudgetDefaults,
+		RecordConsents:           recordConsents, RecordAccess: recordAccess, RecordCaptureStatus: recordCapture,
 		AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
 		AdminAudit: auditService,
 		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
@@ -651,8 +726,9 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	background, err := worker.New(worker.Options{
 		Application: workerApplicationAdapter{WorkerApp: workerApp, workspaceBlockGC: workspaceBlockGC,
-			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
-		ActivityFlushInterval: cfg.Reconciler.ActivityFlushInterval, Logger: logger, Registerer: registry,
+			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, hostUsage: hostUsageService, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
+		ActivityFlushInterval: cfg.Reconciler.ActivityFlushInterval, HostUsageInterval: worker.HostUsageSampleInterval,
+		Logger: logger, Registerer: registry,
 	})
 	if err != nil {
 		return err
@@ -663,11 +739,14 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	scheduleWorker, err := worker.NewScheduleWorker(worker.ScheduleWorkerOptions{
-		Service: schedules, PollInterval: time.Second, BatchSize: 100, Logger: logger,
-	})
-	if err != nil {
-		return err
+	var scheduleWorker *worker.ScheduleWorker
+	if executionAdapters.scheduleProcessor != nil {
+		scheduleWorker, err = worker.NewScheduleWorker(worker.ScheduleWorkerOptions{
+			Service: executionAdapters.scheduleProcessor, PollInterval: time.Second, BatchSize: 100, Logger: logger,
+		})
+		if err != nil {
+			return err
+		}
 	}
 	if workspaceSyncNodeProvisioner != nil {
 		if err := workspaceSyncNodeProvisioner.ReconcileWorkspaceSyncNodesOnStartup(ctx); err != nil {
@@ -715,7 +794,8 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
 	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
-	hubService *app.HubService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
+	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService, goals *app.GoalService,
+	projects *app.ProjectService, hubService *app.HubService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -757,7 +837,8 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	tools, err := app.NewCloudDSHToolBrokerWithRecordCapture(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(), recordCapture, hubService)
+	tools, err := app.NewCloudDSHToolBrokerWithPersonalData(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(),
+		recordCapture, personalData, personalSync, goals, projects, hubService)
 	if err != nil {
 		return nil, err
 	}
@@ -1222,8 +1303,11 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	go func() { notificationWorkerDone <- notificationWorker.Run(workerCtx) }()
 	recordWorkerDone := make(chan error, 1)
 	go func() { recordWorkerDone <- recordWorker.Run(workerCtx) }()
-	scheduleWorkerDone := make(chan error, 1)
-	go func() { scheduleWorkerDone <- scheduleWorker.Run(workerCtx) }()
+	var scheduleWorkerDone chan error
+	if scheduleWorker != nil {
+		scheduleWorkerDone = make(chan error, 1)
+		go func() { scheduleWorkerDone <- scheduleWorker.Run(workerCtx) }()
+	}
 	var taskWorkerDone chan error
 	var cancelTaskWorker context.CancelFunc
 	if taskWorker != nil {
@@ -1309,8 +1393,10 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	if err := <-recordWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop record worker: %w", err)
 	}
-	if err := <-scheduleWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
-		runErr = fmt.Errorf("stop schedule worker: %w", err)
+	if scheduleWorkerDone != nil {
+		if err := <-scheduleWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+			runErr = fmt.Errorf("stop schedule worker: %w", err)
+		}
 	}
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := runtime.FlushActivity(flushCtx); err != nil {

@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -118,6 +121,79 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 	replayed, wasReplay, err := store.CreateSchedule(ctx, value, createRecord)
 	if err != nil || !wasReplay || replayed.ID != value.ID || replayed.Status != schedule.StatusCompleted {
 		t.Fatalf("schedule create replay = %#v replay=%t err=%v", replayed, wasReplay, err)
+	}
+}
+
+func TestPostgresHostlessScheduleRunsWithoutComputerAuthorization(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, "", timing, schedule.MisfireRunOnce,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	unsafe := value
+	unsafe.ID = mustID(t, schedule.NewID)
+	unsafe.Objective = "Create a PDF report"
+	unsafeRecord := testIdempotency(owner.ID, "schedule.create", "schedule-create-unsafe-hostless")
+	unsafeRecord.ResourceID = unsafe.ID
+	if _, _, err := store.CreateSchedule(ctx, unsafe, unsafeRecord); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("store accepted hostless file-delivery schedule: %v", err)
+	}
+	occurrence, err := schedule.FirstOccurrence(timing, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+		ScheduleID: value.ID, OwnerID: owner.ID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+		Occurrence:         schedule.Occurrence{Key: occurrence.Key, ScheduledAt: occurrence.ScheduledAt, CheckAt: occurrence.CheckAt, Status: schedule.RunQueued},
+		NotificationEvents: value.NotificationEvents,
+	})
+	if err != nil || !committed || run.TaskID == nil {
+		t.Fatalf("commit hostless occurrence = %#v, committed=%t, err=%v", run, committed, err)
+	}
+	var conversationHost, taskHost pgtype.Text
+	var authKind string
+	var scopes []string
+	if err := store.pool.QueryRow(ctx, `SELECT c.host_id,t.host_id,t.auth_kind,t.auth_scopes
+FROM tasks t JOIN conversations c ON c.id=t.conversation_id AND c.owner_id=t.owner_id WHERE t.id=$1`, *run.TaskID).
+		Scan(&conversationHost, &taskHost, &authKind, &scopes); err != nil {
+		t.Fatal(err)
+	}
+	if conversationHost.Valid || taskHost.Valid || authKind != string(identity.KindScheduleTask) ||
+		!sameStringSlices(scopes, []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit), string(identity.ScopeTaskControl)}) {
+		t.Fatalf("hostless scheduled Task host/auth = conversation:%#v task:%#v kind:%q scopes:%v", conversationHost, taskHost, authKind, scopes)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeTaskRead); err != nil {
+		t.Fatalf("hostless scheduled task read authorization: %v", err)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeComputerOperate); err == nil {
+		t.Fatal("hostless scheduled Task received computer operation authorization")
+	}
+	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
+	if err != nil || loaded.HostID != "" || loaded.LastRun == nil || loaded.LastRun.ID != run.ID {
+		t.Fatalf("read hostless schedule = %#v, %v", loaded, err)
+	}
+}
+
+func TestPostgresScheduleCanBeUnbound(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	timing := schedule.Timing{Kind: schedule.TimingDaily, StartsOn: "2026-11-03", LocalTime: "09:00", TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	value.HostID = ""
+	record := testIdempotency(owner.ID, "schedule.update", "schedule-unbind-001")
+	record.ResourceID = value.ID
+	updated, err := store.UpdateSchedule(ctx, owner.ID, record, value, value.Version)
+	if err != nil || updated.HostID != "" {
+		t.Fatalf("update schedule to hostless = %#v, %v", updated, err)
+	}
+	var isNull bool
+	if err := store.pool.QueryRow(ctx, `SELECT host_id IS NULL FROM schedules WHERE id=$1`, value.ID).Scan(&isNull); err != nil || !isNull {
+		t.Fatalf("schedule host_id null = %t, err=%v", isNull, err)
 	}
 }
 
@@ -596,6 +672,69 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3`, updateRecord.OwnerID, updateReco
 	}
 	if _, err := store.GetSchedule(ctx, ownerA.ID, scheduleB.ID); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("cross-owner schedule read error = %v, want not_found", err)
+	}
+}
+
+func TestPostgresHostlessScheduledTaskAuthorizationIsScopeAndRunBound(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	scheduled := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: scheduled.Format(time.RFC3339), TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireRunOnce,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	occurrence := schedule.Occurrence{Key: value.NextOccurrenceKey, ScheduledAt: value.NextRunAt,
+		CheckAt: *value.NextCheckAt, Status: schedule.RunQueued}
+	run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+		ScheduleID: value.ID, OwnerID: owner.ID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+		Occurrence: occurrence, NotificationEvents: []schedule.NotificationEvent{schedule.NotifyCompleted},
+	})
+	if err != nil || !committed || run.TaskID == nil {
+		t.Fatalf("commit Host-bound schedule occurrence: run=%#v committed=%t err=%v", run, committed, err)
+	}
+	const taskScopeArray = `ARRAY['task:read','task:submit','task:control']::text[]`
+	if _, err := store.pool.Exec(ctx, `UPDATE schedules SET host_id=NULL WHERE id=$1`, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET host_id=NULL,auth_scopes=`+taskScopeArray+` WHERE id=$1`, *run.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WithTx(ctx, func(tx pgx.Tx) error {
+		return checkAgentCheckpointAuthorization(ctx, tx, owner.ID, *run.TaskID, string(identity.KindScheduleTask), run.ID,
+			[]string{"task:read", "task:submit", "task:control"}, "")
+	}); err != nil {
+		t.Fatalf("hostless scheduled checkpoint authorization: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "hostless-worker", 30*time.Second)
+	if err != nil || !found || claimed.ID != *run.TaskID {
+		t.Fatalf("claim hostless scheduled Task: found=%t claimed=%#v err=%v", found, claimed, err)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeTaskRead); err != nil {
+		t.Fatalf("authorize hostless Task read: %v", err)
+	}
+	for _, scope := range []identity.Scope{identity.ScopeComputerObserve, identity.ScopeComputerOperate} {
+		if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", scope); domain.CodeOf(err) != domain.CodeUnauthenticated {
+			t.Errorf("hostless computer scope %q error=%v, want unauthenticated", scope, err)
+		}
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, hostValue.ID, identity.ScopeTaskRead); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("Host-bound action on hostless Schedule = %v, want unauthenticated", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET auth_scopes=array_append(auth_scopes,'computer:observe') WHERE id=$1`, *run.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeTaskRead); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("hostless Task with an extra computer scope = %v, want unauthenticated", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET auth_scopes=`+taskScopeArray+` WHERE id=$1`, *run.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE schedule_runs SET task_id=NULL,status='skipped',skip_reason='overlap' WHERE id=$1`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeTaskRead); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("ScheduleRun detached from Task = %v, want unauthenticated", err)
 	}
 }
 

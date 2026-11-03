@@ -19,9 +19,22 @@ import (
 type cloudDSHMCPStoreStub struct {
 	*cloudDSHBrokerTaskStore
 	*mcpConnectorStoreStub
-	grants     []TaskMCPConnectorGrant
-	operations map[string]MCPConnectorOperation
-	binding    *workspace.Binding
+	grants                []TaskMCPConnectorGrant
+	operations            map[string]MCPConnectorOperation
+	binding               *workspace.Binding
+	projectGrantActive    bool
+	projectGrantVersion   int64
+	projectAuthorizeCalls int
+	completeErr           error
+}
+
+func (s *cloudDSHMCPStoreStub) AuthorizeProjectMCPConnector(_ context.Context, projectID, actorID, connectorOwnerID, connectorID string, expectedVersion int64) error {
+	s.projectAuthorizeCalls++
+	if !s.projectGrantActive || expectedVersion != s.projectGrantVersion || projectID != s.details.Task.ProjectID ||
+		actorID != taskActorID(s.details.Task) || connectorID == "" || connectorOwnerID == "" {
+		return domain.NewError(domain.CodeForbidden, "project connector authorization is no longer active")
+	}
+	return nil
 }
 
 func (s *cloudDSHMCPStoreStub) GetWorkspaceBinding(_ context.Context, hostID, workspaceID string) (workspace.Binding, error) {
@@ -88,6 +101,9 @@ func (s *cloudDSHMCPStoreStub) MarkMCPConnectorOperationDispatched(_ context.Con
 
 func (s *cloudDSHMCPStoreStub) CompleteMCPConnectorOperation(_ context.Context, value MCPConnectorOperation, _ string,
 	status task.OperationStatus, result string) (MCPConnectorOperation, error) {
+	if s.completeErr != nil {
+		return MCPConnectorOperation{}, s.completeErr
+	}
 	stored, ok := s.operations[value.Key]
 	if !ok || stored.Status != task.OperationDispatched || stored.CancelRequested {
 		return MCPConnectorOperation{}, domain.NewError(domain.CodeConflict, "operation is not dispatched")
@@ -123,11 +139,15 @@ type cloudDSHMCPClientStub struct {
 	callCalls   int
 	lastTool    string
 	lastRequest json.RawMessage
+	onList      func()
 	onCall      func()
 }
 
 func (s *cloudDSHMCPClientStub) ListTools(context.Context, string, http.Header) ([]MCPConnectorToolDefinition, error) {
 	s.listCalls++
+	if s.onList != nil {
+		s.onList()
+	}
 	return append([]MCPConnectorToolDefinition(nil), s.tools...), nil
 }
 
@@ -161,7 +181,7 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	store := &cloudDSHMCPStoreStub{
 		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
 		mcpConnectorStoreStub:   connectorStore,
-		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID, ConnectorOwnerID: fixture.store.details.Task.OwnerID,
 			ConnectorID: connectorID, ConnectorRevision: 1, CredentialVersion: 1, GrantVersion: 1}},
 		binding: &workspace.Binding{OwnerID: fixture.store.details.Task.OwnerID, HostID: fixture.store.details.Task.HostID,
 			Workspace: workspace.Workspace{ID: fixture.store.details.Task.WorkspaceID}, BindingVersion: 9},
@@ -223,7 +243,7 @@ func TestCloudDSHMCPBrokerPersistsUnknownWithoutReplaying(t *testing.T) {
 	store := &cloudDSHMCPStoreStub{
 		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
 		mcpConnectorStoreStub:   connectorStore,
-		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID, ConnectorOwnerID: fixture.store.details.Task.OwnerID,
 			ConnectorID: connectorID, ConnectorRevision: 1, GrantVersion: 1}},
 	}
 	fixture.executor.store = store
@@ -260,10 +280,10 @@ func TestCloudDSHMCPConfirmedUnsupportedResultPausesAndReplaysWithoutCallingAgai
 	store := &cloudDSHMCPStoreStub{
 		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
 		mcpConnectorStoreStub: &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
-			connectorID: {ID: connectorID, OwnerID: fixture.store.details.Task.OwnerID, Name: "Research", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1},
+			connectorID: {ID: connectorID, OwnerID: fixture.store.details.Task.OwnerID, Name: "Research", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1, CredentialVersion: 1},
 		}},
-		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
-			ConnectorID: connectorID, ConnectorRevision: 1, GrantVersion: 1}},
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID, ConnectorOwnerID: fixture.store.details.Task.OwnerID,
+			ConnectorID: connectorID, ConnectorRevision: 1, CredentialVersion: 1, GrantVersion: 1}},
 	}
 	fixture.executor.store = store
 	client := &cloudDSHMCPClientStub{
@@ -312,7 +332,7 @@ func TestCloudDSHMCPBrokerDiscardsResultAfterGrantRevocation(t *testing.T) {
 		mcpConnectorStoreStub: &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
 			connectorID: {ID: connectorID, OwnerID: fixture.store.details.Task.OwnerID, Name: "Research", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1},
 		}},
-		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID, ConnectorOwnerID: fixture.store.details.Task.OwnerID,
 			ConnectorID: connectorID, ConnectorRevision: 1, GrantVersion: 1}},
 	}
 	fixture.executor.store = store
@@ -340,6 +360,99 @@ func TestCloudDSHMCPBrokerDiscardsResultAfterGrantRevocation(t *testing.T) {
 	if err != nil || result.Status != AgentToolNeedsUser || operation.Status != task.OperationUnknown || !operation.CancelRequested ||
 		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "mcp_connector_revoked" {
 		t.Fatalf("revoked MCP result = %#v, err=%v, operation=%#v, task=%#v", result, err, operation, store.details.Task)
+	}
+}
+
+func TestCloudDSHMCPBrokerMarksUnknownWhenResultCommitFails(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
+	fixture.store.details.Task.ExecutionLocation = "server"
+	connectorID := "k3456789"
+	store := &cloudDSHMCPStoreStub{
+		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
+		mcpConnectorStoreStub: &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
+			connectorID: {ID: connectorID, OwnerID: fixture.store.details.Task.OwnerID, Name: "Research", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1, CredentialVersion: 1},
+		}},
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
+			ConnectorOwnerID: fixture.store.details.Task.OwnerID, ConnectorID: connectorID, ConnectorRevision: 1, CredentialVersion: 1, GrantVersion: 1}},
+		completeErr: domain.NewError(domain.CodeInternal, "result commit failed"),
+	}
+	fixture.executor.store = store
+	client := &cloudDSHMCPClientStub{tools: []MCPConnectorToolDefinition{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, cloudDSHMCPCredentialStub{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	var mcpToolName string
+	for _, definition := range definitions {
+		if definition.MCPConnectorID == connectorID {
+			mcpToolName = definition.Name
+			break
+		}
+	}
+	if err != nil || mcpToolName == "" {
+		t.Fatalf("discover tools = %#v, err=%v", definitions, err)
+	}
+	result, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: "result-commit-failed", Name: mcpToolName, Arguments: `{}`})
+	operation := store.operations[agentOperationKey("result-commit-failed")]
+	if err != nil || result.Status != AgentToolUnknown || client.callCalls != 1 || operation.Status != task.OperationUnknown ||
+		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "mcp_result_unknown" {
+		t.Fatalf("failed result commit = %#v, err=%v, calls=%d, operation=%#v task=%#v", result, err, client.callCalls, operation, store.details.Task)
+	}
+}
+
+func TestCloudDSHMCPBrokerRechecksProjectConnectorAuthorization(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
+	fixture.store.details.Task.ExecutionLocation = "server"
+	fixture.store.details.Task.ProjectID = "j1234567"
+	fixture.store.details.Task.InitiatorID = "u7654321"
+	connectorID := "k3456789"
+	connectorOwnerID := "u2345678"
+	store := &cloudDSHMCPStoreStub{
+		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
+		mcpConnectorStoreStub: &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
+			connectorID: {ID: connectorID, OwnerID: connectorOwnerID, Name: "Shared", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1},
+		}},
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
+			ConnectorOwnerID: connectorOwnerID, ProjectID: fixture.store.details.Task.ProjectID, ProjectGrantVersion: 4,
+			ConnectorID: connectorID, ConnectorRevision: 1, CredentialVersion: 0, GrantVersion: 1}},
+		projectGrantActive: true, projectGrantVersion: 4,
+	}
+	fixture.executor.store = store
+	client := &cloudDSHMCPClientStub{tools: []MCPConnectorToolDefinition{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`)}}}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, cloudDSHMCPCredentialStub{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	definitions, err := broker.mcpDefinitions(context.Background(), claimed)
+	if err != nil || len(definitions) != 1 || store.projectAuthorizeCalls != 3 {
+		t.Fatalf("discover project MCP tools = %#v, err=%v authCalls=%d", definitions, err, store.projectAuthorizeCalls)
+	}
+	store.projectGrantActive = false
+	if _, err := broker.mcpDefinitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("discovery after project grant revoke = %v, want forbidden", err)
+	}
+	if _, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: "project-mcp-call", Name: definitions[0].Name, Arguments: `{}`}); domain.CodeOf(err) != domain.CodeForbidden || client.callCalls != 0 {
+		t.Fatalf("dispatch after project grant revoke = err %v, remoteCalls=%d", err, client.callCalls)
+	}
+	store.projectGrantActive = true
+	store.projectAuthorizeCalls = 0
+	store.grants[0].ToolSchema, store.grants[0].ToolSchemaSHA256 = nil, nil
+	client.onList = func() { store.projectGrantActive = false }
+	if definitions, err := broker.mcpDefinitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeForbidden || len(definitions) != 0 ||
+		store.projectAuthorizeCalls != 3 || client.listCalls != 2 || len(store.grants[0].ToolSchema) != 0 {
+		t.Fatalf("revocation during project tool discovery = defs=%#v err=%v authCalls=%d listCalls=%d schema=%q",
+			definitions, err, store.projectAuthorizeCalls, client.listCalls, store.grants[0].ToolSchema)
 	}
 }
 

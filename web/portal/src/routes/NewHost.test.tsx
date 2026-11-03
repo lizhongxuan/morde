@@ -36,6 +36,7 @@ describe('NewHost workspace loading', () => {
     render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
     expect(await screen.findByText('正在加载工作目录…')).toBeInTheDocument();
+    expect(screen.getByText('/home/gem/workspace')).toBeInTheDocument();
     expect(screen.queryByText('目前没有可用的工作区。')).not.toBeInTheDocument();
     await act(async () => { rejectInitial(new Error('工作目录服务不可用')); });
     expect(await screen.findByRole('alert')).toHaveTextContent('工作目录服务不可用');
@@ -47,7 +48,7 @@ describe('NewHost workspace loading', () => {
     await waitFor(() => expect(existingWorkspace).toBeEnabled());
     await user.click(existingWorkspace);
 
-    const selectedWorkspace = screen.getByRole('checkbox', { name: /待挂载目录/ });
+    const selectedWorkspace = screen.getByRole('radio', { name: /待挂载目录/ });
     await user.click(selectedWorkspace);
     await user.click(screen.getByRole('button', { name: '创建主机' }));
     await waitFor(() => expect(createHost).toHaveBeenCalledWith({ workspace_ids: ['w1234567'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/)));
@@ -67,6 +68,28 @@ describe('NewHost workspace loading', () => {
 
     await userEvent.setup().click(await screen.findByRole('radio', { name: '绑定已有工作区' }));
     expect(await screen.findByText('目前没有可用的工作区。')).toBeInTheDocument();
+  });
+
+  it('binds exactly one existing Workspace when multiple are available', async () => {
+    vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [
+      { id: 'w1234567', name: '工作区一', revision: 3, used_bytes: 100, quota_bytes: 1024, state: 'ready', created_at: '', updated_at: '' },
+      { id: 'w7654321', name: '工作区二', revision: 4, used_bytes: 200, quota_bytes: 2048, state: 'ready', created_at: '', updated_at: '' },
+    ] });
+    const createHost = vi.spyOn(portalApi, 'createHost').mockResolvedValue({
+      id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'creating', state_reason: '', runtime_generation: 1, control_version: 0, control_state: 'ai', url: '', workspaces: [],
+      resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+
+    render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><NewHost /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    await user.click(await screen.findByRole('radio', { name: '绑定已有工作区' }));
+    await user.click(screen.getByRole('radio', { name: /工作区一/ }));
+    await user.click(screen.getByRole('radio', { name: /工作区二/ }));
+    expect(screen.getByRole('radio', { name: /工作区一/ })).not.toBeChecked();
+    await user.click(screen.getByRole('button', { name: '创建主机' }));
+    await waitFor(() => expect(createHost).toHaveBeenCalledWith({ workspace_ids: ['w7654321'] }, expect.any(String)));
   });
 
   it('creates an independent workspace before creating a host', async () => {

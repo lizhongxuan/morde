@@ -2,15 +2,11 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
-	"morde/server/internal/domain/host"
 	"morde/server/internal/store/postgres/sqlcgen"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func (s *Store) AcquireHostActivityLease(ctx context.Context, lease app.HostActivityLease) error {
@@ -84,35 +80,6 @@ func (s *Store) HasOutstandingControlTransitionLeases(ctx context.Context, hostI
 		return false, fmt.Errorf("check outstanding control transition leases: %w", err)
 	}
 	return pending, nil
-}
-
-func (s *Store) WithHostInputPermit(ctx context.Context, ref host.Ref, forward func() error) error {
-	if !domain.ValidHostID(ref.ID) || ref.RuntimeGeneration <= 0 || ref.ControlVersion < 0 || forward == nil {
-		return domain.InvalidArgument("host_id", "user input permit is invalid")
-	}
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var lockedHostID string
-		err := tx.QueryRow(ctx, `
-SELECT id
-FROM hosts
-WHERE id=$1 AND state='running' AND deleted_at IS NULL
-  AND runtime_generation=$2 AND control_version=$3 AND control_state='user'
-FOR SHARE`, ref.ID, ref.RuntimeGeneration, ref.ControlVersion).Scan(&lockedHostID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return hostActivityLeaseConflict()
-		}
-		if err != nil {
-			return fmt.Errorf("lock Host for user input permit: %w", err)
-		}
-		if err := forward(); err != nil {
-			return fmt.Errorf("forward user input: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func hostActivityLeaseConflict() error {

@@ -161,8 +161,8 @@ func TestWorkspaceSyncPostgresQuotaUDSDockerAndHostE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Workspace sync service: %v", err)
 	}
-	if err := syncService.SetWorkspaceCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string) error {
-		return current.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, blocks)
+	if err := syncService.SetWorkspaceCurrentMaterializer(func(ctx context.Context, ownerID, workspaceID string, revision int64, files []workspace.File, emptyDirectories []string, directories []workspace.Directory) error {
+		return current.Materialize(ctx, ownerID, workspaceID, revision, files, emptyDirectories, directories, blocks)
 	}); err != nil {
 		t.Fatal(err)
 	}

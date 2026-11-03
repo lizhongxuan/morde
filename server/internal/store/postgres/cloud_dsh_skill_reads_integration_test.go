@@ -106,8 +106,9 @@ func TestPostgresCloudDSHSkillReadIsIdempotentAndFenced(t *testing.T) {
 		t.Fatalf("expired authorization was not rejected inside the commit transaction: %v", err)
 	}
 	details, err = store.GetTask(ctx, claimed.ID, owner.ID)
-	if err != nil || details.Task.Usage.ToolCalls != 1 || details.Task.EventSequence != initialEventSequence+1 {
-		t.Fatalf("rejected replays changed Task budget or sequence: details=%+v err=%v", details.Task, err)
+	if err != nil || details.Task.Usage.ToolCalls != 1 || details.Task.Status != task.StatusCancelling ||
+		details.Task.EventSequence != initialEventSequence+2 {
+		t.Fatalf("expired authorization did not cancel Task without charging skill usage: details=%+v err=%v", details.Task, err)
 	}
 }
 

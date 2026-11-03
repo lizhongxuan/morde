@@ -68,36 +68,30 @@ func (s *workerTestOrphanCleanupStore) CompleteOrphanHostVolumeCleanup(_ context
 	return nil
 }
 
-func TestWorkerAppRetriesOrphanVolumesAfterSandboxIsGone(t *testing.T) {
+func TestWorkerAppCompletesOrphanCleanupWhileRetainingVolumes(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	hostID := "h7654321"
 	deps.sandbox.add(Sandbox{ID: "orphan-before-volume-retry", State: SandboxRunning, Metadata: hostServiceMetadata(hostID)})
 	volume := service.volumes.(*hostServiceTestVolume)
-	volume.errByName = map[string]error{domain.HostAppsVolumeName(hostID): errors.New("volume daemon unavailable")}
+	volume.errByName = map[string]error{domain.HostAppsVolumeName(hostID): errors.New("volume deletion must remain disabled")}
 	worker := newWorkerAppTest(t, service)
 
-	if _, err := worker.Reconcile(context.Background()); err == nil {
-		t.Fatal("Reconcile() error = nil, want application volume failure")
+	if _, err := worker.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() = %v, want sandbox cleanup with volume retention", err)
 	}
 	if deps.sandbox.values["orphan-before-volume-retry"].State != SandboxTerminated {
 		t.Fatalf("orphan sandbox state = %v, want terminated", deps.sandbox.values["orphan-before-volume-retry"].State)
 	}
 	cleanupStore := worker.cleanups.(*workerTestOrphanCleanupStore)
-	if pending, err := cleanupStore.ListOrphanHostVolumeCleanups(context.Background(), service.instance); err != nil || len(pending) != 1 || pending[0] != hostID {
-		t.Fatalf("pending cleanup = %v, %v; want %s", pending, err, hostID)
-	}
-
-	delete(deps.sandbox.values, "orphan-before-volume-retry")
-	volume.errByName[domain.HostAppsVolumeName(hostID)] = nil
-	if _, err := worker.Reconcile(context.Background()); err != nil {
-		t.Fatalf("retry after sandbox disappeared: %v", err)
-	}
 	if pending, err := cleanupStore.ListOrphanHostVolumeCleanups(context.Background(), service.instance); err != nil || len(pending) != 0 {
-		t.Fatalf("pending cleanup after retry = %v, %v; want empty", pending, err)
+		t.Fatalf("pending cleanup = %v, %v; want complete", pending, err)
 	}
-	if len(volume.names) != 6 || volume.names[3] != domain.RuntimeVolumeName(hostID) ||
-		volume.names[4] != domain.ProfileVolumeName(hostID) || volume.names[5] != domain.HostAppsVolumeName(hostID) {
-		t.Fatalf("volume deletion retries = %v", volume.names)
+	delete(deps.sandbox.values, "orphan-before-volume-retry")
+	if _, err := worker.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() after sandbox disappeared: %v", err)
+	}
+	if len(volume.names) != 0 {
+		t.Fatalf("orphan cleanup deleted legacy volumes = %v", volume.names)
 	}
 }
 
@@ -126,14 +120,14 @@ func TestWorkerAppDoesNotRepeatCompletedOrphanCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	volume := service.volumes.(*hostServiceTestVolume)
-	if len(volume.names) != 3 {
-		t.Fatalf("initial volume cleanup = %v", volume.names)
+	if len(volume.names) != 0 {
+		t.Fatalf("orphan cleanup removed retained volumes = %v", volume.names)
 	}
 	if _, err := worker.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(volume.names) != 3 {
-		t.Fatalf("completed volume cleanup repeated for retained terminated sandbox: %v", volume.names)
+	if len(volume.names) != 0 {
+		t.Fatalf("completed orphan cleanup removed retained volumes: %v", volume.names)
 	}
 }
 

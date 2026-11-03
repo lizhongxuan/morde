@@ -66,13 +66,7 @@ func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspac
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, _, _ := createF01Host(t, ctx, store, sealer, owner.ID)
-	if _, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: host.ID, Workspace: value, Directory: value.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	host, _, _ := createF01Host(t, ctx, store, sealer, owner.ID, value.ID)
 	if _, err := store.TransitionWorkspaceBinding(ctx, host.ID, value.ID, 1, workspace.BindingPreparing, workspace.BindingActive, 0, 0); err != nil {
 		t.Fatal(err)
 	}

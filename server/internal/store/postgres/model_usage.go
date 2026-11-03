@@ -12,6 +12,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
 )
 
@@ -21,73 +22,122 @@ func (s *Store) ReserveModelCall(ctx context.Context, request app.ModelCallReser
 		len(request.CallID) < 8 || len(request.CallID) > 128 {
 		return domain.InvalidArgument("model_call", "invalid model reservation")
 	}
-	// The account budget row serializes reservations and settlement for every source.
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		var limit int64
-		var maxConcurrent int32
-		if err := tx.QueryRow(ctx, `SELECT token_limit,max_concurrent FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, request.OwnerID).Scan(&limit, &maxConcurrent); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.NewError(domain.CodeQuotaExceeded, "model budget is not configured")
-			}
-			return fmt.Errorf("lock model budget: %w", err)
+	return s.WithTx(ctx, func(tx pgx.Tx) error { return reserveModelCallInTx(ctx, tx, request, nil) })
+}
+
+// reserveModelCallInTx commits the account token hold and, for project Tasks,
+// the money hold in the same transaction before any provider dispatch.
+func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation, projectReservation *app.ProjectModelReservation) error {
+	var limit int64
+	var maxConcurrent int32
+	if err := tx.QueryRow(ctx, `SELECT token_limit,max_concurrent FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, request.OwnerID).Scan(&limit, &maxConcurrent); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeQuotaExceeded, "model budget is not configured")
 		}
-		if err := checkModelCaller(ctx, tx, request); err != nil {
-			return err
+		return fmt.Errorf("lock model budget: %w", err)
+	}
+	if err := checkModelCaller(ctx, tx, request); err != nil {
+		return err
+	}
+	var taskProjectID string
+	if request.Source == app.ModelCallTask {
+		if request.Task == nil {
+			return domain.NewError(domain.CodeUnauthenticated, "task model authorization is unavailable")
 		}
-		var priorDigest []byte
-		err := tx.QueryRow(ctx, `SELECT request_digest FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3`,
-			request.OwnerID, string(request.Source), request.CallID).Scan(&priorDigest)
-		if err == nil {
-			if !bytes.Equal(priorDigest, request.RequestDigest) {
-				return domain.NewError(domain.CodeIdempotencyConflict, "model call key was used with different content")
-			}
-			return domain.NewError(domain.CodeConflict, "model call was already dispatched; reconcile its result")
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(project_id,'') FROM tasks WHERE id=$1 AND owner_id=$2 AND initiator_id=$3`,
+			request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&taskProjectID); err != nil {
+			return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("find model call: %w", err)
+	}
+	if request.Source == app.ModelCallTask && request.ProjectID != taskProjectID {
+		return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
+	}
+	projectID := request.ProjectID
+	if projectID != "" && (!project.ValidID(projectID) || projectReservation == nil || projectReservation.ProjectID != projectID) {
+		return domain.NewError(domain.CodeInvalidState, "project model budget reservation is required")
+	}
+	if projectID == "" && projectReservation != nil {
+		return domain.NewError(domain.CodeUnauthenticated, "project model Task attribution is unavailable")
+	}
+	var priorDigest []byte
+	err := tx.QueryRow(ctx, `SELECT request_digest FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3`,
+		request.OwnerID, string(request.Source), request.CallID).Scan(&priorDigest)
+	if err == nil {
+		if !bytes.Equal(priorDigest, request.RequestDigest) {
+			return domain.NewError(domain.CodeIdempotencyConflict, "model call key was used with different content")
 		}
-		var used int64
-		var running int32
-		var unknown bool
-		err = tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens ELSE reserved_tokens END),0),
+		return domain.NewError(domain.CodeConflict, "model call was already dispatched; reconcile its result")
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("find model call: %w", err)
+	}
+	var used int64
+	var running int32
+	var unknown bool
+	err = tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens ELSE reserved_tokens END),0),
   count(*) FILTER (WHERE state='dispatched'), COALESCE(bool_or(state='unknown'),false)
   FROM model_call_ledger WHERE owner_id=$1`, request.OwnerID).Scan(&used, &running, &unknown)
-		if err != nil {
-			return fmt.Errorf("read model usage: %w", err)
+	if err != nil {
+		return fmt.Errorf("read model usage: %w", err)
+	}
+	if unknown {
+		return domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
+	}
+	if running >= maxConcurrent {
+		return domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
+	}
+	if used > limit || request.ReservedTokens > limit-used {
+		return domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")
+	}
+	var taskID any
+	if request.Task != nil {
+		var taskUsed, taskLimit int64
+		if err := tx.QueryRow(ctx, `SELECT usage_model_tokens,budget_model_tokens FROM tasks WHERE id=$1`, request.Task.TaskID).Scan(&taskUsed, &taskLimit); err != nil {
+			return domain.NewError(domain.CodeInvalidState, "task model usage is unavailable")
 		}
-		if unknown {
-			return domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
+		var pending int64
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND state='dispatched'`, request.Task.TaskID).Scan(&pending); err != nil {
+			return fmt.Errorf("read task model reservations: %w", err)
 		}
-		if running >= maxConcurrent {
-			return domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
+		if taskUsed > taskLimit || pending > taskLimit-taskUsed || request.ReservedTokens > taskLimit-taskUsed-pending {
+			return domain.NewError(domain.CodeQuotaExceeded, "task model token budget exceeded")
 		}
-		if used > limit || request.ReservedTokens > limit-used {
-			return domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")
+		taskID = request.Task.TaskID
+	}
+	if projectReservation != nil {
+		if err := reserveProjectBudgetLedgerInTx(ctx, tx, *projectReservation); err != nil {
+			return err
 		}
-		var taskID any
-		if request.Task != nil {
-			var taskUsed, taskLimit int64
-			if err := tx.QueryRow(ctx, `SELECT usage_model_tokens,budget_model_tokens FROM tasks WHERE id=$1`, request.Task.TaskID).Scan(&taskUsed, &taskLimit); err != nil {
-				return domain.NewError(domain.CodeInvalidState, "task model usage is unavailable")
-			}
-			var pending int64
-			if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND state='dispatched'`, request.Task.TaskID).Scan(&pending); err != nil {
-				return fmt.Errorf("read task model reservations: %w", err)
-			}
-			if taskUsed > taskLimit || pending > taskLimit-taskUsed || request.ReservedTokens > taskLimit-taskUsed-pending {
-				return domain.NewError(domain.CodeQuotaExceeded, "task model token budget exceeded")
-			}
-			taskID = request.Task.TaskID
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO model_call_ledger
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO model_call_ledger
  (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,created_at)
  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched',clock_timestamp())`, request.OwnerID, string(request.Source), request.CallID,
-			request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens)
-		if err != nil {
-			return fmt.Errorf("reserve model call: %w", err)
-		}
+		request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens); err != nil {
+		return fmt.Errorf("reserve model call: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ModelTaskProjectID(ctx context.Context, fence app.ModelTaskFence) (string, error) {
+	if !domain.ValidTaskID(fence.TaskID) || !domain.ValidUserID(fence.OwnerID) || !domain.ValidUserID(fence.InitiatorID) {
+		return "", domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
+	}
+	var projectID string
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(project_id,'') FROM tasks WHERE id=$1 AND owner_id=$2 AND initiator_id=$3`,
+		fence.TaskID, fence.OwnerID, fence.InitiatorID).Scan(&projectID); err != nil {
+		return "", domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
+	}
+	if projectID != "" && !project.ValidID(projectID) {
+		return "", domain.NewError(domain.CodeInternal, "task model project scope is invalid")
+	}
+	return projectID, nil
+}
+
+func projectTaskID(request app.ModelCallReservation) any {
+	if request.Task == nil {
 		return nil
-	})
+	}
+	return request.Task.TaskID
 }
 
 func (s *Store) BeginModelCallDispatch(ctx context.Context, request app.ModelCallReservation) error {
@@ -101,6 +151,27 @@ func (s *Store) BeginModelCallDispatch(ctx context.Context, request app.ModelCal
 		}
 		if err := checkModelCaller(ctx, tx, request); err != nil {
 			return err
+		}
+		projectID := request.ProjectID
+		if request.Source == app.ModelCallTask {
+			if request.Task == nil {
+				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
+			}
+			if err := tx.QueryRow(ctx, `SELECT COALESCE(project_id,'') FROM tasks WHERE id=$1 AND owner_id=$2 AND initiator_id=$3`,
+				request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&projectID); err != nil || projectID != request.ProjectID {
+				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
+			}
+		}
+		if projectID != "" {
+			if _, _, err := lockProjectForActorInTx(ctx, tx, request.OwnerID, projectID, project.RoleMember, false); err != nil {
+				return err
+			}
+			var reserved bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM project_budget_ledger WHERE project_id=$1
+AND source=$2 AND call_id=$3 AND actor_id=$4 AND task_id IS NOT DISTINCT FROM $5::text AND model_id=$6 AND status='reserved')`,
+				projectID, string(request.Source), request.CallID, request.OwnerID, projectTaskID(request), request.ModelID).Scan(&reserved); err != nil || !reserved {
+				return domain.NewError(domain.CodeInvalidState, "project model budget reservation is unavailable")
+			}
 		}
 		var state, modelID string
 		var priorDigest []byte
@@ -147,7 +218,7 @@ func checkModelCaller(ctx context.Context, tx pgx.Tx, request app.ModelCallReser
 			return domain.NewError(domain.CodeUnauthenticated, "model caller credential is unavailable")
 		}
 	case app.ModelCallTask:
-		if request.Task == nil || request.Task.OwnerID != request.OwnerID {
+		if request.Task == nil || request.Task.InitiatorID != request.OwnerID {
 			return domain.NewError(domain.CodeUnauthenticated, "task model authorization is unavailable")
 		}
 		if err := checkTaskModelFence(ctx, tx, *request.Task, request.ModelID); err != nil {
@@ -186,9 +257,13 @@ func checkTaskModelFence(ctx context.Context, tx pgx.Tx, fence app.ModelTaskFenc
 	if rootSessionID == "" {
 		rootSessionID = fence.AgentSessionID
 	}
+	projectID, err := lockTaskInitiatorInTx(ctx, tx, fence.TaskID, fence.OwnerID, fence.InitiatorID)
+	if err != nil {
+		return err
+	}
 	var gateState string
 	var gateEpoch int64
-	if err := tx.QueryRow(ctx, `SELECT state,epoch FROM owner_execution_controls WHERE owner_id=$1 FOR SHARE`, fence.OwnerID).Scan(&gateState, &gateEpoch); err != nil || gateState != "enabled" {
+	if err := tx.QueryRow(ctx, `SELECT state,epoch FROM owner_execution_controls WHERE owner_id=$1 FOR SHARE`, fence.InitiatorID).Scan(&gateState, &gateEpoch); err != nil || gateState != "enabled" {
 		return domain.NewError(domain.CodeUnauthenticated, "task execution authorization is unavailable")
 	}
 	var status, location, leaseOwner, agentID, sessionID, engineVersion, profileVersion, taskModel, authKind, tokenID, installationID string
@@ -197,11 +272,13 @@ func checkTaskModelFence(ctx context.Context, tx pgx.Tx, fence app.ModelTaskFenc
 	var leaseValid, authValid bool
 	var checkpointDigest []byte
 	var hostID, workspaceID *string
-	err := tx.QueryRow(ctx, `SELECT status,execution_location,lease_owner,lease_version,
+	var taskInitiatorID, taskProjectID string
+	err = tx.QueryRow(ctx, `SELECT initiator_id,COALESCE(project_id,''),status,execution_location,lease_owner,lease_version,
  agent_instance_id,agent_generation,agent_session_id,agent_engine_version,agent_profile_version,auth_version,
  checkpoint_through_seq,checkpoint_digest,model_id,
  auth_kind,auth_token_id,auth_scopes,COALESCE(auth_client_installation_id,''),execution_epoch,host_id,workspace_id
- FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, fence.TaskID, fence.OwnerID).Scan(&status, &location, &leaseOwner, &leaseVersion,
+	FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, fence.TaskID, fence.OwnerID).Scan(
+		&taskInitiatorID, &taskProjectID, &status, &location, &leaseOwner, &leaseVersion,
 		&agentID, &generation, &sessionID, &engineVersion, &profileVersion, &authVersion, &through, &checkpointDigest, &taskModel,
 		&authKind, &tokenID, &authScopes, &installationID, &executionEpoch, &hostID, &workspaceID)
 	if err != nil {
@@ -212,7 +289,8 @@ COALESCE(auth_kind='schedule_task' OR auth_expires_at>clock_timestamp(),false)
  FROM tasks WHERE id=$1`, fence.TaskID).Scan(&leaseValid, &authValid); err != nil {
 		return fmt.Errorf("check task model execution expiry: %w", err)
 	}
-	if status != "running" || location != "server" || !leaseValid || !authValid ||
+	if taskInitiatorID != fence.InitiatorID || taskProjectID != projectID ||
+		status != "running" || location != "server" || !leaseValid || !authValid ||
 		leaseOwner != fence.LeaseOwner || leaseVersion != fence.LeaseVersion || agentID != fence.AgentInstanceID ||
 		generation != fence.AgentGeneration || sessionID != rootSessionID || authVersion != fence.AuthorizationVersion ||
 		engineVersion != fence.EngineVersion || profileVersion != fence.ProfileVersion ||
@@ -220,7 +298,7 @@ COALESCE(auth_kind='schedule_task' OR auth_expires_at>clock_timestamp(),false)
 		return domain.NewError(domain.CodeUnauthenticated, "task model execution fence is unavailable")
 	}
 	if err := lockActiveAgentLease(ctx, tx, app.AgentInstanceFence{
-		TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
+		TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, AgentInstanceID: fence.AgentInstanceID,
 		AgentGeneration: fence.AgentGeneration, AgentSessionID: rootSessionID,
 		LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
 		AuthorizationVersion: fence.AuthorizationVersion, EngineVersion: fence.EngineVersion,
@@ -279,7 +357,7 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 	if hostID != nil {
 		var allowed bool
 		err := tx.QueryRow(ctx, `SELECT owner_id=$2 AND state NOT IN ('deleting','deleted') AND deleted_at IS NULL
- FROM hosts WHERE id=$1 FOR SHARE`, *hostID, fence.OwnerID).Scan(&allowed)
+		FROM hosts WHERE id=$1 FOR SHARE`, *hostID, fence.InitiatorID).Scan(&allowed)
 		if err != nil || !allowed {
 			return domain.NewError(domain.CodeUnauthenticated, "task Host authorization is unavailable")
 		}
@@ -287,7 +365,7 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 	if workspaceID != nil {
 		var allowed bool
 		err := tx.QueryRow(ctx, `SELECT owner_id=$2 AND state='ready' AND deleted_at IS NULL
- FROM workspaces WHERE id=$1 FOR SHARE`, *workspaceID, fence.OwnerID).Scan(&allowed)
+		FROM workspaces WHERE id=$1 FOR SHARE`, *workspaceID, fence.InitiatorID).Scan(&allowed)
 		if err != nil || !allowed {
 			return domain.NewError(domain.CodeUnauthenticated, "task Workspace authorization is unavailable")
 		}
@@ -301,7 +379,7 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM schedule_runs r JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
   WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND s.host_id=$4
-)`, tokenID, fence.OwnerID, fence.TaskID, *hostID).Scan(&linked)
+)`, tokenID, fence.InitiatorID, fence.TaskID, *hostID).Scan(&linked)
 		if err != nil || !linked {
 			return domain.NewError(domain.CodeUnauthenticated, "scheduled Task authorization is unavailable")
 		}
@@ -310,7 +388,7 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		if !domain.ValidClientInstallationID(installationID) {
 			return domain.NewError(domain.CodeUnauthenticated, "task installation is unavailable")
 		}
-		return checkModelInstallation(ctx, tx, installationID, fence.OwnerID)
+		return checkModelInstallation(ctx, tx, installationID, fence.InitiatorID)
 	case string(identity.KindSession), string(identity.KindAPIKey):
 		if !domain.ValidTokenID(tokenID) {
 			return domain.NewError(domain.CodeUnauthenticated, "task credential is unavailable")
@@ -320,11 +398,11 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		if authKind == string(identity.KindAPIKey) {
 			query = `SELECT revoked_at IS NULL AND expires_at>clock_timestamp() AND kind=$3 FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`
 		}
-		if err := tx.QueryRow(ctx, query, tokenID, fence.OwnerID, authKind).Scan(&active); err != nil || !active {
+		if err := tx.QueryRow(ctx, query, tokenID, fence.InitiatorID, authKind).Scan(&active); err != nil || !active {
 			return domain.NewError(domain.CodeUnauthenticated, "task credential is unavailable")
 		}
 		if installationID != "" {
-			return checkModelInstallation(ctx, tx, installationID, fence.OwnerID)
+			return checkModelInstallation(ctx, tx, installationID, fence.InitiatorID)
 		}
 		return nil
 	default:
@@ -366,10 +444,10 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 						return fmt.Errorf("check unknown task model usage: %w", err)
 					}
 					if unknown {
-						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`, *taskID, settlement.OwnerID)
+						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=clock_timestamp() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
 					} else {
 						_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=COALESCE((SELECT SUM(input_tokens::numeric+output_tokens::numeric)
- FROM model_call_ledger WHERE task_id=$1 AND state='settled'),0),updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`, *taskID, settlement.OwnerID)
+ FROM model_call_ledger WHERE task_id=$1 AND state='settled'),0),updated_at=clock_timestamp() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
 					}
 					if err != nil {
 						return fmt.Errorf("rebuild late task model usage: %w", err)
@@ -396,9 +474,9 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		}
 		if taskID != nil {
 			if settlement.Unknown {
-				_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=now() WHERE id=$1 AND owner_id=$2`, *taskID, settlement.OwnerID)
+				_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=NULL,updated_at=now() WHERE id=$1 AND initiator_id=$2`, *taskID, settlement.OwnerID)
 			} else {
-				_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=usage_model_tokens+$3,updated_at=now() WHERE id=$1 AND owner_id=$2`,
+				_, err = tx.Exec(ctx, `UPDATE tasks SET usage_model_tokens=usage_model_tokens+$3,updated_at=now() WHERE id=$1 AND initiator_id=$2`,
 					*taskID, settlement.OwnerID, settlement.Usage.InputTokens+settlement.Usage.OutputTokens)
 			}
 			if err != nil {

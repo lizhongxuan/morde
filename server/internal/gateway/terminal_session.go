@@ -116,8 +116,23 @@ func (g *gateway) manageTerminalSession(c *gin.Context, replace bool) {
 		httpserver.WriteError(c, domain.NewError(domain.CodeInvalidState, "terminal requires user control"))
 		return
 	}
+	principal := principalFrom(c)
+	checkControl := func(ctx context.Context) error {
+		return g.deps.InputPermits.WithHostControlPermit(ctx, ref, principal.UserID, host.PermissionTerminalControl, func() error { return nil })
+	}
+	if err := checkControl(c.Request.Context()); err != nil {
+		httpserver.WriteError(c, err)
+		return
+	}
 
-	guard, leaseCtx, err := g.acquireHostActivityLease(c.Request.Context(), ref, app.HostActivityLeaseKindGateway, g.memberAuthorizationCheck(c))
+	checkAuthorization := g.memberAuthorizationCheck(c)
+	checkControlAndMember := func(ctx context.Context) error {
+		if err := checkAuthorization(ctx); err != nil {
+			return err
+		}
+		return checkControl(ctx)
+	}
+	guard, leaseCtx, err := g.acquireHostActivityLease(c.Request.Context(), ref, app.HostActivityLeaseKindGateway, checkControlAndMember)
 	if err != nil {
 		if domain.CodeOf(err) == domain.CodeConflict {
 			err = domain.NewError(domain.CodeHostNotReady, "host control or runtime state changed")
@@ -139,7 +154,7 @@ func (g *gateway) manageTerminalSession(c *gin.Context, replace bool) {
 		return
 	}
 	reservation, created, err := g.deps.TerminalSessions.EnsureTerminalSession(leaseCtx, app.TerminalSession{
-		HostID: ref.ID, OwnerID: ref.OwnerID, ActorID: principalFrom(c).UserID,
+		HostID: ref.ID, OwnerID: ref.OwnerID, ActorID: principal.UserID,
 		RuntimeGeneration: ref.RuntimeGeneration, ControlVersion: ref.ControlVersion,
 		AttemptID: attemptID, State: app.TerminalSessionCreating,
 	}, replace)

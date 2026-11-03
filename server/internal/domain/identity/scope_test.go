@@ -63,3 +63,35 @@ func TestDeviceCredentialUsesDynamicWorkspaceAuthorization(t *testing.T) {
 		t.Fatal("API keys must not inherit the device-only workspace scope")
 	}
 }
+
+func TestScheduledTaskExecutionScopesDependOnHostBinding(t *testing.T) {
+	hostBound := ScheduleTaskExecutionScopes()
+	hostless := HostlessScheduleTaskExecutionScopes()
+	if !IsScheduleTaskExecutionScopeSet(hostBound) || !IsHostBoundScheduleTaskExecutionScopeSet(hostBound) ||
+		IsHostlessScheduleTaskExecutionScopeSet(hostBound) {
+		t.Fatalf("host-bound scheduled Task scopes were not recognized: %v", hostBound)
+	}
+	if !IsScheduleTaskExecutionScopeSet(hostless) || !IsHostlessScheduleTaskExecutionScopeSet(hostless) ||
+		IsHostBoundScheduleTaskExecutionScopeSet(hostless) {
+		t.Fatalf("hostless scheduled Task scopes were not recognized: %v", hostless)
+	}
+	for _, scope := range hostless {
+		if scope == ScopeComputerObserve || scope == ScopeComputerOperate {
+			t.Fatalf("hostless scheduled Task has computer scope %q", scope)
+		}
+	}
+	principal := Principal{Kind: KindScheduleTask, Scopes: hostless}
+	if !principal.HasScope(ScopeTaskRead) || !principal.HasScope(ScopeTaskSubmit) || !principal.HasScope(ScopeTaskControl) ||
+		principal.HasScope(ScopeComputerObserve) || principal.HasScope(ScopeComputerOperate) {
+		t.Fatalf("hostless scheduled Task principal scope checks are wrong: %v", principal.Scopes)
+	}
+	for _, invalid := range [][]Scope{
+		append(append([]Scope(nil), hostless...), ScopeComputerObserve),
+		{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskRead},
+		{ScopeTaskRead, ScopeTaskSubmit},
+	} {
+		if IsScheduleTaskExecutionScopeSet(invalid) {
+			t.Fatalf("invalid scheduled Task scope set was accepted: %v", invalid)
+		}
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/execution"
 )
 
 type AccountAgentRuntimeState string
@@ -74,6 +75,7 @@ func (r AccountAgentRuntimeStart) Validate() error {
 type AccountAgentRuntime struct {
 	Fence                         AccountAgentRuntimeFence
 	State                         AccountAgentRuntimeState
+	FailureReason                 execution.RuntimeFailureReason
 	LeaseExpiresAt                time.Time
 	MaxConcurrentTasks            int
 	RuntimeSequence               int64
@@ -175,6 +177,7 @@ const MaxPendingAccountAgentRuntimeStopAttestations = 100
 type AccountAgentRuntimeStore interface {
 	StartAccountAgentRuntime(context.Context, AccountAgentRuntimeStart) (AccountAgentRuntime, bool, error)
 	MarkAccountAgentRuntimeReady(context.Context, AccountAgentRuntimeFence) (AccountAgentRuntime, error)
+	MarkAccountAgentRuntimeFailed(context.Context, AccountAgentRuntimeFence, execution.RuntimeFailureReason) error
 	RenewAccountAgentRuntime(context.Context, AccountAgentRuntimeFence, time.Duration) (AccountAgentRuntime, error)
 	GetAccountAgentRuntime(context.Context, string) (AccountAgentRuntime, bool, error)
 	AccountAgentRuntimeStopIdentity(context.Context, string) (AccountAgentRuntimeStopIdentity, error)
@@ -358,6 +361,19 @@ func (s *AccountAgentRuntimeService) Ready(ctx context.Context, fence AccountAge
 	return s.store.MarkAccountAgentRuntimeReady(ctx, fence)
 }
 
+func (s *AccountAgentRuntimeService) Fail(ctx context.Context, fence AccountAgentRuntimeFence, reason execution.RuntimeFailureReason) error {
+	if ctx == nil {
+		return domain.InvalidArgument("context", "account runtime context is required")
+	}
+	if err := fence.Validate(); err != nil {
+		return err
+	}
+	if !reason.Valid() {
+		return domain.InvalidArgument("failure_reason", "account runtime failure reason is invalid")
+	}
+	return s.store.MarkAccountAgentRuntimeFailed(ctx, fence, reason)
+}
+
 func (s *AccountAgentRuntimeService) Renew(ctx context.Context, fence AccountAgentRuntimeFence, duration time.Duration) (AccountAgentRuntime, error) {
 	if ctx == nil {
 		return AccountAgentRuntime{}, domain.InvalidArgument("context", "account runtime context is required")
@@ -429,7 +445,7 @@ func validateAccountAgentRuntimeStopAttestation(attestation AccountAgentRuntimeS
 
 func validateAccountAgentTaskStopAttestation(attestation AccountAgentTaskStopAttestation) error {
 	if err := attestation.RuntimeFence.Validate(); err != nil || attestation.TaskFence.Validate() != nil ||
-		attestation.TaskFence.OwnerID != attestation.RuntimeFence.OwnerID || !attestation.Destroyed ||
+		attestation.TaskFence.InitiatorID != attestation.RuntimeFence.OwnerID || !attestation.Destroyed ||
 		!isLowerHex(attestation.RuntimeContainerID) || len(attestation.RuntimeContainerID) != sha256.Size*2 ||
 		attestation.ContainerPID < 1 || attestation.HostPID < 1 || attestation.StartTimeTick == 0 ||
 		!validCgroupPath(attestation.CgroupPath) || !isLowerHex(attestation.NonceSHA256) ||

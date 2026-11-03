@@ -88,6 +88,43 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, owner.UserID, stale.Source, sta
 	}
 }
 
+func TestPostgresStaleProjectTaskRecoveryUsesInitiator(t *testing.T) {
+	store, _, _, actor, conversationOwnerID, taskID, callID := projectUnknownReconciliationFixture(t, struct {
+		name           string
+		accountTokens  int64
+		reservedInput  int64
+		reservedOutput int64
+		reservedMicros int64
+		wantQuotaError bool
+	}{name: "stale project Task", accountTokens: 100, reservedInput: 100, reservedOutput: 100, reservedMicros: 200})
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET state='dispatched',settled_at=NULL,
+created_at=clock_timestamp()-interval '3 minutes' WHERE owner_id=$1 AND source='task' AND call_id=$2`, actor.UserID, callID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE project_budget_ledger SET status='reserved',settled_at=NULL,
+created_at=clock_timestamp()-interval '3 minutes' WHERE source='task' AND call_id=$1`, callID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET usage_model_tokens=99 WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := store.MarkStaleModelCallsUnknown(ctx); err != nil || marked != 1 {
+		t.Fatalf("MarkStaleModelCallsUnknown() = %d, %v", marked, err)
+	}
+	var taskOwnerID, initiatorID, accountState, projectState string
+	var usage *int64
+	if err := store.pool.QueryRow(ctx, `SELECT t.owner_id,t.initiator_id,t.usage_model_tokens,a.state,p.status
+FROM tasks t JOIN model_call_ledger a ON a.task_id=t.id
+JOIN project_budget_ledger p ON p.task_id=t.id WHERE t.id=$1 AND p.call_id=$2`, taskID, callID).
+		Scan(&taskOwnerID, &initiatorID, &usage, &accountState, &projectState); err != nil ||
+		taskOwnerID != conversationOwnerID || initiatorID != actor.UserID || usage != nil ||
+		accountState != "unknown" || projectState != "unknown" {
+		t.Fatalf("stale project Task recovery = owner %q initiator %q usage %v ledgers %q/%q: %v",
+			taskOwnerID, initiatorID, usage, accountState, projectState, err)
+	}
+}
+
 func TestPostgresModelCallDispatchRefreshesRecoveryAge(t *testing.T) {
 	store, _, reservation := modelUsageFixture(t)
 	ctx := context.Background()

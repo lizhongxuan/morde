@@ -19,11 +19,21 @@ STATE_NAME = ".morde-aio-profile-state"
 EPHEMERAL_NAMES = frozenset({"code-server-ipc.sock"})
 # Codex recreates disposable command shims in this tree, including symlinks.
 CODEX_EPHEMERAL_PATH = "tmp"
+AIO_UID = 1000
+WORKSPACE_DIRECTORIES = (
+    ("DESKTOP", "Desktop"),
+    ("DOWNLOAD", "Downloads"),
+    ("DOCUMENTS", "Documents"),
+    ("MUSIC", "Music"),
+    ("PICTURES", "Pictures"),
+    ("VIDEOS", "Videos"),
+)
 MANAGED_PATHS = (
     ("bashrc", ".bashrc", "file"),
     ("code-server-vscode", ".config/code-server/vscode", "directory"),
     ("jupyter", ".jupyter", "directory"),
     ("matplotlib", ".config/matplotlib/matplotlibrc", "file"),
+    ("user-directories", ".config/user-dirs.dirs", "file"),
     ("browser-preferences", ".config/browser/Default/Preferences", "file"),
     ("opencode", ".config/opencode/config.json", "file"),
     ("claude", ".claude/settings.json", "file"),
@@ -61,7 +71,8 @@ def atomic_json(path: Path, value: dict) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.chown(tmp, 0, 0)
+        owner = path.parent.stat()
+        os.chown(tmp, owner.st_uid, owner.st_gid)
         os.replace(tmp, path)
         fsync_dir(path.parent)
     finally:
@@ -69,6 +80,147 @@ def atomic_json(path: Path, value: dict) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+def atomic_text(path: Path, value: str, home: Path) -> None:
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    parent_info = path.parent.lstat()
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        raise SafeguardError("workspace profile parent is unsafe")
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise SafeguardError("workspace profile file is not regular")
+    if existing is not None:
+        owner = (existing.st_uid, existing.st_gid)
+    elif os.geteuid() == 0:
+        owner = (AIO_UID, AIO_UID)
+    else:
+        owner = (home.stat().st_uid, home.stat().st_gid)
+    mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
+    fd, tmp_name = tempfile.mkstemp(prefix=".workspace-defaults.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        os.fchown(fd, *owner)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def directory_has_data(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return True
+    try:
+        return next(path.iterdir(), None) is not None
+    except OSError as exc:
+        raise SafeguardError("existing user directory cannot be inspected") from exc
+
+
+def ensure_workspace_directory(workspace: Path, name: str) -> None:
+    path = workspace / name
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(mode=0o770)
+        if os.geteuid() == 0:
+            os.chown(path, AIO_UID, AIO_UID)
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SafeguardError("Workspace default directory is unsafe")
+
+
+def workspace_defaults(home: Path) -> None:
+    layout = os.environ.get("MORDE_WORKSPACE_LAYOUT")
+    if layout == "legacy":
+        return
+    if layout != "workspace":
+        raise SafeguardError("workspace layout is unavailable")
+    workspace = check_safe_parent(home, "workspace")
+    try:
+        workspace_info = workspace.lstat()
+    except OSError as exc:
+        raise SafeguardError("Workspace mount is unavailable") from exc
+    if stat.S_ISLNK(workspace_info.st_mode) or not stat.S_ISDIR(workspace_info.st_mode):
+        raise SafeguardError("Workspace mount is unsafe")
+
+    user_dirs = check_safe_parent(home, ".config/user-dirs.dirs")
+    try:
+        user_dirs_info = user_dirs.lstat()
+    except FileNotFoundError:
+        user_dirs_info = None
+        lines: list[str] = []
+    else:
+        if not stat.S_ISREG(user_dirs_info.st_mode):
+            raise SafeguardError("user directory configuration is unsafe")
+        lines = user_dirs.read_text(encoding="utf-8").splitlines()
+    updated: list[str] = []
+    seen: set[str] = set()
+    changed = False
+    for line in lines:
+        key = next((f"XDG_{kind}_DIR" for kind, _ in WORKSPACE_DIRECTORIES if line.startswith(f"XDG_{kind}_DIR=")), "")
+        if not key:
+            updated.append(line)
+            continue
+        if key in seen:
+            raise SafeguardError("user directory configuration has duplicate entries")
+        seen.add(key)
+        name = next(name for kind, name in WORKSPACE_DIRECTORIES if key == f"XDG_{kind}_DIR")
+        old_values = {f'"$HOME/{name}"', f'"${{HOME}}/{name}"', f'"$HOME/{name}/"'}
+        if line.split("=", 1)[1].strip() in old_values and not directory_has_data(home / name):
+            ensure_workspace_directory(workspace, name)
+            line = f'{key}="$HOME/workspace/{name}"'
+            changed = True
+        updated.append(line)
+    for kind, name in WORKSPACE_DIRECTORIES:
+        key = f"XDG_{kind}_DIR"
+        if key not in seen and not directory_has_data(home / name):
+            ensure_workspace_directory(workspace, name)
+            updated.append(f'{key}="$HOME/workspace/{name}"')
+            changed = True
+    if changed or user_dirs_info is None:
+        atomic_text(user_dirs, "\n".join(updated) + "\n", home)
+
+    preferences = check_safe_parent(home, ".config/browser/Default/Preferences")
+    try:
+        preferences_info = preferences.lstat()
+    except FileNotFoundError:
+        preferences_info = None
+        value: dict = {}
+    else:
+        if not stat.S_ISREG(preferences_info.st_mode):
+            raise SafeguardError("browser preferences are unsafe")
+        try:
+            value = json.loads(preferences.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SafeguardError("browser preferences are unreadable") from exc
+        if not isinstance(value, dict):
+            raise SafeguardError("browser preferences are invalid")
+    download = value.setdefault("download", {})
+    if not isinstance(download, dict):
+        raise SafeguardError("browser download preferences are invalid")
+    current = download.get("default_directory", "")
+    normalized = os.path.normpath(str(current).replace("${HOME}", str(home)).replace("$HOME", str(home)).replace("~", str(home), 1))
+    default_downloads = {"Downloads", str(home / "Downloads"), str(home / "Downloads/")}
+    if (not current or normalized in default_downloads) and not directory_has_data(home / "Downloads"):
+        ensure_workspace_directory(workspace, "Downloads")
+        download["default_directory"] = str(workspace / "Downloads")
+        download["directory_upgrade"] = True
+        atomic_text(preferences, json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", home)
 
 
 def check_safe_parent(home: Path, relative: str) -> Path:
@@ -90,16 +242,19 @@ def check_safe_parent(home: Path, relative: str) -> Path:
 
 def ensure_state_dir(home: Path) -> Path:
     state = home / STATE_NAME
+    home_info = home.stat()
+    owner_uid = 0 if home == DEFAULT_HOME else home_info.st_uid
+    owner_gid = 0 if home == DEFAULT_HOME else home_info.st_gid
     try:
         info = state.lstat()
     except FileNotFoundError:
         state.mkdir(mode=0o700)
-        os.chown(state, 0, 0)
+        os.chown(state, owner_uid, owner_gid)
         info = state.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise SafeguardError("profile state path is not a real directory")
-    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
-        raise SafeguardError("profile state directory is not root-only")
+    if info.st_uid != owner_uid or stat.S_IMODE(info.st_mode) & 0o077:
+        raise SafeguardError("profile state directory ownership or mode is unsafe")
     return state
 
 
@@ -208,7 +363,8 @@ def save_pending(state: Path, name: str, target: Path, relative: str, kind: str)
         manifest_path = temp / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(manifest_path, 0o600)
-        os.chown(manifest_path, 0, 0)
+        state_info = state.stat()
+        os.chown(manifest_path, state_info.st_uid, state_info.st_gid)
         with manifest_path.open("rb") as stream:
             os.fsync(stream.fileno())
         fsync_dir(temp)
@@ -303,7 +459,7 @@ def restore(home: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("prepare", "restore"))
+    parser.add_argument("command", choices=("prepare", "restore", "workspace-defaults"))
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME, help=argparse.SUPPRESS)
     args = parser.parse_args()
     home = args.home
@@ -312,6 +468,8 @@ def main() -> int:
             raise SafeguardError("profile safeguard must run as root")
         if args.command == "prepare":
             prepare(home)
+        elif args.command == "workspace-defaults":
+            workspace_defaults(home)
         else:
             restore(home)
         return 0

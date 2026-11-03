@@ -78,6 +78,7 @@ type CloudDSHInstances interface {
 type CloudDSHCheckpoints interface {
 	Save(context.Context, app.AgentCheckpointCommand) (bool, error)
 	ReadPage(context.Context, app.AgentCheckpointPageRequest) (app.AgentCheckpointPage, error)
+	PendingMessages(context.Context, app.AgentCheckpointFence) ([]app.AgentConversationMessage, error)
 }
 
 type CloudDSHModels interface {
@@ -228,7 +229,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		value.AgentProfileVersion == cloudDSHProfileVersion &&
 		((value.CheckpointThroughSequence == -1 && len(value.CheckpointDigest) == 0) ||
 			(value.CheckpointThroughSequence >= 0 && value.CheckpointThroughSequence <= 1<<53-1 && len(value.CheckpointDigest) == sha256.Size))
-	if ctx == nil || !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
+	if ctx == nil || !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) || !domain.ValidUserID(value.InitiatorID) ||
 		!domain.ValidModelConnectionID(value.ModelID) || value.Status != task.StatusRunning || value.ExecutionLocation != "server" ||
 		value.Lease.Owner == "" || value.Lease.Version < 1 || value.Lease.ExpiresAt == nil || !value.Lease.ExpiresAt.After(time.Now()) ||
 		value.Authorization.Version < 1 || value.Budget.Validate() != nil || (!freshAgent && !recoveringAgent) ||
@@ -256,14 +257,14 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	var accountRuntime *cloudDSHAccountRuntimeSession
 	var runtimeFence *app.AccountAgentRuntimeFence
 	if e.options.AccountRuntimes != nil {
-		accountRuntime, err = e.options.AccountRuntimes.Acquire(ctx, value.OwnerID)
+		accountRuntime, err = e.options.AccountRuntimes.Acquire(ctx, value.InitiatorID)
 		if err != nil {
 			return err
 		}
 		fence := accountRuntime.runtime.Fence
 		runtimeFence = &fence
 	}
-	fence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, AgentInstanceID: instanceID,
+	fence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, AgentInstanceID: instanceID,
 		AgentSessionID: sessionID, SupervisorID: e.options.SupervisorID, LeaseOwner: value.Lease.Owner,
 		LeaseVersion: value.Lease.Version, AuthorizationVersion: value.Authorization.Version,
 		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
@@ -484,7 +485,7 @@ type cloudDSHRead struct {
 }
 
 func checkpointFence(fence app.AgentInstanceFence) app.AgentCheckpointFence {
-	return app.AgentCheckpointFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentInstanceID: fence.AgentInstanceID,
+	return app.AgentCheckpointFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, AgentInstanceID: fence.AgentInstanceID,
 		AgentGeneration: fence.AgentGeneration, AgentSessionID: fence.AgentSessionID, AgentRootSessionID: fence.AgentSessionID,
 		AuthorizationVersion: fence.AuthorizationVersion,
 		LeaseOwner:           fence.LeaseOwner, LeaseVersion: fence.LeaseVersion, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion}
@@ -849,6 +850,11 @@ func cloudDSHToolAllowed(definitions []app.AgentToolDefinition, name string) boo
 }
 
 func writeCloudDSHFrame(ctx context.Context, target io.WriteCloser, frame any) error {
+	if writer, ok := target.(interface {
+		writeFrame(context.Context, any) error
+	}); ok {
+		return writer.writeFrame(ctx, frame)
+	}
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
 	encoder.SetEscapeHTML(false)

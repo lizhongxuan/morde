@@ -10,6 +10,7 @@ import (
 	"morde/server/internal/domain"
 	sitedomain "morde/server/internal/domain/site"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/store/postgres/sqlcgen"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -146,7 +147,7 @@ func workspaceRevisionManifestSHA256(ctx context.Context, tx pgx.Tx, workspaceID
 	}
 
 	rows, err := tx.Query(ctx, `
-SELECT file_path, size_bytes, sha256, mode, chunks
+SELECT file_path, size_bytes, sha256, mode, kind, symlink_target, mod_time_ns, hardlink_to, chunks, xattrs, acl, metadata_known
 FROM workspace_revision_files
 WHERE workspace_id=$1 AND valid_from_revision <= $2
   AND (valid_to_revision IS NULL OR valid_to_revision > $2)
@@ -155,49 +156,60 @@ ORDER BY file_path`, workspaceID, revision)
 		return "", 0, fmt.Errorf("read Workspace revision manifest: %w", err)
 	}
 	defer rows.Close()
+	files := make([]workspace.File, 0, expectedFileCount)
+	items := make([]workspaceManifestItem, 0)
 	var fileCount int64
 	var totalBytes int64
-	var readErr error
-	digest, err := workspace.ManifestSHA256Stream(func(yield func(workspace.File) error) error {
-		for rows.Next() {
-			var path, digest string
-			var size int64
-			var mode int32
-			var chunks []byte
-			if err := rows.Scan(&path, &size, &digest, &mode, &chunks); err != nil {
-				readErr = fmt.Errorf("scan Workspace revision manifest: %w", err)
-				return readErr
-			}
-			file, err := workspaceFileFromRow(path, size, digest, mode, chunks)
-			if err != nil {
-				readErr = domain.NewError(domain.CodeInternal, "stored Workspace revision manifest is invalid")
-				return readErr
-			}
-			if size > expectedBytes-totalBytes {
-				readErr = domain.NewError(domain.CodeInternal, "stored Workspace revision byte count is invalid")
-				return readErr
-			}
-			totalBytes += size
-			fileCount++
-			if err := yield(file); err != nil {
-				readErr = domain.NewError(domain.CodeInternal, "stored Workspace revision manifest is invalid")
-				return readErr
-			}
+	for rows.Next() {
+		var path, fileDigest, kind string
+		var size int64
+		var mode int32
+		var symlinkTarget pgtype.Text
+		var modTimeNS pgtype.Int8
+		var hardlinkTo pgtype.Text
+		var chunks, xattrs, acl []byte
+		var metadataKnown bool
+		if err := rows.Scan(&path, &size, &fileDigest, &mode, &kind, &symlinkTarget, &modTimeNS, &hardlinkTo, &chunks, &xattrs, &acl, &metadataKnown); err != nil {
+			return "", 0, fmt.Errorf("scan Workspace revision manifest: %w", err)
 		}
-		if err := rows.Err(); err != nil {
-			readErr = fmt.Errorf("iterate Workspace revision manifest: %w", err)
-			return readErr
+		file, err := workspaceFileFromRow(path, size, fileDigest, mode, kind, symlinkTarget, modTimeNS, hardlinkTo, chunks, xattrs, acl, metadataKnown)
+		if err != nil {
+			return "", 0, domain.NewError(domain.CodeInternal, "stored Workspace revision manifest is invalid")
 		}
-		if fileCount != expectedFileCount || totalBytes != expectedBytes {
-			readErr = domain.NewError(domain.CodeInternal, "stored Workspace revision manifest count is invalid")
-			return readErr
+		if workspace.CanonicalFileKind(file.Kind) != workspace.FileKindRegular {
+			return "", 0, domain.NewError(domain.CodeInvalidState, "Site releases do not support Workspace symlinks")
 		}
-		return nil
+		if size > expectedBytes-totalBytes {
+			return "", 0, domain.NewError(domain.CodeInternal, "stored Workspace revision byte count is invalid")
+		}
+		totalBytes += size
+		fileCount++
+		files = append(files, file)
+		items = append(items, workspaceManifestItem{path: file.Path, file: &file})
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, fmt.Errorf("iterate Workspace revision manifest: %w", err)
+	}
+	if fileCount != expectedFileCount || totalBytes != expectedBytes {
+		return "", 0, domain.NewError(domain.CodeInternal, "stored Workspace revision manifest count is invalid")
+	}
+	emptyDirectories, err := sqlcgen.New(tx).ListWorkspaceRevisionEmptyDirectories(ctx, sqlcgen.ListWorkspaceRevisionEmptyDirectoriesParams{
+		WorkspaceID: workspaceID, ValidFromRevision: revision,
 	})
 	if err != nil {
-		if readErr != nil {
-			return "", 0, readErr
-		}
+		return "", 0, fmt.Errorf("list Workspace revision empty directories for Site manifest: %w", err)
+	}
+	for _, path := range emptyDirectories {
+		items = append(items, workspaceManifestItem{path: path})
+	}
+	directoryPaths := workspaceDirectoryAncestors(items)
+	directoryPaths = append(directoryPaths, ".")
+	directories, err := loadWorkspaceRevisionDirectories(ctx, tx, workspaceID, revision, uniqueWorkspacePaths(directoryPaths))
+	if err != nil {
+		return "", 0, err
+	}
+	digest, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+	if err != nil {
 		return "", 0, domain.NewError(domain.CodeInternal, "stored Workspace revision manifest is invalid")
 	}
 	return digest, expectedBytes, nil

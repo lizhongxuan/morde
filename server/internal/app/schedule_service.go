@@ -80,7 +80,7 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		return schedule.Schedule{}, err
 	}
 	command.Objective = stringsTrim(command.Objective)
-	if !domain.ValidHostID(command.HostID) || command.ModelID == "" || len(command.ModelID) > 200 || command.Objective == "" || len(command.Objective) > 32768 {
+	if (command.HostID != "" && !domain.ValidHostID(command.HostID)) || command.ModelID == "" || len(command.ModelID) > 200 || command.Objective == "" || len(command.Objective) > 32768 {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule fields are invalid")
 	}
 	if command.MisfirePolicy == "" {
@@ -89,7 +89,7 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 	if command.NotificationEvents == nil {
 		command.NotificationEvents = []schedule.NotificationEvent{schedule.NotifyCompleted, schedule.NotifyFailed, schedule.NotifyWaitingUser}
 	}
-	if err := validateScheduleHost(ctx, s.authorizer, principal, command.HostID); err != nil {
+	if err := validateScheduleResources(ctx, s.authorizer, principal, command.HostID, command.Objective, command.Observation); err != nil {
 		return schedule.Schedule{}, err
 	}
 	configured, err := s.models.IsConfiguredModel(ctx, principal.UserID, command.ModelID)
@@ -196,7 +196,7 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 		current.NotificationEvents = append([]schedule.NotificationEvent(nil), (*command.NotificationEvents)...)
 	}
 	current.Authorization = scheduleAuthorization(principal)
-	if err := validateScheduleHost(ctx, s.authorizer, principal, current.HostID); err != nil {
+	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Objective, current.Observation); err != nil {
 		return schedule.Schedule{}, err
 	}
 	configured, err := s.models.IsConfiguredModel(ctx, principal.UserID, current.ModelID)
@@ -237,7 +237,7 @@ func (s *ScheduleService) Action(ctx context.Context, principal identity.Princip
 	if err != nil {
 		return ScheduleActionResult{}, err
 	}
-	if err := validateScheduleHost(ctx, s.authorizer, principal, current.HostID); err != nil {
+	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Objective, current.Observation); err != nil {
 		return ScheduleActionResult{}, err
 	}
 	if command.CurrentRunAction == schedule.CurrentRunCancel && current.CurrentRun != nil && current.CurrentRun.TaskID != nil {
@@ -446,6 +446,16 @@ func validateScheduleHost(ctx context.Context, authorizer TaskAuthorizer, princi
 		return hideTaskAccessError(err)
 	}
 	return nil
+}
+
+func validateScheduleResources(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, hostID, objective string, observation *schedule.ObservationSpec) error {
+	if hostID == "" {
+		if observation != nil || ClassifyFileDeliveryIntent(objective, false) != task.FileDeliveryNone {
+			return domain.InvalidArgument("schedule", "hostless schedule cannot request computer or workspace capabilities")
+		}
+		return nil
+	}
+	return validateScheduleHost(ctx, authorizer, principal, hostID)
 }
 
 func scheduleAuthorization(principal identity.Principal) task.Authorization {

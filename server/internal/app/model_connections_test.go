@@ -111,14 +111,14 @@ func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
-		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.Shared || !created.HasAPIKey || strings.Contains(strings.ToLower(strings.Join([]string{created.Name, created.BaseURL, created.ModelName}, " ")), "secret-value") {
+	if !created.Shared || !created.HasAPIKey || strings.Contains(strings.ToLower(strings.Join([]string{created.Name, created.BaseURL, created.ModelName}, " ")), "secret-value") {
 		t.Fatalf("unsafe create response: %+v", created)
 	}
 	stored := store.values[created.ID]
@@ -146,13 +146,45 @@ func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
 	}
 }
 
+func TestPlatformConnectionUsesMeteredModelGateway(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	service := modelConnectionTestService(t, store, &modelClientStub{})
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession}
+	created, err := service.Create(context.Background(), admin, ModelConnectionCommand{
+		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "platform-secret", Shared: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkedAt := time.Now().UTC()
+	record := store.values[created.ID]
+	record.Capabilities, record.CheckedAt = ModelCapabilities{Text: true, Tools: true}, &checkedAt
+	store.values[created.ID] = record
+
+	ledger := &modelGatewayStoreTest{}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "answer", Usage: ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}}
+	gateway, err := NewModelGatewayService(ledger, service, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient, TokenID: "t1234567", ClientInstallationID: "i1234567"}
+	response, err := gateway.Complete(context.Background(), ModelCall{
+		Source: ModelCallClient, Principal: principal, ModelID: created.ID, CallID: "platform-call-01",
+		Request: ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10},
+	})
+	if err != nil || response.Text != "answer" || client.request.Endpoint.APIKey != "platform-secret" ||
+		!ledger.dispatch || ledger.reservation.Source != ModelCallClient || ledger.settlement.Unknown {
+		t.Fatalf("platform gateway response=%#v request=%#v reservation=%#v settlement=%#v err=%v", response, client.request, ledger.reservation, ledger.settlement, err)
+	}
+}
+
 func TestCheckedTextToolModelWithoutVisionCanRunNonVisualTasks(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: false}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
-		Name: "text and tools", BaseURL: "https://api.openai.com/v1", ModelName: "text-tool-model", APIKey: "secret-value",
+		Name: "text and tools", BaseURL: "https://api.openai.com/v1", ModelName: "text-tool-model", APIKey: "secret-value", Shared: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -182,6 +214,16 @@ func TestModelConnectionScopeSeparatesPersonalAndSharedManagement(t *testing.T) 
 	}); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("user shared create error = %v", err)
 	}
+	if _, err := service.Create(context.Background(), user, ModelConnectionCommand{
+		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+	}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("user personal create error = %v", err)
+	}
+	if _, err := service.Create(context.Background(), admin, ModelConnectionCommand{
+		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+	}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("admin personal create error = %v", err)
+	}
 	shared, err := service.Create(context.Background(), admin, ModelConnectionCommand{
 		Name: "shared", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
 	})
@@ -197,6 +239,11 @@ func TestModelConnectionScopeSeparatesPersonalAndSharedManagement(t *testing.T) 
 	}); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("user shared update error = %v", err)
 	}
+	if _, err := service.Update(context.Background(), admin, shared.ID, ModelConnectionCommand{
+		Name: "shared", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test",
+	}); err != nil {
+		t.Fatalf("admin shared update error = %v", err)
+	}
 	if _, err := service.ResolveEndpoint(context.Background(), user.UserID, shared.ID); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("unchecked shared connection resolve error = %v", err)
 	}
@@ -205,24 +252,82 @@ func TestModelConnectionScopeSeparatesPersonalAndSharedManagement(t *testing.T) 
 	}
 }
 
+func TestLegacyPersonalModelConnectionsRemainStoredButCannotBeUsed(t *testing.T) {
+	checkedAt := time.Now().UTC()
+	legacy := ModelConnectionRecord{
+		ID: "p1234567", OwnerID: "u1234567", Name: "legacy", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-legacy",
+		APIKeyCipher: []byte("opaque-existing-ciphertext"), Capabilities: ModelCapabilities{Text: true, Tools: true}, CheckedAt: &checkedAt,
+		CreatedAt: checkedAt, UpdatedAt: checkedAt,
+	}
+	store := &modelConnectionStoreStub{values: map[string]ModelConnectionRecord{legacy.ID: legacy}}
+	client := &modelClientStub{}
+	service := modelConnectionTestService(t, store, client)
+	user := identity.Principal{UserID: legacy.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+
+	if items, err := service.List(context.Background(), user); err != nil || len(items) != 0 {
+		t.Fatalf("legacy personal list = %+v, %v", items, err)
+	}
+	if _, err := service.Get(context.Background(), user, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy personal get error = %v", err)
+	}
+	if _, err := service.Update(context.Background(), user, legacy.ID, ModelConnectionCommand{}); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy personal update error = %v", err)
+	}
+	if err := service.Delete(context.Background(), user, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy personal delete error = %v", err)
+	}
+	if configured, err := service.IsConfiguredModel(context.Background(), user.UserID, legacy.ID); err != nil || configured {
+		t.Fatalf("legacy personal configured = %t, %v", configured, err)
+	}
+	if _, err := service.ResolveEndpoint(context.Background(), user.UserID, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy direct endpoint error = %v", err)
+	}
+	if _, err := service.ResolveGatewayEndpoint(context.Background(), user.UserID, legacy.ID, false, false); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy gateway endpoint error = %v", err)
+	}
+	if _, err := service.ResolveProbeEndpoint(context.Background(), user, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy probe endpoint error = %v", err)
+	}
+	if _, err := service.SaveProbeCapabilities(context.Background(), user, legacy.ID, checkedAt, ModelCapabilities{}); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("legacy probe save error = %v", err)
+	}
+	ledger := &modelGatewayStoreTest{}
+	gateway, err := NewModelGatewayService(ledger, service, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPrincipal := identity.Principal{UserID: user.UserID, Role: user.Role, Kind: identity.KindClient, TokenID: "t1234567", ClientInstallationID: "i1234567"}
+	if _, err := gateway.Complete(context.Background(), ModelCall{
+		Source: ModelCallClient, Principal: clientPrincipal, ModelID: legacy.ID, CallID: "legacy-model-01",
+		Request: ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10},
+	}); domain.CodeOf(err) != domain.CodeNotFound || ledger.reservation.CallID != "" {
+		t.Fatalf("legacy client model call reached ledger: reservation=%+v err=%v", ledger.reservation, err)
+	}
+	stored, exists := store.values[legacy.ID]
+	if string(client.endpoint.APIKey) != "" || !exists || stored.OwnerID != legacy.OwnerID ||
+		string(stored.APIKeyCipher) != string(legacy.APIKeyCipher) || stored.UpdatedAt != legacy.UpdatedAt {
+		t.Fatal("legacy personal model was used or its stored connection changed")
+	}
+}
+
 func TestModelConnectionRejectsUnapprovedEndpointsAndResetsChecks(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
 	for _, endpoint := range []string{
 		"http://api.openai.com/v1", "https://evil.example/v1", "https://127.0.0.1/v1",
 		"https://user:pass@api.openai.com/v1", "https://api.openai.com/v1?token=secret", "https://api.openai.com:8443/v1",
 		"https://api.openai.com:/v1", "https://api.openai.com/v1/../private", "https://api.openai.com.",
 		"https://api.openai.com/v1/" + strings.Repeat("a", 2050),
 	} {
-		_, err := service.Create(context.Background(), principal, ModelConnectionCommand{Name: "invalid", BaseURL: endpoint, ModelName: "gpt-test", APIKey: "secret-value"})
+		_, err := service.Create(context.Background(), principal, ModelConnectionCommand{Name: "invalid", BaseURL: endpoint, ModelName: "gpt-test", APIKey: "secret-value", Shared: true})
 		if err == nil {
 			t.Errorf("Create accepted endpoint %q", endpoint)
 		}
 	}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
-		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +336,7 @@ func TestModelConnectionRejectsUnapprovedEndpointsAndResetsChecks(t *testing.T) 
 		t.Fatal(err)
 	}
 	updated, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
-		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-new",
+		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-new",
 	})
 	if err != nil || updated.CheckedAt != nil || updated.Capabilities.Text {
 		t.Fatalf("model update retained stale capabilities: %+v, %v", updated, err)
@@ -254,9 +359,9 @@ func TestModelConnectionCheckClassifiesProviderErrorWithoutSecrets(t *testing.T)
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{err: &ModelClientError{Kind: ModelErrorAuthentication}}
 	service := modelConnectionTestService(t, store, client)
-	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
-		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
 	})
 	if err != nil {
 		t.Fatal(err)

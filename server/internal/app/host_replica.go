@@ -99,7 +99,21 @@ func (s *hostReplicaService) ScopeWorkspace(ctx context.Context, principal ident
 	if err != nil {
 		return identity.Principal{}, err
 	}
-	if binding.OwnerID != principal.UserID {
+	bindings, err := s.workspaces.GetWorkspaceBindingsByHost(ctx, principal.HostScope)
+	if err != nil {
+		return identity.Principal{}, err
+	}
+	activeCount := 0
+	for _, current := range bindings {
+		if current.State != workspace.BindingDetached {
+			activeCount++
+		}
+	}
+	if activeCount != 1 {
+		return identity.Principal{}, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
+	}
+	if binding.OwnerID != principal.UserID || binding.Workspace.OwnerID != principal.UserID ||
+		binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil {
 		return identity.Principal{}, domain.NewError(domain.CodeNotFound, "workspace binding not found")
 	}
 	if binding.BindingVersion != bindingVersion {
@@ -128,10 +142,20 @@ func (s *hostReplicaService) ListBindings(ctx context.Context, principal identit
 	if err != nil {
 		return nil, err
 	}
+	activeCount := 0
 	for _, binding := range bindings {
 		if binding.OwnerID != principal.UserID || binding.HostID != principal.HostScope {
 			return nil, domain.NewError(domain.CodeInternal, "Host workspace binding is inconsistent")
 		}
+		if binding.State != workspace.BindingDetached {
+			activeCount++
+			if binding.Workspace.OwnerID != principal.UserID || binding.Workspace.State != workspace.StateReady || binding.Workspace.DeletedAt != nil || binding.State == workspace.BindingFailed {
+				return nil, domain.NewError(domain.CodeWorkspaceBusy, "Host workspace binding is not available")
+			}
+		}
+	}
+	if activeCount != 1 {
+		return nil, domain.NewError(domain.CodeWorkspaceConflict, "host must have exactly one active workspace binding")
 	}
 	return bindings, nil
 }

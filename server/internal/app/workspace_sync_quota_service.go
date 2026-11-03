@@ -298,9 +298,10 @@ func describeWorkspaceReceiveFile(file *os.File, reservation WorkspaceSyncReceiv
 	if info.Size() != reservation.TargetBytes || !info.Mode().IsRegular() {
 		return workspace.File{}, domain.NewError(domain.CodeWorkspaceConflict, "received Workspace file changed during preflight")
 	}
+	modTimeNS := info.ModTime().UnixNano()
 	value := workspace.File{
 		Path: reservation.Path, SizeBytes: reservation.TargetBytes, SHA256: hex.EncodeToString(wholeHash.Sum(nil)),
-		Mode: uint32(info.Mode().Perm() & 0o777), Chunks: chunks,
+		Mode: uint32(info.Mode().Perm() & 0o777), ModTimeNS: &modTimeNS, Chunks: chunks,
 	}
 	if err := workspace.ValidateFile(value); err != nil {
 		return workspace.File{}, domain.NewError(domain.CodeWorkspaceConflict, "received Workspace file manifest is invalid")

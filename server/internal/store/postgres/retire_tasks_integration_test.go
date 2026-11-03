@@ -25,10 +25,7 @@ func (retiredTaskExecutor) StopTaskOperation(context.Context, task.Task, task.Op
 func TestRetireTaskExecutionStopsExistingTasksAndSchedulesIdempotently(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
-	owner := createTestUser(t, store, 1, 20_000, 40_000)
-	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
-		t.Fatal(err)
-	}
+	owner := createPreRetirementTestUser(t, store, 1, 20_000, 40_000)
 	computer := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
 	plan, _ := createPostgresSchedule(t, ctx, store, owner.ID, computer.ID,
 		schedule.Timing{Kind: schedule.TimingDaily, StartsOn: time.Now().UTC().Format("2006-01-02"), LocalTime: "23:59", TimeZone: "UTC"},

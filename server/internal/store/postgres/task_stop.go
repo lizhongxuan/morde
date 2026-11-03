@@ -53,13 +53,17 @@ func (s *Store) RequestTaskAction(ctx context.Context, record app.IdempotencyRec
 				}
 			}
 		}
-		var status, workspaceID, waitingReason string
+		var status, workspaceID, waitingReason, initiatorID string
 		var leaseVersion, workspaceCheckpointRevision int64
 		var taskEpoch int64
-		err := tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch, COALESCE(workspace_id,''),
-COALESCE(workspace_checkpoint_revision,-1), waiting_reason
-FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
-			Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &workspaceCheckpointRevision, &waitingReason)
+		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, true)
+		if err != nil {
+			return err
+		}
+		err = tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch, COALESCE(workspace_id,''),
+COALESCE(workspace_checkpoint_revision,-1), waiting_reason, initiator_id
+FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
+			Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &workspaceCheckpointRevision, &waitingReason, &initiatorID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
@@ -82,6 +86,9 @@ FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, record.OwnerID).
 			requestIDToUse = stored.ResourceID
 		} else {
 			if action == task.ActionResume && workspaceID != "" {
+				if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+					return err
+				}
 				var currentRevision int64
 				var workspaceState string
 				err := tx.QueryRow(ctx, `SELECT revision, state FROM workspaces WHERE id=$1 AND owner_id=$2`, workspaceID, record.OwnerID).
@@ -149,7 +156,7 @@ FROM tasks WHERE id=$1`, taskID).Scan(&safeAfter)
 				err = tx.QueryRow(ctx, `UPDATE tasks SET status=$3, lease_version=lease_version+1, lease_owner='', lease_expires_at=NULL,
 waiting_reason='', finished_at=NULL, event_seq=event_seq+1, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND status=$4 RETURNING event_seq`,
-					taskID, record.OwnerID, string(targetStatus), status).Scan(&sequence)
+					taskID, taskOwnerID, string(targetStatus), status).Scan(&sequence)
 				if errors.Is(err, pgx.ErrNoRows) {
 					return domain.NewError(domain.CodeConflict, "task state changed while applying the action")
 				}
@@ -175,7 +182,7 @@ VALUES ($1,$2,$3,'pending',$4)`, requestIDToUse, taskID, string(action), safeAft
 				var sequence int64
 				err := tx.QueryRow(ctx, `UPDATE tasks SET status='queued', lease_version=lease_version+1, lease_owner='', lease_expires_at=NULL,
 waiting_reason='', finished_at=NULL, event_seq=event_seq+1, updated_at=clock_timestamp()
-WHERE id=$1 AND owner_id=$2 AND status='paused' RETURNING event_seq`, taskID, record.OwnerID).Scan(&sequence)
+WHERE id=$1 AND owner_id=$2 AND status='paused' RETURNING event_seq`, taskID, taskOwnerID).Scan(&sequence)
 				if errors.Is(err, pgx.ErrNoRows) {
 					return domain.NewError(domain.CodeConflict, "task state changed while resuming")
 				}
@@ -188,7 +195,7 @@ WHERE id=$1 AND owner_id=$2 AND status='paused' RETURNING event_seq`, taskID, re
 			}
 		}
 
-		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: taskID, OwnerID: record.OwnerID})
+		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: taskID, OwnerID: taskOwnerID})
 		if err != nil {
 			return fmt.Errorf("read task after action: %w", err)
 		}

@@ -391,6 +391,9 @@ func newWorkspaceSyncFixture(t *testing.T) *workspaceSyncFixture {
 	if err := os.Mkdir(quotaSocketRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chown(quotaSocketRoot, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewUnstartedServer(engine)
 	_ = server.Listener.Close()
 	server.Listener = listener
@@ -465,7 +468,7 @@ func TestDockerWorkspaceSyncNodeEnsureCreatesIsolatedNode(t *testing.T) {
 	wantSources := map[string]string{
 		dockerWorkspaceSyncConfigPath: filepath.Join(mustEvalSymlinks(t, f.stateRoot), ownerHash),
 		dockerWorkspaceSyncFilesPath:  filepath.Join(mustEvalSymlinks(t, f.workRoot), ownerHash),
-		dockerWorkspaceSyncQuotaPath:  filepath.Join(f.options.QuotaSocketRoot, ownerHash),
+		dockerWorkspaceSyncQuotaPath:  filepath.Join(mustEvalSymlinks(t, f.options.QuotaSocketRoot), ownerHash),
 	}
 	for _, raw := range mounts {
 		mount := raw.(map[string]any)

@@ -37,7 +37,7 @@ const allowHosts = async (count: number, client: typeof api = api, cpuMilli = 40
 
 beforeAll(() => server.listen());
 beforeEach(() => { resetMockState(); api = createApiClient(); workspaceSequence = 0; hostSequence = 0; });
-afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); });
+afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 afterAll(() => server.close());
 
 describe("portal personal-data mock reads", () => {
@@ -74,6 +74,227 @@ describe("portal personal-data mock reads", () => {
   });
 });
 
+describe("local project mock routes", () => {
+  it("shares project conversations with accepted members and replays a queued Task without dispatching a model", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const projectID = "pdem0001";
+    const createBody = { title: "本机合成对话" };
+    const createHeaders = { "content-type": "application/json", "Idempotency-Key": "project-conversation-create-1" };
+    const created = await api(`/api/projects/${projectID}/conversations`, { method: "POST", headers: createHeaders, body: JSON.stringify(createBody) });
+    const conversation = await created.json() as { id: string; owner_id: string; project_id: string; title: string };
+    expect(created.status).toBe(201);
+    expect(conversation).toMatchObject({ owner_id: "u1a2b3c4", project_id: projectID, title: "本机合成对话" });
+    const replayedCreate = await api(`/api/projects/${projectID}/conversations`, { method: "POST", headers: createHeaders, body: JSON.stringify(createBody) });
+    expect(replayedCreate.status).toBe(200);
+    expect(await replayedCreate.json()).toMatchObject({ id: conversation.id });
+    expect(await (await api(`/api/projects/${projectID}/conversations`)).json()).toMatchObject({ items: [{ id: conversation.id }] });
+
+    const prompt = { model_id: "pmodel01", content: "只返回合成任务，不调用模型或读取文件。" };
+    const appendPath = `/api/projects/${projectID}/conversations/${conversation.id}/messages`;
+    const appendHeaders = { "content-type": "application/json", "Idempotency-Key": "project-append-test-1" };
+    const first = await api(appendPath, { method: "POST", headers: appendHeaders, body: JSON.stringify(prompt) });
+    const firstResult = await first.json() as { message: { id: string; owner_id: string; actor_id: string; task_id: string }; task: { id: string; project_id: string; initiator_id: string; status: string; model_id: string } };
+    expect(first.status).toBe(202);
+    expect(firstResult).toMatchObject({
+      message: { owner_id: "u1a2b3c4", actor_id: "u1a2b3c4" },
+      task: { project_id: projectID, initiator_id: "u1a2b3c4", status: "queued", model_id: "pmodel01" },
+    });
+    expect(firstResult.message.task_id).toBe(firstResult.task.id);
+    expect(await (await api(appendPath)).json()).toMatchObject({ items: [{ owner_id: "u1a2b3c4", actor_id: "u1a2b3c4", delivery_status: "applied" }] });
+    const replayedAppend = await api(appendPath, { method: "POST", headers: appendHeaders, body: JSON.stringify(prompt) });
+    const replayedResult = await replayedAppend.json() as typeof firstResult;
+    expect(replayedAppend.status).toBe(202);
+    expect(replayedResult.task.id).toBe(firstResult.task.id);
+    expect(replayedResult.message.id).toBe(firstResult.message.id);
+    const mismatchedReplay = await api(appendPath, { method: "POST", headers: appendHeaders, body: JSON.stringify({ ...prompt, content: "不同内容" }) });
+    expect(mismatchedReplay.status).toBe(409);
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(`/api/projects/${projectID}/conversations`)).status).toBe(404);
+    await member("/api/project-invitations/rinvite1/accept", {
+      method: "POST", headers: { "Idempotency-Key": "project-member-accept-1" },
+    });
+    const shared = await member(`/api/projects/${projectID}/conversations`);
+    expect(await shared.json()).toMatchObject({ items: [{ id: conversation.id, owner_id: "u1a2b3c4" }] });
+    const memberAppend = await member(appendPath, {
+      method: "POST", headers: { ...appendHeaders, "Idempotency-Key": "project-member-append-1" }, body: JSON.stringify(prompt),
+    });
+    expect(await memberAppend.json()).toMatchObject({
+      message: { owner_id: "u1a2b3c4", actor_id: "umember1" },
+      task: { project_id: projectID, initiator_id: "umember1", status: "queued" },
+    });
+    expect(await (await member(appendPath)).json()).toMatchObject({ items: [
+      { owner_id: "u1a2b3c4", actor_id: "u1a2b3c4" }, { owner_id: "u1a2b3c4", actor_id: "umember1" },
+    ] });
+  });
+
+  it("keeps project access behind invitation acceptance and checks work-item versions", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const projectPage = await api("/api/projects");
+    const project = (await projectPage.json() as { items: Array<{ id: string; version: number }> }).items[0];
+    if (!project) throw new Error("local project fixture is missing");
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(`/api/projects/${project.id}`)).status).toBe(404);
+    const invitations = await member("/api/me/project-invitations");
+    const invitation = (await invitations.json() as { items: Array<{ id: string; state: string }> }).items[0];
+    expect(invitation?.state).toBe("pending");
+
+    const accepted = await member(`/api/project-invitations/${invitation!.id}/accept`, { method: "POST", headers: { "Idempotency-Key": "project-accept-test" } });
+    expect(accepted.status).toBe(201);
+    expect(await accepted.json()).toMatchObject({ project_id: project.id, user_id: "umember1", role: "member" });
+    const acceptedProject = await member(`/api/projects/${project.id}`);
+    expect(acceptedProject.status).toBe(200);
+
+    const transfer = await api(`/api/projects/${project.id}/owner-transfer`, {
+      ...json("POST", { user_id: "umember1", expected_version: project.version }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "project-transfer-test" },
+    });
+    expect(await transfer.json()).toMatchObject({ owner_id: "umember1", version: 2 });
+
+    const blocked = await member(`/api/projects/${project.id}/work-items/jdem0001/block`, json("POST", { blocked_reason: "等待确认", expected_version: 1 }));
+    expect(await blocked.json()).toMatchObject({ state: "blocked", blocked_reason: "等待确认", version: 2 });
+    const stale = await member(`/api/projects/${project.id}/work-items/jdem0001/resume`, json("POST", { expected_version: 1 }));
+    expect(stale.status).toBe(409);
+    const resumed = await member(`/api/projects/${project.id}/work-items/jdem0001/resume`, json("POST", { expected_version: 2 }));
+    expect(await resumed.json()).toMatchObject({ state: "open", blocked_reason: "", version: 3 });
+  });
+
+  it("keeps project Workspace directory reads behind both resource linkage and direct Workspace access", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const workspaceResponse = await createWorkspace("项目源工作区");
+    const workspace = await workspaceResponse.json() as { id: string };
+    const projectID = "pdem0001";
+    const linked = await api(`/api/projects/${projectID}/resources`, {
+      ...json("POST", { kind: "workspace", resource_id: workspace.id, expected_version: 1 }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "project-workspace-link-01" },
+    });
+    expect(linked.status).toBe(201);
+
+    const ownerManifest = await api(`/api/projects/${projectID}/workspaces/${workspace.id}/manifest`);
+    expect(ownerManifest.status).toBe(200);
+    expect(await ownerManifest.json()).toEqual({
+      project_id: projectID, workspace_id: workspace.id, revision: 0,
+      files: [], empty_directories: [], next_cursor: null,
+    });
+    expect((await api(`/api/projects/${projectID}/workspaces/wmiss001/manifest`)).status).toBe(404);
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    await member("/api/project-invitations/rinvite1/accept", {
+      method: "POST", headers: { "Idempotency-Key": "project-workspace-member-01" },
+    });
+    expect((await member(`/api/projects/${projectID}/workspaces/${workspace.id}/manifest`)).status).toBe(404);
+
+    await allowHosts(2);
+    const hostResponse = await api("/api/hosts", {
+      method: "POST", headers: { "content-type": "application/json", "Idempotency-Key": "project-workspace-host-01" },
+      body: JSON.stringify({ name: "Workspace 只读授权", workspace_ids: [workspace.id] }),
+    });
+    const host = await hostResponse.json() as { id: string };
+    expect(hostResponse.status).toBe(201);
+    const shared = await api(`/api/hosts/${host.id}/members`, json("POST", { user_id: "umember1", permissions: ["workspace:file:read"] }));
+    expect(shared.status).toBe(201);
+
+    expect(await (await member(`/api/projects/${projectID}/resources`)).json()).toMatchObject({
+      items: [{ project_id: projectID, kind: "workspace", resource_id: workspace.id }],
+    });
+    const memberManifest = await member(`/api/projects/${projectID}/workspaces/${workspace.id}/manifest`);
+    expect(memberManifest.status).toBe(200);
+    expect(await memberManifest.json()).toMatchObject({ project_id: projectID, workspace_id: workspace.id, revision: 0, files: [] });
+  });
+});
+
+describe("local main-conversation mock routes", () => {
+  it("shares one server-owned main ID across clients and rejects a stale concurrent update", async () => {
+    const firstClient = createApiClient();
+    const secondClient = createApiClient();
+    await firstClient("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const createTask = (client: typeof firstClient, key: string, objective: string) => client("/api/tasks", {
+      ...json("POST", { model_id: "pmodel01", objective }),
+      headers: { "content-type": "application/json", "Idempotency-Key": key },
+    });
+    const firstTask = await createTask(firstClient, "main-task-one-001", "第一个历史会话");
+    const secondTask = await createTask(firstClient, "main-task-two-001", "第二个历史会话");
+    const firstConversationID = (await firstTask.json() as { conversation_id: string }).conversation_id;
+    const secondConversationID = (await secondTask.json() as { conversation_id: string }).conversation_id;
+    await secondClient("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+
+    const selectionRequired = await firstClient("/api/me/main-conversation/ensure", {
+      method: "POST", headers: { "Idempotency-Key": "main-ensure-test-001" },
+    });
+    expect(await selectionRequired.json()).toEqual({ status: "selection_required", conversation_id: "", version: 0 });
+    const selected = await firstClient("/api/me/main-conversation", {
+      ...json("PUT", { conversation_id: firstConversationID, expected_version: 0 }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "main-select-test-001" },
+    });
+    expect(await selected.json()).toEqual({ status: "ready", conversation_id: firstConversationID, version: 1 });
+    expect(await (await secondClient("/api/me/main-conversation")).json()).toEqual({ status: "ready", conversation_id: firstConversationID, version: 1 });
+
+    const stale = await secondClient("/api/me/main-conversation", {
+      ...json("PUT", { conversation_id: secondConversationID, expected_version: 0 }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "main-select-stale-001" },
+    });
+    expect(stale.status).toBe(409);
+    const tasksAfterConflict = await firstClient("/api/tasks");
+    expect(await tasksAfterConflict.json()).toMatchObject({ items: [{ id: expect.any(String) }, { id: expect.any(String) }] });
+  });
+});
+
+describe("workspace manifest metadata mock", () => {
+  it("returns owner-scoped revision metadata without file content", async () => {
+    expect((await api("/api/workspaces/w1234567/manifest?revision=0")).status).toBe(401);
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const created = await createWorkspace("manifest demo");
+    const workspace = await created.json() as { id: string; revision: number };
+
+    const manifest = await api(`/api/workspaces/${workspace.id}/manifest?revision=0&limit=1000`);
+    expect(await manifest.json()).toEqual({ workspace_id: workspace.id, revision: 0, files: [], empty_directories: [], next_cursor: null });
+    expect((await api(`/api/workspaces/${workspace.id}/manifest?revision=invalid`)).status).toBe(400);
+    expect((await api(`/api/workspaces/${workspace.id}/manifest?revision=1`)).status).toBe(404);
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(`/api/workspaces/${workspace.id}/manifest?revision=0`)).status).toBe(404);
+  });
+});
+
+describe("workspace diff and restore mock", () => {
+  it("returns owner-scoped synthetic diffs and applies an idempotent compare-and-set restore", async () => {
+    vi.stubEnv("VITE_MOCK_API", "1");
+    resetMockState();
+    expect((await api("/api/workspaces/wlocal01/diff?from_revision=1&to_revision=2")).status).toBe(401);
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+
+    const diff = await api("/api/workspaces/wlocal01/diff?from_revision=1&to_revision=2");
+    expect(await diff.json()).toMatchObject({
+      workspace_id: "wlocal01", from_revision: 1, to_revision: 2,
+      changes: [{ path: "README.md", display_status: "text", before_text: "本地合成 revision v1", after_text: "本地合成 revision v2" }],
+    });
+    const restoreBody = { target_revision: 1, expected_current_revision: 2, paths: ["README.md"] };
+    const restore = await api("/api/workspaces/wlocal01/restore", {
+      ...json("POST", restoreBody), headers: { "content-type": "application/json", "Idempotency-Key": "restore-test-key-001" },
+    });
+    expect(await restore.json()).toEqual({ workspace_id: "wlocal01", target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false });
+    const replay = await api("/api/workspaces/wlocal01/restore", {
+      ...json("POST", restoreBody), headers: { "content-type": "application/json", "Idempotency-Key": "restore-test-key-001" },
+    });
+    expect(await replay.json()).toEqual({ workspace_id: "wlocal01", target_revision: 1, expected_current_revision: 2, revision: 3, replayed: true });
+    expect((await api("/api/workspaces/wlocal01/restore", {
+      ...json("POST", { ...restoreBody, paths: ["../outside"] }), headers: { "content-type": "application/json", "Idempotency-Key": "restore-test-key-002" },
+    })).status).toBe(400);
+    expect((await api("/api/workspaces/wlocal01/restore", {
+      ...json("POST", { ...restoreBody, expected_current_revision: 2 }), headers: { "content-type": "application/json", "Idempotency-Key": "restore-test-key-003" },
+    })).status).toBe(409);
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member("/api/workspaces/wlocal01/diff?from_revision=1&to_revision=2")).status).toBe(404);
+  });
+});
+
 describe("schedule mock routes", () => {
   it("creates and lists an every-N-hours schedule", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
@@ -104,8 +325,9 @@ describe("admin console mock routes", () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const settings = await api("/api/admin/settings");
     expect(await settings.json()).toMatchObject({
-      registration_review_required: true, automatic_new_user_model_budget: false,
+      registration_review_required: true, automatic_new_user_model_budget: true,
       automatic_invitation_reward: false, automatic_contribution_reward: false,
+      default_model_budget: { configured: false, token_limit: 0, max_concurrent: 0, version: 0 },
     });
     const codeResponse = await api("/api/me/invite-code");
     const { code } = await codeResponse.json() as { code: string };
@@ -263,8 +485,14 @@ describe("admin console mock routes", () => {
   it("rejects non-admin console reads and shared model writes", async () => {
     await api("/api/auth/login", json("POST", { name: "member", password: "member" }));
     expect((await api("/api/admin/overview")).status).toBe(403);
+    expect((await api("/api/model-connections")).status).toBe(200);
+    const models = await (await api("/api/model-connections")).json() as { items: Array<{ shared: boolean }> };
+    expect(models.items.every((item) => item.shared)).toBe(true);
     expect((await api("/api/model-connections", json("POST", {
       name: "未授权连接", base_url: "https://models.example.test/v1", model_name: "test-model", api_key: "local-test-secret", shared: true,
+    }))).status).toBe(403);
+    expect((await api("/api/model-connections", json("POST", {
+      name: "个人连接", base_url: "https://models.example.test/v1", model_name: "test-model", api_key: "local-test-secret", shared: false,
     }))).status).toBe(403);
   });
 });
@@ -312,6 +540,12 @@ describe("portal mock cookie sessions", () => {
     api = createApiClient();
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const host = (await (await api("/api/hosts")).json()).items[0] as { id: string };
+    const workspace = await createWorkspace("legacy host workspace");
+    const { id: workspaceID, revision } = await workspace.json() as { id: string; revision: number };
+    await api(`/api/hosts/${host.id}/workspace-bindings`, {
+      ...json("POST", { workspace_id: workspaceID, expected_revision: revision, expected_binding_version: 0 }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "legacy-restore-bind-01" },
+    });
     expect((await api(`/api/hosts/${host.id}/restore`, { method: "POST" })).status).toBe(202);
     await wait(950);
     expect((await (await api(`/api/hosts/${host.id}`)).json()).state).toBe("running");
@@ -382,8 +616,27 @@ describe("portal mock cookie sessions", () => {
     expect(stale.status).toBe(409);
     expect((await stale.json()).error.code).toBe("conflict");
 
+    const unconfiguredApproval = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "pending", status: "approved" }));
+    expect(unconfiguredApproval.status).toBe(409);
+    expect((await unconfiguredApproval.json()).error.code).toBe("invalid_state");
+    expect(await (await admin(`/api/admin/users/${user.id}`)).json()).toMatchObject({ status: "pending" });
+
+    const invalidDefault = await admin("/api/admin/settings/model-budget-default", json("PUT", { expected_version: 0, token_limit: 0, max_concurrent: 101 }));
+    expect(invalidDefault.status).toBe(400);
+
+    const configured = await admin("/api/admin/settings/model-budget-default", json("PUT", { expected_version: 0, token_limit: 100_000, max_concurrent: 4 }));
+    expect(configured.status).toBe(200);
+    expect(await configured.json()).toMatchObject({ configured: true, token_limit: 100_000, max_concurrent: 4, version: 1 });
+    const staleDefault = await admin("/api/admin/settings/model-budget-default", json("PUT", { expected_version: 0, token_limit: 200_000, max_concurrent: 8 }));
+    expect(staleDefault.status).toBe(409);
+    expect((await staleDefault.json()).error.code).toBe("conflict");
+
     const approved = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "pending", status: "approved" }));
     expect(approved.status).toBe(200);
+    expect(await (await admin(`/api/admin/users/${user.id}/model-usage-budget`)).json()).toMatchObject({ configured: true, token_limit: 100_000, max_concurrent: 4 });
+    const nextDefault = await admin("/api/admin/settings/model-budget-default", json("PUT", { expected_version: 1, token_limit: 200_000, max_concurrent: 8 }));
+    expect(nextDefault.status).toBe(200);
+    expect(await (await admin(`/api/admin/users/${user.id}/model-usage-budget`)).json()).toMatchObject({ configured: true, token_limit: 100_000, max_concurrent: 4 });
     const promoted = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "approved", role: "admin" }));
     expect(await promoted.json()).toMatchObject({ role: "admin", status: "approved" });
     await account("/api/auth/login", json("POST", { name: "review-me", password: "secret-pass" }));
@@ -396,6 +649,8 @@ describe("portal mock cookie sessions", () => {
     const disabledLogin = await account("/api/auth/login", json("POST", { name: "review-me", password: "secret-pass" }));
     expect(disabledLogin.status).toBe(403);
     expect((await disabledLogin.json()).error.code).toBe("account_disabled");
+    expect((await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "disabled", status: "approved" }))).status).toBe(200);
+    expect(await (await admin(`/api/admin/users/${user.id}/model-usage-budget`)).json()).toMatchObject({ configured: true, token_limit: 100_000, max_concurrent: 4 });
 
     const rejectedRegistration = await account("/api/auth/register", json("POST", { name: "rejected-me", password: "secret-pass" }));
     const rejectedUser = (await rejectedRegistration.json() as { user: { id: string } }).user;
@@ -404,6 +659,9 @@ describe("portal mock cookie sessions", () => {
     const rejectedLogin = await account("/api/auth/login", json("POST", { name: "rejected-me", password: "secret-pass" }));
     expect(rejectedLogin.status).toBe(403);
     expect((await rejectedLogin.json()).error.code).toBe("account_rejected");
+    const reapproved = await admin(`/api/admin/users/${rejectedUser.id}`, json("PATCH", { expected_status: "rejected", status: "approved" }));
+    expect(reapproved.status).toBe(200);
+    expect(await (await admin(`/api/admin/users/${rejectedUser.id}/model-usage-budget`)).json()).toMatchObject({ configured: true, token_limit: 200_000, max_concurrent: 8 });
   });
 
   it("protects the super administrator and restricts its initial default-password session", async () => {
@@ -644,6 +902,37 @@ describe("portal mock admin workspaces", () => {
 });
 
 describe("portal mock durable tasks", () => {
+  it("appends to the expected active Task and rejects a stale Task ID without creating another", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const submitted = await api("/api/tasks", {
+      ...json("POST", { model_id: "pmodel01", objective: "初始指令" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "task-append-submit-01" },
+    });
+    const task = await submitted.json() as { id: string; conversation_id: string };
+    expect(submitted.status).toBe(202);
+
+    const appendPath = `/api/conversations/${task.conversation_id}/messages`;
+    const appendBody = { expected_task_id: task.id, model_id: "pmodel01", content: "追加说明" };
+    const appendHeaders = { "content-type": "application/json", "Idempotency-Key": "task-append-message-01" };
+    const first = await api(appendPath, { ...json("POST", appendBody), headers: appendHeaders });
+    const result = await first.json() as { task: { id: string }; message: { id: string; task_id: string; delivery_status: string } };
+    expect(first.status).toBe(202);
+    expect(result).toMatchObject({
+      task: { id: task.id },
+      message: { task_id: task.id, content: "追加说明", delivery_status: "pending" },
+    });
+
+    const replay = await api(appendPath, { ...json("POST", appendBody), headers: appendHeaders });
+    expect(await replay.json()).toMatchObject({ task: { id: task.id }, message: { id: result.message.id } });
+    const stale = await api(appendPath, {
+      ...json("POST", { ...appendBody, expected_task_id: "q7654321" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "task-append-message-02" },
+    });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: { code: "conflict" } });
+    expect((await (await api(appendPath)).json()).items).toHaveLength(2);
+  });
+
   it("persists a queued Task, replays an exact retry, and protects conversation ownership", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const headers = { "content-type": "application/json", "Idempotency-Key": "task-submit-retry-001" };
@@ -658,7 +947,7 @@ describe("portal mock durable tasks", () => {
     expect(replay.status).toBe(202);
     expect(await replay.json()).toMatchObject({ id: saved.id, conversation_id: saved.conversation_id });
     const history = await api(`/api/conversations/${saved.conversation_id}/messages`);
-    expect(await history.json()).toMatchObject({ items: [{ content: "你好", role: "user", task_id: saved.id }] });
+    expect(await history.json()).toMatchObject({ items: [{ content: "你好", role: "user", task_id: saved.id, delivery_status: "applied" }] });
     expect(await (await api(`/api/tasks/${saved.id}`)).json()).toMatchObject({
       id: saved.id, status: "queued", host_id: "h1234567", workspace_id: "w1234567", input_revision: 5,
     });
@@ -674,6 +963,45 @@ describe("portal mock durable tasks", () => {
     const restored = await api(`/api/conversations/${saved.conversation_id}/messages`);
     expect((await restored.json()).items).toHaveLength(1);
     expect((await (await api(`/api/tasks/${saved.id}`)).json()).status).toBe("queued");
+  });
+
+  it("issues a read-only observation ticket only for the current owner and matching Host Task", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const hostList = await api("/api/hosts");
+    const host = (await hostList.json() as { items: Array<{ id: string }> }).items[0]!;
+    const workspaceResponse = await createWorkspace("Task observation workspace");
+    const workspace = await workspaceResponse.json() as { id: string };
+    const bound = await api(`/api/hosts/${host.id}/workspace-bindings`, {
+      ...json("POST", { workspace_id: workspace.id, expected_revision: 0, expected_binding_version: 0 }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "task-observe-bind-001" },
+    });
+    expect(bound.status).toBe(201);
+    await api(`/api/hosts/${host.id}/restore`, { method: "POST" });
+    await wait(950);
+    await api("/api/hosts");
+    const created = await api("/api/tasks", {
+      ...json("POST", { model_id: "pmodel01", objective: "observe", host_id: host.id, workspace_id: workspace.id, input_revision: 0 }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "task-observe-submit-01" },
+    });
+    expect(created.status).toBe(202);
+    const task = await created.json() as { id: string; host_id: string };
+    const ticketResponse = await api(`/api/tasks/${task.id}/workbench-observation-ticket`, { method: "POST" });
+    expect(ticketResponse.status).toBe(200);
+    expect(await ticketResponse.json()).toMatchObject({
+      task_id: task.id, host_id: task.host_id, ticket: expect.stringContaining("mock-one-time-task-ticket"),
+      expires_at: expect.any(String),
+    });
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(`/api/tasks/${task.id}/workbench-observation-ticket`, { method: "POST" })).status).toBe(404);
+
+    const noHost = await api("/api/tasks", {
+      ...json("POST", { model_id: "pmodel01", objective: "cloud only" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "task-observe-cloud-01" },
+    });
+    const cloudTask = await noHost.json() as { id: string };
+    expect((await api(`/api/tasks/${cloudTask.id}/workbench-observation-ticket`, { method: "POST" })).status).toBe(404);
   });
 
   it("records a pending cancellation, replays the same action, and rejects stale status", async () => {
@@ -956,6 +1284,30 @@ describe("portal mock workspace bindings", () => {
 
     await api("/api/auth/login", json("POST", { name: "member", password: "member" }));
     expect((await api(`/api/workspaces/${workspace.id}/sync-progress`)).status).toBe(404);
+  });
+
+  it("binds a ready workspace to a stopped host before restore", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    await allowHosts(2);
+    const workspaceResponse = await createWorkspace("stopped host workspace");
+    const workspace = await workspaceResponse.json() as { id: string; revision: number };
+    const hostResponse = await createHostRequest({ name: "stopped workspace host", workspace_ids: [] });
+    const host = await hostResponse.json() as { id: string };
+    await wait(950);
+    await api(`/api/hosts/${host.id}/release`, json("POST", { confirm_process_termination: true }));
+    await wait(950);
+
+    const headers = { "content-type": "application/json", "Idempotency-Key": "stopped-host-bind-01" };
+    const bound = await api(`/api/hosts/${host.id}/workspace-bindings`, {
+      ...json("POST", { workspace_id: workspace.id, expected_revision: workspace.revision, expected_binding_version: 0 }), headers,
+    });
+    expect(bound.status).toBe(201);
+    expect(await bound.json()).toMatchObject({ state: "preparing", desired_revision: workspace.revision, applied_revision: 0 });
+
+    const restore = await api(`/api/hosts/${host.id}/restore`, json("POST", {}));
+    expect(restore.status).toBe(202);
+    await wait(950);
+    expect((await (await api(`/api/hosts/${host.id}`)).json()).workspaces[0]).toMatchObject({ state: "active", applied_revision: workspace.revision });
   });
 
   it("accepts unbinding only with current version and writer confirmation while retaining workspace data", async () => {

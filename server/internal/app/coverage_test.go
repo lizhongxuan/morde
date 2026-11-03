@@ -470,7 +470,7 @@ func TestCoverageLoadSealerAndWorkerAppFacade(t *testing.T) {
 	}
 }
 
-func TestCoverageWorkerPreservesWorkspaceAcrossRootVolumeDeleteRetry(t *testing.T) {
+func TestCoverageWorkerRetainsWorkspaceAndLegacyRootAfterHostDeletion(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateDeleting)
 	value.SandboxID = ""
@@ -483,29 +483,23 @@ func TestCoverageWorkerPreservesWorkspaceAcrossRootVolumeDeleteRetry(t *testing.
 	volume := service.volumes.(*hostServiceTestVolume)
 	volume.errByName = map[string]error{domain.WorkspaceRootVolumeName(value.ID): errors.New("volume is still mounted")}
 	worker := newWorkerAppTest(t, service)
-	if _, err := worker.Reconcile(context.Background()); err == nil {
-		t.Fatal("Reconcile() with busy volume returned no error")
+	if _, err := worker.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() with retained legacy volume = %v", err)
 	}
-	workspaceAfterFailure, err := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if err != nil || workspaceAfterFailure.State != workspace.StateReady {
-		t.Fatalf("workspace after failed volume delete = %#v, %v", workspaceAfterFailure, err)
+	workspaceAfterDelete, err := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
+	if err != nil || workspaceAfterDelete.State != workspace.StateReady {
+		t.Fatalf("workspace after Host deletion = %#v, %v", workspaceAfterDelete, err)
 	}
-	hostAfterFailure, err := deps.hosts.GetHost(context.Background(), value.ID)
-	if err != nil || hostAfterFailure.State != host.StateDeleting {
-		t.Fatalf("host after failed volume delete = %#v, %v", hostAfterFailure, err)
+	hostAfterDelete, err := deps.hosts.GetHost(context.Background(), value.ID)
+	if err != nil || hostAfterDelete.State != host.StateDeleted {
+		t.Fatalf("Host after retaining old volume = %#v, %v", hostAfterDelete, err)
 	}
 	binding, err := deps.workspaces.GetWorkspaceBinding(context.Background(), value.ID, testHostWorkspaceID(value))
 	if err != nil || binding.State != workspace.BindingDetached {
-		t.Fatalf("binding after root volume failure = %#v, %v", binding, err)
+		t.Fatalf("binding after Host deletion = %#v, %v", binding, err)
 	}
-	volume.errByName = nil
-	if _, err := worker.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile() retry = %v", err)
-	}
-	workspaceAfterRetry, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	hostAfterRetry, _ := deps.hosts.GetHost(context.Background(), value.ID)
-	if workspaceAfterRetry.State != workspace.StateReady || hostAfterRetry.State != host.StateDeleted {
-		t.Fatalf("host/workspace after retry = %#v / %#v", hostAfterRetry, workspaceAfterRetry)
+	if len(volume.names) != 0 {
+		t.Fatalf("Host deletion removed a retained Workspace or legacy root volume: %v", volume.names)
 	}
 }
 

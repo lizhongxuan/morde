@@ -21,7 +21,7 @@ func TestHostRuntimeIdentityRoundTripAndLegacyNulls(t *testing.T) {
 	ctx := context.Background()
 	owner := createTestUser(t, store, 8, 20_000, 40_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
-	params := testCreateHostParams(t, owner.ID, capacity, nil)
+	params := testCreateHostParams(t, store, owner.ID, capacity, nil)
 	params.Host.RuntimeInstanceID = "runtime-instance"
 	created, _, err := store.CreateHost(ctx, params)
 	if err != nil {
@@ -62,7 +62,7 @@ func TestHostRuntimeIdentityRoundTripAndLegacyNulls(t *testing.T) {
 		t.Fatalf("stale runtime handshake error = %v", err)
 	}
 
-	withoutInstance, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, nil))
+	withoutInstance, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, nil))
 	if err != nil {
 		t.Fatal(err)
 	}

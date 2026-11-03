@@ -22,9 +22,8 @@ func TestPostgresHostReplicaBindingChangesRequireCurrentRunningGeneration(t *tes
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 20_000, 40_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 	activationWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "host-replica-activation-fence")
-	statusWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "host-replica-status-fence")
 	createBinding := func(value workspace.Workspace) workspace.Binding {
 		t.Helper()
 		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
@@ -37,20 +36,14 @@ func TestPostgresHostReplicaBindingChangesRequireCurrentRunningGeneration(t *tes
 		return binding
 	}
 	activationBinding := createBinding(activationWorkspace)
-	statusBinding := createBinding(statusWorkspace)
-	statusBinding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, statusWorkspace.ID, statusBinding.BindingVersion,
-		workspace.BindingPreparing, workspace.BindingActive, statusBinding.DesiredRevision, statusBinding.AppliedRevision)
-	if err != nil {
-		t.Fatalf("activate sync-status fixture binding: %v", err)
-	}
 
 	staleGeneration := hostValue.RuntimeGeneration + 1
 	if _, err := store.ActivateWorkspaceBindingForHost(ctx, hostValue.ID, staleGeneration, activationWorkspace.ID,
 		activationBinding.BindingVersion, activationBinding.DesiredRevision, activationBinding.AppliedRevision); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("activate with stale Host generation error = %v", err)
 	}
-	if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, staleGeneration, statusWorkspace.ID,
-		statusBinding.BindingVersion, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeUnauthenticated {
+	if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, staleGeneration, activationWorkspace.ID,
+		activationBinding.BindingVersion, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("sync status with stale Host generation error = %v", err)
 	}
 
@@ -62,15 +55,15 @@ func TestPostgresHostReplicaBindingChangesRequireCurrentRunningGeneration(t *tes
 		activationBinding.BindingVersion, activationBinding.DesiredRevision, activationBinding.AppliedRevision); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("activate after Host stopped admission error = %v", err)
 	}
-	if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, hostValue.RuntimeGeneration, statusWorkspace.ID,
-		statusBinding.BindingVersion, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+	if _, err := store.SetWorkspaceBindingSyncStatusForHost(ctx, hostValue.ID, hostValue.RuntimeGeneration, activationWorkspace.ID,
+		activationBinding.BindingVersion, workspace.BindingSyncConflict, []string{"src/main.go"}); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("sync status after Host stopped admission error = %v", err)
 	}
 	activationAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, activationWorkspace.ID)
 	if err != nil || activationAfter.State != workspace.BindingPreparing || activationAfter.BindingVersion != activationBinding.BindingVersion {
 		t.Fatalf("Host activation changed binding after rejection = %#v, err=%v", activationAfter, err)
 	}
-	statusAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, statusWorkspace.ID)
+	statusAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, activationWorkspace.ID)
 	if err != nil || statusAfter.SyncState != workspace.BindingSyncHealthy || len(statusAfter.SyncConflicts) != 0 {
 		t.Fatalf("Host status changed binding after rejection = %#v, err=%v", statusAfter, err)
 	}
@@ -82,7 +75,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		owner := createTestUser(t, store, 3, 20_000, 40_000)
-		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-create-binding")
 
 		err := stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
@@ -106,7 +99,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		owner := createTestUser(t, store, 3, 20_000, 40_000)
-		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-unbind-transition")
 		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -122,7 +115,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		}
 
 		err = stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
-			`%SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
+			`%SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
 				_, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 					workspace.BindingActive, workspace.BindingUnbinding, binding.DesiredRevision, binding.AppliedRevision)
 				return err
@@ -141,7 +134,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		owner := createTestUser(t, store, 3, 20_000, 40_000)
-		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-applied-revision")
 
 		file := syncTestFile("receipt.txt", []byte("applied revision receipt"))
@@ -179,33 +172,35 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		}
 
 		commitWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "deactivated-host-commit")
+		commitHostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 		commitBinding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: commitWorkspace, Directory: commitWorkspace.ID,
+			OwnerID: owner.ID, HostID: commitHostValue.ID, Workspace: commitWorkspace, Directory: commitWorkspace.ID,
 			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: commitWorkspace.Revision,
 		})
 		if err != nil {
 			t.Fatalf("create binding for deactivated Host commit: %v", err)
 		}
 		unbindWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "deactivated-host-unbind")
+		unbindHostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 		unbindBinding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: unbindWorkspace, Directory: unbindWorkspace.ID,
+			OwnerID: owner.ID, HostID: unbindHostValue.ID, Workspace: unbindWorkspace, Directory: unbindWorkspace.ID,
 			State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: unbindWorkspace.Revision,
 		})
 		if err != nil {
 			t.Fatalf("create binding for deactivated Host unbind: %v", err)
 		}
-		unbindBinding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, unbindWorkspace.ID, unbindBinding.BindingVersion,
+		unbindBinding, err = store.TransitionWorkspaceBinding(ctx, unbindHostValue.ID, unbindWorkspace.ID, unbindBinding.BindingVersion,
 			workspace.BindingPreparing, workspace.BindingActive, unbindBinding.DesiredRevision, unbindBinding.AppliedRevision)
 		if err != nil {
 			t.Fatalf("activate binding for deactivated Host unbind: %v", err)
 		}
-		unbindBinding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, unbindWorkspace.ID, unbindBinding.BindingVersion,
+		unbindBinding, err = store.TransitionWorkspaceBinding(ctx, unbindHostValue.ID, unbindWorkspace.ID, unbindBinding.BindingVersion,
 			workspace.BindingActive, workspace.BindingUnbinding, unbindBinding.DesiredRevision, unbindBinding.AppliedRevision)
 		if err != nil {
 			t.Fatalf("begin unbind for deactivated Host: %v", err)
 		}
 		commitSession := newTestSyncSession(t, commitWorkspace, owner.ID, []workspace.File{}, []workspace.File{}, nil)
-		commitSession.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, commitWorkspace.ID, commitBinding.BindingVersion)
+		commitSession.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", commitHostValue.ID, commitHostValue.RuntimeGeneration, commitWorkspace.ID, commitBinding.BindingVersion)
 		commitSession.Direction = workspace.SyncDownload
 		commitKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "deactivated-host-commit:"+commitSession.ID, commitSession.ID)
 		if _, _, err := createTestWorkspaceSyncSession(ctx, store, commitSession, nil,
@@ -243,11 +238,11 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); domain.CodeOf(err) != domain.CodeUnauthenticated {
 			t.Fatalf("Host heartbeat after owner deactivation = %v, want unauthenticated", err)
 		}
-		if _, err := store.CompleteWorkspaceBindingUnbind(ctx, hostValue.ID, unbindWorkspace.ID,
-			unbindBinding.BindingVersion, hostValue.RuntimeGeneration, unbindWorkspace.Revision); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		if _, err := store.CompleteWorkspaceBindingUnbind(ctx, unbindHostValue.ID, unbindWorkspace.ID,
+			unbindBinding.BindingVersion, unbindHostValue.RuntimeGeneration, unbindWorkspace.Revision); domain.CodeOf(err) != domain.CodeUnauthenticated {
 			t.Fatalf("Host unbind completion after owner deactivation = %v, want unauthenticated", err)
 		}
-		unbindAfter, err := store.GetWorkspaceBinding(ctx, hostValue.ID, unbindWorkspace.ID)
+		unbindAfter, err := store.GetWorkspaceBinding(ctx, unbindHostValue.ID, unbindWorkspace.ID)
 		if err != nil || unbindAfter.State != workspace.BindingUnbinding || unbindAfter.BindingVersion != unbindBinding.BindingVersion {
 			t.Fatalf("binding advanced after owner deactivation: %#v, err=%v", unbindAfter, err)
 		}
@@ -304,7 +299,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		owner := createTestUser(t, store, 3, 20_000, 40_000)
-		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+		hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 0)
 		workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "release-wait-complete-unbind")
 		binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
 			OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
@@ -325,7 +320,7 @@ func TestWorkspaceBindingMutationsRecheckHostAfterReleaseWait(t *testing.T) {
 		}
 
 		err = stopHostAfterWorkspaceMutationWait(t, store, ctx, hostValue.ID,
-			`%SELECT state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
+			`%SELECT owner_id, state, runtime_generation FROM hosts WHERE id=$1 FOR UPDATE%`, func() error {
 				_, err := store.CompleteWorkspaceBindingUnbind(ctx, hostValue.ID, workspaceValue.ID,
 					binding.BindingVersion, hostValue.RuntimeGeneration, workspaceValue.Revision)
 				return err
@@ -379,7 +374,7 @@ func TestHostComputeReleaseAndConcurrentRestore(t *testing.T) {
 	owner := createTestUser(t, store, 3, 20_000, 40_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "restore-check")
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, []string{workspaceValue.ID}))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{workspaceValue.ID}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,6 +412,9 @@ func TestHostComputeReleaseAndConcurrentRestore(t *testing.T) {
 		len(stopped.Workspaces) != 1 || stopped.Workspaces[0].Workspace.ID != workspaceValue.ID ||
 		stopped.Workspaces[0].State != workspace.BindingActive || stopped.RuntimeGeneration != 1 || stopped.SandboxID != "" || stopped.RuntimeInstanceID != "" {
 		t.Fatalf("CompleteHostRelease() = %#v, %v", stopped, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_actor_id=$2, control_lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, created.ID, owner.ID); err != nil {
+		t.Fatalf("seed stale lease before restore: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE users SET quota_hosts=0 WHERE id=$1`, owner.ID); err != nil {
 		t.Fatalf("set former host-count limit before restore: %v", err)
@@ -464,6 +462,14 @@ func TestHostComputeReleaseAndConcurrentRestore(t *testing.T) {
 	if len(failures) != 0 || changedCount != 1 {
 		t.Fatalf("concurrent restore: changed=%d failures=%v", changedCount, failures)
 	}
+	var actorIsNull, leaseIsNull bool
+	if err := pool.QueryRow(ctx, `SELECT control_actor_id IS NULL, control_lease_expires_at IS NULL FROM hosts WHERE id=$1`, created.ID).
+		Scan(&actorIsNull, &leaseIsNull); err != nil || !actorIsNull || !leaseIsNull {
+		t.Fatalf("restored Host retained old control lease: actor_null=%t lease_null=%t err=%v", actorIsNull, leaseIsNull, err)
+	}
+	if err := store.CheckHostControlLease(ctx, created.ID, owner.ID, created.RuntimeGeneration, created.ControlVersion); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("old control fence after restore = %v; want conflict", err)
+	}
 
 	if err := store.MarkCreateAttempt(ctx, created.ID); err != nil {
 		t.Fatal(err)
@@ -487,6 +493,80 @@ func TestHostComputeReleaseAndConcurrentRestore(t *testing.T) {
 	workspaceFinal, err := store.GetWorkspace(ctx, workspaceValue.ID)
 	if err != nil || workspaceFinal != workspaceBefore {
 		t.Fatalf("workspace changed after refused delete: %#v, err=%v; before %#v", workspaceFinal, err, workspaceBefore)
+	}
+}
+
+func TestStoppedUnboundHostCanBindOneWorkspaceThenRestore(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
+	initial := createTestWorkspace(t, ctx, store, owner.ID, "legacy-unbound")
+	created := createTestHost(t, ctx, store, owner.ID, capacity, []string{initial.ID})
+	if _, err := pool.Exec(ctx, `UPDATE workspace_bindings SET state='detached' WHERE host_id=$1 AND workspace_id=$2`, created.ID, initial.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	available := createTestWorkspace(t, ctx, store, owner.ID, "legacy-replacement")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: created.ID, Workspace: available, Directory: available.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: available.Revision,
+	})
+	if err != nil || binding.State != workspace.BindingPreparing {
+		t.Fatalf("bind stopped legacy Host = %#v, %v", binding, err)
+	}
+
+	restored, changed, err := store.BeginHostRestore(ctx, app.RestoreHostParams{
+		HostID: created.ID, RuntimeCredentialEnc: []byte("restored runtime credential"),
+		ExpiresAt: time.Now().UTC().Add(time.Hour), Capacity: capacity,
+	})
+	if err != nil || !changed || restored.State != host.StateCreating || restored.RuntimeGeneration != 2 {
+		t.Fatalf("restore stopped legacy Host = %#v, changed=%t, err=%v", restored, changed, err)
+	}
+	activeCount := 0
+	for _, value := range restored.Workspaces {
+		if value.State != workspace.BindingDetached {
+			activeCount++
+			if value.Workspace.ID != available.ID {
+				t.Fatalf("restored Host active Workspace = %q, want %q", value.Workspace.ID, available.ID)
+			}
+		}
+	}
+	if activeCount != 1 {
+		t.Fatalf("restored Host has %d non-detached bindings, want 1", activeCount)
+	}
+}
+
+func TestRestoreRefusesLegacyHostWithMultipleActiveBindings(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
+	first := createTestWorkspace(t, ctx, store, owner.ID, "legacy-multi-first")
+	created := createTestHost(t, ctx, store, owner.ID, capacity, []string{first.ID})
+	second := createTestWorkspace(t, ctx, store, owner.ID, "legacy-multi-second")
+	if _, err := pool.Exec(ctx, `INSERT INTO workspace_bindings (
+  id, owner_id, host_id, workspace_id, directory_name, state,
+  binding_version, desired_revision, applied_revision
+) VALUES ($1, $2, $3, $4, $4, 'preparing', 1, $5, 0)`,
+		bindingID(created.ID, second.ID), owner.ID, created.ID, second.ID, second.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.BeginHostRestore(ctx, app.RestoreHostParams{
+		HostID: created.ID, RuntimeCredentialEnc: []byte("must not restore"),
+		ExpiresAt: time.Now().UTC().Add(time.Hour), Capacity: capacity,
+	}); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("restore multi-binding Host error = %v, want workspace conflict", err)
+	}
+	unchanged, err := store.GetHost(ctx, created.ID)
+	if err != nil || unchanged.State != host.StateStopped || unchanged.RuntimeGeneration != 1 {
+		t.Fatalf("Host after rejected restore = %#v, %v", unchanged, err)
 	}
 }
 
@@ -1236,7 +1316,7 @@ func TestApplicationLaunchReservationSerializesWithHostRelease(t *testing.T) {
 		if !reserved.created {
 			t.Fatalf("launch reservation was not new: %#v", reserved)
 		}
-		if domain.CodeOf(released.err) != domain.CodeConflict || released.changed || released.value.State != host.StateRunning || current.State != host.StateRunning {
+		if domain.CodeOf(released.err) != domain.CodeConflict || released.changed || current.State != host.StateRunning {
 			t.Fatalf("release crossed an active launch reservation: release=%#v, current=%#v", released, current)
 		}
 		return

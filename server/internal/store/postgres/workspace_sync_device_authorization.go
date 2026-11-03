@@ -54,14 +54,14 @@ func (s *Store) WithWorkspaceSyncHostSessionAccess(ctx context.Context, principa
 		if !ok {
 			return domain.NewError(domain.CodeUnauthenticated, "host replica workspace binding is invalid")
 		}
-		if err := lockWorkspaceSyncHostSessionAccess(ctx, tx, principal.UserID, workspaceID, sessionID, replica, false); err != nil {
+		if err := lockWorkspaceSyncHostSessionAccess(ctx, tx, principal.UserID, workspaceID, sessionID, replica, false, false); err != nil {
 			return err
 		}
 		return write()
 	})
 }
 
-func lockWorkspaceSyncHostSessionAccess(ctx context.Context, tx pgx.Tx, ownerID, workspaceID, sessionID string, replica hostSyncReplicaID, forUpdate bool) error {
+func lockWorkspaceSyncHostSessionAccess(ctx context.Context, tx pgx.Tx, ownerID, workspaceID, sessionID string, replica hostSyncReplicaID, forUpdate, allowUnbindingVersionAdvance bool) error {
 	lockClause := "FOR SHARE"
 	if forUpdate {
 		lockClause = "FOR UPDATE"
@@ -90,6 +90,9 @@ func lockWorkspaceSyncHostSessionAccess(ctx context.Context, tx pgx.Tx, ownerID,
 	if workspaceOwner != ownerID || workspaceState != string(workspace.StateReady) || workspaceDeleted.Valid {
 		return domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
+	if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+		return err
+	}
 	var bindingOwner, bindingState string
 	var bindingVersion int64
 	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT owner_id, state, binding_version FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 %s`, lockClause),
@@ -98,7 +101,12 @@ func lockWorkspaceSyncHostSessionAccess(ctx context.Context, tx pgx.Tx, ownerID,
 	} else if err != nil {
 		return fmt.Errorf("lock Workspace binding for Host sync access: %w", err)
 	}
-	if bindingOwner != ownerID || bindingVersion != replica.bindingVersion ||
+	versionMatches := bindingVersion == replica.bindingVersion
+	if allowUnbindingVersionAdvance && bindingState == string(workspace.BindingUnbinding) &&
+		bindingVersion > replica.bindingVersion && bindingVersion-replica.bindingVersion == 1 {
+		versionMatches = true
+	}
+	if bindingOwner != ownerID || !versionMatches ||
 		(bindingState != string(workspace.BindingPreparing) && bindingState != string(workspace.BindingActive) &&
 			bindingState != string(workspace.BindingUnbinding)) {
 		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
@@ -141,6 +149,9 @@ FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, principal.TokenID, principal
 		}
 		if workspaceOwner != principal.UserID || workspaceState != string(workspace.StateReady) || workspaceDeleted.Valid {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		var sessionOwner, replicaID, sessionState string
 		if err := tx.QueryRow(ctx, `SELECT owner_id, replica_id, state FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2 FOR SHARE`,

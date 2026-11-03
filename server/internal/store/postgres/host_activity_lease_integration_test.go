@@ -9,6 +9,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/control"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/workspace"
 )
 
 func TestPostgresHostActivityLeaseFencesExpiryAndRelease(t *testing.T) {
@@ -179,7 +180,7 @@ func TestPostgresHostDeleteKeepsExistingActivityLeasesVisibleAndClosesAdmission(
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 4, 8_000, 16_000)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 7)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 7)
 	lease := app.HostActivityLease{
 		HostID: hostValue.ID, LeaseID: "gateway-delete-drain", RuntimeGeneration: hostValue.RuntimeGeneration,
 		ControlVersion: 7, Kind: app.HostActivityLeaseKindGateway, TTL: 30 * time.Second,
@@ -222,7 +223,7 @@ func TestPostgresHostDeleteWaitsForControlTransitionAdmissionToSettle(t *testing
 		t.Fatalf("acquire activity lease before control transition: %v", err)
 	}
 	if _, err := store.BeginControlTransition(ctx, control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "delete-control-race",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "delete-control-race",
 		Action: control.ActionTakeOver, ExpectedControlVersion: 0,
 	}); err != nil {
 		t.Fatalf("begin control transition: %v", err)
@@ -249,7 +250,7 @@ func TestPostgresHostDeleteSerializesWithActivityLeaseAcquire(t *testing.T) {
 	owner := createTestUser(t, store, 12, 80_000, 160_000)
 
 	for range 8 {
-		hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 9)
+		hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, host.ControlAI, 9)
 		lease := app.HostActivityLease{
 			HostID: hostValue.ID, LeaseID: "gateway-delete-race", RuntimeGeneration: hostValue.RuntimeGeneration,
 			ControlVersion: 9, Kind: app.HostActivityLeaseKindGateway, TTL: 30 * time.Second,
@@ -294,6 +295,23 @@ func TestPostgresHostDeleteSerializesWithActivityLeaseAcquire(t *testing.T) {
 			t.Fatalf("unexpected concurrent activity lease acquire error: %v", acquireErr)
 		}
 	}
+}
+
+func createRunningControlHostWithoutWorkspace(t *testing.T, ctx context.Context, store *Store, ownerID string, controlState host.ControlState, controlVersion int64) host.Host {
+	t.Helper()
+	value := createRunningControlHost(t, ctx, store, ownerID, controlState, controlVersion)
+	for _, binding := range value.Workspaces {
+		unbinding, err := store.TransitionWorkspaceBinding(ctx, value.ID, binding.Workspace.ID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingUnbinding, binding.DesiredRevision, binding.AppliedRevision)
+		if err != nil {
+			t.Fatalf("begin workspace unbind before Host lifecycle test: %v", err)
+		}
+		if _, err := store.TransitionWorkspaceBinding(ctx, value.ID, binding.Workspace.ID, unbinding.BindingVersion,
+			workspace.BindingUnbinding, workspace.BindingDetached, binding.DesiredRevision, binding.AppliedRevision); err != nil {
+			t.Fatalf("complete workspace unbind before Host lifecycle test: %v", err)
+		}
+	}
+	return value
 }
 
 func TestPostgresHostReleaseSerializesWithMCPRuntimeOperation(t *testing.T) {
@@ -368,7 +386,7 @@ func TestPostgresControlTransitionSeesOldGatewayLeasesUntilReleased(t *testing.T
 		t.Fatalf("acquire old-fence lease: %v", err)
 	}
 	transition, err := store.BeginControlTransition(ctx, control.BeginRequest{
-		HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "takeover-lease-drain",
+		HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "takeover-lease-drain",
 		Action: control.ActionTakeOver, ExpectedControlVersion: 0,
 	})
 	if err != nil {
@@ -389,11 +407,14 @@ func TestPostgresControlTransitionSeesOldGatewayLeasesUntilReleased(t *testing.T
 }
 
 func TestPostgresUserInputPermitSerializesWithControlTransition(t *testing.T) {
-	store, _ := newTemporaryStore(t)
+	store, pool := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	owner := createTestUser(t, store, 4, 8_000, 16_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 7)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_actor_id=$2, control_lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, hostValue.ID, owner.ID); err != nil {
+		t.Fatal(err)
+	}
 	ref := host.Ref{
 		ID: hostValue.ID, RuntimeGeneration: hostValue.RuntimeGeneration,
 		ControlVersion: 7, ControlState: host.ControlUser,
@@ -403,7 +424,7 @@ func TestPostgresUserInputPermitSerializesWithControlTransition(t *testing.T) {
 	releaseInput := make(chan struct{})
 	inputDone := make(chan error, 1)
 	go func() {
-		inputDone <- store.WithHostInputPermit(ctx, ref, func() error {
+		inputDone <- store.WithHostControlPermit(ctx, ref, owner.ID, host.PermissionDesktopControl, func() error {
 			close(inputStarted)
 			<-releaseInput
 			return nil
@@ -416,7 +437,7 @@ func TestPostgresUserInputPermitSerializesWithControlTransition(t *testing.T) {
 	go func() {
 		close(transitionStarted)
 		_, err := store.BeginControlTransition(ctx, control.BeginRequest{
-			HostID: hostValue.ID, OwnerID: owner.ID, RequestID: "input-permit-release",
+			HostID: hostValue.ID, OwnerID: owner.ID, ActorUserID: owner.ID, RequestID: "input-permit-release",
 			Action: control.ActionRelease, ExpectedControlVersion: 7,
 		})
 		transitionDone <- err
@@ -435,7 +456,7 @@ func TestPostgresUserInputPermitSerializesWithControlTransition(t *testing.T) {
 	if err := <-transitionDone; err != nil {
 		t.Fatalf("begin release after input completed: %v", err)
 	}
-	if err := store.WithHostInputPermit(ctx, ref, func() error { return nil }); domain.CodeOf(err) != domain.CodeConflict {
+	if err := store.WithHostControlPermit(ctx, ref, owner.ID, host.PermissionDesktopControl, func() error { return nil }); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("old user input fence after transition error = %v", err)
 	}
 }

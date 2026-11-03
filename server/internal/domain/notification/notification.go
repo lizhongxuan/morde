@@ -11,17 +11,28 @@ import (
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/personal"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
 
 type Kind string
 
 const (
-	KindCompleted         Kind = "completed"
-	KindFailed            Kind = "failed"
-	KindApprovalRequired  Kind = "approval_required"
-	KindClarification     Kind = "clarification_required"
-	KindAttentionRequired Kind = "attention_required"
+	KindCompleted            Kind = "completed"
+	KindFailed               Kind = "failed"
+	KindApprovalRequired     Kind = "approval_required"
+	KindClarification        Kind = "clarification_required"
+	KindAttentionRequired    Kind = "attention_required"
+	KindGoalStepBlocked      Kind = "goal_step_blocked"
+	KindGoalCompleted        Kind = "goal_completed"
+	KindProjectItemBlocked   Kind = "project_work_item_blocked"
+	KindProjectItemDelivered Kind = "project_work_item_delivered"
+)
+
+const (
+	SourceGoal            = "goal"
+	SourceProjectWorkItem = "project_work_item"
 )
 
 type TaskEvent struct {
@@ -40,6 +51,11 @@ type Notification struct {
 	OwnerID        string
 	TaskID         string
 	EventSequence  int64
+	SourceEventID  int64
+	SourceKind     string
+	SourceID       string
+	SourceVersion  int64
+	ProjectID      string
 	Kind           Kind
 	Summary        string
 	RequestID      string
@@ -48,6 +64,18 @@ type Notification struct {
 	ReadAt         *time.Time
 	HandledAt      *time.Time
 	CreatedAt      time.Time
+}
+
+// SourceEvent is a recipient-scoped durable event that does not originate from a Task.
+type SourceEvent struct {
+	ID            int64
+	RecipientID   string
+	SourceKind    string
+	SourceID      string
+	SourceVersion int64
+	ProjectID     string
+	Kind          Kind
+	CreatedAt     time.Time
 }
 
 type EventEffect struct {
@@ -153,17 +181,27 @@ func newNotification(event TaskEvent, id string, kind Kind, summary, requestID s
 }
 
 func Validate(value Notification) error {
-	if !ValidID(value.ID) || !domain.ValidUserID(value.OwnerID) || !domain.ValidTaskID(value.TaskID) ||
-		value.EventSequence < 1 || !value.Kind.valid() || !utf8.ValidString(value.Summary) ||
+	if !ValidID(value.ID) || !domain.ValidUserID(value.OwnerID) || !value.Kind.valid() || !utf8.ValidString(value.Summary) ||
 		strings.TrimSpace(value.Summary) == "" || len(value.Summary) > 256 || value.CreatedAt.IsZero() {
 		return errors.New("notification fields are invalid")
+	}
+	if value.TaskID != "" {
+		if !domain.ValidTaskID(value.TaskID) || value.EventSequence < 1 || value.SourceEventID != 0 || value.SourceKind != "" ||
+			value.SourceID != "" || value.SourceVersion != 0 || value.ProjectID != "" || !value.Kind.taskKind() {
+			return errors.New("task notification source is invalid")
+		}
+	} else if value.EventSequence != 0 || value.SourceEventID < 1 || value.SourceVersion < 1 || !value.Kind.sourceKind() ||
+		value.SourceID == "" || (value.SourceKind != SourceGoal && value.SourceKind != SourceProjectWorkItem) ||
+		(value.SourceKind == SourceProjectWorkItem && (!project.ValidID(value.ProjectID) || !project.ValidID(value.SourceID))) ||
+		(value.SourceKind == SourceGoal && (value.ProjectID != "" || personal.ValidateObjectIdentifier(personal.ObjectTypeGoal, value.SourceID) != nil)) {
+		return errors.New("source notification identity is invalid")
 	}
 	if value.Summary != value.Kind.summary() {
 		return errors.New("notification summary does not match its kind")
 	}
 	switch value.Kind {
 	case KindApprovalRequired, KindClarification:
-		if !domain.ValidPendingRequestID(value.RequestID) || value.RequestVersion < 1 {
+		if value.TaskID == "" || !domain.ValidPendingRequestID(value.RequestID) || value.RequestVersion < 1 {
 			return errors.New("notification request reference is invalid")
 		}
 	default:
@@ -177,15 +215,63 @@ func Validate(value Notification) error {
 	return nil
 }
 
+func ValidateSourceEvent(value SourceEvent) error {
+	if value.ID < 1 || !domain.ValidUserID(value.RecipientID) || value.SourceVersion < 1 ||
+		!value.Kind.sourceKind() || value.CreatedAt.IsZero() {
+		return errors.New("notification source event is invalid")
+	}
+	switch value.SourceKind {
+	case SourceGoal:
+		if value.ProjectID != "" || !value.Kind.goalKind() || personal.ValidateObjectIdentifier(personal.ObjectTypeGoal, value.SourceID) != nil {
+			return errors.New("goal notification source event is invalid")
+		}
+	case SourceProjectWorkItem:
+		if !project.ValidID(value.ProjectID) || !project.ValidID(value.SourceID) || !value.Kind.projectKind() {
+			return errors.New("project notification source event is invalid")
+		}
+	default:
+		return errors.New("notification source kind is invalid")
+	}
+	return nil
+}
+
+func NewSourceEventNotification(event SourceEvent, id string) (Notification, error) {
+	if err := ValidateSourceEvent(event); err != nil {
+		return Notification{}, domain.InvalidArgument("event", "notification source event is invalid")
+	}
+	value := Notification{
+		ID: id, OwnerID: event.RecipientID, SourceEventID: event.ID, SourceKind: event.SourceKind,
+		SourceID: event.SourceID, SourceVersion: event.SourceVersion, ProjectID: event.ProjectID,
+		Kind: event.Kind, Summary: event.Kind.summary(), CreatedAt: event.CreatedAt,
+	}
+	if err := Validate(value); err != nil {
+		return Notification{}, domain.InvalidArgument("notification", "source notification is invalid")
+	}
+	return value, nil
+}
+
 func (value Notification) IsHandled() bool { return value.HandledAt != nil }
 
 func (kind Kind) valid() bool {
 	switch kind {
-	case KindCompleted, KindFailed, KindApprovalRequired, KindClarification, KindAttentionRequired:
+	case KindCompleted, KindFailed, KindApprovalRequired, KindClarification, KindAttentionRequired,
+		KindGoalStepBlocked, KindGoalCompleted, KindProjectItemBlocked, KindProjectItemDelivered:
 		return true
 	default:
 		return false
 	}
+}
+
+func (kind Kind) taskKind() bool {
+	return kind == KindCompleted || kind == KindFailed || kind == KindApprovalRequired || kind == KindClarification || kind == KindAttentionRequired
+}
+
+func (kind Kind) sourceKind() bool { return kind.goalKind() || kind.projectKind() }
+
+func (kind Kind) goalKind() bool { return kind == KindGoalStepBlocked || kind == KindGoalCompleted }
+
+func (kind Kind) projectKind() bool {
+	return kind == KindProjectItemBlocked || kind == KindProjectItemDelivered
 }
 
 func (kind Kind) summary() string {
@@ -200,6 +286,14 @@ func (kind Kind) summary() string {
 		return "任务等待补充信息"
 	case KindAttentionRequired:
 		return "任务需要你处理"
+	case KindGoalStepBlocked:
+		return "目标步骤遇到阻塞"
+	case KindGoalCompleted:
+		return "目标已完成"
+	case KindProjectItemBlocked:
+		return "项目工作项遇到阻塞"
+	case KindProjectItemDelivered:
+		return "项目工作项已交付"
 	default:
 		return ""
 	}

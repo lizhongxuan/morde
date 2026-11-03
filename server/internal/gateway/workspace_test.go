@@ -8,26 +8,39 @@ import (
 	"testing"
 	"time"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/workspace"
 )
 
 type testHostWorkspaceFileService struct {
-	bindings []workspace.Binding
-	page     workspace.ManifestPage
-	file     workspace.File
-	body     []byte
-	listErr  error
-	pageErr  error
-	stream   func(func(workspace.File, []byte) error) error
-	listCall int
-	pageCall int
-	fileCall int
-	actorID  string
-	hostID   string
-	spaceID  string
-	revision int64
-	path     string
+	bindings  []workspace.Binding
+	page      workspace.ManifestPage
+	file      workspace.File
+	body      []byte
+	listErr   error
+	pageErr   error
+	stream    func(func(workspace.File, []byte) error) error
+	listCall  int
+	pageCall  int
+	fileCall  int
+	actorID   string
+	hostID    string
+	spaceID   string
+	revision  int64
+	path      string
+	diffErr   error
+	diffCalls int
+}
+
+func (s *testHostWorkspaceFileService) GetHostDiff(_ context.Context, actorID, hostID, workspaceID string, fromRevision, toRevision int64) (app.WorkspaceDiff, error) {
+	s.diffCalls++
+	s.actorID, s.hostID, s.spaceID = actorID, hostID, workspaceID
+	s.revision = toRevision
+	if s.diffErr != nil {
+		return app.WorkspaceDiff{}, s.diffErr
+	}
+	return app.WorkspaceDiff{WorkspaceID: workspaceID, FromRevision: fromRevision, ToRevision: toRevision, Changes: []app.WorkspaceDiffChange{}}, nil
 }
 
 func (s *testHostWorkspaceFileService) ListHostWorkspaceBindings(_ context.Context, actorID, hostID string) ([]workspace.Binding, error) {
@@ -75,6 +88,29 @@ func TestHostWorkspaceGatewayMemberUsesOnlyExplicitFilePermission(t *testing.T) 
 	workbench := request(handler, http.MethodGet, hostAuthority(), "/__ch/wb/?tab=workspace", nil, hostCookieName+"="+memberCookie, "")
 	if workbench.Code != http.StatusOK || !strings.Contains(workbench.Body.String(), "workbench") {
 		t.Fatalf("workspace-only Workbench entry = %d %q", workbench.Code, workbench.Body.String())
+	}
+}
+
+func TestHostWorkspaceDiffIsOwnerOnlyAndUsesBoundedReadService(t *testing.T) {
+	handler, g, _, _, _ := newTestDeps(t)
+	files := g.deps.WorkspaceFiles.(*testHostWorkspaceFileService)
+	ownerCookie := hostCookie(g, testHostID, testUserID, time.Hour)
+	ownerResponse := request(handler, http.MethodGet, hostAuthority(), "/__ch/api/workspaces/w1234567/diff?from_revision=2&to_revision=4", nil, hostCookieName+"="+ownerCookie, "")
+	if ownerResponse.Code != http.StatusOK || files.diffCalls != 1 || files.actorID != testUserID || files.spaceID != "w1234567" || files.revision != 4 {
+		t.Fatalf("owner diff = %d %s calls=%d actor=%s", ownerResponse.Code, ownerResponse.Body, files.diffCalls, files.actorID)
+	}
+	if !strings.Contains(ownerResponse.Body.String(), `"from_revision":2`) || ownerResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("diff response body/header = %s %#v", ownerResponse.Body, ownerResponse.Header())
+	}
+	memberCookie := hostCookie(g, testHostID, testMemberID, time.Hour)
+	setMemberPermissionGrants(g, host.PermissionWorkspaceFileRead)
+	memberResponse := request(handler, http.MethodGet, hostAuthority(), "/__ch/api/workspaces/w1234567/diff?from_revision=2&to_revision=4", nil, hostCookieName+"="+memberCookie, "")
+	if memberResponse.Code != http.StatusNotFound || files.diffCalls != 1 {
+		t.Fatalf("workspace:file:read member diff = %d %s calls=%d, want denied before service", memberResponse.Code, memberResponse.Body, files.diffCalls)
+	}
+	badQuery := request(handler, http.MethodGet, hostAuthority(), "/__ch/api/workspaces/w1234567/diff?from_revision=2&to_revision=4&extra=1", nil, hostCookieName+"="+ownerCookie, "")
+	if badQuery.Code != http.StatusBadRequest || files.diffCalls != 1 {
+		t.Fatalf("invalid diff query = %d %s calls=%d", badQuery.Code, badQuery.Body, files.diffCalls)
 	}
 }
 

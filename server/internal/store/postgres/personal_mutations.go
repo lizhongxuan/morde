@@ -86,9 +86,10 @@ func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identit
 	}
 	var storedObjectID string
 	var previousObjectBytes int64
-	objectErr := tx.QueryRow(ctx, `SELECT object_id, COALESCE(octet_length(body::text),0) FROM personal_objects
+	var previousBody []byte
+	objectErr := tx.QueryRow(ctx, `SELECT object_id, COALESCE(octet_length(body::text),0), COALESCE(body::text,'') FROM personal_objects
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR UPDATE`,
-		instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&storedObjectID, &previousObjectBytes)
+		instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&storedObjectID, &previousObjectBytes, &previousBody)
 	objectExists := objectErr == nil
 	if objectErr != nil && !errors.Is(objectErr, pgx.ErrNoRows) {
 		return personal.MutationReceipt{}, fmt.Errorf("lock personal object: %w", objectErr)
@@ -179,6 +180,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4`,
 		instanceID, mutation.OwnerID, mutation.ObjectType, mutation.ObjectID).Scan(&receipt.ResultRevision); err != nil {
 		return personal.MutationReceipt{}, fmt.Errorf("read personal object revision: %w", err)
+	}
+	if mutation.ObjectType == personal.ObjectTypeGoal && objectExists && !mutation.Delete {
+		if err := enqueueGoalNotificationEventsInTx(ctx, tx, mutation.OwnerID, mutation.ObjectID, receipt.ResultRevision, previousBody, mutation.Body); err != nil {
+			return personal.MutationReceipt{}, err
+		}
 	}
 	if err := tx.QueryRow(ctx, `SELECT last_sequence FROM account_change_counters
 WHERE service_instance_id=$1::uuid AND owner_id=$2`, instanceID, mutation.OwnerID).Scan(&receipt.AccountChangeSequence); err != nil {

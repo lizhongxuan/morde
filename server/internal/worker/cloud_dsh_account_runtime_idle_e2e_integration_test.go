@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/execution"
 )
 
 func TestAccountAgentRuntimeIdleRenewalPersistsBeyondOriginalExpiry(t *testing.T) {
@@ -68,7 +69,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
 	}
 }
 
-func TestAccountRuntimeRecoversAbortedStartAcrossManagerRestart(t *testing.T) {
+func TestAccountRuntimeRecoversFailedStartAcrossManagerRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
@@ -105,12 +106,15 @@ func TestAccountRuntimeRecoversAbortedStartAcrossManagerRestart(t *testing.T) {
 		t.Fatal("incomplete first startup unexpectedly succeeded")
 	}
 	old, found, err := control.Get(ctx, owner.ID)
-	if err != nil || !found || old.State != app.AccountAgentRuntimeStarting {
+	if err != nil || !found || old.State != app.AccountAgentRuntimeFailed || old.FailureReason != execution.RuntimeFailureStartup ||
+		!old.LeaseExpiresAt.After(time.Now()) {
 		t.Fatalf("failed startup state=%+v found=%t err=%v", old, found, err)
 	}
-	restarted := newManager(&signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: privateKey, aborted: true})
-	if _, err := restarted.Acquire(ctx, owner.ID); err == nil {
-		t.Fatal("replacement Runtime started before the old lease expired")
+	// An incomplete supervisor response is persisted as failed, so recovery must
+	// require a full Guardian stop attestation before replacing the Runtime.
+	restarted := newManager(&signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: privateKey})
+	if _, err := restarted.Acquire(ctx, owner.ID); err == nil || err.Error() != "account Agent Runtime lease is active in another worker" {
+		t.Fatalf("failed Runtime replacement while the lease is active: err=%v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
@@ -131,8 +135,8 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
 		t.Fatal("old Runtime fence became ready after replacement")
 	}
 	pending, err := control.ListPendingAccountAgentRuntimeStopAttestations(ctx, 1, verifier)
-	if err != nil || len(pending) != 0 || len(guardian.runtimeProofAcks) != 0 {
-		t.Fatalf("aborted start required nonexistent Guardian ACK: pending=%+v ACKs=%d err=%v", pending, len(guardian.runtimeProofAcks), err)
+	if err != nil || len(pending) != 0 || len(guardian.runtimeProofAcks) != 1 {
+		t.Fatalf("failed start Guardian ACK state: pending=%+v ACKs=%d err=%v", pending, len(guardian.runtimeProofAcks), err)
 	}
 }
 
@@ -214,8 +218,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
 
 type signedRuntimeRecoverySupervisor struct {
 	*accountRuntimeSupervisorStub
-	key     ed25519.PrivateKey
-	aborted bool
+	key ed25519.PrivateKey
 }
 
 func (s *signedRuntimeRecoverySupervisor) RecoverAccountRuntimeStopped(_ context.Context, fence app.AccountAgentRuntimeFence,
@@ -231,11 +234,8 @@ func (s *signedRuntimeRecoverySupervisor) RecoverAccountRuntimeStopped(_ context
 	identity := sha256.Sum256(append(append(encodedFence, 0), nonce...))
 	proof := app.AccountAgentRuntimeStopAttestation{Fence: fence,
 		ContainerName: "morde-account-runtime-" + hex.EncodeToString(identity[:]), NonceSHA256: nonceSHA256,
-		DestroyedAt: time.Now().UTC(), ProofSHA256: strings.Repeat("e", 64), Destroyed: true, StartAborted: s.aborted}
-	if !s.aborted {
-		proof.ContainerID = strings.Repeat("a", 64)
-		proof.ExpiresAt = time.Now().Add(-time.Second)
-	}
+		ContainerID: strings.Repeat("a", 64), ExpiresAt: time.Now().Add(-time.Second),
+		DestroyedAt: time.Now().UTC(), ProofSHA256: strings.Repeat("e", 64), Destroyed: true, StartAborted: false}
 	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(proof)
 	if err != nil {
 		return app.AccountAgentRuntimeStopAttestation{}, err

@@ -67,6 +67,13 @@ func TestExecutionControlRoutesUseSessionAndExpectedEpoch(t *testing.T) {
 	if service.principal.Kind != identity.KindSession || service.action != "status" {
 		t.Fatalf("status call principal/action = %#v/%q", service.principal, service.action)
 	}
+	service.status.Runtime = execution.Runtime{State: execution.RuntimeStateFailed, FailureReason: execution.RuntimeFailureStartup,
+		RuntimeID: "runtime-test", RuntimeGeneration: 1, MaxConcurrentTasks: 2}
+	response = requestWithCookie(router, http.MethodGet, "/api/execution", cookie, "")
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &status) != nil ||
+		status.Runtime.State != execution.RuntimeStateFailed || status.Runtime.FailureReason != execution.RuntimeFailureStartup {
+		t.Fatalf("GET /api/execution omitted safe Runtime failure reason: %d %s", response.Code, response.Body)
+	}
 
 	response = requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/execution/stop-all", `{"expected_epoch":4}`, cookie,
 		"https://portal.example.test", "Idempotency-Key", "stop-control-0001")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestWorkspaceSyncReceiveReservationSettlesIdempotently(t *testing.T) {
@@ -215,6 +218,10 @@ func TestWorkspaceSyncReceiveReservesExactProjectedQuota(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Register both folders before the first receive establishes the owner-wide
+	// receive fence, which correctly prevents device node reconciliation.
+	authorizeTestWorkspaceSyncReceive(t, ctx, store, owner.ID, within.ID)
+	authorizeTestWorkspaceSyncReceive(t, ctx, store, owner.ID, over.ID)
 	reserveTestWorkspaceReceive(t, ctx, store, receiveTestRequest(owner.ID, within.ID, "exact.txt", 10, "quota-exact"))
 	if _, err := reserveTestWorkspaceReceiveErr(t, ctx, store, receiveTestRequest(owner.ID, over.ID, "over.txt", 11, "quota-over")); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("reserve above Workspace quota = %v; want quota exceeded", err)
@@ -305,6 +312,7 @@ func TestWorkspaceSyncReceiveQuotaRetryReevaluatesSameOperation(t *testing.T) {
 func TestWorkspaceSyncReceiveQuotaBaseMatchesRejectsChangedPathState(t *testing.T) {
 	file := &workspace.File{Path: "report.txt", SizeBytes: 7, SHA256: strings.Repeat("a", 64), Mode: 0640}
 	filePath, fileSize, fileSHA, fileMode := file.Path, file.SizeBytes, file.SHA256, int32(file.Mode)
+	changedModTime := int64(1)
 	fileDirectory := "reports"
 	cases := []struct {
 		name      string
@@ -317,11 +325,12 @@ func TestWorkspaceSyncReceiveQuotaBaseMatchesRejectsChangedPathState(t *testing.
 		{name: "changed size", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes + 1, SHA256: file.SHA256, Mode: file.Mode}},
 		{name: "changed content", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes, SHA256: strings.Repeat("b", 64), Mode: file.Mode}},
 		{name: "changed permissions", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: 0600}},
+		{name: "changed modification time", file: &workspace.File{Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Mode: file.Mode, ModTimeNS: &changedModTime}},
 		{name: "replaced by directory", directory: &fileDirectory},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := workspaceSyncReceiveQuotaBaseMatches(tt.file, tt.directory, &filePath, &fileSize, &fileSHA, &fileMode, nil); got != tt.want {
+			if got := workspaceSyncReceiveQuotaBaseMatches(tt.file, tt.directory, &filePath, &fileSize, &fileSHA, &fileMode, nil, nil); got != tt.want {
 				t.Fatalf("workspaceSyncReceiveQuotaBaseMatches() = %t; want %t", got, tt.want)
 			}
 		})
@@ -356,7 +365,10 @@ func TestWorkspaceSyncReceivePhysicalQuotaPauseIsPersisted(t *testing.T) {
 	if _, err := store.BeginAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, reservation.ID); err != nil {
 		t.Fatalf("begin abort after owner quota rejection: %v", err)
 	}
-	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+	if err := store.BeginWorkspaceCurrentMaterialization(ctx, value.ID, 0, reservation.ID); err != nil {
+		t.Fatalf("begin base revision restore after owner quota rejection: %v", err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterializedForReceive(ctx, value.ID, 0, reservation.ID); err != nil {
 		t.Fatalf("restore base revision after owner quota rejection: %v", err)
 	}
 	if err := store.CompleteAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, reservation.ID); err != nil {
@@ -376,7 +388,10 @@ func TestWorkspaceSyncReceivePhysicalQuotaPauseIsPersisted(t *testing.T) {
 	if _, err := store.BeginAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, retry.ID); err != nil {
 		t.Fatalf("begin second owner quota abort: %v", err)
 	}
-	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
+	if err := store.BeginWorkspaceCurrentMaterialization(ctx, value.ID, 0, retry.ID); err != nil {
+		t.Fatalf("begin base revision restore after second owner quota rejection: %v", err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterializedForReceive(ctx, value.ID, 0, retry.ID); err != nil {
 		t.Fatalf("restore base revision after second owner quota rejection: %v", err)
 	}
 	if err := store.CompleteAbortWorkspaceSyncReceive(ctx, owner.ID, value.ID, retry.ID); err != nil {
@@ -427,6 +442,9 @@ func TestWorkspaceSyncReceiveCommitsDirectoryRevision(t *testing.T) {
 	repeated, err := store.CommitWorkspaceSyncReceive(ctx, owner.ID, value.ID, repeatedReservation.ID, nil, &directory)
 	if err != nil || repeated.State != "settled" || repeated.Revision != 1 {
 		t.Fatalf("settle unchanged directory receive = %#v, err=%v; want revision 1", repeated, err)
+	}
+	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 1); err != nil {
+		t.Fatalf("confirm unchanged directory receive revision: %v", err)
 	}
 	deleteRequest := receiveTestRequest(owner.ID, value.ID, directory, 0, "directory-delete")
 	deleteRequest.Operation = app.WorkspaceSyncReceiveDirectoryDelete
@@ -557,7 +575,7 @@ func TestWorkspaceSyncReceiveBlocksSyncCommitAndTaskPublish(t *testing.T) {
 func TestWorkspaceSyncReceiveBlocksTaskPublishReservation(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	_, value, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "sync-receive-task-guard")
+	value, command := newSyncTaskWorkspacePublishTask(t, ctx, store, "sync-receive-task-guard")
 	if err := store.MarkWorkspaceCurrentMaterialized(ctx, value.ID, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -601,15 +619,32 @@ WHERE b.owner_id=$1 AND b.workspace_id=$2 AND b.state='active' AND f.state='acti
 	if active {
 		return
 	}
-	principal := syncDeviceTestPrincipal(t, store, ownerID)
-	registerTestWorkspaceSyncDevice(t, store, principal, workspaceID,
-		"AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA", "receive-test-"+workspaceID)
+	var principal identity.Principal
+	var deviceID string
+	err := store.pool.QueryRow(ctx, `SELECT i.client_installation_id, t.id, i.device_id
+FROM workspace_sync_device_identities i
+JOIN workspace_sync_device_bindings b ON b.device_identity_id=i.id AND b.owner_id=i.owner_id
+JOIN workspace_sync_folders f ON f.workspace_id=b.workspace_id AND f.owner_id=b.owner_id AND f.state='active'
+JOIN tokens t ON t.owner_id=i.owner_id AND t.client_installation_id=i.client_installation_id
+  AND t.kind='client' AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
+WHERE i.owner_id=$1 AND i.revoked_at IS NULL AND b.state='active'
+ORDER BY i.id LIMIT 1`, ownerID).Scan(&principal.ClientInstallationID, &principal.TokenID, &deviceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		principal = syncDeviceTestPrincipal(t, store, ownerID)
+		deviceID = "AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA-AAAAAAA"
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	principal.UserID = ownerID
+	principal.Role = identity.RoleUser
+	principal.Kind = identity.KindClient
+	registerTestWorkspaceSyncDevice(t, store, principal, workspaceID, deviceID, "receive-test-device-"+ownerID)
 	applyWorkspaceSyncNodeState(t, store, ownerID)
 }
 
 func receiveTestRequest(ownerID, workspaceID, path string, targetBytes int64, key string) app.WorkspaceSyncReceiveRequest {
 	operation := sha256.Sum256([]byte("workspace-sync-receive:" + key))
-	folderHash := sha256.Sum256([]byte(workspaceID + "\x00receive-test-" + workspaceID))
+	folderHash := sha256.Sum256([]byte(workspaceID + "\x00receive-test-device-" + ownerID))
 	return app.WorkspaceSyncReceiveRequest{
 		OwnerID: ownerID, WorkspaceID: workspaceID, FolderID: "morde-" + hex.EncodeToString(folderHash[:16]), OperationID: hex.EncodeToString(operation[:]), Path: path,
 		Operation: app.WorkspaceSyncReceiveUpsert, TargetBytes: targetBytes,

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain/workspace"
 )
@@ -42,18 +43,23 @@ func TestMaterializeAtomicallyPublishesVerifiedWorkspaceTree(t *testing.T) {
 	first := []byte("first revision")
 	firstDigest := sha256.Sum256(first)
 	firstSHA := hex.EncodeToString(firstDigest[:])
+	firstModified := time.Date(2024, time.June, 7, 8, 9, 10, 123456789, time.UTC).UnixNano()
 	firstFile := workspace.File{
 		Path: "docs/readme.txt", SizeBytes: int64(len(first)), SHA256: firstSHA, Mode: 0640,
+		ModTimeNS: &firstModified, MetadataKnown: true,
 		Chunks: []workspace.Chunk{{SHA256: firstSHA, SizeBytes: int64(len(first))}},
 	}
 	blocks := testBlocks{firstSHA: first}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{firstFile}, nil, blocks); err != nil {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{firstFile}, nil, workspaceRootMetadata(), blocks); err != nil {
 		t.Fatal(err)
 	}
 	ownerDigest := sha256.Sum256([]byte("u1234567"))
 	target := filepath.Join(root, hex.EncodeToString(ownerDigest[:]), "w1234567")
 	if got, err := os.ReadFile(filepath.Join(target, "docs", "readme.txt")); err != nil || !bytes.Equal(got, first) {
 		t.Fatalf("first materialized file = %q, %v", got, err)
+	}
+	if info, err := os.Stat(filepath.Join(target, "docs", "readme.txt")); err != nil || info.ModTime().UnixNano() != firstModified {
+		t.Fatalf("first materialized file modification time = %v, %v", info, err)
 	}
 	if revision, exists, err := store.CurrentRevision("u1234567", "w1234567"); err != nil || !exists || revision != 1 {
 		t.Fatalf("first current revision = %d, %t, %v", revision, exists, err)
@@ -64,10 +70,10 @@ func TestMaterializeAtomicallyPublishesVerifiedWorkspaceTree(t *testing.T) {
 	secondSHA := hex.EncodeToString(secondDigest[:])
 	secondFile := workspace.File{
 		Path: "docs/readme.txt", SizeBytes: int64(len(second)), SHA256: secondSHA, Mode: 0600,
-		Chunks: []workspace.Chunk{{SHA256: secondSHA, SizeBytes: int64(len(second))}},
+		Chunks: []workspace.Chunk{{SHA256: secondSHA, SizeBytes: int64(len(second))}}, MetadataKnown: true,
 	}
 	blocks[secondSHA] = second
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 2, []workspace.File{secondFile}, []string{"empty"}, blocks); err != nil {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 2, []workspace.File{secondFile}, []string{"empty"}, workspaceRootMetadata(), blocks); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(filepath.Join(target, "docs", "readme.txt")); err != nil || !bytes.Equal(got, second) {
@@ -84,6 +90,53 @@ func TestMaterializeAtomicallyPublishesVerifiedWorkspaceTree(t *testing.T) {
 	}
 }
 
+func TestMaterializeAndVerifyWorkspaceHardlinkIdentity(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "current")
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	content := []byte("shared inode")
+	digest := sha256.Sum256(content)
+	sha := hex.EncodeToString(digest[:])
+	anchor := workspace.File{Path: "a.txt", SizeBytes: int64(len(content)), SHA256: sha, Mode: 0640,
+		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}, MetadataKnown: true}
+	alias := anchor
+	alias.Path, alias.HardlinkTo = "nested/b.txt", anchor.Path
+	blocks := testBlocks{sha: content}
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{alias, anchor}, nil, workspaceRootMetadata(), blocks); err != nil {
+		t.Fatal(err)
+	}
+	workspaceRoot := filepath.Join(root, ownerHashForTest("u1234567"), "w1234567")
+	anchorInfo, err := os.Stat(filepath.Join(workspaceRoot, anchor.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(workspaceRoot, filepath.FromSlash(alias.Path))
+	aliasInfo, err := os.Stat(aliasPath)
+	if err != nil || !os.SameFile(anchorInfo, aliasInfo) {
+		t.Fatalf("materialized hardlink identity = %v, %v; want same inode as anchor", aliasInfo, err)
+	}
+	assertMatches := func(want bool) {
+		t.Helper()
+		matched, err := store.MatchesManifest(context.Background(), "u1234567", "w1234567", []workspace.File{anchor, alias}, nil, workspaceRootMetadata())
+		if err != nil || matched != want {
+			t.Fatalf("MatchesManifest() = %t, %v; want %t", matched, err, want)
+		}
+	}
+	assertMatches(true)
+
+	if err := os.Remove(aliasPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aliasPath, content, 0640); err != nil {
+		t.Fatal(err)
+	}
+	assertMatches(false)
+}
+
 func TestCurrentRevisionRequiresValidMarkerAndPublishedDirectory(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "current")
 	store, err := Open(root)
@@ -95,7 +148,7 @@ func TestCurrentRevisionRequiresValidMarkerAndPublishedDirectory(t *testing.T) {
 			t.Errorf("close store: %v", err)
 		}
 	}()
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, nil, nil, testBlocks{}); err != nil {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, nil, nil, workspaceRootMetadata(), testBlocks{}); err != nil {
 		t.Fatal(err)
 	}
 	ownerDigest := sha256.Sum256([]byte("u1234567"))
@@ -112,7 +165,7 @@ func TestCurrentRevisionRequiresValidMarkerAndPublishedDirectory(t *testing.T) {
 	if err := os.WriteFile(unknownFile, []byte("preserve me"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, nil, nil, testBlocks{}); !errors.Is(err, ErrUntrustedDirectory) {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, nil, nil, workspaceRootMetadata(), testBlocks{}); !errors.Is(err, ErrUntrustedDirectory) {
 		t.Fatalf("Materialize() with an invalid marker error = %v", err)
 	}
 	if got, err := os.ReadFile(unknownFile); err != nil || string(got) != "preserve me" {
@@ -142,9 +195,9 @@ func TestMatchesManifestDetectsCurrentProjectionDrift(t *testing.T) {
 	digest := sha256.Sum256(content)
 	sha := hex.EncodeToString(digest[:])
 	file := workspace.File{Path: "docs/readme.txt", SizeBytes: int64(len(content)), SHA256: sha, Mode: 0640,
-		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}}
+		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}, MetadataKnown: true}
 	directories := []string{"empty"}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, directories, testBlocks{sha: content}); err != nil {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, directories, workspaceRootMetadata(), testBlocks{sha: content}); err != nil {
 		t.Fatal(err)
 	}
 	ownerDigest := sha256.Sum256([]byte("u1234567"))
@@ -152,7 +205,7 @@ func TestMatchesManifestDetectsCurrentProjectionDrift(t *testing.T) {
 	target := filepath.Join(root, ownerHash, "w1234567")
 	assertMatch := func(want bool) {
 		t.Helper()
-		matches, err := store.MatchesManifest(context.Background(), "u1234567", "w1234567", []workspace.File{file}, directories)
+		matches, err := store.MatchesManifest(context.Background(), "u1234567", "w1234567", []workspace.File{file}, directories, workspaceRootMetadata())
 		if err != nil || matches != want {
 			t.Fatalf("MatchesManifest() = %t, %v; want %t", matches, err, want)
 		}
@@ -207,6 +260,87 @@ func TestMatchesManifestDetectsCurrentProjectionDrift(t *testing.T) {
 	assertMatch(true)
 }
 
+func TestMaterializeRestoresAndVerifiesDirectoryMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "current")
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+
+	content := []byte("directory metadata")
+	digest := sha256.Sum256(content)
+	sha := hex.EncodeToString(digest[:])
+	file := workspace.File{Path: "src/readme.txt", SizeBytes: int64(len(content)), SHA256: sha, Mode: 0o640,
+		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}, MetadataKnown: true}
+	mode, modified := uint32(0o750), int64(1_700_000_000_123_456_789)
+	directories := []workspace.Directory{
+		{Path: ".", MetadataKnown: true},
+		{Path: "src", Mode: &mode, ModTimeNS: &modified, MetadataKnown: true},
+	}
+	emptyDirectories := []string{"legacy-empty"}
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, emptyDirectories, directories,
+		testBlocks{sha: content}); err != nil {
+		t.Fatalf("materialize directory metadata: %v", err)
+	}
+	ownerRoot := filepath.Join(root, ownerHash("u1234567"), "w1234567")
+	info, err := os.Stat(filepath.Join(ownerRoot, "src"))
+	if err != nil {
+		t.Fatalf("stat materialized directory: %v", err)
+	}
+	if info.Mode().Perm() != os.FileMode(mode) || info.ModTime().UnixNano() != modified {
+		t.Fatalf("materialized directory attributes = mode %v mtime %v, err=%v", info.Mode().Perm(), info.ModTime().UnixNano(), err)
+	}
+	assertMatches := func(want bool) {
+		t.Helper()
+		matched, err := store.MatchesManifest(context.Background(), "u1234567", "w1234567", []workspace.File{file}, emptyDirectories, directories)
+		if err != nil || matched != want {
+			t.Fatalf("MatchesManifest() = %t, %v; want %t", matched, err, want)
+		}
+	}
+	assertMatches(true)
+	if err := os.Chmod(filepath.Join(ownerRoot, "src"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assertMatches(false)
+	if err := os.Chmod(filepath.Join(ownerRoot, "src"), os.FileMode(mode)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(ownerRoot, "src"), time.Unix(0, modified+1), time.Unix(0, modified+1)); err != nil {
+		t.Fatal(err)
+	}
+	assertMatches(false)
+	if err := os.Chtimes(filepath.Join(ownerRoot, "src"), time.Unix(0, modified), time.Unix(0, modified)); err != nil {
+		t.Fatal(err)
+	}
+	assertMatches(true)
+
+	legacyPath := filepath.Join(ownerRoot, "legacy-empty")
+	if err := os.Chmod(legacyPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unknownTime := time.Unix(0, modified+2)
+	if err := os.Chtimes(legacyPath, unknownTime, unknownTime); err != nil {
+		t.Fatal(err)
+	}
+	assertMatches(true)
+
+	if err := os.Chmod(filepath.Join(ownerRoot, "src"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 2, []workspace.File{file}, emptyDirectories, directories,
+		testBlocks{sha: content}); err != nil {
+		t.Fatalf("replace revision with restrictive prior directory mode: %v", err)
+	}
+	if _, err := os.Stat(ownerRoot); err != nil {
+		t.Fatalf("current Workspace was not readable after replacing prior revision: %v", err)
+	}
+}
+
 func TestMaterializeRecoversUnmarkedEmptyInitialDirectory(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "current")
 	store, err := Open(root)
@@ -224,7 +358,7 @@ func TestMaterializeRecoversUnmarkedEmptyInitialDirectory(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(ownerRoot, "w1234567"), 0750); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 0, nil, nil, testBlocks{}); err != nil {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 0, nil, nil, workspaceRootMetadata(), testBlocks{}); err != nil {
 		t.Fatal(err)
 	}
 	if revision, exists, err := store.CurrentRevision("u1234567", "w1234567"); err != nil || !exists || revision != 0 {
@@ -263,8 +397,8 @@ func TestOpenRegularFileRejectsSymlinkComponents(t *testing.T) {
 	digest := sha256.Sum256(content)
 	sha := hex.EncodeToString(digest[:])
 	file := workspace.File{Path: "safe/file.txt", SizeBytes: int64(len(content)), SHA256: sha, Mode: 0644,
-		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, nil, testBlocks{sha: content}); err != nil {
+		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}, MetadataKnown: true}
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, nil, workspaceRootMetadata(), testBlocks{sha: content}); err != nil {
 		t.Fatal(err)
 	}
 	opened, info, err := store.OpenRegularFile("u1234567", "w1234567", "safe/file.txt")
@@ -334,11 +468,11 @@ func TestMaterializeFailureKeepsPublishedTree(t *testing.T) {
 	digest := sha256.Sum256(content)
 	sha := hex.EncodeToString(digest[:])
 	file := workspace.File{Path: "stable.txt", SizeBytes: int64(len(content)), SHA256: sha, Mode: 0644,
-		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, nil, testBlocks{sha: content}); err != nil {
+		Chunks: []workspace.Chunk{{SHA256: sha, SizeBytes: int64(len(content))}}, MetadataKnown: true}
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 1, []workspace.File{file}, nil, workspaceRootMetadata(), testBlocks{sha: content}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 2, []workspace.File{file}, nil, testBlocks{}); err == nil {
+	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 2, []workspace.File{file}, nil, workspaceRootMetadata(), testBlocks{}); err == nil {
 		t.Fatal("Materialize() succeeded with a missing block")
 	}
 	ownerDigest := sha256.Sum256([]byte("u1234567"))

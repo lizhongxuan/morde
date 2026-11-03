@@ -127,8 +127,8 @@ WHERE workspace_id = $1 AND import_state = 'pending'`, workspaceID, reason)
 	return nil
 }
 
-func (s *Store) CommitWorkspaceLegacyVolumeImport(ctx context.Context, value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (workspace.Workspace, error) {
-	totalBytes, err := validateLegacyWorkspaceImport(value, files, emptyDirectories)
+func (s *Store) CommitWorkspaceLegacyVolumeImport(ctx context.Context, value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string, directories []workspace.Directory) (workspace.Workspace, error) {
+	totalBytes, err := validateLegacyWorkspaceImport(value, files, emptyDirectories, directories)
 	if err != nil {
 		return workspace.Workspace{}, err
 	}
@@ -183,13 +183,18 @@ FOR UPDATE OF v, w`, value.WorkspaceID).Scan(
 		for _, directory := range emptyDirectories {
 			directoryMutations = append(directoryMutations, syncDirectoryMutation{path: directory})
 		}
-		if len(mutations)+len(directoryMutations) > 0 {
-			if err := applyWorkspaceSyncTreeMutations(ctx, tx, value.WorkspaceID, 0, 0, 0, quotaBytes, mutations, directoryMutations); err != nil {
+		directoryMetadataMutations := make([]syncDirectoryMetadataMutation, 0, len(directories))
+		for i := range directories {
+			directory := directories[i]
+			directoryMetadataMutations = append(directoryMetadataMutations, syncDirectoryMetadataMutation{path: directory.Path, directory: &directory})
+		}
+		if len(mutations)+len(directoryMutations)+len(directoryMetadataMutations) > 0 {
+			if err := applyWorkspaceSyncTreeMutations(ctx, tx, value.WorkspaceID, 0, 0, 0, quotaBytes, mutations, directoryMutations, directories, directoryMetadataMutations); err != nil {
 				return err
 			}
 		}
 		targetRevision := int64(0)
-		if len(mutations)+len(directoryMutations) > 0 {
+		if len(mutations)+len(directoryMutations)+len(directoryMetadataMutations) > 0 {
 			targetRevision++
 		}
 		if err := enqueueWorkspaceCurrentMaterialization(ctx, tx, value.WorkspaceID, targetRevision); err != nil {
@@ -218,15 +223,32 @@ WHERE workspace_id = $1 AND import_state = 'pending'`, value.WorkspaceID)
 	return imported, nil
 }
 
-func validateLegacyWorkspaceImport(value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (int64, error) {
+func validateLegacyWorkspaceImport(value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string, directories []workspace.Directory) (int64, error) {
 	if !domain.ValidWorkspaceID(value.WorkspaceID) || value.VolumeName == "" || value.Revision < 0 || value.UsedBytes < 0 || value.QuotaBytes <= 0 {
 		return 0, domain.InvalidArgument("legacy_volume", "workspace legacy volume snapshot is invalid")
 	}
-	if len(files)+len(emptyDirectories) > workspace.MaxSyncFiles {
+	if len(files)+max(len(emptyDirectories), len(directories)) > workspace.MaxSyncFiles {
 		return 0, domain.NewError(domain.CodeQuotaExceeded, "legacy workspace content exceeds file count limit")
 	}
 	seen := make(map[string]string, len(files)+len(emptyDirectories))
+	seenFiles := make(map[string]string, len(files))
 	paths := make([]string, 0, len(files)+len(emptyDirectories))
+	expectedDirectories := make(map[string]string)
+	directoryCaseCollision := false
+	addExpectedDirectories := func(pathValue string, includeSelf bool) {
+		limit := path.Dir(pathValue)
+		if includeSelf {
+			limit = pathValue
+		}
+		for current := limit; current != "."; current = path.Dir(current) {
+			folded := strings.ToLower(current)
+			if previous, ok := expectedDirectories[folded]; ok && previous != current {
+				directoryCaseCollision = true
+			} else {
+				expectedDirectories[folded] = current
+			}
+		}
+	}
 	var totalBytes int64
 	for _, file := range files {
 		if err := workspace.ValidateFile(file); err != nil {
@@ -240,7 +262,9 @@ func validateLegacyWorkspaceImport(value app.LegacyWorkspaceVolume, files []work
 			return 0, domain.InvalidArgument("files", fmt.Sprintf("legacy workspace paths %q and %q collide case-insensitively", previous, file.Path))
 		}
 		seen[folded] = file.Path
+		seenFiles[folded] = file.Path
 		paths = append(paths, file.Path)
+		addExpectedDirectories(file.Path, false)
 		if totalBytes > math.MaxInt64-file.SizeBytes {
 			return 0, domain.InvalidArgument("files", "legacy workspace file sizes overflow")
 		}
@@ -256,6 +280,10 @@ func validateLegacyWorkspaceImport(value app.LegacyWorkspaceVolume, files []work
 		}
 		seen[folded] = directory
 		paths = append(paths, directory)
+		addExpectedDirectories(directory, true)
+	}
+	if directoryCaseCollision {
+		return 0, domain.InvalidArgument("directories", "legacy workspace directory paths collide by case")
 	}
 	for _, pathValue := range paths {
 		for parent := path.Dir(strings.ToLower(pathValue)); parent != "."; parent = path.Dir(parent) {
@@ -263,6 +291,33 @@ func validateLegacyWorkspaceImport(value app.LegacyWorkspaceVolume, files []work
 				return 0, domain.InvalidArgument("files", fmt.Sprintf("legacy workspace path %q conflicts with child %q", ancestor, pathValue))
 			}
 		}
+	}
+	seenMetadataDirectories := make(map[string]string, len(directories))
+	for _, directory := range directories {
+		if err := workspace.ValidateDirectory(directory, true); err != nil {
+			return 0, domain.InvalidArgument("directories", "legacy workspace directory metadata is invalid")
+		}
+		folded := strings.ToLower(directory.Path)
+		if previous, ok := seenMetadataDirectories[folded]; ok {
+			return 0, domain.InvalidArgument("directories", fmt.Sprintf("legacy workspace directories %q and %q collide case-insensitively", previous, directory.Path))
+		}
+		if filePath, ok := seenFiles[folded]; ok {
+			return 0, domain.InvalidArgument("directories", fmt.Sprintf("legacy workspace directory %q conflicts with file %q", directory.Path, filePath))
+		}
+		if expected, ok := expectedDirectories[folded]; !ok || expected != directory.Path {
+			return 0, domain.InvalidArgument("directories", fmt.Sprintf("legacy workspace directory %q does not match the imported tree", directory.Path))
+		}
+		seenMetadataDirectories[folded] = directory.Path
+	}
+	if len(directories) > 0 && len(seenMetadataDirectories) != len(expectedDirectories) {
+		return 0, domain.InvalidArgument("directories", "legacy workspace directory metadata must cover every directory in the imported tree")
+	}
+	filesJSON, filesErr := json.Marshal(files)
+	emptyDirectoriesJSON, emptyDirectoriesErr := json.Marshal(emptyDirectories)
+	directoriesJSON, directoriesErr := json.Marshal(directories)
+	if filesErr != nil || emptyDirectoriesErr != nil || directoriesErr != nil ||
+		len(filesJSON)+len(emptyDirectoriesJSON)+len(directoriesJSON) > workspace.MaxSyncManifestBytes {
+		return 0, domain.NewError(domain.CodeQuotaExceeded, "legacy workspace manifest exceeds 16 MiB")
 	}
 	return totalBytes, nil
 }

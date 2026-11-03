@@ -140,7 +140,7 @@ func TestRFBWebSocketBodyAllowsViewerTrafficAndBlocksAIMutations(t *testing.T) {
 			ref := host.Ref{ID: testHostID, RuntimeGeneration: 1, ControlVersion: 4, ControlState: host.ControlAI}
 			upstream := &rfbCaptureBody{}
 			permits := &testActivityLeaseStore{}
-			body := newRFBFilteringBody(upstream, context.Background(), ref, permits, true, nil)
+			body := newRFBFilteringBody(upstream, context.Background(), ref, permits, testUserID, true, nil)
 			viewerMessages := append([]byte("RFB 003.008\n"), 1, 1)
 			viewerMessages = append(viewerMessages, 3, 0, 0, 0, 0, 0, 1, 0, 1, 0)
 			frame := testMaskedWebSocketFrame(2, true, viewerMessages)
@@ -168,7 +168,7 @@ func TestRFBWebSocketBodyDropsAllMemberInputWithoutPermits(t *testing.T) {
 	ref := host.Ref{ID: testHostID, RuntimeGeneration: 1, ControlVersion: 4, ControlState: host.ControlAI}
 	upstream := &rfbCaptureBody{}
 	permits := &testActivityLeaseStore{}
-	body := newRFBFilteringBody(upstream, context.Background(), ref, permits, false, nil)
+	body := newRFBFilteringBody(upstream, context.Background(), ref, permits, testUserID, false, nil)
 	viewerTraffic := append([]byte("RFB 003.008\n"), 1, 1)
 	viewerTraffic = append(viewerTraffic, 3, 0, 0, 0, 0, 0, 1, 0, 1, 0) // framebuffer update request
 	if _, err := body.Write(testMaskedWebSocketFrame(2, true, viewerTraffic)); err != nil {
@@ -190,7 +190,7 @@ func TestRFBWebSocketBodyDropsAllMemberInputWithoutPermits(t *testing.T) {
 func TestRFBWebSocketBodyAllowsClipboardCapabilitiesButBlocksClipboardDataInAI(t *testing.T) {
 	ref := host.Ref{ID: testHostID, RuntimeGeneration: 1, ControlVersion: 4, ControlState: host.ControlAI}
 	upstream := &rfbCaptureBody{}
-	body := newRFBFilteringBody(upstream, context.Background(), ref, &testActivityLeaseStore{}, true, nil)
+	body := newRFBFilteringBody(upstream, context.Background(), ref, &testActivityLeaseStore{}, testUserID, true, nil)
 	handshake := append([]byte("RFB 003.008\n"), 1, 1)
 	if _, err := body.Write(testMaskedWebSocketFrame(2, true, handshake)); err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func TestRFBWebSocketBodyRequiresCurrentUserPermit(t *testing.T) {
 	upstream := &rfbCaptureBody{}
 	permits := &testActivityLeaseStore{}
 	var filterError error
-	body := newRFBFilteringBody(upstream, context.Background(), ref, permits, true, func(err error) { filterError = err })
+	body := newRFBFilteringBody(upstream, context.Background(), ref, permits, testUserID, true, func(err error) { filterError = err })
 	handshake := append([]byte("RFB 003.008\n"), 1, 1)
 	if _, err := body.Write(testMaskedWebSocketFrame(2, true, handshake)); err != nil {
 		t.Fatal(err)
@@ -274,7 +274,7 @@ func TestRFBInputWriteTimeoutClosesSocket(t *testing.T) {
 	permits := &testActivityLeaseStore{}
 	body := newRFBFilteringBody(upstream, context.Background(), host.Ref{
 		ID: testHostID, RuntimeGeneration: 1, ControlVersion: 4, ControlState: host.ControlUser,
-	}, permits, true, nil)
+	}, permits, testUserID, true, nil)
 	body.rfb.stage = 3
 
 	started := time.Now()

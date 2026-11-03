@@ -258,7 +258,7 @@ func newDockerDSHFixture(t *testing.T) (*DockerCloudDSHSupervisor, *dockerDSHFak
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", SupervisorID: "supervisor-test", LeaseOwner: "worker-1", LeaseVersion: 1, AuthorizationVersion: 1,
 		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
 	launch := CloudDSHLaunch{NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs",

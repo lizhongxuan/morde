@@ -97,6 +97,10 @@ func (g *gateway) workbench(c *gin.Context) {
 	filename := filepath.Join(g.deps.Config.WorkbenchDir, name)
 	info, err := os.Stat(filename)
 	if err != nil || info.IsDir() {
+		if _, taskObservation := c.Get(taskObservationSessionKey); taskObservation && name != "index.html" {
+			writeNotFound(c)
+			return
+		}
 		filename = filepath.Join(g.deps.Config.WorkbenchDir, "index.html")
 		info, err = os.Stat(filename)
 		if err != nil || info.IsDir() {
@@ -113,7 +117,11 @@ func (g *gateway) workbench(c *gin.Context) {
 	defer func() { _ = data.Close() }()
 	c.Header("Content-Security-Policy", "frame-ancestors 'self'")
 	c.Header("X-Content-Type-Options", "nosniff")
-	if name == "index.html" {
+	if _, taskObservation := c.Get(taskObservationSessionKey); taskObservation {
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+	} else if name == "index.html" {
 		c.Header("Cache-Control", "no-cache")
 	} else if hashedAssetName.MatchString(filepath.Base(name)) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")

@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -18,12 +19,17 @@ import (
 )
 
 const (
-	MaxSyncBlockBytes    int64 = 4 << 20
-	MaxSyncFileBytes     int64 = 300 << 20
-	MaxSyncFiles               = 100_000
-	MaxSyncManifestBytes       = 16 << 20
-	MaxSyncScopeItems          = 10_000
-	MaxSyncPathBytes           = 4096
+	MaxSyncBlockBytes           int64 = 4 << 20
+	MaxSyncFileBytes            int64 = 300 << 20
+	MaxSyncFiles                      = 100_000
+	MaxSyncManifestBytes              = 16 << 20
+	MaxSyncScopeItems                 = 10_000
+	MaxSyncPathBytes                  = 4096
+	MaxWorkspaceXattrs                = 64
+	MaxWorkspaceXattrNameBytes        = 255
+	MaxWorkspaceXattrValueBytes       = 16 << 10
+	MaxWorkspaceACLBytes              = 32 << 10
+	MaxWorkspaceMetadataBytes         = 64 << 10
 )
 
 const syncIDAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -111,20 +117,130 @@ type BlockReference struct {
 	SizeBytes   int64
 }
 
+const (
+	FileKindRegular = "file"
+	FileKindSymlink = "symlink"
+)
+
 type File struct {
-	Path      string  `json:"path"`
-	SizeBytes int64   `json:"size_bytes"`
-	SHA256    string  `json:"sha256"`
-	Mode      uint32  `json:"mode"`
-	Chunks    []Chunk `json:"chunks"`
+	Kind          string              `json:"kind,omitempty"`
+	SymlinkTarget string              `json:"symlink_target,omitempty"`
+	HardlinkTo    string              `json:"hardlink_to,omitempty"`
+	MetadataKnown bool                `json:"metadata_known,omitempty"`
+	Xattrs        []ExtendedAttribute `json:"xattrs,omitempty"`
+	ACL           *NativeACL          `json:"acl,omitempty"`
+	Path          string              `json:"path"`
+	SizeBytes     int64               `json:"size_bytes"`
+	SHA256        string              `json:"sha256"`
+	Mode          uint32              `json:"mode"`
+	ModTimeNS     *int64              `json:"mod_time_ns,omitempty"`
+	Chunks        []Chunk             `json:"chunks"`
+}
+
+// ExtendedAttribute preserves an operating-system extended attribute as its
+// original name and bytes. JSON encodes Value as base64.
+type ExtendedAttribute struct {
+	Name  string `json:"name"`
+	Value []byte `json:"value"`
+}
+
+// NativeACL is an opaque ACL payload. Platform and Format must match the
+// filesystem doing the restore; the service never translates ACL semantics.
+type NativeACL struct {
+	Platform string `json:"platform"`
+	Format   string `json:"format"`
+	Data     []byte `json:"data"`
+}
+
+// Directory records POSIX permission bits and modification time for one
+// workspace-relative directory. Nil metadata means the revision predates
+// directory metadata capture or the source did not provide that field.
+type Directory struct {
+	Path          string              `json:"path"`
+	Mode          *uint32             `json:"mode,omitempty"`
+	ModTimeNS     *int64              `json:"mod_time_ns,omitempty"`
+	MetadataKnown bool                `json:"metadata_known,omitempty"`
+	Xattrs        []ExtendedAttribute `json:"xattrs,omitempty"`
+	ACL           *NativeACL          `json:"acl,omitempty"`
+}
+
+func ValidateDirectory(value Directory, requireKnown bool) error {
+	if value.Path != "." {
+		if err := ValidateRelativePath(value.Path); err != nil {
+			return err
+		}
+	}
+	if value.Mode != nil && *value.Mode > 0o777 {
+		return errors.New("directory permission bits are invalid")
+	}
+	if requireKnown && (value.Mode == nil || value.ModTimeNS == nil) {
+		return errors.New("directory permissions and modification time are required")
+	}
+	if !value.MetadataKnown && (len(value.Xattrs) > 0 || value.ACL != nil) {
+		return errors.New("workspace directory metadata is present but not marked known")
+	}
+	return ValidateNativeMetadata(value.Xattrs, value.ACL)
+}
+
+// ValidateNativeMetadata bounds untrusted manifest metadata and requires a
+// stable attribute order so revisions have a unique representation.
+func ValidateNativeMetadata(xattrs []ExtendedAttribute, acl *NativeACL) error {
+	if len(xattrs) > MaxWorkspaceXattrs {
+		return errors.New("workspace extended attribute count exceeds limit")
+	}
+	total := 0
+	previous := ""
+	for _, attribute := range xattrs {
+		if attribute.Name == "" || len(attribute.Name) > MaxWorkspaceXattrNameBytes || !utf8.ValidString(attribute.Name) ||
+			!strings.HasPrefix(attribute.Name, "user.") || len(attribute.Name) == len("user.") ||
+			strings.IndexByte(attribute.Name, 0) >= 0 || len(attribute.Value) > MaxWorkspaceXattrValueBytes ||
+			previous != "" && attribute.Name <= previous {
+			return errors.New("workspace extended attributes are outside the user namespace, invalid, or not in strict name order")
+		}
+		previous = attribute.Name
+		total += len(attribute.Name) + len(attribute.Value)
+	}
+	if acl != nil {
+		if len(acl.Data) == 0 || len(acl.Data) > MaxWorkspaceACLBytes ||
+			(acl.Platform == "darwin" && acl.Format != "darwin-filesec-v1") ||
+			(acl.Platform == "linux" && acl.Format != "linux-posix-acl-v1") ||
+			(acl.Platform != "darwin" && acl.Platform != "linux") {
+			return errors.New("workspace native ACL metadata is invalid")
+		}
+		total += len(acl.Platform) + len(acl.Format) + len(acl.Data)
+	}
+	if total > MaxWorkspaceMetadataBytes {
+		return errors.New("workspace metadata exceeds byte limit")
+	}
+	return nil
+}
+
+// SameNativeMetadata compares xattrs and ACLs without treating nil and empty
+// xattr slices as different when metadata is known to be empty.
+func SameNativeMetadata(aXattrs, bXattrs []ExtendedAttribute, aACL, bACL *NativeACL) bool {
+	if len(aXattrs) != len(bXattrs) || (aACL == nil) != (bACL == nil) {
+		return false
+	}
+	for index := range aXattrs {
+		if aXattrs[index].Name != bXattrs[index].Name || !bytes.Equal(aXattrs[index].Value, bXattrs[index].Value) {
+			return false
+		}
+	}
+	return aACL == nil || aACL.Platform == bACL.Platform && aACL.Format == bACL.Format && bytes.Equal(aACL.Data, bACL.Data)
+}
+
+func SameDirectoryMetadata(a, b Directory) bool {
+	return a.Path == b.Path && sameOptionalUint32(a.Mode, b.Mode) && sameOptionalInt64(a.ModTimeNS, b.ModTimeNS) &&
+		a.MetadataKnown == b.MetadataKnown && SameNativeMetadata(a.Xattrs, b.Xattrs, a.ACL, b.ACL)
 }
 
 type ManifestPage struct {
-	WorkspaceID      string   `json:"workspace_id"`
-	Revision         int64    `json:"revision"`
-	Files            []File   `json:"files"`
-	EmptyDirectories []string `json:"empty_directories"`
-	NextCursor       *string  `json:"next_cursor"`
+	WorkspaceID      string      `json:"workspace_id"`
+	Revision         int64       `json:"revision"`
+	Files            []File      `json:"files"`
+	EmptyDirectories []string    `json:"empty_directories"`
+	Directories      []Directory `json:"directories"`
+	NextCursor       *string     `json:"next_cursor"`
 }
 
 type ChangeAction string
@@ -137,10 +253,11 @@ const (
 )
 
 type Change struct {
-	Revision int64        `json:"revision"`
-	Path     string       `json:"path"`
-	Action   ChangeAction `json:"action"`
-	File     *File        `json:"file"`
+	Revision  int64        `json:"revision"`
+	Path      string       `json:"path"`
+	Action    ChangeAction `json:"action"`
+	File      *File        `json:"file"`
+	Directory *Directory   `json:"directory"`
 }
 
 type ChangePage struct {
@@ -164,7 +281,7 @@ func DecodeChangeCursor(value string) (ChangeCursor, error) {
 		return ChangeCursor{}, errors.New("invalid workspace changes cursor")
 	}
 	var cursor ChangeCursor
-	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.Revision < 0 || (cursor.Path != "" && ValidateRelativePath(cursor.Path) != nil) {
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.Revision < 0 || (cursor.Path != "" && cursor.Path != "." && ValidateRelativePath(cursor.Path) != nil) {
 		return ChangeCursor{}, errors.New("invalid workspace changes cursor")
 	}
 	return cursor, nil
@@ -209,6 +326,7 @@ type CreateSyncSession struct {
 	Scope               []string      `json:"scope,omitempty"`
 	Files               []File        `json:"files"`
 	EmptyDirectories    []string      `json:"empty_directories,omitempty"`
+	Directories         []Directory   `json:"directories,omitempty"`
 	DeletedPaths        []string      `json:"deleted_paths,omitempty"`
 	DeletedDirectories  []string      `json:"deleted_directories,omitempty"`
 	AckCursor           *string       `json:"ack_cursor,omitempty"`
@@ -233,6 +351,10 @@ func DownloadActionsForPlan(files []File, deletedPaths []string) []DownloadActio
 }
 
 func DownloadActionsForTreePlan(files []File, deletedPaths, emptyDirectories, deletedDirectories []string) []DownloadAction {
+	return DownloadActionsForTreePlanWithMetadata(files, deletedPaths, emptyDirectories, deletedDirectories, nil)
+}
+
+func DownloadActionsForTreePlanWithMetadata(files []File, deletedPaths, emptyDirectories, deletedDirectories []string, directories []Directory) []DownloadAction {
 	actions := make([]DownloadAction, 0, len(files)+len(deletedPaths)+len(emptyDirectories)+len(deletedDirectories))
 	for _, file := range files {
 		digest := file.SHA256
@@ -249,24 +371,48 @@ func DownloadActionsForTreePlan(files []File, deletedPaths, emptyDirectories, de
 	for _, directory := range deletedDirectories {
 		actions = append(actions, DownloadAction{Path: directory, Action: ChangeDirectoryDelete})
 	}
+	seenDirectories := pathSet(emptyDirectories)
+	for _, directory := range directories {
+		key := strings.ToLower(directory.Path)
+		if _, exists := seenDirectories[key]; exists {
+			continue
+		}
+		seenDirectories[key] = directory.Path
+		actions = append(actions, DownloadAction{Path: directory.Path, Action: ChangeDirectoryUpsert})
+	}
 	sort.Slice(actions, func(i, j int) bool { return actions[i].Path < actions[j].Path })
 	return actions
 }
 
 func ValidateDownloadAction(value DownloadAction) error {
-	if err := ValidateRelativePath(value.Path); err != nil {
-		return err
-	}
 	switch value.Action {
 	case ChangeUpsert:
+		if err := ValidateRelativePath(value.Path); err != nil {
+			return err
+		}
 		if value.SHA256 == nil || !sha256Pattern.MatchString(*value.SHA256) || value.SizeBytes < 0 {
 			return errors.New("download upsert action metadata is invalid")
 		}
 	case ChangeDelete:
+		if err := ValidateRelativePath(value.Path); err != nil {
+			return err
+		}
 		if value.SHA256 != nil || value.SizeBytes != 0 {
 			return errors.New("download delete action metadata is invalid")
 		}
-	case ChangeDirectoryUpsert, ChangeDirectoryDelete:
+	case ChangeDirectoryUpsert:
+		if value.Path != "." {
+			if err := ValidateRelativePath(value.Path); err != nil {
+				return err
+			}
+		}
+		if value.SHA256 != nil || value.SizeBytes != 0 {
+			return errors.New("download directory action metadata is invalid")
+		}
+	case ChangeDirectoryDelete:
+		if err := ValidateRelativePath(value.Path); err != nil {
+			return err
+		}
 		if value.SHA256 != nil || value.SizeBytes != 0 {
 			return errors.New("download directory action metadata is invalid")
 		}
@@ -296,8 +442,11 @@ type SyncSession struct {
 	DownloadActions            []DownloadAction `json:"download_actions"`
 	Conflicts                  []Conflict       `json:"conflicts"`
 	Files                      []File           `json:"-"`
+	Directories                []Directory      `json:"-"`
 	UploadFiles                []File           `json:"-"`
 	DownloadFiles              []File           `json:"-"`
+	UploadDirectories          []Directory      `json:"-"`
+	DownloadDirectories        []Directory      `json:"-"`
 	Scope                      []string         `json:"-"`
 	DeletedPaths               []string         `json:"-"`
 	EmptyDirectories           []string         `json:"-"`
@@ -380,6 +529,8 @@ func SyncQuotaStatusForUsage(usedBytes, quotaBytes int64) SyncQuotaStatus {
 type SyncPlan struct {
 	UploadFiles                []File
 	DownloadFiles              []File
+	UploadDirectories          []Directory
+	DownloadDirectories        []Directory
 	UploadDeletedPaths         []string
 	DownloadDeletedPaths       []string
 	UploadEmptyDirectories     []string
@@ -404,12 +555,21 @@ func PlanSync(baseFiles, currentFiles []File, request CreateSyncSession) SyncPla
 // immutable snapshots. Directories have no content blocks and do not affect
 // file quota or byte counts.
 func PlanSyncTree(baseFiles, currentFiles []File, baseEmptyDirectories, currentEmptyDirectories []string, request CreateSyncSession) SyncPlan {
+	return PlanSyncTreeWithDirectories(baseFiles, currentFiles, baseEmptyDirectories, currentEmptyDirectories, nil, nil, request)
+}
+
+// PlanSyncTreeWithDirectories plans file content, empty-directory structure,
+// and directory metadata against the same immutable snapshots. Unknown legacy
+// metadata remains unknown unless a client supplies a known value.
+func PlanSyncTreeWithDirectories(baseFiles, currentFiles []File, baseEmptyDirectories, currentEmptyDirectories []string,
+	baseDirectories, currentDirectories []Directory, request CreateSyncSession) SyncPlan {
 	base := fileMap(baseFiles)
 	current := fileMap(currentFiles)
 	client := fileMap(request.Files)
 	localDeleted := stringSet(request.DeletedPaths)
 	plan := SyncPlan{
 		UploadFiles: []File{}, DownloadFiles: []File{},
+		UploadDirectories: []Directory{}, DownloadDirectories: []Directory{},
 		UploadDeletedPaths: []string{}, DownloadDeletedPaths: []string{},
 		Conflicts: []Conflict{}, UploadBlocks: []Chunk{}, DownloadBlocks: []Chunk{}, RequiredBlocks: []Chunk{},
 		UploadEmptyDirectories: []string{}, DownloadEmptyDirectories: []string{},
@@ -494,6 +654,7 @@ func PlanSyncTree(baseFiles, currentFiles []File, baseEmptyDirectories, currentE
 		}
 	}
 	planEmptyDirectoryChanges(&plan, baseEmptyDirectories, currentEmptyDirectories, request)
+	planDirectoryMetadataChanges(&plan, baseDirectories, currentDirectories, request)
 	coalesceTreePlan(&plan, baseFiles, currentFiles, baseEmptyDirectories, currentEmptyDirectories, request)
 
 	for _, file := range plan.UploadFiles {
@@ -536,7 +697,150 @@ func PlanSyncTree(baseFiles, currentFiles []File, baseEmptyDirectories, currentE
 	sort.Strings(plan.DownloadEmptyDirectories)
 	sort.Strings(plan.UploadDeletedDirectories)
 	sort.Strings(plan.DownloadDeletedDirectories)
+	sort.Slice(plan.UploadDirectories, func(i, j int) bool { return plan.UploadDirectories[i].Path < plan.UploadDirectories[j].Path })
+	sort.Slice(plan.DownloadDirectories, func(i, j int) bool { return plan.DownloadDirectories[i].Path < plan.DownloadDirectories[j].Path })
 	return plan
+}
+
+func planDirectoryMetadataChanges(plan *SyncPlan, baseDirectories, currentDirectories []Directory, request CreateSyncSession) {
+	base, current, local := directoryMap(baseDirectories), directoryMap(currentDirectories), directoryMap(request.Directories)
+	localDeleted := stringSet(request.DeletedDirectories)
+	keys := make(map[string]struct{}, len(base)+len(current)+len(local)+len(localDeleted))
+	for key := range base {
+		keys[key] = struct{}{}
+	}
+	for key := range current {
+		keys[key] = struct{}{}
+	}
+	for key := range local {
+		keys[key] = struct{}{}
+	}
+	for key := range localDeleted {
+		keys[key] = struct{}{}
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	for _, key := range ordered {
+		baseValue, baseOK := base[key]
+		remoteValue, remoteOK := current[key]
+		localValue, localOK := local[key]
+		localDelete := localDeleted[key]
+		localChanged := localDelete && baseOK || localOK && (!baseOK || !sameDirectory(localValue, baseValue))
+		remoteChanged := baseOK != remoteOK || baseOK && remoteOK && !sameDirectory(baseValue, remoteValue)
+		mergeTreeMTime := localOK && remoteOK && directoryMetadataTimeOnlyDiverged(localValue, remoteValue)
+		uploadTreeMutation := directoryHasUploadTreeMutation(key, *plan)
+		if !inDirectoryScope(key, request.Scope) {
+			continue
+		}
+		if request.Direction == SyncUpload || request.Direction == SyncBidirectional {
+			if localChanged {
+				if request.Policy == SyncFillMissing {
+					if !remoteOK && localOK {
+						plan.UploadDirectories = append(plan.UploadDirectories, localValue)
+					}
+				} else if remoteChanged && !sameOptionalDirectory(localValue, localOK, remoteValue, remoteOK) && !mergeTreeMTime {
+					appendConflictOnce(plan, Conflict{Path: canonicalDirectoryMetadataPath(key, baseValue, baseOK, remoteValue, remoteOK, localValue, localOK), Reason: "metadata_changed"})
+				} else if localDelete {
+					if remoteOK {
+						plan.UploadDeletedDirectories = append(plan.UploadDeletedDirectories, remoteValue.Path)
+					}
+				} else if localOK && !sameOptionalDirectory(localValue, true, remoteValue, remoteOK) &&
+					(!mergeTreeMTime || uploadTreeMutation || request.Direction == SyncUpload) {
+					plan.UploadDirectories = append(plan.UploadDirectories, localValue)
+				}
+			}
+		}
+		if request.Direction == SyncDownload || request.Direction == SyncBidirectional {
+			if request.Policy == SyncFillMissing {
+				if remoteOK && (!localOK || remoteChanged) {
+					plan.DownloadDirectories = append(plan.DownloadDirectories, remoteValue)
+				}
+			} else if remoteChanged {
+				if localChanged && !sameOptionalDirectory(localValue, localOK, remoteValue, remoteOK) && !mergeTreeMTime {
+					appendConflictOnce(plan, Conflict{Path: canonicalDirectoryMetadataPath(key, baseValue, baseOK, remoteValue, remoteOK, localValue, localOK), Reason: "metadata_changed"})
+				} else if remoteOK && (!localOK || !sameDirectory(localValue, remoteValue)) &&
+					(!localChanged || request.Direction == SyncDownload || mergeTreeMTime && !uploadTreeMutation) {
+					plan.DownloadDirectories = append(plan.DownloadDirectories, remoteValue)
+				}
+			}
+		}
+	}
+	conflictPaths := make(map[string]struct{}, len(plan.Conflicts))
+	for _, conflict := range plan.Conflicts {
+		conflictPaths[strings.ToLower(conflict.Path)] = struct{}{}
+	}
+	filter := func(values []Directory) []Directory {
+		result := values[:0]
+		for _, value := range values {
+			if _, conflict := conflictPaths[strings.ToLower(value.Path)]; !conflict {
+				result = append(result, value)
+			}
+		}
+		return result
+	}
+	plan.UploadDirectories, plan.DownloadDirectories = filter(plan.UploadDirectories), filter(plan.DownloadDirectories)
+}
+
+func directoryMap(values []Directory) map[string]Directory {
+	result := make(map[string]Directory, len(values))
+	for _, value := range values {
+		result[strings.ToLower(value.Path)] = value
+	}
+	return result
+}
+
+func sameDirectory(a, b Directory) bool {
+	return a.Path == b.Path && sameOptionalUint32(a.Mode, b.Mode) && sameOptionalInt64(a.ModTimeNS, b.ModTimeNS) &&
+		a.MetadataKnown == b.MetadataKnown && SameNativeMetadata(a.Xattrs, b.Xattrs, a.ACL, b.ACL)
+}
+
+func directoryMetadataTimeOnlyDiverged(a, b Directory) bool {
+	return a.ModTimeNS != nil && b.ModTimeNS != nil && *a.ModTimeNS != *b.ModTimeNS && a.Path == b.Path &&
+		sameOptionalUint32(a.Mode, b.Mode) && a.MetadataKnown == b.MetadataKnown && SameNativeMetadata(a.Xattrs, b.Xattrs, a.ACL, b.ACL)
+}
+
+func directoryHasUploadTreeMutation(directory string, plan SyncPlan) bool {
+	affects := func(value string) bool {
+		value = strings.ToLower(value)
+		return directory == "." || value == directory || strings.HasPrefix(value, directory+"/")
+	}
+	for _, file := range plan.UploadFiles {
+		if affects(file.Path) {
+			return true
+		}
+	}
+	for _, values := range [][]string{plan.UploadDeletedPaths, plan.UploadEmptyDirectories, plan.UploadDeletedDirectories} {
+		for _, value := range values {
+			if affects(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameOptionalDirectory(a Directory, aOK bool, b Directory, bOK bool) bool {
+	return aOK == bOK && (!aOK || sameDirectory(a, b))
+}
+
+func sameOptionalUint32(a, b *uint32) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
+}
+
+func canonicalDirectoryMetadataPath(key string, base Directory, baseOK bool, remote Directory, remoteOK bool, local Directory, localOK bool) string {
+	if baseOK {
+		return base.Path
+	}
+	if remoteOK {
+		return remote.Path
+	}
+	if localOK {
+		return local.Path
+	}
+	return key
 }
 
 func planEmptyDirectoryChanges(plan *SyncPlan, baseDirectories, currentDirectories []string, request CreateSyncSession) {
@@ -822,8 +1126,28 @@ func inScope(filePath string, scope []string) bool {
 	return false
 }
 
+func inDirectoryScope(directory string, scope []string) bool {
+	if len(scope) == 0 {
+		return true
+	}
+	for _, candidate := range scope {
+		candidate = strings.TrimSuffix(candidate, "/")
+		if strings.EqualFold(directory, candidate) || strings.HasPrefix(strings.ToLower(directory), strings.ToLower(candidate)+"/") ||
+			strings.HasPrefix(strings.ToLower(candidate), strings.ToLower(directory)+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func sameFile(a, b File) bool {
-	return a.Path == b.Path && a.SizeBytes == b.SizeBytes && a.SHA256 == b.SHA256 && a.Mode == b.Mode
+	return a.Path == b.Path && CanonicalFileKind(a.Kind) == CanonicalFileKind(b.Kind) && a.SymlinkTarget == b.SymlinkTarget && a.HardlinkTo == b.HardlinkTo &&
+		a.SizeBytes == b.SizeBytes && a.SHA256 == b.SHA256 && a.Mode == b.Mode && sameOptionalInt64(a.ModTimeNS, b.ModTimeNS) &&
+		a.MetadataKnown == b.MetadataKnown && SameNativeMetadata(a.Xattrs, b.Xattrs, a.ACL, b.ACL)
+}
+
+func sameOptionalInt64(a, b *int64) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
 func sameOptional(a File, aOK bool, b File, bOK bool) bool {
@@ -893,7 +1217,7 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 	if (value.TaskID == "") != (value.TaskHubOperationKey == "") {
 		return errors.New("task sync association requires both task_id and task_hub_operation_key")
 	}
-	if len(value.Files)+len(value.EmptyDirectories) > MaxSyncFiles || len(value.Scope) > MaxSyncScopeItems ||
+	if len(value.Files)+max(len(value.EmptyDirectories), len(value.Directories)) > MaxSyncFiles || len(value.Scope) > MaxSyncScopeItems ||
 		len(value.DeletedPaths) > MaxSyncFiles || len(value.DeletedDirectories) > MaxSyncFiles ||
 		len(value.DeletedPaths)+len(value.DeletedDirectories) > MaxSyncFiles {
 		return errors.New("sync manifest exceeds item limits")
@@ -937,6 +1261,9 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 		}
 		total += file.SizeBytes
 	}
+	if err := ValidateHardlinkAnchors(value.Files); err != nil {
+		return err
+	}
 	for _, directory := range value.EmptyDirectories {
 		if err := ValidateRelativePath(directory); err != nil {
 			return fmt.Errorf("empty directory %q: %w", directory, err)
@@ -953,6 +1280,96 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 		if len(value.Scope) > 0 && !inScope(strings.ToLower(directory), value.Scope) {
 			return fmt.Errorf("empty directory path %q is outside the requested sync scope", directory)
 		}
+	}
+	seenMetadataDirectories := make(map[string]string, len(value.Directories))
+	expectedDirectories := make(map[string]string, len(value.Files)+len(value.EmptyDirectories))
+	addDirectoryAncestors := func(value string, includeSelf bool) {
+		parts := strings.Split(value, "/")
+		limit := len(parts)
+		if !includeSelf {
+			limit--
+		}
+		prefix := ""
+		for index := 0; index < limit; index++ {
+			if index > 0 {
+				prefix += "/"
+			}
+			prefix += parts[index]
+			expectedDirectories[strings.ToLower(prefix)] = prefix
+		}
+	}
+	canonicalComponents := make(map[string]string)
+	for _, file := range value.Files {
+		addDirectoryAncestors(file.Path, false)
+	}
+	for _, directory := range value.EmptyDirectories {
+		addDirectoryAncestors(directory, true)
+	}
+	for folded, directory := range expectedDirectories {
+		canonicalComponents[folded] = directory
+	}
+	for _, directory := range value.Directories {
+		if err := ValidateDirectory(directory, true); err != nil {
+			return fmt.Errorf("directory %q: %w", directory.Path, err)
+		}
+		if directory.Path == "." {
+			if len(value.Scope) > 0 {
+				return errors.New("Workspace root metadata cannot be updated by a scoped sync")
+			}
+			if _, exists := seenMetadataDirectories["."]; exists {
+				return errors.New("duplicate Workspace root metadata")
+			}
+			seenMetadataDirectories["."] = directory.Path
+			continue
+		}
+		if directory.Mode == nil || *directory.Mode > 0777 || directory.ModTimeNS == nil {
+			return fmt.Errorf("directory %q must include valid permissions and modification time", directory.Path)
+		}
+		folded := strings.ToLower(directory.Path)
+		if previous, exists := seenMetadataDirectories[folded]; exists {
+			return fmt.Errorf("duplicate or case-folded directory path %q conflicts with %q", directory.Path, previous)
+		}
+		if filePath, exists := seenFiles[folded]; exists {
+			return fmt.Errorf("directory path %q conflicts with file %q", directory.Path, filePath)
+		}
+		if len(value.Scope) > 0 && !inDirectoryScope(strings.ToLower(directory.Path), value.Scope) {
+			return fmt.Errorf("directory path %q is outside the requested sync scope", directory.Path)
+		}
+		parts := strings.Split(directory.Path, "/")
+		prefix := ""
+		for index, part := range parts {
+			if index > 0 {
+				prefix += "/"
+			}
+			prefix += part
+			key := strings.ToLower(prefix)
+			if existing, exists := canonicalComponents[key]; exists && existing != prefix {
+				return fmt.Errorf("directory path %q has case-folded component collision with %q", directory.Path, existing)
+			}
+			canonicalComponents[key] = prefix
+		}
+		seenMetadataDirectories[folded] = directory.Path
+	}
+	if len(value.Directories) > 0 {
+		metadataDirectoryCount := len(seenMetadataDirectories)
+		if _, hasRoot := seenMetadataDirectories["."]; hasRoot {
+			metadataDirectoryCount--
+		}
+		if metadataDirectoryCount != len(expectedDirectories) {
+			return errors.New("sync directory metadata must cover every directory in the manifest")
+		}
+		for folded, expected := range expectedDirectories {
+			if actual, exists := seenMetadataDirectories[folded]; !exists || actual != expected {
+				return fmt.Errorf("directory %q has no matching metadata entry", expected)
+			}
+		}
+	}
+	manifestDirectories := append([]string(nil), value.EmptyDirectories...)
+	for _, directory := range value.Directories {
+		manifestDirectories = append(manifestDirectories, directory.Path)
+	}
+	if err := ValidateNoSymlinkDescendants(value.Files, manifestDirectories); err != nil {
+		return err
 	}
 	seenDeleted := make(map[string]struct{}, len(value.DeletedPaths))
 	var deletedTree mordesync.ManifestPathValidator
@@ -985,6 +1402,9 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 		}
 		folded := strings.ToLower(directory)
 		if _, exists := seenDirectories[folded]; exists {
+			return fmt.Errorf("directory %q is both present and deleted", directory)
+		}
+		if _, exists := seenMetadataDirectories[folded]; exists {
 			return fmt.Errorf("directory %q is both present and deleted", directory)
 		}
 		if _, exists := seenDeletedDirectories[folded]; exists {
@@ -1027,6 +1447,26 @@ func ValidateFile(file File) error {
 	}
 	if file.SizeBytes < 0 || file.Mode > 0777 || !sha256Pattern.MatchString(file.SHA256) {
 		return errors.New("file size, mode, or SHA-256 is invalid")
+	}
+	if err := ValidateNativeMetadata(file.Xattrs, file.ACL); err != nil {
+		return err
+	}
+	if !file.MetadataKnown && (len(file.Xattrs) > 0 || file.ACL != nil) {
+		return errors.New("workspace file metadata is present but not marked known")
+	}
+	switch CanonicalFileKind(file.Kind) {
+	case FileKindRegular:
+		if file.SymlinkTarget != "" || file.HardlinkTo != "" &&
+			(ValidateRelativePath(file.HardlinkTo) != nil || file.HardlinkTo >= file.Path) {
+			return errors.New("regular file has invalid link metadata")
+		}
+	case FileKindSymlink:
+		if file.HardlinkTo != "" {
+			return errors.New("symbolic link cannot have a hardlink anchor")
+		}
+		return validateWorkspaceSymlink(file)
+	default:
+		return errors.New("file kind is invalid")
 	}
 	var total int64
 	for _, chunk := range file.Chunks {

@@ -6,6 +6,7 @@ import { useToast } from '../app/toast';
 const primaryLinks = [
   { to: '/hosts', label: '云端电脑', icon: '▣', end: true },
   { to: '/assistant', label: 'AI 助手', icon: '✧' },
+  { to: '/projects', label: '项目', icon: '▦' },
   { to: '/personal', label: '个人数据', icon: '▤' },
   { to: '/goals', label: '目标与计划', icon: '◎' },
   { to: '/workspaces', label: '工作区', icon: '▱' },
@@ -19,7 +20,7 @@ const settingLinks = [
 ];
 
 const titles: Record<string, string> = {
-  '/assistant': 'AI 助手', '/hosts': '云端电脑',
+  '/assistant': 'AI 助手', '/hosts': '云端电脑', '/projects': '项目',
   '/personal': '个人数据', '/goals': '目标与计划',
   '/hosts/new': '创建电脑', '/workspaces': '工作区', '/connections': '模型连接',
   '/clients': '客户端', '/apikeys': 'API Key',

@@ -363,7 +363,7 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
   return <form className="form-card form-stack schedule-editor" onSubmit={submit}>
     <h3>{initial ? `编辑计划定义 · 版本 ${initial.version}` : '新建云端计划'}</h3>
     <div className="schedule-form-grid">
-      <label>主机<select value={hostID} required onChange={(event) => setHostID(event.target.value)}>{initial && !hosts.some((host) => host.id === initial.host_id) && <option value={initial.host_id}>{initial.host_id}</option>}{hosts.map((host) => <option key={host.id} value={host.id}>{host.name} · {host.state}</option>)}</select></label>
+      <label>主机<select value={hostID} required onChange={(event) => setHostID(event.target.value)}>{initial?.host_id && !hosts.some((host) => host.id === initial.host_id) && <option value={initial.host_id}>{initial.host_id}</option>}{hosts.map((host) => <option key={host.id} value={host.id}>{host.name} · {host.state}</option>)}</select></label>
       <label>模型<select value={modelID} required onChange={(event) => setModelID(event.target.value)}>{initial && !models.some((model) => model.id === initial.model_id) && <option value={initial.model_id}>{initial.model_id}</option>}{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model_name}</option>)}</select></label>
       <label className="schedule-form-wide">计划内容<textarea value={objective} maxLength={32768} rows={3} required onChange={(event) => setObjective(event.target.value)} placeholder="描述计划运行时需要完成的工作" /></label>
     </div>

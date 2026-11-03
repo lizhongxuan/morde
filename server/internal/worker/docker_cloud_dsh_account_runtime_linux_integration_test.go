@@ -234,7 +234,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 			if label == "" {
 				t.Fatalf("unexpected Task child process frame: %+v", frame)
 			}
-			taskFence := app.AgentInstanceFence{TaskID: frame.TaskID, OwnerID: fence.OwnerID,
+			taskFence := app.AgentInstanceFence{TaskID: frame.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.OwnerID,
 				AgentInstanceID: "agent-" + label, AgentGeneration: 1,
 				AgentSessionID: "session-" + label, SupervisorID: "supervisor-test",
 				LeaseOwner: "worker-runtime", LeaseVersion: 1, AuthorizationVersion: 1,
@@ -410,7 +410,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 			}
 			nonce := bytes.Repeat([]byte{byte(sequence)}, 32)
 			lease, replayed, err := instances.Start(taskCtx, app.AgentInstanceStart{
-				Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID,
+				Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: owner.ID,
 					AgentInstanceID: fmt.Sprintf("agent-%d", sequence), AgentSessionID: fmt.Sprintf("session-%d", sequence),
 					SupervisorID: "supervisor-test", LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 					AuthorizationVersion: claimed.Authorization.Version, EngineVersion: cloudDSHEngineVersion,

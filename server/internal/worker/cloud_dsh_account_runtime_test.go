@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/execution"
 	"morde/server/internal/dshguardian"
 )
 
@@ -25,6 +26,7 @@ type accountRuntimeControlStub struct {
 	acknowledgedStopProofs []app.AccountAgentRuntimeStopAttestation
 	requestStops           int
 	stopProofs             int
+	failureMarks           int
 	renewals               int
 }
 
@@ -45,6 +47,18 @@ func (s *accountRuntimeControlStub) Ready(_ context.Context, fence app.AccountAg
 	}
 	s.runtime.State = app.AccountAgentRuntimeRunning
 	return s.runtime, nil
+}
+
+func (s *accountRuntimeControlStub) Fail(_ context.Context, fence app.AccountAgentRuntimeFence, reason execution.RuntimeFailureReason) error {
+	if s.runtime.Fence != fence {
+		return errors.New("runtime fence mismatch")
+	}
+	if s.runtime.State == app.AccountAgentRuntimeStarting || s.runtime.State == app.AccountAgentRuntimeRunning {
+		s.runtime.State = app.AccountAgentRuntimeFailed
+		s.runtime.FailureReason = reason
+		s.failureMarks++
+	}
+	return nil
 }
 
 func (s *accountRuntimeControlStub) Renew(_ context.Context, fence app.AccountAgentRuntimeFence, duration time.Duration) (app.AccountAgentRuntime, error) {
@@ -102,6 +116,62 @@ func (s *accountRuntimeControlStub) MarkAccountAgentRuntimeStopAttestationAcknow
 		}
 	}
 	return false, nil
+}
+
+type ownerScopedAccountRuntimeControlStub struct {
+	*accountRuntimeControlStub
+	mu       sync.Mutex
+	runtimes map[string]app.AccountAgentRuntime
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) Start(ctx context.Context, request app.AccountAgentRuntimeStart) (app.AccountAgentRuntime, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runtime, replayed, err := s.accountRuntimeControlStub.Start(ctx, request)
+	if err == nil {
+		s.runtimes[request.OwnerID] = runtime
+	}
+	return runtime, replayed, err
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) Ready(ctx context.Context, fence app.AccountAgentRuntimeFence) (app.AccountAgentRuntime, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = s.runtimes[fence.OwnerID]
+	runtime, err := s.accountRuntimeControlStub.Ready(ctx, fence)
+	if err == nil {
+		s.runtimes[fence.OwnerID] = runtime
+	}
+	return runtime, err
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) Fail(ctx context.Context, fence app.AccountAgentRuntimeFence, reason execution.RuntimeFailureReason) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = s.runtimes[fence.OwnerID]
+	if err := s.accountRuntimeControlStub.Fail(ctx, fence, reason); err != nil {
+		return err
+	}
+	s.runtimes[fence.OwnerID] = s.runtime
+	return nil
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) Renew(ctx context.Context, fence app.AccountAgentRuntimeFence, duration time.Duration) (app.AccountAgentRuntime, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = s.runtimes[fence.OwnerID]
+	runtime, err := s.accountRuntimeControlStub.Renew(ctx, fence, duration)
+	if err == nil {
+		s.runtimes[fence.OwnerID] = runtime
+	}
+	return runtime, err
+}
+
+func (s *ownerScopedAccountRuntimeControlStub) Get(_ context.Context, ownerID string) (app.AccountAgentRuntime, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runtime, found := s.runtimes[ownerID]
+	return runtime, found, nil
 }
 
 type accountRuntimeStopVerifierStub struct{}
@@ -171,7 +241,7 @@ func (s *accountRuntimeSupervisorStub) StartAccountRuntime(_ context.Context, fe
 			case "runtime_start":
 				_ = json.NewEncoder(runtimeOutput).Encode(map[string]any{"type": "runtime_ready", "version": 1,
 					"server_instance_id": fence.ServiceInstanceID, "owner_id": fence.OwnerID, "runtime_id": fence.RuntimeID,
-					"runtime_generation": fence.RuntimeGeneration, "max_concurrent_tasks": 2, "engine_version": cloudDSHEngineVersion})
+					"runtime_generation": fence.RuntimeGeneration, "max_concurrent_tasks": frame["max_concurrent_tasks"], "engine_version": cloudDSHEngineVersion})
 			case "task_start":
 				ready := map[string]any{"type": "task_process_ready", "server_instance_id": fence.ServiceInstanceID,
 					"owner_id": fence.OwnerID, "runtime_id": fence.RuntimeID, "runtime_generation": fence.RuntimeGeneration,
@@ -196,8 +266,9 @@ func (s *accountRuntimeSupervisorStub) StartAccountRuntime(_ context.Context, fe
 }
 
 func TestAccountAgentRuntimeRejectsIncompleteSupervisorProcess(t *testing.T) {
+	control := &accountRuntimeControlStub{}
 	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
-		Control: &accountRuntimeControlStub{}, Supervisor: &accountRuntimeSupervisorStub{incomplete: true},
+		Control: control, Supervisor: &accountRuntimeSupervisorStub{incomplete: true},
 		Guardian: &accountRuntimeGuardianStub{}, StopVerifier: accountRuntimeStopVerifierStub{},
 		TaskStopper: &accountRuntimeTaskStopperStub{}, LeaseOwner: "worker-runtime", MaxTasks: 2,
 	})
@@ -207,6 +278,52 @@ func TestAccountAgentRuntimeRejectsIncompleteSupervisorProcess(t *testing.T) {
 	if _, err := manager.Acquire(context.Background(), "u1234567"); err == nil || !strings.Contains(err.Error(), "incomplete pipes") {
 		t.Fatalf("incomplete supervisor process error = %v", err)
 	}
+	if control.runtime.State != app.AccountAgentRuntimeFailed || control.failureMarks != 1 {
+		t.Fatalf("failed startup state=%q marks=%d, want failed/1", control.runtime.State, control.failureMarks)
+	}
+}
+
+func TestAccountAgentRuntimeSessionsAreIsolatedByOwner(t *testing.T) {
+	control := &ownerScopedAccountRuntimeControlStub{
+		accountRuntimeControlStub: &accountRuntimeControlStub{}, runtimes: make(map[string]app.AccountAgentRuntime),
+	}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: control, Supervisor: &accountRuntimeSupervisorStub{}, Guardian: &accountRuntimeGuardianStub{},
+		StopVerifier: accountRuntimeStopVerifierStub{}, TaskStopper: &accountRuntimeTaskStopperStub{},
+		LeaseOwner: "worker-runtime", MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.Acquire(context.Background(), "u1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Acquire(context.Background(), "u7654321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second || first.runtime.Fence.OwnerID == second.runtime.Fence.OwnerID ||
+		manager.sessions[first.runtime.Fence.OwnerID] != first || manager.sessions[second.runtime.Fence.OwnerID] != second {
+		t.Fatalf("account Runtime sessions were shared: first=%p/%+v second=%p/%+v sessions=%v",
+			first, first.runtime.Fence, second, second.runtime.Fence, manager.sessions)
+	}
+	reused, err := manager.Acquire(context.Background(), first.runtime.Fence.OwnerID)
+	if err != nil || reused != first {
+		t.Fatalf("acquire for first account did not reuse its own Runtime: reused=%t err=%v", reused == first, err)
+	}
+	firstState, firstFound, err := control.Get(context.Background(), first.runtime.Fence.OwnerID)
+	if err != nil || !firstFound || firstState.Fence != first.runtime.Fence {
+		t.Fatalf("first account Runtime state crossed accounts: runtime=%+v found=%t err=%v", firstState, firstFound, err)
+	}
+	secondState, secondFound, err := control.Get(context.Background(), second.runtime.Fence.OwnerID)
+	if err != nil || !secondFound || secondState.Fence != second.runtime.Fence {
+		t.Fatalf("second account Runtime state crossed accounts: runtime=%+v found=%t err=%v", secondState, secondFound, err)
+	}
+	_ = first.process.Input.Close()
+	_ = first.process.Output.Close()
+	_ = second.process.Input.Close()
+	_ = second.process.Output.Close()
 }
 
 func (s *accountRuntimeSupervisorStub) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
@@ -360,7 +477,7 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	}
 	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
 	nonce := []byte(strings.Repeat("n", 32))
-	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
 	lease := app.AgentInstanceLease{Fence: fence, RuntimeFence: &session.runtime.Fence, RuntimeSequence: 1,
@@ -488,6 +605,90 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	}
 }
 
+func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
+	control := &accountRuntimeControlStub{}
+	supervisor := &accountRuntimeSupervisorStub{recoverErr: errors.New("Runtime is still running")}
+	guardian := &accountRuntimeGuardianStub{}
+	taskStopper := &accountRuntimeTaskStopperStub{}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{Control: control,
+		Supervisor: supervisor, Guardian: guardian, StopVerifier: accountRuntimeStopVerifierStub{},
+		TaskStopper: taskStopper, LeaseOwner: "worker-runtime", MaxTasks: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	session, err := manager.Acquire(ctx, "u1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
+	nonce := []byte(strings.Repeat("n", 32))
+	startTask := func(taskID, agentID, sessionID string, sequence int64, admitted bool) app.AgentInstanceFence {
+		t.Helper()
+		fence := app.AgentInstanceFence{TaskID: taskID, OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: agentID, AgentGeneration: 1,
+			AgentSessionID: sessionID, SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
+			AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+		lease := app.AgentInstanceLease{Fence: fence, RuntimeFence: &session.runtime.Fence, RuntimeSequence: sequence,
+			ExpiresAt: time.Now().Add(app.MaxAgentLease)}
+		input, output, err := session.StartTask(ctx, fence, nonce, lease)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = input.Close(); _ = output.Close() })
+		if _, err := bufio.NewReader(output).ReadBytes('\n'); err != nil {
+			t.Fatalf("read Task %s ready frame: %v", taskID, err)
+		}
+		if admitted {
+			start := map[string]any{"type": "start", "version": 1, "task_id": fence.TaskID, "owner_id": fence.OwnerID,
+				"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
+				"authorization_version": fence.AuthorizationVersion, "model": "test-model", "tools": []any{}, "prompt": "do work"}
+			if err := writeCloudDSHFrame(ctx, input, start); err != nil {
+				t.Fatalf("admit Task %s: %v", taskID, err)
+			}
+		}
+		return fence
+	}
+	sibling := startTask("q1234567", "agent-armed", "session-armed", 1, true)
+	siblingTwo := startTask("q2345679", "agent-armed-2", "session-armed-2", 2, true)
+	unarmed := startTask("q2345678", "agent-unarmed", "session-unarmed", 3, false)
+	if err := manager.StopTask(ctx, session, unarmed); err == nil {
+		t.Fatal("unarmed Task stop succeeded while a sibling Task was active")
+	}
+	if control.requestStops != 0 || supervisor.stopCalls != 0 || session.closed() {
+		t.Fatalf("unarmed stop affected shared Runtime: stop requests=%d Runtime stops=%d closed=%t",
+			control.requestStops, supervisor.stopCalls, session.closed())
+	}
+	if err := manager.StopTask(ctx, session, sibling); err != nil {
+		t.Fatalf("stop guarded sibling Task: %v", err)
+	}
+	if control.requestStops != 0 || supervisor.stopCalls != 0 || session.closed() {
+		t.Fatalf("stopping sibling retired shared Runtime: requests=%d stops=%d closed=%t",
+			control.requestStops, supervisor.stopCalls, session.closed())
+	}
+	session.mu.Lock()
+	_, secondSiblingActive := session.tasks[siblingTwo]
+	_, unarmedActive := session.tasks[unarmed]
+	session.mu.Unlock()
+	if !secondSiblingActive || !unarmedActive {
+		t.Fatalf("stopping one Task removed siblings: guarded=%t unarmed=%t", secondSiblingActive, unarmedActive)
+	}
+	if err := manager.StopTask(ctx, session, siblingTwo); err != nil {
+		t.Fatalf("stop second guarded sibling Task: %v", err)
+	}
+	if control.requestStops != 0 || supervisor.stopCalls != 0 || session.closed() {
+		t.Fatalf("stopping second sibling retired shared Runtime: requests=%d stops=%d closed=%t",
+			control.requestStops, supervisor.stopCalls, session.closed())
+	}
+	if err := manager.StopTask(ctx, session, unarmed); err != nil {
+		t.Fatalf("retire last unarmed Task after sibling stopped: %v", err)
+	}
+	if control.runtime.State != app.AccountAgentRuntimeStopped || control.requestStops != 1 || supervisor.stopCalls != 1 || len(taskStopper.confirmed) != 2 {
+		t.Fatalf("final Runtime state=%q requests=%d Runtime stops=%d Task proofs=%d",
+			control.runtime.State, control.requestStops, supervisor.stopCalls, len(taskStopper.confirmed))
+	}
+}
+
 func TestAccountAgentRuntimeLifecycleReapsIdleStoppingRuntime(t *testing.T) {
 	control := &accountRuntimeControlStub{}
 	guardian := &accountRuntimeGuardianStub{}
@@ -553,7 +754,7 @@ func TestAccountAgentRuntimeLifecycleReplaysPersistedStopProofAcknowledgements(t
 	runtimeProof := app.AccountAgentRuntimeStopAttestation{Fence: runtimeFence, NonceSHA256: strings.Repeat("a", 64),
 		ProofSHA256: strings.Repeat("b", 64), Destroyed: true, DestroyedAt: time.Now()}
 	control := &accountRuntimeControlStub{pendingStopProofs: []app.AccountAgentRuntimeStopAttestation{runtimeProof}}
-	taskFence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
+	taskFence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
 	taskProof := app.AccountAgentTaskStopAttestation{RuntimeFence: runtimeFence, TaskFence: taskFence,
@@ -591,7 +792,7 @@ func TestAccountAgentRuntimeLifecycleKeepsRuntimeWithActiveTasks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent-1",
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1",
 		AgentSessionID: "session-1", AgentGeneration: 1, AuthorizationVersion: 1}
 	session.tasks[fence] = &cloudDSHAccountTask{fence: fence}
 	control.runtime.State = app.AccountAgentRuntimeStopping

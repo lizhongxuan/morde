@@ -27,7 +27,7 @@ func TestPostgresClaimNextTaskWithOwnerLimitIsAtomicAcrossStores(t *testing.T) {
 			t.Fatalf("submit owner A task %d: %v", i, err)
 		}
 	}
-	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, ownerB.ID, "", "owner-b", "owner B task")); err != nil {
+	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, ownerB.ID, "", "owner-b-task", "owner B task")); err != nil {
 		t.Fatalf("submit owner B task: %v", err)
 	}
 

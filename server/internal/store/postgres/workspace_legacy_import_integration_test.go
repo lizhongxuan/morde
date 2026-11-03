@@ -76,13 +76,37 @@ func TestWorkspaceLegacyImportCommitsFilesAndEmptyVolume(t *testing.T) {
 	assertLegacyImportState(t, ctx, store, snapshot.WorkspaceID, "imported")
 
 	directorySnapshot := createPendingLegacyWorkspace(t, ctx, store, "directory-import")
-	directoryImport, err := commitWorkspaceLegacyVolumeImportWithDirectories(ctx, store, directorySnapshot, nil, []string{"empty/nested"})
+	parentMode, leafMode := uint32(0750), uint32(0700)
+	parentTime, leafTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC).UnixNano(), time.Date(2026, time.January, 3, 4, 5, 6, 0, time.UTC).UnixNano()
+	directoryImport, err := commitWorkspaceLegacyVolumeImportWithTree(ctx, store, directorySnapshot, nil, []string{"empty/nested"}, []workspace.Directory{
+		{Path: "empty", Mode: &parentMode, ModTimeNS: &parentTime},
+		{Path: "empty/nested", Mode: &leafMode, ModTimeNS: &leafTime},
+	})
 	if err != nil || directoryImport.Revision != 1 {
 		t.Fatalf("import legacy empty directory = %#v, err=%v", directoryImport, err)
+	}
+	directoryPage, err := store.GetWorkspaceManifestPage(ctx, directorySnapshot.WorkspaceID, 1, "", "", 100)
+	if err != nil || len(directoryPage.Directories) != 3 || !workspace.SameDirectoryMetadata(directoryPage.Directories[0], workspace.Directory{Path: "."}) ||
+		!workspace.SameDirectoryMetadata(directoryPage.Directories[1], workspace.Directory{Path: "empty", Mode: &parentMode, ModTimeNS: &parentTime}) ||
+		!workspace.SameDirectoryMetadata(directoryPage.Directories[2], workspace.Directory{Path: "empty/nested", Mode: &leafMode, ModTimeNS: &leafTime}) {
+		t.Fatalf("imported directory metadata = %#v, err=%v", directoryPage.Directories, err)
 	}
 	var directoryPath string
 	if err := store.pool.QueryRow(ctx, `SELECT directory_path FROM workspace_revision_empty_directories WHERE workspace_id=$1 AND valid_from_revision=1`, directorySnapshot.WorkspaceID).Scan(&directoryPath); err != nil || directoryPath != "empty/nested" {
 		t.Fatalf("imported empty directory = %q, err=%v", directoryPath, err)
+	}
+
+	nonEmptySnapshot := createPendingLegacyWorkspace(t, ctx, store, "nonempty-directory-import")
+	mode, modified := uint32(0755), time.Date(2026, time.February, 4, 5, 6, 7, 0, time.UTC).UnixNano()
+	nonEmptyFile := syncTestFile("src/main.go", []byte("package main\n"))
+	if imported, err := commitWorkspaceLegacyVolumeImportWithTree(ctx, store, nonEmptySnapshot, []workspace.File{nonEmptyFile}, nil, []workspace.Directory{{Path: "src", Mode: &mode, ModTimeNS: &modified}}); err != nil || imported.Revision != 1 {
+		t.Fatalf("import legacy nonempty directory = %#v, err=%v", imported, err)
+	}
+	nonEmptyPage, err := store.GetWorkspaceManifestPage(ctx, nonEmptySnapshot.WorkspaceID, 1, "", "", 100)
+	if err != nil || len(nonEmptyPage.Files) != 1 || len(nonEmptyPage.Directories) != 2 ||
+		!workspace.SameDirectoryMetadata(nonEmptyPage.Directories[0], workspace.Directory{Path: "."}) ||
+		!workspace.SameDirectoryMetadata(nonEmptyPage.Directories[1], workspace.Directory{Path: "src", Mode: &mode, ModTimeNS: &modified}) {
+		t.Fatalf("imported nonempty directory metadata = %#v, err=%v", nonEmptyPage.Directories, err)
 	}
 
 	if _, err := commitWorkspaceLegacyVolumeImport(ctx, store, snapshot, files); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
@@ -283,12 +307,11 @@ func TestWorkspaceLegacyImportWaitsForTaskOperationAdmission(t *testing.T) {
 		workspaceValue.ID, "legacy-"+workspaceValue.ID); err != nil {
 		t.Fatal(err)
 	}
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
-	})
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='running', control_state='ai', control_version=0 WHERE id=$1`, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +395,7 @@ func TestWorkspaceLegacyImportSerializesDirectReceive(t *testing.T) {
 	}
 	secondPrincipal := syncDeviceTestPrincipal(t, store, owner.ID)
 	registerTestWorkspaceSyncDevice(t, store, secondPrincipal, workspaceValue.ID,
-		"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB", "receive-test-"+workspaceValue.ID)
+		"BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB-BBBBBBB", "receive-test-device-"+owner.ID)
 	applyWorkspaceSyncNodeState(t, store, owner.ID)
 	activeRequest := receiveTestRequest(owner.ID, workspaceValue.ID, "from-phone.txt", 1, "receive-before-import")
 	if reservation, err := reserveTestWorkspaceReceiveErr(t, ctx, store, activeRequest); err != nil || reservation.State != "reserved" {
@@ -478,11 +501,11 @@ func assertLegacyImportState(t *testing.T, ctx context.Context, store *Store, wo
 }
 
 func commitWorkspaceLegacyVolumeImport(ctx context.Context, store *Store, value app.LegacyWorkspaceVolume, files []workspace.File) (workspace.Workspace, error) {
-	return commitWorkspaceLegacyVolumeImportWithDirectories(ctx, store, value, files, nil)
+	return commitWorkspaceLegacyVolumeImportWithTree(ctx, store, value, files, nil, nil)
 }
 
-func commitWorkspaceLegacyVolumeImportWithDirectories(ctx context.Context, store *Store, value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (workspace.Workspace, error) {
-	if _, err := validateLegacyWorkspaceImport(value, files, emptyDirectories); err != nil {
+func commitWorkspaceLegacyVolumeImportWithTree(ctx context.Context, store *Store, value app.LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string, directories []workspace.Directory) (workspace.Workspace, error) {
+	if _, err := validateLegacyWorkspaceImport(value, files, emptyDirectories, directories); err != nil {
 		return workspace.Workspace{}, err
 	}
 	seen := make(map[string]struct{})
@@ -497,7 +520,7 @@ func commitWorkspaceLegacyVolumeImportWithDirectories(ctx context.Context, store
 			seen[chunk.SHA256] = struct{}{}
 		}
 	}
-	return store.CommitWorkspaceLegacyVolumeImport(ctx, value, files, emptyDirectories)
+	return store.CommitWorkspaceLegacyVolumeImport(ctx, value, files, emptyDirectories, directories)
 }
 
 func assertWorkspaceStillPending(t *testing.T, ctx context.Context, store *Store, workspaceID string) {
@@ -569,7 +592,7 @@ func TestValidateLegacyWorkspaceImportEnforcesFileCountLimit(t *testing.T) {
 	files := make([]workspace.File, workspace.MaxSyncFiles+1)
 	_, err := validateLegacyWorkspaceImport(app.LegacyWorkspaceVolume{
 		WorkspaceID: "w123abcd", VolumeName: "legacy-w123abcd", QuotaBytes: 1,
-	}, files, nil)
+	}, files, nil, nil)
 	if domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("file count limit error = %v, want quota exceeded", err)
 	}
@@ -585,9 +608,26 @@ func TestValidateLegacyWorkspaceImportEnforcesPerFileLimit(t *testing.T) {
 	}
 	_, err := validateLegacyWorkspaceImport(app.LegacyWorkspaceVolume{
 		WorkspaceID: "w123abcd", VolumeName: "legacy-w123abcd", QuotaBytes: workspace.MaxSyncFileBytes + 1,
-	}, []workspace.File{file}, nil)
+	}, []workspace.File{file}, nil, nil)
 	if domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("single-file limit error = %v, want quota exceeded", err)
+	}
+}
+
+func TestValidateLegacyWorkspaceImportRequiresCompleteDirectoryMetadata(t *testing.T) {
+	value := app.LegacyWorkspaceVolume{WorkspaceID: "w123abcd", VolumeName: "legacy-w123abcd", QuotaBytes: 100}
+	files := []workspace.File{syncTestFile("src/main.go", []byte("package main\n"))}
+	mode, modified := uint32(0750), int64(123)
+	directories := []workspace.Directory{{Path: "src", Mode: &mode, ModTimeNS: &modified}}
+	if _, err := validateLegacyWorkspaceImport(value, files, nil, directories); err != nil {
+		t.Fatalf("complete directory metadata error = %v", err)
+	}
+	if _, err := validateLegacyWorkspaceImport(value, files, nil, []workspace.Directory{}); err != nil {
+		t.Fatalf("legacy import without directory metadata error = %v", err)
+	}
+	files = append(files, syncTestFile("config/app.toml", []byte("[app]\n")))
+	if _, err := validateLegacyWorkspaceImport(value, files, nil, directories); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("incomplete directory metadata error = %v, want invalid argument", err)
 	}
 }
 

@@ -24,12 +24,50 @@ describe('Gateway API client', () => {
     }
   });
 
+  it('reads a read-only Workspace revision diff through the Host observation session', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ workspace_id: 'w1234567', from_revision: 3, to_revision: 4, changes: [] });
+    }));
+
+    await expect(gatewayApi.workspaceDiff('w1234567', 3, 4)).resolves.toEqual({
+      workspace_id: 'w1234567', from_revision: 3, to_revision: 4, changes: [],
+    });
+    expect(request?.method).toBe('GET');
+    expect(new URL(request!.url).pathname).toBe('/__ch/api/workspaces/w1234567/diff');
+    expect(new URL(request!.url).searchParams.toString()).toBe('from_revision=3&to_revision=4');
+    expect(request!.credentials).toBe('include');
+    expect(request!.headers.get('Authorization')).toBeNull();
+  });
+
+  it('reads the Task snapshot through the separate read-only Gateway session and builds a cursor URL', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      return Response.json({ task_id: 'q1234567', host_id: 'h1234567', status: 'running', event_sequence: 8,
+        updated_at: '2026-11-03T12:00:00Z', artifacts: [] });
+    }));
+
+    await expect(gatewayApi.taskObservation('q1234567')).resolves.toMatchObject({ task_id: 'q1234567', event_sequence: 8 });
+    expect([requests[0]!.method, new URL(requests[0]!.url).pathname, requests[0]!.credentials]).toEqual([
+      'GET', '/__ch/api/tasks/q1234567', 'include',
+    ]);
+    const eventsURL = new URL(gatewayApi.taskObservationEventsURL('q1234567', 8));
+    expect(eventsURL.pathname).toBe('/__ch/api/tasks/q1234567/events');
+    expect(eventsURL.searchParams.get('after')).toBe('8');
+  });
+
   it('reads control state and accepts a pending 202 handoff response', async () => {
     const requests: Request[] = [];
     const status = {
       host_id: 'h1234567',
       control_state: 'taking_over',
       control_version: 1,
+      control_actor_user_id: '',
+      control_lease_expires_at: null,
+      control_lease_active: false,
+      control_lease_held_by_me: false,
       active_transition: {
         request_id: 'handoff-1',
         action: 'take_over',
@@ -54,6 +92,21 @@ describe('Gateway API client', () => {
       ['POST', '/__ch/api/control/actions'],
     ]);
     expect(await requests[1]!.clone().json()).toEqual(request);
+  });
+
+  it('renews a control lease with the current control version', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ host_id: 'h1234567', control_state: 'user', control_version: 8,
+        control_actor_user_id: 'u1234567', control_lease_expires_at: '2026-11-02T00:00:30Z',
+        control_lease_active: true, control_lease_held_by_me: true, active_transition: null });
+    }));
+
+    await expect(gatewayApi.renewControlLease(8)).resolves.toMatchObject({ control_lease_held_by_me: true });
+    expect([request!.method, new URL(request!.url).pathname, await request!.json()]).toEqual([
+      'POST', '/__ch/api/control/lease/renew', { expected_control_version: 8 },
+    ]);
   });
 
   it('reads the host Codex installation and login readiness', async () => {

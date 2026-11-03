@@ -192,13 +192,15 @@ func (s *Store) ListNotifications(ctx context.Context, ownerID string, unreadOnl
 		return app.NotificationPage{}, err
 	}
 	rows, err := s.pool.Query(ctx, `
-SELECT n.id, n.owner_id, n.task_id, n.event_sequence, n.kind, n.summary, n.request_id, n.request_version,
-n.actionable AND t.status='waiting_user' AND current_request.is_pending AS actionable,
+SELECT n.id, n.owner_id, COALESCE(n.task_id,''), COALESCE(n.event_sequence,0), COALESCE(n.source_event_id,0),
+COALESCE(n.source_kind,''), COALESCE(n.source_id,''), COALESCE(n.source_version,0), COALESCE(n.project_id,''),
+n.kind, n.summary, n.request_id, n.request_version,
+COALESCE(n.actionable AND t.status='waiting_user' AND current_request.is_pending,false) AS actionable,
 n.read_at,
 COALESCE(n.handled_at, CASE WHEN n.actionable AND NOT (t.status='waiting_user' AND current_request.is_pending) THEN t.updated_at END) AS handled_at,
 n.created_at
 FROM notifications n
-JOIN tasks t ON t.id=n.task_id AND t.owner_id=n.owner_id
+LEFT JOIN tasks t ON t.id=n.task_id AND t.owner_id=n.owner_id
 CROSS JOIN LATERAL (SELECT CASE n.kind
   WHEN 'approval_required' THEN EXISTS (
     SELECT 1 FROM task_pending_requests r WHERE r.id=n.request_id AND r.task_id=n.task_id AND r.version=n.request_version AND r.status='pending'
@@ -208,7 +210,9 @@ CROSS JOIN LATERAL (SELECT CASE n.kind
   )
   ELSE false
 END AS is_pending) current_request
-WHERE n.owner_id=$1 AND (NOT $2::boolean OR (n.created_at,n.id)<($3,$4))
+WHERE n.owner_id=$1 AND (n.project_id IS NULL OR EXISTS (
+  SELECT 1 FROM project_members pm WHERE pm.project_id=n.project_id AND pm.user_id=n.owner_id
+)) AND (NOT $2::boolean OR (n.created_at,n.id)<($3,$4))
 AND (NOT $5::boolean OR n.read_at IS NULL)
 ORDER BY n.created_at DESC, n.id DESC LIMIT $6`, ownerID, createdAt.Valid, createdAt, cursorID, unreadOnly, limit+1)
 	if err != nil {
@@ -243,8 +247,11 @@ func (s *Store) MarkNotificationRead(ctx context.Context, ownerID, id string) (n
 		return notification.Notification{}, domain.NewError(domain.CodeNotFound, "notification not found")
 	}
 	row := s.pool.QueryRow(ctx, `UPDATE notifications SET read_at=COALESCE(read_at, clock_timestamp())
-WHERE id=$1 AND owner_id=$2
-RETURNING id, owner_id, task_id, event_sequence, kind, summary, request_id, request_version,
+WHERE id=$1 AND owner_id=$2 AND (project_id IS NULL OR EXISTS (
+  SELECT 1 FROM project_members pm WHERE pm.project_id=notifications.project_id AND pm.user_id=notifications.owner_id
+))
+RETURNING id, owner_id, COALESCE(task_id,''), COALESCE(event_sequence,0), COALESCE(source_event_id,0),
+COALESCE(source_kind,''), COALESCE(source_id,''), COALESCE(source_version,0), COALESCE(project_id,''), kind, summary, request_id, request_version,
 actionable, read_at, handled_at, created_at`, id, ownerID)
 	value, err := scanNotificationRow(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -267,7 +274,8 @@ func scanNotification(rows pgx.Rows) (notification.Notification, error) {
 func scanNotificationRow(row notificationRowScanner) (notification.Notification, error) {
 	var value notification.Notification
 	var kind string
-	err := row.Scan(&value.ID, &value.OwnerID, &value.TaskID, &value.EventSequence, &kind, &value.Summary,
+	err := row.Scan(&value.ID, &value.OwnerID, &value.TaskID, &value.EventSequence, &value.SourceEventID,
+		&value.SourceKind, &value.SourceID, &value.SourceVersion, &value.ProjectID, &kind, &value.Summary,
 		&value.RequestID, &value.RequestVersion, &value.Actionable, &value.ReadAt, &value.HandledAt, &value.CreatedAt)
 	if err != nil {
 		return notification.Notification{}, err

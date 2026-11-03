@@ -94,33 +94,57 @@ func sameStringSlices(left, right []string) bool {
 }
 
 func scheduleTaskScopeStringsValid(values []string) bool {
+	return identity.IsScheduleTaskExecutionScopeSet(scheduleTaskScopes(values))
+}
+
+func scheduleTaskScopeStringsValidForHost(values []string, hostBound bool) bool {
+	scopes := scheduleTaskScopes(values)
+	if hostBound {
+		return identity.IsHostBoundScheduleTaskExecutionScopeSet(scopes)
+	}
+	return identity.IsHostlessScheduleTaskExecutionScopeSet(scopes)
+}
+
+func scheduleTaskScopes(values []string) []identity.Scope {
 	scopes := make([]identity.Scope, 0, len(values))
 	for _, value := range values {
 		scopes = append(scopes, identity.Scope(value))
 	}
-	return identity.IsScheduleTaskExecutionScopeSet(scopes)
+	return scopes
 }
 
 // AuthorizeScheduledTaskAction only authorizes an internal Task when its
 // token-id slot refers to a ScheduleRun attached to that exact Task.
 func (s *Store) AuthorizeScheduledTaskAction(ctx context.Context, ownerID, runID, hostID string, required identity.Scope) error {
-	if !domain.ValidUserID(ownerID) || !schedule.ValidRunID(runID) || !domain.ValidHostID(hostID) ||
+	if !domain.ValidUserID(ownerID) || !schedule.ValidRunID(runID) || (hostID != "" && !domain.ValidHostID(hostID)) ||
 		!containsScope(identity.ScheduleTaskExecutionScopes(), required) {
 		return domain.NewError(domain.CodeUnauthenticated, "scheduled task authorization is unavailable")
 	}
-	var authorized bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
-  SELECT 1 FROM schedule_runs r
-  JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
-  JOIN tasks t ON t.id=r.task_id AND t.owner_id=r.owner_id
-  WHERE r.id=$1 AND r.owner_id=$2 AND s.host_id=$3
-    AND t.host_id=$3 AND t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
-    AND t.execution_location='server' AND t.auth_kind='schedule_task' AND t.auth_token_id=r.id
-)`, runID, ownerID, hostID).Scan(&authorized)
+	if hostID == "" && (required == identity.ScopeComputerObserve || required == identity.ScopeComputerOperate) {
+		return domain.NewError(domain.CodeUnauthenticated, "scheduled task authorization is unavailable")
+	}
+	var scheduleHostID, taskHostID pgtype.Text
+	var taskScopes []string
+	var taskOwnerID, taskInitiatorID, taskAuthKind, taskAuthTokenID, taskStatus, taskExecutionLocation string
+	err := s.pool.QueryRow(ctx, `SELECT s.host_id,t.host_id,t.auth_scopes,t.owner_id,t.initiator_id,t.auth_kind,t.auth_token_id,t.status,t.execution_location
+FROM schedule_runs r
+JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
+JOIN tasks t ON t.id=r.task_id AND t.owner_id=r.owner_id AND t.initiator_id=r.owner_id
+WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id IS NOT NULL`, runID, ownerID).
+		Scan(&scheduleHostID, &taskHostID, &taskScopes, &taskOwnerID, &taskInitiatorID, &taskAuthKind, &taskAuthTokenID, &taskStatus, &taskExecutionLocation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeUnauthenticated, "scheduled task authorization is unavailable")
+	}
 	if err != nil {
 		return fmt.Errorf("authorize scheduled Task action: %w", err)
 	}
-	if !authorized {
+	if scheduleHostID.Valid != taskHostID.Valid || scheduleHostID.Valid && scheduleHostID.String != taskHostID.String ||
+		(hostID == "") != !scheduleHostID.Valid || hostID != "" && scheduleHostID.String != hostID ||
+		!scheduleTaskScopeStringsValidForHost(taskScopes, taskHostID.Valid) || !containsScope(scheduleTaskScopes(taskScopes), required) ||
+		taskOwnerID != ownerID || taskInitiatorID != ownerID || taskAuthKind != string(identity.KindScheduleTask) ||
+		taskAuthTokenID != runID || taskExecutionLocation != "server" ||
+		(taskStatus != "queued" && taskStatus != "running" && taskStatus != "waiting_user" &&
+			taskStatus != "pausing" && taskStatus != "paused" && taskStatus != "cancelling") {
 		return domain.NewError(domain.CodeUnauthenticated, "scheduled task authorization is unavailable")
 	}
 	return nil

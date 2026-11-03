@@ -19,6 +19,8 @@ import (
 	"testing/fstest"
 	"time"
 
+	mordesync "morde-sync"
+
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/workspace"
 )
@@ -40,6 +42,7 @@ type legacyImportStoreFake struct {
 	finalized        []WorkspaceBlockAllocation
 	files            []workspace.File
 	emptyDirectories []string
+	directories      []workspace.Directory
 }
 
 type legacyImportLockFake struct {
@@ -112,7 +115,7 @@ func (s *legacyImportStoreFake) FinalizeWorkspaceBlockUsage(ctx context.Context,
 	return nil
 }
 
-func (s *legacyImportStoreFake) CommitWorkspaceLegacyVolumeImport(ctx context.Context, value LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string) (workspace.Workspace, error) {
+func (s *legacyImportStoreFake) CommitWorkspaceLegacyVolumeImport(ctx context.Context, value LegacyWorkspaceVolume, files []workspace.File, emptyDirectories []string, directories []workspace.Directory) (workspace.Workspace, error) {
 	if err := ctx.Err(); err != nil {
 		return workspace.Workspace{}, err
 	}
@@ -123,8 +126,9 @@ func (s *legacyImportStoreFake) CommitWorkspaceLegacyVolumeImport(ctx context.Co
 	s.commitCall++
 	s.files = append([]workspace.File{}, files...)
 	s.emptyDirectories = append([]string{}, emptyDirectories...)
+	s.directories = append([]workspace.Directory{}, directories...)
 	revision := int64(1)
-	if len(files)+len(emptyDirectories) == 0 {
+	if len(files)+len(emptyDirectories)+len(directories) == 0 {
 		revision = 0
 	}
 	return workspace.Workspace{ID: value.WorkspaceID, Revision: revision, UsedBytes: legacyFilesSize(files)}, nil
@@ -220,10 +224,16 @@ func (s *legacyImportBlocksFake) RemoveStaleTempBlocks(string) error {
 }
 
 type legacyImportSourceFake struct {
-	fs       fs.FS
-	openErr  error
-	closer   *legacyImportCloser
-	openName string
+	fs             fs.FS
+	openErr        error
+	validateErr    error
+	closer         *legacyImportCloser
+	openName       string
+	validateNames  []string
+	validateRoots  []string
+	hardlinkScans  []map[string]string
+	mutateManifest func(int, *mordesync.Manifest)
+	validateCall   int
 }
 
 func (s *legacyImportSourceFake) OpenLegacyVolume(_ context.Context, name string) (fs.FS, io.Closer, error) {
@@ -232,6 +242,90 @@ func (s *legacyImportSourceFake) OpenLegacyVolume(_ context.Context, name string
 		return nil, nil, s.openErr
 	}
 	return s.fs, s.closer, nil
+}
+
+func (s *legacyImportSourceFake) ValidateLegacyWorkspaceTree(ctx context.Context, name, root string) (mordesync.Manifest, error) {
+	if err := ctx.Err(); err != nil {
+		return mordesync.Manifest{}, err
+	}
+	s.validateNames = append(s.validateNames, name)
+	s.validateRoots = append(s.validateRoots, root)
+	if s.validateErr != nil {
+		return mordesync.Manifest{}, s.validateErr
+	}
+	var value map[string]string
+	if len(s.hardlinkScans) > 0 {
+		index := min(s.validateCall, len(s.hardlinkScans)-1)
+		value = s.hardlinkScans[index]
+	}
+	call := s.validateCall
+	s.validateCall++
+	copy := make(map[string]string, len(value))
+	for path, anchor := range value {
+		copy[path] = anchor
+	}
+	tree := s.fs
+	if root != "" {
+		var err error
+		tree, err = fs.Sub(s.fs, root)
+		if err != nil {
+			return mordesync.Manifest{}, err
+		}
+	}
+	manifest, err := legacyImportManifestForFS(ctx, tree, copy)
+	if err == nil && s.mutateManifest != nil {
+		s.mutateManifest(call, &manifest)
+	}
+	return manifest, err
+}
+
+func legacyImportManifestForFS(ctx context.Context, volumeFS fs.FS, hardlinks map[string]string) (mordesync.Manifest, error) {
+	sources, emptyDirectories, directories, err := scanLegacyWorkspace(ctx, volumeFS, 1<<60)
+	if err != nil {
+		return mordesync.Manifest{}, err
+	}
+	manifest := mordesync.Manifest{EmptyDirectories: emptyDirectories, FileCount: int64(len(sources))}
+	for _, source := range sources {
+		modTimeNS := source.info.ModTime().UnixNano()
+		source.metadata = workspace.File{
+			Path: source.path, SizeBytes: source.info.Size(), Mode: uint32(source.info.Mode().Perm() & 0777),
+			ModTimeNS: &modTimeNS, HardlinkTo: hardlinks[source.path], MetadataKnown: true,
+		}
+		file, err := readLegacyFile(ctx, volumeFS, source, nil)
+		if err != nil {
+			return mordesync.Manifest{}, err
+		}
+		manifest.TotalBytes += file.SizeBytes
+		observed := mordesync.File{
+			Path: file.Path, Kind: file.Kind, SymlinkTarget: file.SymlinkTarget, HardlinkTo: file.HardlinkTo,
+			MetadataKnown: file.MetadataKnown, Mode: file.Mode, ModTimeNS: *file.ModTimeNS, ModTimeKnown: true,
+			Size: file.SizeBytes, SHA256: file.SHA256,
+		}
+		var offset int64
+		for _, chunk := range file.Chunks {
+			observed.Blocks = append(observed.Blocks, mordesync.Block{Offset: offset, Size: chunk.SizeBytes, SHA256: chunk.SHA256})
+			offset += chunk.SizeBytes
+		}
+		manifest.Files = append(manifest.Files, observed)
+	}
+	rootInfo, err := fs.Stat(volumeFS, ".")
+	if err != nil {
+		return mordesync.Manifest{}, err
+	}
+	allDirectories := append([]workspace.Directory(nil), directories...)
+	mode, modified := uint32(rootInfo.Mode().Perm()&0777), rootInfo.ModTime().UnixNano()
+	allDirectories = append(allDirectories, workspace.Directory{Path: ".", Mode: &mode, ModTimeNS: &modified, MetadataKnown: true})
+	for _, directory := range allDirectories {
+		observed := mordesync.Directory{Path: directory.Path, ModeKnown: true, ModTimeKnown: true, MetadataKnown: true}
+		if directory.Mode != nil {
+			observed.Mode = *directory.Mode
+		}
+		if directory.ModTimeNS != nil {
+			observed.ModTimeNS = *directory.ModTimeNS
+		}
+		manifest.Directories = append(manifest.Directories, observed)
+	}
+	return manifest, nil
 }
 
 type legacyImportCloser struct {
@@ -266,6 +360,7 @@ func TestWorkspaceLegacyImportPreservesFilesAndPermissions(t *testing.T) {
 	volumeFS := fstest.MapFS{
 		"README.md": legacyMapFile([]byte("welcome"), 0644),
 		"bin/tool":  legacyMapFile([]byte("#!/bin/sh\n"), 0755),
+		"bin":       {Mode: fs.ModeDir | 0750, ModTime: legacyImportTime},
 		"src":       {Mode: fs.ModeDir | 0755, ModTime: legacyImportTime},
 		"src/empty": legacyMapFile(nil, 0600),
 	}
@@ -278,14 +373,20 @@ func TestWorkspaceLegacyImportPreservesFilesAndPermissions(t *testing.T) {
 	if result.ID != legacyImportWorkspaceID || result.Revision != 1 || result.UsedBytes != int64(len("welcome")+len("#!/bin/sh\n")) {
 		t.Fatalf("import result = %+v", result)
 	}
-	if source.openName != "legacy-volume" || !source.closer.closed || store.commitCall != 1 || store.lockReleaseCalls != 1 || blocks.removeTempCalls != 1 {
-		t.Fatalf("open=%q closed=%v commits=%d lock releases=%d temp recoveries=%d", source.openName, source.closer.closed, store.commitCall, store.lockReleaseCalls, blocks.removeTempCalls)
+	if source.openName != "legacy-volume" || len(source.validateRoots) != 2 || source.validateNames[0] != "legacy-volume" || source.validateNames[1] != "legacy-volume" || !source.closer.closed || store.commitCall != 1 || store.lockReleaseCalls != 1 || blocks.removeTempCalls != 1 {
+		t.Fatalf("open=%q validation=%q roots=%q closed=%v commits=%d lock releases=%d temp recoveries=%d", source.openName, source.validateNames, source.validateRoots, source.closer.closed, store.commitCall, store.lockReleaseCalls, blocks.removeTempCalls)
 	}
 	if len(store.files) != 3 || store.files[0].Path != "README.md" || store.files[1].Path != "bin/tool" || store.files[2].Path != "src/empty" {
 		t.Fatalf("manifest files = %+v", store.files)
 	}
-	if store.files[1].Mode != 0755 || store.files[2].Mode != 0600 || store.files[2].SizeBytes != 0 || len(store.files[2].Chunks) != 0 {
+	if store.files[1].Mode != 0755 || store.files[2].Mode != 0600 || store.files[2].SizeBytes != 0 || len(store.files[2].Chunks) != 0 || !store.files[0].MetadataKnown {
 		t.Fatalf("file permissions or empty file metadata = %+v", store.files)
+	}
+	wantBinMode, wantMode, wantModTime := uint32(0750), uint32(0755), legacyImportTime.UnixNano()
+	if len(store.directories) != 3 || store.directories[0].Path != "." || !store.directories[0].MetadataKnown ||
+		!workspace.SameDirectoryMetadata(store.directories[1], workspace.Directory{Path: "bin", Mode: &wantBinMode, ModTimeNS: &wantModTime, MetadataKnown: true}) ||
+		!workspace.SameDirectoryMetadata(store.directories[2], workspace.Directory{Path: "src", Mode: &wantMode, ModTimeNS: &wantModTime, MetadataKnown: true}) {
+		t.Fatalf("directory metadata = %+v", store.directories)
 	}
 	emptyDigest := sha256.Sum256(nil)
 	if store.files[2].SHA256 != hex.EncodeToString(emptyDigest[:]) {
@@ -305,6 +406,70 @@ func TestWorkspaceLegacyImportPreservesFilesAndPermissions(t *testing.T) {
 	}
 	if store.commitCall != 1 {
 		t.Fatalf("repeat import committed %d times", store.commitCall)
+	}
+}
+
+func TestWorkspaceLegacyImportPreservesNativeMetadata(t *testing.T) {
+	volumeFS := fstest.MapFS{"README.md": legacyMapFile([]byte("welcome"), 0644)}
+	service, store, _, source := newLegacyImportHarness(volumeFS, 1<<20)
+	source.mutateManifest = func(_ int, manifest *mordesync.Manifest) {
+		manifest.Files[0].Xattrs = []mordesync.ExtendedAttribute{{Name: "user.note", Value: []byte("file-value")}}
+		manifest.Files[0].ACL = &mordesync.NativeACL{Platform: "linux", Format: "linux-posix-acl-v1", Data: []byte{1, 2}}
+		for i := range manifest.Directories {
+			if manifest.Directories[i].Path == "." {
+				manifest.Directories[i].Xattrs = []mordesync.ExtendedAttribute{{Name: "user.note", Value: []byte("root-value")}}
+			}
+		}
+	}
+
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.files) != 1 || !store.files[0].MetadataKnown || len(store.files[0].Xattrs) != 1 ||
+		store.files[0].Xattrs[0].Name != "user.note" || string(store.files[0].Xattrs[0].Value) != "file-value" ||
+		store.files[0].ACL == nil || store.files[0].ACL.Format != "linux-posix-acl-v1" {
+		t.Fatalf("imported file metadata = %+v", store.files)
+	}
+	if len(store.directories) != 1 || store.directories[0].Path != "." || !store.directories[0].MetadataKnown ||
+		len(store.directories[0].Xattrs) != 1 || string(store.directories[0].Xattrs[0].Value) != "root-value" {
+		t.Fatalf("imported root metadata = %+v", store.directories)
+	}
+}
+
+func TestWorkspaceLegacyImportPreservesHardlinkManifest(t *testing.T) {
+	body := []byte("shared data")
+	volumeFS := fstest.MapFS{
+		"a.txt": legacyMapFile(body, 0640),
+		"b.txt": legacyMapFile(body, 0640),
+	}
+	service, store, blocks, source := newLegacyImportHarness(volumeFS, 1<<20)
+	source.hardlinkScans = []map[string]string{{"b.txt": "a.txt"}}
+
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.files) != 2 || store.files[0].Path != "a.txt" || store.files[1].Path != "b.txt" || store.files[1].HardlinkTo != "a.txt" {
+		t.Fatalf("imported hard-link manifest = %+v", store.files)
+	}
+	if len(blocks.data) != 1 {
+		t.Fatalf("stored blocks = %d, want shared content block", len(blocks.data))
+	}
+}
+
+func TestWorkspaceLegacyImportRejectsHardlinkTopologyChange(t *testing.T) {
+	body := []byte("shared data")
+	volumeFS := fstest.MapFS{
+		"a.txt": legacyMapFile(body, 0640),
+		"b.txt": legacyMapFile(body, 0640),
+	}
+	service, store, _, source := newLegacyImportHarness(volumeFS, 1<<20)
+	source.hardlinkScans = []map[string]string{{"b.txt": "a.txt"}, {}}
+
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "hard-link topology changed") {
+		t.Fatalf("import with changed hard-link topology error = %v", err)
+	}
+	if store.commitCall != 0 {
+		t.Fatalf("committed imports = %d, want no commit", store.commitCall)
 	}
 }
 
@@ -346,7 +511,8 @@ func TestWorkspaceLegacyImportAllowsEmptyVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Revision != 0 || store.commitCall != 1 || store.files == nil || len(store.files) != 0 || !source.closer.closed {
+	if result.Revision != 1 || store.commitCall != 1 || store.files == nil || len(store.files) != 0 || len(store.directories) != 1 ||
+		store.directories[0].Path != "." || !store.directories[0].MetadataKnown || !source.closer.closed {
 		t.Fatalf("empty-volume import = result %+v, files %#v, commits %d, closed %v", result, store.files, store.commitCall, source.closer.closed)
 	}
 }
@@ -364,6 +530,94 @@ func TestWorkspaceLegacyImportPreservesEmptyDirectories(t *testing.T) {
 	}
 	if result.Revision != 1 || len(store.emptyDirectories) != 2 || store.emptyDirectories[0] != "empty-dir" || store.emptyDirectories[1] != "nested/empty" {
 		t.Fatalf("legacy empty directories = %#v, result %+v", store.emptyDirectories, result)
+	}
+}
+
+func TestWorkspaceLegacyImportSelectsMatchingRootInSharedLegacyVolume(t *testing.T) {
+	volumeFS := fstest.MapFS{
+		"w1234567/README.md":  legacyMapFile([]byte("selected"), 0644),
+		"w7654321/secret.txt": legacyMapFile([]byte("other workspace"), 0600),
+	}
+	service, store, blocks, source := newLegacyImportHarness(volumeFS, 1<<20)
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.files) != 1 || store.files[0].Path != "README.md" || string(blocks.data[store.files[0].Chunks[0].SHA256]) != "selected" {
+		t.Fatalf("imported files = %+v, blocks = %#v", store.files, blocks.data)
+	}
+	if len(source.validateRoots) != 2 || source.validateRoots[0] != legacyImportWorkspaceID || source.validateRoots[1] != legacyImportWorkspaceID {
+		t.Fatalf("validated shared volume roots = %#v", source.validateRoots)
+	}
+	if got, err := fs.ReadFile(volumeFS, "w7654321/secret.txt"); err != nil || string(got) != "other workspace" {
+		t.Fatalf("unselected Workspace source = %q, err=%v", got, err)
+	}
+}
+
+func TestWorkspaceLegacyImportRejectsUnsupportedMetadataBeforeWritingBlocks(t *testing.T) {
+	service, store, blocks, source := newLegacyImportHarness(fstest.MapFS{"file.txt": legacyMapFile([]byte("content"), 0644)}, 1<<20)
+	source.validateErr = errors.New("workspace tree copy cannot preserve extended attributes or ACLs")
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "extended attributes or ACLs") {
+		t.Fatalf("unsupported metadata import error = %v", err)
+	}
+	if blocks.putCalls != 0 || store.commitCall != 0 || len(source.validateRoots) != 1 || !source.closer.closed {
+		t.Fatalf("unsupported metadata changed state: writes=%d commits=%d validations=%q closed=%v", blocks.putCalls, store.commitCall, source.validateRoots, source.closer.closed)
+	}
+}
+
+func TestWorkspaceLegacyImportRejectsDirectoryChangeDuringBlockWrite(t *testing.T) {
+	volumeFS := fstest.MapFS{
+		"src":      {Mode: fs.ModeDir | 0755, ModTime: legacyImportTime},
+		"src/file": legacyMapFile([]byte("content"), 0644),
+	}
+	service, store, blocks, source := newLegacyImportHarness(volumeFS, 1<<20)
+	blocks.onPut = func() {
+		directory := volumeFS["src"]
+		directory.ModTime = legacyImportTime.Add(time.Second)
+		volumeFS["src"] = directory
+	}
+	if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "changed during import") {
+		t.Fatalf("directory change import error = %v", err)
+	}
+	if blocks.putCalls != 1 || store.commitCall != 0 || !source.closer.closed {
+		t.Fatalf("directory change changed state: writes=%d commits=%d closed=%v", blocks.putCalls, store.commitCall, source.closer.closed)
+	}
+}
+
+func TestWorkspaceLegacyImportRejectsUnmappedOrMixedSharedVolumeRoots(t *testing.T) {
+	tests := []struct {
+		name string
+		fs   fstest.MapFS
+	}{
+		{
+			name: "requested Workspace root is absent",
+			fs: fstest.MapFS{
+				"w7654321/README.md": legacyMapFile([]byte("other"), 0644),
+			},
+		},
+		{
+			name: "invalid Workspace root ID",
+			fs: fstest.MapFS{
+				"w123456A/README.md": legacyMapFile([]byte("invalid"), 0644),
+			},
+		},
+		{
+			name: "Workspace roots mixed with unclassified files",
+			fs: fstest.MapFS{
+				"w1234567/README.md": legacyMapFile([]byte("workspace"), 0644),
+				"README.md":          legacyMapFile([]byte("ambiguous"), 0644),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, blocks, source := newLegacyImportHarness(test.fs, 1<<20)
+			if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil || !strings.Contains(err.Error(), "cleanup is required") {
+				t.Fatalf("ambiguous legacy volume import error = %v", err)
+			}
+			if store.cleanupReason == "" || store.commitCall != 0 || len(blocks.data) != 0 || !source.closer.closed {
+				t.Fatalf("ambiguous import changed state: cleanup=%q commits=%d blocks=%d closed=%v", store.cleanupReason, store.commitCall, len(blocks.data), source.closer.closed)
+			}
+		})
 	}
 }
 
@@ -458,12 +712,12 @@ func TestWorkspaceLegacyImportChecksExistingBlocksAndSourceStability(t *testing.
 
 	t.Run("source changed after preflight", func(t *testing.T) {
 		base := fstest.MapFS{"file": legacyMapFile([]byte("initial"), 0644)}
-		volumeFS := &legacyChangingFS{base: base, name: "file", changeAt: 3, replacement: []byte("changed")}
+		volumeFS := &legacyChangingFS{base: base, name: "file", changeAt: 5, replacement: []byte("changed")}
 		service, store, blocks, _ := newLegacyImportHarness(volumeFS, 100)
 		if _, err := service.Import(context.Background(), legacyImportWorkspaceID); err == nil {
 			t.Fatal("import accepted source changes between preflight and block transfer")
 		}
-		if store.commitCall != 0 || blocks.putCalls != 0 || volumeFS.opens != 3 {
+		if store.commitCall != 0 || blocks.putCalls != 0 || volumeFS.opens != 5 {
 			t.Fatalf("commits=%d puts=%d source opens=%d", store.commitCall, blocks.putCalls, volumeFS.opens)
 		}
 	})

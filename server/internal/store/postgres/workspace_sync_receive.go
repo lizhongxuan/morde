@@ -22,9 +22,11 @@ type receiveBlockReservation struct {
 }
 
 func (s *Store) ReserveWorkspaceSyncReceive(ctx context.Context, request app.WorkspaceSyncReceiveRequest, reservationID string, requestHash []byte) (app.WorkspaceSyncReceiveReservation, error) {
+	validPath := workspace.ValidateRelativePath(request.Path) == nil ||
+		(request.Operation == app.WorkspaceSyncReceiveDirectoryUpsert && request.Path == ".")
 	if !domain.ValidUserID(request.OwnerID) || !domain.ValidWorkspaceID(request.WorkspaceID) || !workspace.ValidSyncFolderID(request.FolderID) ||
 		!domain.ValidPendingRequestID(reservationID) || !validPostgresSHA256(request.OperationID) || len(requestHash) != 32 ||
-		workspace.ValidateRelativePath(request.Path) != nil || request.TargetBytes < 0 || request.TargetBytes > workspace.MaxSyncFileBytes ||
+		!validPath || request.TargetBytes < 0 || request.TargetBytes > workspace.MaxSyncFileBytes ||
 		(request.Operation != app.WorkspaceSyncReceiveUpsert && request.Operation != app.WorkspaceSyncReceiveDelete &&
 			request.Operation != app.WorkspaceSyncReceiveDirectoryUpsert && request.Operation != app.WorkspaceSyncReceiveDirectoryDelete) ||
 		(request.Operation != app.WorkspaceSyncReceiveUpsert && request.TargetBytes != 0) {
@@ -39,6 +41,7 @@ func (s *Store) ReserveWorkspaceSyncReceive(ctx context.Context, request app.Wor
 		var rejectedBaseFileSize *int64
 		var rejectedBaseFileSHA *string
 		var rejectedBaseFileMode *int32
+		var rejectedBaseFileModTimeNS *int64
 		var rejectedBaseDirectory *string
 		var ownerID, state string
 		var revision, usedBytes, quotaBytes, revisionBytes int64
@@ -48,6 +51,9 @@ func (s *Store) ReserveWorkspaceSyncReceive(ctx context.Context, request app.Wor
 		}
 		if ownerID != request.OwnerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, request.WorkspaceID); err != nil {
+			return err
 		}
 		if state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for synchronization")
@@ -65,10 +71,10 @@ SELECT 1 FROM workspace_legacy_volumes WHERE workspace_id=$1 AND import_state='p
 			return err
 		}
 		var rejectedHash []byte
-		err := tx.QueryRow(ctx, `SELECT request_hash, state, base_file_path, base_file_size, base_file_sha256, base_file_mode, base_empty_directory_path
+		err := tx.QueryRow(ctx, `SELECT request_hash, state, base_file_path, base_file_size, base_file_sha256, base_file_mode, base_file_mod_time_ns, base_empty_directory_path
 FROM workspace_sync_receive_quota_rejections WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3`,
 			request.OwnerID, request.WorkspaceID, request.OperationID).Scan(&rejectedHash, &previousQuotaState,
-			&rejectedBaseFilePath, &rejectedBaseFileSize, &rejectedBaseFileSHA, &rejectedBaseFileMode, &rejectedBaseDirectory)
+			&rejectedBaseFilePath, &rejectedBaseFileSize, &rejectedBaseFileSHA, &rejectedBaseFileMode, &rejectedBaseFileModTimeNS, &rejectedBaseDirectory)
 		if err == nil {
 			if !bytes.Equal(rejectedHash, requestHash) {
 				return idempotencyConflict()
@@ -170,7 +176,7 @@ FROM workspace_sync_receive_quota_rejections WHERE owner_id=$1 AND workspace_id=
 			baseDirectory = &baseDirectories[0]
 		}
 		if previousQuotaState == "paused" && !workspaceSyncReceiveQuotaBaseMatches(baseFile, baseDirectory,
-			rejectedBaseFilePath, rejectedBaseFileSize, rejectedBaseFileSHA, rejectedBaseFileMode, rejectedBaseDirectory) {
+			rejectedBaseFilePath, rejectedBaseFileSize, rejectedBaseFileSHA, rejectedBaseFileMode, rejectedBaseFileModTimeNS, rejectedBaseDirectory) {
 			if _, err := tx.Exec(ctx, `UPDATE workspace_sync_receive_quota_rejections
 SET state='superseded', updated_at=clock_timestamp()
 WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3 AND state='paused'`, request.OwnerID, request.WorkspaceID, request.OperationID); err != nil {
@@ -294,6 +300,9 @@ func (s *Store) RecordWorkspaceSyncReceiveQuotaRejection(ctx context.Context, ow
 		if storedOwner != ownerID {
 			return domain.NewError(domain.CodeNotFound, "Workspace receive reservation not found")
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		reservation, found, err := getWorkspaceSyncReceiveReservationByID(ctx, tx, ownerID, workspaceID, reservationID, true)
 		if err != nil {
 			return err
@@ -354,12 +363,14 @@ WHERE workspace_id=$1 AND folded_path=$2 AND operation_id<>$3 AND state IN ('res
 		var baseFileSize *int64
 		var baseFileSHA *string
 		var baseFileMode *int32
+		var baseFileModTimeNS *int64
 		if baseFile != nil {
 			path, size, digest, mode := baseFile.Path, baseFile.SizeBytes, baseFile.SHA256, int32(baseFile.Mode)
 			baseFilePath, baseFileSize, baseFileSHA, baseFileMode = &path, &size, &digest, &mode
+			baseFileModTimeNS = baseFile.ModTimeNS
 		}
 		baseChanged := !workspaceSyncReceiveQuotaBaseMatches(currentFile, currentDirectory,
-			baseFilePath, baseFileSize, baseFileSHA, baseFileMode, baseDirectory)
+			baseFilePath, baseFileSize, baseFileSHA, baseFileMode, baseFileModTimeNS, baseDirectory)
 		if err := recordWorkspaceSyncReceiveQuotaRejection(ctx, tx, ownerID, workspaceID, reservation.OperationID,
 			reservation.RequestHash, reservation.Path, reservation.Operation, reservation.TargetBytes, baseFile, baseDirectory, reason); err != nil {
 			return err
@@ -423,14 +434,16 @@ func recordWorkspaceSyncReceiveQuotaRejection(ctx context.Context, tx pgx.Tx, ow
 	var baseFileSize *int64
 	var baseFileSHA *string
 	var baseFileMode *int32
+	var baseFileModTimeNS *int64
 	if baseFile != nil {
 		path, size, digest, mode := baseFile.Path, baseFile.SizeBytes, baseFile.SHA256, int32(baseFile.Mode)
 		baseFilePath, baseFileSize, baseFileSHA, baseFileMode = &path, &size, &digest, &mode
+		baseFileModTimeNS = baseFile.ModTimeNS
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO workspace_sync_receive_quota_rejections
 (owner_id, workspace_id, operation_id, request_hash, file_path, folded_path, operation, target_size,
- base_file_path, base_file_size, base_file_sha256, base_file_mode, base_empty_directory_path, reason_code, state)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'paused')
+ base_file_path, base_file_size, base_file_sha256, base_file_mode, base_file_mod_time_ns, base_empty_directory_path, reason_code, state)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'paused')
 ON CONFLICT (owner_id, workspace_id, operation_id) DO UPDATE
 SET reason_code=EXCLUDED.reason_code, state='paused', updated_at=clock_timestamp()
 WHERE workspace_sync_receive_quota_rejections.request_hash=EXCLUDED.request_hash
@@ -441,9 +454,10 @@ WHERE workspace_sync_receive_quota_rejections.request_hash=EXCLUDED.request_hash
   AND workspace_sync_receive_quota_rejections.base_file_size IS NOT DISTINCT FROM EXCLUDED.base_file_size
   AND workspace_sync_receive_quota_rejections.base_file_sha256 IS NOT DISTINCT FROM EXCLUDED.base_file_sha256
   AND workspace_sync_receive_quota_rejections.base_file_mode IS NOT DISTINCT FROM EXCLUDED.base_file_mode
+  AND workspace_sync_receive_quota_rejections.base_file_mod_time_ns IS NOT DISTINCT FROM EXCLUDED.base_file_mod_time_ns
   AND workspace_sync_receive_quota_rejections.base_empty_directory_path IS NOT DISTINCT FROM EXCLUDED.base_empty_directory_path`,
 		ownerID, workspaceID, operationID, requestHash, path, strings.ToLower(path), string(operation), targetBytes,
-		baseFilePath, baseFileSize, baseFileSHA, baseFileMode, baseDirectory, string(reason))
+		baseFilePath, baseFileSize, baseFileSHA, baseFileMode, baseFileModTimeNS, baseDirectory, string(reason))
 	if err != nil {
 		return fmt.Errorf("persist Workspace receive quota rejection: %w", err)
 	}
@@ -454,19 +468,20 @@ WHERE workspace_sync_receive_quota_rejections.request_hash=EXCLUDED.request_hash
 	var storedBaseFileSize *int64
 	var storedBaseFileSHA *string
 	var storedBaseFileMode *int32
+	var storedBaseFileModTimeNS *int64
 	var storedBaseDirectory *string
 	var storedReasonCode string
 	if err := tx.QueryRow(ctx, `SELECT request_hash, file_path, operation, target_size, reason_code,
-       base_file_path, base_file_size, base_file_sha256, base_file_mode, base_empty_directory_path
+       base_file_path, base_file_size, base_file_sha256, base_file_mode, base_file_mod_time_ns, base_empty_directory_path
 FROM workspace_sync_receive_quota_rejections WHERE owner_id=$1 AND workspace_id=$2 AND operation_id=$3`,
 		ownerID, workspaceID, operationID).Scan(&storedHash, &storedPath, &storedOperation, &storedSize, &storedReasonCode,
-		&storedBaseFilePath, &storedBaseFileSize, &storedBaseFileSHA, &storedBaseFileMode, &storedBaseDirectory); err != nil {
+		&storedBaseFilePath, &storedBaseFileSize, &storedBaseFileSHA, &storedBaseFileMode, &storedBaseFileModTimeNS, &storedBaseDirectory); err != nil {
 		return fmt.Errorf("verify persisted Workspace receive quota rejection: %w", err)
 	}
 	if !bytes.Equal(storedHash, requestHash) || storedPath != path || storedOperation != string(operation) ||
 		storedSize != targetBytes || storedReasonCode != string(reason) ||
 		!workspaceSyncReceiveQuotaBaseMatches(baseFile, baseDirectory,
-			storedBaseFilePath, storedBaseFileSize, storedBaseFileSHA, storedBaseFileMode, storedBaseDirectory) {
+			storedBaseFilePath, storedBaseFileSize, storedBaseFileSHA, storedBaseFileMode, storedBaseFileModTimeNS, storedBaseDirectory) {
 		return idempotencyConflict()
 	}
 	return nil
@@ -477,7 +492,7 @@ func validWorkspaceSyncQuotaPauseReason(reason workspace.SyncQuotaPauseReason) b
 }
 
 func workspaceSyncReceiveQuotaBaseMatches(file *workspace.File, directory *string, filePath *string, fileSize *int64,
-	fileSHA *string, fileMode *int32, directoryPath *string,
+	fileSHA *string, fileMode *int32, fileModTimeNS *int64, directoryPath *string,
 ) bool {
 	if (file == nil) != (filePath == nil) || (file == nil) != (fileSize == nil) ||
 		(file == nil) != (fileSHA == nil) || (file == nil) != (fileMode == nil) ||
@@ -485,6 +500,9 @@ func workspaceSyncReceiveQuotaBaseMatches(file *workspace.File, directory *strin
 		return false
 	}
 	if file != nil && (file.Path != *filePath || file.SizeBytes != *fileSize || file.SHA256 != *fileSHA || int32(file.Mode) != *fileMode) {
+		return false
+	}
+	if file != nil && (file.ModTimeNS == nil) != (fileModTimeNS == nil) || file != nil && file.ModTimeNS != nil && *file.ModTimeNS != *fileModTimeNS {
 		return false
 	}
 	return directory == nil || *directory == *directoryPath
@@ -515,6 +533,9 @@ func (s *Store) CommitWorkspaceSyncReceive(ctx context.Context, ownerID, workspa
 		}
 		if workspaceOwner != ownerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		if workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for synchronization")
@@ -618,7 +639,7 @@ func (s *Store) CommitWorkspaceSyncReceive(ctx context.Context, ownerID, workspa
 			if err := ensureWorkspaceMutationsBlockUsageStored(ctx, tx, workspaceID, fileMutations); err != nil {
 				return err
 			}
-			if err := applyWorkspaceSyncTreeMutations(ctx, tx, workspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, fileMutations, directoryMutations); err != nil {
+			if err := applyWorkspaceSyncTreeMutations(ctx, tx, workspaceID, currentRevision, currentFileCount, currentBytes, quotaBytes, fileMutations, directoryMutations, nil, nil); err != nil {
 				return err
 			}
 			currentRevision++
@@ -668,6 +689,9 @@ func (s *Store) ReserveWorkspaceSyncReceiveBlockUsage(ctx context.Context, owner
 		}
 		if storedOwner != ownerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		if workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for receive block reservation")
@@ -800,6 +824,9 @@ func (s *Store) BeginAbortWorkspaceSyncReceive(ctx context.Context, ownerID, wor
 		if workspaceOwner != ownerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		if workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for receive recovery")
 		}
@@ -865,6 +892,9 @@ func (s *Store) CompleteAbortWorkspaceSyncReceive(ctx context.Context, ownerID, 
 		}
 		if workspaceOwner != ownerID {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		reservation, found, err := getWorkspaceSyncReceiveReservationByID(ctx, tx, ownerID, workspaceID, reservationID, true)
 		if err != nil {
@@ -1178,7 +1208,8 @@ func workspaceSyncReceiveSettlementMatches(reservation app.WorkspaceSyncReceiveR
 	if reservation.Operation == app.WorkspaceSyncReceiveDirectoryUpsert || reservation.Operation == app.WorkspaceSyncReceiveDirectoryDelete {
 		return file == nil && directory != nil && *directory == reservation.Path && reservation.ResultSHA256 == nil && reservation.ResultMode == nil
 	}
-	return directory == nil && file != nil && file.Path == reservation.Path && file.SizeBytes == reservation.TargetBytes &&
+	return directory == nil && file != nil && workspace.CanonicalFileKind(file.Kind) == workspace.FileKindRegular &&
+		file.Path == reservation.Path && file.SizeBytes == reservation.TargetBytes &&
 		reservation.ResultSHA256 != nil && reservation.ResultMode != nil && file.SHA256 == *reservation.ResultSHA256 && file.Mode == *reservation.ResultMode
 }
 

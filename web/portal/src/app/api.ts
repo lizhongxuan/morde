@@ -7,6 +7,40 @@ type AuditQuery = NonNullable<operations['listAuditLogs']['parameters']['query']
 export type HostMemberPermission = components['schemas']['HostMemberPermission'];
 export type HostMember = components['schemas']['HostMember'];
 export type SharedHost = components['schemas']['SharedHost'];
+export type MainConversation = {
+  status: 'ready' | 'uninitialized' | 'selection_required';
+  conversation_id: string | null;
+  version: number;
+};
+export type ConversationDeliveryStatus = components['schemas']['ConversationMessage']['delivery_status'];
+export type TaskWorkbenchObservationTicket = components['schemas']['TaskWorkbenchObservationTicket'];
+
+async function readMainConversation(response: Response): Promise<MainConversation> {
+  if (!response.ok) await throwResponseError(response);
+  const value: unknown = await response.json();
+  if (!value || typeof value !== 'object' || !('status' in value) || !('conversation_id' in value) || !('version' in value)
+    || !['ready', 'uninitialized', 'selection_required'].includes(String(value.status))
+    || !(value.conversation_id === null || typeof value.conversation_id === 'string')
+    || typeof value.version !== 'number' || !Number.isSafeInteger(value.version) || value.version < 0
+    || (value.status === 'ready' && (typeof value.conversation_id !== 'string' || !value.conversation_id))
+    || (value.status !== 'ready' && value.conversation_id !== null && value.conversation_id !== '')) {
+    throw new Error('主会话响应格式无效');
+  }
+  return { ...value, conversation_id: value.conversation_id || null } as MainConversation;
+}
+
+async function readTaskWorkbenchObservationTicket(response: Response, taskID: string): Promise<TaskWorkbenchObservationTicket> {
+  if (!response.ok) await throwResponseError(response);
+  const value: unknown = await response.json();
+  if (!value || typeof value !== 'object' || !('ticket' in value) || !('task_id' in value) || !('host_id' in value) || !('expires_at' in value)
+    || typeof value.ticket !== 'string' || value.ticket.length < 16 || value.ticket.length > 4096
+    || typeof value.task_id !== 'string' || value.task_id !== taskID
+    || typeof value.host_id !== 'string' || !/^h[a-z0-9]{7}$/.test(value.host_id)
+    || typeof value.expires_at !== 'string' || !Number.isFinite(Date.parse(value.expires_at)) || Date.parse(value.expires_at) <= Date.now()) {
+    throw new Error('Task 观察票据响应无效');
+  }
+  return { ticket: value.ticket, task_id: value.task_id, host_id: value.host_id, expires_at: value.expires_at };
+}
 
 export const portalApi = {
   me: async () => unwrapApiResponse(await api.GET('/api/me')),
@@ -16,7 +50,7 @@ export const portalApi = {
   onboardingStatus: async () => unwrapApiResponse(await api.GET('/api/onboarding/status')),
   ensureDefaultHost: async (body: components['schemas']['EnsureDefaultHostRequest'] = {}) => unwrapApiResponse(await api.POST('/api/me/default-host', { body })),
   login: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/login', { body: { name, password } })),
-  register: async (name: string, password: string, inviteCode = '') => unwrapApiResponse(await api.POST('/api/auth/register', { body: { name, password, ...(inviteCode.trim() ? { invite_code: inviteCode.trim() } : {}) } })),
+  register: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/register', { body: { name, password } })),
   logout: async () => unwrapApiResponse(await api.POST('/api/auth/logout')),
   changePassword: async (body: components['schemas']['ChangePasswordRequest']) => unwrapApiResponse(await api.POST('/api/me/password', { body })),
   hosts: async () => unwrapApiResponse(await api.GET('/api/hosts')),
@@ -37,6 +71,9 @@ export const portalApi = {
   enterHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/enter', { params: { path: { id } } })),
   hostControl: async (id: string) => unwrapApiResponse(await api.GET('/api/hosts/{id}/control', { params: { path: { id } } })),
   hostControlAction: async (id: string, body: components['schemas']['ControlActionRequest']) => unwrapApiResponse(await api.POST('/api/hosts/{id}/control/actions', { params: { path: { id } }, body })),
+  renewHostControlLease: async (id: string, expectedControlVersion: number) => unwrapApiResponse(await api.POST('/api/hosts/{id}/control/lease/renew', {
+    params: { path: { id } }, body: { expected_control_version: expectedControlVersion },
+  })),
   renewHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/renew', { params: { path: { id } } })),
   releaseHost: async (id: string, confirmProcessTermination: boolean) => unwrapApiResponse(await api.POST('/api/hosts/{id}/release', { params: { path: { id } }, body: { confirm_process_termination: confirmProcessTermination } })),
   restoreHost: async (id: string) => unwrapApiResponse(await api.POST('/api/hosts/{id}/restore', { params: { path: { id } } })),
@@ -60,8 +97,8 @@ export const portalApi = {
   createWorkspace: async (body: components['schemas']['CreateWorkspaceRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/workspaces', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
-  bindWorkspaceToHost: async (id: string, body: components['schemas']['BindWorkspaceRequest']) => unwrapApiResponse(await api.POST('/api/hosts/{id}/workspace-bindings', {
-    params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body,
+  bindWorkspaceToHost: async (id: string, body: components['schemas']['BindWorkspaceRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/hosts/{id}/workspace-bindings', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
   retryHostWorkspaceSync: async (hostID: string, workspaceID: string, expectedBindingVersion: number) => {
     const response = await requestFetch(`/api/hosts/${encodeURIComponent(hostID)}/workspace-bindings/${encodeURIComponent(workspaceID)}/retry-sync`, {
@@ -69,12 +106,18 @@ export const portalApi = {
     });
     if (!response.ok) await throwResponseError(response);
   },
-  unbindWorkspaceFromHost: async (id: string, workspaceID: string, body: operations['unbindWorkspaceFromHost']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}/workspace-bindings/{workspace_id}', {
-    params: { path: { id, workspace_id: workspaceID }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body,
+  unbindWorkspaceFromHost: async (id: string, workspaceID: string, body: operations['unbindWorkspaceFromHost']['requestBody']['content']['application/json'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.DELETE('/api/hosts/{id}/workspace-bindings/{workspace_id}', {
+    params: { path: { id, workspace_id: workspaceID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
   deleteWorkspace: async (id: string) => unwrapApiResponse(await api.DELETE('/api/workspaces/{id}', { params: { path: { id } } })),
   workspaceManifest: async (id: string, query: NonNullable<operations['getWorkspaceManifest']['parameters']['query']> = {}) =>
     unwrapApiResponse(await api.GET('/api/workspaces/{id}/manifest', { params: { path: { id }, query } })),
+  workspaceDiff: async (id: string, fromRevision: number, toRevision: number) => unwrapApiResponse(await api.GET('/api/workspaces/{id}/diff', {
+    params: { path: { id }, query: { from_revision: fromRevision, to_revision: toRevision } },
+  })),
+  restoreWorkspacePaths: async (id: string, body: components['schemas']['WorkspaceRestoreRequest'], idempotencyKey: string) => unwrapApiResponse(await api.POST('/api/workspaces/{id}/restore', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
   workspaceChanges: async (id: string, after: string, options: Partial<Omit<NonNullable<operations['getWorkspaceChanges']['parameters']['query']>, 'after'>> = {}) =>
     unwrapApiResponse(await api.GET('/api/workspaces/{id}/changes', { params: { path: { id }, query: { after, ...options } } })),
   createWorkspaceSyncSession: async (id: string, body: components['schemas']['CreateSyncSessionRequest']) => unwrapApiResponse(await api.POST('/api/workspaces/{id}/sync-sessions', {
@@ -113,19 +156,42 @@ export const portalApi = {
   revokeClient: async (id: string) => unwrapApiResponse(await api.DELETE('/api/clients/{id}', { params: { path: { id } } })),
   capabilities: async () => unwrapApiResponse(await api.GET('/api/capabilities')),
   conversations: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
+  conversation: async (id: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}', { params: { path: { id } } })),
+  mainConversation: async (): Promise<MainConversation> => {
+    const response = await requestFetch('/api/me/main-conversation');
+    return readMainConversation(response);
+  },
+  ensureMainConversation: async (idempotencyKey: string): Promise<MainConversation> => {
+    const response = await requestFetch('/api/me/main-conversation/ensure', {
+      method: 'POST', headers: { 'Idempotency-Key': idempotencyKey },
+    });
+    return readMainConversation(response);
+  },
+  setMainConversation: async (conversationID: string, expectedVersion: number, idempotencyKey: string): Promise<MainConversation> => {
+    const response = await requestFetch('/api/me/main-conversation', {
+      method: 'PUT', headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify({ conversation_id: conversationID, expected_version: expectedVersion }),
+    });
+    return readMainConversation(response);
+  },
   conversationMessages: async (id: string, cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
     params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } },
   })),
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  taskWorkbenchObservationTicket: async (id: string): Promise<TaskWorkbenchObservationTicket> => readTaskWorkbenchObservationTicket(
+    await requestFetch(`/api/tasks/${encodeURIComponent(id)}/workbench-observation-ticket`, { method: 'POST' }), id,
+  ),
   taskAction: async (id: string, body: components['schemas']['TaskActionRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/actions', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
   submitTask: async (body: components['schemas']['SubmitTaskRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
-  appendConversationMessage: async (id: string, body: components['schemas']['AppendConversationMessageRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/conversations/{id}/messages', {
-    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
-  })),
+  appendConversationMessage: async (id: string, body: components['schemas']['AppendConversationMessageRequest'], idempotencyKey = newIdempotencyKey()) => {
+    return unwrapApiResponse(await api.POST('/api/conversations/{id}/messages', {
+      params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+    }));
+  },
   answerTaskInput: async (id: string, body: components['schemas']['TaskInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/inputs', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
@@ -223,6 +289,7 @@ export const portalApi = {
   adminPlaces: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/places', { params: { query: { days } } })),
   adminControls: async () => unwrapApiResponse(await api.GET('/api/admin/controls')),
   adminSettings: async () => unwrapApiResponse(await api.GET('/api/admin/settings')),
+  updateAdminModelBudgetDefault: async (body: components['schemas']['UpdateAdminModelBudgetDefaultRequest']) => unwrapApiResponse(await api.PUT('/api/admin/settings/model-budget-default', { body })),
   adminInvites: async (search = '', limit = 25, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/invites', { params: { query: { search, limit, offset } } })),
   adminSites: async (limit = 25, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/sites', { params: { query: { limit, offset } } })),
   adminNudges: async () => unwrapApiResponse(await api.GET('/api/admin/nudges')),

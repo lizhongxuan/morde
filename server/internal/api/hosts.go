@@ -84,6 +84,7 @@ func (h *api) registerHosts(group *gin.RouterGroup) {
 	group.GET("/shared-hosts", h.listSharedHosts)
 	group.POST("/hosts", h.createHost)
 	group.GET("/hosts/:id", h.getHost)
+	group.GET("/hosts/:id/usage", h.getHostUsageReceipt)
 	group.GET("/hosts/:id/workspace-bindings", h.listHostWorkspaceBindings)
 	group.POST("/hosts/:id/workspace-bindings", h.bindHostWorkspace)
 	group.POST("/hosts/:id/workspace-bindings/:workspace_id/retry-sync", h.retryHostWorkspaceSync)
@@ -175,8 +176,8 @@ func (h *api) createHost(c *gin.Context) {
 		writeError(c, domain.InvalidArgument("workspace", "workspace is not a supported host creation field"))
 		return
 	}
-	if len(request.WorkspaceIDs) > workspace.MaxBindingsPerHost {
-		writeError(c, domain.InvalidArgument("workspace_ids", "at most 64 workspaces may be bound to a host"))
+	if len(request.WorkspaceIDs) != 1 {
+		writeError(c, domain.InvalidArgument("workspace_ids", "exactly one workspace must be bound to a host"))
 		return
 	}
 	seenWorkspaceIDs := make(map[string]struct{}, len(request.WorkspaceIDs))

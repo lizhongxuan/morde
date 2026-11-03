@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Morde Runtime Control API
-  version: 1.0.0
+  version: 2.0.0
   description: >-
     Private Morde-to-morde-runtime protocol. Every request carries the protocol
     header. JSON objects carry the same protocol_version. Unknown major
@@ -26,7 +26,7 @@ paths:
         - name: protocol_version
           in: query
           required: true
-          schema: { type: string, const: '1.0' }
+          schema: { type: string, const: '2.0' }
         - name: host_id
           in: query
           required: true
@@ -150,7 +150,7 @@ paths:
         - name: protocol_version
           in: query
           required: true
-          schema: { type: string, const: '1.0' }
+          schema: { type: string, const: '2.0' }
         - name: host_id
           in: query
           required: true
@@ -234,7 +234,7 @@ paths:
         - name: protocol_version
           in: query
           required: true
-          schema: { type: string, const: '1.0' }
+          schema: { type: string, const: '2.0' }
         - name: host_id
           in: query
           required: true
@@ -554,7 +554,7 @@ components:
       name: X-Morde-Runtime-Protocol
       in: header
       required: true
-      schema: { type: string, const: '1.0' }
+      schema: { type: string, const: '2.0' }
   responses:
     InvalidRequest:
       description: Request validation failed.
@@ -622,7 +622,7 @@ components:
       type: object
       required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, mode, operation_store_ready, capabilities]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         host_id: { $ref: '#/components/schemas/HostID' }
         runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
         runtime_instance_id: { type: string, minLength: 1 }
@@ -742,7 +742,7 @@ components:
       additionalProperties: false
       required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, request_id]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         host_id: { $ref: '#/components/schemas/HostID' }
         runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
         runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
@@ -753,7 +753,7 @@ components:
       additionalProperties: false
       required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, operation]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         host_id: { $ref: '#/components/schemas/HostID' }
         runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
         runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
@@ -796,7 +796,7 @@ components:
       additionalProperties: false
       required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, launch_id]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         host_id: { $ref: '#/components/schemas/HostID' }
         runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
         runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
@@ -807,7 +807,7 @@ components:
       additionalProperties: false
       required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, operation]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         host_id: { $ref: '#/components/schemas/HostID' }
         runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
         runtime_instance_id: { type: string, minLength: 1, maxLength: 128 }
@@ -818,7 +818,7 @@ components:
       additionalProperties: false
       required: [protocol_version, host_id, runtime_generation, runtime_instance_id, control_version, checked_at, items]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         host_id: { $ref: '#/components/schemas/HostID' }
         runtime_generation: { $ref: '#/components/schemas/RuntimeGeneration' }
         runtime_instance_id: { type: string, minLength: 1 }
@@ -877,7 +877,7 @@ components:
         - type: object
           required: [protocol_version, mode]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             mode: { $ref: '#/components/schemas/Mode' }
             drained_receipt: { $ref: '#/components/schemas/DrainedReceipt' }
     SetControlResponse:
@@ -886,7 +886,7 @@ components:
         - type: object
           required: [protocol_version, mode]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             mode: { $ref: '#/components/schemas/Mode' }
     SetTaskLeaseRequest:
       allOf:
@@ -894,7 +894,7 @@ components:
         - type: object
           required: [protocol_version, lease_version, expires_at]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             lease_version: { type: integer, minimum: 1 }
             workspace_task: { type: boolean, description: True when this lease belongs to a persistent Workspace Task. }
             expires_at:
@@ -907,7 +907,7 @@ components:
         - type: object
           required: [protocol_version, task_id, lease_version, expires_at]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             lease_version: { type: integer, minimum: 1 }
             expires_at: { type: string, format: date-time }
@@ -925,7 +925,7 @@ components:
         - type: object
           required: [protocol_version, bindings]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             bindings:
               type: array
               maxItems: 64
@@ -936,7 +936,7 @@ components:
         - type: object
           required: [protocol_version, bindings]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             bindings:
               type: array
               maxItems: 64
@@ -948,7 +948,7 @@ components:
           additionalProperties: false
           required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, manifest_sha256]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1 }
@@ -961,7 +961,7 @@ components:
         - type: object
           required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, manifest_sha256, view_id]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1 }
@@ -976,7 +976,7 @@ components:
           additionalProperties: false
           required: [protocol_version, task_id, request_id]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             request_id: { type: string, pattern: '^z[a-z0-9]{7}$' }
     DeleteTaskWorkspaceViewResponse:
@@ -985,7 +985,7 @@ components:
         - type: object
           required: [protocol_version, task_id, request_id, deleted]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             request_id: { type: string, pattern: '^z[a-z0-9]{7}$' }
             deleted: { type: boolean, const: true }
@@ -996,7 +996,7 @@ components:
           additionalProperties: false
           required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, limit]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1 }
@@ -1014,7 +1014,7 @@ components:
           additionalProperties: false
           required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, sha256]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1 }
@@ -1034,23 +1034,78 @@ components:
     TaskWorkspaceManifestFile:
       type: object
       additionalProperties: false
-      required: [path, size_bytes, sha256, mode, chunks]
+      required: [path, kind, size_bytes, sha256, mode, chunks]
+      allOf:
+        - if:
+            properties:
+              kind: { const: symlink }
+          then:
+            required: [symlink_target]
+            not:
+              required: [hardlink_to]
+          else:
+            not:
+              required: [symlink_target]
+        - if:
+            required: [hardlink_to]
+          then:
+            properties:
+              kind: { const: file }
       properties:
         path: { type: string, minLength: 1, maxLength: 4096 }
+        kind: { type: string, enum: [file, symlink] }
+        symlink_target: { type: string, minLength: 1, maxLength: 4096, description: UTF-8 relative POSIX target up to 4096 bytes; NUL, backslash, colon, absolute and root-escaping targets are rejected. Present only for kind symlink and never followed. }
+        hardlink_to: { type: string, minLength: 1, maxLength: 4096, description: Canonical earlier regular-file path for another name of the same inode. The anchor has identical content, mode and modification time. }
         size_bytes: { type: integer, format: int64, minimum: 0, maximum: 5368709120 }
         sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
         mode: { type: integer, minimum: 0, maximum: 511 }
+        mod_time_ns: { type: integer, format: int64 }
+        metadata_known: { type: boolean, description: True when the xattr/ACL set was explicitly captured. }
+        xattrs:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/WorkspaceExtendedAttribute' }
+        acl: { $ref: '#/components/schemas/WorkspaceNativeACL' }
         chunks:
           type: array
           maxItems: 1280
           items: { $ref: '#/components/schemas/TaskWorkspaceManifestChunk' }
+    WorkspaceExtendedAttribute:
+      type: object
+      additionalProperties: false
+      required: [name, value]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        value: { type: string, format: byte, maxLength: 21848 }
+    WorkspaceNativeACL:
+      type: object
+      additionalProperties: false
+      required: [platform, format, data]
+      properties:
+        platform: { type: string, enum: [linux, darwin] }
+        format: { type: string, enum: [linux-posix-acl-v1, darwin-filesec-v1] }
+        data: { type: string, format: byte, maxLength: 43692, description: Opaque native ACL bytes; compatible platform/filesystem required for restore. }
+    TaskWorkspaceManifestDirectory:
+      type: object
+      additionalProperties: false
+      required: [path, mode]
+      properties:
+        path: { type: string, minLength: 1, maxLength: 4096, description: "`.` denotes the Workspace root." }
+        mode: { type: integer, minimum: 0, maximum: 511 }
+        mod_time_ns: { type: integer, format: int64 }
+        metadata_known: { type: boolean, description: True when the xattr/ACL set was explicitly captured. }
+        xattrs:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/WorkspaceExtendedAttribute' }
+        acl: { $ref: '#/components/schemas/WorkspaceNativeACL' }
     TaskWorkspaceManifestResponse:
       allOf:
         - $ref: '#/components/schemas/HostFence'
         - type: object
-          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, files]
+          required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, files, empty_directories, directories]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1 }
@@ -1063,6 +1118,14 @@ components:
               type: array
               maxItems: 1000
               items: { $ref: '#/components/schemas/TaskWorkspaceManifestFile' }
+            empty_directories:
+              type: array
+              maxItems: 1000
+              items: { type: string, minLength: 1, maxLength: 4096 }
+            directories:
+              type: array
+              maxItems: 1000
+              items: { $ref: '#/components/schemas/TaskWorkspaceManifestDirectory' }
             next_cursor: { type: string, maxLength: 4096 }
     TaskWorkspaceBlockResponse:
       allOf:
@@ -1070,7 +1133,7 @@ components:
         - type: object
           required: [protocol_version, task_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, input_manifest_sha256, view_id, manifest_sha256, sha256, size_bytes, data]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1 }
@@ -1091,7 +1154,7 @@ components:
         - type: object
           required: [protocol_version, task_id, operation_id, lease_version, capability, action, arguments]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             task_id: { $ref: '#/components/schemas/TaskID' }
             workspace_id: { $ref: '#/components/schemas/WorkspaceID' }
             binding_version: { type: integer, format: int64, minimum: 1, description: Required with workspace_id for file.* and shell.exec; checked against the current active Host binding on every operation. }
@@ -1128,7 +1191,7 @@ components:
       type: object
       required: [protocol_version, request_fence, operation]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         request_fence: { $ref: '#/components/schemas/HostFence' }
         operation: { $ref: '#/components/schemas/Operation' }
     CancelOperationRequest:
@@ -1137,14 +1200,14 @@ components:
         - type: object
           required: [protocol_version]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
     QuiesceRequest:
       allOf:
         - $ref: '#/components/schemas/HostFence'
         - type: object
           required: [protocol_version, target_control_version, task_ids]
           properties:
-            protocol_version: { type: string, const: '1.0' }
+            protocol_version: { type: string, const: '2.0' }
             target_control_version: { $ref: '#/components/schemas/ControlVersion' }
             task_ids:
               type: array
@@ -1153,7 +1216,7 @@ components:
       type: object
       required: [protocol_version, status, pending_operation_ids]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         status: { type: string, enum: [draining, drained, failed] }
         pending_operation_ids:
           type: array
@@ -1163,7 +1226,7 @@ components:
       type: object
       required: [protocol_version, code]
       properties:
-        protocol_version: { type: string, const: '1.0' }
+        protocol_version: { type: string, const: '2.0' }
         code:
           type: string
           enum:

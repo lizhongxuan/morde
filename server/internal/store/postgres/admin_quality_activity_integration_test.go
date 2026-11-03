@@ -32,6 +32,13 @@ VALUES ($1,$2,'Activity target','desktop',clock_timestamp()+interval '1 day')`, 
 	now := time.Now().UTC().Truncate(time.Second)
 	inside := now.Add(-time.Hour)
 	outside := now.Add(-49 * time.Hour)
+	statusEvent, err := store.pool.Exec(ctx, `UPDATE task_events SET created_at=$2 WHERE task_id=$1 AND event_type='task.status'`, created.Task.ID, inside)
+	if err != nil {
+		t.Fatalf("place initial task event inside the activity day: %v", err)
+	}
+	if statusEvent.RowsAffected() != 1 {
+		t.Fatalf("initial task status event rows = %d, want one", statusEvent.RowsAffected())
+	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO task_hub_operations (
 task_id,owner_id,operation_key,tool_name,target_installation_id,action,task_authorization_version,target_grant_version,lease_version,
 request_hash,result_hash,status,created_at,updated_at)

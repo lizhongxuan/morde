@@ -78,6 +78,18 @@ describe('admin account management', () => {
     expect(await screen.findByRole('row', { name: /alice.*已通过/ })).toBeInTheDocument();
   });
 
+  it('keeps an account pending and explains the missing default budget when approval is blocked', async () => {
+    const input = userEvent.setup();
+    const { update } = setup([userRecord('u0000001', 'alice', 'user', 'pending')]);
+    update.mockRejectedValueOnce(Object.assign(new Error('请先配置新用户默认模型额度'), { code: 'invalid_state', status: 409 }));
+
+    const row = await screen.findByRole('row', { name: /alice.*待审核/ });
+    await input.click(within(row).getByRole('button', { name: '通过审核' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('请先到“设置与默认额度”配置后再批准');
+    expect(await screen.findByRole('row', { name: /alice.*待审核/ })).toBeInTheDocument();
+  });
+
   it('does not offer status or role changes for the current administrator', async () => {
     currentUser.id = 'u0000001';
     currentUser.role = 'admin';

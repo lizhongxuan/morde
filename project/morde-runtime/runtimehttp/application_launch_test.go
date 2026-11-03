@@ -82,7 +82,7 @@ func TestApplicationLaunchRejectsStaleFenceAndPathBodyMismatch(t *testing.T) {
 		t.Fatalf("mismatched stop path dispatched %d times", launcher.stops)
 	}
 
-	wrongProtocol := "/runtime/v1/applications/wechat/launches/launch_wechat_02?protocol_version=2.0&host_id=h1234567&runtime_generation=1&runtime_instance_id=" + fence.RuntimeInstanceID + "&control_version=0"
+	wrongProtocol := "/runtime/v1/applications/wechat/launches/launch_wechat_02?protocol_version=1.0&host_id=h1234567&runtime_generation=1&runtime_instance_id=" + fence.RuntimeInstanceID + "&control_version=0"
 	get := httptest.NewRequest(http.MethodGet, wrongProtocol, nil)
 	get.Header.Set("Authorization", "Bearer "+credential)
 	get.Header.Set(contract.ProtocolHeader, contract.ProtocolVersion)

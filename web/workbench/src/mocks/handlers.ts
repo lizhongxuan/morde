@@ -16,6 +16,10 @@ const control = {
   host_id: host.id,
   control_state: "ai" as "ai" | "taking_over" | "user" | "returning",
   control_version: 0,
+  control_actor_user_id: "",
+  control_lease_expires_at: null as string | null,
+  control_lease_active: false,
+  control_lease_held_by_me: false,
   active_transition: null as null | { request_id: string; action: "take_over" | "release"; phase: string; failure_reason: string; expected_control_version: number },
 };
 type MockInstallOperation = { id: string; application_id: string; status: "accepted" | "running" | "succeeded" | "failed"; progress_percent: number; error_code: string; created_at: string; updated_at: string };
@@ -68,6 +72,10 @@ const noVncMockHtml = (connected: boolean) => `<!doctype html><html class="${con
 function resetControl() {
   control.control_state = "ai";
   control.control_version = 0;
+  control.control_actor_user_id = "";
+  control.control_lease_expires_at = null;
+  control.control_lease_active = false;
+  control.control_lease_held_by_me = false;
   control.active_transition = null;
   controlPolls = 0;
   failedControlRequests.clear();
@@ -109,6 +117,10 @@ function controlResponse() {
     controlPolls += 1;
     if (controlPolls >= 2 && control.active_transition) {
       control.control_state = control.active_transition.action === "take_over" ? "user" : "ai";
+      control.control_actor_user_id = control.control_state === "user" ? "u1234567" : "";
+      control.control_lease_expires_at = control.control_state === "user" ? new Date(Date.now() + 30_000).toISOString() : null;
+      control.control_lease_active = control.control_state === "user";
+      control.control_lease_held_by_me = control.control_state === "user";
       control.control_version += 1;
       control.active_transition.phase = "completed";
     }
@@ -248,6 +260,44 @@ const e2eNoVncHandlers = import.meta.env.VITE_WORKBENCH_E2E === "1" ? [
 export const handlers = [
   ...e2eNoVncHandlers,
   http.get("/__ch/api/workspaces", () => json({ items: host.workspaces })),
+  http.get("/__ch/api/tasks/:task_id", ({ params }) => json({
+    task_id: String(params.task_id), host_id: host.id, status: "running", event_sequence: 0, updated_at: now(), artifacts: [],
+  })),
+  http.get("/__ch/api/tasks/:task_id/events", () => new HttpResponse(new ReadableStream<Uint8Array>({ start() {} }), {
+    headers: { "Cache-Control": "no-cache", "Content-Type": "text/event-stream; charset=utf-8" },
+  })),
+  http.get("/__ch/api/workspaces/:workspace_id/diff", ({ request, params }) => {
+    const binding = host.workspaces.find((item) => item.workspace.id === params.workspace_id);
+    if (!binding) return json({ error: { code: "not_found", message: "Workspace 不存在" } }, 404);
+    const url = new URL(request.url);
+    const fromRevision = Number(url.searchParams.get("from_revision"));
+    const toRevision = Number(url.searchParams.get("to_revision"));
+    if (!Number.isSafeInteger(fromRevision) || !Number.isSafeInteger(toRevision) || fromRevision < 0 || toRevision <= fromRevision) {
+      return json({ error: { code: "invalid_argument", message: "revision 参数无效" } }, 400);
+    }
+    if (binding.workspace.used_bytes > binding.workspace.quota_bytes || binding.workspace.state !== "ready"
+      || binding.state !== "active" || binding.applied_revision !== binding.desired_revision
+      || binding.sync_state !== "healthy" || binding.sync_conflicts.length > 0 || toRevision > binding.applied_revision) {
+      return json({ error: { code: "workspace_conflict", message: "Workspace revision 尚未在 Host 应用" } }, 409);
+    }
+    if (binding.workspace.id !== workspaceID || fromRevision !== 3 || toRevision !== 4) {
+      return json({ error: { code: "not_found", message: "指定 revision 不可用" } }, 404);
+    }
+    return json({
+      workspace_id: workspaceID,
+      from_revision: fromRevision,
+      to_revision: toRevision,
+      changes: [{
+        path: "README.md",
+        action: "changed",
+        before: { kind: "file", path: "README.md", size_bytes: 28 },
+        after: { kind: "file", path: "README.md", size_bytes: 43 },
+        display_status: "metadata_only",
+        before_text: null,
+        after_text: null,
+      }],
+    });
+  }),
   http.get("/__ch/api/workspaces/:workspace_id/manifest", ({ request, params }) => {
     const binding = host.workspaces.find((item) => item.workspace.id === params.workspace_id);
     if (!binding) return json({ error: { code: "not_found", message: "Workspace 不存在" } }, 404);
@@ -382,6 +432,15 @@ export const handlers = [
   }),
   http.post("/__ch/api/renew", () => { host.expires_at = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(); return json(host); }),
   http.get("/__ch/api/control", () => json(controlResponse())),
+  http.post("/__ch/api/control/lease/renew", async ({ request }) => {
+    const body = await request.json().catch(() => null) as { expected_control_version?: number } | null;
+    if (!body || body.expected_control_version !== control.control_version || !control.control_lease_held_by_me) {
+      return json({ error: { code: "conflict", message: "控制租约已变化或已失效" } }, 409);
+    }
+    control.control_lease_expires_at = new Date(Date.now() + 30_000).toISOString();
+    control.control_lease_active = true;
+    return json(controlResponse());
+  }),
   http.post("/__ch/api/control/actions", async ({ request }) => {
     const body = await request.json().catch(() => null) as { action?: string; request_id?: string; expected_control_version?: number } | null;
     if (!body || !body.request_id || !["take_over", "release"].includes(body.action ?? "")) {
@@ -400,6 +459,9 @@ export const handlers = [
     }
     control.control_state = action === "take_over" ? "taking_over" : "returning";
     control.control_version += 1;
+    control.control_lease_expires_at = null;
+    control.control_lease_active = false;
+    control.control_lease_held_by_me = false;
     control.active_transition = {
       request_id: body.request_id,
       action,

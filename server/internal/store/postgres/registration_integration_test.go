@@ -11,7 +11,7 @@ import (
 )
 
 func TestRegisteredUserWaitsForApprovalBeforeLogin(t *testing.T) {
-	store, _ := newTemporaryStore(t)
+	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	audit, err := app.NewAuditService(store)
 	if err != nil {
@@ -64,12 +64,27 @@ func TestRegisteredUserWaitsForApprovalBeforeLogin(t *testing.T) {
 	if err != nil || !adminPrincipal.Role.IsAdmin() || adminPrincipal.MustChangePassword {
 		t.Fatalf("admin principal after password change = %#v, %v", adminPrincipal, err)
 	}
+	modelBudgetDefaults, err := app.NewAdminModelBudgetDefaultService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := modelBudgetDefaults.Update(ctx, adminPrincipal, app.UpdateModelBudgetDefaultCommand{
+		ExpectedVersion: 0, TokenLimit: 45000, MaxConcurrent: 3,
+	}, "192.0.2.1"); err != nil {
+		t.Fatalf("configure default model budget: %v", err)
+	}
 
 	approved := identity.StatusApproved
 	if _, err := users.Update(ctx, adminPrincipal, registered.ID, app.UpdateUserCommand{
 		ExpectedStatus: identity.StatusPending, Status: &approved,
 	}); err != nil {
 		t.Fatalf("approve registered account: %v", err)
+	}
+	var tokenLimit int64
+	var maxConcurrent int32
+	if err := pool.QueryRow(ctx, `SELECT token_limit,max_concurrent FROM model_account_budgets WHERE owner_id=$1`, registered.ID).
+		Scan(&tokenLimit, &maxConcurrent); err != nil || tokenLimit != 45000 || maxConcurrent != 3 {
+		t.Fatalf("approved account model budget = %d/%d err=%v", tokenLimit, maxConcurrent, err)
 	}
 	login, err := credentials.Login(ctx, "new-member", "new-password-123", "192.0.2.1")
 	if err != nil || login.User.ID != registered.ID || login.User.Role != identity.RoleUser || login.Credential == "" {

@@ -9,6 +9,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -24,6 +25,9 @@ func (s *Store) EnsureTerminalSession(ctx context.Context, value app.TerminalSes
 	var result app.TerminalSession
 	created := false
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockTerminalControlHost(ctx, tx, value); err != nil {
+			return err
+		}
 		var err error
 		// Serialize ensure and explicit replacement per Host/actor; the partial unique index is the durable race guard.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('terminal-session:' || $1::text || ':' || $2::text, 0))`, value.HostID, value.ActorID); err != nil {
@@ -94,18 +98,45 @@ func (s *Store) CompleteTerminalSession(ctx context.Context, reservation app.Ter
 	if !validTerminalReservation(reservation) || !validAIOSessionID(aioSessionID) {
 		return false, domain.InvalidArgument("terminal_session", "terminal session completion is invalid")
 	}
-	tag, err := s.pool.Exec(ctx, `
+	updated := false
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockTerminalControlHost(ctx, tx, reservation); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
 UPDATE host_terminal_sessions
 SET state='ready', aio_session_id=$5, updated_at=clock_timestamp()
-WHERE host_id=$1 AND actor_id=$2 AND runtime_generation=$3 AND attempt_id=$4 AND state='creating'
-  AND EXISTS (SELECT 1 FROM hosts WHERE id=$1 AND owner_id=$6 AND state='running' AND deleted_at IS NULL
-    AND runtime_generation=$3 AND control_version=$7 AND control_state='user')`,
-		reservation.HostID, reservation.ActorID, reservation.RuntimeGeneration, reservation.AttemptID, aioSessionID,
-		reservation.OwnerID, reservation.ControlVersion)
-	if err != nil {
-		return false, fmt.Errorf("complete terminal session: %w", err)
+	WHERE host_id=$1 AND actor_id=$2 AND runtime_generation=$3 AND attempt_id=$4 AND state='creating'`,
+			reservation.HostID, reservation.ActorID, reservation.RuntimeGeneration, reservation.AttemptID, aioSessionID)
+		if err != nil {
+			return fmt.Errorf("complete terminal session: %w", err)
+		}
+		updated = tag.RowsAffected() == 1
+		return nil
+	})
+	return updated, err
+}
+
+func lockTerminalControlHost(ctx context.Context, tx pgx.Tx, value app.TerminalSession) error {
+	var ownerID string
+	err := tx.QueryRow(ctx, `SELECT owner_id FROM hosts WHERE id=$1 AND owner_id=$2 AND state='running' AND deleted_at IS NULL
+  AND runtime_generation=$3 AND control_version=$4 AND control_state='user' AND control_actor_id=$5
+  AND control_lease_expires_at > clock_timestamp() FOR SHARE`,
+		value.HostID, value.OwnerID, value.RuntimeGeneration, value.ControlVersion, value.ActorID).Scan(&ownerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return controlLeaseConflict()
 	}
-	return tag.RowsAffected() == 1, nil
+	if err != nil {
+		return fmt.Errorf("lock Host control lease for terminal session: %w", err)
+	}
+	allowed, err := hasControlPermission(ctx, tx, value.HostID, ownerID, value.ActorID, string(host.PermissionTerminalControl))
+	if err != nil {
+		return fmt.Errorf("authorize terminal session actor: %w", err)
+	}
+	if !allowed {
+		return controlLeaseConflict()
+	}
+	return nil
 }
 
 func (s *Store) MarkTerminalSessionUnknown(ctx context.Context, reservation app.TerminalSession) error {

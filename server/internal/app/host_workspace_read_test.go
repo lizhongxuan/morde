@@ -338,3 +338,37 @@ func TestStreamHostWorkspaceFileCallsWriterForEmptyFileAndStopsOnWriterError(t *
 		t.Fatalf("writer failure = writes %d, error %v; want one callback and original error", writes, err)
 	}
 }
+
+func TestStreamHostWorkspaceFileDoesNotFollowSymlink(t *testing.T) {
+	store, _, service := newHostWorkspaceReadFixture(t)
+	target := "private.txt"
+	digest := sha256.Sum256([]byte(target))
+	link := workspace.File{Path: "current", Kind: "symlink", SymlinkTarget: target, SizeBytes: int64(len(target)),
+		SHA256: hex.EncodeToString(digest[:]), Mode: 0, Chunks: []workspace.Chunk{}}
+	store.snapshots[4] = []workspace.File{link}
+	writes := 0
+	_, err := service.StreamHostWorkspaceFile(context.Background(), hostWorkspaceReadMember, hostWorkspaceReadHost, store.workspace.ID, 4, link.Path,
+		func(workspace.File, []byte) error { writes++; return nil })
+	if domain.CodeOf(err) != domain.CodeForbidden || writes != 0 {
+		t.Fatalf("StreamHostWorkspaceFile() = %v, writes=%d; want forbidden without writing referent bytes", err, writes)
+	}
+}
+
+func TestGetHostDiffRequiresOwnerAndAppliedRevisionBounds(t *testing.T) {
+	store, blocks, service := newHostWorkspaceReadFixture(t)
+	store.snapshots[1] = []workspace.File{hostWorkspaceReadFile(t, blocks, "note.txt", []byte("before"))}
+	store.snapshots[4] = []workspace.File{hostWorkspaceReadFile(t, blocks, "note.txt", []byte("after"))}
+
+	result, err := service.GetHostDiff(context.Background(), hostWorkspaceReadOwner, hostWorkspaceReadHost, store.workspace.ID, 1, 4)
+	if err != nil || len(result.Changes) != 1 || result.Changes[0].DisplayStatus != "text" ||
+		result.Changes[0].BeforeText == nil || *result.Changes[0].BeforeText != "before" ||
+		result.Changes[0].AfterText == nil || *result.Changes[0].AfterText != "after" {
+		t.Fatalf("host owner diff = %#v, %v", result, err)
+	}
+	if _, err := service.GetHostDiff(context.Background(), hostWorkspaceReadMember, hostWorkspaceReadHost, store.workspace.ID, 1, 4); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("non-owner host diff error = %v, want not found", err)
+	}
+	if _, err := service.GetHostDiff(context.Background(), hostWorkspaceReadOwner, hostWorkspaceReadHost, store.workspace.ID, 1, 5); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("unapplied revision diff error = %v, want workspace conflict", err)
+	}
+}

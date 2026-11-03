@@ -20,6 +20,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"morde-runtime/contract"
+
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
@@ -252,6 +254,21 @@ func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequ
 	if err := checkRuntimeToolBudget(current); err != nil {
 		return AgentToolPreparation{}, err
 	}
+	workspaceID, err := runtimeToolOperationWorkspaceID(mapping, request.Arguments, current)
+	if err != nil {
+		return AgentToolPreparation{}, err
+	}
+	if request.WorkspaceID != "" && request.WorkspaceID != workspaceID {
+		return AgentToolPreparation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace binding is invalid")
+	}
+	request.WorkspaceID = workspaceID
+	if workspaceID != "" {
+		current, err = e.renewTaskWorkspaceLease(ctx, current)
+		if err != nil {
+			return AgentToolPreparation{}, err
+		}
+		request.Task = current
+	}
 	if err := e.authorize(ctx, current, mapping.scope); err != nil {
 		return AgentToolPreparation{}, err
 	}
@@ -267,15 +284,7 @@ func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequ
 	if !session.Supports(mapping.capability) {
 		return AgentToolPreparation{}, domain.NewError(domain.CodeUnsupported, "Host runtime does not support this tool")
 	}
-	workspaceID, err := runtimeToolOperationWorkspaceID(mapping, request.Arguments, current)
-	if err != nil {
-		return AgentToolPreparation{}, err
-	}
-	if request.WorkspaceID != "" && request.WorkspaceID != workspaceID {
-		return AgentToolPreparation{}, domain.NewError(domain.CodeInvalidArgument, "runtime Workspace binding is invalid")
-	}
 	bindingVersion := int64(0)
-	request.WorkspaceID = workspaceID
 	if workspaceID != "" {
 		if runtimeclient.WorkspaceScopedCapability(mapping.capability) {
 			bindingVersion, _, err = session.SetTaskWorkspaceView(ctx, current, workspaceID, 0)
@@ -392,6 +401,13 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 		(workspaceID != "" && preparation.BindingVersion < 1) || (workspaceID == "" && preparation.BindingVersion != 0) ||
 		preparation.Token != runtimeToolPreparationToken(request, preparation.Fence, preparation.BindingVersion) {
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidArgument, "runtime tool preparation is invalid")
+	}
+	if workspaceID != "" {
+		current, err = e.renewTaskWorkspaceLease(ctx, current)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		request.Task = current
 	}
 	if err := e.authorize(ctx, current, mapping.scope); err != nil {
 		return AgentToolResult{}, err
@@ -542,6 +558,13 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 		!sameTaskInputRevision(current.WorkspaceCheckpointRevision, persisted.WorkspaceCheckpointRevision) ||
 		(persisted.WorkspaceID != "" && (current.WorkspaceID != persisted.WorkspaceID || current.InputRevision == nil || *current.InputRevision < 0)) {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
+	}
+	if persisted.WorkspaceID != "" && !terminal {
+		current, err = e.renewTaskWorkspaceLease(ctx, current)
+		if err != nil {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
+		}
+		request.Task = current
 	}
 	if err := e.authorize(ctx, current, mapping.scope); err != nil {
 		return AgentToolResult{}, err
@@ -735,6 +758,12 @@ func (e *RuntimeToolExecutor) Verify(ctx context.Context, request AgentVerificat
 	groups, invalid := e.groupFileEvidence(ctx, current, request.Evidence)
 	if invalid.Status != "" {
 		return invalid, nil
+	}
+	if len(groups) > 0 {
+		current, err = e.renewTaskWorkspaceLease(ctx, current)
+		if err != nil {
+			return unknownAgentVerification("Workspace access is unavailable while ownership transfer is in progress."), nil
+		}
 	}
 	verified := AgentVerificationResult{Status: AgentVerified}
 	for _, group := range groups {
@@ -1370,11 +1399,11 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 	if receipt.State == TaskWorkspacePublishQuotaRejected {
 		return workspacePublishQuotaVerification()
 	}
-	files, emptyDirectories, manifestSHA, err := taskWorkspaceOutputManifest(ctx, session, current, group)
+	files, emptyDirectories, directories, manifestSHA, err := taskWorkspaceOutputManifest(ctx, session, current, group)
 	if err != nil {
 		return taskWorkspacePublishErrorVerification(err)
 	}
-	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, manifestSHA, func(ctx context.Context, digest string) ([]byte, error) {
+	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, directories, manifestSHA, func(ctx context.Context, digest string) ([]byte, error) {
 		block, err := session.ReadTaskWorkspaceBlock(ctx, current, group.bindingVersion, group.viewID, manifestSHA, digest)
 		if err != nil {
 			return nil, err
@@ -1394,63 +1423,103 @@ func taskWorkspacePublishOperationKey(stepID, workspaceID string) string {
 	return "task-workspace-publish:" + stepID + ":" + workspaceID
 }
 
-func taskWorkspaceOutputManifest(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup) ([]workspace.File, []string, string, error) {
+func taskWorkspaceOutputManifest(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup) ([]workspace.File, []string, []workspace.Directory, string, error) {
 	files := make([]workspace.File, 0)
 	emptyDirectories := make([]string, 0)
+	directoryByPath := make(map[string]workspace.Directory)
 	afterPath, manifestSHA := "", ""
 	for {
 		page, err := session.TaskWorkspaceManifestPage(ctx, current, group.bindingVersion, group.viewID, manifestSHA, afterPath, 1000)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, nil, "", err
 		}
 		if page.TaskID != current.ID || page.WorkspaceID != group.workspaceID || page.BindingVersion != group.bindingVersion ||
 			page.InputRevision != *current.InputRevision || page.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision ||
 			page.InputManifestSHA256 != hex.EncodeToString(current.ContextDigest) || page.ViewID != group.viewID ||
 			(manifestSHA != "" && page.ManifestSHA256 != manifestSHA) || (page.NextCursor != "" && page.NextCursor <= afterPath) {
-			return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest changed during export")
+			return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest changed during export")
 		}
 		if len(files)+len(emptyDirectories)+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
-			return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest exceeds its item limit")
+			return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest exceeds its item limit")
 		}
 		if manifestSHA == "" {
 			manifestSHA = page.ManifestSHA256
 		}
-		pageLastPath := afterPath
+		pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
 		for _, item := range page.Files {
-			if item.Path <= afterPath {
-				return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest cursor is invalid")
+			if !item.MetadataKnown {
+				return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output metadata is incomplete")
 			}
-			if item.Path > pageLastPath {
-				pageLastPath = item.Path
-			}
+			pagePaths = append(pagePaths, item.Path)
 			chunks := make([]workspace.Chunk, len(item.Chunks))
 			for index, chunk := range item.Chunks {
 				chunks[index] = workspace.Chunk{SHA256: chunk.SHA256, SizeBytes: chunk.SizeBytes}
 			}
-			files = append(files, workspace.File{Path: item.Path, SizeBytes: item.SizeBytes, SHA256: item.SHA256, Mode: item.Mode, Chunks: chunks})
+			xattrs, acl := workspaceNativeMetadataFromRuntime(item.Xattrs, item.ACL)
+			files = append(files, workspace.File{Path: item.Path, Kind: item.Kind, SymlinkTarget: item.SymlinkTarget, HardlinkTo: item.HardlinkTo,
+				SizeBytes: item.SizeBytes, SHA256: item.SHA256, Mode: item.Mode, ModTimeNS: item.ModTimeNS,
+				MetadataKnown: item.MetadataKnown, Xattrs: xattrs, ACL: acl, Chunks: chunks})
 		}
 		for _, directory := range page.EmptyDirectories {
-			if directory <= afterPath {
-				return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output directory cursor is invalid")
-			}
-			if directory > pageLastPath {
-				pageLastPath = directory
-			}
+			pagePaths = append(pagePaths, directory)
 			emptyDirectories = append(emptyDirectories, directory)
 		}
-		if page.NextCursor != "" && (page.NextCursor != pageLastPath || pageLastPath == afterPath) {
-			return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest cursor is invalid")
+		for _, observed := range page.Directories {
+			if !observed.MetadataKnown {
+				return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output directory metadata is incomplete")
+			}
+			mode := observed.Mode
+			directory := workspace.Directory{Path: observed.Path, Mode: &mode, ModTimeNS: observed.ModTimeNS, MetadataKnown: observed.MetadataKnown}
+			directory.Xattrs, directory.ACL = workspaceNativeMetadataFromRuntime(observed.Xattrs, observed.ACL)
+			if err := workspace.ValidateDirectory(directory, false); err != nil {
+				return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output directory metadata is invalid")
+			}
+			key := strings.ToLower(directory.Path)
+			if previous, exists := directoryByPath[key]; exists {
+				if !workspace.SameDirectoryMetadata(previous, directory) {
+					return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output directory metadata changed between pages")
+				}
+				continue
+			}
+			directoryByPath[key] = directory
+		}
+		sort.Strings(pagePaths)
+		previousPath := afterPath
+		for _, path := range pagePaths {
+			if path <= previousPath || strings.EqualFold(path, previousPath) {
+				return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest cursor is invalid")
+			}
+			previousPath = path
+		}
+		if page.NextCursor != "" && (len(pagePaths) == 0 || page.NextCursor != pagePaths[len(pagePaths)-1] || page.NextCursor <= afterPath) {
+			return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest cursor is invalid")
 		}
 		if page.NextCursor == "" {
 			break
 		}
 		afterPath = page.NextCursor
 	}
-	actualManifestSHA, err := workspace.ManifestTreeSHA256(files, emptyDirectories)
-	if err != nil || manifestSHA == "" || actualManifestSHA != manifestSHA {
-		return nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest failed integrity verification")
+	directories := make([]workspace.Directory, 0, len(directoryByPath))
+	for _, directory := range directoryByPath {
+		directories = append(directories, directory)
 	}
-	return files, emptyDirectories, manifestSHA, nil
+	sort.Slice(directories, func(i, j int) bool { return directories[i].Path < directories[j].Path })
+	actualManifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+	if err != nil || manifestSHA == "" || actualManifestSHA != manifestSHA {
+		return nil, nil, nil, "", domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace output manifest failed integrity verification")
+	}
+	return files, emptyDirectories, directories, manifestSHA, nil
+}
+
+func workspaceNativeMetadataFromRuntime(xattrs []contract.WorkspaceExtendedAttribute, acl *contract.WorkspaceNativeACL) ([]workspace.ExtendedAttribute, *workspace.NativeACL) {
+	converted := make([]workspace.ExtendedAttribute, len(xattrs))
+	for i, attribute := range xattrs {
+		converted[i] = workspace.ExtendedAttribute{Name: attribute.Name, Value: append([]byte(nil), attribute.Value...)}
+	}
+	if acl == nil {
+		return converted, nil
+	}
+	return converted, &workspace.NativeACL{Platform: acl.Platform, Format: acl.Format, Data: append([]byte(nil), acl.Data...)}
 }
 
 func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifacts(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup, receipt TaskWorkspacePublishReceipt, result *AgentVerificationResult) AgentVerificationResult {
@@ -1533,6 +1602,37 @@ func (e *RuntimeToolExecutor) currentTaskForOperationReconciliation(ctx context.
 	return e.loadCurrentTask(ctx, claimed, false)
 }
 
+// renewTaskWorkspaceLease uses the Store's Workspace admission check before
+// Runtime mutates a task view or binding. The Store serializes this check with
+// ownership transfer admission and refuses the renewal while a transfer is
+// frozen.
+func (e *RuntimeToolExecutor) renewTaskWorkspaceLease(ctx context.Context, current task.Task) (task.Task, error) {
+	if current.WorkspaceID == "" {
+		return current, nil
+	}
+	if current.Lease.ExpiresAt == nil {
+		return task.Task{}, domain.NewError(domain.CodeInvalidState, "task Workspace lease changed before Runtime access")
+	}
+	leaseWindow := time.Until(*current.Lease.ExpiresAt)
+	if leaseWindow <= 0 {
+		return task.Task{}, domain.NewError(domain.CodeInvalidState, "task Workspace lease changed before Runtime access")
+	}
+	renewed, err := e.store.RenewTaskLease(ctx, current.ID, current.Lease.Owner, current.Lease.Version, leaseWindow)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if renewed.ID != current.ID || renewed.OwnerID != current.OwnerID || renewed.InitiatorID != current.InitiatorID ||
+		renewed.ProjectID != current.ProjectID || renewed.HostID != current.HostID || renewed.WorkspaceID != current.WorkspaceID ||
+		!sameTaskInputRevision(renewed.InputRevision, current.InputRevision) ||
+		!sameTaskInputRevision(renewed.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision) ||
+		!bytes.Equal(renewed.ContextDigest, current.ContextDigest) || renewed.Status != task.StatusRunning ||
+		renewed.Lease.Owner != current.Lease.Owner || renewed.Lease.Version != current.Lease.Version ||
+		renewed.Lease.ExpiresAt == nil || !renewed.Lease.ExpiresAt.After(time.Now()) {
+		return task.Task{}, domain.NewError(domain.CodeInvalidState, "task Workspace lease changed before Runtime access")
+	}
+	return renewed, nil
+}
+
 func (e *RuntimeToolExecutor) loadCurrentTask(ctx context.Context, claimed task.Task, checkToolBudget bool) (task.Task, error) {
 	if ctx == nil || !domain.ValidTaskID(claimed.ID) || !domain.ValidUserID(claimed.OwnerID) || !domain.ValidHostID(claimed.HostID) {
 		return task.Task{}, domain.NewError(domain.CodeInvalidArgument, "runtime task is invalid")
@@ -1542,7 +1642,7 @@ func (e *RuntimeToolExecutor) loadCurrentTask(ctx context.Context, claimed task.
 		return task.Task{}, err
 	}
 	current := details.Task
-	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.HostID != claimed.HostID ||
+	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.InitiatorID != claimed.InitiatorID || current.ProjectID != claimed.ProjectID || current.HostID != claimed.HostID ||
 		current.Status != task.StatusRunning || current.Lease.Owner == "" || current.Lease.Version < 1 ||
 		current.Lease.Owner != claimed.Lease.Owner || current.Lease.Version != claimed.Lease.Version ||
 		current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
@@ -1579,12 +1679,18 @@ func (e *RuntimeToolExecutor) authorize(ctx context.Context, current task.Task, 
 	if scope != identity.ScopeComputerObserve && scope != identity.ScopeComputerOperate {
 		return domain.NewError(domain.CodeForbidden, "task authorization does not allow this tool")
 	}
-	return e.authorizer.AuthorizeTaskAction(ctx, current.OwnerID, identity.Kind(current.Authorization.Kind), current.Authorization.TokenID,
+	if !domain.ValidUserID(current.InitiatorID) {
+		return domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
+	}
+	return e.authorizer.AuthorizeTaskAction(ctx, current.InitiatorID, identity.Kind(current.Authorization.Kind), current.Authorization.TokenID,
 		current.HostID, agentScopeSnapshot(current.Authorization.Scopes), scope)
 }
 
 func (e *RuntimeToolExecutor) readFence(ctx context.Context, current task.Task, expected *AgentHostFence) (AgentHostFence, error) {
-	fence, err := e.fences.ReadTaskFence(ctx, current.OwnerID, current.HostID)
+	if !domain.ValidUserID(current.InitiatorID) {
+		return AgentHostFence{}, domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
+	}
+	fence, err := e.fences.ReadTaskFence(ctx, current.InitiatorID, current.HostID)
 	if err != nil || !fence.AIAllowed || fence.RuntimeGeneration < 1 || fence.ControlVersion < 0 ||
 		(expected != nil && (fence.RuntimeGeneration != expected.RuntimeGeneration || fence.ControlVersion != expected.ControlVersion ||
 			(expected.RuntimeInstanceID != "" && fence.RuntimeInstanceID != expected.RuntimeInstanceID))) {
@@ -2043,6 +2149,7 @@ func runtimeToolPreparationToken(request AgentToolRequest, fence AgentHostFence,
 	value := struct {
 		TaskID         string                     `json:"task_id"`
 		OwnerID        string                     `json:"owner_id"`
+		InitiatorID    string                     `json:"initiator_id"`
 		HostID         string                     `json:"host_id"`
 		LeaseOwner     string                     `json:"lease_owner"`
 		LeaseVersion   int64                      `json:"lease_version"`
@@ -2056,7 +2163,7 @@ func runtimeToolPreparationToken(request AgentToolRequest, fence AgentHostFence,
 		BindingVersion int64                      `json:"binding_version"`
 		Approval       *AgentToolApprovalDecision `json:"approval,omitempty"`
 	}{
-		TaskID: request.Task.ID, OwnerID: request.Task.OwnerID, HostID: request.Task.HostID,
+		TaskID: request.Task.ID, OwnerID: request.Task.OwnerID, InitiatorID: request.Task.InitiatorID, HostID: request.Task.HostID,
 		LeaseOwner: request.Task.Lease.Owner, LeaseVersion: request.Task.Lease.Version,
 		OperationKey: request.OperationKey, CallID: request.Call.CallID,
 		Tool: request.Call.Name, ArgumentsHash: hex.EncodeToString(argumentsHash[:]),

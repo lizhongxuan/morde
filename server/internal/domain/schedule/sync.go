@@ -12,7 +12,7 @@ import (
 // occurrence/runtime state stay server-side.
 type SyncDefinition struct {
 	Status             Status              `json:"status"`
-	HostID             string              `json:"host_id"`
+	HostID             *string             `json:"host_id"`
 	ModelID            string              `json:"model_id"`
 	Objective          string              `json:"objective"`
 	Timing             Timing              `json:"timing"`
@@ -29,8 +29,12 @@ type SyncBudget struct {
 }
 
 func NewSyncDefinition(value Schedule) SyncDefinition {
+	var hostID *string
+	if value.HostID != "" {
+		hostID = &value.HostID
+	}
 	return SyncDefinition{
-		Status: value.Status, HostID: value.HostID, ModelID: value.ModelID, Objective: value.Objective,
+		Status: value.Status, HostID: hostID, ModelID: value.ModelID, Objective: value.Objective,
 		Timing: value.Timing, Budget: SyncBudget{ActiveSeconds: value.Budget.ActiveSeconds,
 			ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens},
 		MisfirePolicy: value.MisfirePolicy, NotificationEvents: append([]NotificationEvent(nil), value.NotificationEvents...),
@@ -39,11 +43,18 @@ func NewSyncDefinition(value Schedule) SyncDefinition {
 }
 
 func ValidateSyncDefinition(id string, value SyncDefinition) error {
-	if !ValidID(id) || !value.Status.Valid() || !domain.ValidHostID(value.HostID) || value.ModelID == "" ||
+	hostID := ""
+	if value.HostID != nil {
+		hostID = *value.HostID
+	}
+	if !ValidID(id) || !value.Status.Valid() || (hostID != "" && !domain.ValidHostID(hostID)) || value.ModelID == "" ||
 		len(value.ModelID) > 200 || strings.TrimSpace(value.Objective) == "" || len(value.Objective) > 32768 ||
 		!value.MisfirePolicy.Valid() || value.Timing.Validate() != nil ||
 		(task.Budget{ActiveSeconds: value.Budget.ActiveSeconds, ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens}).Validate() != nil {
 		return errors.New("schedule sync definition is invalid")
+	}
+	if hostID == "" && value.Observation != nil {
+		return errors.New("hostless schedule cannot configure computer observation")
 	}
 	seen := make(map[NotificationEvent]struct{}, len(value.NotificationEvents))
 	for _, event := range value.NotificationEvents {

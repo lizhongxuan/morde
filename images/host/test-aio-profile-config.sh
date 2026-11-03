@@ -3,11 +3,13 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 script="$script_dir/morde-aio-profile-config.py"
-test_root="$(mktemp -d)"
+test_root="$(mktemp -d /tmp/morde-aio.XXXXXX)"
 home="$test_root/home"
 mkdir -p "$home"
 chmod 0755 "$home"
 trap 'rm -rf "$test_root"' EXIT
+test_uid="$(id -u)"
+test_gid="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_gid)' "$home")"
 
 run_config() {
   python3 "$script" "$1" --home "$home"
@@ -18,12 +20,22 @@ assert_file() {
   test "$(cat "$home/$path")" = "$expected"
 }
 
+assert_owner_mode() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import os
+import stat
+import sys
+
+info = os.stat(sys.argv[1], follow_symlinks=False)
+assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4], 8))
+PY
+}
+
 # Pre-existing non-empty files and trees survive AIO's first-run copy.
 mkdir -p "$home/.config/code-server/vscode" "$home/.jupyter" "$home/.config/matplotlib" \
   "$home/.config/browser/Default" "$home/.config/opencode" "$home/.claude" "$home/.codex" \
   "$home/.agents/skills/custom" "$home/.config/fcitx5/conf"
 printf 'user-bashrc-secret' > "$home/.bashrc"
-chown 1000:1000 "$home/.bashrc"
 printf 'user-vscode-setting' > "$home/.config/code-server/vscode/settings.json"
 printf 'user-jupyter-setting' > "$home/.jupyter/custom.py"
 printf 'user-matplotlib-setting' > "$home/.config/matplotlib/matplotlibrc"
@@ -44,8 +56,8 @@ printf 'user-fcitx-setting' > "$home/.config/fcitx5/conf/custom.conf"
 mkdir -p "$home/workspace"
 printf 'workspace-data' > "$home/workspace/keep.txt"
 run_config prepare
-test "$(stat -c '%u:%a' "$home/.morde-aio-profile-state")" = 0:700
-test "$(stat -c '%u:%a' "$home/.morde-aio-profile-state/bashrc.pending")" = 0:700
+assert_owner_mode "$home/.morde-aio-profile-state" "$test_uid" "$test_gid" 700
+assert_owner_mode "$home/.morde-aio-profile-state/bashrc.pending" "$test_uid" "$test_gid" 700
 
 # Simulate the fixed image's copy/overwrite stage. It runs before pre-services.
 printf 'aio-default' > "$home/.bashrc"
@@ -76,7 +88,7 @@ PY
 run_config restore
 
 assert_file .bashrc user-bashrc-secret
-test "$(stat -c '%u:%g' "$home/.bashrc")" = 1000:1000
+assert_owner_mode "$home/.bashrc" "$test_uid" "$test_gid" 644
 assert_file .config/code-server/vscode/settings.json user-vscode-setting
 test ! -e "$home/.config/code-server/vscode/default.json"
 test ! -e "$home/.config/code-server/vscode/code-server-ipc.sock"
@@ -90,8 +102,8 @@ assert_file .codex/config.toml user-codex-setting
 assert_file .codex/model-catalog.json user-catalog-setting
 assert_file .codex/other-settings.json user-codex-extra-setting
 assert_file .codex/auth.json '{"morde_test_fixture":"SYNTHETIC_NOT_A_CREDENTIAL"}'
-test "$(stat -c '%a' "$home/.codex/other-settings.json")" = 600
-test "$(stat -c '%a' "$home/.codex/auth.json")" = 600
+assert_owner_mode "$home/.codex/other-settings.json" "$test_uid" "$test_gid" 600
+assert_owner_mode "$home/.codex/auth.json" "$test_uid" "$test_gid" 600
 test ! -e "$home/.codex/tmp"
 assert_file .agents/skills/custom/SKILL.md user-skill
 test ! -e "$home/.agents/skills/custom/aio-default.md"
@@ -131,6 +143,50 @@ test ! -e "$empty_home/.morde-aio-profile-state/bashrc.pending"
 printf 'aio-initial-default' > "$empty_home/.bashrc"
 python3 "$script" restore --home "$empty_home"
 test "$(cat "$empty_home/.bashrc")" = aio-initial-default
+
+# New Workspace volumes become the default for empty desktop directories and Chromium downloads.
+workspace_home="$test_root/workspace-home"
+mkdir -p "$workspace_home/workspace" "$workspace_home/.config/browser/Default"
+printf '{}' > "$workspace_home/.config/browser/Default/Preferences"
+MORDE_WORKSPACE_LAYOUT=workspace python3 "$script" workspace-defaults --home "$workspace_home"
+grep -Fq 'XDG_DOWNLOAD_DIR="$HOME/workspace/Downloads"' "$workspace_home/.config/user-dirs.dirs"
+grep -Fq 'XDG_DESKTOP_DIR="$HOME/workspace/Desktop"' "$workspace_home/.config/user-dirs.dirs"
+test -d "$workspace_home/workspace/Downloads"
+python3 - "$workspace_home/.config/browser/Default/Preferences" "$workspace_home/workspace/Downloads" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    preferences = json.load(source)
+assert preferences["download"]["default_directory"] == sys.argv[2]
+assert preferences["download"]["directory_upgrade"] is True
+PY
+
+# Existing profile files stay at their old path until W22 handles their data.
+preserve_home="$test_root/preserve-home"
+mkdir -p "$preserve_home/workspace" "$preserve_home/Downloads" "$preserve_home/.config/browser/Default"
+printf 'keep-existing-download' > "$preserve_home/Downloads/keep.txt"
+printf 'XDG_DOWNLOAD_DIR="$HOME/Downloads"\n' > "$preserve_home/.config/user-dirs.dirs"
+printf '{"download":{"default_directory":"%s/Downloads"}}\n' "$preserve_home" > "$preserve_home/.config/browser/Default/Preferences"
+MORDE_WORKSPACE_LAYOUT=workspace python3 "$script" workspace-defaults --home "$preserve_home"
+grep -Fq 'XDG_DOWNLOAD_DIR="$HOME/Downloads"' "$preserve_home/.config/user-dirs.dirs"
+python3 - "$preserve_home/.config/browser/Default/Preferences" "$preserve_home" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    preferences = json.load(source)
+assert preferences["download"]["default_directory"] == sys.argv[2] + "/Downloads"
+PY
+test "$(cat "$preserve_home/Downloads/keep.txt")" = keep-existing-download
+
+# Legacy Host volumes retain the profile's existing defaults.
+legacy_home="$test_root/legacy-home"
+mkdir -p "$legacy_home/workspace" "$legacy_home/Downloads"
+printf 'old-downloads' > "$legacy_home/Downloads/keep.txt"
+MORDE_WORKSPACE_LAYOUT=legacy python3 "$script" workspace-defaults --home "$legacy_home"
+test ! -e "$legacy_home/.config/user-dirs.dirs"
+test "$(cat "$legacy_home/Downloads/keep.txt")" = old-downloads
 
 # A deliberate deletion after baseline creation is also restored after AIO recreates it.
 rm -f "$home/.config/matplotlib/matplotlibrc"

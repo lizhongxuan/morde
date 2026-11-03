@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -136,13 +137,20 @@ func TestCredentialLoginEnsuresOneStoppedHostBeforeIssuingSession(t *testing.T) 
 	if len(hosts.values) != 1 || hosts.values[0].State != host.StateStopped {
 		t.Fatalf("login default hosts = %#v", hosts.values)
 	}
-	hosts.ensureErr = errors.New("storage unavailable")
-	before := len(tokens.values)
-	if _, err := service.Login(context.Background(), "alice", "correct horse", "127.0.0.3"); err == nil {
-		t.Fatal("Login() succeeded when default host storage failed")
-	}
-	if len(tokens.values) != before {
-		t.Fatal("Login() issued a session after default host storage failed")
+	for index, failure := range []error{
+		domain.NewError(domain.CodeQuotaExceeded, "workspace quota exceeded"),
+		domain.NewError(domain.CodeCapacityExceeded, "workspace capacity exceeded"),
+		errors.New("default Host or Workspace creation failed"),
+	} {
+		hosts.ensureErr = failure
+		before := len(tokens.values)
+		ip := fmt.Sprintf("127.0.0.%d", index+3)
+		if _, err := service.Login(context.Background(), "alice", "correct horse", ip); err != nil {
+			t.Fatalf("Login() error with default Host failure %v = %v", failure, err)
+		}
+		if len(tokens.values) != before+1 {
+			t.Fatalf("Login() issued %d session tokens after default Host failure; want one", len(tokens.values)-before)
+		}
 	}
 }
 

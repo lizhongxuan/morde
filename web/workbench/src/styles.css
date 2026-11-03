@@ -41,6 +41,8 @@ button, a, input, textarea { accent-color: var(--primary); }
 .control-state[data-state="user"] { border-color: #b7e3c7; color: var(--success); background: #eef9f2; }
 .control-state[data-state="taking_over"], .control-state[data-state="returning"] { color: #8a5b00; }
 .control-state[role="alert"], .control-error { color: var(--danger); }
+.control-version { color: var(--muted); font-size: .78rem; font-variant-numeric: tabular-nums; }
+.desktop-sharing-notice { max-width: 100%; margin: 0; color: var(--muted); font-size: .76rem; line-height: 1.4; }
 .control-error { max-width: 300px; font-size: .82rem; overflow-wrap: anywhere; }
 .button { min-height: 34px; padding: 6px 12px; border: 1px solid var(--primary); border-radius: var(--radius); background: var(--primary); color: var(--primary-contrast); cursor: pointer; font-size: .8rem; font-weight: 650; }
 .button:hover:not(:disabled) { filter: brightness(.94); }
@@ -95,6 +97,17 @@ button, a, input, textarea { accent-color: var(--primary); }
 .muted { color: var(--muted); font-size: .9rem; }
 .copy-status, .success-text { color: var(--success); }
 .error-text { color: var(--danger); }
+.task-observation { width: min(100%, 1040px); min-height: 100vh; margin: 0 auto; padding: 28px 18px; }
+.task-observation > header { margin-bottom: 18px; }
+.task-observation > header h1 { margin: 0 0 8px; }
+.task-observation > header p { margin-top: 0; }
+.task-observation-card { margin-bottom: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.task-observation-card h2 { margin: 0 0 10px; font-size: 1rem; }
+.task-observation-card p { margin: 5px 0; overflow-wrap: anywhere; }
+.task-observation-card ol, .task-observation-card ul { margin: 0; padding-left: 22px; }
+.task-observation-card li { margin: 8px 0; overflow-wrap: anywhere; }
+.task-observation-card time, .task-observation-card li span { display: block; color: var(--muted); font-size: .85rem; }
+.task-observation-card li strong { display: block; }
 
 .tab-panel-files { overflow: auto; }
 .tab-panel-files > .file-manager { min-height: 100%; padding: 18px; }
@@ -102,10 +115,16 @@ button, a, input, textarea { accent-color: var(--primary); }
 .workspace-browser { min-height: 100%; padding: 18px; }
 .workspace-browser-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: #fbfcfe; }
 .workspace-browser-toolbar .field-label { margin: 0; }
-.workspace-browser-toolbar select { min-width: 180px; min-height: 38px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }
+.workspace-browser-toolbar select, .workspace-browser-toolbar input { min-width: 150px; min-height: 38px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }
+.workspace-browser-toolbar select { min-width: 180px; }
 .workspace-sync-status { margin-bottom: 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.workspace-sync-status h3 { margin: 0 0 8px; font-size: 1rem; }
 .workspace-sync-status p { margin: 0 0 6px; color: var(--muted); font-size: .9rem; }
 .workspace-sync-status p:last-of-type { margin-bottom: 0; }
+.workspace-history-diff .workspace-browser-toolbar { justify-content: flex-start; }
+.workspace-diff-table { min-width: 780px; }
+.workspace-diff-text-grid { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 10px; min-width: 350px; padding-top: 8px; }
+.workspace-diff-text-grid pre { max-height: 280px; margin: 5px 0; overflow: auto; padding: 9px; border-radius: 6px; background: #f7f8fb; color: var(--text); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .workspace-sync-status ul { margin: 8px 0 0; padding-left: 22px; color: var(--danger); overflow-wrap: anywhere; }
 .workspace-browser-path { color: var(--muted); font-size: .88rem; }
 .file-manager { height: 100%; overflow: auto; padding: 4px; }

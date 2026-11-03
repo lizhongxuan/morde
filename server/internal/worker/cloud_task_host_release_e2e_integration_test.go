@@ -21,6 +21,12 @@ import (
 	"morde/server/internal/storage/workspacefs"
 )
 
+type f01WorkspaceVolumeResolver struct{}
+
+func (f01WorkspaceVolumeResolver) PrepareHostWorkspaceVolume(context.Context, string, string, string, string, string) (app.SandboxVolume, error) {
+	return app.SandboxVolume{}, nil
+}
+
 func TestHostReleaseAPIWaitsForActiveWorkspaceTask(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -34,14 +40,8 @@ func TestHostReleaseAPIWaitsForActiveWorkspaceTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, _, _ := createF01Host(t, ctx, store, sealer, owner.ID)
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	hostValue, _, _ := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	binding := hostValue.Workspaces[0]
 	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
 		t.Fatal(err)
@@ -81,8 +81,9 @@ func TestHostReleaseAPIWaitsForActiveWorkspaceTask(t *testing.T) {
 	}
 	hostService, err := app.NewHostService(app.HostServiceOptions{
 		Hosts: store, Users: store, Workspaces: store, Tokens: store,
-		Sandboxes: f01SandboxRouter{endpoint: "https://runtime.example.test"},
-		Volumes:   f01ReleaseNoopVolume{}, DiskCapacity: f01ReleaseNoopCapacity{},
+		WorkspaceVolumes: f01WorkspaceVolumeResolver{},
+		Sandboxes:        f01SandboxRouter{endpoint: "https://runtime.example.test"},
+		Volumes:          f01ReleaseNoopVolume{}, DiskCapacity: f01ReleaseNoopCapacity{},
 		Probe: f01ReleaseNoopProbe{}, Runtime: f01ReleaseNoopRuntime{}, Audit: auditService,
 		CreateLocks: store, Sealer: sealer,
 		Templates:         map[string]domainTemplate.Template{"f01-local-template": f01ReleaseTemplate()},

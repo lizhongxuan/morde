@@ -17,6 +17,10 @@ import (
 // shortcut: creation concurrency is fixed at four; make it configurable only if deployments need different throughput.
 const createWorkers = 4
 
+// HostUsageSampleInterval leaves one second of slack below the app's maximum
+// accepted observation gap.
+const HostUsageSampleInterval = 4 * time.Second
+
 type LeaderLock interface {
 	Release(context.Context) error
 }
@@ -32,11 +36,16 @@ type Application interface {
 	TryReconcilerLock(context.Context) (LeaderLock, bool, error)
 }
 
+type hostUsageApplication interface {
+	CollectHostUsage(context.Context) error
+}
+
 type Options struct {
 	Application           Application
 	CreateQueue           *CreateQueue
 	Interval              time.Duration
 	ActivityFlushInterval time.Duration
+	HostUsageInterval     time.Duration
 	Logger                *zap.Logger
 	Registerer            prometheus.Registerer
 }
@@ -46,6 +55,8 @@ type Worker struct {
 	queue                 *CreateQueue
 	interval              time.Duration
 	activityFlushInterval time.Duration
+	hostUsage             hostUsageApplication
+	hostUsageInterval     time.Duration
 	logger                *zap.Logger
 	metrics               *metrics
 	runMu                 sync.Mutex
@@ -65,9 +76,14 @@ func New(options Options) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	usageApp, hasUsageApp := options.Application.(hostUsageApplication)
+	if hasUsageApp && options.HostUsageInterval <= 0 {
+		return nil, fmt.Errorf("host usage sampling interval must be positive")
+	}
 	return &Worker{
 		app: options.Application, queue: options.CreateQueue,
 		interval: options.Interval, activityFlushInterval: options.ActivityFlushInterval,
+		hostUsage: usageApp, hostUsageInterval: options.HostUsageInterval,
 		logger: logger, metrics: workerMetrics,
 	}, nil
 }
@@ -209,12 +225,23 @@ func (w *Worker) runAsLeader(ctx context.Context, lock LeaderLock, ticks <-chan 
 		}
 	}()
 	w.reconcileOnce(ctx)
+	var usageTicker *time.Ticker
+	var usageTicks <-chan time.Time
+	if w.hostUsage != nil {
+		usageTicker = time.NewTicker(w.hostUsageInterval)
+		usageTicks = usageTicker.C
+		defer usageTicker.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticks:
 			w.reconcileOnce(ctx)
+		case <-usageTicks:
+			if err := w.runTask("collect_host_usage", "", func() error { return w.hostUsage.CollectHostUsage(ctx) }); err != nil && ctx.Err() == nil {
+				w.logger.Error("collect Host usage failed", zap.Error(err))
+			}
 		}
 	}
 }

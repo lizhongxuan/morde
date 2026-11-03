@@ -16,7 +16,20 @@ const control: GatewayControl = {
   host_id: host.id,
   control_state: 'ai',
   control_version: 0,
+  control_actor_user_id: '',
+  control_lease_expires_at: null,
+  control_lease_active: false,
+  control_lease_held_by_me: false,
   active_transition: null,
+};
+const userControl: GatewayControl = {
+  ...control,
+  control_state: 'user',
+  control_version: 1,
+  control_actor_user_id: 'u1234567',
+  control_lease_expires_at: '2026-11-02T00:00:30.000Z',
+  control_lease_active: true,
+  control_lease_held_by_me: true,
 };
 
 function mockWorkbenchApi() {
@@ -74,6 +87,34 @@ describe('Workbench MVP navigation', () => {
     expect(gatewayApi.control).not.toHaveBeenCalled();
     expect(gatewayApi.workspaces).toHaveBeenCalledOnce();
   });
+
+  it('renders Task observation without loading Host controls or Workspace APIs', async () => {
+    const taskID = 't1234567';
+    const taskObservation = vi.spyOn(gatewayApi, 'taskObservation').mockResolvedValue({
+      task_id: taskID, host_id: host.id, status: 'running', event_sequence: 8, updated_at: '2026-11-03T12:00:00Z',
+      artifacts: [{ id: 'a1234567', label: 'report', media_type: 'text/plain', workspace_id: 'w1234567', revision: 2,
+        size_bytes: 15, sha256: 'a'.repeat(64), created_at: '2026-11-03T12:00:00Z' }],
+    });
+    const eventSources: Array<{ url: string; close: ReturnType<typeof vi.fn> }> = [];
+    vi.stubGlobal('EventSource', class extends EventTarget {
+      url: string;
+      close = vi.fn();
+      constructor(url: string) { super(); this.url = url; eventSources.push(this); }
+    });
+    window.history.replaceState({}, '', `/__ch/wb/?task_id=${taskID}`);
+    render(<Workbench />);
+
+    expect(await screen.findByText(`Task ${taskID}`)).toBeVisible();
+    expect(screen.getByText('report')).toBeVisible();
+    await waitFor(() => expect(eventSources).toHaveLength(1));
+    expect(new URL(eventSources[0]!.url).searchParams.get('after')).toBe('8');
+    expect(taskObservation).toHaveBeenCalledWith(taskID);
+    expect(gatewayApi.host).not.toHaveBeenCalled();
+    expect(gatewayApi.control).not.toHaveBeenCalled();
+    expect(gatewayApi.workspaces).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /暂停|继续|停止任务|接管电脑/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /下载|打开/ })).not.toBeInTheDocument();
+  });
 });
 
 describe('Workbench control conflicts', () => {
@@ -101,7 +142,6 @@ describe('Workbench control conflicts', () => {
 
   it('fails closed when a control refresh fails after the user took over', async () => {
     vi.useFakeTimers();
-    const userControl = { ...control, control_state: 'user' as const, control_version: 1 };
     vi.spyOn(gatewayApi, 'control')
       .mockResolvedValueOnce(userControl)
       .mockRejectedValueOnce(new Error('connection lost'))
@@ -109,7 +149,7 @@ describe('Workbench control conflicts', () => {
     render(<Workbench />);
 
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(screen.getByText('当前控制者：你')).toBeVisible();
+    expect(screen.getByText('你持有电脑操作权')).toBeVisible();
     expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
 
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
@@ -124,9 +164,55 @@ describe('Workbench control conflicts', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '重试读取' }));
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(screen.getByText('当前控制者：你')).toBeVisible();
+    expect(screen.getByText('你持有电脑操作权')).toBeVisible();
     expect(screen.getByRole('button', { name: '交回 AI' })).toBeVisible();
     expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
+  });
+
+  it('keeps an observer-only session read-only when the service denies control access', async () => {
+    vi.spyOn(gatewayApi, 'control').mockRejectedValue(new ApiError({
+      message: '当前账号只有桌面观察权限', code: 'forbidden', status: 403,
+    }));
+    const controlAction = vi.spyOn(gatewayApi, 'controlAction');
+    render(<Workbench />);
+
+    expect(await screen.findByText('控制状态暂时不可用')).toBeVisible();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=true');
+    expect(screen.queryByRole('button', { name: '接管电脑' })).not.toBeInTheDocument();
+    expect(controlAction).not.toHaveBeenCalled();
+  });
+
+  it('keeps desktop, terminal, and VS Code read-only when another member holds the lease', async () => {
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue({
+      ...userControl, control_actor_user_id: 'u8765432', control_lease_held_by_me: false,
+    });
+    const controlAction = vi.spyOn(gatewayApi, 'controlAction');
+    const terminal = vi.spyOn(gatewayApi, 'ensureTerminalSession');
+    render(<Workbench />);
+
+    expect(await screen.findByText('当前操作账号：u8765432')).toBeVisible();
+    expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=true');
+    fireEvent.click(screen.getByRole('button', { name: '终端' }));
+    expect(screen.getByText('请先接管电脑后使用终端。')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '交回 AI' })).not.toBeInTheDocument();
+    expect(controlAction).not.toHaveBeenCalled();
+    expect(terminal).not.toHaveBeenCalled();
+  });
+
+  it('renews the current user lease while the Workbench stays open', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-02T00:00:00.000Z'));
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
+    const renewed = { ...userControl, control_lease_expires_at: '2026-11-02T00:00:40.000Z' };
+    const renewLease = vi.spyOn(gatewayApi, 'renewControlLease').mockResolvedValue(renewed);
+    render(<Workbench />);
+
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+
+    expect(renewLease).toHaveBeenCalledWith(userControl.control_version);
+    expect(screen.getByText('你持有电脑操作权')).toBeVisible();
   });
 });
 
@@ -139,7 +225,7 @@ describe('Workbench terminal sessions', () => {
   });
 
   it('reuses the registered session and confirms before replacing it', async () => {
-    vi.spyOn(gatewayApi, 'control').mockResolvedValue({ ...control, control_state: 'user' });
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
     const ensure = vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({
       state: 'ready', url: '/terminal?session_id=registered',
     });
@@ -165,7 +251,7 @@ describe('Workbench terminal sessions', () => {
   });
 
   it('does not create another PTY automatically when the prior result is unknown', async () => {
-    vi.spyOn(gatewayApi, 'control').mockResolvedValue({ ...control, control_state: 'user' });
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
     vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({ state: 'unknown', url: '' });
     const createNew = vi.spyOn(gatewayApi, 'newTerminalSession');
     vi.spyOn(window, 'confirm').mockReturnValue(false);
@@ -177,7 +263,7 @@ describe('Workbench terminal sessions', () => {
   });
 
   it('explains an interrupted PTY may be unavailable and does not replace it automatically', async () => {
-    vi.spyOn(gatewayApi, 'control').mockResolvedValue({ ...control, control_state: 'user' });
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
     vi.spyOn(gatewayApi, 'ensureTerminalSession').mockResolvedValue({ state: 'interrupted', url: '' });
     const createNew = vi.spyOn(gatewayApi, 'newTerminalSession');
     render(<Workbench />);
@@ -189,7 +275,7 @@ describe('Workbench terminal sessions', () => {
 
   it('waits for an in-flight terminal creation before connecting', async () => {
     vi.useFakeTimers();
-    vi.spyOn(gatewayApi, 'control').mockResolvedValue({ ...control, control_state: 'user' });
+    vi.spyOn(gatewayApi, 'control').mockResolvedValue(userControl);
     const ensure = vi.spyOn(gatewayApi, 'ensureTerminalSession')
       .mockResolvedValueOnce({ state: 'creating', url: '' })
       .mockResolvedValueOnce({ state: 'ready', url: '/terminal?session_id=created' });

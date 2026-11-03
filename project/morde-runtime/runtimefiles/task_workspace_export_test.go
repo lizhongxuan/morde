@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"morde-runtime/contract"
 	mordesync "morde-sync"
 )
 
@@ -20,6 +22,15 @@ func TestTaskWorkspaceManifestPageAndBlockExport(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(viewPath, "b.txt"), []byte("output-beta"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	modified := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.Chtimes(filepath.Join(viewPath, "b.txt"), modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	fileInfo, err := os.Stat(filepath.Join(viewPath, "b.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantModTimeNS := fileInfo.ModTime().UnixNano()
 	wantManifest, wantDigest, err := scanTaskWorkspace(context.Background(), viewPath)
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +42,7 @@ func TestTaskWorkspaceManifestPageAndBlockExport(t *testing.T) {
 	if first.TaskID != taskID || first.ViewID != viewID || first.WorkspaceID != "wabc1234" ||
 		first.BindingVersion != 3 || first.InputRevision != 4 || first.WorkspaceCheckpointRevision != 9 ||
 		first.InputManifestSHA256 != inputDigest || first.ManifestSHA256 != wantDigest || len(first.Files) != 1 ||
-		first.Files[0].Path != "a.txt" || first.NextCursor != "a.txt" {
+		first.Files[0].Path != "a.txt" || first.Files[0].Kind != "file" || first.NextCursor != "a.txt" {
 		t.Fatalf("unexpected first page: %+v", first)
 	}
 	if got, err := taskManifestSHA256(wantManifest); err != nil || got != first.ManifestSHA256 {
@@ -41,14 +52,356 @@ func TestTaskWorkspaceManifestPageAndBlockExport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second manifest page: %v", err)
 	}
-	if len(second.Files) != 1 || second.Files[0].Path != "b.txt" || second.NextCursor != "" ||
+	if len(second.Files) != 1 || second.Files[0].Path != "b.txt" || second.Files[0].Kind != "file" || second.NextCursor != "" ||
 		second.Files[0].SizeBytes != int64(len("output-beta")) || len(second.Files[0].Chunks) != 1 ||
-		second.Files[0].Chunks[0].SHA256 != testSHA256("output-beta") {
+		second.Files[0].Chunks[0].SHA256 != testSHA256("output-beta") || second.Files[0].ModTimeNS == nil || *second.Files[0].ModTimeNS != wantModTimeNS {
 		t.Fatalf("unexpected second page: %+v", second)
+	}
+	response, err := workspace.ExportTaskWorkspaceManifestPage(context.Background(), contract.TaskWorkspaceManifestRequest{
+		ProtocolVersion: contract.ProtocolVersion, TaskID: taskID, WorkspaceID: "wabc1234", BindingVersion: 3,
+		InputRevision: 4, WorkspaceCheckpointRevision: 9, InputManifestSHA256: inputDigest, ViewID: viewID,
+		ManifestSHA256: first.ManifestSHA256, Limit: 10,
+	})
+	if err != nil || len(response.Files) != 2 || response.Files[1].ModTimeNS == nil || *response.Files[1].ModTimeNS != wantModTimeNS {
+		t.Fatalf("contract manifest response = %#v, %v; want persisted modification time %d", response, err, wantModTimeNS)
 	}
 	block, err := workspace.ReadTaskWorkspaceBlock(context.Background(), taskID, viewID, first.ManifestSHA256, testSHA256("output-beta"))
 	if err != nil || string(block) != "output-beta" {
 		t.Fatalf("read block = %q, %v", block, err)
+	}
+}
+
+func TestPrepareTaskWorkspaceViewPreservesFileModTime(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	viewID := "v" + strings.Repeat("a", 64)
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const filePath = "note.txt"
+	if err := os.WriteFile(filepath.Join(sourcePath, filePath), []byte("workspace input"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	modified := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.Chtimes(filepath.Join(sourcePath, filePath), modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	_, manifestSHA, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskRoot := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRoot, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, manifestSHA); err != nil {
+		t.Fatalf("prepare Task Workspace view: %v", err)
+	}
+	copyPath := filepath.Join(taskRoot, taskID, viewID, taskWorkspaceContentDirectory, filePath)
+	info, err := os.Stat(copyPath)
+	if err != nil || info.ModTime().UnixNano() != modified.UnixNano() {
+		t.Fatalf("copied file modification time = %v, %v; want %d", info, err, modified.UnixNano())
+	}
+	page, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, "", "", 10)
+	if err != nil || len(page.Files) != 1 || page.Files[0].ModTimeNS == nil || *page.Files[0].ModTimeNS != modified.UnixNano() {
+		t.Fatalf("Task Workspace manifest mtime = %#v, %v; want %d", page.Files, err, modified.UnixNano())
+	}
+}
+
+func TestPrepareTaskWorkspaceViewAcceptsLegacyDigestWithoutRootMetadata(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	viewID := "v" + strings.Repeat("b", 64)
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest, sourceDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputDigest, err := taskManifestContentSHA256(manifest)
+	if err != nil || inputDigest == sourceDigest {
+		t.Fatalf("legacy input digest = %q, %v; want a digest without local root metadata", inputDigest, err)
+	}
+	taskRoot := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRoot, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, inputDigest); err != nil {
+		t.Fatalf("prepare Task Workspace view from legacy digest: %v", err)
+	}
+	viewPath := filepath.Join(taskRoot, taskID, viewID, taskWorkspaceContentDirectory)
+	_, viewDigest, err := scanTaskWorkspace(context.Background(), viewPath)
+	if err != nil || viewDigest != sourceDigest {
+		t.Fatalf("copied Task Workspace digest = %q, %v; want source digest %q", viewDigest, err, sourceDigest)
+	}
+	page, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, "", "", 10)
+	if err != nil || page.InputManifestSHA256 != inputDigest || page.ManifestSHA256 != sourceDigest {
+		t.Fatalf("Task Workspace manifests = input %q, view %q, %v; want input %q and view %q", page.InputManifestSHA256, page.ManifestSHA256, err, inputDigest, sourceDigest)
+	}
+}
+
+func TestPrepareTaskWorkspaceViewAcceptsLegacyDigestWithFiles(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	viewID := "v" + strings.Repeat("e", 64)
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "note.txt"), []byte("legacy Workspace input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, sourceDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputDigest, err := taskManifestContentSHA256(manifest)
+	if err != nil || inputDigest == sourceDigest {
+		t.Fatalf("legacy input digest = %q, %v; want a digest without file metadata", inputDigest, err)
+	}
+	taskRoot := filepath.Join(t.TempDir(), "task-views")
+	taskWorkspace, err := OpenTaskWorkspace(root, taskRoot, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taskWorkspace.Close()
+	if err := taskWorkspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, inputDigest); err != nil {
+		t.Fatalf("prepare Task Workspace view from legacy file digest: %v", err)
+	}
+	page, err := taskWorkspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, "", "", 10)
+	if err != nil || page.InputManifestSHA256 != inputDigest || page.ManifestSHA256 != sourceDigest {
+		t.Fatalf("Task Workspace manifests = input %q, view %q, %v; want input %q and view %q", page.InputManifestSHA256, page.ManifestSHA256, err, inputDigest, sourceDigest)
+	}
+}
+
+func TestPrepareTaskWorkspaceViewPreservesHardlinksAndExportsMetadata(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	viewID := "v" + strings.Repeat("c", 64)
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("shared Task inode")
+	anchor := filepath.Join(sourcePath, "a.txt")
+	alias := filepath.Join(sourcePath, "z.txt")
+	if err := os.WriteFile(anchor, content, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(anchor, alias); err != nil {
+		t.Fatal(err)
+	}
+	_, inputDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatalf("scan hardlinked source workspace: %v", err)
+	}
+	taskRoot := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRoot, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, inputDigest); err != nil {
+		t.Fatalf("prepare hardlinked Task Workspace view: %v", err)
+	}
+	viewRoot := filepath.Join(taskRoot, taskID, viewID, taskWorkspaceContentDirectory)
+	anchorInfo, err := os.Stat(filepath.Join(viewRoot, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasInfo, err := os.Stat(filepath.Join(viewRoot, "z.txt"))
+	if err != nil || !os.SameFile(anchorInfo, aliasInfo) {
+		t.Fatalf("Task Workspace hardlink identity = %v, %v; want same inode", aliasInfo, err)
+	}
+	first, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, "", "", 1)
+	if err != nil || first.NextCursor != "a.txt" || len(first.Files) != 1 {
+		t.Fatalf("first hardlink manifest page = %#v, %v", first, err)
+	}
+	second, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, first.ManifestSHA256, first.NextCursor, 1)
+	if err != nil || len(second.Files) != 1 || second.Files[0].HardlinkTo != "a.txt" || second.ManifestSHA256 != first.ManifestSHA256 {
+		t.Fatalf("hardlink manifest page = %#v, %v", second, err)
+	}
+	response, err := workspace.ExportTaskWorkspaceManifestPage(context.Background(), contract.TaskWorkspaceManifestRequest{
+		ProtocolVersion: contract.ProtocolVersion, TaskID: taskID, WorkspaceID: workspaceID, BindingVersion: 1,
+		InputRevision: 0, WorkspaceCheckpointRevision: 0, InputManifestSHA256: inputDigest, ViewID: viewID, Limit: 10,
+	})
+	if err != nil || len(response.Files) != 2 || response.Files[1].HardlinkTo != "a.txt" {
+		t.Fatalf("Task Workspace contract manifest = %#v, %v", response.Files, err)
+	}
+	block, err := workspace.ReadTaskWorkspaceBlock(context.Background(), taskID, viewID, first.ManifestSHA256, testSHA256(string(content)))
+	if err != nil || string(block) != string(content) {
+		t.Fatalf("read hardlink block = %q, %v", block, err)
+	}
+}
+
+func TestTaskWorkspaceCopiesPersistsAndExportsDanglingSymlinkWithoutBlocks(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const target = "missing.txt"
+	if err := os.Symlink(target, filepath.Join(sourcePath, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	_, inputDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatalf("scan source symlink: %v", err)
+	}
+	taskRootPath := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRootPath, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workspace.Close() })
+	viewID := "v" + strings.Repeat("a", 64)
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 3, 4, 9, inputDigest); err != nil {
+		t.Fatalf("prepare Task view: %v", err)
+	}
+	viewPath := filepath.Join(taskRootPath, taskID, viewID, taskWorkspaceContentDirectory)
+	linkPath := filepath.Join(viewPath, "dangling")
+	if info, err := os.Lstat(linkPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied dangling link = %v, %v; want symlink", info, err)
+	}
+	if got, err := os.Readlink(linkPath); err != nil || got != target {
+		t.Fatalf("copied symlink target = %q, %v; want %q", got, err, target)
+	}
+
+	page, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, "", "", 10)
+	if err != nil || len(page.Files) != 1 || page.Files[0].Kind != "symlink" || page.Files[0].SymlinkTarget != target ||
+		page.Files[0].SizeBytes != int64(len(target)) || page.Files[0].SHA256 != testSHA256(target) || len(page.Files[0].Chunks) != 0 {
+		t.Fatalf("symlink manifest page = %#v, %v", page, err)
+	}
+	loaded, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, page.ManifestSHA256, "", 10)
+	if err != nil || len(loaded.Files) != 1 || loaded.Files[0].Kind != "symlink" || loaded.Files[0].SymlinkTarget != target ||
+		len(loaded.Files[0].Chunks) != 0 || loaded.ManifestSHA256 != page.ManifestSHA256 {
+		t.Fatalf("persisted symlink manifest page = %#v, %v", loaded, err)
+	}
+	response, err := workspace.ExportTaskWorkspaceManifestPage(context.Background(), contract.TaskWorkspaceManifestRequest{
+		ProtocolVersion: contract.ProtocolVersion, TaskID: taskID, WorkspaceID: workspaceID, BindingVersion: 3,
+		InputRevision: 4, WorkspaceCheckpointRevision: 9, InputManifestSHA256: inputDigest, ViewID: viewID, Limit: 10,
+	})
+	if err != nil || len(response.Files) != 1 || response.Files[0].Kind != "symlink" || response.Files[0].SymlinkTarget != target || len(response.Files[0].Chunks) != 0 {
+		t.Fatalf("contract symlink response = %#v, %v", response, err)
+	}
+	if _, err := workspace.ReadTaskWorkspaceBlock(context.Background(), taskID, viewID, page.ManifestSHA256, testSHA256(target)); err == nil {
+		t.Fatal("ReadTaskWorkspaceBlock returned a block for a symlink target")
+	}
+}
+
+func TestReadTaskWorkspaceBlockDoesNotFollowSymlinkTarget(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "referent.txt"), []byte("private bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("referent.txt", filepath.Join(sourcePath, "link")); err != nil {
+		t.Fatal(err)
+	}
+	_, inputDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatalf("scan source symlink: %v", err)
+	}
+	taskRootPath := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRootPath, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workspace.Close() })
+	viewID := "v" + strings.Repeat("b", 64)
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, inputDigest); err != nil {
+		t.Fatalf("prepare Task view: %v", err)
+	}
+	viewPath := filepath.Join(taskRootPath, taskID, viewID, taskWorkspaceContentDirectory)
+	if info, err := os.Lstat(filepath.Join(viewPath, "link")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied link = %v, %v; want symlink", info, err)
+	}
+	page, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, "", "", 10)
+	if err != nil || len(page.Files) != 2 {
+		t.Fatalf("manifest page = %#v, %v", page, err)
+	}
+	linkFound := false
+	for _, file := range page.Files {
+		if file.Path == "link" {
+			linkFound = true
+			if file.Kind != "symlink" || file.SymlinkTarget != "referent.txt" || len(file.Chunks) != 0 {
+				t.Fatalf("link manifest entry = %#v", file)
+			}
+		}
+	}
+	if !linkFound {
+		t.Fatal("manifest page did not include the symlink")
+	}
+
+	sentinel := filepath.Join(t.TempDir(), "sentinel.txt")
+	const sentinelValue = "must stay untouched"
+	if err := os.WriteFile(sentinel, []byte(sentinelValue), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(viewPath, "link")
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sentinel, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspace.ReadTaskWorkspaceBlock(context.Background(), taskID, viewID, page.ManifestSHA256, testSHA256("referent.txt")); err == nil {
+		t.Fatal("ReadTaskWorkspaceBlock treated a symlink target as a block")
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != sentinelValue {
+		t.Fatalf("external sentinel = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestTaskWorkspaceRejectsEscapingSymlinkWithoutChangingSentinel(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "keep.txt"), []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, inputDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(t.TempDir(), "sentinel.txt")
+	const sentinelValue = "must stay untouched"
+	if err := os.WriteFile(sentinel, []byte(sentinelValue), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sentinel, filepath.Join(sourcePath, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	taskRootPath := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRootPath, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workspace.Close() })
+	viewID := "v" + strings.Repeat("c", 64)
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, inputDigest); err == nil {
+		t.Fatal("PrepareTaskWorkspaceView accepted an absolute symlink target")
+	}
+	if _, err := os.Lstat(filepath.Join(taskRootPath, taskID, viewID)); !os.IsNotExist(err) {
+		t.Fatalf("unsafe Task Workspace view was published: %v", err)
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != sentinelValue {
+		t.Fatalf("external sentinel = %q, %v; want unchanged", got, err)
 	}
 }
 
@@ -160,7 +513,7 @@ func TestTaskWorkspaceCopiesAndExportsEmptyDirectories(t *testing.T) {
 	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, digest); err != nil {
 		t.Fatalf("prepare Task view with empty directories: %v", err)
 	}
-	viewPath := filepath.Join(workspace.taskRootPath, taskID, viewID)
+	viewPath := filepath.Join(workspace.taskRootPath, taskID, viewID, taskWorkspaceContentDirectory)
 	for _, directory := range manifest.EmptyDirectories {
 		info, err := os.Stat(filepath.Join(viewPath, filepath.FromSlash(directory)))
 		if err != nil || !info.IsDir() {
@@ -202,6 +555,9 @@ func TestTaskManifestTreeSHA256CanonicalizesFileAndDirectoryOrder(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if firstDigest != "00365fdf903c2eebb6173f251ee27cd1c30ff7e15f2da69962d05e1fa77944ae" {
+		t.Fatalf("regular-only tree digest = %q; want existing v2 digest", firstDigest)
+	}
 	secondDigest, err := taskManifestSHA256(second)
 	if err != nil || firstDigest != secondDigest {
 		t.Fatalf("tree digest depends on directory order: %q, %q, %v", firstDigest, secondDigest, err)
@@ -216,6 +572,26 @@ func TestTaskManifestSHA256FileOnlyKeepsV1Digest(t *testing.T) {
 	digest, err := taskManifestSHA256(manifest)
 	if err != nil || digest != "411449d004e66ac3f2a4ae4f408ebc3b187b651078e43d098da6704c3ecf0bfe" {
 		t.Fatalf("file-only manifest digest = %q, %v; want existing V1 digest", digest, err)
+	}
+}
+
+func TestTaskManifestSHA256IncludesSymlinkKindAndTarget(t *testing.T) {
+	makeManifest := func(target string) mordesync.Manifest {
+		return mordesync.Manifest{
+			FileCount: 1, TotalBytes: int64(len(target)),
+			Files: []mordesync.File{{
+				Path: "link", Kind: "symlink", SymlinkTarget: target, Size: int64(len(target)),
+				Mode: 0, SHA256: testSHA256(target),
+			}},
+		}
+	}
+	first, err := taskManifestSHA256(makeManifest("missing.txt"))
+	if err != nil || first != "2e1916eb69ff9b7588f5b099265f2d12811fcd5d68a18e81415261ff4b30236f" {
+		t.Fatalf("symlink manifest digest = %q, %v; want canonical digest including kind and target", first, err)
+	}
+	second, err := taskManifestSHA256(makeManifest("other.txt"))
+	if err != nil || first == second {
+		t.Fatalf("symlink target change kept the manifest digest: %q, %q, %v", first, second, err)
 	}
 }
 
@@ -430,6 +806,6 @@ func openTaskExportWorkspace(t *testing.T, files map[string]string) (*Workspace,
 	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 3, 4, 9, inputDigest); err != nil {
 		t.Fatalf("prepare task workspace view: %v", err)
 	}
-	viewPath := filepath.Join(taskRootPath, taskID, viewID)
+	viewPath := filepath.Join(taskRootPath, taskID, viewID, taskWorkspaceContentDirectory)
 	return workspace, taskID, viewID, inputDigest, viewPath
 }

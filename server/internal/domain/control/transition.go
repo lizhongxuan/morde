@@ -37,6 +37,7 @@ var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 type BeginRequest struct {
 	HostID                 string
 	OwnerID                string
+	ActorUserID            string
 	RequestID              string
 	Action                 Action
 	ExpectedControlVersion int64
@@ -48,6 +49,9 @@ func (r BeginRequest) Validate() error {
 	}
 	if !domain.ValidUserID(r.OwnerID) {
 		return domain.InvalidArgument("owner_id", "owner id is invalid")
+	}
+	if !domain.ValidUserID(r.ActorUserID) {
+		return domain.InvalidArgument("actor_user_id", "actor user id is invalid")
 	}
 	if !ValidRequestID(r.RequestID) {
 		return domain.InvalidArgument("request_id", "request id is invalid")
@@ -70,6 +74,7 @@ func ValidRequestID(requestID string) bool {
 type Transition struct {
 	HostID                 string          `json:"host_id"`
 	OwnerID                string          `json:"owner_id"`
+	ActorUserID            string          `json:"actor_user_id"`
 	RequestID              string          `json:"request_id"`
 	Action                 Action          `json:"action"`
 	Phase                  Phase           `json:"phase"`

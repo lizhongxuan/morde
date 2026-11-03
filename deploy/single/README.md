@@ -1,5 +1,7 @@
 # 基础版单机启动
 
+项目模型调用必须配置 `models.project_rates`：每个 `model_id` 对应一个版本化费率，`model` 要与平台连接实际使用的上游模型一致，输入/输出费率单位为每百万 token 的货币微单位。费率变更时递增 `version`；空列表（默认）会拒绝项目模型调用，避免未计价调用绕过预算。配置字段见 `deploy/single/portal.yaml`。
+
 > 唯一网络方案：runsc + 专用 Docker 网桥 + 宿主 nftables。固定 OSB 不发送 networkPolicy、不部署 egress sidecar。规则检查失败时 Portal 启动、readiness 和创建均失败。
 
 目标环境为 Linux：Docker 已注册 runsc，安装 nftables、Python 3.11+（tomllib）、coreutils 和 util-linux（flock）。当前测试机只有一块系统盘，因此 Docker、PostgreSQL 和系统日志仍共享物理盘；Portal 在 Docker 数据根目录剩余空间低于 10 GiB 时拒绝新建 Host，但不提供每个 Workspace 硬配额或数据库独立保护。默认只对外开放 Caddy，Portal/数据库/OpenSandbox/Host 端口保持回环监听。F02 私有 Syncthing relay 使用独立 Compose profile，默认不启动；公网入口仅开放 TCP 22067，不开放 relay status 端口。账号节点使用普通 Docker bridge；启动前 nftables 先建立空的 relay 接口白名单，默认拒绝主机入站、跨网络转发和未授权的已建立流量。仅允许 Portal 访问账号节点 REST TCP 8384 的已建立响应；只有当前设备/Workspace 配置已应用并持久提交后，才放行该账号 bridge 到 relay 主机绑定 IPv4 的 TCP 22067 及同一账号接口的返回包；撤权在数据库更新前先关闭该账号接口。Relay 不接入账号 bridge。执行前先跑 `m0/02-gvisor.sh`，证明固定 AIO 的核心接口和浏览器可用。
@@ -32,7 +34,7 @@ SYNCTHING_SOURCE_DIR="/path/to/local/syncthing-f02-worktree" IMAGE_PLATFORM=linu
 
    安装前要求 `web/portal/dist/index.html`、`web/portal/dist/admin/index.html`、`web/portal/dist/app/index.html` 和 `web/workbench/dist/index.html` 均已生成；任一入口缺失时安装会失败。正式 PC 客户端基于 `project/nanoMuse/harness/desktop` 二开并复用唯一同步引擎 `project/morde-sync`；其签名、公证和下载发布不在本部署步骤内。
 
-每个 Host 还会创建一个独立的 `runtime-<host_id>` Docker named volume，挂载到 `/var/lib/morde-runtime`，用于运行端状态；入口将其初始化为 `root:root`、`0700`。OpenSandbox 新建 Workspace 卷默认是 root-owned，Morde entrypoint 启动时将 Workspace 根初始化为 `root:1000`、`2770`（setgid），确保固定 AIO UID/GID 1000 可读写；运行端原子创建的文件以 `0660` 提交，用户组可继续编辑。删除 Host 或清理失败 Sandbox 时，先确认 Sandbox 已清理，再回收 runtime 卷；Workspace 是否保留不影响 runtime 卷回收。当前 OpenSandbox Docker 后端会忽略 PVC `storage` 请求，因此模板发出的 `1Gi` 只是请求值，不是硬配额；Docker named volume 的用量仍受宿主 Docker 数据盘容量影响。运行端 operation store 已在本地实现，但尚未随精确 Morde 镜像在目标机验收。
+每个 Workspace 注册独立的 `workspace-<workspace_id>` Docker named volume，Host 只把已核验身份的卷挂载到 `/home/gem/workspace`；卷 registry 已就绪但卷缺失或标签不符时启动失败，不会创建空卷替代。旧 `workspace-root` 卷仅供唯一明确绑定它的旧 Host 使用；`runtime-data` 与 `host-apps` 旧卷均保留，等待 W22 迁移和回滚预检。新 Host 不再挂载独立 `host-apps` 卷，Apps catalog 使用容器临时目录 `/run/morde-runtime/apps`。`runtime-<host_id>` 卷仍挂载 `/var/lib/morde-runtime`，保存 Runtime cache 与本地日志证据；Runtime 操作账本的权威副本已迁至 Portal PostgreSQL。Host 入口以 `root:root`、`0700` 初始化 runtime 目录，以 `root:1000`、`3770`（setgid）初始化 Workspace 根；AIO UID/GID 1000 可读写，Runtime 原子提交的文件使用 `0660`。新 Workspace Host 的空 profile 默认桌面目录及 Chromium 下载目录指向 Workspace；已有非空 profile 目录、用户自定义路径和旧卷保持原样。删除 Host 或清理失败 Sandbox 时，确认 Sandbox 已清理后再回收 Host runtime 卷；Workspace named volume 独立于 Host 生命周期。OpenSandbox Docker 后端忽略 PVC `storage` 请求，因此 `20Gi` 只是请求值，不是硬配额，Docker named volumes 仍受宿主 Docker 数据盘容量限制。固定 linux/amd64 镜像、Linux 卷重建和硬容量限额尚未验收；不要据此开放依赖这些能力的正式功能。
 Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退避重启；AIO 和桌面进程继续运行，Host 健康检查在 Runtime readiness 恢复前保持失败。该机制只恢复 Runtime 控制面进程，不会恢复尚未登记的 PTY / GUI 会话，也不会把未知操作结果标成成功。
 
 6. 在仓库根目录切换到 root shell，指定现有专用服务账户并启动基础服务。执行前先把有硬容量上限的专用数据文件系统挂载到 `CH_WORKSPACE_SYNC_DATA_ROOT_DIR`，并让挂载根归服务账户所有、权限为 `0700`。该卷承载 `blocks/`、`current/`、`nodes/` 和 `relay/`；各目录不得另挂子卷。即使同步功能关闭，Portal 仍从同一卷读写块库和 Workspace 当前目录。`cloudhost.env` 遵循 systemd 的 EnvironmentFile 语法；不要用 Bash `source` 执行它，尤其是多行 Caddy 配置。下面的读取器只提取单行路径和本地服务地址，不读取或打印密码、API Key：
@@ -83,7 +85,7 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
 
    `workspace_sync_node.workspace_root` 是普通 Workspace 当前目录，`workspace_storage.root_dir` 是不可变块库；两者和 `.morde-staging`、同步接收临时文件、节点索引、relay 状态统一放在 `workspace_sync_node.data_root` 下的独立直接子目录。MVP 中当前目录是 PostgreSQL revision 与块库的可重建投影，私有 `.morde-revisions` marker 会在 Portal 启动对账时发现目录缺失或数据库恢复到不同 revision，并重建目录。`backup.py` 仍备份 PostgreSQL 与块库，不备份当前目录；这个恢复合同只适用于直接 Syncthing 写入关闭的 MVP。用户已选择“共享硬上限”：用一个独立、固定容量且非 thin-provisioned 的文件系统限制全部 Workspace 同步数据；它必须与系统、Docker、Site、PostgreSQL 分离。Portal 启动和 systemd 安装门禁要求数据根是活动 mount，并要求 blocks/current 以及启用同步时的 nodes/relay 是彼此独立的直接子目录、没有嵌套挂载且同属该文件系统；Portal 服务仅绑定这一个 mount。接收新文件前，服务端按共享卷 `MinFreeBytes` 余量及本次文件大小做容量准入，空间不足时拒绝新的写入 reservation；删除仍允许。底层文件系统容量是所有数据的最终硬上限。该门禁只能验证挂载拓扑和当时的可用空间，不能证明云盘底层无 thin overcommit，也不能把并发准入转换为容量预留；同时写入仍由文件系统硬上限兜底。一个账号仍受现有逻辑块额度约束，但共享卷满时不保证每个账号都能同时用满逻辑额度。升级或更改根目录后重跑安装脚本；挂载维护必须通过 systemd 管理。当前 Ubuntu 尚未准备该固定容量卷，未完成真实容量及接收验收前继续保持 `workspace-sync` 关闭。
 
-   升级旧版本时，先为 `CH_WORKSPACE_SYNC_DATA_ROOT_DIR` 准备独立、固定容量的活动挂载，并确认挂载根由 Portal 账户持有且为 `0700`；块库、当前目录、节点与 relay 状态必须是其彼此独立的直接子目录。旧部署没有这些变量或仍把根指向普通目录时，必须先完成挂载和环境文件更新。旧版若把 block/current/node/relay 分别放在其他数据根，须先停止 Portal、同步节点与 relay，在新共享卷上离线复制数据并核对完整性；本流程不自动搬动这些数据，原目录需保留到备份和恢复核验完成。随后停止旧 Portal 和旧 Host 的写入，再执行 `migrate up`。导入器只读取未被任何 Docker 容器引用的旧卷；需移除引用该卷的旧 Host 容器，同时保留 named volume 本身，并确认容器内没有需要保留的非卷数据。逐个运行 `.local/bin/portal workspace import-legacy --workspace <workspace-id> --config deploy/single/portal.yaml`。导入成功前不要删除旧卷；导入后再执行 `workspace verify`。Portal 会在仍有待导入旧卷时拒绝启动，并提示待处理 Workspace。全新安装没有待迁移的旧卷，可直接运行下面的 verify。
+   升级旧版本时，先为 `CH_WORKSPACE_SYNC_DATA_ROOT_DIR` 准备独立、固定容量的活动挂载，并确认挂载根由 Portal 账户持有且为 `0700`；块库、当前目录、节点与 relay 状态必须是其彼此独立的直接子目录。旧部署没有这些变量或仍把根指向普通目录时，必须先完成挂载和环境文件更新。旧版若把 block/current/node/relay 分别放在其他数据根，须先停止 Portal、同步节点与 relay，在新共享卷上离线复制数据并核对完整性；本流程不自动搬动这些数据，原目录需保留到备份和恢复核验完成。随后停止旧 Portal 和旧 Host 的写入，再执行 `migrate up`。导入器只读取未被任何 Docker 容器引用的旧卷；需移除引用该卷的旧 Host 容器，同时保留 named volume 本身，并确认容器内没有需要保留的非卷数据。逐个运行 `.local/bin/portal workspace import-legacy --workspace <workspace-id> --config deploy/single/portal.yaml`。旧共享 Workspace 卷根下若有合法 Workspace ID 命名的一级子目录，导入器只读取与 `--workspace` 完全匹配的目录；缺少该目录、混有未分类根层内容或路径结构不安全时会拒绝并保留原卷，不会猜测归属。导入成功前不要删除旧卷；导入后再执行 `workspace verify`。Portal 会在仍有待导入旧卷时拒绝启动，并提示待处理 Workspace。全新安装没有待迁移的旧卷，可直接运行下面的 verify。
 
    `portal workspace verify` 会只读核对数据库所有历史 Workspace revision 引用的正文块，以及块目录里的哈希、大小和路径；发现缺块、损坏或未知残留时失败并保留原文件。它是完整性检查，不会创建备份，也不能替代数据库与正文块的一致备份 / 恢复演练。
 7. 登录门户，创建主机并进入工作台，验证浏览器、终端和文件；在 API Key 页创建平台 Key，按 `examples/agent/codex/config.toml` 接入 MCP。预览为私有，用户先进入主机再打开预览链接。删除主机默认保留工作目录；自动空闲释放当前禁用，用户显式释放计算资源时保留 Host、Workspace 和 runtime 数据。
@@ -94,7 +96,7 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
 
 ## 离线备份与恢复
 
-`backup/backup.py` 的 v3 bundle 包含四个本地数据根：PostgreSQL 完整数据目录、连续 WAL 归档、Workspace 不可变块、Site 发布物。个人附件块、记录正文及记录专用附件随 PostgreSQL 目录备份；Workspace 当前文件投影不归档，恢复后由数据库 revision 与块库重建。校验覆盖校验和、tar 路径、控制文件、WAL 段与块/发布物结构，不逐行核对业务引用。
+`backup/backup.py` 的 v4 bundle 包含四个本地数据根：PostgreSQL 完整数据目录、连续 WAL 归档、Workspace 不可变块、Site 发布物，以及 Morde-managed、`cloudhost` Compose 和已知旧 Host/Workspace Docker named volumes。个人附件块、记录正文及记录专用附件随 PostgreSQL 目录备份；Workspace 当前文件投影不归档，恢复后由数据库 revision 与块库重建。校验覆盖校验和、tar 路径、控制文件、WAL 段、卷归档与块/发布物结构，不逐行核对业务引用。
 
 PostgreSQL 容器启用 WAL 归档和 60 秒切段。部署前在独立于 Workspace 数据文件系统的位置创建归档目录，并设为 PostgreSQL 容器用户 `999:999`、权限 `0700`；安装器会拒绝目录缺失、权限不符、与 PGDATA/Workspace 重叠或与 Workspace 共用文件系统。例如：
 
@@ -104,7 +106,7 @@ sudo install -d -o 999 -g 999 -m 0700 /srv/cloudhost-postgres-wal-archive
 
 归档包含数据库变更日志，需限制本地介质访问；当前没有自动保留/清理策略，容量会随写入持续增长。
 
-备份与恢复不会自动停止或启动服务。先通过实际使用的进程管理器停止 `portal serve`，再停止 Compose 中的 PostgreSQL，并在整个操作期间保持二者停止；同时停止所有能写入四个数据根或 Workspace 当前目录的进程。脚本会检查 Portal/PostgreSQL 未运行、PostgreSQL 已干净关闭及运行中容器没有重叠的可写挂载，但无法阻止外部管理器重新启动服务。例如：
+备份与恢复不会自动停止或启动服务。先通过实际使用的进程管理器停止 `portal serve` 和所有 Host/Sandbox，再停止 Compose 服务；保持 Portal、PostgreSQL、Host/Sandbox 及其他写入者停止，并移除引用待归档 named volume 的容器（包括已停止容器），保留卷本身。保留 Compose 中已退出的 `postgres` 容器，脚本需要确认该数据库容器存在且已干净关闭。Docker Compose `down` 会移除这个容器；如使用 `down`，之后需先重建并停止 PostgreSQL 容器，再运行脚本。任何时候都不要加 `-v` 或删除 named volume。脚本会检查 Portal/PostgreSQL 未运行、PostgreSQL 已干净关闭、无运行容器写入受保护目录，并且待归档卷未被任何容器引用；它无法阻止外部管理器重新启动服务。例如：
 
 ```sh
 sudo docker compose --env-file /etc/cloudhost/cloudhost.env -f deploy/single/docker-compose.yml stop postgres
@@ -130,16 +132,16 @@ sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py c
   --destination "/var/backups/morde/morde-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-v3 bundle 只写到本机指定目录，不覆盖已存在的 bundle；目录权限为 `0700`，bundle 文件为 `0600`。metadata 记录四个源路径、PostgreSQL 镜像 digest、系统 ID、时间线、checkpoint/redo LSN、WAL 段大小和数据统计。当前脚本不支持旧 v1/v2 bundle；若仍需它们，请在升级前保留旧脚本与归档。备份目标需容纳四份完整归档及 rollback bundle；`verify` 会在 `TMPDIR`（通常为 `/tmp`）解包临时副本，也需预留相应空间。`verify` 不连接或修改在线服务，且需要本机已缓存 metadata 中记录的精确 PostgreSQL 镜像。
+v4 bundle 只写到本机指定目录，不覆盖已存在的 bundle；目录权限为 `0700`，bundle 文件为 `0600`。metadata 记录四个源路径、PostgreSQL 镜像 digest、系统 ID、时间线、checkpoint/redo LSN、WAL 段大小、数据统计，以及所有 `morde.managed_by=portal`、`cloudhost` Compose 和已知未标记 Workspace/Host 旧卷的身份、归档路径、大小及 SHA-256。采集前后会比对 Docker 全部卷名和待归档卷身份；卷变化、未知 Morde 卷身份、非本地驱动、自定义卷选项或仍被容器引用时拒绝并删除未完成 bundle。其他 Compose 项目的卷不会纳入备份。v3 仅能离线校验，不能用于新建 `restore`；其已中断的目录恢复仍可用 `recover` 回滚。当前脚本不支持 v1/v2，若仍需它们，请在升级前保留旧脚本与归档。备份目标需容纳四份完整归档、所有目标 named volume 归档及 rollback bundle；`verify` 会在 `TMPDIR`（通常为 `/tmp`）解包四个目录归档并校验卷归档，也需预留相应空间。`verify` 不连接或修改在线服务，且需要本机已缓存 metadata 中记录的精确 PostgreSQL 镜像。
 
 ```sh
 BUNDLE=/var/backups/morde/morde-实际时间戳
 sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py verify --bundle "$BUNDLE"
 ```
 
-`restore` 使用两个经校验的 bundle：从较早的 base bundle 取 PostgreSQL 数据目录，从较后的 follow-up bundle 取 WAL、Workspace、Site；PostgreSQL 在隔离容器中重放 WAL 到 follow-up checkpoint 并提升。两个 bundle 必须属于同一 PostgreSQL 系统、同一时间线、相同路径和镜像 digest，且连续 WAL 段齐全；follow-up checkpoint 还必须不早于当前数据库状态。这样保留随 PostgreSQL 事务记录的新增、删除和撤权状态。条件不满足时，会在替换数据目录前失败。此恢复不能修复损坏或缺失的当前目录，因为脚本需要读取当前状态并创建 rollback bundle。
+`restore` 使用两个经校验的 v4 bundle：从较早的 base bundle 取 PostgreSQL 数据目录，从较后的 follow-up bundle 取 WAL、Workspace、Site 和全部部署 named volume；PostgreSQL 在隔离容器中重放 WAL 到 follow-up checkpoint 并提升。两个 bundle 必须属于同一 PostgreSQL 系统、同一时间线、相同路径和相同 Docker 卷身份，连续 WAL 段齐全；follow-up checkpoint 还必须不早于当前数据库状态。这样保留随 PostgreSQL 事务记录的新增、删除和撤权状态。条件不满足时，会在替换目录或卷前失败。此恢复不能修复损坏或缺失的当前目录，因为脚本需要读取当前状态并创建 rollback bundle。
 
-恢复会替换四个数据根，并在操作前创建并校验当前数据的 rollback bundle。确认服务已停止、bundle 已验证，且同级目录和 `TMPDIR` 有足够空间后，在交互终端执行；准确输入脚本显示的四个目标路径才会继续：
+恢复会替换四个数据根和 bundle 中列出的 named volume，并在操作前创建并校验包含当前目录和卷内容的 rollback bundle。卷内容按顺序写入；每个卷在 journal 中记录恢复进度，失败时用 rollback bundle 重放原卷。确认服务已停止、卷没有容器引用、bundle 已验证，且同级目录、卷空间和 `TMPDIR` 有足够空间后，在交互终端执行；准确输入脚本显示的四个目标路径和 `DOCKER_VOLUMES` 名单才会继续：
 
 ```sh
 set -e
@@ -161,7 +163,7 @@ sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py r
   --confirm-restore
 ```
 
-恢复完成前不要启动服务。脚本会保留 rollback bundle；若目录替换期间意外中断，保持服务停止，保留 `.pre-restore-*`、`.morde-restore-*` 路径和 rollback bundle，不要手工改名或删除。仅对这类中断执行下面的 `recover`：
+恢复完成前不要启动服务。脚本会保留 rollback bundle；若卷或目录替换期间意外中断，保持服务停止，保留 `.pre-restore-*`、`.morde-restore-*` 路径和 rollback bundle，不要手工改名或删除。仅对这类中断执行下面的 `recover`；恢复会根据 journal 幂等地恢复已变更的 Docker 卷，再恢复原始目录：
 
 ```sh
 set -e
@@ -181,6 +183,6 @@ sudo env TMPDIR=/var/backups/morde/.tmp python3 deploy/single/backup/backup.py r
   --confirm-recover
 ```
 
-还必须在交互终端准确输入脚本显示的四个目标路径，才能恢复保留的原始目录。脚本会逐文件比对目录与已校验 rollback 归档；若不能证明目录状态，会标记 `manual_recovery_required` 并拒绝自动替换。遇到该状态、目标与原始目录都缺失或任何校验错误时，保持服务停止，保留所有路径和 rollback bundle，交由人工检查。
+还必须在交互终端准确输入脚本显示的四个目标路径和 Docker 卷名单，才能恢复保留的原始目录及卷。脚本会逐文件比对目录与已校验 rollback 归档，并重新归档卷校验 SHA-256；若不能证明目录或卷状态，会标记 `manual_recovery_required` 并拒绝自动替换。遇到该状态、目标与原始目录都缺失或任何校验错误时，保持服务停止，保留所有路径和 rollback bundle，交由人工检查。
 
-该工具不备份 Portal 二进制/迁移文件、配置、数据加密密钥、Cookie 密钥、Docker/Caddy named volumes、Host/Sandbox 卷或镜像。它不是跨版本或跨路径迁移工具；恢复后应用代码、数据库 schema、密钥和部署配置必须仍兼容。当前仅允许同系统、同时间线的 LSN 恢复，不能跨时间线分支。工具只支持同一 Linux 主机的原路径归档验证、恢复及中断恢复，拒绝符号链接和特殊文件；备份内容可能含用户数据，保存在受保护的本地介质上，自行管理介质保管。工具不加密、不上传。目标环境尚未完成真实备份/恢复演练；当前验证仅使用合成数据，不能替代演练。
+该工具归档 `cloudhost` Compose、Morde-managed Workspace 与已知旧 Workspace/Host named volumes，但不归档 Portal 二进制/迁移文件、配置、数据加密密钥、Cookie 密钥或镜像；不能单独作为跨版本升级包。自定义 Docker volume driver/options 会被拒绝。恢复后应用代码、数据库 schema、密钥和部署配置必须仍兼容。当前仅允许同系统、同时间线的 LSN 恢复，不能跨时间线分支。工具只支持同一 Linux 主机的原路径归档验证、恢复及中断恢复；安全的相对符号链接可以保留，路径逃逸、硬链接和特殊文件会被拒绝。备份内容可能含用户数据，保存在受保护的本地介质上，自行管理介质保管。工具不加密、不上传。目标环境尚未完成真实备份/恢复演练；当前验证仅使用合成数据，不能替代演练。

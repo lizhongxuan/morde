@@ -23,6 +23,27 @@ type adminOperationsServiceStub struct {
 	updateErr error
 }
 
+type adminModelBudgetDefaultServiceStub struct {
+	value     app.ModelBudgetDefault
+	command   app.UpdateModelBudgetDefaultCommand
+	ip        string
+	getErr    error
+	updateErr error
+}
+
+func (s *adminModelBudgetDefaultServiceStub) Get(context.Context, identity.Principal) (app.ModelBudgetDefault, error) {
+	return s.value, s.getErr
+}
+
+func (s *adminModelBudgetDefaultServiceStub) Update(_ context.Context, _ identity.Principal, command app.UpdateModelBudgetDefaultCommand, ip string) (app.ModelBudgetDefault, error) {
+	s.command, s.ip = command, ip
+	if s.updateErr != nil {
+		return app.ModelBudgetDefault{}, s.updateErr
+	}
+	s.value = app.ModelBudgetDefault{Configured: true, TokenLimit: command.TokenLimit, MaxConcurrent: command.MaxConcurrent, Version: command.ExpectedVersion + 1}
+	return s.value, nil
+}
+
 func (s *adminOperationsServiceStub) Settings(context.Context, identity.Principal) (app.AdminSettings, error) {
 	return s.settings, nil
 }
@@ -58,12 +79,15 @@ func (s *adminOperationsServiceStub) UpdateNudgePolicy(_ context.Context, _ iden
 func TestAdminOperationsRoutesRequireAdminAndReturnSafeEmptyStates(t *testing.T) {
 	services := newServices()
 	services.verifier.role = identity.RoleAdmin
-	settings := app.AdminSettings{RegistrationReviewRequired: true, DefaultPersonalDataQuotaBytes: 5 << 30, DefaultPersonalAttachmentBytes: 300 << 20}
+	settings := app.AdminSettings{RegistrationReviewRequired: true, AutomaticNewUserModelBudget: true,
+		DefaultPersonalDataQuotaBytes: 5 << 30, DefaultPersonalAttachmentBytes: 300 << 20}
 	nudge := app.AdminNudgePolicy{Version: 1}
 	operations := &adminOperationsServiceStub{settings: settings, invites: app.AdminInvitePage{Items: []app.AdminInvite{}, Total: 0, TotalInviters: 0},
 		sites: app.AdminSitePage{Items: []app.AdminSite{}, Summary: app.AdminSiteSummary{}}, nudge: nudge, code: "0123456789abcdef0123456789abcdef"}
+	modelBudgetDefaults := &adminModelBudgetDefaultServiceStub{}
 	deps := services.deps()
 	deps.AdminOperations = operations
+	deps.AdminModelBudgetDefaults = modelBudgetDefaults
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +96,8 @@ func TestAdminOperationsRoutesRequireAdminAndReturnSafeEmptyStates(t *testing.T)
 	response := requestWithCookie(router, http.MethodGet, "/api/admin/settings", cookie, "")
 	var got adminSettingsResponse
 	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil || response.Code != http.StatusOK || !got.RegistrationReviewRequired ||
-		got.AutomaticNewUserModelBudget || got.AutomaticInvitationReward || got.AutomaticContributionReward || got.DefaultPersonalDataQuotaBytes != 5<<30 {
+		!got.AutomaticNewUserModelBudget || got.AutomaticInvitationReward || got.AutomaticContributionReward || got.DefaultPersonalDataQuotaBytes != 5<<30 ||
+		got.DefaultModelBudget.Configured || got.DefaultModelBudget.Version != 0 {
 		t.Fatalf("admin settings = %d %+v err=%v body=%s", response.Code, got, err, response.Body)
 	}
 	invites := requestWithCookie(router, http.MethodGet, "/api/admin/invites?limit=10&offset=0", cookie, "")
@@ -101,6 +126,34 @@ func TestAdminOperationsRoutesRequireAdminAndReturnSafeEmptyStates(t *testing.T)
 	}
 	denied := requestWithCookie(userRouter, http.MethodGet, "/api/admin/invites", cookie, "")
 	assertError(t, denied, http.StatusForbidden, "forbidden")
+}
+
+func TestAdminModelBudgetDefaultUpdateRequiresFieldsAndUsesVersionCAS(t *testing.T) {
+	services := newServices()
+	services.verifier.role = identity.RoleAdmin
+	defaults := &adminModelBudgetDefaultServiceStub{}
+	deps := services.deps()
+	deps.AdminModelBudgetDefaults = defaults
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	updated := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-budget-default",
+		`{"expected_version":0,"token_limit":25000,"max_concurrent":2}`, cookie, "https://portal.example.test")
+	var got modelBudgetDefaultResponse
+	if err := json.Unmarshal(updated.Body.Bytes(), &got); err != nil || updated.Code != http.StatusOK || !got.Configured ||
+		got.TokenLimit != 25000 || got.MaxConcurrent != 2 || got.Version != 1 || defaults.command.ExpectedVersion != 0 ||
+		defaults.ip == "" {
+		t.Fatalf("default model budget = %d %+v command=%+v ip=%q err=%v body=%s", updated.Code, got, defaults.command, defaults.ip, err, updated.Body)
+	}
+	missing := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-budget-default",
+		`{"expected_version":1,"token_limit":1}`, cookie, "https://portal.example.test")
+	assertError(t, missing, http.StatusBadRequest, "invalid_argument")
+	defaults.updateErr = domain.NewError(domain.CodeConflict, "default model budget version changed")
+	stale := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-budget-default",
+		`{"expected_version":0,"token_limit":25000,"max_concurrent":2}`, cookie, "https://portal.example.test")
+	assertError(t, stale, http.StatusConflict, "conflict")
 }
 
 func TestAdminNudgeUpdatePassesCASAndMapsConflict(t *testing.T) {

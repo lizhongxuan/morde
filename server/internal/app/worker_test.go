@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/workspace"
@@ -124,9 +123,8 @@ func TestWorkerAppReconcileDeletesOnlyOrphansOwnedByInstance(t *testing.T) {
 	if actions["orphan_deleted"] != 1 || len(deps.sandbox.deleteCalls) != 1 || deps.sandbox.deleteCalls[0] != "owned-orphan" {
 		t.Fatalf("actions/deleted = %#v / %v", actions, deps.sandbox.deleteCalls)
 	}
-	if len(volume.names) != 3 || volume.names[0] != domain.RuntimeVolumeName("h7654321") ||
-		volume.names[1] != domain.ProfileVolumeName("h7654321") || volume.names[2] != domain.HostAppsVolumeName("h7654321") {
-		t.Fatalf("orphan runtime volume cleanup = %v", volume.names)
+	if len(volume.names) != 0 {
+		t.Fatalf("orphan cleanup deleted retained Host volumes = %v", volume.names)
 	}
 	if len(deps.audit.entries) != 1 || deps.audit.entries[0].Action != audit.ActionOrphanDeleted {
 		t.Fatalf("audit entries = %#v", deps.audit.entries)
@@ -147,9 +145,8 @@ func TestWorkerAppCleansOrphansForAlreadyDeletedHost(t *testing.T) {
 		t.Fatalf("deleted host orphan sandbox = %#v / %v", deps.sandbox.values["deleted-host-orphan"], deps.sandbox.deleteCalls)
 	}
 	volume := service.volumes.(*hostServiceTestVolume)
-	if len(volume.names) != 3 || volume.names[0] != domain.RuntimeVolumeName(value.ID) ||
-		volume.names[1] != domain.ProfileVolumeName(value.ID) || volume.names[2] != domain.HostAppsVolumeName(value.ID) {
-		t.Fatalf("deleted host orphan runtime volume cleanup = %v", volume.names)
+	if len(volume.names) != 0 {
+		t.Fatalf("deleted Host orphan cleanup removed retained volumes = %v", volume.names)
 	}
 }
 
@@ -284,9 +281,7 @@ func TestWorkerAppReconcileDeletesHostAfterVerifiedWorkspaceDetach(t *testing.T)
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
 	binding, _ := deps.workspaces.GetWorkspaceBinding(context.Background(), value.ID, testHostWorkspaceID(value))
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || binding.State != workspace.BindingDetached || len(volume.names) != 4 ||
-		volume.names[0] != domain.RuntimeVolumeName(value.ID) || volume.names[1] != domain.ProfileVolumeName(value.ID) ||
-		volume.names[2] != domain.HostAppsVolumeName(value.ID) || volume.names[3] != domain.WorkspaceRootVolumeName(value.ID) {
+	if got.State != host.StateDeleted || ws.State != workspace.StateReady || binding.State != workspace.BindingDetached || len(volume.names) != 0 {
 		t.Fatalf("host/workspace/binding/volume = %#v / %#v / %#v / %v", got, ws, binding, volume.names)
 	}
 }
@@ -321,7 +316,7 @@ func TestWorkerAppWaitsForHostActivityLeasesBeforeDeletingHost(t *testing.T) {
 	}
 	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
 	if got.State != host.StateDeleted || deps.sandbox.values[value.SandboxID].State != SandboxTerminated ||
-		len(deps.sandbox.deleteCalls) != 1 || len(volume.names) != 4 {
+		len(deps.sandbox.deleteCalls) != 1 || len(volume.names) != 0 {
 		t.Fatalf("Host after activity lease drain = %#v, sandbox=%#v, deletes=%v, volumes=%v",
 			got, deps.sandbox.values[value.SandboxID], deps.sandbox.deleteCalls, volume.names)
 	}
@@ -391,14 +386,12 @@ func TestWorkerAppReconcilePreservesWorkspaceForAlreadyDetachedBinding(t *testin
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
 	volume := service.volumes.(*hostServiceTestVolume)
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 4 ||
-		volume.names[0] != domain.RuntimeVolumeName(value.ID) || volume.names[1] != domain.ProfileVolumeName(value.ID) ||
-		volume.names[2] != domain.HostAppsVolumeName(value.ID) || volume.names[3] != domain.WorkspaceRootVolumeName(value.ID) {
+	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 0 {
 		t.Fatalf("host/detached workspace/volume = %#v / %#v / %v", got, ws, volume.names)
 	}
 }
 
-func TestWorkerAppKeepsDeletingHostUntilRuntimeVolumeCleanupSucceeds(t *testing.T) {
+func TestWorkerAppRetainsLegacyVolumesAfterHostDeletion(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateDeleting)
 	value.SandboxID = ""
@@ -410,102 +403,13 @@ func TestWorkerAppKeepsDeletingHostUntilRuntimeVolumeCleanupSucceeds(t *testing.
 	})
 	worker := newWorkerAppTest(t, service)
 	volume := service.volumes.(*hostServiceTestVolume)
-	volume.err = errors.New("volume still in use")
-
-	if _, err := worker.Reconcile(context.Background()); err == nil {
-		t.Fatal("Reconcile() error = nil, want runtime volume deletion failure")
-	}
-	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
-	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleting || ws.State != workspace.StateReady || len(volume.names) != 1 ||
-		volume.names[0] != domain.RuntimeVolumeName(value.ID) {
-		t.Fatalf("host/workspace/volume after failure = %#v / %#v / %v", got, ws, volume.names)
-	}
-
-	volume.err = nil
 	if _, err := worker.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
-	ws, _ = deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 5 ||
-		volume.names[1] != domain.RuntimeVolumeName(value.ID) || volume.names[2] != domain.ProfileVolumeName(value.ID) ||
-		volume.names[3] != domain.HostAppsVolumeName(value.ID) || volume.names[4] != domain.WorkspaceRootVolumeName(value.ID) {
-		t.Fatalf("host/workspace/volume after retry = %#v / %#v / %v", got, ws, volume.names)
-	}
-}
-
-func TestWorkerAppKeepsDeletingHostUntilProfileVolumeCleanupSucceeds(t *testing.T) {
-	service, deps := newHostServiceTest(t)
-	value := hostServiceTestHost(host.StateDeleting)
-	value.SandboxID = ""
-	value.Workspaces[0].State = workspace.BindingDetached
-	deps.hosts.addHost(value)
-	deps.workspaces.add(workspace.Workspace{
-		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID,
-		State: workspace.StateReady,
-	})
-	worker := newWorkerAppTest(t, service)
-	volume := service.volumes.(*hostServiceTestVolume)
-	volume.errByName = map[string]error{domain.ProfileVolumeName(value.ID): errors.New("profile volume still in use")}
-
-	if _, err := worker.Reconcile(context.Background()); err == nil {
-		t.Fatal("Reconcile() error = nil, want profile volume deletion failure")
-	}
 	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
 	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleting || ws.State != workspace.StateReady || len(volume.names) != 2 ||
-		volume.names[0] != domain.RuntimeVolumeName(value.ID) || volume.names[1] != domain.ProfileVolumeName(value.ID) {
-		t.Fatalf("host/workspace/volume after profile failure = %#v / %#v / %v", got, ws, volume.names)
-	}
-
-	volume.errByName[domain.ProfileVolumeName(value.ID)] = nil
-	if _, err := worker.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
-	ws, _ = deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 6 ||
-		volume.names[2] != domain.RuntimeVolumeName(value.ID) || volume.names[3] != domain.ProfileVolumeName(value.ID) ||
-		volume.names[4] != domain.HostAppsVolumeName(value.ID) || volume.names[5] != domain.WorkspaceRootVolumeName(value.ID) {
-		t.Fatalf("host/workspace/volume after profile retry = %#v / %#v / %v", got, ws, volume.names)
-	}
-}
-
-func TestWorkerAppKeepsDeletingHostUntilHostAppsVolumeCleanupSucceeds(t *testing.T) {
-	service, deps := newHostServiceTest(t)
-	value := hostServiceTestHost(host.StateDeleting)
-	value.SandboxID = ""
-	value.Workspaces[0].State = workspace.BindingDetached
-	deps.hosts.addHost(value)
-	deps.workspaces.add(workspace.Workspace{
-		ID: testHostWorkspaceID(value), OwnerID: value.OwnerID,
-		State: workspace.StateReady,
-	})
-	worker := newWorkerAppTest(t, service)
-	volume := service.volumes.(*hostServiceTestVolume)
-	volume.errByName = map[string]error{domain.HostAppsVolumeName(value.ID): errors.New("apps volume still in use")}
-
-	if _, err := worker.Reconcile(context.Background()); err == nil {
-		t.Fatal("Reconcile() error = nil, want Host apps volume deletion failure")
-	}
-	got, _ := deps.hosts.GetHost(context.Background(), value.ID)
-	ws, _ := deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleting || ws.State != workspace.StateReady || len(volume.names) != 3 ||
-		volume.names[2] != domain.HostAppsVolumeName(value.ID) {
-		t.Fatalf("host/workspace/volume after apps failure = %#v / %#v / %v", got, ws, volume.names)
-	}
-
-	volume.errByName[domain.HostAppsVolumeName(value.ID)] = nil
-	if _, err := worker.Reconcile(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = deps.hosts.GetHost(context.Background(), value.ID)
-	ws, _ = deps.workspaces.GetWorkspace(context.Background(), testHostWorkspaceID(value))
-	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 7 ||
-		volume.names[3] != domain.RuntimeVolumeName(value.ID) || volume.names[4] != domain.ProfileVolumeName(value.ID) ||
-		volume.names[5] != domain.HostAppsVolumeName(value.ID) || volume.names[6] != domain.WorkspaceRootVolumeName(value.ID) {
-		t.Fatalf("host/workspace/volume after apps retry = %#v / %#v / %v", got, ws, volume.names)
+	if got.State != host.StateDeleted || ws.State != workspace.StateReady || len(volume.names) != 0 {
+		t.Fatalf("host/workspace/retained volumes = %#v / %#v / %v", got, ws, volume.names)
 	}
 }
 

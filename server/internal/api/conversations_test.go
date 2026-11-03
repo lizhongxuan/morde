@@ -25,6 +25,12 @@ type conversationServiceStub struct {
 	conversation conversation.Conversation
 	messageID    string
 	messagePage  app.MessagePage
+	mainValue    conversation.MainConversation
+	getMainCalls int
+	ensureCmd    app.EnsureMainConversationCommand
+	ensureCalls  int
+	setCmd       app.SetMainConversationCommand
+	setCalls     int
 	err          error
 }
 
@@ -59,6 +65,30 @@ func (s *conversationServiceStub) ListMessages(_ context.Context, _ identity.Pri
 	return s.messagePage, s.err
 }
 
+func (s *conversationServiceStub) GetMain(context.Context, identity.Principal) (conversation.MainConversation, error) {
+	s.getMainCalls++
+	if s.mainValue.Status == "" {
+		return conversation.MainConversation{Status: conversation.MainConversationUninitialized}, s.err
+	}
+	return s.mainValue, s.err
+}
+
+func (s *conversationServiceStub) EnsureMain(_ context.Context, _ identity.Principal, command app.EnsureMainConversationCommand) (conversation.MainConversation, bool, error) {
+	s.ensureCalls++
+	s.ensureCmd = command
+	if s.mainValue.Status == "" || s.mainValue.Status == conversation.MainConversationUninitialized {
+		s.mainValue = conversation.MainConversation{Status: conversation.MainConversationReady, ConversationID: "c1234567", Version: 1}
+	}
+	return s.mainValue, false, s.err
+}
+
+func (s *conversationServiceStub) SetMain(_ context.Context, _ identity.Principal, command app.SetMainConversationCommand) (conversation.MainConversation, bool, error) {
+	s.setCalls++
+	s.setCmd = command
+	s.mainValue = conversation.MainConversation{Status: conversation.MainConversationReady, ConversationID: command.ConversationID, Version: command.ExpectedVersion + 1}
+	return s.mainValue, false, s.err
+}
+
 func TestConversationCreateHandlerUsesIdempotencyAndReturnsReplayStatus(t *testing.T) {
 	service := &conversationServiceStub{replayed: true}
 	engine := taskAPIRouter(nil, service)
@@ -85,6 +115,55 @@ func TestConversationCreateDoesNotRequireAHost(t *testing.T) {
 	}
 }
 
+func TestMainConversationHandlersUseReadonlyGetAndIdempotentMutations(t *testing.T) {
+	service := &conversationServiceStub{mainValue: conversation.MainConversation{Status: conversation.MainConversationUninitialized}}
+	engine := taskAPIRouter(nil, service)
+	read := httptest.NewRecorder()
+	engine.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/me/main-conversation", nil))
+	if read.Code != http.StatusOK || service.getMainCalls != 1 || service.ensureCalls != 0 ||
+		!strings.Contains(read.Body.String(), `"status":"uninitialized"`) || !strings.Contains(read.Body.String(), `"version":0`) {
+		t.Fatalf("read main conversation = %d %s, calls=%d/%d", read.Code, read.Body.String(), service.getMainCalls, service.ensureCalls)
+	}
+
+	ensure := httptest.NewRequest(http.MethodPost, "/api/me/main-conversation/ensure", nil)
+	ensure.Header.Set("Idempotency-Key", "main-ensure-001")
+	ensured := httptest.NewRecorder()
+	engine.ServeHTTP(ensured, ensure)
+	if ensured.Code != http.StatusOK || service.ensureCalls != 1 || service.ensureCmd.IdempotencyKey != "main-ensure-001" ||
+		!strings.Contains(ensured.Body.String(), `"status":"ready"`) || !strings.Contains(ensured.Body.String(), `"conversation_id":"c1234567"`) {
+		t.Fatalf("ensure main conversation = %d %s, calls=%d command=%+v", ensured.Code, ensured.Body.String(), service.ensureCalls, service.ensureCmd)
+	}
+
+	switchRequest := httptest.NewRequest(http.MethodPut, "/api/me/main-conversation", strings.NewReader(`{"conversation_id":"c7654321","expected_version":1}`))
+	switchRequest.Header.Set("Content-Type", "application/json")
+	switchRequest.Header.Set("Idempotency-Key", "main-switch-001")
+	switched := httptest.NewRecorder()
+	engine.ServeHTTP(switched, switchRequest)
+	if switched.Code != http.StatusOK || service.setCalls != 1 || service.setCmd.ConversationID != "c7654321" ||
+		service.setCmd.ExpectedVersion != 1 || service.setCmd.IdempotencyKey != "main-switch-001" ||
+		!strings.Contains(switched.Body.String(), `"version":2`) {
+		t.Fatalf("switch main conversation = %d %s, calls=%d command=%+v", switched.Code, switched.Body.String(), service.setCalls, service.setCmd)
+	}
+}
+
+func TestMainConversationEnsureRejectsMissingKeyAndSwitchRequiresVersion(t *testing.T) {
+	service := &conversationServiceStub{}
+	engine := taskAPIRouter(nil, service)
+	missingKey := httptest.NewRecorder()
+	engine.ServeHTTP(missingKey, httptest.NewRequest(http.MethodPost, "/api/me/main-conversation/ensure", nil))
+	if missingKey.Code != http.StatusBadRequest || service.ensureCalls != 0 {
+		t.Fatalf("ensure without key = %d %s, calls=%d", missingKey.Code, missingKey.Body.String(), service.ensureCalls)
+	}
+	missingVersion := httptest.NewRequest(http.MethodPut, "/api/me/main-conversation", strings.NewReader(`{"conversation_id":"c1234567"}`))
+	missingVersion.Header.Set("Content-Type", "application/json")
+	missingVersion.Header.Set("Idempotency-Key", "main-switch-002")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, missingVersion)
+	if response.Code != http.StatusBadRequest || service.setCalls != 0 {
+		t.Fatalf("switch without expected version = %d %s, calls=%d", response.Code, response.Body.String(), service.setCalls)
+	}
+}
+
 func TestConversationListReturnsEmptyItemsAndNullCursor(t *testing.T) {
 	engine := taskAPIRouter(nil, &conversationServiceStub{})
 	response := httptest.NewRecorder()
@@ -101,12 +180,40 @@ func TestConversationListReturnsEmptyItemsAndNullCursor(t *testing.T) {
 	}
 }
 
+func TestConversationResponsesIncludePersonalScopeAndMainIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	service := &conversationServiceStub{
+		mainValue:    conversation.MainConversation{Status: conversation.MainConversationReady, ConversationID: "c1234567", Version: 3},
+		listPage:     app.ConversationPage{Items: []conversation.Conversation{{ID: "c1234567", OwnerID: "u1234567", CreatedAt: now, UpdatedAt: now}}},
+		conversation: conversation.Conversation{ID: "c1234567", OwnerID: "u1234567", CreatedAt: now, UpdatedAt: now},
+	}
+	engine := taskAPIRouter(nil, service)
+	list := httptest.NewRecorder()
+	engine.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/conversations", nil))
+	var listed conversationPageResponse
+	if err := json.Unmarshal(list.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if list.Code != http.StatusOK || len(listed.Items) != 1 || listed.Items[0].Scope != "personal" || !listed.Items[0].IsMain {
+		t.Fatalf("conversation list response = %d %+v, body=%s", list.Code, listed, list.Body.String())
+	}
+	get := httptest.NewRecorder()
+	engine.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567", nil))
+	var single conversationResponse
+	if err := json.Unmarshal(get.Body.Bytes(), &single); err != nil {
+		t.Fatal(err)
+	}
+	if get.Code != http.StatusOK || single.Scope != "personal" || !single.IsMain {
+		t.Fatalf("single conversation response = %d %+v, body=%s", get.Code, single, get.Body.String())
+	}
+}
+
 func TestConversationMessagesReturnChronologicalItems(t *testing.T) {
 	older := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 	newer := older.Add(time.Second)
 	service := &conversationServiceStub{messagePage: app.MessagePage{Items: []conversation.Message{
-		{ID: "m1234567", ConversationID: "c1234567", Role: conversation.RoleUser, Content: "first", TaskID: "q1234567", CreatedAt: older},
-		{ID: "m7654321", ConversationID: "c1234567", Role: conversation.RoleAssistant, Content: "second", TaskID: "q1234567", CreatedAt: newer},
+		{ID: "m1234567", ConversationID: "c1234567", Role: conversation.RoleUser, Content: "first", TaskID: "q1234567", DeliveryStatus: conversation.DeliveryPending, CreatedAt: older},
+		{ID: "m7654321", ConversationID: "c1234567", Role: conversation.RoleAssistant, Content: "second", TaskID: "q1234567", DeliveryStatus: conversation.DeliveryApplied, CreatedAt: newer},
 	}}}
 	engine := taskAPIRouter(nil, service)
 	response := httptest.NewRecorder()
@@ -117,7 +224,8 @@ func TestConversationMessagesReturnChronologicalItems(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if response.Code != http.StatusOK || len(body.Items) != 2 || body.Items[0].Content != "first" || body.Items[1].Content != "second" || service.messageID != "c1234567" {
+	if response.Code != http.StatusOK || len(body.Items) != 2 || body.Items[0].Content != "first" || body.Items[1].Content != "second" ||
+		body.Items[0].DeliveryStatus != conversation.DeliveryPending || body.Items[1].DeliveryStatus != conversation.DeliveryApplied || service.messageID != "c1234567" {
 		t.Fatalf("status=%d messages=%#v id=%s body=%s", response.Code, body.Items, service.messageID, response.Body.String())
 	}
 }
@@ -126,7 +234,8 @@ func TestConversationMessagesReturnTasklessImportedHistoryAndAttachmentIDs(t *te
 	message := conversation.Message{
 		ID: "m1234567", ConversationID: "c1234567", Role: conversation.RoleUser,
 		Content: "Imported question", AttachmentIDs: []string{"pa_0123456789abcdef0123456789abcdef"},
-		CreatedAt: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC),
+		DeliveryStatus: conversation.DeliveryApplied,
+		CreatedAt:      time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC),
 	}
 	engine := taskAPIRouter(nil, &conversationServiceStub{messagePage: app.MessagePage{Items: []conversation.Message{message}}})
 	response := httptest.NewRecorder()

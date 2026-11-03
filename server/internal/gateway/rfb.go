@@ -175,6 +175,7 @@ type rfbFilteringBody struct {
 	ctx        context.Context
 	ref        host.Ref
 	permits    app.HostInputPermitStore
+	actorID    string
 	allowInput bool
 	onError    func(error)
 	frames     []byte
@@ -182,8 +183,8 @@ type rfbFilteringBody struct {
 	fragmented bool
 }
 
-func newRFBFilteringBody(upstream io.ReadWriteCloser, ctx context.Context, ref host.Ref, permits app.HostInputPermitStore, allowInput bool, onError func(error)) *rfbFilteringBody {
-	return &rfbFilteringBody{upstream: upstream, ctx: ctx, ref: ref, permits: permits, allowInput: allowInput, onError: onError}
+func newRFBFilteringBody(upstream io.ReadWriteCloser, ctx context.Context, ref host.Ref, permits app.HostInputPermitStore, actorID string, allowInput bool, onError func(error)) *rfbFilteringBody {
+	return &rfbFilteringBody{upstream: upstream, ctx: ctx, ref: ref, permits: permits, actorID: actorID, allowInput: allowInput, onError: onError}
 }
 
 func (b *rfbFilteringBody) Read(p []byte) (int, error) { return b.upstream.Read(p) }
@@ -315,7 +316,7 @@ func (b *rfbFilteringBody) acceptDataFrame(fin bool, opcode byte, payload []byte
 		defer cancel()
 		timer := time.AfterFunc(rfbInputWriteTimeout, func() { _ = b.Close() })
 		defer timer.Stop()
-		return b.permits.WithHostInputPermit(ctx, b.ref, func() error { return b.writeBinary(data) })
+		return b.permits.WithHostControlPermit(ctx, b.ref, b.actorID, host.PermissionDesktopControl, func() error { return b.writeBinary(data) })
 	}
 	return b.writeBinary(data)
 }

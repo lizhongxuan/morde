@@ -157,20 +157,6 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 		rootCredentialA, initialCheckpoint.ID, initialCheckpoint.TargetRevision)
 
 	writeWorkspaceSyncE2EFile(t, directoryA, "before-leaving.txt", []byte("checkpointed on Host A\n"))
-	activeBindingA, err := store.GetWorkspaceBinding(ctx, hostA.ID, workspaceValue.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	unbindingA, err := store.TransitionWorkspaceBinding(ctx, hostA.ID, workspaceValue.ID, activeBindingA.BindingVersion,
-		workspace.BindingActive, workspace.BindingUnbinding, activeBindingA.DesiredRevision, activeBindingA.AppliedRevision)
-	if err != nil || unbindingA.State != workspace.BindingUnbinding {
-		t.Fatalf("begin Host A unbinding = %#v, %v", unbindingA, err)
-	}
-	credentialA, unbindingCredential := hostHandoffBindingCredential(t, httpClient, httpServer.URL, hostA, rootCredentialA, workspaceValue.ID)
-	clientA, err = client.New(httpServer.URL, credentialA, httpClient)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var finalCheckpoint client.SyncSession
 	checkpointRevision, err := clientA.HandoffCheckpoint(ctx, client.LiveSyncOptions{
 		WorkspaceID: workspaceValue.ID, Directory: directoryA,
@@ -180,13 +166,23 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 		t.Fatalf("Host A final checkpoint = revision %d session %#v, %v", checkpointRevision, finalCheckpoint, err)
 	}
 	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostA.ID, hostA.RuntimeGeneration, workspaceValue.ID,
-		unbindingCredential.BindingVersion, finalCheckpoint.ID, checkpointRevision-1); err == nil {
+		bindingA.BindingVersion, finalCheckpoint.ID, checkpointRevision-1); err == nil {
 		t.Fatal("applied receipt accepted a revision different from the completed session target")
 	}
-	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, unbindingCredential.BindingVersion, workspaceValue.ID,
+	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, bindingA.BindingVersion, workspaceValue.ID,
 		rootCredentialA, finalCheckpoint.ID, checkpointRevision)
-	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, unbindingCredential.BindingVersion, workspaceValue.ID,
+	hostHandoffRecordApplied(t, httpClient, httpServer.URL, hostA, bindingA.BindingVersion, workspaceValue.ID,
 		rootCredentialA, finalCheckpoint.ID, checkpointRevision)
+	activeBindingA, err := store.GetWorkspaceBinding(ctx, hostA.ID, workspaceValue.ID)
+	if err != nil || activeBindingA.State != workspace.BindingActive || activeBindingA.DesiredRevision != checkpointRevision || activeBindingA.AppliedRevision != checkpointRevision {
+		t.Fatalf("Host A binding after final checkpoint = %#v, %v", activeBindingA, err)
+	}
+	unbindingA, err := store.TransitionWorkspaceBinding(ctx, hostA.ID, workspaceValue.ID, activeBindingA.BindingVersion,
+		workspace.BindingActive, workspace.BindingUnbinding, activeBindingA.DesiredRevision, activeBindingA.AppliedRevision)
+	if err != nil || unbindingA.State != workspace.BindingUnbinding {
+		t.Fatalf("begin Host A unbinding after checkpoint = %#v, %v", unbindingA, err)
+	}
+	_, unbindingCredential := hostHandoffBindingCredential(t, httpClient, httpServer.URL, hostA, rootCredentialA, workspaceValue.ID)
 	hostHandoffDetach(t, httpClient, httpServer.URL, hostA, unbindingCredential.BindingVersion, workspaceValue.ID, rootCredentialA, checkpointRevision)
 
 	staleCreate := []byte(fmt.Sprintf(`{"direction":"bidirectional","policy":"live","base_revision":%d,"files":[]}`, checkpointRevision))
@@ -202,15 +198,12 @@ func TestHostWorkspaceHandoffAtoBThroughHTTPAndPostgres(t *testing.T) {
 		t.Fatalf("stale Host A advanced revision to %d: %v", afterStaleA.Revision, err)
 	}
 
-	hostB, rootCredentialB := createHostHandoffTestHost(t, ctx, store, sealer, owner.ID, capacity, nil)
+	hostB, rootCredentialB := createHostHandoffTestHost(t, ctx, store, sealer, owner.ID, capacity, []string{workspaceValue.ID})
 	workspaceValue, err = store.GetWorkspace(ctx, workspaceValue.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	preparingB, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostB.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: checkpointRevision,
-	})
+	preparingB, err := store.GetWorkspaceBinding(ctx, hostB.ID, workspaceValue.ID)
 	if err != nil || preparingB.DesiredRevision != checkpointRevision {
 		t.Fatalf("bind Workspace to Host B at checkpoint = %#v, %v", preparingB, err)
 	}
@@ -429,7 +422,7 @@ func createHostHandoffTestHost(t *testing.T, ctx context.Context, store *Store, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	params := testCreateHostParams(t, ownerID, capacity, workspaceIDs)
+	params := testCreateHostParams(t, store, ownerID, capacity, workspaceIDs)
 	params.Host.RuntimeCredentialEnc = sealedCredential
 	created, _, err := store.CreateHost(ctx, params)
 	if err != nil {

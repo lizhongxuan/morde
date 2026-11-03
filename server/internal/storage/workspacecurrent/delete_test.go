@@ -11,7 +11,11 @@ import (
 )
 
 func TestDeleteRemovesWorkspaceTreeMarkerAndStaleStage(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "current")
+	tempRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(tempRoot, "current")
 	store, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
@@ -50,7 +54,11 @@ func TestDeleteRemovesWorkspaceTreeMarkerAndStaleStage(t *testing.T) {
 }
 
 func TestDeleteRejectsWorkspaceSymlinkWithoutRemovingTarget(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "current")
+	tempRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(tempRoot, "current")
 	store, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +72,11 @@ func TestDeleteRejectsWorkspaceSymlinkWithoutRemovingTarget(t *testing.T) {
 	if err := os.Mkdir(ownerRoot, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	outside := filepath.Join(t.TempDir(), "outside")
+	outsideRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(outsideRoot, "outside")
 	if err := os.Mkdir(outside, 0o700); err != nil {
 		t.Fatal(err)
 	}

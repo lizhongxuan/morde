@@ -5,11 +5,13 @@ import (
 	"time"
 
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 )
 
 const MaxAssistantMessageBytes = 32 << 10
+const maxEventPage = 100
 
 type PageRequest struct {
 	Limit  int32
@@ -88,6 +90,7 @@ type IdempotencyRecord struct {
 }
 
 type TaskSubmission struct {
+	ExpectedTaskID              string
 	Conversation                *conversation.Conversation
 	Task                        task.Task
 	Message                     conversation.Message
@@ -107,22 +110,23 @@ type TaskSubmissionResult struct {
 }
 
 type TaskProgress struct {
-	TaskID                 string
-	LeaseOwner             string
-	LeaseVersion           int64
-	Status                 task.Status
-	CurrentStep            string
-	Result                 string
-	WaitingReason          string
-	Usage                  task.Usage
-	ObservationFingerprint string
-	Steps                  []task.Step
-	Artifacts              []task.Artifact
-	Event                  task.Event
-	PendingRequest         *task.PendingRequest
-	ClarificationRequest   *task.ClarificationRequest
-	AssistantMessage       *conversation.Message
-	CloudDSHSkillRead      *CloudDSHSkillReadCommit
+	TaskID                   string
+	LeaseOwner               string
+	LeaseVersion             int64
+	Status                   task.Status
+	CurrentStep              string
+	Result                   string
+	WaitingReason            string
+	Usage                    task.Usage
+	ObservationFingerprint   string
+	Steps                    []task.Step
+	Artifacts                []task.Artifact
+	Event                    task.Event
+	PendingRequest           *task.PendingRequest
+	ClarificationRequest     *task.ClarificationRequest
+	AssistantMessage         *conversation.Message
+	CloudDSHSkillRead        *CloudDSHSkillReadCommit
+	CloudDSHPersonalMutation *CloudDSHPersonalMutationCommit
 }
 
 // CloudDSHSkillReadCommit binds a fixed skill response to one durable dsh call.
@@ -139,6 +143,18 @@ type CloudDSHSkillReadCommit struct {
 	SourceRef            string
 	ContentSHA256        string
 	OutputSHA256         string
+	FingerprintSHA256    string
+}
+
+// CloudDSHPersonalMutationCommit binds a personal object update to one dsh
+// call. The Task event records only metadata and hashes, never the body.
+type CloudDSHPersonalMutationCommit struct {
+	TaskID               string
+	OwnerID              string
+	AgentSessionID       string
+	AuthorizationVersion int64
+	CallID               string
+	Mutation             personal.Mutation
 	FingerprintSHA256    string
 }
 
@@ -194,6 +210,12 @@ type TaskStore interface {
 	GetConversation(context.Context, string, string) (conversation.Conversation, error)
 	ListConversations(context.Context, string, []string, PageRequest) (ConversationPage, error)
 	ListMessages(context.Context, string, string, PageRequest) (MessagePage, error)
+	// Project conversation operations must scope both by projectID and the
+	// actor's current membership, even when the caller has already checked access.
+	CreateProjectConversation(context.Context, string, conversation.Conversation, IdempotencyRecord) (conversation.Conversation, bool, error)
+	GetProjectConversation(context.Context, string, string, string) (conversation.Conversation, error)
+	ListProjectConversations(context.Context, string, string, PageRequest) (ConversationPage, error)
+	ListProjectConversationMessages(context.Context, string, string, string, PageRequest) (MessagePage, error)
 	SubmitTask(context.Context, TaskSubmission) (TaskSubmissionResult, error)
 	AppendMessage(context.Context, TaskSubmission) (TaskSubmissionResult, error)
 	GetTask(context.Context, string, string) (TaskDetails, error)

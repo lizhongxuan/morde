@@ -19,10 +19,15 @@ type ConversationService interface {
 	List(context.Context, identity.Principal, app.PageRequest) (app.ConversationPage, error)
 	Get(context.Context, identity.Principal, string) (conversation.Conversation, error)
 	ListMessages(context.Context, identity.Principal, string, app.PageRequest) (app.MessagePage, error)
+	GetMain(context.Context, identity.Principal) (conversation.MainConversation, error)
+	EnsureMain(context.Context, identity.Principal, app.EnsureMainConversationCommand) (conversation.MainConversation, bool, error)
+	SetMain(context.Context, identity.Principal, app.SetMainConversationCommand) (conversation.MainConversation, bool, error)
 }
 
 type conversationResponse struct {
 	ID        string    `json:"id"`
+	Scope     string    `json:"scope"`
+	IsMain    bool      `json:"is_main"`
 	HostID    string    `json:"host_id,omitempty"`
 	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
@@ -39,14 +44,26 @@ type createConversationRequest struct {
 	Title  string `json:"title"`
 }
 
+type setMainConversationRequest struct {
+	ConversationID  string `json:"conversation_id"`
+	ExpectedVersion *int64 `json:"expected_version"`
+}
+
+type mainConversationResponse struct {
+	Status         conversation.MainConversationStatus `json:"status"`
+	ConversationID string                              `json:"conversation_id"`
+	Version        int64                               `json:"version"`
+}
+
 type messageResponse struct {
-	ID             string            `json:"id"`
-	ConversationID string            `json:"conversation_id"`
-	Role           conversation.Role `json:"role"`
-	Content        string            `json:"content"`
-	TaskID         string            `json:"task_id,omitempty"`
-	AttachmentIDs  []string          `json:"attachment_ids,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
+	ID             string                      `json:"id"`
+	ConversationID string                      `json:"conversation_id"`
+	Role           conversation.Role           `json:"role"`
+	Content        string                      `json:"content"`
+	TaskID         string                      `json:"task_id,omitempty"`
+	AttachmentIDs  []string                    `json:"attachment_ids,omitempty"`
+	DeliveryStatus conversation.DeliveryStatus `json:"delivery_status"`
+	CreatedAt      time.Time                   `json:"created_at"`
 }
 
 type messagePageResponse struct {
@@ -55,6 +72,7 @@ type messagePageResponse struct {
 }
 
 type appendMessageRequest struct {
+	ExpectedTaskID  string             `json:"expected_task_id"`
 	HostID          string             `json:"host_id"`
 	WorkspaceID     string             `json:"workspace_id"`
 	InputRevision   *int64             `json:"input_revision"`
@@ -76,9 +94,99 @@ func (h *api) registerConversations(group *gin.RouterGroup, conversations Conver
 		group.POST("/conversations", h.createConversation(conversations))
 		group.GET("/conversations/:id", h.getConversation(conversations))
 		group.GET("/conversations/:id/messages", h.listConversationMessages(conversations))
+		group.GET("/me/main-conversation", h.getMainConversation(conversations))
+		group.POST("/me/main-conversation/ensure", h.ensureMainConversation(conversations))
+		group.PUT("/me/main-conversation", h.setMainConversation(conversations))
 	}
 	if tasks != nil {
 		group.POST("/conversations/:id/messages", h.appendConversationMessage(tasks))
+	}
+}
+
+func (h *api) getMainConversation(service ConversationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		value, err := service.GetMain(c.Request.Context(), principal)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toMainConversationResponse(value)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, response)
+	}
+}
+
+func (h *api) ensureMainConversation(service ConversationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		key, ok := requiredIdempotencyKey(c)
+		if !ok {
+			return
+		}
+		if c.Request.ContentLength != 0 {
+			var request struct{}
+			if !decodeStrictTaskJSON(c, &request) {
+				return
+			}
+		}
+		value, _, err := service.EnsureMain(c.Request.Context(), principal, app.EnsureMainConversationCommand{IdempotencyKey: key})
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toMainConversationResponse(value)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, response)
+	}
+}
+
+func (h *api) setMainConversation(service ConversationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		key, ok := requiredIdempotencyKey(c)
+		if !ok {
+			return
+		}
+		var request setMainConversationRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if request.ExpectedVersion == nil {
+			writeError(c, domain.InvalidArgument("expected_version", "expected_version is required"))
+			return
+		}
+		value, _, err := service.SetMain(c.Request.Context(), principal, app.SetMainConversationCommand{
+			ConversationID: request.ConversationID, ExpectedVersion: *request.ExpectedVersion, IdempotencyKey: key,
+		})
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toMainConversationResponse(value)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, response)
 	}
 }
 
@@ -100,7 +208,12 @@ func (h *api) createConversation(service ConversationService) gin.HandlerFunc {
 			writeError(c, err)
 			return
 		}
-		response, err := toConversationResponse(value)
+		mainValue, err := service.GetMain(c.Request.Context(), principal)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toConversationResponse(value, mainValue)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -129,9 +242,14 @@ func (h *api) listConversations(service ConversationService) gin.HandlerFunc {
 			writeError(c, err)
 			return
 		}
+		mainValue, err := service.GetMain(c.Request.Context(), principal)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
 		response := conversationPageResponse{Items: make([]conversationResponse, 0, len(result.Items)), NextCursor: cursorPointer(result.NextCursor)}
 		for _, item := range result.Items {
-			view, err := toConversationResponse(item)
+			view, err := toConversationResponse(item, mainValue)
 			if err != nil {
 				writeError(c, err)
 				return
@@ -158,7 +276,12 @@ func (h *api) getConversation(service ConversationService) gin.HandlerFunc {
 			writeError(c, err)
 			return
 		}
-		response, err := toConversationResponse(value)
+		mainValue, err := service.GetMain(c.Request.Context(), principal)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toConversationResponse(value, mainValue)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -220,7 +343,8 @@ func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
 			return
 		}
 		result, err := service.AppendMessage(c.Request.Context(), principal, id, app.AppendMessageCommand{
-			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
+			ExpectedTaskID: request.ExpectedTaskID,
+			HostID:         request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
 			MCPConnectorIDs: request.MCPConnectorIDs,
 			ApplicationID:   request.ApplicationID, ModelID: request.ModelID, Content: request.Content,
 			Budget: budget, IdempotencyKey: c.GetHeader("Idempotency-Key"),
@@ -243,17 +367,33 @@ func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
 	}
 }
 
-func toConversationResponse(value conversation.Conversation) (conversationResponse, error) {
+func toConversationResponse(value conversation.Conversation, main conversation.MainConversation) (conversationResponse, error) {
 	if !domain.ValidConversationID(value.ID) || (value.HostID != "" && !domain.ValidHostID(value.HostID)) || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return conversationResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
-	return conversationResponse{ID: value.ID, HostID: value.HostID, Title: value.Title, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}, nil
+	if err := main.Validate(); err != nil {
+		return conversationResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	return conversationResponse{ID: value.ID, Scope: "personal", IsMain: main.Status == conversation.MainConversationReady && main.ConversationID == value.ID,
+		HostID: value.HostID, Title: value.Title, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}, nil
+}
+
+func toMainConversationResponse(value conversation.MainConversation) (mainConversationResponse, error) {
+	if err := value.Validate(); err != nil {
+		return mainConversationResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	return mainConversationResponse{Status: value.Status, ConversationID: value.ConversationID, Version: value.Version}, nil
 }
 
 func toMessageResponse(value conversation.Message) (messageResponse, error) {
+	deliveryStatus := value.DeliveryStatus
+	if deliveryStatus == "" {
+		deliveryStatus = conversation.DeliveryApplied
+	}
 	if !domain.ValidMessageID(value.ID) || !domain.ValidConversationID(value.ConversationID) ||
 		(value.TaskID != "" && !domain.ValidTaskID(value.TaskID)) ||
-		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.CreatedAt.IsZero() {
+		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.CreatedAt.IsZero() ||
+		!deliveryStatus.Valid() {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	for _, attachmentID := range value.AttachmentIDs {
@@ -263,6 +403,7 @@ func toMessageResponse(value conversation.Message) (messageResponse, error) {
 	}
 	return messageResponse{
 		ID: value.ID, ConversationID: value.ConversationID, Role: value.Role, Content: value.Content,
-		TaskID: value.TaskID, AttachmentIDs: append([]string(nil), value.AttachmentIDs...), CreatedAt: value.CreatedAt,
+		TaskID: value.TaskID, AttachmentIDs: append([]string(nil), value.AttachmentIDs...),
+		DeliveryStatus: deliveryStatus, CreatedAt: value.CreatedAt,
 	}, nil
 }

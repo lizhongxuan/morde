@@ -28,7 +28,13 @@ def digest(path: Path) -> str:
     return value.hexdigest()
 
 
-def create_fixture(root: Path, *, unsafe_workspace_tar: bool = False) -> Path:
+def create_fixture(
+    root: Path,
+    *,
+    unsafe_workspace_tar: bool = False,
+    format_version: int = 4,
+    volume_name: str | None = None,
+) -> Path:
     pg = root / "pg"
     (pg / "global").mkdir(parents=True)
     (pg / "base").mkdir()
@@ -80,9 +86,32 @@ def create_fixture(root: Path, *, unsafe_workspace_tar: bool = False) -> Path:
             archive.add(workspace, arcname=".")
     with tarfile.open(bundle / "site-artifacts.tar", "w") as archive:
         archive.add(sites, arcname=".")
+    volume_records = []
+    volume_archive = None
+    if volume_name:
+        volume_archive = f"docker-volumes/{volume_name}.tar"
+        volume_dir = bundle / "docker-volumes"
+        volume_dir.mkdir(mode=0o700)
+        volume_data = b"synthetic named volume"
+        with tarfile.open(bundle / volume_archive, "w") as archive:
+            directory = tarfile.TarInfo(".")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+            member = tarfile.TarInfo("file.txt")
+            member.size = len(volume_data)
+            archive.addfile(member, io.BytesIO(volume_data))
+        volume_records.append({
+            "name": volume_name,
+            "driver": "local",
+            "options": {},
+            "labels": {},
+            "archive": volume_archive,
+            "size_bytes": len(volume_data),
+            "sha256": digest(bundle / volume_archive),
+        })
     metadata = {
         "format": "morde-single-node-backup",
-        "format_version": 3,
+        "format_version": format_version,
         "created_at_utc": "2026-01-01T00:00:00+00:00",
         "source_paths": {
             "postgres_data_dir": "/var/lib/postgresql/data",
@@ -110,8 +139,13 @@ def create_fixture(root: Path, *, unsafe_workspace_tar: bool = False) -> Path:
             "site_storage_root": "site-artifacts.tar",
         },
     }
+    if format_version == 4:
+        metadata["deployment_volume_inventory"] = {"version": 1, "volumes": volume_records}
     (bundle / "metadata.json").write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    entries = ("postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
+    entries = ["postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar"]
+    if volume_archive:
+        entries.append(volume_archive)
+    entries.append("metadata.json")
     (bundle / "SHA256SUMS").write_text("".join(f"{digest(bundle / name)}  {name}\n" for name in entries), encoding="ascii")
     return bundle
 
@@ -312,12 +346,164 @@ class OfflineBackupValidationTests(unittest.TestCase):
             patch.object(BACKUP, "require_portal_stopped") as portal_stopped,
             patch.object(BACKUP, "require_postgres_stopped") as postgres_stopped,
             patch.object(BACKUP, "require_no_running_container_mounts") as mounts_stopped,
+            patch.object(BACKUP, "docker_volume_snapshot") as volumes_stopped,
             patch.object(BACKUP, "compose_postgres_image", return_value=IMAGE),
         ):
             self.assertEqual(BACKUP.check_services_stopped(Path("env"), Path("compose"), sources), IMAGE)
         portal_stopped.assert_called_once_with()
         postgres_stopped.assert_called_once_with(Path("env"), Path("compose"))
         mounts_stopped.assert_called_once_with(sources)
+        volumes_stopped.assert_called_once_with()
+
+    def test_deployment_volume_inventory_archives_compose_managed_volumes(self) -> None:
+        name = "cloudhost_caddy_data"
+        labels = {"com.docker.compose.project": "cloudhost", "com.docker.compose.volume": "caddy_data"}
+        with patch.object(BACKUP, "run", side_effect=[
+            name + "\n", "", name + "\n", name + "\n",
+            json.dumps([{"Name": name, "Driver": "local", "Options": None, "Labels": labels}]), "",
+        ]):
+            snapshot = BACKUP.docker_volume_snapshot()
+        self.assertEqual(snapshot["volumes"], [{"name": name, "driver": "local", "options": {}, "labels": labels}])
+
+    def test_deployment_volume_inventory_ignores_other_compose_projects(self) -> None:
+        name = "cloudhost_caddy_data"
+        unrelated = "unrelated_caddy_data"
+        labels = {"com.docker.compose.project": "cloudhost", "com.docker.compose.volume": "caddy_data"}
+        calls = []
+
+        def run(args):
+            calls.append(args)
+            if args[:3] == [BACKUP.DOCKER_BIN, "volume", "ls"]:
+                if "label=com.docker.compose.project=cloudhost" in args:
+                    return name + "\n"
+                return name + "\n" + unrelated + "\n" if "--filter" not in args else ""
+            if args[:3] == [BACKUP.DOCKER_BIN, "volume", "inspect"]:
+                return json.dumps([{"Name": name, "Driver": "local", "Options": None, "Labels": labels}])
+            return ""
+
+        with patch.object(BACKUP, "run", side_effect=run):
+            snapshot = BACKUP.docker_volume_snapshot()
+
+        self.assertEqual([volume["name"] for volume in snapshot["volumes"]], [name])
+        self.assertFalse(any(unrelated in call for call in calls))
+        self.assertIn("label=com.docker.compose.project=cloudhost", calls[2])
+
+    def test_deployment_volume_inventory_ignores_legacy_name_owned_by_other_compose_project(self) -> None:
+        name = "cloudhost_workspace-root"
+        labels = {"com.docker.compose.project": "unrelated", "com.docker.compose.volume": "workspace-root"}
+        with patch.object(BACKUP, "run", side_effect=[
+            name + "\n", "", "", name + "\n",
+            json.dumps([{"Name": name, "Driver": "local", "Options": None, "Labels": labels}]),
+        ]):
+            snapshot = BACKUP.docker_volume_snapshot()
+        self.assertEqual(snapshot["volumes"], [])
+
+    def test_deployment_volume_inventory_includes_unlabelled_legacy_names(self) -> None:
+        name = "workspace-root"
+        with patch.object(BACKUP, "run", side_effect=[
+            name + "\n", "", "", name + "\n",
+            json.dumps([{"Name": name, "Driver": "local", "Options": None, "Labels": None}]), "",
+        ]):
+            snapshot = BACKUP.docker_volume_snapshot()
+        self.assertEqual(snapshot["volumes"][0]["name"], name)
+
+    def test_deployment_volume_inventory_validates_workspace_identity(self) -> None:
+        name = "workspace-w1234567"
+        labels = {
+            "morde.managed_by": "portal",
+            "morde.service_instance_id": "test-instance",
+            "morde.owner_id": "u1234567",
+            "morde.workspace_id": "w1234567",
+        }
+        with patch.object(BACKUP, "run", side_effect=[
+            name + "\n", name + "\n", "", name + "\n",
+            json.dumps([{"Name": name, "Driver": "local", "Options": {}, "Labels": labels}]), "",
+        ]):
+            snapshot = BACKUP.docker_volume_snapshot()
+        self.assertEqual(snapshot["volumes"][0]["labels"], labels)
+
+    def test_deployment_volume_inventory_fails_closed_for_unknown_managed_identity(self) -> None:
+        name = "workspace-copy-1"
+        labels = {"morde.managed_by": "portal"}
+        with patch.object(BACKUP, "run", side_effect=[
+            name + "\n", name + "\n", "", name + "\n",
+            json.dumps([{"Name": name, "Driver": "local", "Options": None, "Labels": labels}]),
+        ]):
+            with self.assertRaisesRegex(BACKUP.BackupError, "safely verify Docker deployment volumes"):
+                BACKUP.docker_volume_snapshot()
+
+    def test_deployment_volume_inventory_rejects_custom_driver_options_and_attachments(self) -> None:
+        name = "cloudhost_caddy_data"
+        labels = {"com.docker.compose.project": "cloudhost", "com.docker.compose.volume": "caddy_data"}
+        for volume, attached in (
+            ({"Driver": "nfs", "Options": None}, ""),
+            ({"Driver": "local", "Options": {"type": "nfs"}}, ""),
+            ({"Driver": "local", "Options": None}, "a" * 64 + "\n"),
+        ):
+            with self.subTest(volume=volume, attached=bool(attached)), patch.object(BACKUP, "run", side_effect=[
+                name + "\n", "", name + "\n", name + "\n",
+                json.dumps([{"Name": name, **volume, "Labels": labels}]), attached,
+            ]):
+                with self.assertRaisesRegex(BACKUP.BackupError, "safely verify Docker deployment volumes"):
+                    BACKUP.docker_volume_snapshot()
+
+    def test_deployment_volume_inventory_rejects_incomplete_or_changed_inventory(self) -> None:
+        with patch.object(BACKUP, "run", side_effect=BACKUP.BackupError("docker unavailable")):
+            with self.assertRaisesRegex(BACKUP.BackupError, "safely verify Docker deployment volumes"):
+                BACKUP.docker_volume_snapshot()
+        with patch.object(BACKUP, "run", side_effect=["", "", "", "ghost-volume\n"]):
+            with self.assertRaisesRegex(BACKUP.BackupError, "inventory changed"):
+                BACKUP.docker_volume_snapshot()
+
+    def test_bundle_manifest_rejects_volumes_from_other_compose_projects(self) -> None:
+        with self.assertRaisesRegex(BACKUP.BackupError, "Docker Compose volume identity"):
+            BACKUP.manifest_volumes({
+                "format_version": 4,
+                "deployment_volume_inventory": {"version": 1, "volumes": [{
+                    "name": "cloudhost_caddy_data",
+                    "driver": "local",
+                    "options": {},
+                    "labels": {
+                        "com.docker.compose.project": "unrelated",
+                        "com.docker.compose.volume": "caddy_data",
+                    },
+                    "archive": "docker-volumes/cloudhost_caddy_data.tar",
+                    "size_bytes": 0,
+                    "sha256": "a" * 64,
+                }]},
+            })
+
+    def test_create_bundle_discards_backup_if_docker_inventory_changes(self) -> None:
+        snapshot = {"names": frozenset({"cache"}), "volumes": []}
+        changed = {"names": frozenset({"cache", "appeared"}), "volumes": []}
+        sources = {
+            "postgres_data_dir": self.root / "pg",
+            "postgres_wal_archive_dir": self.root / "postgres-wal-archive",
+            "workspace_root": self.root / "workspaces",
+            "site_storage_root": self.root / "sites",
+        }
+
+        def write_archive(_source: Path, destination: Path) -> None:
+            destination.write_bytes(b"synthetic archive")
+
+        with (
+            patch.object(BACKUP, "docker_volume_snapshot", side_effect=[snapshot, changed]),
+            patch.object(BACKUP, "ensure_local_filesystem"),
+            patch.object(BACKUP.os.path, "ismount", return_value=False),
+            patch.object(BACKUP, "reject_nested_mounts"),
+            patch.object(BACKUP, "postgres_control_data", return_value="control"),
+            patch.object(BACKUP, "postgres_control_metadata", return_value={"wal_segment_size": 1 << 20}),
+            patch.object(BACKUP, "validate_wal_archive", return_value=(0, 0)),
+            patch.object(BACKUP, "validate_workspace_store", return_value=(0, 0)),
+            patch.object(BACKUP, "validate_site_store", return_value=(0, 0, 0)),
+            patch.object(BACKUP, "postgres_major_from_image", return_value="16"),
+            patch.object(BACKUP, "validate_postgres_tree"),
+            patch.object(BACKUP, "make_tar", side_effect=write_archive),
+        ):
+            with self.assertRaisesRegex(BACKUP.BackupError, "inventory changed while the backup was being created"):
+                BACKUP.create_bundle(self.root / "changing-bundle", sources, IMAGE)
+
+        self.assertFalse((self.root / "changing-bundle").exists())
 
     def test_current_root_must_not_overlap_archive_roots(self) -> None:
         nested_current = self.root / "workspaces" / "current"
@@ -365,6 +551,73 @@ class OfflineBackupValidationTests(unittest.TestCase):
         self.assertIn("Backup integrity verified", result.stdout)
         self.assertIn("Workspace blocks: 1", result.stdout)
         self.assertIn("Site releases: 1", result.stdout)
+        self.assertIn("Docker deployment volumes: 0 archived", result.stdout)
+
+    def test_verifies_volume_archive_and_metadata(self) -> None:
+        bundle = create_fixture(self.root / "with-volume", volume_name="workspace-root")
+        result = self.run_verify(bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Docker deployment volumes: 1 archived", result.stdout)
+
+    def test_legacy_v3_bundle_is_verifiable_but_not_restorable(self) -> None:
+        legacy = create_fixture(self.root / "legacy-v3", format_version=3)
+        result = self.run_verify(legacy)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("format v3 has no Docker volume inventory", result.stdout)
+        with self.assertRaisesRegex(BACKUP.BackupError, "format v4 bundle"):
+            BACKUP.require_restorable_bundle({"format_version": 3})
+
+    def test_format_v4_rejects_nonempty_or_malformed_volume_inventory(self) -> None:
+        for inventory, message in (
+            ({"version": 1, "volumes": [{"name": "workspace-w1234567"}]}, "entry is invalid"),
+            ({"version": 2, "volumes": []}, "inventory is invalid"),
+        ):
+            with self.subTest(inventory=inventory), self.assertRaisesRegex(BACKUP.BackupError, message):
+                BACKUP.require_restorable_bundle({"format_version": 4, "deployment_volume_inventory": inventory})
+
+    def test_bundle_verification_rejects_tampered_volume_inventory(self) -> None:
+        bundle = create_fixture(self.root / "tampered-volume-inventory")
+        metadata_path = bundle / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["deployment_volume_inventory"] = {"version": 1, "volumes": [{"name": "workspace-w1234567"}]}
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        entries = ("postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
+        (bundle / "SHA256SUMS").write_text("".join(f"{digest(bundle / name)}  {name}\n" for name in entries), encoding="ascii")
+
+        result = self.run_verify(bundle)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("backup deployment volume entry is invalid", result.stderr)
+
+    def test_bundle_verification_rejects_volume_archive_path_not_bound_to_name(self) -> None:
+        bundle = create_fixture(self.root / "invalid-volume-path", volume_name="workspace-root")
+        metadata_path = bundle / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["deployment_volume_inventory"]["volumes"][0]["archive"] = "../outside.tar"
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        result = self.run_verify(bundle)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("volume archive metadata is invalid", result.stderr)
+
+    def test_bundle_verification_rejects_tampered_volume_archive(self) -> None:
+        bundle = create_fixture(self.root / "tampered-volume-archive", volume_name="workspace-root")
+        with (bundle / "docker-volumes" / "workspace-root.tar").open("ab") as target:
+            target.write(b"tampered")
+        result = self.run_verify(bundle)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checksum verification failed for docker-volumes/workspace-root.tar", result.stderr)
+
+    def test_bundle_verification_rejects_unhashable_format_version(self) -> None:
+        bundle = create_fixture(self.root / "invalid-version")
+        metadata_path = bundle / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["format_version"] = []
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        entries = ("postgres-data.tar", "postgres-wal-archive.tar", "workspace-blocks.tar", "site-artifacts.tar", "metadata.json")
+        (bundle / "SHA256SUMS").write_text("".join(f"{digest(bundle / name)}  {name}\n" for name in entries), encoding="ascii")
+
+        result = self.run_verify(bundle)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported backup format", result.stderr)
 
     def test_pg_controldata_runs_as_control_file_owner(self) -> None:
         for uid, gid in ((999, 999), (0, 0)):
@@ -483,6 +736,107 @@ class OfflineBackupValidationTests(unittest.TestCase):
         self.assertIn("unsafe path", result.stderr)
         self.assertFalse((self.root / "outside").exists())
 
+    def test_volume_archive_accepts_safe_relative_symlinks(self) -> None:
+        archive_path = self.root / "safe-volume.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            root = tarfile.TarInfo(".")
+            root.type = tarfile.DIRTYPE
+            archive.addfile(root)
+            target = tarfile.TarInfo("target")
+            target.size = 3
+            archive.addfile(target, io.BytesIO(b"abc"))
+            link = tarfile.TarInfo("link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "target"
+            archive.addfile(link)
+        self.assertEqual(BACKUP.validate_archive(archive_path), 3)
+
+    def test_volume_archive_rejects_escaping_links_and_paths_beneath_links(self) -> None:
+        escaping = self.root / "escaping-link.tar"
+        with tarfile.open(escaping, "w") as archive:
+            link = tarfile.TarInfo("link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../outside"
+            archive.addfile(link)
+        with self.assertRaisesRegex(BACKUP.BackupError, "escaping symlink"):
+            BACKUP.validate_archive(escaping)
+
+        beneath_link = self.root / "beneath-link.tar"
+        with tarfile.open(beneath_link, "w") as archive:
+            link = tarfile.TarInfo("link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "target"
+            archive.addfile(link)
+            child = tarfile.TarInfo("link/child")
+            child.size = 1
+            archive.addfile(child, io.BytesIO(b"x"))
+        with self.assertRaisesRegex(BACKUP.BackupError, "path beneath a symlink"):
+            BACKUP.validate_archive(beneath_link)
+
+    def test_docker_volume_helper_commands_are_local_and_isolated(self) -> None:
+        args = BACKUP.docker_volume_archive_args("workspace-root", IMAGE)
+        self.assertIn("--pull=never", args)
+        self.assertIn("none", args[args.index("--network") + 1:])
+        self.assertIn("type=volume,source=workspace-root,target=/volume,readonly", args)
+        self.assertIn("--read-only", args)
+        self.assertIn("--xattrs", args)
+        self.assertIn("--acls", args)
+
+        archive = self.root / "volume.tar"
+        archive.write_bytes(b"synthetic")
+        with patch.object(BACKUP, "run") as run:
+            BACKUP.restore_docker_volume("workspace-root", IMAGE, archive)
+        command = run.call_args.args[0]
+        self.assertIn("--pull=never", command)
+        self.assertIn("type=volume,source=workspace-root,target=/volume", command)
+        self.assertIn(f"type=bind,source={archive.resolve()},target=/archive.tar,readonly", command)
+        self.assertIn("--read-only", command)
+
+    def test_volume_restore_journal_replays_rollback_after_interruption(self) -> None:
+        journal = self.root / "journal.json"
+        journal.write_text("{}\n", encoding="utf-8")
+        rollback_bundle = self.root / "rollback"
+        rollback_bundle.mkdir()
+        volume = {
+            "name": "workspace-root",
+            "driver": "local",
+            "options": {},
+            "labels": {},
+            "archive": "docker-volumes/workspace-root.tar",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+        }
+        (rollback_bundle / "docker-volumes").mkdir()
+        archive = rollback_bundle / volume["archive"]
+        archive.write_bytes(b"old")
+        state = {"status": "restoring_volumes", "volume_progress": {"workspace-root": "restoring"}}
+        with patch.object(BACKUP, "require_live_volume_inventory"), patch.object(
+            BACKUP, "restore_docker_volume", side_effect=[BACKUP.BackupError("interrupted"), None]
+        ) as restore, patch.object(BACKUP, "verify_docker_volume_archive"):
+            failed = BACKUP.rollback_changed_volumes(journal, state, IMAGE, rollback_bundle, [volume])
+            self.assertEqual(failed, ["workspace-root"])
+            self.assertEqual(state["volume_progress"]["workspace-root"], "rolling_back")
+            failed = BACKUP.rollback_changed_volumes(journal, state, IMAGE, rollback_bundle, [volume])
+        self.assertEqual(failed, [])
+        self.assertEqual(state["volume_progress"]["workspace-root"], "rolled_back")
+        self.assertEqual(restore.call_count, 2)
+
+    def test_volume_restore_journals_before_and_after_each_mutation(self) -> None:
+        journal = self.root / "journal-followup.json"
+        journal.write_text("{}\n", encoding="utf-8")
+        bundle = self.root / "followup"
+        bundle.mkdir()
+        volume = {"name": "workspace-root", "archive": "docker-volumes/workspace-root.tar", "sha256": "b" * 64}
+        state = {"status": "ready_to_swap", "volume_progress": {"workspace-root": "pending"}}
+        with patch.object(BACKUP, "require_live_volume_inventory"), patch.object(BACKUP, "restore_docker_volume") as restore, patch.object(
+            BACKUP, "verify_docker_volume_archive"
+        ) as verify:
+            BACKUP.restore_follow_up_volumes(journal, state, IMAGE, bundle, [volume])
+        self.assertEqual(state["status"], "volumes_restored")
+        self.assertEqual(state["volume_progress"]["workspace-root"], "restored")
+        restore.assert_called_once_with("workspace-root", IMAGE, bundle / volume["archive"])
+        verify.assert_called_once_with("workspace-root", IMAGE, bundle / volume["archive"], volume["sha256"])
+
     def test_rejects_duplicate_archive_paths(self) -> None:
         with tarfile.open(self.bundle / "workspace-blocks.tar", "w") as archive:
             for name in (".", "./."):
@@ -529,6 +883,22 @@ class OfflineBackupValidationTests(unittest.TestCase):
         with patch.object(BACKUP.sys, "stdin", InteractiveInput()), patch("builtins.input", return_value="ROLLBACK wrong"):
             with self.assertRaisesRegex(BACKUP.BackupError, "did not match"):
                 BACKUP.confirm_recovery(args, pgdata, workspace, self.root / "sites")
+
+    def test_recovery_confirmation_names_docker_volumes(self) -> None:
+        args = type("Args", (), {"confirm_recover": True})()
+
+        class InteractiveInput:
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        output = io.StringIO()
+        with patch.object(BACKUP.sys, "stdin", InteractiveInput()), patch.object(BACKUP.sys, "stdout", output), patch(
+            "builtins.input", return_value="wrong"
+        ):
+            with self.assertRaisesRegex(BACKUP.BackupError, "did not match"):
+                BACKUP.confirm_recovery(args, self.root / "pg", volume_names=["workspace-root"])
+        self.assertIn("DOCKER_VOLUMES workspace-root", output.getvalue())
 
     def test_restore_failure_reinstates_original_directories(self) -> None:
         target = self.root / "pg-target"

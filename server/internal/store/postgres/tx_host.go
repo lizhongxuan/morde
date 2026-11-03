@@ -265,6 +265,9 @@ func validateHostInsert(params app.CreateHostParams, state host.State) error {
 	if params.Capacity.CPUMilli <= 0 || params.Capacity.MemMiB <= 0 {
 		return domain.InvalidArgument("capacity", "cluster capacity limits are invalid")
 	}
+	if len(params.WorkspaceIDs) != 1 {
+		return domain.InvalidArgument("workspace_ids", "exactly one workspace is required")
+	}
 	seen := make(map[string]struct{}, len(params.WorkspaceIDs))
 	for _, workspaceID := range params.WorkspaceIDs {
 		if !domain.ValidWorkspaceID(workspaceID) {
@@ -293,6 +296,7 @@ ORDER BY id FOR UPDATE`, ids)
 		return nil, fmt.Errorf("lock workspaces for host binding: %w", err)
 	}
 	defer rows.Close()
+	lockedIDs := make([]string, 0, len(ids))
 	for rows.Next() {
 		var id, owner, state string
 		var revision int64
@@ -308,12 +312,19 @@ ORDER BY id FOR UPDATE`, ids)
 			return nil, conflict
 		}
 		revisions[id] = revision
+		lockedIDs = append(lockedIDs, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read workspaces for host binding: %w", err)
 	}
+	rows.Close()
 	if len(revisions) != len(ids) {
 		return nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	for _, id := range lockedIDs {
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, id); err != nil {
+			return nil, err
+		}
 	}
 	return revisions, nil
 }

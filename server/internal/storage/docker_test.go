@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -147,6 +148,111 @@ func TestDeleteVolumeHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestEnsureWorkspaceVolumeCreatesAndVerifiesIdentity(t *testing.T) {
+	const volumeName = "workspace-w1234567"
+	var exists bool
+	var created dockerVolumeIdentity
+	var createCalls int
+	client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.44/volumes/"+volumeName:
+			if !exists {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(created)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.44/volumes/create":
+			createCalls++
+			var request dockerVolumeIdentity
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode volume create request: %v", err)
+			}
+			created = request
+			exists = true
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprint(w, `{"Name":"workspace-w1234567"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	if err := client.EnsureWorkspaceVolume(context.Background(), volumeName, "instance-a", "u1234567", "w1234567"); err != nil {
+		t.Fatalf("EnsureWorkspaceVolume() = %v", err)
+	}
+	wantLabels := map[string]string{
+		"morde.managed_by": "portal", "morde.service_instance_id": "instance-a",
+		"morde.owner_id": "u1234567", "morde.workspace_id": "w1234567",
+	}
+	if createCalls != 1 || created.Name != volumeName || created.Driver != "local" || !reflect.DeepEqual(created.Labels, wantLabels) {
+		t.Fatalf("created volume/calls = %#v / %d", created, createCalls)
+	}
+	if err := client.VerifyWorkspaceVolume(context.Background(), volumeName, "instance-a", "u1234567", "w1234567"); err != nil {
+		t.Fatalf("VerifyWorkspaceVolume() = %v", err)
+	}
+	if createCalls != 1 {
+		t.Fatalf("VerifyWorkspaceVolume created a volume; create calls = %d", createCalls)
+	}
+}
+
+func TestEnsureWorkspaceVolumeVerifiesExistingIdentityWithoutRecreating(t *testing.T) {
+	const volumeName = "workspace-w1234567"
+	labels, err := workspaceVolumeLabels(volumeName, "instance-a", "u1234567", "w1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*dockerVolumeIdentity)
+	}{
+		{name: "wrong name", mutate: func(value *dockerVolumeIdentity) { value.Name = "workspace-w8765432" }},
+		{name: "wrong driver", mutate: func(value *dockerVolumeIdentity) { value.Driver = "nfs" }},
+		{name: "wrong owner label", mutate: func(value *dockerVolumeIdentity) { value.Labels["morde.owner_id"] = "u8765432" }},
+		{name: "wrong instance label", mutate: func(value *dockerVolumeIdentity) { value.Labels["morde.service_instance_id"] = "instance-b" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			volume := dockerVolumeIdentity{Name: volumeName, Driver: "local", Labels: labels}
+			test.mutate(&volume)
+			var createCalls int
+			client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/v1.44/volumes/"+volumeName {
+					_ = json.NewEncoder(w).Encode(volume)
+					return
+				}
+				if r.Method == http.MethodPost {
+					createCalls++
+				}
+				http.NotFound(w, r)
+			}))
+			if err := client.EnsureWorkspaceVolume(context.Background(), volumeName, "instance-a", "u1234567", "w1234567"); err == nil {
+				t.Fatal("EnsureWorkspaceVolume() error = nil, want identity rejection")
+			}
+			if createCalls != 0 {
+				t.Fatalf("mismatched existing volume was replaced; create calls = %d", createCalls)
+			}
+		})
+	}
+}
+
+func TestVerifyWorkspaceVolumeRejectsMissingVolumeWithoutCreating(t *testing.T) {
+	var createCalls int
+	client := newUnixDockerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1.44/volumes/workspace-w1234567" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodPost {
+			createCalls++
+		}
+		http.NotFound(w, r)
+	}))
+	if err := client.VerifyWorkspaceVolume(context.Background(), "workspace-w1234567", "instance-a", "u1234567", "w1234567"); err == nil {
+		t.Fatal("VerifyWorkspaceVolume() error = nil, want missing-volume rejection")
+	}
+	if createCalls != 0 {
+		t.Fatalf("VerifyWorkspaceVolume created a missing volume; create calls = %d", createCalls)
+	}
+}
+
 func TestOpenLegacyVolumeReturnsReadOnlyRootForUnattachedLocalVolume(t *testing.T) {
 	dockerRoot := t.TempDir()
 	dockerRoot, err := filepath.EvalSymlinks(dockerRoot)
@@ -174,6 +280,55 @@ func TestOpenLegacyVolumeReturnsReadOnlyRootForUnattachedLocalVolume(t *testing.
 	if _, err := fs.ReadFile(filesystem, "../outside"); err == nil {
 		t.Fatal("fs.ReadFile(parent path) error = nil, want root escape rejection")
 	}
+}
+
+func TestValidateLegacyWorkspaceTreeChecksSelectedRootAndAllowsHardLinks(t *testing.T) {
+	t.Run("selected Workspace root", func(t *testing.T) {
+		dockerRoot, volumePath := legacyVolumeTreeForTest(t)
+		workspaceRoot := filepath.Join(volumePath, "w1234567")
+		if err := os.Mkdir(workspaceRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workspaceRoot, "README.md"), []byte("legacy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		client := newLegacyVolumeDockerForTest(t, dockerRoot, "ws-w8f2k1q0", volumePath, "local", nil)
+		if _, err := client.ValidateLegacyWorkspaceTree(context.Background(), "ws-w8f2k1q0", "w1234567"); err != nil {
+			t.Fatalf("ValidateLegacyWorkspaceTree() = %v", err)
+		}
+	})
+
+	t.Run("hard-linked files", func(t *testing.T) {
+		dockerRoot, volumePath := legacyVolumeTreeForTest(t)
+		first := filepath.Join(volumePath, "first.txt")
+		if err := os.WriteFile(first, []byte("shared"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(first, filepath.Join(volumePath, "second.txt")); err != nil {
+			t.Fatal(err)
+		}
+		client := newLegacyVolumeDockerForTest(t, dockerRoot, "ws-w8f2k1q0", volumePath, "local", nil)
+		manifest, err := client.ValidateLegacyWorkspaceTree(context.Background(), "ws-w8f2k1q0", "")
+		if err != nil {
+			t.Fatalf("ValidateLegacyWorkspaceTree() = %v, want metadata preflight to pass", err)
+		}
+		if len(manifest.Files) != 2 || manifest.Files[1].Path != "second.txt" || manifest.Files[1].HardlinkTo != "first.txt" || !manifest.Files[1].MetadataKnown {
+			t.Fatalf("hard-link manifest = %+v, want second.txt -> first.txt with native metadata known", manifest.Files)
+		}
+	})
+}
+
+func legacyVolumeTreeForTest(t *testing.T) (string, string) {
+	t.Helper()
+	dockerRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumePath := filepath.Join(dockerRoot, "volumes", "ws-w8f2k1q0", "_data")
+	if err := os.MkdirAll(volumePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dockerRoot, volumePath
 }
 
 func TestOpenLegacyVolumeRejectsUnsafeOrReferencedVolumes(t *testing.T) {

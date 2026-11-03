@@ -24,6 +24,14 @@ func terminalSessionReservation(t *testing.T, hostValue host.Host, ownerID strin
 	}
 }
 
+func setTerminalControlLease(t *testing.T, store *Store, hostID, actorID string) {
+	t.Helper()
+	if _, err := store.pool.Exec(context.Background(), `UPDATE hosts SET control_actor_id=$2,
+control_lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, hostID, actorID); err != nil {
+		t.Fatalf("set terminal control lease: %v", err)
+	}
+}
+
 func TestPostgresTerminalSessionSerializesFirstCreationAndReusesReady(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -31,6 +39,7 @@ func TestPostgresTerminalSessionSerializesFirstCreationAndReusesReady(t *testing
 	owner := createTestUser(t, store, 4, 8_000, 16_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 7)
 	hostValue.ControlVersion = 7
+	setTerminalControlLease(t, store, hostValue.ID, owner.ID)
 
 	const contenders = 8
 	start := make(chan struct{})
@@ -83,7 +92,7 @@ func TestPostgresTerminalSessionSerializesFirstCreationAndReusesReady(t *testing
 	}
 }
 
-func TestPostgresTerminalSessionSeparatesOwnerAndMemberActors(t *testing.T) {
+func TestPostgresTerminalSessionRequiresCurrentControlLeaseActor(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -91,6 +100,12 @@ func TestPostgresTerminalSessionSeparatesOwnerAndMemberActors(t *testing.T) {
 	member := createTestUser(t, store, 4, 8_000, 16_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 7)
 	hostValue.ControlVersion = 7
+	setTerminalControlLease(t, store, hostValue.ID, owner.ID)
+	if _, err := store.UpsertHostMember(ctx, host.Member{
+		HostID: hostValue.ID, OwnerID: owner.ID, UserID: member.ID, Permissions: []host.Permission{host.PermissionTerminalControl},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	ownerReservation := terminalSessionReservation(t, hostValue, owner.ID)
 	ownerSession, created, err := store.EnsureTerminalSession(ctx, ownerReservation, false)
@@ -103,18 +118,17 @@ func TestPostgresTerminalSessionSeparatesOwnerAndMemberActors(t *testing.T) {
 
 	memberReservation := terminalSessionReservation(t, hostValue, owner.ID)
 	memberReservation.ActorID = member.ID
-	memberSession, created, err := store.EnsureTerminalSession(ctx, memberReservation, false)
-	if err != nil || !created {
-		t.Fatalf("reserve member terminal session = %+v created=%t err=%v", memberSession, created, err)
+	if _, _, err := store.EnsureTerminalSession(ctx, memberReservation, false); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("non-holder member terminal session error = %v; want conflict", err)
 	}
 	otherHost := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 7)
-	wrongHost := memberSession
+	wrongHost := ownerSession
 	wrongHost.HostID = otherHost.ID
-	wrongOwner := memberSession
+	wrongOwner := ownerSession
 	wrongOwner.OwnerID = member.ID
-	wrongGeneration := memberSession
+	wrongGeneration := ownerSession
 	wrongGeneration.RuntimeGeneration++
-	wrongControlVersion := memberSession
+	wrongControlVersion := ownerSession
 	wrongControlVersion.ControlVersion++
 	for _, mismatch := range []struct {
 		name        string
@@ -125,35 +139,65 @@ func TestPostgresTerminalSessionSeparatesOwnerAndMemberActors(t *testing.T) {
 		{name: "generation", reservation: wrongGeneration},
 		{name: "control version", reservation: wrongControlVersion},
 	} {
-		if completed, err := store.CompleteTerminalSession(ctx, mismatch.reservation, "stale-session"); err != nil || completed {
-			t.Errorf("complete with mismatched %s fence = %t, %v; want false", mismatch.name, completed, err)
+		if completed, err := store.CompleteTerminalSession(ctx, mismatch.reservation, "stale-session"); completed || (err != nil && domain.CodeOf(err) != domain.CodeConflict) {
+			t.Errorf("complete with mismatched %s fence = %t, %v; want fenced false", mismatch.name, completed, err)
 		}
-	}
-	if completed, err := store.CompleteTerminalSession(ctx, memberSession, "member-session"); err != nil || !completed {
-		t.Fatalf("complete member terminal session = %t, %v", completed, err)
 	}
 
-	for _, actor := range []struct {
-		name    string
-		id      string
-		session string
-	}{{name: "owner", id: owner.ID, session: "owner-session"}, {name: "member", id: member.ID, session: "member-session"}} {
-		reservation := terminalSessionReservation(t, hostValue, owner.ID)
-		reservation.ActorID = actor.id
-		reused, created, err := store.EnsureTerminalSession(ctx, reservation, false)
-		if err != nil || created {
-			t.Fatalf("reuse %s terminal session = %+v created=%t err=%v", actor.name, reused, created, err)
-		}
-		stored, err := terminalSessionByHostActor(ctx, pool, hostValue.ID, actor.id, false)
-		if err != nil || stored.ID != reused.ID || stored.OwnerID != owner.ID || stored.ActorID != actor.id || stored.State != app.TerminalSessionReady {
-			t.Fatalf("stored %s terminal session = %+v, reused=%+v, err=%v", actor.name, stored, reused, err)
-		}
-		if stored.AIOSessionID != actor.session {
-			t.Fatalf("stored %s AIO session = %q, want %q", actor.name, stored.AIOSessionID, actor.session)
-		}
+	reused, created, err := store.EnsureTerminalSession(ctx, terminalSessionReservation(t, hostValue, owner.ID), false)
+	if err != nil || created {
+		t.Fatalf("reuse holder terminal session = %+v created=%t err=%v", reused, created, err)
 	}
-	if ownerSession.ID == memberSession.ID {
-		t.Fatalf("owner and member share terminal reservation id %d", ownerSession.ID)
+	stored, err := terminalSessionByHostActor(ctx, pool, hostValue.ID, owner.ID, false)
+	if err != nil || stored.ID != reused.ID || stored.OwnerID != owner.ID || stored.ActorID != owner.ID || stored.State != app.TerminalSessionReady {
+		t.Fatalf("stored owner terminal session = %+v, reused=%+v, err=%v", stored, reused, err)
+	}
+	if stored.AIOSessionID != "owner-session" {
+		t.Fatalf("stored owner AIO session = %q, want owner-session", stored.AIOSessionID)
+	}
+}
+
+func TestPostgresTerminalSessionAdmissionAndCompletionAreFencedByLease(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	owner := createTestUser(t, store, 4, 8_000, 16_000)
+	member := createTestUser(t, store, 4, 8_000, 16_000)
+
+	memberHost := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 7)
+	memberHost.ControlVersion = 7
+	if _, err := store.UpsertHostMember(ctx, host.Member{
+		HostID: memberHost.ID, OwnerID: owner.ID, UserID: member.ID,
+		Permissions: []host.Permission{host.PermissionTerminalControl},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setTerminalControlLease(t, store, memberHost.ID, member.ID)
+	memberReservation := terminalSessionReservation(t, memberHost, owner.ID)
+	memberReservation.ActorID = member.ID
+	reserved, created, err := store.EnsureTerminalSession(ctx, memberReservation, false)
+	if err != nil || !created {
+		t.Fatalf("reserve member terminal session = %+v created=%t err=%v", reserved, created, err)
+	}
+	if err := store.RevokeHostMember(ctx, memberHost.ID, owner.ID, member.ID); err != nil {
+		t.Fatalf("revoke member during terminal create: %v", err)
+	}
+	if completed, err := store.CompleteTerminalSession(ctx, reserved, "stale-member-session"); completed || domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("complete member terminal session after revoke = %t, %v; want conflict", completed, err)
+	}
+	if _, _, err := store.EnsureTerminalSession(ctx, memberReservation, false); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("member terminal admission after revoke = %v; want conflict", err)
+	}
+
+	expiredHost := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 8)
+	expiredHost.ControlVersion = 8
+	setTerminalControlLease(t, store, expiredHost.ID, owner.ID)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, expiredHost.ID); err != nil {
+		t.Fatal(err)
+	}
+	expiredReservation := terminalSessionReservation(t, expiredHost, owner.ID)
+	if _, _, err := store.EnsureTerminalSession(ctx, expiredReservation, false); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("expired terminal admission = %v; want conflict", err)
 	}
 }
 
@@ -163,6 +207,8 @@ func TestPostgresTerminalSessionUnknownGenerationFenceAndExplicitReplacement(t *
 	defer cancel()
 	owner := createTestUser(t, store, 4, 8_000, 16_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 2)
+	hostValue.ControlVersion = 2
+	setTerminalControlLease(t, store, hostValue.ID, owner.ID)
 	first := terminalSessionReservation(t, hostValue, owner.ID)
 	reserved, created, err := store.EnsureTerminalSession(ctx, first, false)
 	if err != nil || !created {
@@ -175,7 +221,8 @@ func TestPostgresTerminalSessionUnknownGenerationFenceAndExplicitReplacement(t *
 	if err != nil || created || unknown.State != app.TerminalSessionUnknown {
 		t.Fatalf("unknown session ensure = %+v created=%t err=%v", unknown, created, err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE hosts SET runtime_generation=runtime_generation+1, control_version=control_version+1 WHERE id=$1`, hostValue.ID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET runtime_generation=runtime_generation+1, control_version=control_version+1,
+control_actor_id=$2, control_lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, hostValue.ID, owner.ID); err != nil {
 		t.Fatal(err)
 	}
 	newFence := hostValue
@@ -199,8 +246,8 @@ func TestPostgresTerminalSessionUnknownGenerationFenceAndExplicitReplacement(t *
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_version=control_version+1 WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
-	if completed, err := store.CompleteTerminalSession(ctx, replacement, "stale-id"); err != nil || completed {
-		t.Fatalf("stale control fence complete = %t, %v; want false", completed, err)
+	if completed, err := store.CompleteTerminalSession(ctx, replacement, "stale-id"); completed || (err != nil && domain.CodeOf(err) != domain.CodeConflict) {
+		t.Fatalf("stale control fence complete = %t, %v; want fenced false", completed, err)
 	}
 }
 
@@ -211,6 +258,7 @@ func TestPostgresTerminalSessionNotFoundRequiresCurrentAIOHandle(t *testing.T) {
 	owner := createTestUser(t, store, 4, 8_000, 16_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 3)
 	hostValue.ControlVersion = 3
+	setTerminalControlLease(t, store, hostValue.ID, owner.ID)
 	reservation := terminalSessionReservation(t, hostValue, owner.ID)
 	reserved, created, err := store.EnsureTerminalSession(ctx, reservation, false)
 	if err != nil || !created {
@@ -258,6 +306,7 @@ func TestPostgresTerminalSessionCreatingExpiresBeforeExplicitReplacement(t *test
 	defer cancel()
 	owner := createTestUser(t, store, 4, 8_000, 16_000)
 	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlUser, 0)
+	setTerminalControlLease(t, store, hostValue.ID, owner.ID)
 	first := terminalSessionReservation(t, hostValue, owner.ID)
 	creating, created, err := store.EnsureTerminalSession(ctx, first, false)
 	if err != nil || !created {

@@ -72,8 +72,10 @@ func (s *WorkspaceSyncService) ReserveWorkspaceSyncReceive(ctx context.Context, 
 	if err != nil {
 		return WorkspaceSyncReceiveReservation{}, err
 	}
+	validPath := workspace.ValidateRelativePath(request.Path) == nil ||
+		(request.Operation == WorkspaceSyncReceiveDirectoryUpsert && request.Path == ".")
 	if ctx == nil || !domain.ValidUserID(request.OwnerID) || !domain.ValidWorkspaceID(request.WorkspaceID) || !workspace.ValidSyncFolderID(request.FolderID) ||
-		!workspaceSyncReceiveOperationIDPattern.MatchString(request.OperationID) || workspace.ValidateRelativePath(request.Path) != nil ||
+		!workspaceSyncReceiveOperationIDPattern.MatchString(request.OperationID) || !validPath ||
 		request.TargetBytes < 0 || request.TargetBytes > workspace.MaxSyncFileBytes ||
 		(request.Operation != WorkspaceSyncReceiveUpsert && request.Operation != WorkspaceSyncReceiveDelete &&
 			request.Operation != WorkspaceSyncReceiveDirectoryUpsert && request.Operation != WorkspaceSyncReceiveDirectoryDelete) ||

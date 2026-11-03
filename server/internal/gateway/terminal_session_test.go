@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
 )
 
@@ -324,6 +325,19 @@ func TestTerminalSessionRequiresTerminalControl(t *testing.T) {
 	response := terminalSessionRequestAs(handler, g, http.MethodPut, "", testMemberID)
 	if response.Code != http.StatusNotFound || aio.calls != 0 {
 		t.Fatalf("non-owner terminal request = %d %s calls=%d", response.Code, response.Body, aio.calls)
+	}
+}
+
+func TestTerminalSessionAdmissionRequiresCurrentControlLease(t *testing.T) {
+	handler, g, _, store, aio := terminalSessionFixture(t)
+	permits := g.deps.InputPermits.(*testActivityLeaseStore)
+	permits.controlErr = nil
+	permits.inputErr = domain.NewError(domain.CodeConflict, "control lease expired")
+
+	response := terminalSessionRequest(handler, g, http.MethodPut, "")
+	if response.Code != http.StatusConflict || aio.calls != 0 || store.current != nil {
+		t.Fatalf("expired lease terminal admission = %d %s AIO calls=%d session=%+v; want conflict before side effects",
+			response.Code, response.Body, aio.calls, store.current)
 	}
 }
 

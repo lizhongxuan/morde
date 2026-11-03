@@ -160,15 +160,33 @@ func IsScheduleGrantScopeSet(scopes []Scope) bool {
 		scopes[0] == ScopeScheduleManage && scopes[1] == ScopeScheduleRead
 }
 
-// ScheduleTaskExecutionScopes are internal Task scopes attached to a Task
-// created by a validated scheduled occurrence. They are not schedule grant
-// scopes and are never accepted by the API authentication middleware.
+// ScheduleTaskExecutionScopes are the internal Task scopes attached to a
+// Host-bound Task created by a validated scheduled occurrence. They are not
+// schedule grant scopes and are never accepted by API authentication middleware.
 func ScheduleTaskExecutionScopes() []Scope {
 	return []Scope{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskControl, ScopeComputerObserve, ScopeComputerOperate}
 }
 
+// HostlessScheduleTaskExecutionScopes are the internal Task scopes attached
+// to scheduled Tasks that have no Host. They intentionally omit computer
+// observation and operation capabilities.
+func HostlessScheduleTaskExecutionScopes() []Scope {
+	return []Scope{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskControl}
+}
+
 func IsScheduleTaskExecutionScopeSet(scopes []Scope) bool {
-	expected := ScheduleTaskExecutionScopes()
+	return IsHostBoundScheduleTaskExecutionScopeSet(scopes) || IsHostlessScheduleTaskExecutionScopeSet(scopes)
+}
+
+func IsHostBoundScheduleTaskExecutionScopeSet(scopes []Scope) bool {
+	return isExactScopeSet(scopes, ScheduleTaskExecutionScopes())
+}
+
+func IsHostlessScheduleTaskExecutionScopeSet(scopes []Scope) bool {
+	return isExactScopeSet(scopes, HostlessScheduleTaskExecutionScopes())
+}
+
+func isExactScopeSet(scopes, expected []Scope) bool {
 	if len(scopes) != len(expected) {
 		return false
 	}

@@ -221,6 +221,9 @@ func finalizeWorkspaceBlockUsageTx(ctx context.Context, tx pgx.Tx, workspaceID, 
 	if err := tx.QueryRow(ctx, `SELECT owner_id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&ownerID); err != nil {
 		return false, storeError("lock workspace before settling block usage", "workspace", err)
 	}
+	if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+		return false, err
+	}
 	ownerAllocated, ownerReserved, err := lockWorkspaceOwnerUsage(ctx, tx, ownerID)
 	if err != nil {
 		return false, err
@@ -405,7 +408,8 @@ WHERE u.state='reserved'
 		if _, err := tx.Exec(ctx, `
 UPDATE workspace_owner_block_usage o SET
   allocated_bytes=COALESCE((SELECT sum(u.allocated_bytes) FROM workspace_block_usage u JOIN workspaces w ON w.id=u.workspace_id WHERE w.owner_id=o.owner_id),0),
-  reserved_bytes=COALESCE((SELECT sum(u.reserved_bytes) FROM workspace_block_usage u JOIN workspaces w ON w.id=u.workspace_id WHERE w.owner_id=o.owner_id),0),
+  reserved_bytes=COALESCE((SELECT sum(u.reserved_bytes) FROM workspace_block_usage u JOIN workspaces w ON w.id=u.workspace_id WHERE w.owner_id=o.owner_id),0)
+    + COALESCE((SELECT sum(c.reserved_bytes) FROM workspace_copy_reservations c WHERE c.owner_id=o.owner_id AND c.state IN ('reserved','copying','unknown')),0),
   updated_at=now()`); err != nil {
 			return fmt.Errorf("rebuild workspace owner block usage counters: %w", err)
 		}

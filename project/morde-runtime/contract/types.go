@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	ProtocolVersion      = "1.0"
+	ProtocolVersion      = "2.0"
 	ProtocolHeader       = "X-Morde-Runtime-Protocol"
 	MaxTaskLeaseDuration = 30 * time.Second
 )
@@ -565,13 +565,40 @@ type TaskWorkspaceManifestChunk struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
+type WorkspaceExtendedAttribute struct {
+	Name  string `json:"name"`
+	Value []byte `json:"value"`
+}
+
+type WorkspaceNativeACL struct {
+	Platform string `json:"platform"`
+	Format   string `json:"format"`
+	Data     []byte `json:"data"`
+}
+
 // TaskWorkspaceManifestFile is a workspace-relative file in an export page.
 type TaskWorkspaceManifestFile struct {
-	Path      string                       `json:"path"`
-	SizeBytes int64                        `json:"size_bytes"`
-	SHA256    string                       `json:"sha256"`
-	Mode      uint32                       `json:"mode"`
-	Chunks    []TaskWorkspaceManifestChunk `json:"chunks"`
+	Path          string                       `json:"path"`
+	Kind          string                       `json:"kind"`
+	SymlinkTarget string                       `json:"symlink_target,omitempty"`
+	HardlinkTo    string                       `json:"hardlink_to,omitempty"`
+	SizeBytes     int64                        `json:"size_bytes"`
+	SHA256        string                       `json:"sha256"`
+	Mode          uint32                       `json:"mode"`
+	ModTimeNS     *int64                       `json:"mod_time_ns,omitempty"`
+	MetadataKnown bool                         `json:"metadata_known,omitempty"`
+	Xattrs        []WorkspaceExtendedAttribute `json:"xattrs,omitempty"`
+	ACL           *WorkspaceNativeACL          `json:"acl,omitempty"`
+	Chunks        []TaskWorkspaceManifestChunk `json:"chunks"`
+}
+
+type TaskWorkspaceManifestDirectory struct {
+	Path          string                       `json:"path"`
+	Mode          uint32                       `json:"mode"`
+	ModTimeNS     *int64                       `json:"mod_time_ns,omitempty"`
+	MetadataKnown bool                         `json:"metadata_known,omitempty"`
+	Xattrs        []WorkspaceExtendedAttribute `json:"xattrs,omitempty"`
+	ACL           *WorkspaceNativeACL          `json:"acl,omitempty"`
 }
 
 // TaskWorkspaceManifestResponse identifies a bounded page from one exact
@@ -579,17 +606,18 @@ type TaskWorkspaceManifestFile struct {
 type TaskWorkspaceManifestResponse struct {
 	ProtocolVersion string `json:"protocol_version"`
 	HostFence
-	TaskID                      string                      `json:"task_id"`
-	WorkspaceID                 string                      `json:"workspace_id"`
-	BindingVersion              int64                       `json:"binding_version"`
-	InputRevision               int64                       `json:"input_revision"`
-	WorkspaceCheckpointRevision int64                       `json:"workspace_checkpoint_revision"`
-	InputManifestSHA256         string                      `json:"input_manifest_sha256"`
-	ViewID                      string                      `json:"view_id"`
-	ManifestSHA256              string                      `json:"manifest_sha256"`
-	Files                       []TaskWorkspaceManifestFile `json:"files"`
-	EmptyDirectories            []string                    `json:"empty_directories"`
-	NextCursor                  string                      `json:"next_cursor,omitempty"`
+	TaskID                      string                           `json:"task_id"`
+	WorkspaceID                 string                           `json:"workspace_id"`
+	BindingVersion              int64                            `json:"binding_version"`
+	InputRevision               int64                            `json:"input_revision"`
+	WorkspaceCheckpointRevision int64                            `json:"workspace_checkpoint_revision"`
+	InputManifestSHA256         string                           `json:"input_manifest_sha256"`
+	ViewID                      string                           `json:"view_id"`
+	ManifestSHA256              string                           `json:"manifest_sha256"`
+	Files                       []TaskWorkspaceManifestFile      `json:"files"`
+	EmptyDirectories            []string                         `json:"empty_directories"`
+	Directories                 []TaskWorkspaceManifestDirectory `json:"directories"`
+	NextCursor                  string                           `json:"next_cursor,omitempty"`
 }
 
 // TaskWorkspaceBlockResponse returns one exact morde-sync block as base64 JSON

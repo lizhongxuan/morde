@@ -151,7 +151,7 @@ type WorkspaceSyncStore interface {
 	ReserveTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error)
 	GetTaskWorkspacePublishReceipt(context.Context, TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error)
 	FindTaskWorkspacePublishReceipt(context.Context, string, string, string, string) (TaskWorkspacePublishReceipt, error)
-	CommitTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, []workspace.File, []string, string) (TaskWorkspacePublishReceipt, error)
+	CommitTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, []workspace.File, []string, []workspace.Directory, string) (TaskWorkspacePublishReceipt, error)
 	RejectTaskWorkspacePublishQuota(context.Context, TaskWorkspacePublishCommand) error
 	ReserveTaskWorkspaceBlockUsage(context.Context, string, []WorkspaceBlockReservation, int64) error
 	CancelWorkspaceSyncSession(context.Context, string, string, IdempotencyRecord) (workspace.SyncSession, bool, error)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"morde-runtime/contract"
+	"morde-runtime/internal/operationstore"
 )
 
 func TestCapabilitiesAndSameVersionAIModeReconciliation(t *testing.T) {
@@ -584,7 +585,7 @@ func TestQuiesceReceiptIsVersionBoundAndOneTime(t *testing.T) {
 	closeManager(t, manager)
 }
 
-func TestRestartMarksAcceptedFailedAndRunningUnknownWithoutReplay(t *testing.T) {
+func TestRestartQuarantinesUnknownOperationWithoutReplay(t *testing.T) {
 	dir := newStoreDir(t)
 	first, err := Open(Options{StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 1})
 	if err != nil {
@@ -614,25 +615,34 @@ func TestRestartMarksAcceptedFailedAndRunningUnknownWithoutReplay(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	second, err := Open(Options{StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 2})
+	if _, err := Open(Options{StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 2}); !errors.Is(err, ErrRuntimeStateUnavailable) {
+		t.Fatalf("startup with an old unknown operation error = %v, want fail closed", err)
+	}
+	ledger, err := operationstore.Open(dir, uint32(os.Geteuid()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer second.store.Close() // unknown is intentionally unresolved and must not be auto-cleared.
-	current := currentFence(t, second)
-	accepted, err := second.QueryOperation(contract.ProtocolVersion, "o1234567", contract.OperationQuery{HostFence: current, TaskID: testTaskID, LeaseVersion: 1})
-	if err != nil || accepted.Status != contract.OperationFailed {
-		t.Fatalf("accepted recovery result=%#v err=%v", accepted, err)
+	defer ledger.Close()
+	events, err := ledger.Events()
+	if err != nil {
+		t.Fatal(err)
 	}
-	running, err := second.QueryOperation(contract.ProtocolVersion, "o7654321", contract.OperationQuery{HostFence: current, TaskID: testTaskID, LeaseVersion: 1})
-	if err != nil || running.Status != contract.OperationUnknown {
-		t.Fatalf("running recovery result=%#v err=%v", running, err)
+	statuses := map[string]contract.OperationStatus{}
+	for _, event := range events {
+		if event.Kind != "operation" {
+			continue
+		}
+		var record operationRecord
+		if err := json.Unmarshal(event.Data, &record); err != nil {
+			t.Fatal(err)
+		}
+		statuses[record.Operation.OperationID] = record.Operation.Status
 	}
-	if running.RuntimeGeneration != 1 || running.RuntimeInstanceID != fence.RuntimeInstanceID {
-		t.Fatalf("operation lost its original fences: %#v", running)
+	if statuses["o1234567"] != contract.OperationFailed || statuses["o7654321"] != contract.OperationUnknown {
+		t.Fatalf("restart recovery statuses = %#v", statuses)
 	}
-	if _, err := second.QueryOperation(contract.ProtocolVersion, "o7654321", contract.OperationQuery{HostFence: fence, TaskID: testTaskID, LeaseVersion: 1}); !errors.Is(err, ErrFenceRejected) {
-		t.Fatalf("old generation query fence error = %v", err)
+	if _, err := Open(Options{StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 3}); !errors.Is(err, ErrRuntimeStateUnavailable) {
+		t.Fatalf("replay of an old unknown operation error = %v, want fail closed", err)
 	}
 }
 
@@ -649,6 +659,67 @@ func TestOperationStoreUnavailableFailsClosed(t *testing.T) {
 	}
 	if _, err := manager.Submit(context.Background(), testExecute(fence, `{"x":1}`)); !errors.Is(err, ErrRuntimeStateUnavailable) {
 		t.Fatalf("submit with closed store error = %v", err)
+	}
+}
+
+type failingEventStore struct {
+	events      []operationstore.Event
+	appendCalls int
+	appendErr   error
+	reconciled  bool
+	closed      bool
+}
+
+func (s *failingEventStore) Reconcile(legacy operationstore.EventStore) error {
+	events, err := legacy.Events()
+	if err != nil {
+		return err
+	}
+	s.events = events
+	s.reconciled = true
+	return nil
+}
+
+func (s *failingEventStore) Events() ([]operationstore.Event, error) {
+	events := make([]operationstore.Event, len(s.events))
+	copy(events, s.events)
+	return events, nil
+}
+
+func (s *failingEventStore) Append(string, any) error {
+	s.appendCalls++
+	return s.appendErr
+}
+
+func (s *failingEventStore) Ready() bool { return !s.closed }
+
+func (s *failingEventStore) Close() error {
+	s.closed = true
+	return nil
+}
+
+func TestPortalLedgerWriteFailureDoesNotFallBackToLocalJournal(t *testing.T) {
+	dir := newStoreDir(t)
+	remote := &failingEventStore{appendErr: errors.New("Portal unavailable")}
+	if _, err := Open(Options{
+		StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID, Generation: 1, Store: remote,
+	}); !errors.Is(err, ErrRuntimeStateUnavailable) {
+		t.Fatalf("runtime startup with Portal append failure = %v, want fail closed", err)
+	}
+	if !remote.reconciled || remote.appendCalls != 1 {
+		t.Fatalf("remote ledger reconciliation=%t append calls=%d", remote.reconciled, remote.appendCalls)
+	}
+	legacy, err := operationstore.Open(dir, uint32(os.Geteuid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	events, err := legacy.Events()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("failed Portal write fell back to local journal: %#v", events)
 	}
 }
 

@@ -29,7 +29,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 
 	owner := createTestUser(t, store, 1, 20_000, 40_000)
 	created := createTestHost(t, ctx, store, owner.ID, capacity, nil)
-	if created.State != host.StateCreating || len(created.Workspaces) != 0 {
+	if created.State != host.StateCreating || len(created.Workspaces) != 1 {
 		t.Fatalf("created host = %#v", created)
 	}
 
@@ -52,13 +52,13 @@ func TestAtomicPostgresOperations(t *testing.T) {
 		t.Fatalf("empty activity batch: %v", err)
 	}
 
-	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, nil)); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, nil)); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("create another host past the host-count limit: %v", err)
 	}
 
 	capacityOwner := createTestUser(t, store, 3, 10_000, 20_000)
 	capacityLimited := app.Capacity{CPUMilli: 1_000, MemMiB: 4_096}
-	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, capacityOwner.ID, capacityLimited, nil)); domain.CodeOf(err) != domain.CodeCapacityExceeded {
+	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, capacityOwner.ID, capacityLimited, nil)); domain.CodeOf(err) != domain.CodeCapacityExceeded {
 		t.Fatalf("cluster capacity error = %v", err)
 	}
 
@@ -68,8 +68,26 @@ func TestAtomicPostgresOperations(t *testing.T) {
 	if _, err := store.TransitionHost(ctx, created.ID, host.StateCreating, host.StateFailed, "stale"); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("stale host transition error = %v", err)
 	}
+	if _, err := store.TransitionHost(ctx, created.ID, host.StateRunning, host.StateDeleting, ""); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("delete Host with active Workspace binding = %v, want workspace busy", err)
+	}
+	binding := created.Workspaces[0]
+	binding, err = store.TransitionWorkspaceBinding(ctx, created.ID, binding.Workspace.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, binding.DesiredRevision, binding.AppliedRevision)
+	if err != nil {
+		t.Fatalf("activate Host Workspace before unbind: %v", err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, created.ID, binding.Workspace.ID, binding.BindingVersion,
+		workspace.BindingActive, workspace.BindingUnbinding, binding.DesiredRevision, binding.AppliedRevision)
+	if err != nil {
+		t.Fatalf("begin Host Workspace unbind: %v", err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, created.ID, binding.Workspace.ID, binding.BindingVersion,
+		workspace.BindingUnbinding, workspace.BindingDetached, 0, 0); err != nil {
+		t.Fatalf("detach Host Workspace before deletion: %v", err)
+	}
 	if _, err := store.TransitionHost(ctx, created.ID, host.StateRunning, host.StateDeleting, ""); err != nil {
-		t.Fatalf("transition running host to deleting: %v", err)
+		t.Fatalf("transition running Host to deleting after detach: %v", err)
 	}
 	standalone := createTestWorkspace(t, ctx, store, owner.ID, "deletable")
 	claimed, err := store.ClaimWorkspaceForDelete(ctx, standalone.ID, standalone.Revision)
@@ -88,7 +106,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 		const attempts = 8
 		paramsList := make([]app.CreateHostParams, attempts)
 		for i := range attempts {
-			paramsList[i] = testCreateHostParams(t, parallelOwner.ID, capacity, nil)
+			paramsList[i] = testCreateHostParams(t, store, parallelOwner.ID, capacity, nil)
 		}
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -124,8 +142,7 @@ func TestAtomicPostgresOperations(t *testing.T) {
 		const attachAttempts = 8
 		attachParams := make([]app.CreateHostParams, attachAttempts)
 		for i := range attachAttempts {
-			attachParams[i] = testCreateHostParams(t, attachOwner.ID, capacity, nil)
-			attachParams[i].WorkspaceIDs = []string{detached.ID}
+			attachParams[i] = testCreateHostParams(t, store, attachOwner.ID, capacity, []string{detached.ID})
 		}
 		wg = sync.WaitGroup{}
 		mu = sync.Mutex{}
@@ -247,7 +264,7 @@ func TestHostCreateIdempotencyReplaysAtomically(t *testing.T) {
 	owner := createTestUser(t, store, 8, 20_000, 40_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "host-create-retry")
-	params := testCreateHostParams(t, owner.ID, capacity, []string{workspaceValue.ID})
+	params := testCreateHostParams(t, store, owner.ID, capacity, []string{workspaceValue.ID})
 	requestHash := sha256.Sum256([]byte(`{"name":"retry"}`))
 	params.Idempotency = app.IdempotencyRecord{
 		OwnerID: owner.ID, Operation: "host.create", Key: "host-create-retry-001",
@@ -298,10 +315,13 @@ func TestWorkspaceBindingCanMoveBetweenHosts(t *testing.T) {
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	value := createTestWorkspace(t, ctx, store, owner.ID, "shared")
-	firstParams := testCreateHostParams(t, owner.ID, capacity, []string{value.ID})
+	firstParams := testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID})
 	first, _, err := store.CreateHost(ctx, firstParams)
 	if err != nil || len(first.Workspaces) != 1 || first.Workspaces[0].State != workspace.BindingPreparing {
 		t.Fatalf("create first host binding = %#v, err=%v", first.Workspaces, err)
+	}
+	if _, err := store.TransitionHost(ctx, first.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+		t.Fatalf("start first Host before activating Workspace: %v", err)
 	}
 	active, err := store.TransitionWorkspaceBinding(ctx, first.ID, value.ID, 1, workspace.BindingPreparing, workspace.BindingActive, 0, 0)
 	if err != nil || active.BindingVersion != 2 {
@@ -314,7 +334,7 @@ func TestWorkspaceBindingCanMoveBetweenHosts(t *testing.T) {
 	if _, err := store.TransitionWorkspaceBinding(ctx, first.ID, value.ID, 3, workspace.BindingUnbinding, workspace.BindingDetached, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	params := testCreateHostParams(t, owner.ID, capacity, []string{value.ID})
+	params := testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID})
 	second, _, err := store.CreateHost(ctx, params)
 	if err != nil {
 		t.Fatal(err)
@@ -325,18 +345,15 @@ func TestWorkspaceBindingCanMoveBetweenHosts(t *testing.T) {
 	}
 }
 
-func TestWorkspaceBindingAppendEnforcesHostLimit(t *testing.T) {
+func TestWorkspaceBindingEnforcesOneWorkspacePerHost(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
-	workspaceIDs := make([]string, workspace.MaxBindingsPerHost)
-	for i := range workspaceIDs {
-		workspaceIDs[i] = createTestWorkspace(t, ctx, store, owner.ID, fmt.Sprintf("binding-limit-%02d", i)).ID
-	}
-	created := createTestHost(t, ctx, store, owner.ID, capacity, workspaceIDs)
-	if len(created.Workspaces) != workspace.MaxBindingsPerHost {
-		t.Fatalf("created host bindings = %d, want %d", len(created.Workspaces), workspace.MaxBindingsPerHost)
+	first := createTestWorkspace(t, ctx, store, owner.ID, "binding-limit-first")
+	created := createTestHost(t, ctx, store, owner.ID, capacity, []string{first.ID})
+	if len(created.Workspaces) != 1 || created.Workspaces[0].Workspace.ID != first.ID {
+		t.Fatalf("created Host bindings = %#v, want exactly one", created.Workspaces)
 	}
 	if _, err := store.TransitionHost(ctx, created.ID, host.StateCreating, host.StateRunning, ""); err != nil {
 		t.Fatal(err)
@@ -346,15 +363,15 @@ func TestWorkspaceBindingAppendEnforcesHostLimit(t *testing.T) {
 		OwnerID: owner.ID, HostID: created.ID, Workspace: extra, Directory: extra.ID,
 		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: extra.Revision,
 	})
-	if domain.CodeOf(err) != domain.CodeCapacityExceeded {
-		t.Fatalf("append binding at host limit error = %v, want capacity exceeded", err)
+	if domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("append second binding error = %v, want workspace conflict", err)
 	}
 	bindings, err := store.GetWorkspaceBindingsByHost(ctx, created.ID)
-	if err != nil || len(bindings) != workspace.MaxBindingsPerHost {
+	if err != nil || len(bindings) != 1 {
 		t.Fatalf("host bindings after rejected append = %d, err=%v", len(bindings), err)
 	}
 	for _, binding := range bindings {
-		if binding.State != workspace.BindingPreparing || binding.BindingVersion != 1 {
+		if binding.State != workspace.BindingPreparing || binding.BindingVersion != 1 || binding.Workspace.ID != first.ID {
 			t.Fatalf("existing binding changed after rejected append: %#v", binding)
 		}
 	}
@@ -363,17 +380,17 @@ func TestWorkspaceBindingAppendEnforcesHostLimit(t *testing.T) {
 	}
 }
 
-func TestWorkspaceBindingAppendSerializesAtHostLimit(t *testing.T) {
+func TestWorkspaceBindingCreateSerializesPerHost(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
-	workspaceIDs := make([]string, workspace.MaxBindingsPerHost-1)
-	for i := range workspaceIDs {
-		workspaceIDs[i] = createTestWorkspace(t, ctx, store, owner.ID, fmt.Sprintf("binding-race-%02d", i)).ID
+	first := createTestWorkspace(t, ctx, store, owner.ID, "binding-race-initial")
+	created := createTestHost(t, ctx, store, owner.ID, capacity, []string{first.ID})
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_bindings SET state='detached' WHERE host_id=$1 AND workspace_id=$2`, created.ID, first.ID); err != nil {
+		t.Fatal(err)
 	}
-	created := createTestHost(t, ctx, store, owner.ID, capacity, workspaceIDs)
-	if _, err := store.TransitionHost(ctx, created.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, created.ID); err != nil {
 		t.Fatal(err)
 	}
 	extra := []workspace.Workspace{
@@ -402,18 +419,27 @@ func TestWorkspaceBindingAppendSerializesAtHostLimit(t *testing.T) {
 			continue
 		}
 		switch domain.CodeOf(err) {
-		case domain.CodeCapacityExceeded:
+		case domain.CodeWorkspaceConflict:
 			limited++
 		default:
 			t.Fatalf("concurrent append error = %v", err)
 		}
 	}
 	if succeeded != 1 || limited != 1 {
-		t.Fatalf("concurrent append results: succeeded=%d limited=%d, want 1 each", succeeded, limited)
+		t.Fatalf("concurrent binding results: succeeded=%d rejected=%d, want 1 each", succeeded, limited)
 	}
 	bindings, err := store.GetWorkspaceBindingsByHost(ctx, created.ID)
-	if err != nil || len(bindings) != workspace.MaxBindingsPerHost {
-		t.Fatalf("host bindings after concurrent append = %d, err=%v", len(bindings), err)
+	if err != nil {
+		t.Fatalf("host bindings after concurrent bind: %v", err)
+	}
+	active := 0
+	for _, binding := range bindings {
+		if binding.State != workspace.BindingDetached {
+			active++
+		}
+	}
+	if active != 1 {
+		t.Fatalf("active Host bindings after concurrent bind = %d, want 1", active)
 	}
 }
 
@@ -423,7 +449,7 @@ func TestWorkspaceBindingSyncStatusIsScopedAndIdempotent(t *testing.T) {
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	value := createTestWorkspace(t, ctx, store, owner.ID, "binding-sync-status")
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, []string{value.ID}))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID}))
 	if err != nil || len(created.Workspaces) != 1 {
 		t.Fatalf("create Host binding = %#v, %v", created.Workspaces, err)
 	}
@@ -465,7 +491,7 @@ func TestHostDeletionRequiresDetachedWorkspaceAndFencesRebind(t *testing.T) {
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	value := createTestWorkspace(t, ctx, store, owner.ID, "delete-fence")
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, []string{value.ID}))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +526,7 @@ func TestFailedWorkspaceBindingRemainsExclusiveUntilRecovered(t *testing.T) {
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	value := createTestWorkspace(t, ctx, store, owner.ID, "failed-binding")
-	first, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, []string{value.ID}))
+	first, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +538,7 @@ func TestFailedWorkspaceBindingRemainsExclusiveUntilRecovered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, []string{value.ID})); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+	if _, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID})); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("bind Workspace while previous binding is failed error = %v, want workspace busy", err)
 	}
 	recovered, err := store.TransitionWorkspaceBinding(ctx, first.ID, value.ID, failed.BindingVersion,
@@ -528,9 +554,12 @@ func TestWorkspaceBindingTransitionDoesNotRewindConcurrentWorkspaceRevision(t *t
 	owner := createTestUser(t, store, 10, 100_000, 200_000)
 	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
 	value := createTestWorkspace(t, ctx, store, owner.ID, "binding-revision-race")
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, owner.ID, capacity, []string{value.ID}))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, owner.ID, capacity, []string{value.ID}))
 	if err != nil || len(created.Workspaces) != 1 {
 		t.Fatalf("create host with preparing binding = %#v, err=%v", created.Workspaces, err)
+	}
+	if _, err := store.TransitionHost(ctx, created.ID, host.StateCreating, host.StateRunning, ""); err != nil {
+		t.Fatalf("start Host before racing binding activation: %v", err)
 	}
 
 	blocker, err := pool.Begin(ctx)
@@ -591,8 +620,9 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	created := make(chan bool, callers)
 	errors := make(chan error, callers)
 	requests := make([]app.CreateHostParams, callers)
+	defaultWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "default-host")
 	for index := range requests {
-		requests[index] = testCreateHostParams(t, owner.ID, capacity, nil)
+		requests[index] = testCreateHostParams(t, store, owner.ID, capacity, []string{defaultWorkspace.ID})
 		requests[index].Host.State = host.StateStopped
 		requests[index].Host.ExpiresAt = nil
 	}
@@ -617,7 +647,7 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	}
 	var firstID string
 	for value := range results {
-		if value.State != host.StateStopped || value.SandboxID != "" || value.CPUMilli != 1000 || value.MemMiB != 2048 {
+		if value.State != host.StateStopped || value.SandboxID != "" || value.CPUMilli != 1000 || value.MemMiB != 2048 || len(value.Workspaces) != 1 {
 			t.Fatalf("default host = %#v", value)
 		}
 		if firstID == "" {
@@ -635,14 +665,18 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	if createdCount != 1 {
 		t.Fatalf("default host created %d times", createdCount)
 	}
-	params := testCreateHostParams(t, owner.ID, capacity, nil)
+	lookedUp, found, err := store.GetDefaultHostForOwner(ctx, owner.ID)
+	if err != nil || !found || lookedUp.ID != firstID || len(lookedUp.Workspaces) != 1 {
+		t.Fatalf("GetDefaultHostForOwner() = %#v, found=%t, err=%v", lookedUp, found, err)
+	}
+	params := testCreateHostParams(t, store, owner.ID, capacity, nil)
 	if _, _, err := store.CreateHost(ctx, params); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("create over stopped host quota: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE users SET quota_hosts=2, default_host_cpu_milli=1500, default_host_mem_mib=3072 WHERE id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
-	concurrentRequests := []app.CreateHostParams{params, testCreateHostParams(t, owner.ID, capacity, nil)}
+	concurrentRequests := []app.CreateHostParams{params, testCreateHostParams(t, store, owner.ID, capacity, nil)}
 	type createResult struct {
 		value host.Host
 		err   error
@@ -675,7 +709,7 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	if successes != 1 || quotaFailures != 1 {
 		t.Fatalf("concurrent creates: success=%d quota_exceeded=%d", successes, quotaFailures)
 	}
-	ensureParams := testCreateHostParams(t, owner.ID, capacity, nil)
+	ensureParams := testCreateHostParams(t, store, owner.ID, capacity, nil)
 	ensureParams.Host.State = host.StateStopped
 	ensureParams.Host.ExpiresAt = nil
 	selected, didCreate, err := store.EnsureDefaultHost(ctx, ensureParams)
@@ -688,6 +722,41 @@ func TestDefaultHostIsStoppedAndCountsTowardConcurrentCreateQuota(t *testing.T) 
 	selected, didCreate, err = store.EnsureDefaultHost(ctx, ensureParams)
 	if err != nil || didCreate || selected.ID != "" {
 		t.Fatalf("multiple hosts without selection = %#v, created=%t, err=%v", selected, didCreate, err)
+	}
+}
+
+func TestDefaultHostQuotaOrCapacityFailureLeavesNoHost(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		quotaCPU  int
+		capacity  app.Capacity
+		wantError domain.ErrorCode
+	}{
+		{name: "quota", quotaCPU: 500, capacity: app.Capacity{CPUMilli: 10_000, MemMiB: 20_000}, wantError: domain.CodeQuotaExceeded},
+		{name: "capacity", quotaCPU: 10_000, capacity: app.Capacity{CPUMilli: 500, MemMiB: 20_000}, wantError: domain.CodeCapacityExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, pool := newTemporaryStore(t)
+			ctx := context.Background()
+			owner := createTestUser(t, store, 1, test.quotaCPU, 20_000)
+			value := createTestWorkspace(t, ctx, store, owner.ID, "default-workspace")
+			params := testCreateHostParams(t, store, owner.ID, test.capacity, []string{value.ID})
+			params.Host.State = host.StateStopped
+			params.Host.ExpiresAt = nil
+			if _, _, err := store.EnsureDefaultHost(ctx, params); domain.CodeOf(err) != test.wantError {
+				t.Fatalf("EnsureDefaultHost() error = %v, want %s", err, test.wantError)
+			}
+			var hosts, bindings int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM hosts WHERE owner_id=$1`, owner.ID).Scan(&hosts); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM workspace_bindings WHERE owner_id=$1`, owner.ID).Scan(&bindings); err != nil {
+				t.Fatal(err)
+			}
+			if hosts != 0 || bindings != 0 {
+				t.Fatalf("Host/Workspace binding persisted after rejected default create: %d/%d", hosts, bindings)
+			}
+		})
 	}
 }
 
@@ -794,15 +863,19 @@ func testSessionTokenID(ownerID string) string {
 
 func createTestHost(t *testing.T, ctx context.Context, store *Store, ownerID string, capacity app.Capacity, workspaceIDs []string) host.Host {
 	t.Helper()
-	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, ownerID, capacity, workspaceIDs))
+	created, _, err := store.CreateHost(ctx, testCreateHostParams(t, store, ownerID, capacity, workspaceIDs))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return created
 }
 
-func testCreateHostParams(t *testing.T, ownerID string, capacity app.Capacity, workspaceIDs []string) app.CreateHostParams {
+func testCreateHostParams(t *testing.T, store *Store, ownerID string, capacity app.Capacity, workspaceIDs []string) app.CreateHostParams {
 	t.Helper()
+	if len(workspaceIDs) == 0 {
+		value := createTestWorkspace(t, context.Background(), store, ownerID, "host-workspace")
+		workspaceIDs = []string{value.ID}
+	}
 	hostID, err := domain.NewHostID()
 	if err != nil {
 		t.Fatal(err)

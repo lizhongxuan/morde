@@ -28,6 +28,15 @@
       "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "task_api", "cloud_tasks"],
       "default_max_request_bytes": 1048576
     },
+    "project_budget_execution": {
+      "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
+      "api_version": "1",
+      "hub_version": null,
+      "event_version": null,
+      "minimum_client_version": null,
+      "supported_features": ["password_login", "ordered_client_login", "client_installations", "available_models", "model_gateway", "task_api", "cloud_tasks", "project_budget_execution"],
+      "default_max_request_bytes": 1048576
+    },
     "hub": {
       "service_instance_id": "9f0de095-66ba-49c6-a87b-0c527f4f81a1",
       "api_version": "1",

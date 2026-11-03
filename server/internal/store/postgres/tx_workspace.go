@@ -65,8 +65,15 @@ func (s *Store) CreateWorkspaceBinding(ctx context.Context, value workspace.Bind
 		if ownerID != value.OwnerID {
 			return domain.NewError(domain.CodeNotFound, "host not found")
 		}
-		if hostState != string(host.StateRunning) {
-			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to bind a workspace")
+		var activeBindingCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM workspace_bindings WHERE host_id=$1 AND state <> 'detached'`, value.HostID).Scan(&activeBindingCount); err != nil {
+			return fmt.Errorf("count active host workspace bindings: %w", err)
+		}
+		if hostState != string(host.StateRunning) && hostState != string(host.StateStopped) {
+			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running or stopped to bind a workspace")
+		}
+		if activeBindingCount != 0 {
+			return domain.NewError(domain.CodeWorkspaceConflict, "host already has an active workspace binding")
 		}
 		// Portal and Runtime snapshots include detached bindings, so cap persisted rows too.
 		var bindingCount int
@@ -84,6 +91,9 @@ func (s *Store) CreateWorkspaceBinding(ctx context.Context, value workspace.Bind
 		}
 		if err != nil {
 			return fmt.Errorf("lock workspace for binding: %w", err)
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.Workspace.ID); err != nil {
+			return err
 		}
 		if workspaceState != string(workspace.StateReady) || revision != value.DesiredRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace changed before binding")
@@ -166,13 +176,18 @@ func (s *Store) transitionWorkspaceBinding(ctx context.Context, expectedGenerati
 		if expectedGeneration > 0 && hostGeneration != expectedGeneration {
 			return domain.NewError(domain.CodeUnauthenticated, "host replica generation is no longer current")
 		}
-		if hostState != string(host.StateRunning) {
+		stoppedRebind := hostState == string(host.StateStopped) && to == workspace.BindingPreparing &&
+			(from == workspace.BindingDetached || from == workspace.BindingFailed)
+		if hostState != string(host.StateRunning) && !stoppedRebind {
 			return domain.NewError(domain.CodeWorkspaceBusy, "host must be running to change a workspace binding")
 		}
 		var currentWorkspaceState string
 		var currentWorkspaceRevision int64
 		if err := tx.QueryRow(ctx, `SELECT state, revision FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&currentWorkspaceState, &currentWorkspaceRevision); err != nil {
 			return fmt.Errorf("lock workspace before binding transition: %w", err)
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		var bindingID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, hostID, workspaceID).Scan(&bindingID); errors.Is(err, pgx.ErrNoRows) {
@@ -189,6 +204,16 @@ func (s *Store) transitionWorkspaceBinding(ctx context.Context, expectedGenerati
 		}
 		if current.BindingVersion != expectedVersion || current.BindingState != string(from) {
 			return bindingStateConflict(ctx, tx, hostID, workspaceID)
+		}
+		if to != workspace.BindingDetached {
+			var otherActiveBindings int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM workspace_bindings
+WHERE host_id=$1 AND workspace_id<>$2 AND state <> 'detached'`, hostID, workspaceID).Scan(&otherActiveBindings); err != nil {
+				return fmt.Errorf("count other active host workspace bindings: %w", err)
+			}
+			if otherActiveBindings != 0 {
+				return domain.NewError(domain.CodeWorkspaceConflict, "host has multiple active workspace bindings")
+			}
 		}
 		if desiredRevision != current.DesiredRevision || appliedRevision != current.AppliedRevision || desiredRevision > currentWorkspaceRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace binding revision is stale")
@@ -281,6 +306,9 @@ func (s *Store) CompleteWorkspaceBindingUnbind(ctx context.Context, hostID, work
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		} else if err != nil {
 			return fmt.Errorf("lock workspace before completing unbind: %w", err)
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		var bindingID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, hostID, workspaceID).Scan(&bindingID); errors.Is(err, pgx.ErrNoRows) {
@@ -384,6 +412,9 @@ func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, host
 		} else if err != nil {
 			return fmt.Errorf("lock workspace before applied revision receipt: %w", err)
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		var bindingID string
 		if err := tx.QueryRow(ctx, `SELECT id FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, hostID, workspaceID).Scan(&bindingID); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "workspace binding not found")
@@ -412,7 +443,16 @@ func (s *Store) AdvanceWorkspaceBindingAppliedRevision(ctx context.Context, host
 			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
 		}
 		if row.BaseRevision > current.AppliedRevision {
-			return domain.NewError(domain.CodeWorkspaceConflict, "workspace sync session skipped a revision that the Host has not applied")
+			followsOwnCheckpoint := false
+			if row.Direction == string(workspace.SyncBidirectional) && row.Policy == string(workspace.SyncLive) {
+				followsOwnCheckpoint, err = completedHostWorkspaceCheckpoint(ctx, tx, workspaceID, row.ReplicaID, row.BaseRevision, sessionID)
+				if err != nil {
+					return fmt.Errorf("check Host workspace checkpoint before applied revision receipt: %w", err)
+				}
+			}
+			if !followsOwnCheckpoint {
+				return domain.NewError(domain.CodeWorkspaceConflict, "workspace sync session skipped a revision that the Host has not applied")
+			}
 		}
 		validDirection := row.Direction == string(workspace.SyncDownload) || row.Direction == string(workspace.SyncBidirectional)
 		validPolicy := row.Policy == string(workspace.SyncFillMissing) || row.Policy == string(workspace.SyncLive)
@@ -506,6 +546,9 @@ func (s *Store) setWorkspaceBindingSyncStatus(ctx context.Context, hostID string
 		} else if err != nil {
 			return fmt.Errorf("lock workspace before sync status: %w", err)
 		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		if workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "workspace is unavailable for sync status updates")
 		}
@@ -590,6 +633,9 @@ func (s *Store) ClaimWorkspaceForDelete(ctx context.Context, workspaceID string,
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		} else if err != nil {
 			return fmt.Errorf("lock workspace before deletion: %w", err)
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, workspaceID); err != nil {
+			return err
 		}
 		row, err := sqlcgen.New(tx).GetWorkspace(ctx, workspaceID)
 		if err != nil {

@@ -65,9 +65,16 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 	var result app.TaskDetails
 	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		queries := sqlcgen.New(tx)
-		row, err := queries.GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: ownerID})
+		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, id, ownerID, false, false)
+		if err != nil {
+			return err
+		}
+		row, err := queries.GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: taskOwnerID})
 		if err != nil {
 			return storeError("get task", "task", err)
+		}
+		if !row.ProjectID.Valid && row.InitiatorID != row.OwnerID {
+			return domain.NewError(domain.CodeUnauthenticated, "personal task authorization is unavailable")
 		}
 		var observationJSON []byte
 		err = tx.QueryRow(ctx, `SELECT observation_spec FROM schedule_runs WHERE task_id=$1 AND observation_spec IS NOT NULL`, id).Scan(&observationJSON)
@@ -178,13 +185,28 @@ func (s *Store) ListTasks(ctx context.Context, ownerID string, filter app.TaskLi
 		}
 		status = string(filter.Status)
 	}
-	rows, err := s.q.ListTasks(ctx, sqlcgen.ListTasksParams{
-		OwnerID: ownerID, Column2: filter.HostIDs, Column3: status, Column4: cursorAt, ID: cursorID, Limit: limit + 1,
+	var rows []sqlcgen.Task
+	visibleRows := make([]sqlcgen.Task, 0)
+	err = s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
+		var err error
+		rows, err = sqlcgen.New(tx).ListTasks(ctx, sqlcgen.ListTasksParams{
+			OwnerID: ownerID, Column2: filter.HostIDs, Column3: status, Column4: cursorAt, ID: cursorID, Limit: limit + 1,
+		})
+		if err != nil {
+			return fmt.Errorf("list tasks: %w", err)
+		}
+		for _, row := range rows {
+			if !row.ProjectID.Valid && row.InitiatorID != row.OwnerID {
+				continue
+			}
+			visibleRows = append(visibleRows, row)
+		}
+		return nil
 	})
 	if err != nil {
-		return app.TaskPage{}, fmt.Errorf("list tasks: %w", err)
+		return app.TaskPage{}, err
 	}
-	items := mapRows(rows, rowTaskDomain)
+	items := mapRows(visibleRows, rowTaskDomain)
 	page := app.TaskPage{Items: items}
 	page.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
 	if int32(len(items)) > limit {
@@ -216,13 +238,23 @@ func (s *Store) taskEventPage(ctx context.Context, ownerID, taskID string, after
 	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		var current int64
 		var status string
-		err := tx.QueryRow(ctx, `SELECT COALESCE(host_id, ''), status, event_seq FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).
-			Scan(&result.HostID, &status, &current)
+		var taskOwnerID, initiatorID string
+		var projectID pgtype.Text
+		var err error
+		taskOwnerID, err = taskOwnerIDForActor(ctx, tx, taskID, ownerID, false, false)
+		if err != nil {
+			return err
+		}
+		err = tx.QueryRow(ctx, `SELECT COALESCE(host_id, ''), status, event_seq,project_id,initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
+			Scan(&result.HostID, &status, &current, &projectID, &initiatorID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
 		if err != nil {
 			return fmt.Errorf("read task event state: %w", err)
+		}
+		if !projectID.Valid && initiatorID != ownerID {
+			return domain.NewError(domain.CodeUnauthenticated, "personal task authorization is unavailable")
 		}
 		result.Status = task.Status(status)
 		result.CurrentSequence = current
@@ -261,10 +293,10 @@ func (s *Store) AppendAssistantTextDelta(ctx context.Context, delta app.Assistan
 	}
 	var result task.Event
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
-		var ownerID string
-		err := tx.QueryRow(ctx, `SELECT owner_id FROM tasks WHERE id=$1 AND status='running'
+		var ownerID, initiatorID string
+		err := tx.QueryRow(ctx, `SELECT owner_id,initiator_id FROM tasks WHERE id=$1 AND status='running'
 AND lease_owner=$2 AND lease_version=$3 AND lease_expires_at > clock_timestamp() FOR UPDATE`,
-			delta.TaskID, delta.LeaseOwner, delta.LeaseVersion).Scan(&ownerID)
+			delta.TaskID, delta.LeaseOwner, delta.LeaseVersion).Scan(&ownerID, &initiatorID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			var exists bool
 			if readErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1)`, delta.TaskID).Scan(&exists); readErr != nil {
@@ -277,6 +309,30 @@ AND lease_owner=$2 AND lease_version=$3 AND lease_expires_at > clock_timestamp()
 		}
 		if err != nil {
 			return fmt.Errorf("lock task before appending assistant text: %w", err)
+		}
+		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: delta.TaskID, OwnerID: ownerID})
+		if err != nil {
+			return fmt.Errorf("read task authorization before appending assistant text: %w", err)
+		}
+		if taskRow.InitiatorID != initiatorID {
+			return domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
+		}
+		if taskRow.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
+				return err
+			}
+		}
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, initiatorID, &taskRow.ExecutionEpoch)
+		if err != nil {
+			return err
+		}
+		if authorized, err := requireCurrentTaskAuthorization(ctx, tx, taskRow); err != nil {
+			return err
+		} else if !authorized {
+			return domain.NewError(domain.CodeUnauthenticated, "task text authorization is unavailable")
+		}
+		if gate.state != execution.StateEnabled {
+			return ownerExecutionDisabledError(gate)
 		}
 		var sequence int64
 		err = tx.QueryRow(ctx, `UPDATE tasks SET event_seq=event_seq+1, updated_at=clock_timestamp()
@@ -449,10 +505,10 @@ func (s *Store) claimNextTask(ctx context.Context, worker string, leaseDuration 
 	var claimed task.Task
 	var found bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var ownerID string
+		var initiatorID string
 		var taskEpoch int64
 		err := tx.QueryRow(ctx, `
-SELECT t.owner_id, t.execution_epoch FROM tasks AS t
+SELECT t.initiator_id, t.execution_epoch FROM tasks AS t
 WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
   `+taskHubWorkspaceSyncClaimPredicate+` OR
   (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
@@ -462,14 +518,18 @@ WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_
       AND wb.sync_state='healthy'
       AND wb.desired_revision>=t.workspace_checkpoint_revision AND wb.applied_revision>=t.workspace_checkpoint_revision
       AND w.state='ready' AND w.deleted_at IS NULL AND w.revision=t.workspace_checkpoint_revision
-      AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=t.host_id AND h.owner_id=t.owner_id AND h.state='running' AND h.deleted_at IS NULL
+      AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=t.host_id AND h.owner_id=t.initiator_id AND h.state='running' AND h.deleted_at IS NULL
         AND EXISTS (SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
           AND hb.last_seen_at > clock_timestamp() - $2::double precision * interval '1 second'))
   )))
   AND t.execution_location='server'
+	  AND ((t.project_id IS NULL AND t.initiator_id=t.owner_id) OR (t.project_id IS NOT NULL AND EXISTS (
+	    SELECT 1 FROM project_members pm JOIN users pu ON pu.id=pm.user_id AND pu.status='approved'
+	    WHERE pm.project_id=t.project_id AND pm.user_id=t.initiator_id AND pm.role IN ('member','owner')
+	  )))
   AND ($1::integer = 0 OR (
     SELECT count(*) FROM tasks AS active_task
-    WHERE active_task.owner_id=t.owner_id AND active_task.status='running'
+    WHERE active_task.initiator_id=t.initiator_id AND active_task.status='running'
       AND active_task.id<>t.id
       AND (active_task.lease_expires_at > clock_timestamp() OR EXISTS (
         SELECT 1 FROM task_agent_instances AS agent
@@ -478,15 +538,19 @@ WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_
   ) < $1)
   AND EXISTS (
     SELECT 1 FROM owner_execution_controls AS ec
-    WHERE ec.owner_id=t.owner_id AND ec.state='enabled' AND ec.epoch=t.execution_epoch
+    WHERE ec.owner_id=t.initiator_id AND ec.state='enabled' AND ec.epoch=t.execution_epoch
   )
   AND (t.host_id IS NULL OR EXISTS (
     SELECT 1 FROM hosts AS h
-    WHERE h.id=t.host_id AND h.owner_id=t.owner_id
+    WHERE h.id=t.host_id AND h.owner_id=t.initiator_id
       AND h.state<>'deleted' AND h.deleted_at IS NULL
   ))
+  AND (t.workspace_id IS NULL OR NOT EXISTS (
+    SELECT 1 FROM workspace_ownership_transfers transfer
+    WHERE transfer.workspace_id=t.workspace_id AND transfer.state IN ('pending','accepting','unknown')
+  ))
 ORDER BY t.created_at, t.id
-LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&ownerID, &taskEpoch)
+LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&initiatorID, &taskEpoch)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -495,7 +559,7 @@ LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&own
 		}
 		var gate executionGate
 		if maxActivePerOwner > 0 {
-			gate, err = lockOwnerExecutionControl(ctx, tx, ownerID, true)
+			gate, err = lockOwnerExecutionControl(ctx, tx, initiatorID, true)
 			if err != nil {
 				return err
 			}
@@ -503,7 +567,7 @@ LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&own
 				return nil
 			}
 		} else {
-			gate, err = requireOwnerExecutionEnabled(ctx, tx, ownerID, &taskEpoch)
+			gate, err = requireOwnerExecutionEnabled(ctx, tx, initiatorID, &taskEpoch)
 			if err != nil {
 				if domain.CodeOf(err) == domain.CodeConflict {
 					return nil
@@ -511,12 +575,12 @@ LIMIT 1`, maxActivePerOwner, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&own
 				return err
 			}
 		}
-		var id string
+		var id, taskOwnerID string
 		var hostID string
 		var oldVersion int64
 		err = tx.QueryRow(ctx, `
-SELECT t.id, COALESCE(t.host_id,''), t.lease_version FROM tasks AS t
-WHERE t.owner_id=$1 AND t.execution_epoch=$2
+SELECT t.id, t.owner_id, COALESCE(t.host_id,''), t.lease_version FROM tasks AS t
+WHERE t.initiator_id=$1 AND t.execution_epoch=$2
   AND (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
     `+taskHubWorkspaceSyncClaimPredicate+` OR
     (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
@@ -526,22 +590,30 @@ WHERE t.owner_id=$1 AND t.execution_epoch=$2
         AND wb.sync_state='healthy'
         AND wb.desired_revision>=t.workspace_checkpoint_revision AND wb.applied_revision>=t.workspace_checkpoint_revision
         AND w.state='ready' AND w.deleted_at IS NULL AND w.revision=t.workspace_checkpoint_revision
-        AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=t.host_id AND h.owner_id=t.owner_id AND h.state='running' AND h.deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=t.host_id AND h.owner_id=t.initiator_id AND h.state='running' AND h.deleted_at IS NULL
           AND EXISTS (SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
             AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'))
     )))
   AND t.execution_location='server'
+	AND ((t.project_id IS NULL AND t.initiator_id=t.owner_id) OR (t.project_id IS NOT NULL AND EXISTS (
+	  SELECT 1 FROM project_members pm JOIN users pu ON pu.id=pm.user_id AND pu.status='approved'
+	  WHERE pm.project_id=t.project_id AND pm.user_id=t.initiator_id AND pm.role IN ('member','owner')
+	)))
   AND EXISTS (
     SELECT 1 FROM owner_execution_controls AS ec
-    WHERE ec.owner_id=t.owner_id AND ec.state='enabled' AND ec.epoch=t.execution_epoch
+    WHERE ec.owner_id=t.initiator_id AND ec.state='enabled' AND ec.epoch=t.execution_epoch
   )
   AND (t.host_id IS NULL OR EXISTS (
     SELECT 1 FROM hosts AS h
-    WHERE h.id=t.host_id AND h.owner_id=t.owner_id
+    WHERE h.id=t.host_id AND h.owner_id=t.initiator_id
       AND h.state<>'deleted' AND h.deleted_at IS NULL
   ))
+  AND (t.workspace_id IS NULL OR NOT EXISTS (
+    SELECT 1 FROM workspace_ownership_transfers transfer
+    WHERE transfer.workspace_id=t.workspace_id AND transfer.state IN ('pending','accepting','unknown')
+  ))
 ORDER BY t.created_at, t.id
-LIMIT 1 FOR UPDATE SKIP LOCKED`, ownerID, gate.epoch, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&id, &hostID, &oldVersion)
+LIMIT 1 FOR UPDATE SKIP LOCKED`, initiatorID, gate.epoch, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&id, &taskOwnerID, &hostID, &oldVersion)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -550,10 +622,10 @@ LIMIT 1 FOR UPDATE SKIP LOCKED`, ownerID, gate.epoch, host.RuntimeHeartbeatFresh
 		}
 		if maxActivePerOwner > 0 {
 			var active int64
-			if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks AS active_task WHERE owner_id=$1 AND id<>$2 AND status='running'
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks AS active_task WHERE initiator_id=$1 AND id<>$2 AND status='running'
 AND (lease_expires_at > clock_timestamp() OR EXISTS (
   SELECT 1 FROM task_agent_instances AS agent WHERE agent.task_id=active_task.id AND agent.state='active'
-))`, ownerID, id).Scan(&active); err != nil {
+				))`, initiatorID, id).Scan(&active); err != nil {
 				return fmt.Errorf("count active owner tasks before claim: %w", err)
 			}
 			if active >= int64(maxActivePerOwner) {
@@ -561,23 +633,31 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 			}
 		}
 		if hostID != "" {
-			if err := lockTaskTargetHost(ctx, tx, hostID, ownerID); err != nil {
+			if err := lockTaskTargetHost(ctx, tx, hostID, initiatorID); err != nil {
 				if domain.CodeOf(err) == domain.CodeNotFound {
 					return nil
 				}
 				return err
 			}
 		}
-		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: ownerID})
+		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: taskOwnerID})
 		if err != nil {
 			return fmt.Errorf("read task authorization before claim: %w", err)
+		}
+		if taskRow.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
+				if domain.CodeOf(err) == domain.CodeWorkspaceBusy || domain.CodeOf(err) == domain.CodeNotFound {
+					return nil
+				}
+				return err
+			}
 		}
 		authorized, err := requireCurrentTaskAuthorization(ctx, tx, taskRow)
 		if err != nil {
 			return err
 		}
 		if !authorized {
-			if err := requestTaskCancellationForAuthorization(ctx, tx, id, ownerID); err != nil {
+			if err := requestTaskCancellationForAuthorization(ctx, tx, id, taskOwnerID); err != nil {
 				return err
 			}
 			return nil
@@ -594,7 +674,7 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 		if taskRow.Status == string(task.StatusWaitingUser) && taskRow.WaitingReason == "task_hub_workspace_sync" {
 			var ready bool
 			if err := tx.QueryRow(ctx, `SELECT `+taskHubWorkspaceSyncClaimPredicate+`
-FROM tasks AS t WHERE t.id=$1 AND t.owner_id=$2`, id, ownerID).Scan(&ready); err != nil {
+				FROM tasks AS t WHERE t.id=$1 AND t.owner_id=$2`, id, taskOwnerID).Scan(&ready); err != nil {
 				return fmt.Errorf("recheck Task Hub Workspace sync before claim: %w", err)
 			}
 			if !ready {
@@ -667,11 +747,17 @@ WHERE id=$1 RETURNING event_seq`, id, worker, newVersion, leaseMillis).Scan(&eve
 				return err
 			}
 		}
-		row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: ownerID})
+		row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: id, OwnerID: taskOwnerID})
 		if err != nil {
 			return fmt.Errorf("read claimed task: %w", err)
 		}
 		claimed = rowTaskDomain(row)
+		if claimed.CheckpointThroughSequence < 0 {
+			claimed.ConversationContext, err = readTaskConversationContext(ctx, tx, claimed)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return claimed, found, err
@@ -688,19 +774,24 @@ func (s *Store) RenewTaskLease(ctx context.Context, taskID, worker string, versi
 	var row sqlcgen.Task
 	var authorizationDenied bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var ownerID string
-		if err := tx.QueryRow(ctx, `SELECT owner_id FROM tasks WHERE id=$1`, taskID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+		var ownerID, initiatorID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id,initiator_id FROM tasks WHERE id=$1`, taskID).Scan(&ownerID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("read task owner before lease renewal: %w", err)
 		}
-		gate, err := requireOwnerExecutionEnabled(ctx, tx, ownerID, nil)
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, initiatorID, nil)
 		if err != nil {
 			return err
 		}
 		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: taskID, OwnerID: ownerID})
 		if err != nil {
 			return fmt.Errorf("read task authorization before lease renewal: %w", err)
+		}
+		if taskRow.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
+				return err
+			}
 		}
 		authorized, err := requireCurrentTaskAuthorization(ctx, tx, taskRow)
 		if err != nil {
@@ -751,8 +842,23 @@ func requireCurrentTaskAuthorization(ctx context.Context, tx pgx.Tx, value sqlcg
 	if value.AuthTokenID == "" || value.AuthVersion < 1 {
 		return false, nil
 	}
+	if !domain.ValidUserID(value.InitiatorID) {
+		return false, nil
+	}
+	projectID, err := lockTaskInitiatorInTx(ctx, tx, value.ID, value.OwnerID, value.InitiatorID)
+	if err != nil {
+		switch domain.CodeOf(err) {
+		case domain.CodeUnauthenticated, domain.CodeForbidden, domain.CodeNotFound:
+			return false, nil
+		default:
+			return false, err
+		}
+	}
+	if value.ProjectID.Valid != (projectID != "") || value.ProjectID.Valid && value.ProjectID.String != projectID {
+		return false, nil
+	}
 	var approved bool
-	err := tx.QueryRow(ctx, `SELECT status='approved' FROM users WHERE id=$1 FOR SHARE`, value.OwnerID).Scan(&approved)
+	err = tx.QueryRow(ctx, `SELECT status='approved' FROM users WHERE id=$1 FOR SHARE`, value.InitiatorID).Scan(&approved)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && !approved {
 		return false, nil
 	}
@@ -760,16 +866,23 @@ func requireCurrentTaskAuthorization(ctx context.Context, tx pgx.Tx, value sqlcg
 		return false, fmt.Errorf("check task authorization account: %w", err)
 	}
 	if value.AuthKind == string(identity.KindScheduleTask) {
-		if !scheduleTaskScopeStringsValid(value.AuthScopes) || !schedule.ValidRunID(value.AuthTokenID) ||
+		if !scheduleTaskScopeStringsValidForHost(value.AuthScopes, value.HostID.Valid) || !schedule.ValidRunID(value.AuthTokenID) ||
 			value.AuthClientInstallationID.Valid {
 			return false, nil
+		}
+		var taskHostID any
+		if value.HostID.Valid {
+			taskHostID = value.HostID.String
 		}
 		var linked bool
 		err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM schedule_runs r
   JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
-  WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND s.host_id=$4
-)`, value.AuthTokenID, value.OwnerID, value.ID, value.HostID.String).Scan(&linked)
+  JOIN tasks t ON t.id=r.task_id AND t.owner_id=r.owner_id AND t.initiator_id=r.owner_id
+  WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND t.auth_kind='schedule_task' AND t.auth_token_id=r.id
+    AND t.execution_location='server' AND s.host_id IS NOT DISTINCT FROM t.host_id
+    AND t.host_id IS NOT DISTINCT FROM $4::text
+)`, value.AuthTokenID, value.InitiatorID, value.ID, taskHostID).Scan(&linked)
 		if err != nil {
 			return false, fmt.Errorf("check scheduled Task run link: %w", err)
 		}
@@ -780,7 +893,7 @@ func requireCurrentTaskAuthorization(ctx context.Context, tx pgx.Tx, value sqlcg
 	var expiresAt time.Time
 	var revokedAt pgtype.Timestamptz
 	err = tx.QueryRow(ctx, `SELECT kind, client_installation_id, expires_at, revoked_at
-FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, value.AuthTokenID, value.OwnerID).
+FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, value.AuthTokenID, value.InitiatorID).
 		Scan(&kind, &installationID, &expiresAt, &revokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -805,7 +918,7 @@ FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, value.AuthTokenID, value.Own
 		var expiresAt pgtype.Timestamptz
 		var revokedAt pgtype.Timestamptz
 		err := tx.QueryRow(ctx, `SELECT expires_at, revoked_at FROM client_installations
-WHERE id=$1 AND owner_id=$2 FOR SHARE`, installationID.String, value.OwnerID).Scan(&expiresAt, &revokedAt)
+WHERE id=$1 AND owner_id=$2 FOR SHARE`, installationID.String, value.InitiatorID).Scan(&expiresAt, &revokedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
@@ -828,7 +941,7 @@ func workspaceTaskHostSyncReady(ctx context.Context, tx pgx.Tx, value sqlcgen.Ta
 	}
 	var hostRunning bool
 	var runtimeGeneration int64
-	if err := tx.QueryRow(ctx, `SELECT state='running' AND deleted_at IS NULL, runtime_generation FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, value.HostID.String, value.OwnerID).
+	if err := tx.QueryRow(ctx, `SELECT state='running' AND deleted_at IS NULL, runtime_generation FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, value.HostID.String, value.InitiatorID).
 		Scan(&hostRunning, &runtimeGeneration); errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	} else if err != nil {
@@ -837,13 +950,22 @@ func workspaceTaskHostSyncReady(ctx context.Context, tx pgx.Tx, value sqlcgen.Ta
 	if !hostRunning {
 		return false, nil
 	}
-	var workspaceReady bool
+	var workspaceOwner, workspaceState string
 	var workspaceRevision int64
-	if err := tx.QueryRow(ctx, `SELECT state='ready' AND deleted_at IS NULL, revision FROM workspaces WHERE id=$1 FOR SHARE`, value.WorkspaceID.String).
-		Scan(&workspaceReady, &workspaceRevision); errors.Is(err, pgx.ErrNoRows) {
+	if err := tx.QueryRow(ctx, `SELECT owner_id,state,revision FROM workspaces WHERE id=$1 FOR SHARE`, value.WorkspaceID.String).
+		Scan(&workspaceOwner, &workspaceState, &workspaceRevision); errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	} else if err != nil {
 		return false, fmt.Errorf("lock Workspace before resuming Workspace Task: %w", err)
+	}
+	if workspaceOwner != value.InitiatorID {
+		return false, nil
+	}
+	if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID.String); err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceBusy {
+			return false, nil
+		}
+		return false, err
 	}
 	var bindingState, syncState string
 	var desiredRevision, appliedRevision int64
@@ -862,7 +984,8 @@ WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, value.HostID.String, value.Work
 )`, value.HostID.String, runtimeGeneration, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&heartbeatFresh); err != nil {
 		return false, fmt.Errorf("check Host Runtime heartbeat before resuming Workspace Task: %w", err)
 	}
-	return workspaceReady && workspaceRevision == value.WorkspaceCheckpointRevision.Int64 && bindingState == string(workspace.BindingActive) &&
+	return workspaceOwner == value.InitiatorID && workspaceState == string(workspace.StateReady) &&
+		workspaceRevision == value.WorkspaceCheckpointRevision.Int64 && bindingState == string(workspace.BindingActive) &&
 		syncState == string(workspace.BindingSyncHealthy) &&
 		desiredRevision >= value.WorkspaceCheckpointRevision.Int64 && appliedRevision >= value.WorkspaceCheckpointRevision.Int64 && heartbeatFresh, nil
 }
@@ -923,30 +1046,31 @@ VALUES ($1,$2,'cancel','pending',$3)`, requestID, taskID, safeAfter); err != nil
 	return insertTaskStatusEvent(ctx, tx, taskID, sequence, task.StatusCancelling, task.ActionCancel, requestID)
 }
 
-func stopTasksForAuthorization(ctx context.Context, tx pgx.Tx, ownerID, tokenID, installationID string) (int, error) {
-	rows, err := tx.Query(ctx, `SELECT t.id FROM tasks t
-WHERE t.owner_id=$1 AND t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
+func stopTasksForAuthorization(ctx context.Context, tx pgx.Tx, actorID, tokenID, installationID string) (int, error) {
+	rows, err := tx.Query(ctx, `SELECT t.id,t.owner_id FROM tasks t
+WHERE t.initiator_id=$1 AND t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
   AND (($2::text <> '' AND t.auth_token_id=$2) OR ($3::text <> '' AND t.auth_client_installation_id=$3))
-ORDER BY t.id FOR UPDATE OF t`, ownerID, tokenID, installationID)
+ORDER BY t.id FOR UPDATE OF t`, actorID, tokenID, installationID)
 	if err != nil {
 		return 0, fmt.Errorf("lock tasks for authorization revocation: %w", err)
 	}
-	ids := make([]string, 0)
+	type taskOwner struct{ id, ownerID string }
+	ids := make([]taskOwner, 0)
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var value taskOwner
+		if err := rows.Scan(&value.id, &value.ownerID); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("read task for authorization revocation: %w", err)
 		}
-		ids = append(ids, id)
+		ids = append(ids, value)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return 0, fmt.Errorf("iterate tasks for authorization revocation: %w", err)
 	}
 	rows.Close()
-	for _, id := range ids {
-		if err := requestTaskCancellationForAuthorization(ctx, tx, id, ownerID); err != nil {
+	for _, value := range ids {
+		if err := requestTaskCancellationForAuthorization(ctx, tx, value.id, value.ownerID); err != nil {
 			return 0, err
 		}
 	}
@@ -999,6 +1123,13 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			return task.Event{}, err
 		}
 	}
+	if personalMutation := progress.CloudDSHPersonalMutation; personalMutation != nil {
+		if progress.CloudDSHSkillRead != nil || progress.Status != task.StatusRunning || progress.Event.Type != "task.step" ||
+			!app.ValidCloudDSHPersonalMutationCommit(*personalMutation) ||
+			app.ValidateCloudDSHPersonalMutationEvent(progress.Event.Payload, *personalMutation) != nil {
+			return task.Event{}, domain.InvalidArgument("personal_mutation", "personal mutation progress is invalid")
+		}
+	}
 	var result task.Event
 	var authorizationDenied bool
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
@@ -1018,12 +1149,12 @@ WHERE t.id=$1 AND c.id=$2 AND c.owner_id=$3 FOR UPDATE OF c`,
 			}
 		}
 		var current sqlcgen.Task
-		err := tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
+		err := tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, project_id, initiator_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
 lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, application_id,
 execution_location, agent_session_id, auth_version, auth_expires_at, workspace_id, input_revision, workspace_checkpoint_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
-			&current.ID, &current.OwnerID, &current.ConversationID, &current.HostID, &current.ModelID, &current.Objective, &current.Status,
+			&current.ID, &current.OwnerID, &current.ConversationID, &current.ProjectID, &current.InitiatorID, &current.HostID, &current.ModelID, &current.Objective, &current.Status,
 			&current.AuthKind, &current.AuthTokenID, &current.AuthScopes, &current.AuthClientInstallationID, &current.BudgetActiveSeconds, &current.BudgetToolCalls,
 			&current.BudgetModelTokens, &current.UsageActiveSeconds, &current.UsageToolCalls, &current.UsageModelTokens,
 			&current.LeaseOwner, &current.LeaseVersion, &current.LeaseExpiresAt, &current.EventSeq, &current.CurrentStep,
@@ -1036,13 +1167,49 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			return fmt.Errorf("lock task for progress: %w", err)
 		}
 		var leaseValid bool
-		if err := tx.QueryRow(ctx, `SELECT lease_expires_at > clock_timestamp() FROM tasks WHERE id=$1`, progress.TaskID).Scan(&leaseValid); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at > clock_timestamp(), false) FROM tasks WHERE id=$1`, progress.TaskID).Scan(&leaseValid); err != nil {
 			return fmt.Errorf("check task lease: %w", err)
 		}
 		if current.LeaseOwner != progress.LeaseOwner || current.LeaseVersion != progress.LeaseVersion || !leaseValid || current.Status != string(task.StatusRunning) {
 			return taskLeaseConflict()
 		}
 		currentTask := rowTaskDomain(current)
+		if current.WorkspaceID.Valid {
+			if err := lockTaskWorkspaceForExecution(ctx, tx, current.WorkspaceID.String, current.InitiatorID); err != nil {
+				return err
+			}
+		}
+		var executionEnabled bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM owner_execution_controls ec JOIN tasks t ON t.initiator_id=ec.owner_id
+WHERE t.id=$1 AND t.owner_id=$2 AND ec.state='enabled' AND ec.epoch=t.execution_epoch
+)`, current.ID, current.OwnerID).Scan(&executionEnabled); err != nil {
+			return fmt.Errorf("check task initiator execution gate before progress: %w", err)
+		}
+		if !executionEnabled {
+			return taskLeaseConflict()
+		}
+		authorized, err := requireCurrentTaskAuthorization(ctx, tx, current)
+		if err != nil {
+			return err
+		}
+		if !authorized {
+			if err := requestTaskCancellationForAuthorization(ctx, tx, current.ID, current.OwnerID); err != nil {
+				return err
+			}
+			authorizationDenied = true
+			return nil
+		}
+		if personalMutation := progress.CloudDSHPersonalMutation; personalMutation != nil {
+			existing, found, err := validateCloudDSHPersonalMutationFence(ctx, tx, currentTask, progress, *personalMutation)
+			if err != nil {
+				return err
+			}
+			if found {
+				result = existing
+				return nil
+			}
+		}
 		if skillRead := progress.CloudDSHSkillRead; skillRead != nil {
 			if current.ID != skillRead.TaskID || current.OwnerID != skillRead.OwnerID || currentTask.ExecutionLocation != "server" ||
 				currentTask.AgentSessionID != skillRead.AgentSessionID ||
@@ -1102,29 +1269,30 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
   SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id AND hb.runtime_generation=h.runtime_generation
     AND hb.last_seen_at > clock_timestamp() - $3::double precision * interval '1 second'
 ), h.runtime_generation FROM hosts AS h WHERE h.id=$1 AND h.owner_id=$2 FOR SHARE`,
-				current.HostID.String, current.OwnerID, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&hostReady, &workspaceRuntimeGeneration)
+				current.HostID.String, current.InitiatorID, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&hostReady, &workspaceRuntimeGeneration)
 			if errors.Is(err, pgx.ErrNoRows) {
 				err = nil
 			}
 			if err != nil {
 				return fmt.Errorf("lock target Host before task completion: %w", err)
 			}
+			var workspaceOwner string
 			var revision int64
-			err = tx.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1 FOR SHARE`, current.WorkspaceID.String).Scan(&revision)
+			err = tx.QueryRow(ctx, `SELECT owner_id,revision FROM workspaces WHERE id=$1 FOR SHARE`, current.WorkspaceID.String).Scan(&workspaceOwner, &revision)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.NewError(domain.CodeWorkspaceConflict, "Workspace was removed after this task input was confirmed")
 			}
 			if err != nil {
 				return fmt.Errorf("read Workspace before task completion: %w", err)
 			}
-			if revision != current.WorkspaceCheckpointRevision.Int64 {
+			if workspaceOwner != current.InitiatorID || revision != current.WorkspaceCheckpointRevision.Int64 {
 				return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task checkpoint was confirmed")
 			}
 			appliedRevision, desiredRevision := int64(-1), int64(-1)
-			var bindingActive, bindingHealthy bool
-			err = tx.QueryRow(ctx, `SELECT applied_revision, desired_revision, state='active', sync_state='healthy' FROM workspace_bindings
+			var bindingOwner, bindingState, syncState string
+			err = tx.QueryRow(ctx, `SELECT owner_id,applied_revision, desired_revision,state,sync_state FROM workspace_bindings
 WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.WorkspaceID.String).
-				Scan(&appliedRevision, &desiredRevision, &bindingActive, &bindingHealthy)
+				Scan(&bindingOwner, &appliedRevision, &desiredRevision, &bindingState, &syncState)
 			if errors.Is(err, pgx.ErrNoRows) {
 				err = nil
 			}
@@ -1140,7 +1308,8 @@ WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.
 			if err != nil {
 				return fmt.Errorf("recheck Host Runtime heartbeat before task completion: %w", err)
 			}
-			if !hostReady || !heartbeatFresh || !bindingActive || !bindingHealthy || desiredRevision < current.WorkspaceCheckpointRevision.Int64 || appliedRevision < current.WorkspaceCheckpointRevision.Int64 {
+			if !hostReady || !heartbeatFresh || bindingOwner != current.InitiatorID || bindingState != string(workspace.BindingActive) ||
+				syncState != string(workspace.BindingSyncHealthy) || desiredRevision < current.WorkspaceCheckpointRevision.Int64 || appliedRevision < current.WorkspaceCheckpointRevision.Int64 {
 				progress.Status = task.StatusWaitingUser
 				progress.WaitingReason = task.WaitingReasonWorkspaceHostSync
 				progress.Result = current.Result
@@ -1161,6 +1330,25 @@ WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.
 				}
 			}
 		}
+		switch progress.Status {
+		case task.StatusCompleted:
+			var pendingMessages bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM conversation_messages
+WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND delivery_status='pending'
+)`, current.ID, current.OwnerID, current.ConversationID).Scan(&pendingMessages); err != nil {
+				return fmt.Errorf("check pending user messages before task completion: %w", err)
+			}
+			if pendingMessages {
+				return domain.NewError(domain.CodeConflict, "task has pending user messages")
+			}
+		case task.StatusFailed, task.StatusCancelled:
+			if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='unknown'
+WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND delivery_status='pending'`,
+				current.ID, current.OwnerID, current.ConversationID); err != nil {
+				return fmt.Errorf("mark undelivered user messages unknown on Task stop: %w", err)
+			}
+		}
 		observationOutcome, observationConfigured, err := commitScheduleObservation(ctx, tx, progress)
 		if err != nil {
 			return err
@@ -1168,6 +1356,11 @@ WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.
 		if observationConfigured && progress.Status == task.StatusCompleted && progress.Event.Type == "task.result" {
 			eventPayload, err = addObservationOutcomeToTaskResult(eventPayload, observationOutcome)
 			if err != nil {
+				return err
+			}
+		}
+		if personalMutation := progress.CloudDSHPersonalMutation; personalMutation != nil {
+			if err := applyCloudDSHPersonalMutationInTx(ctx, tx, currentTask, *personalMutation, eventPayload); err != nil {
 				return err
 			}
 		}
@@ -1255,7 +1448,7 @@ RETURNING event_seq`,
 			progress.TaskID, progress.LeaseOwner, progress.LeaseVersion, string(progress.Status), progress.CurrentStep,
 			progress.Result, progress.WaitingReason, progress.Usage.ActiveSeconds, progress.Usage.ToolCalls,
 			taskUsageTokens(progress.Usage.ModelTokens), finished, workspaceCompletionHeartbeatRequired,
-			current.HostID.String, current.OwnerID, workspaceRuntimeGeneration, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&sequence)
+			current.HostID.String, current.InitiatorID, workspaceRuntimeGeneration, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&sequence)
 		if errors.Is(err, pgx.ErrNoRows) && workspaceCompletionHeartbeatRequired {
 			return domain.NewError(domain.CodeWorkspaceConflict, "Host Runtime heartbeat expired before Workspace Task completion")
 		}
@@ -1305,7 +1498,7 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending')`, clarification.ID, clarification.TaskID, c
 			}
 		}
 		if message := progress.AssistantMessage; message != nil {
-			if message.OwnerID != current.OwnerID || message.ConversationID != current.ConversationID {
+			if message.OwnerID != current.OwnerID || message.ActorID != current.InitiatorID || message.ConversationID != current.ConversationID {
 				return domain.InvalidArgument("assistant_message", "assistant message does not belong to the task")
 			}
 			if err := insertMessage(ctx, tx, *message); err != nil {
@@ -1351,6 +1544,9 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 		return nil
 	})
 	if err == nil && authorizationDenied {
+		if progress.CloudDSHPersonalMutation != nil || progress.CloudDSHSkillRead != nil {
+			return task.Event{}, domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+		}
 		return task.Event{}, taskLeaseConflict()
 	}
 	return result, err
@@ -1453,23 +1649,23 @@ func (s *Store) CreateOperation(ctx context.Context, value task.Operation, lease
 	var result task.Operation
 	var replayed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var ownerID string
-		if err := tx.QueryRow(ctx, `SELECT owner_id FROM tasks WHERE id=$1`, value.TaskID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+		var ownerID, initiatorID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id,initiator_id FROM tasks WHERE id=$1`, value.TaskID).Scan(&ownerID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("read task owner before operation registration: %w", err)
 		}
-		gate, err := requireOwnerExecutionEnabled(ctx, tx, ownerID, nil)
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, initiatorID, nil)
 		if err != nil {
 			return err
 		}
 		var row sqlcgen.Task
 		var taskEpoch int64
-		err = tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
+		err = tx.QueryRow(ctx, `SELECT id, owner_id, project_id, initiator_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
 lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, execution_epoch, application_id, workspace_id, input_revision, workspace_checkpoint_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
-			&row.ID, &row.OwnerID, &row.ConversationID, &row.HostID, &row.ModelID, &row.Objective, &row.Status,
+			&row.ID, &row.OwnerID, &row.ProjectID, &row.InitiatorID, &row.ConversationID, &row.HostID, &row.ModelID, &row.Objective, &row.Status,
 			&row.AuthKind, &row.AuthTokenID, &row.AuthScopes, &row.AuthClientInstallationID, &row.BudgetActiveSeconds, &row.BudgetToolCalls,
 			&row.BudgetModelTokens, &row.UsageActiveSeconds, &row.UsageToolCalls, &row.UsageModelTokens,
 			&row.LeaseOwner, &row.LeaseVersion, &row.LeaseExpiresAt, &row.EventSeq, &row.CurrentStep,
@@ -1482,11 +1678,25 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			return fmt.Errorf("lock task for operation: %w", err)
 		}
 		ownerID = row.OwnerID
+		if row.InitiatorID != initiatorID {
+			return domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
+		}
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
 		}
 		if err := requireCurrentLease(ctx, tx, row, leaseOwner, value.LeaseVersion); err != nil {
 			return err
+		}
+		authorizationRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: value.TaskID, OwnerID: ownerID})
+		if err != nil {
+			return fmt.Errorf("read task authorization before operation registration: %w", err)
+		}
+		authorized, err := requireCurrentTaskAuthorization(ctx, tx, authorizationRow)
+		if err != nil {
+			return err
+		}
+		if !authorized {
+			return domain.NewError(domain.CodeUnauthenticated, "task operation authorization is unavailable")
 		}
 		if value.HostID != row.HostID.String {
 			return domain.InvalidArgument("operation.host_id", "operation host does not match task host")
@@ -1553,24 +1763,24 @@ func (s *Store) UpdateOperation(ctx context.Context, update app.OperationUpdate)
 	var result task.Operation
 	var authorizationDenied bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var ownerID string
-		if err := tx.QueryRow(ctx, `SELECT owner_id FROM tasks WHERE id=$1`, update.TaskID).Scan(&ownerID); errors.Is(err, pgx.ErrNoRows) {
+		var ownerID, initiatorID string
+		if err := tx.QueryRow(ctx, `SELECT owner_id,initiator_id FROM tasks WHERE id=$1`, update.TaskID).Scan(&ownerID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("read task owner before operation update: %w", err)
 		}
-		gate, err := requireOwnerExecutionEnabled(ctx, tx, ownerID, nil)
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, initiatorID, nil)
 		if err != nil {
 			return err
 		}
 		var row sqlcgen.Task
 		var taskEpoch int64
-		err = tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
+		err = tx.QueryRow(ctx, `SELECT id, owner_id, project_id, initiator_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
 lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, execution_epoch, application_id,
 workspace_id, input_revision, workspace_checkpoint_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
-			&row.ID, &row.OwnerID, &row.ConversationID, &row.HostID, &row.ModelID, &row.Objective, &row.Status,
+			&row.ID, &row.OwnerID, &row.ProjectID, &row.InitiatorID, &row.ConversationID, &row.HostID, &row.ModelID, &row.Objective, &row.Status,
 			&row.AuthKind, &row.AuthTokenID, &row.AuthScopes, &row.AuthClientInstallationID, &row.BudgetActiveSeconds, &row.BudgetToolCalls,
 			&row.BudgetModelTokens, &row.UsageActiveSeconds, &row.UsageToolCalls, &row.UsageModelTokens,
 			&row.LeaseOwner, &row.LeaseVersion, &row.LeaseExpiresAt, &row.EventSeq, &row.CurrentStep,
@@ -1582,11 +1792,29 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 		if err != nil {
 			return fmt.Errorf("lock task for operation update: %w", err)
 		}
+		if row.InitiatorID != initiatorID {
+			return domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
+		}
 		if taskEpoch != gate.epoch {
 			return ownerExecutionDisabledError(gate)
 		}
 		if err := requireCurrentLease(ctx, tx, row, update.LeaseOwner, update.LeaseVersion); err != nil {
 			return err
+		}
+		authorizationRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: update.TaskID, OwnerID: ownerID})
+		if err != nil {
+			return fmt.Errorf("read task authorization before operation update: %w", err)
+		}
+		authorized, err := requireCurrentTaskAuthorization(ctx, tx, authorizationRow)
+		if err != nil {
+			return err
+		}
+		if !authorized {
+			if err := requestTaskCancellationForAuthorization(ctx, tx, update.TaskID, ownerID); err != nil {
+				return err
+			}
+			authorizationDenied = true
+			return nil
 		}
 		operation, err := loadOperationByKey(ctx, tx, update.TaskID, update.OperationKey)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1601,23 +1829,6 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 		}
 		dispatching := operation.Status == task.OperationPrepared && update.Status == task.OperationDispatched
 		rearming := operation.Status == task.OperationUnknown && update.Status == task.OperationPrepared
-		if adoptingPrepared || rearming || update.Status == task.OperationDispatched {
-			taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: update.TaskID, OwnerID: ownerID})
-			if err != nil {
-				return fmt.Errorf("read task authorization before operation dispatch: %w", err)
-			}
-			authorized, err := requireCurrentTaskAuthorization(ctx, tx, taskRow)
-			if err != nil {
-				return err
-			}
-			if !authorized {
-				if err := requestTaskCancellationForAuthorization(ctx, tx, update.TaskID, ownerID); err != nil {
-					return err
-				}
-				authorizationDenied = true
-				return nil
-			}
-		}
 		if update.RearmAfterNotFound != rearming || update.AdoptPrepared != adoptingPrepared {
 			return domain.NewError(domain.CodeInvalidState, "operation rearm requires an explicit confirmed not-found result")
 		}
@@ -1764,13 +1975,21 @@ func taskLeaseConflict() error {
 }
 
 func requireOperationHostFence(ctx context.Context, tx pgx.Tx, ownerID string, operation task.Operation) error {
+	var initiatorID string
+	if err := tx.QueryRow(ctx, `SELECT initiator_id FROM tasks WHERE id=$1 AND owner_id=$2 FOR SHARE`, operation.TaskID, ownerID).
+		Scan(&initiatorID); err != nil {
+		return domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
+	}
+	if _, err := lockTaskInitiatorInTx(ctx, tx, operation.TaskID, ownerID, initiatorID); err != nil {
+		return err
+	}
 	var runtimeGeneration, controlVersion int64
 	var runtimeInstanceID string
 	var controlState string
 	var hostState string
 	var deleted bool
 	err := tx.QueryRow(ctx, `SELECT runtime_generation, COALESCE(runtime_instance_id,''), control_version, control_state, state, deleted_at IS NOT NULL FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`,
-		operation.HostID, ownerID).Scan(&runtimeGeneration, &runtimeInstanceID, &controlVersion, &controlState, &hostState, &deleted)
+		operation.HostID, initiatorID).Scan(&runtimeGeneration, &runtimeInstanceID, &controlVersion, &controlState, &hostState, &deleted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NewError(domain.CodeNotFound, "host not found")
 	}
@@ -1798,11 +2017,14 @@ func requireTaskWorkspaceInputAdmission(ctx context.Context, tx pgx.Tx, row sqlc
 	var revision int64
 	err := tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 FOR SHARE`, operation.WorkspaceID).
 		Scan(&ownerID, &state, &revision)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != row.OwnerID || state != string(workspace.StateReady) || revision != checkpoint)) {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != row.InitiatorID || state != string(workspace.StateReady) || revision != checkpoint)) {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this task input was confirmed")
 	}
 	if err != nil {
 		return fmt.Errorf("lock Workspace for task operation admission: %w", err)
+	}
+	if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, operation.WorkspaceID); err != nil {
+		return err
 	}
 	if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, operation.WorkspaceID); err != nil {
 		return err
@@ -1813,7 +2035,7 @@ func requireTaskWorkspaceInputAdmission(ctx context.Context, tx pgx.Tx, row sqlc
 	err = tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version
 FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, operation.HostID, operation.WorkspaceID).
 		Scan(&bindingOwner, &bindingState, &syncState, &bindingVersion)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (bindingOwner != row.OwnerID || bindingState != string(workspace.BindingActive) ||
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (bindingOwner != row.InitiatorID || bindingState != string(workspace.BindingActive) ||
 		bindingVersion != operation.BindingVersion || syncState != string(workspace.BindingSyncHealthy))) {
 		return domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace no longer matches the task input revision")
 	}

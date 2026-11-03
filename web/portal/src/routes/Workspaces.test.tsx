@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { components } from '../api/schema';
 import { portalApi } from '../app/api';
+import type { PendingWorkspaceRestore } from '../app/workspace-restore';
 import { ToastProvider } from '../app/toast';
 import { Workspaces } from './Workspaces';
 
@@ -28,8 +29,12 @@ const deviceProgress: components['schemas']['DeviceWorkspaceSyncProgress'] = {
 const deviceProgressSummary = { revision: workspace.revision, used_bytes: workspace.used_bytes, quota_bytes: workspace.quota_bytes,
   remaining_bytes: workspace.quota_bytes - workspace.used_bytes, quota_status: 'available' as const, quota_pauses: [] };
 
-function renderWorkspaces() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+function renderWorkspaces(initialWorkspaces?: components['schemas']['Workspace'][], initialHosts: components['schemas']['Host'][] = []) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, ...(initialWorkspaces ? { staleTime: Infinity } : {}) }, mutations: { retry: false } } });
+  if (initialWorkspaces) {
+    client.setQueryData(['workspaces'], { items: initialWorkspaces });
+    client.setQueryData(['hosts'], { items: initialHosts });
+  }
   return render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter><Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 }
 
@@ -50,6 +55,269 @@ describe('Workspaces', () => {
 
     await waitFor(() => expect(create).toHaveBeenCalledWith({ name: '客户项目' }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/)));
     expect(await screen.findByText('工作区已在服务端创建并保存。')).toBeInTheDocument();
+  });
+
+  it('does not offer a second Workspace binding for a host that already has one', async () => {
+    const otherWorkspaceBinding = { ...binding, workspace: { ...binding.workspace, id: 'w7654321', name: '另一个工作区' } };
+    vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
+    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [{ ...host, workspaces: [otherWorkspaceBinding] }] });
+    renderWorkspaces();
+
+    expect(await screen.findByText('暂无未绑定工作区的运行中主机')).toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: `工作区 ${workspace.name} 的绑定主机` })).not.toBeInTheDocument();
+  });
+
+  it('renders the server diff, metadata, and expandable text safely', async () => {
+    const fileVersion = (path: string, hash: string) => ({ kind: 'file' as const, path, size_bytes: 4, sha256: hash, mode: 0o644 });
+    const changes: components['schemas']['WorkspaceDiffChange'][] = [
+      { path: 'legacy.txt', action: 'removed', before: fileVersion('legacy.txt', 'b'.repeat(64)), after: null, display_status: 'not_applicable', before_text: null, after_text: null },
+      { path: 'new.txt', action: 'added', before: null, after: fileVersion('new.txt', 'c'.repeat(64)), display_status: 'text', before_text: null, after_text: '<script>demo</script>' },
+      { path: 'config.json', action: 'changed', before: fileVersion('config.json', 'd'.repeat(64)), after: fileVersion('config.json', 'e'.repeat(64)), display_status: 'binary', before_text: null, after_text: null },
+    ];
+    const diff = vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    expect(screen.getByText(/小型文本可展开查看/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+
+    expect(await screen.findByText('new.txt')).toBeInTheDocument();
+    expect(screen.getByText('legacy.txt')).toBeInTheDocument();
+    expect(screen.getByText('config.json')).toBeInTheDocument();
+    expect(screen.getAllByText('新增')).toHaveLength(1);
+    expect(screen.getAllByText('移除')).toHaveLength(1);
+    expect(screen.getAllByText('修改')).toHaveLength(1);
+    expect(screen.getByText('二进制，不展示内容')).toBeInTheDocument();
+    await user.click(screen.getByText('展开文本'));
+    expect(screen.getByText('<script>demo</script>')).toBeInTheDocument();
+    expect(diff).toHaveBeenCalledWith(workspace.id, 1, 2);
+  });
+
+  it('rejects an invalid revision before requesting the diff', async () => {
+    const diff = vi.spyOn(portalApi, 'workspaceDiff');
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    const targetRevision = screen.getByLabelText('目标 revision');
+    await user.clear(targetRevision);
+    await user.type(targetRevision, '3');
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('revision 必须是 0 到当前版本 v2 之间的整数');
+    expect(diff).not.toHaveBeenCalled();
+  });
+
+  it('paginates a long server diff list', async () => {
+    const changes: components['schemas']['WorkspaceDiffChange'][] = Array.from({ length: 51 }, (_, index) => {
+      const path = `added-${String(index).padStart(2, '0')}.txt`;
+      return { path, action: 'added', before: null, after: { kind: 'file', path, size_bytes: 1, sha256: 'a'.repeat(64), mode: 0o644 }, display_status: 'metadata_only', before_text: null, after_text: null };
+    });
+    const diff = vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+
+    expect(await screen.findByText('共 51 个路径差异；按路径分页显示。')).toBeInTheDocument();
+    expect(screen.getByText('added-49.txt')).toBeInTheDocument();
+    expect(screen.queryByText('added-50.txt')).not.toBeInTheDocument();
+    expect(screen.getByText('第 1 / 2 页')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '下一页差异' }));
+    expect(screen.getByText('added-50.txt')).toBeInTheDocument();
+    expect(screen.getByText('第 2 / 2 页')).toBeInTheDocument();
+    expect(diff).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a diff response for the wrong Workspace or revision', async () => {
+    const diff = vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: 'w7654321', from_revision: 1, to_revision: 2, changes: [] });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('历史差异响应的工作区、revision 或路径格式无效');
+    expect(diff).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('heading', { name: 'v1 → v2' })).not.toBeInTheDocument();
+  });
+
+  it('shows a conflict without displaying a partial server diff', async () => {
+    const conflict = Object.assign(new Error('工作区历史版本已变化'), { code: 'workspace_conflict', status: 409 });
+    const diff = vi.spyOn(portalApi, 'workspaceDiff').mockRejectedValue(conflict);
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('历史 revision 冲突：工作区历史版本已变化');
+    expect(diff).toHaveBeenCalledTimes(1);
+  });
+
+  it('confirms restore paths and reuses the same idempotency key after an uncertain response', async () => {
+    const fileVersion = (path: string) => ({ kind: 'file' as const, path, size_bytes: 4, sha256: 'a'.repeat(64), mode: 0o644 });
+    const changes: components['schemas']['WorkspaceDiffChange'][] = [
+      { path: 'new.md', action: 'renamed', before: fileVersion('old.md'), after: fileVersion('new.md'), display_status: 'metadata_only', before_text: null, after_text: null },
+      { path: 'docs', action: 'changed', before: { kind: 'directory', path: 'docs' }, after: { kind: 'directory', path: 'docs' }, display_status: 'not_applicable', before_text: null, after_text: null },
+      { path: 'docs/guide.md', action: 'changed', before: fileVersion('docs/guide.md'), after: fileVersion('docs/guide.md'), display_status: 'metadata_only', before_text: null, after_text: null },
+    ];
+    vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
+    const restoreResult: components['schemas']['WorkspaceRestoreResult'] = {
+      workspace_id: workspace.id, target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false,
+    };
+    let currentWorkspace = workspace;
+    vi.mocked(portalApi.workspaces).mockImplementation(async () => ({ items: [currentWorkspace] }));
+    const restore = vi.spyOn(portalApi, 'restoreWorkspacePaths')
+      .mockRejectedValueOnce(new TypeError('服务器已接受请求，但响应丢失'))
+      .mockImplementation(async () => {
+        currentWorkspace = { ...workspace, revision: 3 };
+        return restoreResult;
+      });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+    await user.click(await screen.findByRole('button', { name: '从 v1 恢复 3 个路径' }));
+    expect(screen.getByText(/以当前 v2 为条件创建新 revision/)).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
+    await user.click(screen.getByRole('button', { name: '恢复并创建新版本' }));
+    expect(await screen.findByText('服务器已接受请求，但响应丢失')).toBeInTheDocument();
+    const pending = JSON.parse(localStorage.getItem('morde.pending-workspace-restore.u1234567') ?? 'null') as PendingWorkspaceRestore;
+    expect(pending.phase).toBe('restore_workspace');
+    expect(pending.restoreRequested).toBe(true);
+    await user.click(screen.getByRole('button', { name: '核对状态并继续恢复' }));
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
+    await user.click(screen.getByRole('button', { name: '核对状态并继续' }));
+
+    await waitFor(() => expect(restore).toHaveBeenCalledTimes(2));
+    const firstRequest = restore.mock.calls[0]!;
+    expect(firstRequest[0]).toBe(workspace.id);
+    expect(firstRequest[1]).toEqual({ target_revision: 1, expected_current_revision: 2, paths: ['docs', 'new.md', 'old.md'] });
+    expect(firstRequest[2]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
+    expect(restore.mock.calls[1]).toEqual(firstRequest);
+    expect(await screen.findByText('Workspace 已恢复为 revision v3，新版本 projection 已确认。')).toBeInTheDocument();
+    expect(localStorage.getItem('morde.pending-workspace-restore.u1234567')).toBeNull();
+  });
+
+  it('unbinds, releases, restores, rebinds and restarts a running Host in order', async () => {
+    const changes: components['schemas']['WorkspaceDiffChange'][] = [
+      { path: 'notes.md', action: 'changed', before: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'a'.repeat(64), mode: 0o644 }, after: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'b'.repeat(64), mode: 0o644 }, display_status: 'metadata_only', before_text: null, after_text: null },
+    ];
+    let serverWorkspace = workspace;
+    let serverHost = { ...host, workspaces: [binding] };
+    vi.mocked(portalApi.workspaces).mockImplementation(async () => ({ items: [serverWorkspace] }));
+    vi.mocked(portalApi.hosts).mockImplementation(async () => ({ items: [serverHost] }));
+    vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
+    const unbind = vi.spyOn(portalApi, 'unbindWorkspaceFromHost').mockImplementation(async () => {
+      const detached = { ...binding, state: 'detached' as const, binding_version: 2 };
+      serverHost = { ...serverHost, workspaces: [detached] };
+      return detached;
+    });
+    const release = vi.spyOn(portalApi, 'releaseHost').mockImplementation(async () => {
+      serverHost = { ...serverHost, state: 'stopped' };
+      return serverHost;
+    });
+    const restore = vi.spyOn(portalApi, 'restoreWorkspacePaths').mockImplementation(async () => {
+      serverWorkspace = { ...workspace, revision: 3 };
+      return { workspace_id: workspace.id, target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false };
+    });
+    const bindWorkspace = vi.spyOn(portalApi, 'bindWorkspaceToHost').mockImplementation(async () => {
+      const preparing = { ...binding, state: 'preparing' as const, binding_version: 3, desired_revision: 3, workspace: { ...binding.workspace, revision: 3 } };
+      serverHost = { ...serverHost, workspaces: [preparing] };
+      return preparing;
+    });
+    const restoreHost = vi.spyOn(portalApi, 'restoreHost').mockImplementation(async () => {
+      const active = { ...binding, state: 'active' as const, binding_version: 3, desired_revision: 3, applied_revision: 3, workspace: { ...binding.workspace, revision: 3 } };
+      serverHost = { ...serverHost, state: 'running', workspace_runtime_online: true, workspaces: [active] };
+      return serverHost;
+    });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }]);
+
+    await user.click(await screen.findByRole('button', { name: '比较工作区版本 ' + workspace.name }));
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+    await user.click(await screen.findByRole('button', { name: '安全恢复并重启 Host' }));
+    const confirm = screen.getByRole('button', { name: '解绑、恢复并重启 Host' });
+    expect(confirm).toBeDisabled();
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
+    await user.click(confirm);
+
+    expect(await screen.findByText(/Host 与新版本应用状态均已确认/)).toBeInTheDocument();
+    expect(unbind).toHaveBeenCalledWith(host.id, workspace.id, { expected_binding_version: 1, writers_stopped: true }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
+    expect(release).toHaveBeenCalledWith(host.id, true);
+    expect(restore).toHaveBeenCalledWith(workspace.id, { target_revision: 1, expected_current_revision: 2, paths: ['notes.md'] }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
+    expect(bindWorkspace).toHaveBeenCalledWith(host.id, { workspace_id: workspace.id, expected_revision: 3, expected_binding_version: 2 }, expect.stringMatching(/^[A-Za-z0-9._~-]{8,128}$/));
+    expect(restoreHost).toHaveBeenCalledWith(host.id);
+    expect(localStorage.getItem('morde.pending-workspace-restore.u1234567')).toBeNull();
+  });
+
+  it('pauses after an unknown unbind result and does not release the Host', async () => {
+    const changes: components['schemas']['WorkspaceDiffChange'][] = [
+      { path: 'notes.md', action: 'changed', before: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'a'.repeat(64), mode: 0o644 }, after: { kind: 'file', path: 'notes.md', size_bytes: 1, sha256: 'b'.repeat(64), mode: 0o644 }, display_status: 'metadata_only', before_text: null, after_text: null },
+    ];
+    vi.mocked(portalApi.workspaces).mockResolvedValue({ items: [workspace] });
+    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [{ ...host, workspaces: [binding] }] });
+    vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 1, to_revision: 2, changes });
+    const unbind = vi.spyOn(portalApi, 'unbindWorkspaceFromHost').mockRejectedValue(new TypeError('解绑结果未知'));
+    const release = vi.spyOn(portalApi, 'releaseHost').mockResolvedValue({ ...host, state: 'stopped' });
+    const restore = vi.spyOn(portalApi, 'restoreWorkspacePaths').mockResolvedValue({
+      workspace_id: workspace.id, target_revision: 1, expected_current_revision: 2, revision: 3, replayed: false,
+    });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace], [{ ...host, workspaces: [binding] }]);
+
+    await user.click(await screen.findByRole('button', { name: '比较工作区版本 ' + workspace.name }));
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+    await user.click(await screen.findByRole('button', { name: '安全恢复并重启 Host' }));
+    await user.click(screen.getByRole('checkbox', { name: /我已关闭可能写入此 Workspace/ }));
+    await user.click(screen.getByRole('button', { name: '解绑、恢复并重启 Host' }));
+
+    expect(await screen.findByText('解绑结果未知')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '核对状态并继续恢复' })).toBeInTheDocument();
+    const saved = JSON.parse(localStorage.getItem('morde.pending-workspace-restore.u1234567') ?? 'null') as PendingWorkspaceRestore;
+    expect(saved.phase).toBe('unbind');
+    expect(saved.unbindKey).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
+    expect(release).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
+    expect(unbind).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps restore disabled when the compared target is not the current revision', async () => {
+    vi.spyOn(portalApi, 'workspaceDiff').mockResolvedValue({ workspace_id: workspace.id, from_revision: 0, to_revision: 1, changes: [
+      { path: 'old.txt', action: 'removed', before: { kind: 'file', path: 'old.txt', size_bytes: 1, sha256: 'a'.repeat(64), mode: 0o644 }, after: null, display_status: 'not_applicable', before_text: null, after_text: null },
+    ] });
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `比较工作区版本 ${workspace.name}` }));
+    await user.clear(screen.getByLabelText('起始 revision'));
+    await user.type(screen.getByLabelText('起始 revision'), '0');
+    await user.clear(screen.getByLabelText('目标 revision'));
+    await user.type(screen.getByLabelText('目标 revision'), '1');
+    await user.click(screen.getByRole('button', { name: '比较版本' }));
+
+    expect(await screen.findByRole('button', { name: '从 v0 恢复 1 个路径' })).toBeDisabled();
+    expect(screen.getByText('恢复前请将目标 revision 设为当前版本。')).toBeInTheDocument();
+  });
+
+  it('opens a clearly local copy preview without creating a real Workspace or reading file content', async () => {
+    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace');
+    const readManifest = vi.spyOn(portalApi, 'workspaceManifest');
+    const user = userEvent.setup();
+    renderWorkspaces([workspace]);
+
+    await user.click(await screen.findByRole('button', { name: `预演复制与移交 ${workspace.name}` }));
+    expect(screen.getByText(/不连接真实服务、不创建服务端工作区、不上传文件/)).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: /我已检查快照可能包含/ }));
+    await user.click(screen.getByRole('button', { name: '模拟快照并创建副本' }));
+
+    expect(screen.getByText(/这不是服务端副本/)).toBeInTheDocument();
+    expect(createWorkspace).not.toHaveBeenCalled();
+    expect(readManifest).not.toHaveBeenCalled();
   });
 
   it('recovers the same create key after the server accepted a workspace but its response was lost', async () => {

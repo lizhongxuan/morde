@@ -21,12 +21,24 @@ const (
 	RuntimeStateFailed     RuntimeState = "failed"
 )
 
+type RuntimeFailureReason string
+
+const (
+	RuntimeFailureStartup RuntimeFailureReason = "startup_failed"
+	RuntimeFailureRuntime RuntimeFailureReason = "runtime_failed"
+)
+
+func (r RuntimeFailureReason) Valid() bool {
+	return r == RuntimeFailureStartup || r == RuntimeFailureRuntime
+}
+
 type Runtime struct {
-	State              RuntimeState `json:"state"`
-	RuntimeID          string       `json:"runtime_id,omitempty"`
-	RuntimeGeneration  int64        `json:"runtime_generation"`
-	MaxConcurrentTasks int          `json:"max_concurrent_tasks"`
-	ActiveTaskCount    int64        `json:"active_task_count"`
+	State              RuntimeState         `json:"state"`
+	FailureReason      RuntimeFailureReason `json:"failure_reason,omitempty"`
+	RuntimeID          string               `json:"runtime_id,omitempty"`
+	RuntimeGeneration  int64                `json:"runtime_generation"`
+	MaxConcurrentTasks int                  `json:"max_concurrent_tasks"`
+	ActiveTaskCount    int64                `json:"active_task_count"`
 }
 
 func (r Runtime) Valid() bool {
@@ -35,6 +47,13 @@ func (r Runtime) Valid() bool {
 		return false
 	}
 	if r.ActiveTaskCount < 0 || r.MaxConcurrentTasks < 0 || r.MaxConcurrentTasks > 16 || r.RuntimeGeneration < 0 {
+		return false
+	}
+	if r.State == RuntimeStateFailed {
+		if !r.FailureReason.Valid() {
+			return false
+		}
+	} else if r.FailureReason != "" {
 		return false
 	}
 	if r.State == RuntimeStateNotStarted {

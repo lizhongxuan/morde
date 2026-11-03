@@ -159,7 +159,7 @@ func TestOnlineResourceReservationBlocksConcurrentCreateAndRestore(t *testing.T)
 	}
 	var wg sync.WaitGroup
 	errors := make(chan error, 2)
-	createParams := testCreateHostParams(t, owner.ID, capacity, nil)
+	createParams := testCreateHostParams(t, store, owner.ID, capacity, nil)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()

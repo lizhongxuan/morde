@@ -19,6 +19,7 @@ import { ChangePassword } from './routes/ChangePassword';
 import { NewHost } from './routes/NewHost';
 import { Notifications } from './routes/Notifications';
 import { PersonalData } from './routes/PersonalData';
+import { Projects } from './routes/Projects';
 import { Workspaces } from './routes/Workspaces';
 import { AdminAudit } from './routes/admin/AdminAudit';
 import { AdminHosts } from './routes/admin/AdminHosts';
@@ -60,6 +61,7 @@ function UserRoutes() {
       <Route element={<PortalLayout />}>
         <Route index element={<Navigate to="/hosts" replace />} />
         <Route path="assistant" element={<Assistant />} />
+        <Route path="projects" element={<Projects />} />
         <Route path="personal" element={<PersonalData />} />
         <Route path="goals" element={<GoalsAndSchedules />} />
         <Route path="hosts" element={<Hosts />} />

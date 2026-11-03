@@ -103,7 +103,7 @@ func (c *Client) Create(ctx context.Context, input app.SandboxCreateRequest) (re
 				MountPath: volume.MountPath,
 				PVC: pvc{
 					ClaimName:                  volume.ClaimName,
-					CreateIfNotExists:          true,
+					CreateIfNotExists:          !volume.RequireExisting,
 					DeleteOnSandboxTermination: false,
 					Storage:                    volume.Storage,
 				},

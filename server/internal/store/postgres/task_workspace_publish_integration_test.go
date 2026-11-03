@@ -1,11 +1,14 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +27,7 @@ func newTaskWorkspacePublishTask(t *testing.T, ctx context.Context, store *Store
 	t.Helper()
 	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
 	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, name)
-	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2 WHERE id=$1`, hostValue.ID, taskWorkspacePublishRuntimeID); err != nil {
 		t.Fatal(err)
 	}
@@ -89,14 +92,63 @@ func taskWorkspacePublishTestService(t *testing.T, store *Store) (*app.Workspace
 	return service, blocks
 }
 
+func taskWorkspacePublishSnapshot(t *testing.T, files []workspace.File, emptyDirectories []string) ([]workspace.File, []workspace.Directory, string) {
+	t.Helper()
+	for index := range files {
+		files[index].MetadataKnown = true
+	}
+	directoryPaths := map[string]string{".": "."}
+	addDirectory := func(path string, includeSelf bool) {
+		parts := strings.Split(path, "/")
+		limit := len(parts)
+		if !includeSelf {
+			limit--
+		}
+		prefix := ""
+		for index := 0; index < limit; index++ {
+			if index > 0 {
+				prefix += "/"
+			}
+			prefix += parts[index]
+			directoryPaths[strings.ToLower(prefix)] = prefix
+		}
+	}
+	for _, file := range files {
+		addDirectory(file.Path, false)
+	}
+	for _, path := range emptyDirectories {
+		addDirectory(path, true)
+	}
+	paths := make([]string, 0, len(directoryPaths))
+	for _, path := range directoryPaths {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	directories := make([]workspace.Directory, 0, len(paths))
+	for _, path := range paths {
+		mode, modTime := uint32(0o755), int64(1)
+		directories = append(directories, workspace.Directory{Path: path, Mode: &mode, ModTimeNS: &modTime, MetadataKnown: true})
+	}
+	digest, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files, directories, digest
+}
+
 func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	hostValue, workspaceValue, binding, claimed, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-success")
 	service, _ := taskWorkspacePublishTestService(t, store)
 	file := syncTestFile("reports/result.txt", []byte("published result"))
+	file.Xattrs = []workspace.ExtendedAttribute{{Name: "user.task", Value: []byte("kept")}}
+	file.ACL = &workspace.NativeACL{Platform: "linux", Format: "linux-posix-acl-v1", Data: []byte{7, 8, 9}}
 	emptyDirectories := []string{"reports/archive"}
-	manifestSHA, err := workspace.ManifestTreeSHA256([]workspace.File{file}, emptyDirectories)
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, emptyDirectories)
+	file = files[0]
+	directories[0].Xattrs = []workspace.ExtendedAttribute{{Name: "user.root", Value: []byte("task root")}}
+	manifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +200,7 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 		t.Fatalf("CreateOperation during pending publish = %v; want workspace busy", err)
 	}
 	reads := 0
-	receipt, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, emptyDirectories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+	receipt, err := service.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
 		reads++
 		if digest != file.SHA256 {
 			t.Fatalf("requested output block %q; want %q", digest, file.SHA256)
@@ -160,8 +212,24 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 	}
 	page, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, receipt.PublishedRevision, "", "", 10)
 	if err != nil || len(page.Files) != 1 || page.Files[0].Path != file.Path || page.Files[0].SHA256 != file.SHA256 ||
-		len(page.EmptyDirectories) != 1 || page.EmptyDirectories[0] != emptyDirectories[0] {
+		len(page.EmptyDirectories) != 1 || page.EmptyDirectories[0] != emptyDirectories[0] ||
+		!reflect.DeepEqual(page.Files[0].Xattrs, file.Xattrs) || page.Files[0].ACL == nil || file.ACL == nil ||
+		page.Files[0].ACL.Platform != file.ACL.Platform || page.Files[0].ACL.Format != file.ACL.Format || !bytes.Equal(page.Files[0].ACL.Data, file.ACL.Data) ||
+		len(page.Directories) != len(directories) || !workspace.SameDirectoryMetadata(page.Directories[0], directories[0]) {
 		t.Fatalf("published Workspace manifest = %#v, err=%v", page, err)
+	}
+	changes, err := store.GetWorkspaceChangePage(ctx, workspaceValue.ID, 0, "", 10)
+	if err != nil {
+		t.Fatalf("read Task publish change feed: %v", err)
+	}
+	var rootChange *workspace.Directory
+	for _, item := range changes.Items {
+		if item.Path == "." && item.Action == workspace.ChangeDirectoryUpsert {
+			rootChange = item.Directory
+		}
+	}
+	if rootChange == nil || !workspace.SameDirectoryMetadata(*rootChange, directories[0]) {
+		t.Fatalf("Task publish root directory change = %#v; want %#v", rootChange, directories[0])
 	}
 	details, err := store.GetTask(ctx, claimed.ID, claimed.OwnerID)
 	if err != nil || details.Task.WorkspaceCheckpointRevision == nil || *details.Task.WorkspaceCheckpointRevision != receipt.PublishedRevision {
@@ -195,7 +263,7 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 		t.Fatalf("settle operation after Task publish: %v", err)
 	}
 	restartedService, _ := taskWorkspacePublishTestService(t, store)
-	replayed, err := restartedService.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, emptyDirectories, manifestSHA, func(context.Context, string) ([]byte, error) {
+	replayed, err := restartedService.CommitTaskWorkspacePublish(ctx, command, files, emptyDirectories, directories, manifestSHA, func(context.Context, string) ([]byte, error) {
 		t.Fatal("published receipt replay read Runtime output blocks")
 		return nil, nil
 	})
@@ -214,8 +282,8 @@ VALUES ($1,$2,$3,$4,true,0,1)`, connectorID, claimed.OwnerID, "publish barrier c
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_grants
-(task_id, owner_id, connector_id, connector_revision, credential_version, grant_version)
-VALUES ($1,$2,$3,1,0,1)`, claimed.ID, claimed.OwnerID, connectorID); err != nil {
+(task_id, owner_id, connector_id, connector_revision, credential_version, grant_version, connector_owner_id)
+VALUES ($1,$2,$3,1,0,1,$2)`, claimed.ID, claimed.OwnerID, connectorID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ReserveTaskWorkspacePublish(ctx, command); err != nil {
@@ -267,8 +335,9 @@ func TestTaskWorkspacePublishBlocksSyncUntilPublishSettles(t *testing.T) {
 		t.Fatalf("sync commit during pending Task publish = %v; want Workspace busy", err)
 	}
 	file := syncTestFile("reports/task.txt", []byte("task output"))
-	manifestSHA, _ := workspace.ManifestSHA256([]workspace.File{file})
-	published, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	file = files[0]
+	published, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
 		if digest != file.SHA256 {
 			t.Fatalf("Task publish requested block %q; want %q", digest, file.SHA256)
 		}
@@ -326,10 +395,8 @@ func TestTaskWorkspacePublishSerializesSameContentAcrossTasks(t *testing.T) {
 		}
 	}
 	file := syncTestFile("reports/shared.txt", []byte("identical output from separate Tasks"))
-	outputManifestSHA, err := workspace.ManifestSHA256([]workspace.File{file})
-	if err != nil {
-		t.Fatal(err)
-	}
+	files, directories, outputManifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	file = files[0]
 	type publishResult struct {
 		taskID  string
 		command app.TaskWorkspacePublishCommand
@@ -342,7 +409,7 @@ func TestTaskWorkspacePublishSerializesSameContentAcrossTasks(t *testing.T) {
 		command := command
 		go func() {
 			<-start
-			receipt, publishErr := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, outputManifestSHA,
+			receipt, publishErr := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, outputManifestSHA,
 				func(_ context.Context, digest string) ([]byte, error) {
 					if digest != file.SHA256 {
 						return nil, errors.New("unexpected output block digest")
@@ -377,7 +444,7 @@ func TestTaskWorkspacePublishSerializesSameContentAcrossTasks(t *testing.T) {
 		}
 	}
 	if retryCommand != nil {
-		_, err := service.CommitTaskWorkspacePublish(ctx, *retryCommand, []workspace.File{file}, nil, outputManifestSHA,
+		_, err := service.CommitTaskWorkspacePublish(ctx, *retryCommand, files, nil, directories, outputManifestSHA,
 			func(_ context.Context, digest string) ([]byte, error) {
 				if digest != file.SHA256 {
 					return nil, errors.New("unexpected retry output block digest")
@@ -462,11 +529,8 @@ waiting_reason='workspace_input_changed' WHERE id=$1`, claimed.ID); err != nil {
 waiting_reason='workspace_input_changed' WHERE id=$1`, claimed.ID); err != nil {
 			t.Fatal(err)
 		}
-		manifestSHA, err := workspace.ManifestSHA256([]workspace.File{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := store.CommitTaskWorkspacePublish(ctx, command, []workspace.File{}, nil, manifestSHA); domain.CodeOf(err) != domain.CodeInvalidState {
+		files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{}, nil)
+		if _, err := store.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA); domain.CodeOf(err) != domain.CodeInvalidState {
 			t.Fatalf("publish commit without a Task lease = %v; want lease conflict", err)
 		}
 	})
@@ -481,11 +545,12 @@ func TestTaskWorkspacePublishQuotaRejectionReleasesOperationBarrier(t *testing.T
 	}
 	service, _ := taskWorkspacePublishTestService(t, store)
 	file := syncTestFile("reports/result.txt", []byte("over quota"))
-	manifestSHA, _ := workspace.ManifestSHA256([]workspace.File{file})
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	file = files[0]
 	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
 		t.Fatal(err)
 	}
-	_, err := service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{file}, nil, manifestSHA, func(context.Context, string) ([]byte, error) {
+	_, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(context.Context, string) ([]byte, error) {
 		return []byte("over quota"), nil
 	})
 	if domain.CodeOf(err) != domain.CodeQuotaExceeded {

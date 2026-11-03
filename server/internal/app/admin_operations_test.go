@@ -57,7 +57,7 @@ func TestAdminOperationsPolicyAndInvitationCode(t *testing.T) {
 	}
 	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Kind: identity.KindSession, Role: identity.RoleAdmin}
 	settings, err := service.Settings(context.Background(), admin)
-	if err != nil || !settings.RegistrationReviewRequired || settings.AutomaticNewUserModelBudget || settings.AutomaticInvitationReward ||
+	if err != nil || !settings.RegistrationReviewRequired || !settings.AutomaticNewUserModelBudget || settings.AutomaticInvitationReward ||
 		settings.AutomaticContributionReward || settings.DefaultPersonalDataQuotaBytes != 5<<30 || settings.DefaultPersonalAttachmentBytes != 300<<20 {
 		t.Fatalf("fixed settings = %+v, %v", settings, err)
 	}

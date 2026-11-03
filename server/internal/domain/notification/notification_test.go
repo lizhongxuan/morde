@@ -112,3 +112,21 @@ func TestValidateRejectsActionableHandledAndRequestlessApproval(t *testing.T) {
 		t.Fatal("approval notification without an exact request reference was accepted")
 	}
 }
+
+func TestSourceEventNotificationUsesFixedSummaryAndNoTaskIdentity(t *testing.T) {
+	created := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
+	value, err := NewSourceEventNotification(SourceEvent{
+		ID: 7, RecipientID: "u1234567", SourceKind: SourceProjectWorkItem, SourceID: "j1234567",
+		SourceVersion: 4, ProjectID: "j2234567", Kind: KindProjectItemBlocked, CreatedAt: created,
+	}, "n1234567")
+	if err != nil || value.Summary != "项目工作项遇到阻塞" || value.TaskID != "" || value.EventSequence != 0 || value.Actionable {
+		t.Fatalf("source notification = %#v, %v", value, err)
+	}
+	if err := Validate(value); err != nil {
+		t.Fatal(err)
+	}
+	value.Summary = "private blocker text"
+	if err := Validate(value); err == nil {
+		t.Fatal("source notification with user content was accepted")
+	}
+}

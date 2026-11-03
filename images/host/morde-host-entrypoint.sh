@@ -3,17 +3,18 @@ set -Eeuo pipefail
 
 . /usr/local/lib/morde-runtime-bootstrap.sh
 
-apps_store=/opt/morde/apps
-if [ -L "$apps_store" ] || [ ! -d "$apps_store" ] || ! mountpoint -q "$apps_store"; then
-    echo 'Morde application store must be a dedicated persistent mount at /opt/morde/apps.' >&2
+apps_store=/run/morde-runtime/apps
+if [ -L /run/morde-runtime ] || { [ -e /run/morde-runtime ] && [ ! -d /run/morde-runtime ]; } ||
+    [ -L "$apps_store" ] || { [ -e "$apps_store" ] && [ ! -d "$apps_store" ]; }; then
+    echo 'Morde application state directory is unsafe.' >&2
     exit 1
 fi
-if ! chown root:root "$apps_store" || ! chmod 0755 "$apps_store"; then
-    echo 'Morde application store must be writable by root for secure initialization.' >&2
+if ! install -d -o root -g root -m 0700 /run/morde-runtime "$apps_store"; then
+    echo 'Morde application state directory is unavailable.' >&2
     exit 1
 fi
-if [ "$(stat -c '%u:%g:%a' "$apps_store")" != '0:0:755' ]; then
-    echo 'Morde application store permissions are unsafe after initialization.' >&2
+if [ "$(stat -c '%u:%g:%a' /run/morde-runtime)" != '0:0:700' ] || [ "$(stat -c '%u:%g:%a' "$apps_store")" != '0:0:700' ]; then
+    echo 'Morde application state permissions are unsafe after initialization.' >&2
     exit 1
 fi
 /usr/local/bin/morde-runtime restore-apps

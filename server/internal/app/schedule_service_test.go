@@ -582,6 +582,128 @@ func TestScheduleCreateAppliesDefaultsAndUsesIdempotencyRecord(t *testing.T) {
 	}
 }
 
+func TestScheduleCreateAcceptsHostlessModelOnlyAndRejectsHostCapabilities(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	authorizer := &scheduleServiceAuthorizerFake{}
+	models := &scheduleServiceModelCatalogFake{configured: true}
+	service := newTestScheduleService(t, store, authorizer, models)
+	command := validScheduleCommand()
+	command.HostID = ""
+	command.Objective = "Check the goal and answer in chat"
+
+	created, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-hostless-create-001")
+	if err != nil || created.HostID != "" || store.createCalls != 1 || authorizer.actionCalls != 0 {
+		t.Fatalf("hostless model schedule create = %#v, %v; store calls=%d authorizer calls=%d", created, err, store.createCalls, authorizer.actionCalls)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*CreateScheduleCommand)
+	}{
+		{
+			name: "computer observation",
+			mutate: func(value *CreateScheduleCommand) {
+				value.Observation = &schedule.ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: schedule.ObservationText}
+			},
+		},
+		{
+			name: "workspace file request",
+			mutate: func(value *CreateScheduleCommand) {
+				value.Objective = "Create a PDF report"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caseStore := newScheduleServiceStoreFake()
+			caseAuthorizer := &scheduleServiceAuthorizerFake{}
+			caseService := newTestScheduleService(t, caseStore, caseAuthorizer, &scheduleServiceModelCatalogFake{configured: true})
+			invalid := validScheduleCommand()
+			invalid.HostID = ""
+			invalid.Objective = "Check the goal and answer in chat"
+			test.mutate(&invalid)
+			if _, err := caseService.Create(context.Background(), scheduleServicePrincipal(), invalid, "schedule-hostless-create-002"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+				t.Fatalf("Create() error = %v, want invalid_argument", err)
+			}
+			if caseStore.createCalls != 0 || caseAuthorizer.actionCalls != 0 {
+				t.Fatalf("unsupported hostless schedule reached collaborators: store=%d host authorization=%d", caseStore.createCalls, caseAuthorizer.actionCalls)
+			}
+		})
+	}
+}
+
+func TestScheduleUpdateCanUnbindOnlyWithoutHostCapabilities(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	original := validStoredSchedule(t, schedule.StatusEnabled)
+	store.values[original.ID] = original
+	authorizer := &scheduleServiceAuthorizerFake{}
+	service := newTestScheduleService(t, store, authorizer, &scheduleServiceModelCatalogFake{configured: true})
+	noHost := ""
+	fileObjective := "Create a PDF report"
+	command := UpdateScheduleCommand{ExpectedVersion: original.Version, HostID: &noHost, Objective: &fileObjective}
+	if _, err := service.Update(context.Background(), scheduleServicePrincipal(), original.ID, command, "schedule-hostless-update-001"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Update() unbound workspace request error = %v, want invalid_argument", err)
+	}
+	if store.updateCalls != 0 || authorizer.actionCalls != 0 {
+		t.Fatalf("rejected unbind reached collaborators: store=%d host authorization=%d", store.updateCalls, authorizer.actionCalls)
+	}
+
+	objective := "Check the goal and answer in chat"
+	command.Objective = &objective
+	updated, err := service.Update(context.Background(), scheduleServicePrincipal(), original.ID, command, "schedule-hostless-update-002")
+	if err != nil || updated.HostID != "" || updated.Objective != objective || authorizer.actionCalls != 0 {
+		t.Fatalf("Update() hostless model schedule = %#v, %v; host authorization=%d", updated, err, authorizer.actionCalls)
+	}
+
+	observationStore := newScheduleServiceStoreFake()
+	observing := validStoredSchedule(t, schedule.StatusEnabled)
+	observation := schedule.ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: schedule.ObservationText}
+	observing.Observation = &observation
+	observing.ObservationConfigHash = observation.ConfigHash()
+	observationStore.values[observing.ID] = observing
+	observationAuthorizer := &scheduleServiceAuthorizerFake{}
+	observationService := newTestScheduleService(t, observationStore, observationAuthorizer, &scheduleServiceModelCatalogFake{configured: true})
+	if _, err := observationService.Update(context.Background(), scheduleServicePrincipal(), observing.ID,
+		UpdateScheduleCommand{ExpectedVersion: observing.Version, HostID: &noHost}, "schedule-hostless-update-003"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("Update() unbound observation error = %v, want invalid_argument", err)
+	}
+	if observationStore.updateCalls != 0 || observationAuthorizer.actionCalls != 0 {
+		t.Fatalf("unbound observation reached collaborators: store=%d host authorization=%d", observationStore.updateCalls, observationAuthorizer.actionCalls)
+	}
+}
+
+func TestScheduleActionAllowsHostlessModelOnlySchedule(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	value := validStoredSchedule(t, schedule.StatusDisabled)
+	value.HostID = ""
+	value.Objective = "Check the goal and answer in chat"
+	store.values[value.ID] = value
+	authorizer := &scheduleServiceAuthorizerFake{}
+	service := newTestScheduleService(t, store, authorizer, &scheduleServiceModelCatalogFake{configured: true})
+
+	result, err := service.Action(context.Background(), scheduleServicePrincipal(), value.ID, ScheduleActionCommand{
+		Action: schedule.ActionEnable, ExpectedVersion: value.Version,
+	}, "schedule-hostless-action-001")
+	if err != nil || result.Schedule.Status != schedule.StatusEnabled || authorizer.actionCalls != 0 {
+		t.Fatalf("Action() hostless schedule = %#v, %v; host authorization=%d", result, err, authorizer.actionCalls)
+	}
+}
+
+func TestScheduleProcessDueProcessesHostlessModelSchedule(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	value := storedDailyScheduleForProcessing(t, schedule.MisfireSkip)
+	value.HostID = ""
+	value.Objective = "Check the goal and answer in chat"
+	store.values[value.ID] = value
+	authorizer := &scheduleServiceAuthorizerFake{}
+	service := newTestScheduleService(t, store, authorizer, &scheduleServiceModelCatalogFake{configured: true})
+
+	processed, err := service.ProcessDue(context.Background(), *value.NextCheckAt, 1)
+	if err != nil || processed != 1 || store.dueTaskCount != 1 || authorizer.validateCalls != 1 {
+		t.Fatalf("ProcessDue() hostless = processed %d, task count %d, authorization checks %d, err %v",
+			processed, store.dueTaskCount, authorizer.validateCalls, err)
+	}
+}
+
 func TestScheduleCreateValidatesIANAZoneAndScheduleRule(t *testing.T) {
 	for _, test := range []struct {
 		name   string

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,12 +24,86 @@ import (
 
 const syncTestOwnerQuotaBytes = 1 << 40
 
+const syncTaskWorkspacePublishRuntimeID = "ri_sync_task_publish"
+
+func newSyncTaskWorkspacePublishTask(t *testing.T, ctx context.Context, store *Store, name string) (workspace.Workspace, app.TaskWorkspacePublishCommand) {
+	t.Helper()
+	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, name)
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{workspaceValue.ID})
+	if err := store.MarkCreateAttempt(ctx, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2, control_state='ai', control_version=0 WHERE id=$1`, hostValue.ID, syncTaskWorkspacePublishRuntimeID); err != nil {
+		t.Fatal(err)
+	}
+	hostValue, err := store.TransitionHost(ctx, hostValue.ID, host.StateCreating, host.StateRunning, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestSHA, err := workspace.ManifestSHA256([]workspace.File{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextDigest, err := hex.DecodeString(manifestSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := workspaceValue.Revision
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "sync-task-workspace-publish:"+name, "write a report")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = contextDigest
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Task Workspace publish task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "sync-task-workspace-publish-worker", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Task Workspace publish task: %#v found=%t err=%v", claimed, found, err)
+	}
+	requestHash := sha256.Sum256([]byte("Task Workspace publish:" + name))
+	command := app.TaskWorkspacePublishCommand{
+		OwnerID: owner.ID, TaskID: claimed.ID, WorkspaceID: workspaceValue.ID, HostID: hostValue.ID,
+		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		BindingVersion: binding.BindingVersion, InputRevision: revision, BaseRevision: revision,
+		HostFence: app.AgentHostFence{RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: syncTaskWorkspacePublishRuntimeID,
+			ControlVersion: hostValue.ControlVersion, AIAllowed: true},
+		ViewID: "v" + strings.Repeat("a", 64), InputManifestSHA256: manifestSHA,
+		OperationKey: "sync-task-workspace-publish:s1234567:" + workspaceValue.ID, RequestHash: requestHash[:],
+	}
+	return workspaceValue, command
+}
+
+func startWorkspaceSyncTestHost(t *testing.T, ctx context.Context, store *Store, value host.Host) host.Host {
+	t.Helper()
+	if err := store.MarkCreateAttempt(ctx, value.ID); err != nil {
+		t.Fatal(err)
+	}
+	running, err := store.TransitionHost(ctx, value.ID, host.StateCreating, host.StateRunning, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return running
+}
+
 func TestWorkspaceSyncPersistsPlanAndCommitsImmutableRevision(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "sync")
 	file := syncTestFile("src/main.go", []byte("hello"))
+	modified := int64(1_700_000_000_123_456_789)
+	file.ModTimeNS = &modified
 	session := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
 	session.PlannedBytes = 0
 	transfers := []workspace.TransferBlock{{Chunk: file.Chunks[0], Role: workspace.BlockUpload, Received: true}}
@@ -61,19 +136,129 @@ func TestWorkspaceSyncPersistsPlanAndCommitsImmutableRevision(t *testing.T) {
 		t.Fatalf("revision zero manifest = %#v err=%v", oldPage, err)
 	}
 	newPage, err := store.GetWorkspaceManifestPage(ctx, value.ID, 1, "", "", 100)
-	if err != nil || len(newPage.Files) != 1 || newPage.Files[0].Path != file.Path || newPage.Files[0].SHA256 != file.SHA256 {
+	if err != nil || len(newPage.Files) != 1 || newPage.Files[0].Path != file.Path || newPage.Files[0].SHA256 != file.SHA256 || newPage.Files[0].ModTimeNS == nil || *newPage.Files[0].ModTimeNS != modified {
 		t.Fatalf("revision one manifest = %#v err=%v", newPage, err)
 	}
 	changes, err := store.GetWorkspaceChangePage(ctx, value.ID, 0, "", 100)
-	if err != nil || len(changes.Items) != 1 || changes.Items[0].Action != workspace.ChangeUpsert || changes.Items[0].File == nil {
+	if err != nil || len(changes.Items) != 1 || changes.Items[0].Action != workspace.ChangeUpsert || changes.Items[0].File == nil ||
+		changes.Items[0].File.ModTimeNS == nil || *changes.Items[0].File.ModTimeNS != modified {
 		t.Fatalf("workspace change page = %#v err=%v", changes, err)
+	}
+}
+
+func TestWorkspaceSyncPersistsDirectoryMetadataAndInvalidatesStaleTimes(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-directory-metadata")
+	mode := uint32(0o750)
+	times := []int64{1_700_000_000_000_000_000, 1_700_000_001_000_000_000}
+	first := syncTestFile("src/main.go", []byte("first"))
+	firstDirectory := workspace.Directory{Path: "src", Mode: &mode, ModTimeNS: &times[0]}
+	create := newTestSyncSession(t, value, owner.ID, []workspace.File{first}, []workspace.File{first}, nil)
+	create.Directories = []workspace.Directory{firstDirectory}
+	create.UploadDirectories = []workspace.Directory{firstDirectory}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, create, syncTestBlocks(create.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "directory-metadata:first", create.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, create.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "directory-metadata:first", create.ID)); err != nil {
+		t.Fatalf("commit initial directory metadata: %v", err)
+	}
+	page, err := store.GetWorkspaceManifestPage(ctx, value.ID, 1, "", "", 10)
+	srcMetadata, found := workspaceDirectoryMapByFoldedPath(page.Directories)["src"]
+	if err != nil || !found || srcMetadata.Mode == nil || *srcMetadata.Mode != mode || srcMetadata.ModTimeNS == nil || *srcMetadata.ModTimeNS != times[0] {
+		t.Fatalf("revision 1 directory metadata = %#v, err=%v", page.Directories, err)
+	}
+
+	current, err := store.GetWorkspace(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := syncTestFile("src/next.go", []byte("second"))
+	secondDirectory := workspace.Directory{Path: "src", Mode: &mode, ModTimeNS: &times[1]}
+	update := newTestSyncSession(t, current, owner.ID, []workspace.File{first, second}, []workspace.File{second}, nil)
+	update.Directories = []workspace.Directory{secondDirectory}
+	update.UploadDirectories = []workspace.Directory{secondDirectory}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, update, syncTestBlocks(update.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "directory-metadata:update", update.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, update.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "directory-metadata:update", update.ID)); err != nil {
+		t.Fatalf("commit changed directory metadata: %v", err)
+	}
+
+	current, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := syncTestFile("src/final.go", []byte("third"))
+	structuralUpdate := newTestSyncSession(t, current, owner.ID, []workspace.File{first, second, third}, []workspace.File{third}, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, structuralUpdate, syncTestBlocks(structuralUpdate.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "directory-metadata:invalidate", structuralUpdate.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, structuralUpdate.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "directory-metadata:invalidate", structuralUpdate.ID)); err != nil {
+		t.Fatalf("commit structural change without directory timestamp: %v", err)
+	}
+	page, err = store.GetWorkspaceManifestPage(ctx, value.ID, 3, "", "", 10)
+	srcMetadata, found = workspaceDirectoryMapByFoldedPath(page.Directories)["src"]
+	if err != nil || !found || srcMetadata.Mode == nil || *srcMetadata.Mode != mode || srcMetadata.ModTimeNS != nil {
+		t.Fatalf("revision 3 directory metadata = %#v, err=%v; want known mode and unknown modification time", page.Directories, err)
+	}
+	historical, err := store.GetWorkspaceManifestPage(ctx, value.ID, 1, "", "", 10)
+	historicalSrc, found := workspaceDirectoryMapByFoldedPath(historical.Directories)["src"]
+	if err != nil || !found || historicalSrc.ModTimeNS == nil || *historicalSrc.ModTimeNS != times[0] {
+		t.Fatalf("historical directory metadata changed after later revisions: %#v, err=%v", historical.Directories, err)
+	}
+
+	current, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertedDirectory := workspace.Directory{Path: "src", Mode: &mode, ModTimeNS: &times[1]}
+	restoreDirectoryTime := newTestSyncSession(t, current, owner.ID, []workspace.File{first, second, third}, []workspace.File{}, nil)
+	restoreDirectoryTime.Directories = []workspace.Directory{assertedDirectory}
+	restoreDirectoryTime.UploadDirectories = []workspace.Directory{assertedDirectory}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, restoreDirectoryTime, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "directory-metadata:restore-known-time", restoreDirectoryTime.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, restoreDirectoryTime.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "directory-metadata:restore-known-time", restoreDirectoryTime.ID)); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err = store.GetWorkspace(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedFirst := syncTestFile("src/main.go", []byte("first content update"))
+	contentUpdate := newTestSyncSession(t, current, owner.ID,
+		[]workspace.File{updatedFirst, second, third}, []workspace.File{updatedFirst}, nil)
+	contentUpdate.Directories = []workspace.Directory{assertedDirectory}
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, contentUpdate, syncTestBlocks(contentUpdate.UploadFiles),
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "directory-metadata:content-update", contentUpdate.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := commitWorkspaceSyncSession(ctx, store, value.ID, contentUpdate.ID,
+		syncTestIdempotency(owner.ID, "workspace.sync.commit", "directory-metadata:content-update", contentUpdate.ID)); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.GetWorkspaceManifestPage(ctx, value.ID, 5, "", "", 10)
+	srcMetadata, found = workspaceDirectoryMapByFoldedPath(page.Directories)["src"]
+	if err != nil || !found || srcMetadata.ModTimeNS == nil || *srcMetadata.ModTimeNS != times[1] {
+		t.Fatalf("content-only file update discarded the submitted directory time: %#v, err=%v", page.Directories, err)
 	}
 }
 
 func TestWorkspaceSyncCommittedBeforeTaskPublishKeepsTaskPublishFenced(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
-	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "sync-before-task-publish")
+	workspaceValue, command := newSyncTaskWorkspacePublishTask(t, ctx, store, "sync-before-task-publish")
 
 	deviceFile := syncTestFile("reports/device.txt", []byte("device revision"))
 	session := newTestSyncSession(t, workspaceValue, command.OwnerID, []workspace.File{deviceFile}, []workspace.File{deviceFile}, nil)
@@ -91,11 +276,9 @@ func TestWorkspaceSyncCommittedBeforeTaskPublishKeepsTaskPublishFenced(t *testin
 		t.Fatalf("reserve Task publish at its existing checkpoint: %v", err)
 	}
 	taskFile := syncTestFile("reports/task.txt", []byte("Task output"))
-	manifestSHA, err := workspace.ManifestSHA256([]workspace.File{taskFile})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = service.CommitTaskWorkspacePublish(ctx, command, []workspace.File{taskFile}, nil, manifestSHA,
+	taskFiles, taskDirectories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{taskFile}, nil)
+	taskFile = taskFiles[0]
+	_, err := service.CommitTaskWorkspacePublish(ctx, command, taskFiles, nil, taskDirectories, manifestSHA,
 		func(_ context.Context, digest string) ([]byte, error) {
 			if digest != taskFile.SHA256 {
 				t.Fatalf("Task publish requested block %q; want %q", digest, taskFile.SHA256)
@@ -191,7 +374,7 @@ func TestWorkspaceSyncPersistsAndDeletesEmptyDirectoriesAcrossRevisions(t *testi
 	if err != nil || len(latest.EmptyDirectories) != 0 {
 		t.Fatalf("revision 2 retained a deleted directory: %#v, err=%v", latest, err)
 	}
-	changes, err = store.GetWorkspaceChangePage(ctx, value.ID, 1, "", 10)
+	changes, err = store.GetWorkspaceChangePage(ctx, value.ID, 1, directory, 10)
 	if err != nil || len(changes.Items) != 1 || changes.Items[0].Action != workspace.ChangeDirectoryDelete || changes.Items[0].File != nil {
 		t.Fatalf("empty-directory deletion changelog = %#v, err=%v", changes, err)
 	}
@@ -220,12 +403,14 @@ func TestWorkspaceSyncQuotaCommitReceiptStaysRejectedAfterSpaceIsFreed(t *testin
 VALUES ($1, $2, $3, $4, $5)`, legacy.OwnerID, legacy.Operation, legacy.Key, legacy.RequestHash, session.ID); err != nil {
 		t.Fatal(err)
 	}
-	otherSessionID, err := workspace.NewSyncSessionID()
-	if err != nil {
-		t.Fatal(err)
+	otherWorkspace := createTestWorkspace(t, ctx, store, owner.ID, "sync-quota-receipt-other")
+	otherSession := newTestSyncSession(t, otherWorkspace, owner.ID, nil, nil, nil)
+	if _, _, err := createTestWorkspaceSyncSession(ctx, store, otherSession, nil,
+		syncTestIdempotency(owner.ID, "workspace.sync.create", "quota-receipt:other-create", otherSession.ID)); err != nil {
+		t.Fatalf("create authenticated session for cross-session idempotency check: %v", err)
 	}
-	otherLegacyRequest := syncTestIdempotency(owner.ID, "workspace.sync.commit", legacy.Key, otherSessionID)
-	if _, err := store.ReserveWorkspaceSyncCommit(ctx, value.ID, otherSessionID, otherLegacyRequest); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+	otherLegacyRequest := syncTestIdempotency(owner.ID, "workspace.sync.commit", legacy.Key, otherSession.ID)
+	if _, err := store.ReserveWorkspaceSyncCommit(ctx, otherWorkspace.ID, otherSession.ID, otherLegacyRequest); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("legacy commit key reused for another session = %v, want idempotency conflict", err)
 	}
 	oldKey := syncTestIdempotency(owner.ID, "workspace.sync.commit", "quota-receipt:old", session.ID)
@@ -873,6 +1058,7 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "host-sync-detach")
 	created := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	created = startWorkspaceSyncTestHost(t, ctx, store, created)
 	active, err := store.TransitionWorkspaceBinding(ctx, created.ID, value.ID, 1,
 		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
 	if err != nil {
@@ -910,6 +1096,9 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 	if err != nil || stillUnbinding.State != workspace.BindingUnbinding || stillUnbinding.BindingVersion != unbinding.BindingVersion || stillUnbinding.AppliedRevision != 0 {
 		t.Fatalf("binding after rejected unbind = %#v, err=%v", stillUnbinding, err)
 	}
+	if err := store.AckWorkspaceSyncBlock(ctx, value.ID, session.ID, file.Chunks[0].SHA256, 0, syncTestOwnerQuotaBytes); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("acknowledge Host sync block after binding version advanced = %v; want not found", err)
+	}
 	if _, _, err := store.CancelWorkspaceSyncSession(ctx, value.ID, session.ID,
 		syncTestIdempotency(owner.ID, "workspace.sync.cancel", "host-detach:cancel", session.ID)); err != nil {
 		t.Fatalf("cancel unfinished Host sync session: %v", err)
@@ -929,8 +1118,8 @@ func TestWorkspaceSyncRejectsHostReplicaCommitAfterBindingDetached(t *testing.T)
 
 	_, _, err = commitWorkspaceSyncSession(ctx, store, value.ID, session.ID,
 		syncTestIdempotency(owner.ID, "workspace.sync.commit", "host-detach:commit", session.ID))
-	if domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("old Host replica session commit after detach error = %v, want invalid state", err)
+	if domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("old Host replica session commit after detach error = %v, want not found", err)
 	}
 	current, err := store.GetWorkspace(ctx, value.ID)
 	if err != nil || current.Revision != 0 || current.UsedBytes != 0 {
@@ -947,6 +1136,13 @@ func TestHostWorkspaceSyncRejectsBaseAheadOfAppliedRevision(t *testing.T) {
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "host-sync-base-ahead")
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
+	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, 1,
+		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
+	if err != nil {
+		t.Fatalf("activate Host binding at revision zero: %v", err)
+	}
 
 	file := syncTestFile("already-saved.txt", []byte("revision one"))
 	upload := newTestSyncSession(t, value, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
@@ -958,22 +1154,13 @@ func TestHostWorkspaceSyncRejectsBaseAheadOfAppliedRevision(t *testing.T) {
 		syncTestIdempotency(owner.ID, "workspace.sync.commit", "host-base-ahead:owner-commit", upload.ID)); err != nil {
 		t.Fatalf("commit Workspace revision: %v", err)
 	}
-	value, err := store.GetWorkspace(ctx, value.ID)
+	value, err = store.GetWorkspace(ctx, value.ID)
 	if err != nil || value.Revision != 1 {
 		t.Fatalf("Workspace revision after upload = %#v, err=%v", value, err)
 	}
-
-	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
-	if err := store.MarkCreateAttempt(ctx, hostValue.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.TransitionHost(ctx, hostValue.ID, host.StateCreating, host.StateRunning, ""); err != nil {
-		t.Fatal(err)
-	}
-	binding, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, 1,
-		workspace.BindingPreparing, workspace.BindingActive, value.Revision, 0)
-	if err != nil {
-		t.Fatalf("activate Host binding before it applies revision: %v", err)
+	binding, err = store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
+	if err != nil || binding.DesiredRevision != value.Revision || binding.AppliedRevision != 0 {
+		t.Fatalf("Host binding after owner revision advance = %#v, err=%v; want desired revision 1 and applied revision 0", binding, err)
 	}
 
 	session := newTestSyncSession(t, value, owner.ID, []workspace.File{}, []workspace.File{}, nil)
@@ -998,6 +1185,7 @@ func TestWorkspaceBindingUnbindRequiresAppliedRevisionAndCurrentHostGeneration(t
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "host-unbind-applied-revision")
 	created := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	created = startWorkspaceSyncTestHost(t, ctx, store, created)
 	active, err := store.TransitionWorkspaceBinding(ctx, created.ID, value.ID, 1,
 		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
 	if err != nil {
@@ -1039,6 +1227,7 @@ func TestWorkspaceBindingDetachSerializesHostSyncSessionCreate(t *testing.T) {
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "host-sync-detach-race")
 	created := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	created = startWorkspaceSyncTestHost(t, ctx, store, created)
 	active, err := store.TransitionWorkspaceBinding(ctx, created.ID, value.ID, 1,
 		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
 	if err != nil {

@@ -56,8 +56,14 @@ func (h *api) capabilities(c *gin.Context) {
 	if taskAPIAvailable {
 		features = append(features, "task_api")
 	}
-	if h.deps.ExecutionControl != nil && taskAPIAvailable {
+	cloudTasksAvailable := h.deps.ExecutionControl != nil && taskAPIAvailable
+	if cloudTasksAvailable {
 		features = append(features, "cloud_tasks")
+	}
+	if h.deps.ProjectBudgetExecutionReady && cloudTasksAvailable && h.deps.Projects != nil &&
+		h.deps.ProjectContent != nil && h.deps.ProjectConversations != nil && h.deps.ProjectWorkItems != nil &&
+		h.deps.ProjectBudget != nil && h.deps.ModelConnections != nil && h.deps.ModelGateway != nil {
+		features = append(features, "project_budget_execution")
 	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, capabilitiesResponse{

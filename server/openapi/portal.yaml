@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Morde Portal and Host Gateway API
   version: 1.0.0
-  description: Portal API, Host Gateway API, and platform MCP endpoint. Portal API keys are sent as bearer credentials; Host Gateway APIs use the host-scoped ch_host cookie.
+  description: Portal API, Host Gateway API, and platform MCP endpoint. Portal API keys are sent as bearer credentials; Host Gateway operations use the host-scoped ch_host cookie, while the Task observation routes use a separate narrowly scoped ch_task_read cookie.
 servers:
   - url: https://{portal}
     variables:
@@ -22,6 +22,8 @@ tags:
     description: Owner-only host-scoped applications and runtime controls.
   - name: Workspaces
     description: Independent workspace metadata, immutable file revisions, and resumable synchronization.
+  - name: Runtime
+    description: Host-scoped durable Runtime operation ledger.
   - name: Sites
     description: Owner-managed immutable Site candidates; runtime publication remains gated.
   - name: Tokens
@@ -34,6 +36,8 @@ tags:
     description: Installation-bound realtime presence and request routing for a user's own devices.
   - name: Personal Data
     description: Owner-scoped personal-data objects, attachments, quotas, snapshots, and incremental change metadata.
+  - name: Projects
+    description: Shared project membership, approved resources, project content, work items, and budget metadata.
   - name: Models
     description: Session-managed model connections and capability checks.
   - name: Instant Chat compatibility
@@ -76,7 +80,7 @@ paths:
                   minimum_client_version: { type: [string, 'null'] }
                   supported_features:
                     type: array
-                    description: An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
+                    description: An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, both project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
                     items: { type: string }
                   default_max_request_bytes: { type: integer, format: int64, minimum: 1 }
         '503': { $ref: '#/components/responses/Error' }
@@ -644,7 +648,7 @@ paths:
       tags: [Hosts]
       operationId: createHost
       summary: Create a host
-      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Reuse the Idempotency-Key only to retry the exact normalized request. Portal Sessions may bind one or more owned workspaces using workspace_ids; an empty list creates a host with no project workspace. API keys may create only an unbound host within the account quota and default resource target.
+      description: Returns immediately in the creating state; poll GET /api/hosts/{id} for completion. Every Host must bind exactly one owned, ready Workspace using workspace_ids; the same ownership and availability checks apply to Portal Sessions, API keys, and internal creation paths. Reuse the Idempotency-Key only to retry the exact normalized request.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -698,6 +702,25 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/hosts/{id}/usage:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    get:
+      tags: [Hosts]
+      operationId: getHostUsageReceipt
+      summary: Get the current generation's Host resource usage receipt
+      description: Host owners, administrators, and API keys with current host:read access can read aggregate CPU and estimated memory usage. This is an unpriced usage record, not an invoice; raw samples and container identities are not returned.
+      responses:
+        '200':
+          description: Aggregate resource usage for the current Host runtime generation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostUsageReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/hosts/{id}/control:
     parameters:
       - $ref: '#/components/parameters/HostId'
@@ -705,7 +728,7 @@ paths:
       tags: [Hosts]
       operationId: getHostControl
       summary: Get the AI and user control state for a host
-      description: Portal sessions can inspect their owned hosts. API keys require current account access to observe this host. The active transition omits internal task snapshots and runtime receipts.
+      description: Portal sessions with owner or Host-sharing observation access may inspect this Host. API keys require current account access to observe it. control_actor_user_id is empty when no active user lease exists; the active transition omits internal task snapshots and runtime receipts.
       responses:
         '200':
           description: Current control fence and active handoff, if any
@@ -773,7 +796,7 @@ paths:
       tags: [Hosts]
       operationId: actOnHostControl
       summary: Hand control of a host between AI and the user
-      description: Portal sessions can operate their owned hosts. API keys require current account permission to operate this host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. Pending runtime operations leave the host fenced and return 202.
+      description: The Host owner or a member with a control permission may take over when no active user lease exists. Release is limited to the current active holder or the Host owner. API keys require current account permission to operate this Host. Reuse the same request_id only to retry the exact same action with the same expected_control_version. A different active holder or stale version returns 409; pending runtime operations leave the Host fenced and return 202.
       requestBody:
         required: true
         content:
@@ -790,6 +813,31 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ControlActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/hosts/{id}/control/lease/renew:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    post:
+      tags: [Hosts]
+      operationId: renewHostControlLease
+      summary: Renew the active Host control lease
+      description: The current Host owner or authorized control member may renew only their own active lease. The caller must provide the current control version; an expired or revoked lease cannot be revived. The response includes current actor, expiry and active state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ControlLeaseRenewRequest' }
+      responses:
+        '200':
+          description: Current control status after lease renewal
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlStatus' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -824,6 +872,143 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /__ch/task-auth:
+    servers:
+      - url: https://{host}
+        variables:
+          host:
+            default: h1234567.hosts.morde.test
+            description: Host-specific Gateway origin using the configured Host suffix.
+    get:
+      tags: [Host Gateway]
+      operationId: exchangeTaskWorkbenchObservationTicket
+      summary: Exchange a one-time Portal ticket for a short-lived Task-read cookie
+      description: The opaque ticket is single-use and expires within 60 seconds. The Host Gateway redirects to a clean Workbench URL after setting a distinct HttpOnly, Secure, SameSite=Strict cookie scoped to /__ch/. The ticket value is never placed in a referrer or cacheable response.
+      security: []
+      parameters:
+        - name: ticket
+          in: query
+          required: true
+          schema: { type: string, minLength: 40, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+      responses:
+        '303':
+          description: Ticket exchanged; browser should follow the clean Workbench location.
+          headers:
+            Location:
+              schema: { type: string }
+              description: 'Clean `/__ch/wb/?task_id={task_id}` URL with no ticket query parameter.'
+            Set-Cookie:
+              schema: { type: string }
+              description: Separate ch_task_read cookie; never a ch_host cookie.
+            Cache-Control: { schema: { type: string, const: no-store } }
+            Referrer-Policy: { schema: { type: string, const: no-referrer } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /__ch/api/tasks/{task_id}:
+    servers:
+      - url: https://{host}
+        variables:
+          host:
+            default: h1234567.hosts.morde.test
+            description: Host-specific Gateway origin using the configured Host suffix.
+    parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Host Gateway]
+      operationId: getWorkbenchTaskObservationSnapshot
+      summary: Read a narrow, read-only Task observation snapshot
+      description: Requires the distinct short-lived Task-read cookie. Returns only Task state, event sequence, timestamps, and verified artifact metadata. It excludes objective, result text, event payloads, file paths, and all mutation or Host-control capabilities. Authorization and Host runtime generation are rechecked per request.
+      security: [{ taskReadCookie: [] }]
+      responses:
+        '200':
+          description: Current safe Task observation projection
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            Referrer-Policy: { schema: { type: string, const: no-referrer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkbenchObservationSnapshot' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /__ch/api/tasks/{task_id}/events:
+    servers:
+      - url: https://{host}
+        variables:
+          host:
+            default: h1234567.hosts.morde.test
+            description: Host-specific Gateway origin using the configured Host suffix.
+    parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Host Gateway]
+      operationId: streamWorkbenchTaskObservationEvents
+      summary: Stream safe Task observation events
+      description: Requires the distinct short-lived Task-read cookie. Each SSE event contains only sequence, fixed event type, and timestamp; event payloads are never returned. Task read authorization and Host generation are rechecked on each poll, so revoked access ends the stream.
+      security: [{ taskReadCookie: [] }]
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: Last-Event-ID
+          in: header
+          schema: { type: string, pattern: '^[0-9]+$' }
+      responses:
+        '200':
+          description: Server-sent safe Task observation events; cursor expiry emits task.snapshot_required and closes the stream.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            Referrer-Policy: { schema: { type: string, const: no-referrer } }
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /__ch/api/workspaces/{workspace_id}/diff:
+    servers:
+      - url: https://{host}
+        variables:
+          host:
+            default: h1234567.hosts.morde.test
+            description: Host-specific Gateway origin using the configured Host suffix.
+    parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/WorkspaceId' }
+    get:
+      tags: [Host Gateway]
+      operationId: getHostWorkspaceDiff
+      summary: Compare two applied Workspace revisions from the Host owner Workbench
+      description: Host owner ch_host cookie only; Host members with workspace:file:read cannot use this route. Requires an active, healthy, conflict-free binding whose desired and applied revision match the current confirmed revision. The bounded diff projection is the same as the Portal Workspace diff.
+      security: [{ hostCookie: [] }]
+      parameters:
+        - name: from_revision
+          in: query
+          required: true
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_revision
+          in: query
+          required: true
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Bounded Workspace revision comparison
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceDiff' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
         default: { $ref: '#/components/responses/Error' }
   /__ch/api/applications/{app_id}/install:
     servers:
@@ -1441,6 +1626,118 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/ownership-transfers:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: requestWorkspaceOwnershipTransfer
+      summary: Request transfer of Workspace ownership
+      description: Portal Session only. Only the current owner can request transfer to an approved account. The request freezes Workspace changes until it is accepted or cancelled. The current Workspace ID, revision history, current tree, and volume are retained; no file bytes are sent. Transfers are refused while a Host binding, Task write, synchronization operation, publish, project or Site reference, registered device, or unsupported legacy volume exists.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RequestWorkspaceOwnershipTransfer' }
+      responses:
+        '201':
+          description: Transfer request created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransfer' }
+        '200':
+          description: Idempotent replay of the transfer request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: Workspace references or volume state cannot be transferred safely, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/ownership-transfers/{transfer_id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - name: transfer_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransferId' }
+    get:
+      tags: [Workspaces]
+      operationId: getWorkspaceOwnershipTransfer
+      summary: Get an ownership transfer request
+      description: Available to the current or former owner and the proposed owner. After acceptance, this endpoint exposes only the transfer receipt; Workspace and sync data access follows the new current owner.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Ownership transfer status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransfer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/ownership-transfers/{transfer_id}/accept:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - name: transfer_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransferId' }
+    post:
+      tags: [Workspaces]
+      operationId: acceptWorkspaceOwnershipTransfer
+      summary: Accept a Workspace ownership transfer
+      description: Only the proposed owner's Portal Session may accept. Acceptance is an idempotent operation with a durable operation ID. A result-unknown state remains frozen for reconciliation; it cannot be cancelled or accepted as a new operation.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Accepted transfer receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/ownership-transfers/{transfer_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - name: transfer_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransferId' }
+    post:
+      tags: [Workspaces]
+      operationId: cancelWorkspaceOwnershipTransfer
+      summary: Cancel a pending Workspace ownership transfer
+      description: Only the former/current owner's Portal Session may cancel while the transfer remains pending. Acceptance or result-unknown operations cannot be cancelled.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Cancelled transfer receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceOwnershipTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
   /api/workspaces/{id}/manifest:
     parameters:
       - $ref: '#/components/parameters/WorkspaceId'
@@ -1478,6 +1775,132 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/diff:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Workspaces]
+      operationId: getWorkspaceDiff
+      summary: Compare two committed Workspace revisions
+      description: Portal owner sessions only. Returns changed file and directory metadata; UTF-8 text content is included only for small files. Large and binary files retain an explicit display status without content.
+      security: [{ portalSession: [] }]
+      parameters:
+        - name: from_revision
+          in: query
+          required: true
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_revision
+          in: query
+          required: true
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Bounded Workspace revision comparison
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceDiff' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/copies:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: copyWorkspace
+      summary: Copy a confirmed Workspace revision
+      description: Portal owner sessions only. Requires a ready Workspace volume, a current tree matching the confirmed revision, no Host binding or in-flight writer, and sufficient owner capacity. Unsupported file metadata fails closed. The source remains unchanged; each idempotency key creates at most one independent Workspace copy.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceCopyRequest' }
+      responses:
+        '201':
+          description: Newly completed independent Workspace copy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceCopyResult' }
+        '200':
+          description: Completed copy returned for an idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceCopyResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: restoreWorkspacePaths
+      summary: Restore selected paths from an immutable revision
+      description: Portal owner sessions only. The current Workspace revision is checked atomically; active Host bindings, in-flight sync or Task writes, unresolved receive operations, and an unmaterialized current revision make restore fail closed. A successful change creates a new revision and never rewrites history.
+      security: [{ portalSession: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceRestoreRequest' }
+      responses:
+        '200':
+          description: Restore result and resulting immutable revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceRestoreResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/file-operations:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: applyWorkspaceFileOperation
+      summary: Rename, move, or delete Workspace paths
+      description: Portal Session only. Editing is read-only unless write_enabled is explicitly true. Credential paths (.ssh, .gnupg, .aws, .azure, .kube, .docker, .config/gcloud, .config/gh, .netrc, .git-credentials, and .env*) are rejected. The expected current revision, committed manifest, and absence of active Host bindings or in-flight writers are checked atomically; ownership-transfer freezes apply to this route.
+      security: [{ portalSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceFileOperationRequest' }
+      responses:
+        '200':
+          description: Operation receipt and resulting immutable revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceFileOperationResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
         default: { $ref: '#/components/responses/Error' }
   /api/workspaces/{id}/changes:
     parameters:
@@ -1930,6 +2353,65 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/host-replicas/{host_id}/generations/{generation}/operation-ledger/{namespace}:
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/HostId' }
+      - name: generation
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+      - name: namespace
+        in: path
+        required: true
+        schema: { type: string, enum: [runtime_core, browser] }
+    get:
+      tags: [Runtime]
+      operationId: listHostRuntimeOperationLedgerEvents
+      summary: Read a bounded page from this Host generation's durable operation ledger
+      description: Host Replica credentials can read only their own Host, runtime generation, and namespace. Events are returned in sequence order for client-side hash-chain validation.
+      security: [{ hostReplicaBootstrap: [] }]
+      parameters:
+        - name: after_sequence
+          in: query
+          schema: { type: integer, format: uint64, minimum: 0, maximum: 65536, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 128, default: 128 }
+      responses:
+        '200':
+          description: Events following the requested sequence
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeOperationLedgerPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Runtime]
+      operationId: appendHostRuntimeOperationLedgerEvent
+      summary: Durably append one Host Runtime operation event
+      description: The event sequence and predecessor hash must match the current ledger head. Replaying the identical event is idempotent; a different event at an existing sequence or a stale predecessor returns conflict. The response is sent only after PostgreSQL commits the event.
+      security: [{ hostReplicaBootstrap: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeOperationLedgerEvent' }
+      responses:
+        '200':
+          description: Durably committed event acknowledgement
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeOperationLedgerEvent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
   /api/host-replicas/{host_id}/generations/{generation}/task-workspace-view-deletions:
     parameters:
       - name: host_id
@@ -2233,7 +2715,7 @@ paths:
       tags: [Notifications]
       operationId: listNotifications
       summary: List the current user's in-app notifications
-      description: Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Related task content is redacted when current authorization no longer allows access. Marking read does not approve or execute an action.
+      description: Portal sessions and native client credentials may read owner-wide notifications; API keys cannot. Task summaries are redacted when current authorization no longer allows access. Project work-item notices are visible only while the recipient is a current project member. Source notices expose a fixed summary and source identity, not source content. Marking read does not approve or execute an action.
       security:
         - portalSession: []
         - bearerToken: []
@@ -2258,7 +2740,7 @@ paths:
       tags: [Notifications]
       operationId: markNotificationRead
       summary: Mark a notification as read
-      description: Portal sessions and native client credentials may mark a historical notification read. Idempotent; this does not execute any task action.
+      description: Portal sessions and native client credentials may mark a historical Task or source notification read. Idempotent; this does not execute any task action.
       security:
         - portalSession: []
         - bearerToken: []
@@ -2445,6 +2927,1152 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/me/main-conversation:
+    get:
+      tags: [Tasks]
+      operationId: getMainConversation
+      summary: Read the current user's main conversation pointer
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Main conversation selection state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MainConversation' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Tasks]
+      operationId: ensureMainConversation
+      summary: Idempotently initialize the current user's main conversation
+      description: Creates and binds a conversation only when no usable personal history candidate exists; ambiguous legacy history returns selection_required without modifying or merging it.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200':
+          description: Main conversation selection state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MainConversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Tasks]
+      operationId: setMainConversation
+      summary: Select an owned personal conversation as the main conversation
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetMainConversationRequest' }
+      responses:
+        '200':
+          description: Updated main conversation selection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MainConversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: List projects available to the current user
+      description: Returns projects where the current user has an accepted membership. Invitations do not grant project access until accepted.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Projects visible to the current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: Create a project with the caller as its owner
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectRequest' }
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '200':
+          description: Exact idempotent replay of the created project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Read a project available to the current user
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Project metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/members:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectMembers
+      summary: List accepted project members
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Accepted members of the project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMemberPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: inviteProjectMember
+      summary: Invite an existing account to a project
+      description: Owner only. The target must be an existing account in this service instance. This creates a pending invitation, not a membership; the invitee must accept it. No email or external message is sent.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteProjectMemberRequest' }
+      responses:
+        '201':
+          description: Pending invitation created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectInvitation' }
+        '200':
+          description: Exact idempotent replay of the invitation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectInvitation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/members/{user_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectMemberUserId' }
+    patch:
+      tags: [Projects]
+      operationId: updateProjectMemberRole
+      summary: Change an accepted member's role
+      description: Owner only. Only member and viewer roles can be assigned here; ownership changes use the explicit owner-transfer operation.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProjectMemberRequest' }
+      responses:
+        '200':
+          description: Updated member role and version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMember' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Projects]
+      operationId: removeProjectMember
+      summary: Remove an accepted project member
+      description: Owner only. Pending invitations use the separate invitation-revocation operation. The expected member version and idempotency key are checked atomically; active work must be reauthorized after removal.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RemoveProjectMemberRequest' }
+      responses:
+        '204': { description: Accepted project member removed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/invitations/{invitation_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - name: invitation_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ProjectInvitationId' }
+    delete:
+      tags: [Projects]
+      operationId: revokeProjectInvitation
+      summary: Revoke a pending project invitation
+      description: Owner only. The invitation must still be pending; expected_version and the idempotency key are checked atomically.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RevokeProjectInvitationRequest' }
+      responses:
+        '204': { description: Pending invitation revoked }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/project-invitations:
+    get:
+      tags: [Projects]
+      operationId: listMyProjectInvitations
+      summary: List invitations addressed to the current user
+      description: Only invitations for the authenticated account are returned.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Invitations addressed to the current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectInvitationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/project-invitations/{id}/accept:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectInvitationId' }
+    post:
+      tags: [Projects]
+      operationId: acceptProjectInvitation
+      summary: Accept an invitation addressed to the current user
+      description: Acceptance is atomic and idempotent. A non-invitee cannot read or accept the invitation. Repeated acceptance does not create a second membership.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '201':
+          description: Membership created from the accepted invitation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMember' }
+        '200':
+          description: Exact idempotent replay of the accepted membership
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMember' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/owner-transfer:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    post:
+      tags: [Projects]
+      operationId: transferProjectOwner
+      summary: Transfer ownership to an accepted member
+      description: Current owner only. The target must already be an accepted member. The transfer atomically makes the target owner and the former owner a member, preserving exactly one owner.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferProjectOwnerRequest' }
+      responses:
+        '200':
+          description: Project with the new owner and incremented version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/resources:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectResources
+      summary: List project resource associations visible to the current user
+      description: Association does not grant Host or Workspace access. The server returns an associated resource ID only when the reader independently has current access to it.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Independently authorized project resource associations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectResourcePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: addProjectResource
+      summary: Associate an already accessible Host or Workspace with a project
+      description: Owner only. The caller must already have independent access to the resource; linking it never grants resource permissions to project members.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectResourceMutationRequest' }
+      responses:
+        '201':
+          description: Resource association created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectResource' }
+        '200':
+          description: Exact idempotent replay of the association
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectResource' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Projects]
+      operationId: removeProjectResource
+      summary: Remove a Host or Workspace association from a project
+      description: Owner only. The request is version checked and idempotent; removing an association does not modify the resource or its permissions.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectResourceMutationRequest' }
+      responses:
+        '204': { description: Resource association removed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/workspaces/{workspace_id}/manifest:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/WorkspaceId' }
+    get:
+      tags: [Projects]
+      operationId: getProjectWorkspaceManifest
+      summary: Read a project workspace directory snapshot
+      description: Requires current project viewer membership, an active Workspace association, and independent current Workspace read permission. Returns only confirmed revision metadata and omits credential paths, file hashes, and block references.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: revision
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0, description: Zero selects the current confirmed revision. }
+        - name: prefix
+          in: query
+          required: false
+          schema: { type: string, maxLength: 1024 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string, maxLength: 512 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        '200':
+          description: Sanitized Workspace directory metadata at a confirmed revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkspaceManifest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectConversations
+      summary: List shared conversations available to project members
+      description: Every request rechecks current project membership. Project conversation owner_id records who created the shared conversation; later message and Task actors are reported separately.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Shared project conversations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: createProjectConversation
+      summary: Create a shared conversation in a project
+      description: Accepted project members may create a shared conversation. The creator remains conversation owner; this does not make them the project owner or a later Task initiator.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectConversationRequest' }
+      responses:
+        '201':
+          description: Project conversation created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversation' }
+        '200':
+          description: Exact idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversation
+      summary: Read a shared project conversation
+      description: The current accepted project membership is checked on every read.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Shared project conversation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/hosts/{host_id}/usage:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/HostId' }
+    get:
+      tags: [Projects]
+      operationId: getProjectHostUsageReceipt
+      summary: Get Host resource usage attributed to a project
+      description: The caller's current accepted project membership is checked on every read and again in the usage query transaction. Only aggregate usage attributed to this project and Host is returned; raw samples, container identities, and Workspace attribution are omitted. Usage is unpriced.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Aggregate project-attributed Host resource usage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectHostUsageReceipt' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectConversationMessages
+      summary: Read shared project conversation history
+      description: Returns the single shared history for accepted project members. owner_id is the conversation creator; actor_id is the account that authored each message.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Messages in chronological order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationMessagePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: appendProjectConversationMessage
+      summary: Append a message and queue a Task in the shared conversation
+      description: Accepted project members may append messages. The conversation owner remains the creator while the Task initiator is the caller; current membership and the caller's independent Host, Workspace, model, and token access are rechecked by the write transaction.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppendProjectConversationMessageRequest' }
+      responses:
+        '202':
+          description: Shared message and queued project Task
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppendProjectConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/project-content/search:
+    get:
+      tags: [Projects]
+      operationId: searchProjectContent
+      summary: Search current Muse content in projects the caller can read
+      description: The SQL query joins current accepted memberships before matching content and always enforces a bounded result limit. Only current non-deleted project Feed posts, Ideas, Library metadata, and briefs are searched; personal records and inaccessible project excerpts are never read.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        '200':
+          description: Bounded matches from currently readable projects
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentSearchResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/content/{kind}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - name: kind
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ProjectContentKind' }
+    get:
+      tags: [Projects]
+      operationId: getProjectContent
+      summary: Read versioned project content
+      description: Available to accepted project members. Kinds include the legacy memory/goal/document records and project-scoped Feed posts, Ideas, Library metadata, and briefs. Content IDs are query values because valid IDs may contain slashes. A deleted head revision returns not found. This route reads only project_content_revisions; it never falls back to personal sync data.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: content_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        '200':
+          description: Current non-deleted content revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Projects]
+      operationId: putProjectContent
+      summary: Create or replace project content at an expected revision
+      description: Owner/member only. Use base_revision 0 for first creation; updates require the current revision. Body is a strict JSON object validated for the selected kind. Each write is idempotent. Initial creation returns 201; update or replay returns 200.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutProjectContentRequest' }
+      responses:
+        '201':
+          description: Content created at revision 1
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContent' }
+        '200':
+          description: Content updated or exact idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Projects]
+      operationId: deleteProjectContent
+      summary: Tombstone project content at an expected revision
+      description: Owner/member only. The tombstone increments and returns the revision so a later recreation can use that revision as base_revision. The current content body is not returned.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteProjectContentRequest' }
+      responses:
+        '200':
+          description: Tombstone revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentTombstone' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/content/{kind}/comments:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - name: kind
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ProjectMuseContentKind' }
+    get:
+      tags: [Projects]
+      operationId: listProjectContentRowComments
+      summary: List comments pinned to one project content revision and row
+      description: Accepted project members with viewer access may read. The referenced immutable content revision must exist and not be a tombstone; comments are isolated to the exact project, kind, content ID, revision, and row ID.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { name: content_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        - { name: content_revision, in: query, required: true, schema: { type: integer, format: int64, minimum: 1 } }
+        - { name: row_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      responses:
+        '200':
+          description: Current comments for this exact row and revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentCommentPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: createProjectContentRowComment
+      summary: Add a comment pinned to a fixed project content revision and row
+      description: Accepted project members only. Creation uses comment base version 0; each update/delete must compare the current comment version. Writes are idempotent and recheck current membership and the pinned non-deleted content revision in the transaction.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectContentCommentRequest' }
+      responses:
+        '201':
+          description: Created comment at version 1
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentComment' }
+        '200':
+          description: Exact idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentComment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/content/{kind}/comments/{comment_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - name: kind
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ProjectMuseContentKind' }
+      - name: comment_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ProjectContentCommentId' }
+      - { name: content_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      - { name: content_revision, in: query, required: true, schema: { type: integer, format: int64, minimum: 1 } }
+      - { name: row_id, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+    put:
+      tags: [Projects]
+      operationId: updateProjectContentRowComment
+      summary: Update a comment with a compare-and-swap base version
+      description: Accepted project members only. A stale base_version returns conflict; the comment remains pinned to its original content revision and row.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProjectContentCommentRequest' }
+      responses:
+        '200':
+          description: Updated comment revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentComment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Projects]
+      operationId: deleteProjectContentRowComment
+      summary: Tombstone a comment with a compare-and-swap base version
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteProjectContentCommentRequest' }
+      responses:
+        '200':
+          description: Comment tombstone revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectContentComment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/budget:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: getProjectBudget
+      summary: Read a project's current budget and usage totals
+      description: Available to accepted project members. Unconfigured budgets return configured=false, empty currency, zero limit and version, and zero totals.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current budget and held/settled totals in integer micro-units
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectBudget' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Projects]
+      operationId: setProjectBudget
+      summary: Set a project's versioned currency limit
+      description: Owner only. expected_version 0 creates the initial budget. Limits and usage are integer micro-units in the declared currency. Stale versions, lowering below committed/reserved usage, unknown held charges, or changing currency after ledger usage exists return conflict. The project budget and the actor's existing account budget both apply to future reservations.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetProjectBudgetRequest' }
+      responses:
+        '200':
+          description: Current budget and usage totals after the update
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectBudget' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/mcp-connectors:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectMCPConnectors
+      summary: List personal MCP connectors explicitly authorized for a project
+      description: Available to current project members. Returns connector references and non-secret metadata only; connector credentials and endpoints are never copied or returned. Grants whose connector owner is no longer a current project member are not available.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Active project connector grants
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMCPConnectorPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/mcp-connectors/{connector_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectMCPConnectorId' }
+    put:
+      tags: [Projects]
+      operationId: grantProjectMCPConnector
+      summary: Explicitly authorize a personal connector for a project
+      description: The authenticated user must own the personal connector and be a current project member. expected_version 0 creates a grant; a current revoked version reauthorizes it. Only a non-secret connector reference and owner authorization are stored.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectMCPConnectorGrantRequest' }
+      responses:
+        '200':
+          description: Active project connector grant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Projects]
+      operationId: revokeProjectMCPConnector
+      summary: Revoke a project's personal connector grant
+      description: Only the connector owner or project owner can revoke. The expected version fences stale requests; affected Task grants and in-flight operations are revoked or marked for unknown-result recovery in the same transaction.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectMCPConnectorRevokeRequest' }
+      responses:
+        '200':
+          description: Revoked project connector grant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectMCPConnector' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/budget/ledger:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectBudgetLedger
+      summary: List project model usage attribution
+      description: Available to accepted project members. Task model calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Stable page of project usage entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectBudgetLedgerPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectWorkItems
+      summary: List work items visible to project members
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Stable project-scoped page ordered by creation time and ID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItemPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Projects]
+      operationId: createProjectWorkItem
+      summary: Create a project work item
+      description: Owner/member only. The default assignee is the caller; any supplied assignee must be an accepted member. Task and Workspace fields are added only through separately authorized operations.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectWorkItemRequest' }
+      responses:
+        '201':
+          description: Work item created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '200':
+          description: Exact idempotent replay of the created work item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items/{work_item_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectWorkItemId' }
+    get:
+      tags: [Projects]
+      operationId: getProjectWorkItem
+      summary: Read one project work item
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Project work item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Projects]
+      operationId: assignProjectWorkItem
+      summary: Assign a work item to an accepted project member
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignProjectWorkItemRequest' }
+      responses:
+        '200':
+          description: Updated work item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items/{work_item_id}/block:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectWorkItemId' }
+    post:
+      tags: [Projects]
+      operationId: blockProjectWorkItem
+      summary: Mark an open work item blocked
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BlockProjectWorkItemRequest' }
+      responses:
+        '200':
+          description: Blocked work item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items/{work_item_id}/resume:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectWorkItemId' }
+    post:
+      tags: [Projects]
+      operationId: resumeProjectWorkItem
+      summary: Resume a blocked work item
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectWorkItemVersionRequest' }
+      responses:
+        '200':
+          description: Resumed work item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items/{work_item_id}/tasks:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectWorkItemId' }
+    post:
+      tags: [Projects]
+      operationId: linkProjectWorkItemTask
+      summary: Link an independently authorized Task to a work item
+      description: The transaction authorizer must verify that the caller can access the Task and that the Task actually belongs to this project; a task_id alone never grants access or changes personal Task ownership.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LinkProjectWorkItemTaskRequest' }
+      responses:
+        '200':
+          description: Work item with the Task linked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '501': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items/{work_item_id}/delivery:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectWorkItemId' }
+    post:
+      tags: [Projects]
+      operationId: deliverProjectWorkItem
+      summary: Attach a saved Workspace revision as work item delivery evidence
+      description: The evidence Task must already be linked to the work item. The W16 authorizer must verify caller access, project/resource scope, and that the Workspace revision is confirmed and durably saved; this request does not grant Workspace access or accept file content.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeliverProjectWorkItemRequest' }
+      responses:
+        '200':
+          description: Delivered work item with saved revision evidence
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '501': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
   /api/conversations:
     get:
       tags: [Tasks]
@@ -2531,8 +4159,8 @@ paths:
     post:
       tags: [Tasks]
       operationId: appendConversationMessage
-      summary: Append a message and queue a cloud task
-      description: The selected model and optional Host apply to this task only. The server-side dsh Agent can continue after the client disconnects.
+      summary: Append a message to a conversation or its active cloud task
+      description: When expected_task_id is supplied, the message is appended only if that Task is still active; a changed or finished Task returns a conflict instead of creating a new Task. Without it, a new Task may be queued. The server-side dsh Agent can continue after the client disconnects.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -2608,6 +4236,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/workbench-observation-ticket:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: issueTaskWorkbenchObservationTicket
+      summary: Issue a short-lived one-time ticket to observe a Host-bound Task in Workbench
+      description: Portal session only. The caller must currently be able to read this Task and own its running Host. The raw ticket is returned once, expires within 60 seconds, and is persisted server-side only as a hash. It grants read-only Task status/events and verified artifact metadata; it grants no Host control or Workspace file access.
+      security: [{ portalSession: [] }]
+      responses:
+        '201':
+          description: One-time Workbench observation ticket
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            Referrer-Policy: { schema: { type: string, const: no-referrer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskWorkbenchObservationTicket' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/workspace-view-deletions:
@@ -2998,7 +4650,7 @@ paths:
       tags: [Schedules]
       operationId: listSchedules
       summary: List schedules owned by the current account
-      description: Schedule-scoped Client grants can access this API; execution authorization remains server-side.
+      description: Schedule-scoped Client grants can access this API; execution authorization remains server-side. Hostless schedules have host_id null. Schedules with browser observation are always Host-bound.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { name: status, in: query, schema: { $ref: '#/components/schemas/ScheduleStatus' } }
@@ -3016,7 +4668,7 @@ paths:
       tags: [Schedules]
       operationId: createSchedule
       summary: Create and enable a schedule
-      description: Requires an enabled Owner execution gate and an Idempotency-Key. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+      description: Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -3045,6 +4697,7 @@ paths:
       tags: [Schedules]
       operationId: getSchedule
       summary: Read one current-account schedule
+      description: Returns host_id as null for a hostless schedule. A schedule with browser observation always has a Host.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       responses:
         '200':
@@ -3059,6 +4712,7 @@ paths:
       tags: [Schedules]
       operationId: updateSchedule
       summary: Update a schedule definition at the expected version
+      description: Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -3088,7 +4742,7 @@ paths:
       tags: [Schedules]
       operationId: updateScheduleStatus
       summary: Enable or disable a schedule
-      description: Requires an Idempotency-Key and expected_version. Disabling does not cancel the current run unless current_run_action is cancel.
+      description: Requires an Idempotency-Key and expected_version. Hostless schedules can be enabled when they do not configure browser observation. Disabling does not cancel the current run unless current_run_action is cancel.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -3895,17 +5549,40 @@ paths:
     get:
       tags: [Admin]
       operationId: getAdminSettings
-      summary: Read fixed account, reward, and quota policy
-      description: Requires an approved administrator's unbound Portal session. Token budgets are set per account; new accounts have no default model budget. This endpoint does not change account consent or issue credits.
+      summary: Read account, model budget, reward, and quota policy
+      description: Requires an approved administrator's unbound Portal session. Newly registered accounts receive the configured default model budget only on their first approval; administrators must configure a positive default before approving any new account. Invitation and contribution rewards remain disabled.
       security: [{ portalSession: [] }]
       responses:
         '200':
-          description: Current fixed policy and personal-data quota defaults
+          description: Current policy, default model budget configuration, and personal-data quota defaults
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AdminSettings' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/settings/model-budget-default:
+    put:
+      tags: [Admin]
+      operationId: updateAdminModelBudgetDefault
+      summary: Version-update the default model budget for newly approved accounts
+      description: Requires an approved administrator's unbound Portal session. The default must be positive and is applied to a new account only on its first approval. Existing account budgets are never overwritten. expected_version is 0 when no default has been configured and increments after each successful update. The setting and audit record are committed atomically.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAdminModelBudgetDefaultRequest' }
+      responses:
+        '200':
+          description: Saved default model budget and version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminModelBudgetDefault' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/invites:
     get:
@@ -4141,6 +5818,7 @@ paths:
       tags: [Admin]
       operationId: updateUser
       summary: Review a user's status, change their role, or update quota
+      description: Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, the configured default model budget is created in the same transaction as the status change and audit. If no valid default is configured, approval fails and the account remains unchanged. Disabling and restoring an account does not grant or reset a budget.
       security:
         - portalSession: []
       requestBody:
@@ -4982,6 +6660,11 @@ components:
       in: cookie
       name: ch_host
       description: Host-scoped session cookie issued when entering the current Host.
+    taskReadCookie:
+      type: apiKey
+      in: cookie
+      name: ch_task_read
+      description: Separate short-lived, single-task read-only Workbench cookie. It is accepted only for Workbench static assets and the explicit Task observation snapshot/events GET routes.
     bearerToken:
       type: http
       scheme: bearer
@@ -5033,11 +6716,41 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/MCPConnectorId' }
+    ProjectMCPConnectorId:
+      name: connector_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/MCPConnectorId' }
     NotificationId:
       name: id
       in: path
       required: true
       schema: { $ref: '#/components/schemas/NotificationId' }
+    ProjectId:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ProjectId' }
+    ProjectConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ConversationId' }
+    ProjectInvitationId:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ProjectInvitationId' }
+    ProjectMemberUserId:
+      name: user_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/UserId' }
+    ProjectWorkItemId:
+      name: work_item_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ProjectWorkItemId' }
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -5184,6 +6897,7 @@ components:
             details: { type: object, additionalProperties: true }
     HostId: { type: string, pattern: '^h[a-z0-9]{7}$' }
     WorkspaceId: { type: string, pattern: '^w[a-z0-9]{7}$' }
+    WorkspaceOwnershipTransferId: { type: string, pattern: '^r[a-z0-9]{7}$' }
     SiteId: { type: string, pattern: '^site_[a-f0-9]{16}$' }
     SiteReleaseId: { type: string, pattern: '^rel_[a-f0-9]{16}$' }
     UserId: { type: string, pattern: '^u[a-z0-9]{7}$' }
@@ -5444,14 +7158,32 @@ components:
       additionalProperties: false
     AdminSettings:
       type: object
-      required: [registration_review_required, automatic_new_user_model_budget, automatic_invitation_reward, automatic_contribution_reward, default_personal_data_quota_bytes, default_personal_attachment_bytes]
+      required: [registration_review_required, automatic_new_user_model_budget, automatic_invitation_reward, automatic_contribution_reward, default_personal_data_quota_bytes, default_personal_attachment_bytes, default_model_budget]
       properties:
         registration_review_required: { type: boolean }
-        automatic_new_user_model_budget: { type: boolean, const: false }
+        automatic_new_user_model_budget: { type: boolean, const: true }
         automatic_invitation_reward: { type: boolean, const: false }
         automatic_contribution_reward: { type: boolean, const: false }
         default_personal_data_quota_bytes: { type: integer, format: int64, minimum: 1 }
         default_personal_attachment_bytes: { type: integer, format: int64, minimum: 1 }
+        default_model_budget: { $ref: '#/components/schemas/AdminModelBudgetDefault' }
+      additionalProperties: false
+    AdminModelBudgetDefault:
+      type: object
+      required: [configured, token_limit, max_concurrent, version]
+      properties:
+        configured: { type: boolean }
+        token_limit: { type: integer, format: int64, minimum: 0 }
+        max_concurrent: { type: integer, minimum: 0, maximum: 100 }
+        version: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    UpdateAdminModelBudgetDefaultRequest:
+      type: object
+      required: [expected_version, token_limit, max_concurrent]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 0 }
+        token_limit: { type: integer, format: int64, minimum: 1 }
+        max_concurrent: { type: integer, minimum: 1, maximum: 100 }
       additionalProperties: false
     AdminInvite:
       type: object
@@ -5688,6 +7420,24 @@ components:
         runtime_generation: { type: integer, format: int64, minimum: 1 }
         items: { type: array, maxItems: 64, items: { $ref: '#/components/schemas/HostReplicaBinding' } }
       additionalProperties: false
+    RuntimeOperationLedgerEvent:
+      type: object
+      required: [version, sequence, kind, data, previous_hash, hash]
+      properties:
+        version: { type: integer, enum: [1] }
+        sequence: { type: integer, format: uint64, minimum: 1, maximum: 65536 }
+        kind: { type: string, minLength: 1, maxLength: 128, enum: [runtime_state, operation, browser.operation, browser.operation_binding, browser.operation_completed, browser.task_context, browser.target_owned, browser.context_closed] }
+        data: { description: 'JSON payload included in the event hash.' }
+        previous_hash: { type: string, pattern: '^([0-9a-f]{64})?$' }
+        hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+      additionalProperties: false
+    RuntimeOperationLedgerPage:
+      type: object
+      required: [items, has_more]
+      properties:
+        items: { type: array, maxItems: 128, items: { $ref: '#/components/schemas/RuntimeOperationLedgerEvent' } }
+        has_more: { type: boolean }
+      additionalProperties: false
     HostTaskWorkspaceViewDeletion:
       type: object
       required: [request_id, task_id]
@@ -5746,6 +7496,38 @@ components:
         expires_at: { type: [string, 'null'], format: date-time }
         last_active_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
+    HostUsageReceipt:
+      type: object
+      required: [host_id, runtime_generation, status, samples, unknown_intervals, calculation_method, cpu_seconds, estimated_memory_mib_seconds, price_status, price_unknown_reason]
+      properties:
+        host_id: { $ref: '#/components/schemas/HostId' }
+        runtime_generation: { type: integer, format: int64, minimum: 1 }
+        status: { type: string, enum: [unknown, measured, partial] }
+        samples: { type: integer, format: int64, minimum: 0 }
+        unknown_intervals: { type: integer, format: int64, minimum: 0 }
+        unknown_reason: { type: string }
+        calculation_method: { type: string }
+        cpu_seconds: { type: number, format: double, minimum: 0 }
+        estimated_memory_mib_seconds: { type: number, format: double, minimum: 0 }
+        price_status: { type: string, enum: [unknown] }
+        price_unknown_reason: { type: string, minLength: 1 }
+      additionalProperties: false
+    ProjectHostUsageReceipt:
+      type: object
+      required: [project_id, host_id, status, samples, unknown_intervals, calculation_method, cpu_seconds, estimated_memory_mib_seconds, price_status, price_unknown_reason]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        host_id: { $ref: '#/components/schemas/HostId' }
+        status: { type: string, enum: [unknown, measured, partial] }
+        samples: { type: integer, format: int64, minimum: 0 }
+        unknown_intervals: { type: integer, format: int64, minimum: 0 }
+        unknown_reason: { type: string }
+        calculation_method: { type: string }
+        cpu_seconds: { type: number, format: double, minimum: 0 }
+        estimated_memory_mib_seconds: { type: number, format: double, minimum: 0 }
+        price_status: { type: string, enum: [unknown] }
+        price_unknown_reason: { type: string, minLength: 1 }
+      additionalProperties: false
     ControlActionRequest:
       type: object
       additionalProperties: false
@@ -5754,24 +7536,50 @@ components:
         action: { type: string, enum: [take_over, release] }
         request_id: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' }
         expected_control_version: { type: integer, format: int64, minimum: 0, maximum: 9223372036854775805 }
+    ControlLeaseRenewRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_control_version]
+      properties:
+        expected_control_version: { type: integer, format: int64, minimum: 0 }
     ControlStatus:
       type: object
-      required: [host_id, control_state, control_version, active_transition]
+      required: [host_id, control_state, control_version, control_actor_user_id, control_lease_expires_at, control_lease_active, control_lease_held_by_me, active_transition]
       properties:
         host_id: { $ref: '#/components/schemas/HostId' }
         control_state: { type: string, enum: [ai, taking_over, user, returning] }
         control_version: { type: integer, format: int64, minimum: 0 }
+        control_actor_user_id:
+          description: Empty when no user currently holds the control lease.
+          anyOf:
+            - { type: string, const: '' }
+            - { $ref: '#/components/schemas/UserId' }
+        control_lease_expires_at: { type: [string, 'null'], format: date-time }
+        control_lease_active: { type: boolean }
+        control_lease_held_by_me:
+          type: boolean
+          description: True only when this authenticated request's user currently holds the active control lease.
         active_transition:
           oneOf:
             - { $ref: '#/components/schemas/ControlTransition' }
             - { type: 'null' }
     ControlActionResponse:
       type: object
-      required: [host_id, control_state, control_version, active_transition, pending_operation_ids]
+      required: [host_id, control_state, control_version, control_actor_user_id, control_lease_expires_at, control_lease_active, control_lease_held_by_me, active_transition, pending_operation_ids]
       properties:
         host_id: { $ref: '#/components/schemas/HostId' }
         control_state: { type: string, enum: [ai, taking_over, user, returning] }
         control_version: { type: integer, format: int64, minimum: 0 }
+        control_actor_user_id:
+          description: Empty when no user currently holds the control lease.
+          oneOf:
+            - { type: string, const: '' }
+            - { $ref: '#/components/schemas/UserId' }
+        control_lease_expires_at: { type: [string, 'null'], format: date-time }
+        control_lease_active: { type: boolean }
+        control_lease_held_by_me:
+          type: boolean
+          description: True only when this authenticated request's user currently holds the active control lease.
         active_transition:
           oneOf:
             - { $ref: '#/components/schemas/ControlTransition' }
@@ -5991,14 +7799,51 @@ components:
     WorkspaceFile:
       type: object
       required: [path, size_bytes, sha256, mode, chunks]
+      allOf:
+        - if:
+            properties:
+              kind: { const: symlink }
+          then:
+            not:
+              required: [hardlink_to]
+        - if:
+            required: [hardlink_to]
+          then:
+            properties:
+              kind: { const: file }
       properties:
-        path: { type: string, minLength: 1, maxLength: 4096, description: 'Clean relative POSIX path; absolute paths, traversal, symlinks and duplicate case-folded paths are rejected.' }
-        size_bytes: { type: integer, format: int64, minimum: 0 }
-        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
-        mode: { type: integer, minimum: 0, maximum: 511, description: Permission bits only; executable bits are preserved. }
+        path: { type: string, minLength: 1, maxLength: 4096, description: 'Clean relative POSIX path; absolute paths, traversal and duplicate case-folded paths are rejected. A symlink is represented at its own path and is never followed.' }
+        kind: { type: string, enum: [file, symlink], description: Empty or omitted kind is a regular file for compatibility with older clients. }
+        symlink_target: { type: string, minLength: 1, maxLength: 4096, description: 'Required for symlinks. UTF-8 relative POSIX target up to 4096 bytes; NUL, backslash, colon, absolute and root-escaping targets are rejected. Never resolved or followed by file APIs.' }
+        hardlink_to: { type: string, minLength: 1, maxLength: 4096, description: 'For regular files, identifies the earlier canonical path for another name of the same inode. The anchor must be a regular file with identical content, chunks, mode and modification time.' }
+        size_bytes: { type: integer, format: int64, minimum: 0, description: 'For symlinks, UTF-8 target byte length.' }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$', description: 'For symlinks, SHA-256 of the target bytes.' }
+        mode: { type: integer, minimum: 0, maximum: 511, description: Permission bits only for regular files; symlink mode is 0. }
+        mod_time_ns: { type: [integer, 'null'], format: int64, description: Modification time as Unix nanoseconds; omitted for legacy revisions whose timestamp is unknown. }
+        metadata_known: { type: boolean, description: True when this revision explicitly captured an empty or non-empty xattr/ACL set; false means legacy/unknown. }
+        xattrs:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/WorkspaceExtendedAttribute' }
+        acl: { $ref: '#/components/schemas/WorkspaceNativeACL' }
         chunks:
           type: array
           items: { $ref: '#/components/schemas/WorkspaceChunk' }
+      additionalProperties: false
+    WorkspaceExtendedAttribute:
+      type: object
+      required: [name, value]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        value: { type: string, format: byte, maxLength: 21848, description: Raw extended-attribute value encoded as base64. }
+      additionalProperties: false
+    WorkspaceNativeACL:
+      type: object
+      required: [platform, format, data]
+      properties:
+        platform: { type: string, enum: [linux, darwin] }
+        format: { type: string, enum: [linux-posix-acl-v1, darwin-filesec-v1] }
+        data: { type: string, format: byte, maxLength: 43692, description: Opaque platform-native ACL payload encoded as base64; restored only by a compatible platform/filesystem. }
       additionalProperties: false
     WorkspaceChunk:
       type: object
@@ -6007,9 +7852,23 @@ components:
         sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
         size_bytes: { type: integer, minimum: 1, maximum: 4194304 }
       additionalProperties: false
+    WorkspaceDirectory:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, minLength: 1, maxLength: 4096, description: Clean relative directory path; `.` denotes the Workspace root. }
+        mode: { type: [integer, 'null'], minimum: 0, maximum: 511, description: Directory permission bits; omitted when the historical revision did not capture them. }
+        mod_time_ns: { type: [integer, 'null'], format: int64, description: Modification time as Unix nanoseconds; omitted when unknown. }
+        metadata_known: { type: boolean, description: True when this revision explicitly captured an empty or non-empty xattr/ACL set; false means legacy/unknown. }
+        xattrs:
+          type: array
+          maxItems: 64
+          items: { $ref: '#/components/schemas/WorkspaceExtendedAttribute' }
+        acl: { $ref: '#/components/schemas/WorkspaceNativeACL' }
+      additionalProperties: false
     WorkspaceManifest:
       type: object
-      required: [workspace_id, revision, files, empty_directories, next_cursor]
+      required: [workspace_id, revision, files, empty_directories, directories, next_cursor]
       properties:
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
         revision: { type: integer, format: int64, minimum: 0 }
@@ -6021,6 +7880,10 @@ components:
           type: array
           maxItems: 100000
           items: { type: string, minLength: 1, maxLength: 4096, description: Empty leaf directory path; combined with files, at most 100000 manifest entries. }
+        directories:
+          type: array
+          maxItems: 100000
+          items: { $ref: '#/components/schemas/WorkspaceDirectory' }
         next_cursor: { type: [string, 'null'], maxLength: 512 }
       additionalProperties: false
     WorkspaceChangePage:
@@ -6032,14 +7895,144 @@ components:
           maxItems: 500
           items:
             type: object
-            required: [revision, path, action, file]
+            required: [revision, path, action, file, directory]
             properties:
               revision: { type: integer, format: int64, minimum: 1 }
               path: { type: string, minLength: 1, maxLength: 4096 }
-              action: { type: string, enum: [upsert, delete, directory_upsert, directory_delete], description: Directory actions have file=null; directory_upsert creates an empty leaf directory. }
+              action: { type: string, enum: [upsert, delete, directory_upsert, directory_delete], description: Directory actions have file=null; directory_upsert carries the captured directory metadata when known. }
               file: { oneOf: [{ $ref: '#/components/schemas/WorkspaceFile' }, { type: 'null' }] }
+              directory: { oneOf: [{ $ref: '#/components/schemas/WorkspaceDirectory' }, { type: 'null' }] }
         next_cursor: { type: string, minLength: 1, maxLength: 512 }
       additionalProperties: false
+    WorkspaceDiff:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, from_revision, to_revision, changes]
+      properties:
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        from_revision: { type: integer, format: int64, minimum: 0 }
+        to_revision: { type: integer, format: int64, minimum: 0 }
+        changes:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/WorkspaceDiffChange' }
+    WorkspaceDiffChange:
+      type: object
+      additionalProperties: false
+      required: [path, action, before, after, display_status, before_text, after_text]
+      properties:
+        path: { type: string, minLength: 1, maxLength: 4096 }
+        action: { type: string, enum: [added, removed, changed, renamed] }
+        before: { oneOf: [{ $ref: '#/components/schemas/WorkspaceDiffVersion' }, { type: 'null' }] }
+        after: { oneOf: [{ $ref: '#/components/schemas/WorkspaceDiffVersion' }, { type: 'null' }] }
+        display_status: { type: string, enum: [text, binary, too_large, metadata_only, not_applicable] }
+        before_text: { type: [string, 'null'], maxLength: 65536 }
+        after_text: { type: [string, 'null'], maxLength: 65536 }
+    WorkspaceDiffVersion:
+      type: object
+      additionalProperties: false
+      required: [kind, path]
+      properties:
+        kind: { type: string, enum: [file, symlink, directory] }
+        path: { type: string, minLength: 1, maxLength: 4096 }
+        symlink_target: { type: string, minLength: 1, maxLength: 4096 }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        mode: { type: integer, minimum: 0, maximum: 511 }
+        mod_time_ns: { type: [integer, 'null'], format: int64, description: Directory modification time as Unix nanoseconds; omitted when unknown. }
+    WorkspaceRestoreRequest:
+      type: object
+      additionalProperties: false
+      required: [target_revision, expected_current_revision, paths]
+      properties:
+        target_revision: { type: integer, format: int64, minimum: 0 }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+        paths:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 4096, description: A normalized relative file or directory path. Selecting a directory includes its descendants. }
+    WorkspaceRestoreResult:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, target_revision, expected_current_revision, revision, replayed]
+      properties:
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        target_revision: { type: integer, format: int64, minimum: 0 }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+        revision: { type: integer, format: int64, minimum: 0 }
+        replayed: { type: boolean }
+    WorkspaceCopyRequest:
+      type: object
+      additionalProperties: false
+      required: [name, expected_current_revision]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+    WorkspaceCopyResult:
+      type: object
+      additionalProperties: false
+      required: [source_workspace_id, workspace, source_revision, state, replayed]
+      properties:
+        source_workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        workspace:
+          type: object
+          additionalProperties: false
+          required: [id, name, revision, state]
+          properties:
+            id: { $ref: '#/components/schemas/WorkspaceId' }
+            name: { type: string }
+            revision: { type: integer, format: int64, minimum: 1 }
+            state: { type: string, enum: [ready] }
+        source_revision: { type: integer, format: int64, minimum: 0 }
+        state: { type: string, enum: [completed] }
+        replayed: { type: boolean }
+    WorkspaceFileOperationRequest:
+      type: object
+      additionalProperties: false
+      required: [action, source_path, expected_current_revision, write_enabled]
+      properties:
+        action: { type: string, enum: [rename, move, delete] }
+        source_path: { type: string, minLength: 1, maxLength: 4096, description: Normalized relative path. Credential paths are rejected. }
+        target_path: { type: string, maxLength: 4096, description: Required for rename and move; omitted for delete. }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+        write_enabled: { type: boolean, description: Must be explicitly true to enable this operation. }
+    WorkspaceFileOperationResult:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, action, source_path, target_path, expected_current_revision, revision, replayed]
+      properties:
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        action: { type: string, enum: [rename, move, delete] }
+        source_path: { type: string, minLength: 1, maxLength: 4096 }
+        target_path: { type: string, maxLength: 4096 }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+        revision: { type: integer, format: int64, minimum: 0 }
+        replayed: { type: boolean }
+    RequestWorkspaceOwnershipTransfer:
+      type: object
+      additionalProperties: false
+      required: [target_user_id, expected_revision]
+      properties:
+        target_user_id: { $ref: '#/components/schemas/UserId' }
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+    WorkspaceOwnershipTransfer:
+      type: object
+      additionalProperties: false
+      required: [id, workspace_id, from_owner_id, to_owner_id, state, expected_revision, version, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/WorkspaceOwnershipTransferId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        from_owner_id: { $ref: '#/components/schemas/UserId' }
+        to_owner_id: { $ref: '#/components/schemas/UserId' }
+        state: { type: string, enum: [pending, accepting, unknown, accepted, cancelled] }
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+        operation_id: { type: string, pattern: '^o[a-z0-9]{7}$' }
+        version: { type: integer, format: int64, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        accepted_at: { type: string, format: date-time }
     CreateSyncSessionRequest:
       type: object
       required: [direction, policy, base_revision, files]
@@ -6061,6 +8054,10 @@ components:
           type: array
           maxItems: 100000
           items: { type: string, minLength: 1, maxLength: 4096, description: Empty leaf directories in the submitted snapshot; combined with files, at most 100000 entries. }
+        directories:
+          type: array
+          maxItems: 100000
+          items: { $ref: '#/components/schemas/WorkspaceDirectory' }
         deleted_paths:
           type: array
           maxItems: 100000
@@ -6355,6 +8352,11 @@ components:
           items: { $ref: '#/components/schemas/PersonalObjectId' }
     ScheduleStatus: { type: string, enum: [enabled, disabled, completed] }
     ScheduleNotificationEvent: { type: string, enum: [completed, failed, waiting_user] }
+    ScheduleHostId:
+      description: Host association for a schedule; null means the schedule is hostless. Browser observation schedules require a Host.
+      oneOf:
+        - { $ref: '#/components/schemas/HostId' }
+        - { type: 'null' }
     ScheduleBudget:
       type: object
       additionalProperties: false
@@ -6422,9 +8424,17 @@ components:
       type: object
       additionalProperties: false
       required: [status, host_id, model_id, objective, timing, budget, misfire_policy, notification_events]
+      allOf:
+        - if:
+            required: [observation]
+            properties:
+              observation: { type: object }
+          then:
+            properties:
+              host_id: { $ref: '#/components/schemas/HostId' }
       properties:
         status: { $ref: '#/components/schemas/ScheduleStatus' }
-        host_id: { $ref: '#/components/schemas/HostId' }
+        host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string, minLength: 1, maxLength: 200 }
         objective: { type: string, minLength: 1, maxLength: 32768 }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
@@ -6467,9 +8477,17 @@ components:
     ScheduleCreateRequest:
       type: object
       additionalProperties: false
-      required: [host_id, model_id, objective, timing, budget]
+      required: [model_id, objective, timing, budget]
+      allOf:
+        - if:
+            required: [observation]
+            properties:
+              observation: { type: object }
+          then:
+            properties:
+              host_id: { $ref: '#/components/schemas/HostId' }
       properties:
-        host_id: { $ref: '#/components/schemas/HostId' }
+        host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string, minLength: 1, maxLength: 200 }
         objective: { type: string, minLength: 1, maxLength: 32768 }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
@@ -6486,7 +8504,7 @@ components:
       required: [expected_version]
       properties:
         expected_version: { type: integer, format: int64, minimum: 1 }
-        host_id: { $ref: '#/components/schemas/HostId' }
+        host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string, minLength: 1, maxLength: 200 }
         objective: { type: string, minLength: 1, maxLength: 32768 }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
@@ -6533,11 +8551,19 @@ components:
       type: object
       additionalProperties: false
       required: [id, version, status, host_id, model_id, objective, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
+      allOf:
+        - if:
+            required: [observation]
+            properties:
+              observation: { type: object }
+          then:
+            properties:
+              host_id: { $ref: '#/components/schemas/HostId' }
       properties:
         id: { $ref: '#/components/schemas/ScheduleId' }
         version: { type: integer, format: int64, minimum: 1 }
         status: { $ref: '#/components/schemas/ScheduleStatus' }
-        host_id: { $ref: '#/components/schemas/HostId' }
+        host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string }
         objective: { type: string }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
@@ -6924,11 +8950,13 @@ components:
         password: { type: string, minLength: 1, writeOnly: true }
     CreateHostRequest:
       type: object
+      required: [workspace_ids]
       properties:
         name: { type: string }
         workspace_ids:
           type: array
-          maxItems: 64
+          minItems: 1
+          maxItems: 1
           uniqueItems: true
           items: { $ref: '#/components/schemas/WorkspaceId' }
       additionalProperties: false
@@ -6981,13 +9009,540 @@ components:
         reply: { $ref: '#/components/schemas/InstantChatMessage' }
     Conversation:
       type: object
-      required: [id, title, created_at, updated_at]
+      required: [id, scope, is_main, title, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/ConversationId' }
+        scope: { type: string, enum: [personal] }
+        is_main: { type: boolean }
         host_id: { $ref: '#/components/schemas/HostId' }
         title: { type: string, maxLength: 120 }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+    MainConversation:
+      type: object
+      required: [status, conversation_id, version]
+      properties:
+        status: { type: string, enum: [ready, uninitialized, selection_required] }
+        conversation_id: { type: string, description: Empty unless status is ready. }
+        version: { type: integer, format: int64, minimum: 0 }
+    SetMainConversationRequest:
+      type: object
+      required: [conversation_id, expected_version]
+      properties:
+        conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        expected_version: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    ProjectId: { type: string, pattern: '^j[a-z0-9]{7}$' }
+    ProjectInvitationId: { type: string, pattern: '^r[a-z0-9]{7}$' }
+    ProjectWorkItemId: { type: string, pattern: '^j[a-z0-9]{7}$' }
+    ProjectRole: { type: string, enum: [owner, member, viewer] }
+    ProjectContentKind: { type: string, enum: [memory, goal, document, feed_post, idea, library_item, brief] }
+    ProjectMuseContentKind: { type: string, enum: [feed_post, idea, library_item, brief] }
+    ProjectContentCommentId: { type: string, pattern: '^c[a-z0-9]{7}$' }
+    ProjectResourceKind: { type: string, enum: [host, workspace] }
+    CreateProjectConversationRequest:
+      type: object
+      properties:
+        title: { type: string, maxLength: 120 }
+      additionalProperties: false
+    ProjectConversation:
+      type: object
+      required: [id, project_id, owner_id, title, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/ConversationId' }
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        title: { type: string, maxLength: 120 }
+        model_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProjectConversationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectConversation' } }
+        next_cursor: { type: [string, 'null'] }
+    ProjectConversationMessage:
+      allOf:
+        - { $ref: '#/components/schemas/ConversationMessage' }
+        - type: object
+          required: [owner_id, actor_id]
+          properties:
+            owner_id: { $ref: '#/components/schemas/UserId' }
+            actor_id: { $ref: '#/components/schemas/UserId' }
+    ProjectConversationMessagePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectConversationMessage' } }
+        next_cursor: { type: [string, 'null'] }
+    AppendProjectConversationMessageRequest:
+      allOf:
+        - { $ref: '#/components/schemas/AppendConversationMessageRequest' }
+    AppendProjectConversationMessageResponse:
+      type: object
+      required: [message, task]
+      properties:
+        message: { $ref: '#/components/schemas/ProjectConversationMessage' }
+        task: { $ref: '#/components/schemas/ProjectConversationTask' }
+    ProjectConversationTask:
+      allOf:
+        - { $ref: '#/components/schemas/Task' }
+        - type: object
+          required: [project_id, initiator_id]
+          properties:
+            project_id: { $ref: '#/components/schemas/ProjectId' }
+            initiator_id: { $ref: '#/components/schemas/UserId' }
+    CreateProjectRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+      additionalProperties: false
+    Project:
+      type: object
+      required: [id, owner_id, name, description, version]
+      properties:
+        id: { $ref: '#/components/schemas/ProjectId' }
+        owner_id: { $ref: '#/components/schemas/UserId' }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        version: { type: integer, format: int64, minimum: 1 }
+    ProjectPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Project' } }
+        next_cursor: { type: [string, 'null'] }
+    ProjectMember:
+      type: object
+      required: [project_id, user_id, role, version]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        user_id: { $ref: '#/components/schemas/UserId' }
+        role: { $ref: '#/components/schemas/ProjectRole' }
+        version: { type: integer, format: int64, minimum: 1 }
+    ProjectMemberPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectMember' } }
+        next_cursor: { type: [string, 'null'] }
+    InviteProjectMemberRequest:
+      type: object
+      required: [user_id, role, expected_version]
+      properties:
+        user_id: { $ref: '#/components/schemas/UserId' }
+        role: { type: string, enum: [member, viewer] }
+        expected_version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    UpdateProjectMemberRequest:
+      type: object
+      required: [role, expected_version]
+      properties:
+        role: { type: string, enum: [member, viewer] }
+        expected_version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    RemoveProjectMemberRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    RevokeProjectInvitationRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    ProjectInvitation:
+      type: object
+      required: [id, project_id, inviter_id, invitee_id, role, state, version]
+      properties:
+        id: { $ref: '#/components/schemas/ProjectInvitationId' }
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        inviter_id: { $ref: '#/components/schemas/UserId' }
+        invitee_id: { $ref: '#/components/schemas/UserId' }
+        role: { type: string, enum: [member, viewer] }
+        state: { type: string, enum: [pending, accepted, revoked] }
+        version: { type: integer, format: int64, minimum: 1 }
+    ProjectInvitationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectInvitation' } }
+        next_cursor: { type: [string, 'null'] }
+    TransferProjectOwnerRequest:
+      type: object
+      required: [user_id, expected_version]
+      properties:
+        user_id: { $ref: '#/components/schemas/UserId' }
+        expected_version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    ProjectResourceMutationRequest:
+      type: object
+      required: [kind, resource_id, expected_version]
+      properties:
+        kind: { $ref: '#/components/schemas/ProjectResourceKind' }
+        resource_id:
+          type: string
+          description: Must be a HostId when kind=host or a WorkspaceId when kind=workspace.
+        expected_version: { type: integer, format: int64, minimum: 1 }
+      additionalProperties: false
+    ProjectResource:
+      type: object
+      required: [project_id, kind, resource_id, version]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        kind: { $ref: '#/components/schemas/ProjectResourceKind' }
+        resource_id: { type: string }
+        version: { type: integer, format: int64, minimum: 1 }
+    ProjectResourcePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectResource' } }
+        next_cursor: { type: [string, 'null'] }
+    ProjectWorkspaceManifest:
+      type: object
+      required: [project_id, workspace_id, revision, files, empty_directories, next_cursor]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        revision: { type: integer, format: int64, minimum: 0 }
+        files:
+          type: array
+          maxItems: 1000
+          items:
+            type: object
+            required: [path, kind, size_bytes, mode]
+            properties:
+              path: { type: string, minLength: 1, maxLength: 4096 }
+              kind: { type: string, enum: [file, symlink], description: The entry type; symlink targets are intentionally hidden from project viewers. }
+              size_bytes: { type: integer, minimum: 0 }
+              mode: { type: integer, minimum: 0 }
+            additionalProperties: false
+        empty_directories:
+          type: array
+          maxItems: 1000
+          items: { type: string, minLength: 1, maxLength: 4096 }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+      additionalProperties: false
+    ProjectContent:
+      type: object
+      required: [project_id, kind, id, revision, body, updated_by]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        kind: { $ref: '#/components/schemas/ProjectContentKind' }
+        id: { type: string, minLength: 1, maxLength: 128 }
+        revision: { type: integer, format: int64, minimum: 1 }
+        body:
+          oneOf:
+            - { $ref: '#/components/schemas/ProjectFeedPost' }
+            - { $ref: '#/components/schemas/ProjectIdea' }
+            - { $ref: '#/components/schemas/ProjectLibraryMetadata' }
+            - { $ref: '#/components/schemas/ProjectBrief' }
+            - { type: object, description: Strict legacy memory/goal/document JSON object; maximum 1 MiB after request decoding., additionalProperties: true }
+        updated_by: { $ref: '#/components/schemas/UserId' }
+    ProjectFeedPost:
+      type: object
+      required: [title, type, body]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        type: { type: string, minLength: 1, maxLength: 32 }
+        emoji: { type: string, maxLength: 16 }
+        created_at: { type: string, format: date-time }
+        liked: { type: boolean }
+        body: { type: string, minLength: 1, maxLength: 65536 }
+      additionalProperties: false
+    ProjectIdea:
+      type: object
+      required: [title, content]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        content: { type: string, minLength: 1, maxLength: 65536 }
+        tags: { type: array, maxItems: 32, uniqueItems: true, items: { type: string, minLength: 1, maxLength: 64 } }
+      additionalProperties: false
+    ProjectLibraryMetadata:
+      type: object
+      required: [name, kind]
+      description: Project-local metadata only. Personal attachment IDs and bytes are not copied or resolved by this API.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        kind: { type: string, enum: [artifact, media] }
+        mime: { type: string, maxLength: 128 }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    ProjectBrief:
+      type: object
+      required: [title, content]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        summary: { type: string, maxLength: 4096 }
+        content: { type: string, minLength: 1, maxLength: 65536 }
+        tags: { type: array, maxItems: 32, uniqueItems: true, items: { type: string, minLength: 1, maxLength: 64 } }
+      additionalProperties: false
+    ProjectContentTombstone:
+      type: object
+      required: [project_id, kind, id, revision, updated_by, deleted]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        kind: { $ref: '#/components/schemas/ProjectContentKind' }
+        id: { type: string, minLength: 1, maxLength: 128 }
+        revision: { type: integer, format: int64, minimum: 1 }
+        updated_by: { $ref: '#/components/schemas/UserId' }
+        deleted: { type: boolean, const: true }
+    ProjectContentSearchResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/ProjectContentSearchResult' }
+      additionalProperties: false
+    ProjectContentSearchResult:
+      type: object
+      required: [project_id, kind, content_id, revision, title, excerpt]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        kind: { $ref: '#/components/schemas/ProjectMuseContentKind' }
+        content_id: { type: string, minLength: 1, maxLength: 128 }
+        revision: { type: integer, format: int64, minimum: 1 }
+        title: { type: string, maxLength: 200 }
+        excerpt: { type: string, maxLength: 240 }
+      additionalProperties: false
+    ProjectContentComment:
+      type: object
+      required: [project_id, kind, content_id, content_revision, row_id, id, revision, updated_by]
+      properties:
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        kind: { $ref: '#/components/schemas/ProjectMuseContentKind' }
+        content_id: { type: string, minLength: 1, maxLength: 128 }
+        content_revision: { type: integer, format: int64, minimum: 1 }
+        row_id: { type: string, minLength: 1, maxLength: 128 }
+        id: { $ref: '#/components/schemas/ProjectContentCommentId' }
+        revision: { type: integer, format: int64, minimum: 1 }
+        body: { type: string, maxLength: 500 }
+        updated_by: { $ref: '#/components/schemas/UserId' }
+        deleted: { type: boolean }
+      additionalProperties: false
+    ProjectContentCommentPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/ProjectContentComment' }
+      additionalProperties: false
+    CreateProjectContentCommentRequest:
+      type: object
+      required: [content_id, content_revision, row_id, body]
+      properties:
+        content_id: { type: string, minLength: 1, maxLength: 128 }
+        content_revision: { type: integer, format: int64, minimum: 1 }
+        row_id: { type: string, minLength: 1, maxLength: 128 }
+        body: { type: string, minLength: 1, maxLength: 500 }
+      additionalProperties: false
+    UpdateProjectContentCommentRequest:
+      type: object
+      required: [base_version, body]
+      properties:
+        base_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+        body: { type: string, minLength: 1, maxLength: 500 }
+      additionalProperties: false
+    DeleteProjectContentCommentRequest:
+      type: object
+      required: [base_version]
+      properties:
+        base_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    ProjectMCPConnector:
+      type: object
+      required: [connector_owner_id, connector_id, enabled, grant_version, active, created_at, updated_at]
+      properties:
+        connector_owner_id: { $ref: '#/components/schemas/UserId', description: Owner of the personal connector that explicitly authorized this project reference. }
+        connector_id: { $ref: '#/components/schemas/MCPConnectorId' }
+        name: { type: string, maxLength: 80, description: Non-secret display name; omitted if the connector was deleted before revocation. }
+        enabled: { type: boolean }
+        connector_revision: { type: integer, format: int64, minimum: 0, description: Non-secret connector revision; zero if the connector was deleted before revocation. }
+        grant_version: { type: integer, format: int64, minimum: 1 }
+        active: { type: boolean }
+        revoked_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProjectMCPConnectorPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/ProjectMCPConnector' }
+    ProjectMCPConnectorGrantRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 0, maximum: 9223372036854775806 }
+      additionalProperties: false
+    ProjectMCPConnectorRevokeRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    PutProjectContentRequest:
+      type: object
+      required: [content_id, base_revision, body]
+      properties:
+        content_id: { type: string, minLength: 1, maxLength: 128 }
+        base_revision: { type: integer, format: int64, minimum: 0 }
+        body: { type: object, description: Strict kind-specific project JSON object; maximum 1 MiB after request decoding., additionalProperties: true }
+      additionalProperties: false
+    DeleteProjectContentRequest:
+      type: object
+      required: [content_id, base_revision]
+      properties:
+        content_id: { type: string, minLength: 1, maxLength: 128 }
+        base_revision: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    ProjectBudget:
+      type: object
+      required: [configured, currency, limit_micros, version, spent_micros, reserved_micros, has_unknown]
+      properties:
+        configured: { type: boolean }
+        currency: { type: string, pattern: '^(|[A-Z]{3})$' }
+        limit_micros: { type: integer, format: int64, minimum: 0 }
+        version: { type: integer, format: int64, minimum: 0 }
+        spent_micros: { type: integer, format: int64, minimum: 0 }
+        reserved_micros: { type: integer, format: int64, minimum: 0 }
+        has_unknown: { type: boolean }
+    SetProjectBudgetRequest:
+      type: object
+      required: [currency, limit_micros, expected_version]
+      properties:
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        limit_micros: { type: integer, format: int64, minimum: 1 }
+        expected_version: { type: integer, format: int64, minimum: 0, maximum: 9223372036854775806 }
+      additionalProperties: false
+    ProjectTokenUsage:
+      type: object
+      required: [input_tokens, output_tokens]
+      properties:
+        input_tokens: { type: integer, format: int64, minimum: 0 }
+        output_tokens: { type: integer, format: int64, minimum: 0 }
+    ProjectBudgetLedgerEntry:
+      type: object
+      required: [call_id, actor_id, source, model_id, rate_version, currency, status, reserved_usage, reserved_micros, created_at]
+      properties:
+        call_id: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
+        actor_id: { $ref: '#/components/schemas/UserId' }
+        task_id: { $ref: '#/components/schemas/TaskId', description: Present only for source=task. }
+        source: { type: string, enum: [client, chat, task] }
+        model_id: { $ref: '#/components/schemas/ModelConnectionId' }
+        rate_version: { type: integer, format: int64, minimum: 1 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        status: { type: string, enum: [reserved, settled, unknown] }
+        reserved_usage: { $ref: '#/components/schemas/ProjectTokenUsage' }
+        actual_usage: { $ref: '#/components/schemas/ProjectTokenUsage' }
+        reserved_micros: { type: integer, format: int64, minimum: 1 }
+        actual_micros: { type: integer, format: int64, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    ProjectBudgetLedgerPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectBudgetLedgerEntry' } }
+        next_cursor: { type: [string, 'null'] }
+    ProjectWorkItemState: { type: string, enum: [open, blocked, delivered] }
+    ProjectWorkItemDelivery:
+      type: object
+      required: [task_id, workspace_id, revision]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        revision: { type: integer, format: int64, minimum: 1 }
+    ProjectWorkItem:
+      type: object
+      required: [id, project_id, title, description, acceptance_criteria, assignee_id, state, blocked_reason, task_ids, version]
+      properties:
+        id: { $ref: '#/components/schemas/ProjectWorkItemId' }
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, maxLength: 4096 }
+        acceptance_criteria:
+          type: array
+          maxItems: 100
+          items: { type: string, minLength: 1, maxLength: 1000 }
+        assignee_id: { $ref: '#/components/schemas/UserId' }
+        state: { $ref: '#/components/schemas/ProjectWorkItemState' }
+        blocked_reason: { type: string, maxLength: 2000 }
+        task_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/TaskId' }
+        delivery:
+          anyOf:
+            - { $ref: '#/components/schemas/ProjectWorkItemDelivery' }
+            - { type: 'null' }
+        version: { type: integer, format: int64, minimum: 1 }
+    ProjectWorkItemPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ProjectWorkItem' } }
+        next_cursor: { type: [string, 'null'] }
+    CreateProjectWorkItemRequest:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        description: { type: string, maxLength: 4096 }
+        acceptance_criteria:
+          type: array
+          maxItems: 100
+          items: { type: string, minLength: 1, maxLength: 1000 }
+        assignee_id: { $ref: '#/components/schemas/UserId', description: Defaults to the caller. }
+      additionalProperties: false
+    AssignProjectWorkItemRequest:
+      type: object
+      required: [assignee_id, expected_version]
+      properties:
+        assignee_id: { $ref: '#/components/schemas/UserId' }
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    BlockProjectWorkItemRequest:
+      type: object
+      required: [blocked_reason, expected_version]
+      properties:
+        blocked_reason: { type: string, minLength: 1, maxLength: 2000 }
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    ProjectWorkItemVersionRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    LinkProjectWorkItemTaskRequest:
+      type: object
+      required: [task_id, expected_version]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    DeliverProjectWorkItemRequest:
+      type: object
+      required: [task_id, workspace_id, revision, expected_version]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        revision: { type: integer, format: int64, minimum: 1 }
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
     ConversationPage:
       type: object
       required: [items, next_cursor]
@@ -6996,13 +9551,15 @@ components:
         next_cursor: { type: [string, 'null'] }
     ConversationMessage:
       type: object
-      required: [id, conversation_id, role, content, task_id, created_at]
+      required: [id, conversation_id, role, content, delivery_status, created_at]
       properties:
         id: { $ref: '#/components/schemas/MessageId' }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
         role: { type: string, enum: [user, assistant] }
         content: { type: string }
         task_id: { $ref: '#/components/schemas/TaskId' }
+        attachment_ids: { type: array, items: { $ref: '#/components/schemas/PersonalAttachmentId' } }
+        delivery_status: { type: string, enum: [pending, applied, unknown] }
         created_at: { type: string, format: date-time }
     ConversationMessagePage:
       type: object
@@ -7021,6 +9578,7 @@ components:
       additionalProperties: false
       required: [model_id, content]
       properties:
+        expected_task_id: { $ref: '#/components/schemas/TaskId', description: Active Task that must receive this message; if it is no longer active, the request conflicts rather than creating another Task. }
         host_id: { $ref: '#/components/schemas/HostId' }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
         input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision used by this task. Required with workspace_id. }
@@ -7069,10 +9627,11 @@ components:
         model_tokens: { type: [integer, 'null'], minimum: 0 }
     TaskSummary:
       type: object
-      required: [id, owner_id, execution_location, conversation_id, model_id, objective, status, current_step, budget, usage, created_at, updated_at]
+      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, current_step, budget, usage, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/TaskId' }
         owner_id: { $ref: '#/components/schemas/UserId' }
+        initiator_id: { $ref: '#/components/schemas/UserId', description: Account that actually submitted this Task; for project Tasks, owner_id is the shared conversation scope owner. }
         host_id: { $ref: '#/components/schemas/HostId', description: Optional target Host for computer operations; the dsh Agent runs independently on the server. }
         execution_location: { type: string, enum: [server, legacy] }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
@@ -7111,13 +9670,18 @@ components:
         error: { type: [string, 'null'] }
     TaskArtifact:
       type: object
-      required: [id, step_id, label, path, media_type, batch_item_id, batch_attempt, created_at]
+      required: [id, step_id, label, path, media_type, workspace_id, workspace_revision, size_bytes, sha256, verified, batch_item_id, batch_attempt, created_at]
       properties:
         id: { $ref: '#/components/schemas/ArtifactId' }
         step_id: { $ref: '#/components/schemas/StepId' }
         label: { type: string }
         path: { type: string, description: Workspace-relative path }
         media_type: { type: string }
+        workspace_id: { type: [string, 'null'], pattern: '^w[a-z0-9]{7}$' }
+        workspace_revision: { type: [integer, 'null'], format: int64, minimum: 0, description: Confirmed immutable Workspace revision; null for legacy artifacts without a proof. }
+        size_bytes: { type: [integer, 'null'], format: int64, minimum: 0, description: Verified file size; null for legacy artifacts without a proof. }
+        sha256: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$', description: Verified file digest; null for legacy artifacts without a proof. }
+        verified: { type: boolean, description: True only when all Workspace proof fields are present and valid. }
         batch_item_id: { oneOf: [{ $ref: '#/components/schemas/BatchItemId' }, { type: 'null' }] }
         batch_attempt: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
@@ -7159,6 +9723,43 @@ components:
         role: { type: string, const: assistant }
         content: { type: string, maxLength: 32768 }
         status: { type: string, enum: [streaming, completed, interrupted] }
+        created_at: { type: string, format: date-time }
+    TaskWorkbenchObservationTicket:
+      type: object
+      additionalProperties: false
+      required: [ticket, task_id, host_id, expires_at]
+      properties:
+        ticket: { type: string, minLength: 40, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        host_id: { $ref: '#/components/schemas/HostId' }
+        expires_at: { type: string, format: date-time }
+    TaskWorkbenchObservationSnapshot:
+      type: object
+      additionalProperties: false
+      required: [task_id, host_id, status, event_sequence, updated_at, artifacts]
+      description: Read-only Task projection. It contains no objective, Task result, event payload, file path, mutation field, or Host control capability.
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        host_id: { $ref: '#/components/schemas/HostId' }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        event_sequence: { type: integer, format: int64, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+        artifacts:
+          type: array
+          items: { $ref: '#/components/schemas/TaskWorkbenchObservationArtifact' }
+    TaskWorkbenchObservationArtifact:
+      type: object
+      additionalProperties: false
+      required: [id, label, media_type, workspace_id, revision, size_bytes, sha256, created_at]
+      description: Metadata for a Task artifact with a complete verified Workspace proof. File paths and contents are never exposed.
+      properties:
+        id: { $ref: '#/components/schemas/ArtifactId' }
+        label: { type: string, maxLength: 256 }
+        media_type: { type: string, maxLength: 256 }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        revision: { type: integer, format: int64, minimum: 0 }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
         created_at: { type: string, format: date-time }
     Task:
       allOf:
@@ -7269,13 +9870,18 @@ components:
         payload: {}
     Notification:
       type: object
+      description: Task-backed notices have a task_id and positive event_sequence. Goal and project work-item source notices have task_id null, event_sequence 0, and source identity fields; project_id is present only for project work-item notices. source_event_id is an internal deduplication key and is not returned.
       required: [id, kind, task_id, event_sequence, summary, redacted, actionable, created_at, read_at]
       properties:
         id: { $ref: '#/components/schemas/NotificationId' }
-        kind: { type: string, enum: [completed, failed, waiting_user] }
+        kind: { type: string, enum: [completed, failed, waiting_user, goal_step_blocked, goal_completed, project_work_item_blocked, project_work_item_delivered] }
         task_id: { oneOf: [{ $ref: '#/components/schemas/TaskId' }, { type: 'null' }] }
-        event_sequence: { type: integer, minimum: 1 }
-        summary: { type: [string, 'null'], maxLength: 2000, description: Null when current authorization no longer permits disclosure. }
+        event_sequence: { type: integer, minimum: 0, description: Positive for Task-backed notices and 0 for source notices. }
+        source_kind: { type: string, enum: [goal, project_work_item], description: Omitted for Task-backed notices. }
+        source_id: { type: string, minLength: 1, maxLength: 128, description: Omitted for Task-backed notices. }
+        source_version: { type: integer, format: int64, minimum: 1, description: Omitted for Task-backed notices. }
+        project_id: { $ref: '#/components/schemas/ProjectId', description: Present only for project work-item notices. }
+        summary: { type: [string, 'null'], maxLength: 256, description: Null when current authorization no longer permits disclosure. }
         redacted: { type: boolean }
         actionable: { type: boolean, description: 'False when the associated pending request is stale, already processed, or inaccessible.' }
         created_at: { type: string, format: date-time }

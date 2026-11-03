@@ -66,14 +66,8 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID)
-	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
-		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
-		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: 0,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	hostValue, runtimeCredential, replicaCredential := createF01Host(t, ctx, store, sealer, owner.ID, workspaceValue.ID)
+	binding := hostValue.Workspaces[0]
 	binding, err = store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, 0, 0)
 	if err != nil {
@@ -186,6 +180,12 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil || !bytes.Equal(localWorkspaceFile, []byte(content)) {
 		t.Fatalf("Host Workspace file before download receipt = %q, err=%v", localWorkspaceFile, err)
 	}
+	rootInfo, err := os.Stat(workspaceDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootMode := uint32(rootInfo.Mode().Perm())
+	rootModTime := rootInfo.ModTime().UnixNano()
 	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -200,6 +200,7 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	}
 	download, err := syncService.CreateSyncSession(ctx, replicaPrincipal, workspaceValue.ID, workspace.CreateSyncSession{
 		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{manifestFile},
+		Directories: []workspace.Directory{{Path: ".", Mode: &rootMode, ModTimeNS: &rootModTime, MetadataKnown: true}},
 	}, "f01-artifact-host-download")
 	if err != nil {
 		t.Fatalf("create Host replica download session: %v", err)
@@ -211,6 +212,12 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID,
 		binding.BindingVersion, completedDownload.ID, completedDownload.TargetRevision); err != nil {
 		t.Fatalf("record applied revision from Host download session: %v", err)
+	}
+	if _, err := hostReplicas.ReportWorkspaceSyncStatus(ctx, replicaPrincipal, workspace.BindingSyncHealthy, nil); err != nil {
+		t.Fatalf("report healthy Host Workspace sync status: %v", err)
+	}
+	if _, err := hostReplicas.ListBindings(ctx, replicaPrincipal); err != nil {
+		t.Fatalf("record Host replica heartbeat after initial sync: %v", err)
 	}
 	taskService, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
 	if err != nil {
@@ -258,7 +265,7 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	}
 	nonce := bytes.Repeat([]byte{0x6a}, 32)
 	started, replayed, err := instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
-		TaskID: claimed.ID, OwnerID: owner.ID, AgentInstanceID: "agent_artifact_failure",
+		TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: claimed.InitiatorID, AgentInstanceID: "agent_artifact_failure",
 		AgentSessionID: "session_artifact_failure", SupervisorID: "f01-artifact-supervisor",
 		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		AuthorizationVersion: claimed.Authorization.Version, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1",
@@ -273,7 +280,7 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkpointFence := app.AgentCheckpointFence{
-		TaskID: started.Fence.TaskID, OwnerID: started.Fence.OwnerID,
+		TaskID: started.Fence.TaskID, OwnerID: started.Fence.OwnerID, InitiatorID: started.Fence.InitiatorID,
 		AgentInstanceID: started.Fence.AgentInstanceID, AgentGeneration: started.Fence.AgentGeneration,
 		AgentSessionID: started.Fence.AgentSessionID, AgentRootSessionID: started.Fence.AgentSessionID,
 		AuthorizationVersion: started.Fence.AuthorizationVersion, LeaseOwner: started.Fence.LeaseOwner,
@@ -340,6 +347,40 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 		t.Fatalf("task after artifact transaction failure = status %s artifacts=%d err=%v; want running without artifacts",
 			afterFailure.Task.Status, len(afterFailure.Artifacts), err)
 	}
+	// The publish receipt and Workspace revision commit before task completion.
+	// Simulate the real Host sync cycle so completion can pass the applied-revision
+	// gate when it retries after the transient artifact transaction failure.
+	publishedManifest, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, 2, "", "", 10)
+	if err != nil || len(publishedManifest.Files) != 1 || publishedManifest.Files[0].Path != manifestFile.Path {
+		t.Fatalf("read published Workspace revision for Host sync: manifest=%#v err=%v", publishedManifest, err)
+	}
+	publicationFile := publishedManifest.Files[0]
+	hostSync, err := syncService.CreateSyncSession(ctx, replicaPrincipal, workspaceValue.ID, workspace.CreateSyncSession{
+		Direction: workspace.SyncBidirectional, Policy: workspace.SyncLive, BaseRevision: 1,
+		Files: []workspace.File{publicationFile}, EmptyDirectories: publishedManifest.EmptyDirectories,
+		Directories: publishedManifest.Directories,
+	}, "f01-artifact-host-publish-download")
+	if err != nil {
+		t.Fatalf("create Host download session for published Task revision: %v", err)
+	}
+	completedHostSync, err := syncService.CommitSyncSession(ctx, replicaPrincipal, workspaceValue.ID, hostSync.ID, "f01-artifact-host-publish-download-commit")
+	if err != nil || completedHostSync.State != workspace.SyncCompleted || completedHostSync.TargetRevision != 2 {
+		t.Fatalf("complete Host download session for published Task revision: session=%#v err=%v", completedHostSync, err)
+	}
+	if _, err := store.AdvanceWorkspaceBindingAppliedRevision(ctx, hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID,
+		binding.BindingVersion, completedHostSync.ID, completedHostSync.TargetRevision); err != nil {
+		t.Fatalf("record Host applied revision after Task publish: %v", err)
+	}
+	if _, err := hostReplicas.ReportWorkspaceSyncStatus(ctx, replicaPrincipal, workspace.BindingSyncHealthy, nil); err != nil {
+		t.Fatalf("report healthy Host live-sync status after Task publish: %v", err)
+	}
+	if _, err := hostReplicas.ListBindings(ctx, replicaPrincipal); err != nil {
+		t.Fatalf("record authenticated Host heartbeat after Task publish sync: %v", err)
+	}
+	acknowledgedBinding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+	if err != nil || acknowledgedBinding.AppliedRevision != 2 || acknowledgedBinding.SyncState != workspace.BindingSyncHealthy {
+		t.Fatalf("Host acknowledgment for published Task revision = binding %#v err=%v; want revision 2 and healthy sync", acknowledgedBinding, err)
+	}
 	firstOperationID := writeOperation.ID
 	if err := toolBroker.Complete(ctx, claimed, completion); err != nil {
 		t.Fatalf("retry completion after transient artifact failure: %v", err)
@@ -347,9 +388,16 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	completed, err := store.GetTask(ctx, claimed.ID, owner.ID)
 	if err != nil || completed.Task.Status != task.StatusCompleted || len(completed.Artifacts) != 1 ||
 		completed.Task.WorkspaceCheckpointRevision == nil || *completed.Task.WorkspaceCheckpointRevision != 2 {
-		t.Fatalf("task after completion retry = status %s waiting=%s checkpoint=%#v artifacts=%d steps=%#v err=%v; want completed with one artifact",
-			completed.Task.Status, completed.Task.WaitingReason, completed.Task.WorkspaceCheckpointRevision,
-			len(completed.Artifacts), completed.Steps, err)
+		currentBinding, bindingErr := store.GetWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID)
+		currentHost, hostErr := store.GetHost(ctx, hostValue.ID)
+		var checkpoint int64 = -1
+		if completed.Task.WorkspaceCheckpointRevision != nil {
+			checkpoint = *completed.Task.WorkspaceCheckpointRevision
+		}
+		t.Fatalf("task after completion retry = status %s waiting=%s checkpoint=%d artifacts=%d steps=%#v binding=%s desired=%d applied=%d sync=%s host=%s generation=%d binding_error=%v host_error=%v err=%v; want completed with one artifact",
+			completed.Task.Status, completed.Task.WaitingReason, checkpoint, len(completed.Artifacts), completed.Steps,
+			currentBinding.State, currentBinding.DesiredRevision, currentBinding.AppliedRevision, currentBinding.SyncState,
+			currentHost.State, currentHost.RuntimeGeneration, bindingErr, hostErr, err)
 	}
 	finalOperation, err := store.GetOperation(ctx, owner.ID, claimed.ID, operationKey)
 	if err != nil || finalOperation.ID != firstOperationID || finalOperation.Status != task.OperationSucceeded {

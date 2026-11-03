@@ -119,7 +119,7 @@ func TestAccountAgentRuntimeGuardianProofScopesAndSigning(t *testing.T) {
 		t.Fatal("aborted account Runtime start proof was accepted as a container stop proof")
 	}
 
-	taskFence := AgentInstanceFence{TaskID: "q1234567", OwnerID: fence.OwnerID, AgentInstanceID: "agent-1", AgentGeneration: 1,
+	taskFence := AgentInstanceFence{TaskID: "q1234567", OwnerID: fence.OwnerID, InitiatorID: fence.OwnerID, AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: "v1", ProfileVersion: "p1"}
 	taskNonce := sha256.Sum256([]byte("task-supervisor-nonce"))

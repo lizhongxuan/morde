@@ -20,6 +20,8 @@ type modelConnectionManagerStub struct {
 	principal identity.Principal
 	command   app.ModelConnectionCommand
 	calls     int
+	createErr error
+	updateErr error
 	checkErr  error
 }
 
@@ -35,13 +37,13 @@ func (s *modelConnectionManagerStub) Get(context.Context, identity.Principal, st
 func (s *modelConnectionManagerStub) Create(_ context.Context, _ identity.Principal, command app.ModelConnectionCommand) (app.ModelConnectionView, error) {
 	s.calls++
 	s.command = command
-	return s.created, nil
+	return s.created, s.createErr
 }
 
 func (s *modelConnectionManagerStub) Update(_ context.Context, _ identity.Principal, _ string, command app.ModelConnectionCommand) (app.ModelConnectionView, error) {
 	s.calls++
 	s.command = command
-	return s.created, nil
+	return s.created, s.updateErr
 }
 
 func (*modelConnectionManagerStub) Delete(context.Context, identity.Principal, string) error {
@@ -52,12 +54,12 @@ func (s *modelConnectionManagerStub) Check(context.Context, identity.Principal, 
 	return app.ModelCapabilities{}, s.checkErr
 }
 
-func TestModelConnectionAPIRequiresSessionAndNeverReturnsAPIKey(t *testing.T) {
+func TestModelConnectionAPIRejectsPersonalCreateAndNeverReturnsAPIKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	manager := &modelConnectionManagerStub{created: app.ModelConnectionView{
 		ID: "p1234567", Name: "OpenAI", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test",
 		HasAPIKey: true, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
-	}}
+	}, createErr: domain.NewError(domain.CodeForbidden, "administrator role and shared model connection required")}
 	services := newServices()
 	deps := services.deps()
 	deps.ModelConnections = manager
@@ -68,7 +70,7 @@ func TestModelConnectionAPIRequiresSessionAndNeverReturnsAPIKey(t *testing.T) {
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	body := `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","api_key":"secret-model-key","shared":false}`
 	response := requestWithCookieBody(router, http.MethodPost, "/api/model-connections", body, cookie, "https://portal.example.test")
-	if response.Code != http.StatusCreated || strings.Contains(response.Body.String(), "secret-model-key") || strings.Contains(response.Body.String(), `"api_key"`) {
+	if response.Code != http.StatusForbidden || strings.Contains(response.Body.String(), "secret-model-key") || strings.Contains(response.Body.String(), `"api_key"`) {
 		t.Fatalf("create response = %d %s", response.Code, response.Body)
 	}
 	if manager.calls != 1 || manager.command.APIKey != "secret-model-key" {
@@ -147,9 +149,11 @@ func TestModelConnectionCheckReturnsSafeProviderCategory(t *testing.T) {
 		}(),
 	}
 	services := newServices()
+	services.verifier.role = identity.RoleAdmin
 	deps := services.deps()
 	deps.ModelConnections = manager
 	deps.ModelGateway = &modelGatewayHTTPTest{checkErr: manager.checkErr}
+	deps.AdminAudit = &adminAuditWriterStub{}
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
