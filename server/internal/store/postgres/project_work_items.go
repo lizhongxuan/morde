@@ -27,9 +27,10 @@ const (
 )
 
 type projectWorkItemCursor struct {
-	ProjectID string    `json:"project_id"`
-	CreatedAt time.Time `json:"created_at"`
-	ID        string    `json:"id"`
+	ProjectID         string    `json:"project_id"`
+	CreatedAt         time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	IncludeUnassigned bool      `json:"include_unassigned"`
 }
 
 type projectWorkItemStored struct {
@@ -138,7 +139,7 @@ func getProjectWorkItemMutationInTx(ctx context.Context, tx pgx.Tx, actorID, pro
 	return stored.Item, true, nil
 }
 
-func (s *Store) ListProjectWorkItems(ctx context.Context, actorID, projectID string, page app.PageRequest) (app.ProjectWorkItemPage, error) {
+func (s *Store) ListProjectWorkItems(ctx context.Context, actorID, projectID string, includeUnassigned bool, page app.PageRequest) (app.ProjectWorkItemPage, error) {
 	if !domain.ValidUserID(actorID) || !project.ValidID(projectID) {
 		return app.ProjectWorkItemPage{}, domain.NewError(domain.CodeNotFound, "project not found")
 	}
@@ -148,7 +149,7 @@ func (s *Store) ListProjectWorkItems(ctx context.Context, actorID, projectID str
 	if page.Limit < 1 || page.Limit > projectWorkItemMaxPageSize || len(page.Cursor) > 1024 {
 		return app.ProjectWorkItemPage{}, domain.InvalidArgument("limit", "project work item page request is out of range")
 	}
-	cursor, err := decodeProjectWorkItemCursor(page.Cursor, projectID)
+	cursor, err := decodeProjectWorkItemCursor(page.Cursor, projectID, includeUnassigned)
 	if err != nil {
 		return app.ProjectWorkItemPage{}, err
 	}
@@ -168,7 +169,8 @@ func (s *Store) ListProjectWorkItems(ctx context.Context, actorID, projectID str
 		}
 		rows, err := tx.Query(ctx, projectWorkItemSelect+`
 WHERE wi.project_id=$1 AND ($2::timestamptz IS NULL OR (wi.created_at, wi.id) < ($2::timestamptz, $3::text))
-ORDER BY wi.created_at DESC, wi.id DESC LIMIT $4`, projectID, afterTime, afterID, page.Limit+1)
+ AND ($5::boolean OR wi.assignee_id IS NOT NULL)
+ORDER BY wi.created_at DESC, wi.id DESC LIMIT $4`, projectID, afterTime, afterID, page.Limit+1, includeUnassigned)
 		if err != nil {
 			return fmt.Errorf("list project work items: %w", err)
 		}
@@ -191,7 +193,7 @@ ORDER BY wi.created_at DESC, wi.id DESC LIMIT $4`, projectID, afterTime, afterID
 			stored = stored[:page.Limit]
 			last := stored[len(stored)-1]
 			result.NextCursor, err = encodeProjectWorkItemCursor(projectWorkItemCursor{
-				ProjectID: projectID, CreatedAt: last.CreatedAt, ID: last.Item.ID,
+				ProjectID: projectID, CreatedAt: last.CreatedAt, ID: last.Item.ID, IncludeUnassigned: includeUnassigned,
 			})
 			if err != nil {
 				return fmt.Errorf("encode project work item cursor: %w", err)
@@ -259,10 +261,10 @@ func (s *Store) CreateProjectWorkItem(ctx context.Context, actorID string, item 
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO project_work_items
-(project_id,id,title,description,acceptance_criteria,assignee_id,state,blocked_reason,
+(project_id,id,title,description,acceptance_criteria,category,assignee_id,state,blocked_reason,
  delivery_task_id,delivery_workspace_id,delivery_revision,version,created_by,updated_by)
-VALUES ($1,$2,$3,$4,$5::jsonb,$6,'open','',NULL,NULL,NULL,1,$7,$7)`,
-			item.ProjectID, item.ID, item.Title, item.Description, criteria, item.AssigneeID, actorID)
+VALUES ($1,$2,$3,$4,$5::jsonb,$6,NULLIF($7,''),'open','',NULL,NULL,NULL,1,$8,$8)`,
+			item.ProjectID, item.ID, item.Title, item.Description, criteria, canonicalWorkItemCategory(item.Category), item.AssigneeID, actorID)
 		if err != nil {
 			return fmt.Errorf("create project work item: %w", err)
 		}
@@ -355,10 +357,10 @@ func (s *Store) UpdateProjectWorkItem(ctx context.Context, actorID string, item 
 			deliveryRevision = item.Delivery.Revision
 		}
 		tag, err := tx.Exec(ctx, `UPDATE project_work_items SET title=$4,description=$5,acceptance_criteria=$6::jsonb,
- assignee_id=$7,state=$8,blocked_reason=$9,delivery_task_id=$10,delivery_workspace_id=$11,delivery_revision=$12,
- version=$13,updated_by=$14,updated_at=clock_timestamp()
+ category=$7,assignee_id=NULLIF($8,''),state=$9,blocked_reason=$10,delivery_task_id=$11,delivery_workspace_id=$12,delivery_revision=$13,
+ version=$14,updated_by=$15,updated_at=clock_timestamp()
 WHERE project_id=$1 AND id=$2 AND version=$3`, item.ProjectID, item.ID, expectedVersion, item.Title, item.Description,
-			criteria, item.AssigneeID, string(item.State), item.BlockedReason, deliveryTaskID, deliveryWorkspaceID,
+			criteria, canonicalWorkItemCategory(item.Category), item.AssigneeID, string(item.State), item.BlockedReason, deliveryTaskID, deliveryWorkspaceID,
 			deliveryRevision, item.Version, actorID)
 		if err != nil {
 			return fmt.Errorf("update project work item: %w", err)
@@ -399,7 +401,7 @@ VALUES ($1,$2,$3,$4) ON CONFLICT (project_id,work_item_id,task_id) DO NOTHING`,
 }
 
 const projectWorkItemSelect = `SELECT wi.project_id,wi.id,wi.title,wi.description,wi.acceptance_criteria,
- wi.assignee_id,wi.state,wi.blocked_reason,wi.delivery_task_id,wi.delivery_workspace_id,wi.delivery_revision,
+ wi.category,wi.assignee_id,wi.state,wi.blocked_reason,wi.delivery_task_id,wi.delivery_workspace_id,wi.delivery_revision,
  wi.version,wi.created_at,COALESCE(task_rows.task_ids,ARRAY[]::text[])
 FROM project_work_items wi
 LEFT JOIN LATERAL (
@@ -428,11 +430,13 @@ func loadProjectWorkItem(ctx context.Context, tx pgx.Tx, projectID, workItemID s
 func scanProjectWorkItem(row interface{ Scan(...any) error }) (projectWorkItemStored, error) {
 	var value projectWorkItemStored
 	var criteria []byte
+	var category string
 	var state string
+	var assigneeID pgtype.Text
 	var deliveryTaskID, deliveryWorkspaceID pgtype.Text
 	var deliveryRevision pgtype.Int8
 	if err := row.Scan(&value.Item.ProjectID, &value.Item.ID, &value.Item.Title, &value.Item.Description, &criteria,
-		&value.Item.AssigneeID, &state, &value.Item.BlockedReason, &deliveryTaskID, &deliveryWorkspaceID,
+		&category, &assigneeID, &state, &value.Item.BlockedReason, &deliveryTaskID, &deliveryWorkspaceID,
 		&deliveryRevision, &value.Item.Version, &value.CreatedAt, &value.Item.TaskIDs); err != nil {
 		return projectWorkItemStored{}, err
 	}
@@ -441,6 +445,10 @@ func scanProjectWorkItem(row interface{ Scan(...any) error }) (projectWorkItemSt
 	}
 	value.Item.AcceptanceCriteria = nonNilStrings(value.Item.AcceptanceCriteria)
 	value.Item.TaskIDs = nonNilStrings(value.Item.TaskIDs)
+	value.Item.Category = project.WorkItemCategory(category)
+	if assigneeID.Valid {
+		value.Item.AssigneeID = assigneeID.String
+	}
 	value.Item.State = project.WorkItemState(state)
 	if deliveryTaskID.Valid || deliveryWorkspaceID.Valid || deliveryRevision.Valid {
 		if !deliveryTaskID.Valid || !deliveryWorkspaceID.Valid || !deliveryRevision.Valid {
@@ -476,7 +484,13 @@ func requireProjectWorkItemMember(ctx context.Context, tx pgx.Tx, actorID, proje
 }
 
 func requireProjectWorkItemAssignee(ctx context.Context, tx pgx.Tx, projectID, assigneeID string) error {
-	if !project.ValidID(projectID) || !domain.ValidUserID(assigneeID) {
+	if !project.ValidID(projectID) {
+		return domain.InvalidArgument("assignee_id", "project work item assignee is invalid")
+	}
+	if assigneeID == "" {
+		return nil
+	}
+	if !domain.ValidUserID(assigneeID) {
 		return domain.InvalidArgument("assignee_id", "project work item assignee is invalid")
 	}
 	var role string
@@ -644,6 +658,9 @@ func validateProjectWorkItemUpdate(current, updated project.WorkItem, expectedVe
 	if current.State == project.WorkItemDelivered {
 		return domain.NewError(domain.CodeConflict, "delivered project work items are immutable")
 	}
+	if canonicalWorkItemCategory(current.Category) != canonicalWorkItemCategory(updated.Category) {
+		return domain.InvalidArgument("category", "project work item category is immutable")
+	}
 	if current.State == project.WorkItemBlocked && updated.State == project.WorkItemDelivered {
 		return domain.NewError(domain.CodeConflict, "blocked project work items must be resumed before delivery")
 	}
@@ -677,9 +694,17 @@ func hashProjectWorkItemCreate(item project.WorkItem) ([]byte, error) {
 		Title              string
 		Description        string
 		AcceptanceCriteria []string
+		Category           project.WorkItemCategory
 		AssigneeID         string
-	}{item.ProjectID, item.Title, item.Description, nonNilStrings(item.AcceptanceCriteria), item.AssigneeID}
+	}{item.ProjectID, item.Title, item.Description, nonNilStrings(item.AcceptanceCriteria), canonicalWorkItemCategory(item.Category), item.AssigneeID}
 	return hashProjectWorkItemRequest(request)
+}
+
+func canonicalWorkItemCategory(value project.WorkItemCategory) project.WorkItemCategory {
+	if value == "" {
+		return project.WorkItemCategoryUnclassified
+	}
+	return value
 }
 
 func hashProjectWorkItemRequest(value any) ([]byte, error) {
@@ -710,7 +735,7 @@ func encodeProjectWorkItemCursor(value projectWorkItemCursor) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(encoded), nil
 }
 
-func decodeProjectWorkItemCursor(value, projectID string) (*projectWorkItemCursor, error) {
+func decodeProjectWorkItemCursor(value, projectID string, includeUnassigned bool) (*projectWorkItemCursor, error) {
 	if value == "" {
 		return nil, nil
 	}
@@ -730,7 +755,8 @@ func decodeProjectWorkItemCursor(value, projectID string) (*projectWorkItemCurso
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return nil, domain.InvalidArgument("cursor", "project work item cursor is invalid")
 	}
-	if cursor.ProjectID != projectID || !project.ValidID(cursor.ProjectID) || !project.ValidID(cursor.ID) || cursor.CreatedAt.IsZero() {
+	if cursor.ProjectID != projectID || cursor.IncludeUnassigned != includeUnassigned ||
+		!project.ValidID(cursor.ProjectID) || !project.ValidID(cursor.ID) || cursor.CreatedAt.IsZero() {
 		return nil, domain.InvalidArgument("cursor", "project work item cursor is invalid")
 	}
 	return &cursor, nil

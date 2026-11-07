@@ -405,10 +405,10 @@ func TestPostgresScheduledObservationBaselinesAndSuppressesOnlyNoChange(t *testi
 	configHash := spec.ConfigHash()
 	scheduleID := mustID(t, schedule.NewID)
 	if _, err := store.pool.Exec(ctx, `INSERT INTO schedules (
-id,owner_id,version,status,execution_epoch,host_id,model_id,objective,timing,
+id,owner_id,version,status,execution_epoch,host_id,model_id,title,objective,timing,
 budget_active_seconds,budget_tool_calls,budget_model_tokens,auth_kind,misfire_policy,notification_events,
 observation_spec,observation_config_hash,baseline_fingerprint
-) VALUES ($1,$2,1,'disabled',1,$3,'model-test','observe page field','{}'::jsonb,60,10,100,'session','skip',ARRAY['completed']::text[],$4::jsonb,$5,'')`,
+) VALUES ($1,$2,1,'disabled',1,$3,'model-test','Observation title','observe page field','{}'::jsonb,60,10,100,'session','skip',ARRAY['completed']::text[],$4::jsonb,$5,'')`,
 		scheduleID, owner.ID, hostValue.ID, specJSON, configHash); err != nil {
 		t.Fatal(err)
 	}
@@ -550,9 +550,9 @@ func attachNotificationScheduleSnapshot(t *testing.T, store *Store, ownerID, hos
 	scheduleID := mustID(t, schedule.NewID)
 	runID := mustID(t, schedule.NewRunID)
 	if _, err := store.pool.Exec(ctx, `INSERT INTO schedules (
-id,owner_id,version,status,execution_epoch,host_id,model_id,objective,timing,
+id,owner_id,version,status,execution_epoch,host_id,model_id,title,objective,timing,
 budget_active_seconds,budget_tool_calls,budget_model_tokens,auth_kind,misfire_policy,notification_events
-) VALUES ($1,$2,1,'disabled',1,$3,'model-test','scheduled test','{}'::jsonb,60,10,100,'session','skip',$4::text[])`,
+) VALUES ($1,$2,1,'disabled',1,$3,'model-test','Scheduled notification','scheduled test','{}'::jsonb,60,10,100,'session','skip',$4::text[])`,
 		scheduleID, ownerID, hostID, events); err != nil {
 		t.Fatalf("insert schedule snapshot owner: %v", err)
 	}

@@ -514,9 +514,10 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 			}
 		}
 		var ownerID, state string
+		var readOnly bool
 		var revision, quotaBytes int64
-		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, quota_bytes FROM workspaces WHERE id=$1 FOR UPDATE`, value.WorkspaceID).
-			Scan(&ownerID, &state, &revision, &quotaBytes); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, quota_bytes, is_read_only FROM workspaces WHERE id=$1 FOR UPDATE`, value.WorkspaceID).
+			Scan(&ownerID, &state, &revision, &quotaBytes, &readOnly); err != nil {
 			return storeError("lock workspace for sync session", "workspace", err)
 		}
 		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
@@ -524,6 +525,9 @@ func (s *Store) CreateWorkspaceSyncSession(ctx context.Context, value workspace.
 		}
 		if ownerID != value.OwnerID || state != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if readOnly && value.Direction != workspace.SyncDownload {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
 			return err
@@ -1143,13 +1147,20 @@ func (s *Store) ReserveWorkspaceSyncCommit(ctx context.Context, workspaceID, ses
 		if err := ensureNoWorkspaceSyncReceive(ctx, tx, workspaceID, ""); err != nil {
 			return err
 		}
-		var sessionOwner, replicaID string
-		if err := tx.QueryRow(ctx, `SELECT owner_id,replica_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
-			Scan(&sessionOwner, &replicaID); err != nil {
+		var sessionOwner, replicaID, direction string
+		if err := tx.QueryRow(ctx, `SELECT owner_id,replica_id,direction FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
+			Scan(&sessionOwner, &replicaID, &direction); err != nil {
 			return storeError("read workspace sync session before commit reservation", "workspace sync session", err)
 		}
 		if sessionOwner != idempotency.OwnerID {
 			return domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+		}
+		var readOnly bool
+		if err := tx.QueryRow(ctx, `SELECT is_read_only FROM workspaces WHERE id=$1`, workspaceID).Scan(&readOnly); err != nil {
+			return storeError("read workspace mode before sync commit reservation", "workspace", err)
+		}
+		if readOnly && direction != string(workspace.SyncDownload) {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if err := requireActiveWorkspaceSyncDeviceSession(ctx, tx, deviceAccess, sessionOwner, workspaceID, replicaID); err != nil {
 			return err
@@ -1218,9 +1229,9 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 	if err := validateWorkspaceSyncCommitReceipt(workspaceID, sessionID, idempotency); err != nil {
 		return workspace.SyncSession{}, false, err
 	}
-	var sessionOwnerID, expectedReplicaID string
-	if err := s.pool.QueryRow(ctx, `SELECT owner_id, replica_id FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
-		Scan(&sessionOwnerID, &expectedReplicaID); err != nil {
+	var sessionOwnerID, expectedReplicaID, expectedDirection string
+	if err := s.pool.QueryRow(ctx, `SELECT owner_id, replica_id, direction FROM workspace_sync_sessions WHERE workspace_id=$1 AND id=$2`, workspaceID, sessionID).
+		Scan(&sessionOwnerID, &expectedReplicaID, &expectedDirection); err != nil {
 		return workspace.SyncSession{}, false, storeError("read workspace sync session before commit", "workspace sync session", err)
 	}
 	if sessionOwnerID != idempotency.OwnerID {
@@ -1274,11 +1285,15 @@ func (s *Store) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, ses
 			}
 		}
 		var workspaceOwner, workspaceState string
+		var workspaceReadOnly bool
 		var currentRevision, currentBytes, quotaBytes, currentFileCount, revisionBytes int64
 		if err := tx.QueryRow(ctx, `
-			SELECT owner_id, state, revision, used_bytes, quota_bytes
-			FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&workspaceOwner, &workspaceState, &currentRevision, &currentBytes, &quotaBytes); err != nil {
+			SELECT owner_id, state, revision, used_bytes, quota_bytes, is_read_only
+			FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&workspaceOwner, &workspaceState, &currentRevision, &currentBytes, &quotaBytes, &workspaceReadOnly); err != nil {
 			return storeError("lock workspace for sync commit", "workspace", err)
+		}
+		if workspaceReadOnly && expectedDirection != string(workspace.SyncDownload) {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if err := ensureNoWorkspaceSyncReceive(ctx, tx, workspaceID, ""); err != nil {
 			return err

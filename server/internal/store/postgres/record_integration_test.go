@@ -3,15 +3,19 @@ package postgres
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,6 +25,7 @@ import (
 	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/record"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/dshguardian"
 	"morde/server/internal/worker"
 )
 
@@ -481,53 +486,146 @@ checkpoint_through_seq=2,checkpoint_digest=$4 WHERE id=$1`, claimed.ID, instance
 }
 
 type recordCloudDSHE2ESupervisor struct {
-	mu  sync.Mutex
-	cmd *exec.Cmd
-	key []byte
+	mu     sync.Mutex
+	cmd    *exec.Cmd
+	node   string
+	script string
+	key    ed25519.PrivateKey
+	fence  app.AccountAgentRuntimeFence
+	nonce  string
+	expiry time.Time
 }
 
-func (s *recordCloudDSHE2ESupervisor) Start(_ context.Context, launch worker.CloudDSHLaunch) (io.WriteCloser, io.ReadCloser, error) {
+func (s *recordCloudDSHE2ESupervisor) StartAccountRuntime(_ context.Context, fence app.AccountAgentRuntimeFence,
+	nonce []byte, expiry time.Time) (worker.CloudDSHAccountRuntimeProcess, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cmd := exec.Command(launch.NodePath, launch.ScriptPath)
-	cmd.Env = append([]string(nil), launch.Environment...)
+	cmd := exec.Command(s.node, s.script)
+	cmd.Dir = filepath.Dir(s.script)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}
 	cmd.Stderr = io.Discard
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, err
+		return worker.CloudDSHAccountRuntimeProcess{}, err
 	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, err
+		_ = in.Close()
+		return worker.CloudDSHAccountRuntimeProcess{}, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, nil, err
+		_ = in.Close()
+		_ = out.Close()
+		return worker.CloudDSHAccountRuntimeProcess{}, err
 	}
 	s.cmd = cmd
-	return in, out, nil
+	digest := sha256.Sum256(nonce)
+	s.fence, s.nonce, s.expiry = fence, hex.EncodeToString(digest[:]), expiry
+	return worker.CloudDSHAccountRuntimeProcess{ContainerID: strings.Repeat("a", 64), ContainerName: "record-test-runtime",
+		Input: in, Output: out}, nil
 }
 
-func (*recordCloudDSHE2ESupervisor) Renew(context.Context, app.AgentInstanceFence, time.Time) error {
+func (*recordCloudDSHE2ESupervisor) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
 	return nil
 }
 
-func (s *recordCloudDSHE2ESupervisor) Stop(_ context.Context, fence app.AgentInstanceFence, nonce []byte) (app.AgentStopReceipt, error) {
+func (s *recordCloudDSHE2ESupervisor) StopAccountRuntime(_ context.Context, fence app.AccountAgentRuntimeFence,
+	nonce string) (app.AccountAgentRuntimeStopAttestation, error) {
 	s.mu.Lock()
-	cmd := s.cmd
-	s.mu.Unlock()
-	if cmd != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	defer s.mu.Unlock()
+	if s.cmd == nil || s.cmd.Process == nil || s.fence != fence || s.nonce != nonce {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("record test runtime process is unavailable")
 	}
-	receipt := app.AgentStopReceipt{Fence: fence, SupervisorNonce: append([]byte(nil), nonce...), TreeStopped: true}
-	payload, err := app.AgentStopReceiptSigningPayload(receipt)
+	_ = s.cmd.Process.Kill()
+	_ = s.cmd.Wait()
+	if s.cmd.ProcessState == nil {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("record test runtime stop is unconfirmed")
+	}
+	s.cmd = nil
+	nonceDigest, err := hex.DecodeString(nonce)
 	if err != nil {
-		return receipt, err
+		return app.AccountAgentRuntimeStopAttestation{}, err
 	}
-	mac := hmac.New(sha256.New, s.key)
-	_, _ = mac.Write(payload)
-	receipt.Signature = mac.Sum(nil)
-	return receipt, nil
+	encodedFence, err := json.Marshal(fence)
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	identity := sha256.Sum256(append(append(encodedFence, 0), nonceDigest...))
+	attestation := app.AccountAgentRuntimeStopAttestation{Fence: fence, NonceSHA256: nonce,
+		ContainerName: "morde-account-runtime-" + hex.EncodeToString(identity[:]), ContainerID: strings.Repeat("a", 64),
+		ExpiresAt: s.expiry, ProofSHA256: strings.Repeat("c", 64), Destroyed: true, DestroyedAt: time.Now()}
+	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(attestation)
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	attestation.Signature = ed25519.Sign(s.key, payload)
+	return attestation, nil
+}
+
+func (s *recordCloudDSHE2ESupervisor) RecoverAccountRuntimeStopped(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	nonce string) (app.AccountAgentRuntimeStopAttestation, error) {
+	return s.StopAccountRuntime(ctx, fence, nonce)
+}
+
+type recordCloudDSHE2EGuardian struct{ key ed25519.PrivateKey }
+
+func (*recordCloudDSHE2EGuardian) ArmTaskProcess(_ context.Context, guard dshguardian.TaskProcessGuard) error {
+	if guard.ContainerPID < 2 || guard.RuntimeContainerID != strings.Repeat("a", 64) {
+		return errors.New("record test task process identity is invalid")
+	}
+	return nil
+}
+
+func (*recordCloudDSHE2EGuardian) StartedTaskProcess(context.Context, dshguardian.TaskProcessGuard) error {
+	return nil
+}
+func (*recordCloudDSHE2EGuardian) RenewTaskProcess(context.Context, dshguardian.TaskProcessGuard) error {
+	return nil
+}
+
+func (g *recordCloudDSHE2EGuardian) StopTaskProcess(_ context.Context, guard dshguardian.TaskProcessGuard) (app.AccountAgentTaskStopAttestation, error) {
+	process, err := os.FindProcess(guard.ContainerPID)
+	if err != nil {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := process.Signal(syscall.Signal(0))
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if err != nil || time.Now().After(deadline) {
+			return app.AccountAgentTaskStopAttestation{}, errors.New("record test task stop is unconfirmed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	attestation := app.AccountAgentTaskStopAttestation{RuntimeFence: guard.RuntimeFence, TaskFence: guard.TaskFence,
+		RuntimeContainerID: guard.RuntimeContainerID, ContainerPID: guard.ContainerPID, HostPID: 2,
+		StartTimeTick: 3, CgroupPath: "/sys/fs/cgroup/account/task", NonceSHA256: guard.NonceSHA256,
+		ExpiresAt: guard.ExpiresAt, DestroyedAt: time.Now(), ProofSHA256: strings.Repeat("b", 64), Destroyed: true}
+	payload, err := app.AccountAgentTaskStopAttestationSigningPayload(attestation)
+	if err != nil {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	attestation.Signature = ed25519.Sign(g.key, payload)
+	return attestation, nil
+}
+
+func (*recordCloudDSHE2EGuardian) RecoverTaskProcessStopped(context.Context, app.AccountAgentRuntimeFence,
+	app.AgentInstanceFence, string) (app.AccountAgentTaskStopAttestation, error) {
+	return app.AccountAgentTaskStopAttestation{}, errors.New("record test task recovery unavailable")
+}
+
+func (*recordCloudDSHE2EGuardian) AcknowledgeTaskProcessStopped(context.Context, app.AccountAgentRuntimeFence,
+	app.AgentInstanceFence, string, string) error {
+	return nil
+}
+func (*recordCloudDSHE2EGuardian) AcknowledgeAccountRuntimeStopped(context.Context, app.AccountAgentRuntimeFence,
+	string, string) error {
+	return nil
 }
 
 type recordCloudDSHE2EModel struct{ calls int }
@@ -566,7 +664,19 @@ func TestCloudDSHRuntimeCompletesAndCapturesThroughPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	instances, err := app.NewAgentInstanceService(store, authenticator)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardianAuth, err := app.NewAgentGuardianStopAuthenticator("record-e2e-supervisor", publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskGuardianAuth, err := app.NewAccountAgentTaskGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceServiceWithGuardianStops(store, authenticator, agentGuardianAuth, taskGuardianAuth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,9 +697,33 @@ func TestCloudDSHRuntimeCompletesAndCapturesThroughPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	model := &recordCloudDSHE2EModel{}
-	supervisor := &recordCloudDSHE2ESupervisor{key: key}
+	control, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopVerifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor := &recordCloudDSHE2ESupervisor{node: node, script: filepath.Join(filepath.Dir(script), "bin-account.mjs"), key: privateKey}
+	guardian := &recordCloudDSHE2EGuardian{key: privateKey}
+	conversationRuntimeManager, err := worker.NewCloudDSHAccountRuntimeManager(worker.CloudDSHAccountRuntimeManagerOptions{
+		Control: control, Supervisor: supervisor, Guardian: guardian, StopVerifier: stopVerifier,
+		TaskStopper: instances, LeaseOwner: "record-e2e-supervisor", MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		supervisor.mu.Lock()
+		defer supervisor.mu.Unlock()
+		if supervisor.cmd != nil && supervisor.cmd.Process != nil {
+			_ = supervisor.cmd.Process.Kill()
+			_ = supervisor.cmd.Wait()
+		}
+	})
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "record-e2e-supervisor", Supervisor: supervisor,
+		SupervisorID: "record-e2e-supervisor", AccountRuntimes: conversationRuntimeManager,
 		Instances: instances, Checkpoints: checkpoints, Models: model, Completion: broker,
 	})
 	if err != nil {

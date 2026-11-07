@@ -28,6 +28,9 @@ const (
 	capabilityWindowActivate = "window.activate"
 	maxScreenshotBytes       = 512 << 10
 	maxScreenshotJSONBytes   = 700 << 10
+	maxDisplayWidth          = 16384
+	maxDisplayHeight         = 16384
+	maxDisplayPixels         = 64 << 20
 	maxDesktopTextBytes      = 4096
 	maxDesktopWindows        = 128
 	maxWindowTitleBytes      = 512
@@ -155,10 +158,14 @@ func (h *actionHandler) Stop(ctx context.Context, operation contract.Operation) 
 }
 
 type clickArguments struct {
-	WindowID string          `json:"window_id"`
-	X        *int            `json:"x"`
-	Y        *int            `json:"y"`
-	Button   json.RawMessage `json:"button"`
+	WindowID         string          `json:"window_id"`
+	X                *int            `json:"x"`
+	Y                *int            `json:"y"`
+	ScreenWidth      *int            `json:"screen_width"`
+	ScreenHeight     *int            `json:"screen_height"`
+	ScreenshotWidth  *int            `json:"screenshot_width"`
+	ScreenshotHeight *int            `json:"screenshot_height"`
+	Button           json.RawMessage `json:"button"`
 }
 
 type typeArguments struct {
@@ -176,7 +183,7 @@ type activateArguments struct {
 func (c *Controller) execute(ctx context.Context, request contract.ExecuteRequest, action string) (json.RawMessage, error) {
 	allowed := map[string][]string{
 		"screenshot": {}, "list": {}, "activate": {"window_id"},
-		"click": {"window_id", "x", "y", "button"}, "type": {"window_id", "text"}, "press_key": {"window_id", "key"},
+		"click": {"window_id", "x", "y", "screen_width", "screen_height", "screenshot_width", "screenshot_height", "button"}, "type": {"window_id", "text"}, "press_key": {"window_id", "key"},
 	}
 	keys, ok := allowed[action]
 	if !ok {
@@ -237,7 +244,23 @@ func (c *Controller) execute(ctx context.Context, request contract.ExecuteReques
 		}{args.WindowID, true}
 	case "click":
 		var args clickArguments
-		if err := decodeObject(request.Arguments, keys, &args); err != nil || !validWindowID(args.WindowID) || args.X == nil || args.Y == nil || *args.X < 0 || *args.Y < 0 {
+		if err := decodeObject(request.Arguments, keys, &args); err != nil || !validWindowID(args.WindowID) || args.X == nil || args.Y == nil ||
+			args.ScreenWidth == nil || args.ScreenHeight == nil || *args.X < 0 || *args.Y < 0 ||
+			(args.ScreenshotWidth == nil) != (args.ScreenshotHeight == nil) {
+			return nil, runtimecore.ErrInvalidRequest
+		}
+		expected := displaySize{width: *args.ScreenWidth, height: *args.ScreenHeight}
+		if !validScreenshotScreen(expected) {
+			return nil, runtimecore.ErrInvalidRequest
+		}
+		pointSpace := expected
+		if args.ScreenshotWidth != nil {
+			pointSpace = displaySize{width: *args.ScreenshotWidth, height: *args.ScreenshotHeight}
+			if !validScreenshotScreen(pointSpace) || pointSpace.width > 1280 || pointSpace.height > 720 || !validScreenshotAspect(pointSpace.width, pointSpace.height, expected) {
+				return nil, runtimecore.ErrInvalidRequest
+			}
+		}
+		if *args.X >= pointSpace.width || *args.Y >= pointSpace.height {
 			return nil, runtimecore.ErrInvalidRequest
 		}
 		button := "left"
@@ -250,11 +273,11 @@ func (c *Controller) execute(ctx context.Context, request contract.ExecuteReques
 		if err != nil {
 			return nil, contextOrUnavailable(ctx)
 		}
-		if size.width < 1 || size.height < 1 {
+		if !validScreenshotScreen(size) {
 			return nil, ErrDesktopUnavailable
 		}
-		if *args.X >= size.width || *args.Y >= size.height {
-			return nil, runtimecore.ErrInvalidRequest
+		if size != expected {
+			return nil, runtimecore.ErrDesktopGeometryChanged
 		}
 		target, err := c.visibleWindow(ctx, args.WindowID)
 		if err != nil {
@@ -263,10 +286,33 @@ func (c *Controller) execute(ctx context.Context, request contract.ExecuteReques
 		if !target.Active {
 			return nil, errDesktopFocusChanged
 		}
-		if !validWindowGeometry(target) || *args.X < target.X || *args.Y < target.Y || int64(*args.X) >= int64(target.X)+int64(target.Width) || int64(*args.Y) >= int64(target.Y)+int64(target.Height) {
+		screenX, screenY := *args.X, *args.Y
+		if args.ScreenshotWidth != nil {
+			screenX = scaleScreenshotCoordinate(screenX, pointSpace.width, expected.width)
+			screenY = scaleScreenshotCoordinate(screenY, pointSpace.height, expected.height)
+		}
+		if !validWindowGeometry(target) || screenX < target.X || screenY < target.Y ||
+			int64(screenX) >= int64(target.X)+int64(target.Width) || int64(screenY) >= int64(target.Y)+int64(target.Height) {
 			return nil, runtimecore.ErrInvalidRequest
 		}
-		if err := c.backend.click(ctx, args.WindowID, *args.X-target.X, *args.Y-target.Y, button); err != nil {
+		latest, err := c.backend.display(ctx)
+		if err != nil || !validScreenshotScreen(latest) {
+			return nil, contextOrUnavailable(ctx)
+		}
+		if latest != expected {
+			return nil, runtimecore.ErrDesktopGeometryChanged
+		}
+		finalTarget, err := c.visibleWindow(ctx, args.WindowID)
+		if err != nil {
+			return nil, err
+		}
+		if !finalTarget.Active {
+			return nil, errDesktopFocusChanged
+		}
+		if finalTarget.X != target.X || finalTarget.Y != target.Y || finalTarget.Width != target.Width || finalTarget.Height != target.Height {
+			return nil, runtimecore.ErrDesktopGeometryChanged
+		}
+		if err := c.backend.click(ctx, args.WindowID, screenX-target.X, screenY-target.Y, button); err != nil {
 			return nil, contextOrActionError(ctx, err)
 		}
 		result = struct {
@@ -275,7 +321,7 @@ func (c *Controller) execute(ctx context.Context, request contract.ExecuteReques
 			Y        int    `json:"y"`
 			Button   string `json:"button"`
 			Clicked  bool   `json:"clicked"`
-		}{args.WindowID, *args.X, *args.Y, button, true}
+		}{args.WindowID, screenX, screenY, button, true}
 	case "type":
 		var args typeArguments
 		if err := decodeObject(request.Arguments, keys, &args); err != nil || !validWindowID(args.WindowID) || args.Text == nil || len(*args.Text) > maxDesktopTextBytes ||
@@ -334,26 +380,54 @@ func (c *Controller) execute(ctx context.Context, request contract.ExecuteReques
 }
 
 func (c *Controller) screenshot(ctx context.Context) (any, error) {
+	screen, err := c.backend.display(ctx)
+	if err != nil || !validScreenshotScreen(screen) {
+		return nil, contextOrUnavailable(ctx)
+	}
 	data, err := c.backend.screenshot(ctx)
 	if err != nil {
+		return nil, contextOrUnavailable(ctx)
+	}
+	after, err := c.backend.display(ctx)
+	if err != nil || after != screen {
 		return nil, contextOrUnavailable(ctx)
 	}
 	if len(data) < 4 || len(data) > maxScreenshotBytes {
 		return nil, runtimecore.ErrResultTooLarge
 	}
 	config, err := jpeg.DecodeConfig(bytes.NewReader(data))
-	if err != nil || config.Width < 1 || config.Height < 1 || config.Width > 1280 || config.Height > 720 {
+	if err != nil || config.Width < 1 || config.Height < 1 || config.Width > 1280 || config.Height > 720 ||
+		config.Width > screen.width || config.Height > screen.height || !validScreenshotAspect(config.Width, config.Height, screen) {
 		return nil, runtimecore.ErrResultTooLarge
 	}
 	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
 		return nil, runtimecore.ErrResultTooLarge
 	}
 	return struct {
-		MIMEType   string `json:"mime_type"`
-		Width      int    `json:"width"`
-		Height     int    `json:"height"`
-		DataBase64 string `json:"data_base64"`
-	}{"image/jpeg", config.Width, config.Height, base64.StdEncoding.EncodeToString(data)}, nil
+		MIMEType     string `json:"mime_type"`
+		Width        int    `json:"width"`
+		Height       int    `json:"height"`
+		ScreenWidth  int    `json:"screen_width"`
+		ScreenHeight int    `json:"screen_height"`
+		DataBase64   string `json:"data_base64"`
+	}{"image/jpeg", config.Width, config.Height, screen.width, screen.height, base64.StdEncoding.EncodeToString(data)}, nil
+}
+
+func validScreenshotScreen(screen displaySize) bool {
+	return screen.width > 0 && screen.width <= maxDisplayWidth && screen.height > 0 && screen.height <= maxDisplayHeight &&
+		int64(screen.width)*int64(screen.height) <= maxDisplayPixels
+}
+
+func validScreenshotAspect(width, height int, screen displaySize) bool {
+	difference := int64(width)*int64(screen.height) - int64(height)*int64(screen.width)
+	if difference < 0 {
+		difference = -difference
+	}
+	return difference <= int64(max(screen.width, screen.height))
+}
+
+func scaleScreenshotCoordinate(value, screenshotSize, screenSize int) int {
+	return int(int64(value) * int64(screenSize) / int64(screenshotSize))
 }
 
 func (c *Controller) visibleWindow(ctx context.Context, id string) (window, error) {

@@ -1,0 +1,11 @@
+{
+  "name": "morde-builtin-search",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test:morde-patches": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "mcp-searxng": "2.10.0"
+  }
+}

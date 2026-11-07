@@ -35,6 +35,10 @@ func TestEveryNHoursTimingValidationAndElapsedCadence(t *testing.T) {
 		{Kind: TimingEveryNHours, IntervalHours: 0, TimeZone: "UTC"},
 		{Kind: TimingEveryNHours, IntervalHours: 169, TimeZone: "UTC"},
 		{Kind: TimingEveryNHours, IntervalHours: 1, StartsOn: "2026-03-08", TimeZone: "UTC"},
+		{Kind: TimingEveryNHours, IntervalHours: 1, AnchorAt: "2026-03-08T06:00:00", TimeZone: "UTC"},
+		{Kind: TimingEveryNHours, IntervalHours: 1, AnchorAt: "not-a-time", TimeZone: "UTC"},
+		{Kind: TimingEveryNHours, IntervalHours: 1, AnchorAt: "2026-03-08T06:00:00.0000001Z", TimeZone: "UTC"},
+		{Kind: TimingDaily, StartsOn: "2026-03-08", LocalTime: "09:00", AnchorAt: "2026-03-08T06:00:00Z", TimeZone: "UTC"},
 	} {
 		if err := timing.Validate(); err == nil {
 			t.Fatalf("Validate(%#v) unexpectedly succeeded", timing)
@@ -58,6 +62,37 @@ func TestEveryNHoursTimingValidationAndElapsedCadence(t *testing.T) {
 	latest, coalesced, err := LatestDue(timing, first, mustTime(t, "2026-03-08T13:00:30Z"))
 	if err != nil || latest.Key != "every_n_hours:2026-03-08T13:00:30Z" || coalesced != 3 {
 		t.Fatalf("LatestDue() = %#v, %d, %v", latest, coalesced, err)
+	}
+}
+
+func TestEveryNHoursAnchorUsesFuturePhaseAndSkipsElapsedSlots(t *testing.T) {
+	timing := Timing{
+		Kind: TimingEveryNHours, IntervalHours: 2, TimeZone: "UTC", AnchorAt: "2030-03-10T06:00:30.123456Z",
+	}
+	for _, test := range []struct {
+		name string
+		now  time.Time
+		want string
+	}{
+		{name: "future anchor", now: mustTime(t, "2030-03-10T05:00:00Z"), want: "2030-03-10T06:00:30.123456Z"},
+		{name: "skip elapsed slots", now: mustTime(t, "2030-03-10T09:00:30.123456Z"), want: "2030-03-10T10:00:30.123456Z"},
+		{name: "strictly after now", now: mustTime(t, "2030-03-10T10:00:30.123456Z"), want: "2030-03-10T12:00:30.123456Z"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			first, err := FirstOccurrence(timing, test.now)
+			if err != nil || !first.CheckAt.Equal(mustTime(t, test.want)) {
+				t.Fatalf("FirstOccurrence() = %#v, %v; want %s", first, err, test.want)
+			}
+		})
+	}
+
+	first, err := FirstOccurrence(timing, mustTime(t, "2030-03-10T05:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := NextOccurrence(timing, first.Key)
+	if err != nil || !next.CheckAt.Equal(mustTime(t, "2030-03-10T08:00:30.123456Z")) {
+		t.Fatalf("NextOccurrence() = %#v, %v", next, err)
 	}
 }
 
@@ -185,7 +220,7 @@ func TestScheduleEnumsAndValidation(t *testing.T) {
 	next := mustTime(t, "2026-11-01T05:30:00Z")
 	base := Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 1, Status: StatusEnabled,
-		HostID: "h1234567", ModelID: "model", Objective: "check for updates",
+		HostID: "h1234567", ModelID: "model", Title: "Daily update check", Objective: "check for updates",
 		Timing:        Timing{Kind: TimingOnce, RunAt: "2026-11-01T01:30:00-04:00", TimeZone: "America/New_York"},
 		Budget:        task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 100},
 		Authorization: task.Authorization{Kind: "session"}, MisfirePolicy: MisfireSkip,
@@ -202,6 +237,9 @@ func TestScheduleEnumsAndValidation(t *testing.T) {
 		func(value *Schedule) { value.Status = "unknown" },
 		func(value *Schedule) { value.HostID = "bad-host" },
 		func(value *Schedule) { value.ModelID = "" },
+		func(value *Schedule) { value.Title = "  " },
+		func(value *Schedule) { value.Title = strings.Repeat("t", 32769) },
+		func(value *Schedule) { value.Objective = strings.Repeat("o", 32769) },
 		func(value *Schedule) { value.Objective = "  " },
 		func(value *Schedule) { value.Authorization.Kind = "" },
 		func(value *Schedule) { value.MisfirePolicy = "unknown" },

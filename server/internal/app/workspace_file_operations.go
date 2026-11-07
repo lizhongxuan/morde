@@ -51,8 +51,12 @@ func (s *WorkspaceSyncService) ApplyFileOperation(ctx context.Context, principal
 	if principal.Kind != identity.KindSession {
 		return WorkspaceFileOperationResult{}, domain.NewError(domain.CodeForbidden, "Workspace file edits require a Portal session")
 	}
-	if _, err := s.authorize(ctx, principal, workspaceID); err != nil {
+	value, err := s.authorize(ctx, principal, workspaceID)
+	if err != nil {
 		return WorkspaceFileOperationResult{}, err
+	}
+	if value.ReadOnly {
+		return WorkspaceFileOperationResult{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 	}
 	if !command.WriteEnabled {
 		return WorkspaceFileOperationResult{}, domain.NewError(domain.CodeForbidden,

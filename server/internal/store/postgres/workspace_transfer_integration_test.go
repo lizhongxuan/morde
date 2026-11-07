@@ -657,11 +657,6 @@ func prepareTransferWorkspace(t *testing.T, ctx context.Context, store *Store, w
 VALUES ($1,0,'README.md','readme.md',$2,$3,420,$4::jsonb,true)`, workspaceID, fileBytes, hex.EncodeToString(digest[:]), chunks); err != nil {
 			t.Fatalf("seed transfer test Workspace manifest: %v", err)
 		}
-		if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revision_directories
-(workspace_id,valid_from_revision,directory_path,folded_path,metadata_known)
-VALUES ($1,0,'.','.',true)`, workspaceID); err != nil {
-			t.Fatalf("seed transfer test Workspace root metadata: %v", err)
-		}
 		if _, err := store.pool.Exec(ctx, `UPDATE workspace_revisions SET file_count=1,total_bytes=$2 WHERE workspace_id=$1 AND revision=0`, workspaceID, fileBytes); err != nil {
 			t.Fatal(err)
 		}

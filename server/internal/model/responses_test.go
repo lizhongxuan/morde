@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +128,65 @@ func TestCompleteEncodesMessagesToolsAndImagesAndParsesCallsAndUsage(t *testing.
 	var strict bool
 	if err := json.Unmarshal(tools[0]["strict"], &strict); err != nil || !strict {
 		t.Fatalf("strict tool option = %v, err = %v", strict, err)
+	}
+}
+
+func TestEncodeRequestDisablesReasoningOnlyForVerifiedGPT6Luna(t *testing.T) {
+	input := []app.ModelInput{{Type: "message", Role: "user", Text: "probe"}}
+	tests := []struct {
+		name            string
+		endpoint        app.ModelEndpoint
+		disableThinking bool
+		wantEffort      string
+	}{
+		{
+			name:            "GPT-6 Luna capability probe",
+			endpoint:        app.ModelEndpoint{BaseURL: "https://api.openai.com/v1", ModelID: "gpt-6-luna"},
+			disableThinking: true,
+			wantEffort:      "none",
+		},
+		{
+			name:     "ordinary GPT-6 Luna request",
+			endpoint: app.ModelEndpoint{BaseURL: "https://api.openai.com/v1", ModelID: "gpt-6-luna"},
+		},
+		{
+			name:            "compatible endpoint",
+			endpoint:        app.ModelEndpoint{BaseURL: "https://api.example.test/v1", ModelID: "gpt-6-luna"},
+			disableThinking: true,
+		},
+		{
+			name:            "older OpenAI model",
+			endpoint:        app.ModelEndpoint{BaseURL: "https://api.openai.com/v1", ModelID: "gpt-4o"},
+			disableThinking: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, err := encodeRequest(app.ModelRequest{
+				Endpoint: test.endpoint, Input: input, MaxOutputTokens: 64,
+				DisableThinking: test.disableThinking,
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(payload, &got); err != nil {
+				t.Fatal(err)
+			}
+			var reasoning struct {
+				Effort string `json:"effort"`
+			}
+			raw, present := got["reasoning"]
+			if test.wantEffort == "" {
+				if present {
+					t.Fatalf("unexpected reasoning field: %s", raw)
+				}
+				return
+			}
+			if !present || json.Unmarshal(raw, &reasoning) != nil || reasoning.Effort != test.wantEffort {
+				t.Fatalf("reasoning = %s, want effort %q", raw, test.wantEffort)
+			}
+		})
 	}
 }
 
@@ -359,7 +420,7 @@ func TestEndpointValidationBlocksUnsafeURLsAndAllowlistMisses(t *testing.T) {
 }
 
 func TestProductionClientUsesTLSAndGuardedDialer(t *testing.T) {
-	client, err := NewResponsesClient([]string{"api.example.test"})
+	client, err := NewResponsesClient([]string{"api.example.test"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,6 +436,80 @@ func TestProductionClientUsesTLSAndGuardedDialer(t *testing.T) {
 	}
 	if _, err := transport.DialContext(context.Background(), "tcp", "api.example.test:"); err == nil || !strings.Contains(err.Error(), "address is invalid") {
 		t.Fatalf("empty port dial error = %v", err)
+	}
+}
+
+func TestModelProxyConnectsToValidatedIPWithoutForwardingCredentials(t *testing.T) {
+	requests := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests <- request
+		conn, _, err := writer.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\nhello")
+	}))
+	defer server.Close()
+	address, err := modelProxyAddress(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := dialModelProxy(context.Background(), &net.Dialer{Timeout: time.Second}, address, "1.1.1.1:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	buffer := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buffer); err != nil || string(buffer) != "hello" {
+		t.Fatalf("proxy tunnel buffered data = %q, %v", buffer, err)
+	}
+	request := <-requests
+	if request.Method != http.MethodConnect || request.Host != "1.1.1.1:443" || request.Header.Get("Authorization") != "" {
+		t.Fatalf("unexpected proxy CONNECT: method=%s host=%s authorization-present=%t", request.Method, request.Host, request.Header.Get("Authorization") != "")
+	}
+	client, err := NewResponsesClient([]string{"api.example.test"}, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := client.httpClient.Transport.(*http.Transport)
+	if _, err := transport.DialContext(context.Background(), "tcp", "unlisted.example.test:443"); err == nil {
+		t.Fatal("proxy allowed an unlisted model host")
+	}
+	openAIClient, err := NewResponsesClient([]string{"api.openai.com"}, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openAITransport := openAIClient.httpClient.Transport.(*http.Transport)
+	conn, err = openAITransport.DialContext(context.Background(), "tcp", "api.openai.com:443")
+	if err != nil {
+		t.Fatalf("allowlisted OpenAI host could not use the configured proxy: %v", err)
+	}
+	_ = conn.Close()
+	openAIRequest := <-requests
+	if openAIRequest.Method != http.MethodConnect || openAIRequest.Host != "api.openai.com:443" {
+		t.Fatalf("proxy did not receive the exact OpenAI host: method=%s host=%s", openAIRequest.Method, openAIRequest.Host)
+	}
+	privateClient, err := NewResponsesClient([]string{"localhost"}, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateTransport := privateClient.httpClient.Transport.(*http.Transport)
+	if _, err := privateTransport.DialContext(context.Background(), "tcp", "localhost:443"); err == nil {
+		t.Fatal("proxy allowed a model host resolved to a private address")
+	}
+	select {
+	case <-requests:
+		t.Fatal("proxy received a request for a forbidden address")
+	default:
+	}
+}
+
+func TestModelProxyRejectsUnsafeURLs(t *testing.T) {
+	for _, value := range []string{"https://proxy.example:443", "http://user:pass@proxy.example:8080", "http://proxy.example:8080/path", "http://proxy.example:0", "http://proxy.example:8080?token=secret"} {
+		if _, err := NewResponsesClient([]string{"api.example.test"}, value); err == nil {
+			t.Fatalf("unsafe proxy URL accepted: %s", value)
+		}
 	}
 }
 
@@ -421,16 +556,18 @@ func TestIsPublicIPRejectsPrivateAndSpecialAddresses(t *testing.T) {
 
 func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		status int
-		body   string
-		want   app.ModelClientErrorKind
+		name             string
+		status           int
+		body             string
+		want             app.ModelClientErrorKind
+		wantStage        string
+		wantProviderCode string
 	}{
 		{name: "unauthorized", status: 401, body: `{"error":{"message":"test-secret-key user prompt"}}`, want: app.ModelErrorAuthentication},
 		{name: "forbidden", status: 403, body: `{}`, want: app.ModelErrorAccess},
 		{name: "rate limited", status: 429, body: `{"error":{"type":"rate_limit_exceeded"}}`, want: app.ModelErrorRateLimited},
 		{name: "quota", status: 400, body: `{"error":{"code":"insufficient_quota","message":"test-secret-key"}}`, want: app.ModelErrorQuota},
-		{name: "other client error", status: 400, body: `{"error":{"code":"invalid_request_error","message":"test-secret-key"}}`, want: app.ModelErrorInvalidRequest},
+		{name: "other client error", status: 400, body: `{"error":{"code":"invalid_request_error","message":"test-secret-key"}}`, want: app.ModelErrorInvalidRequest, wantStage: "provider_status", wantProviderCode: "invalid_request_error"},
 		{name: "server", status: 503, body: `{"error":{"message":"test-secret-key"}}`, want: app.ModelErrorUnavailable},
 		{name: "untrusted response header", status: 401, body: `{}`, want: app.ModelErrorAuthentication},
 	} {
@@ -445,6 +582,12 @@ func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T
 			})
 			if got := modelErrorKind(t, err); got != test.want {
 				t.Fatalf("error kind = %q, want %q", got, test.want)
+			}
+			if test.wantStage != "" {
+				var clientErr *app.ModelClientError
+				if !errors.As(err, &clientErr) || clientErr.Stage != test.wantStage || clientErr.ProviderCode != test.wantProviderCode {
+					t.Fatalf("safe provider diagnostics = %#v, want stage=%q provider_code=%q", clientErr, test.wantStage, test.wantProviderCode)
+				}
 			}
 			if strings.Contains(err.Error(), "test-secret-key") || strings.Contains(err.Error(), "private prompt") || strings.Contains(err.Error(), "user prompt") {
 				t.Fatalf("error leaked sensitive data: %v", err)

@@ -14,7 +14,7 @@ import (
 )
 
 func TestAccountAgentRuntimeContracts(t *testing.T) {
-	request := AccountAgentRuntimeStart{OwnerID: "u1234567", RuntimeID: "runtime-1", LeaseOwner: "portal-1",
+	request := AccountAgentRuntimeStart{OwnerID: "u1234567", ConversationID: "c1234567", RuntimeID: "runtime-1", LeaseOwner: "portal-1",
 		SupervisorNonce: []byte("0123456789abcdef0123456789abcdef"), MaxConcurrentTasks: 2, LeaseDuration: 15 * time.Second}
 	if err := request.Validate(); err != nil {
 		t.Fatalf("valid account runtime start: %v", err)
@@ -28,7 +28,7 @@ func TestAccountAgentRuntimeContracts(t *testing.T) {
 	if err := request.Validate(); err == nil {
 		t.Fatal("account runtime accepted an all-zero supervisor nonce")
 	}
-	fence := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", OwnerID: "u1234567",
+	fence := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567",
 		RuntimeID: "runtime-1", RuntimeGeneration: 1, LeaseOwner: "portal-1", LeaseVersion: 1, ExecutionEpoch: 1}
 	if err := fence.Validate(); err != nil {
 		t.Fatalf("valid account runtime fence: %v", err)
@@ -78,7 +78,7 @@ func TestAccountAgentRuntimeGuardianProofScopesAndSigning(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	fence := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", OwnerID: "u1234567",
+	fence := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567",
 		RuntimeID: "runtime-1", RuntimeGeneration: 1, LeaseOwner: "portal-1", LeaseVersion: 1, ExecutionEpoch: 1}
 	nonce := sha256.Sum256([]byte("runtime-supervisor-nonce"))
 	nonceSHA256 := hex.EncodeToString(nonce[:])
@@ -139,6 +139,20 @@ func TestAccountAgentRuntimeGuardianProofScopesAndSigning(t *testing.T) {
 	if _, err := taskAuthenticator.VerifyAccountAgentTaskStop(context.Background(), taskAttestation); err != nil {
 		t.Fatalf("verify account Task stop proof: %v", err)
 	}
+	sharedTask := taskAttestation
+	sharedTask.TaskFence.InitiatorID = "u7654321"
+	sharedPayload, err := AccountAgentTaskStopAttestationSigningPayload(sharedTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedTask.Signature = ed25519.Sign(privateKey, sharedPayload)
+	if _, err := taskAuthenticator.VerifyAccountAgentTaskStop(context.Background(), sharedTask); err != nil {
+		t.Fatalf("verify shared-conversation Task stop proof: %v", err)
+	}
+	sharedTask.RuntimeFence.ConversationID = "c7654321"
+	if _, err := taskAuthenticator.VerifyAccountAgentTaskStop(context.Background(), sharedTask); err == nil {
+		t.Fatal("Task stop proof accepted a modified conversation identity")
+	}
 	if _, err := authenticator.VerifyAccountAgentRuntimeStop(context.Background(), AccountAgentRuntimeStopAttestation{
 		Fence: fence, ContainerID: strings.Repeat("a", 64), ContainerName: "wrong", NonceSHA256: nonceSHA256,
 		ExpiresAt: now.Add(time.Second), DestroyedAt: now, ProofSHA256: strings.Repeat("b", 64), Destroyed: true,
@@ -173,7 +187,7 @@ func (s *accountAgentRuntimeStopAckStoreStub) MarkAccountAgentRuntimeStopAttesta
 func signedAccountAgentRuntimeStopTestAttestation(t *testing.T, key ed25519.PrivateKey) AccountAgentRuntimeStopAttestation {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
-	fence := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", OwnerID: "u1234567",
+	fence := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567",
 		RuntimeID: "runtime-ack", RuntimeGeneration: 1, LeaseOwner: "portal-ack", LeaseVersion: 1, ExecutionEpoch: 1}
 	nonce := sha256.Sum256([]byte("runtime-stop-ack-nonce"))
 	attestation := AccountAgentRuntimeStopAttestation{Fence: fence, ContainerID: strings.Repeat("a", 64),

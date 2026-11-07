@@ -11,7 +11,9 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/schedule"
 )
 
@@ -117,12 +119,16 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 		}
 		pendingMessageIDs := make([]string, 0, len(value.ConversationMessages))
 		if fence.AgentSessionID == rootSessionID {
+			serviceInstanceID, err := serviceInstanceIDInTx(ctx, tx)
+			if err != nil {
+				return err
+			}
 			for _, message := range value.ConversationMessages {
-				var role, content, deliveryStatus string
-				err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status FROM conversation_messages AS message JOIN tasks AS task
+				var role, content, deliveryStatus, conversationID string
+				err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status,message.conversation_id FROM conversation_messages AS message JOIN tasks AS task
 ON task.id=message.task_id AND task.owner_id=message.owner_id AND task.conversation_id=message.conversation_id
-WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3
-FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &content, &deliveryStatus)
+WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3 AND message.actor_id=task.initiator_id
+FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &content, &deliveryStatus, &conversationID)
 				if errors.Is(err, pgx.ErrNoRows) {
 					if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
 						return err
@@ -138,6 +144,23 @@ FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &co
 						return err
 					}
 					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint user message could not be matched safely")
+					return nil
+				}
+				var storedAttachmentIDs []string
+				if current.ProjectID != "" {
+					storedAttachmentIDs, err = loadProjectCheckpointAttachmentIDs(ctx, tx, serviceInstanceID, current.ProjectID,
+						fence.OwnerID, fence.InitiatorID, conversationID, message.ID)
+				} else {
+					storedAttachmentIDs, err = loadConversationMessageAttachmentIDs(ctx, tx, serviceInstanceID, fence.OwnerID, conversationID, message.ID)
+				}
+				if err != nil && domain.CodeOf(err) != domain.CodeInvalidState {
+					return fmt.Errorf("load checkpoint user message attachments: %w", err)
+				}
+				if err != nil || !sameCheckpointPostgresAttachmentIDs(storedAttachmentIDs, message.AttachmentIDs) {
+					if markErr := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); markErr != nil {
+						return markErr
+					}
+					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint user message attachments could not be matched safely")
 					return nil
 				}
 				if deliveryStatus == "pending" {
@@ -173,6 +196,24 @@ WHERE id=$1 AND owner_id=$2 AND task_id=$3 AND role='user' AND delivery_status='
 				}
 				if result.RowsAffected() != 1 {
 					return domain.NewError(domain.CodeInvalidState, "checkpoint user message changed before commit")
+				}
+				route, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='routed',updated_at=clock_timestamp()
+WHERE message_id=$1 AND owner_id=$2 AND state='waiting_adjustment' AND EXISTS (
+ SELECT 1 FROM task_revision_intents revision WHERE revision.message_id=$1 AND revision.task_id=$3
+ AND revision.owner_id=$2 AND revision.state='applied')`, messageID, fence.OwnerID, fence.TaskID)
+				if err != nil {
+					return fmt.Errorf("confirm checkpointed task revision: %w", err)
+				}
+				if route.RowsAffected() == 1 {
+					if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: fence.OwnerID,
+						ObjectType: "message", ObjectID: messageID, Operation: "upsert", MutationID: messageID}); err != nil {
+						return err
+					}
+				}
+			}
+			if value.RootTurnStarted {
+				if err := recordTaskRevisionStartedInTx(ctx, tx, fence.TaskID); err != nil {
+					return err
 				}
 			}
 		}
@@ -222,27 +263,134 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 		if parentSessionID != "" || sessionThrough != taskThrough || !bytes.Equal(sessionDigest, taskDigest) {
 			return domain.NewError(domain.CodeInvalidState, "root checkpoint head changed")
 		}
-		rows, err := tx.Query(ctx, `SELECT id,content FROM conversation_messages
-WHERE task_id=$1 AND owner_id=$2 AND conversation_id=(SELECT conversation_id FROM tasks WHERE id=$1 AND owner_id=$2)
-  AND role='user' AND delivery_status='pending'
-ORDER BY sequence LIMIT 128`, fence.TaskID, fence.OwnerID)
+		serviceInstanceID, err := serviceInstanceIDInTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT message.id,message.content,message.conversation_id,message.actor_id,
+ (revision.message_id IS NULL AND EXISTS (SELECT 1 FROM conversation_message_routes route
+   WHERE route.message_id=message.id AND route.state='routed')),
+ (revision.message_id IS NOT NULL AND revision.state='applied')
+FROM conversation_messages AS message
+LEFT JOIN task_revision_intents revision ON revision.message_id=message.id
+ AND revision.task_id=message.task_id AND revision.owner_id=message.owner_id
+WHERE message.task_id=$1 AND message.owner_id=$2 AND message.conversation_id=(SELECT conversation_id FROM tasks WHERE id=$1 AND owner_id=$2)
+  AND message.role='user' AND message.delivery_status='pending'
+ORDER BY (revision.message_id IS NOT NULL),revision.expected_revision,message.sequence LIMIT 128`, fence.TaskID, fence.OwnerID)
 		if err != nil {
 			return fmt.Errorf("list pending task messages: %w", err)
 		}
 		defer rows.Close()
+		messageIndexes := make(map[string]int)
+		messageConversations := make(map[string]string)
 		for rows.Next() {
 			var message app.AgentConversationMessage
-			if err := rows.Scan(&message.ID, &message.Content); err != nil {
+			var conversationID, actorID string
+			if err := rows.Scan(&message.ID, &message.Content, &conversationID, &actorID, &message.Initial, &message.RevisionUpdate); err != nil {
 				return fmt.Errorf("scan pending task message: %w", err)
 			}
+			if actorID != fence.InitiatorID {
+				return domain.NewError(domain.CodeUnauthenticated, "pending task message belongs to a different initiator")
+			}
+			messageIndexes[message.ID] = len(messages)
+			messageConversations[message.ID] = conversationID
 			messages = append(messages, message)
 		}
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("iterate pending task messages: %w", err)
 		}
+		rows.Close()
+		if current.ProjectID != "" {
+			for index := range messages {
+				attachmentIDs, err := loadProjectCheckpointAttachmentIDs(ctx, tx, serviceInstanceID, current.ProjectID,
+					fence.OwnerID, fence.InitiatorID, messageConversations[messages[index].ID], messages[index].ID)
+				if err != nil {
+					return err
+				}
+				messages[index].AttachmentIDs = attachmentIDs
+			}
+		} else if len(messages) != 0 {
+			messageIDs := make([]string, 0, len(messages))
+			for _, message := range messages {
+				messageIDs = append(messageIDs, message.ID)
+			}
+			attachmentRows, err := tx.Query(ctx, `SELECT link.message_id,link.attachment_id,COALESCE(upload.state,'')
+FROM conversation_message_attachments AS link
+LEFT JOIN personal_attachment_uploads AS upload
+  ON upload.service_instance_id=link.service_instance_id AND upload.owner_id=link.owner_id
+ AND upload.upload_id=link.upload_id AND upload.attachment_id=link.attachment_id
+WHERE link.service_instance_id=$1::uuid AND link.owner_id=$2 AND link.conversation_id=$3
+  AND link.message_id=ANY($4::text[])
+ORDER BY link.message_id,link.attachment_id`, serviceInstanceID, fence.OwnerID, messageConversations[messages[0].ID], messageIDs)
+			if err != nil {
+				return fmt.Errorf("list pending task message attachments: %w", err)
+			}
+			defer attachmentRows.Close()
+			for attachmentRows.Next() {
+				var messageID, attachmentID, state string
+				if err := attachmentRows.Scan(&messageID, &attachmentID, &state); err != nil {
+					return fmt.Errorf("scan pending task message attachment: %w", err)
+				}
+				index, exists := messageIndexes[messageID]
+				if !exists || state != string(personal.AttachmentUploadCommitted) || !personal.ValidPersonalAttachmentID(attachmentID) {
+					return domain.NewError(domain.CodeInvalidState, "pending conversation attachment is not committed and readable")
+				}
+				attachments := &messages[index].AttachmentIDs
+				if len(*attachments) == conversation.MaxHistoryImportAttachments ||
+					len(*attachments) > 0 && (*attachments)[len(*attachments)-1] >= attachmentID {
+					return domain.NewError(domain.CodeInvalidState, "pending conversation message exceeds the attachment limit")
+				}
+				*attachments = append(*attachments, attachmentID)
+			}
+			if err := attachmentRows.Err(); err != nil {
+				return fmt.Errorf("iterate pending task message attachments: %w", err)
+			}
+		}
 		return nil
 	})
 	return messages, err
+}
+
+func loadConversationMessageAttachmentIDs(ctx context.Context, tx pgx.Tx, serviceInstanceID, ownerID, conversationID, messageID string) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT link.attachment_id,COALESCE(upload.state,'')
+FROM conversation_message_attachments AS link
+LEFT JOIN personal_attachment_uploads AS upload
+  ON upload.service_instance_id=link.service_instance_id AND upload.owner_id=link.owner_id
+ AND upload.upload_id=link.upload_id AND upload.attachment_id=link.attachment_id
+WHERE link.service_instance_id=$1::uuid AND link.owner_id=$2 AND link.conversation_id=$3 AND link.message_id=$4
+ORDER BY link.attachment_id`, serviceInstanceID, ownerID, conversationID, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("query conversation message attachments: %w", err)
+	}
+	defer rows.Close()
+	var attachmentIDs []string
+	for rows.Next() {
+		var attachmentID, state string
+		if err := rows.Scan(&attachmentID, &state); err != nil {
+			return nil, fmt.Errorf("scan conversation message attachment: %w", err)
+		}
+		if !personal.ValidPersonalAttachmentID(attachmentID) || state != string(personal.AttachmentUploadCommitted) ||
+			len(attachmentIDs) == conversation.MaxHistoryImportAttachments || len(attachmentIDs) > 0 && attachmentIDs[len(attachmentIDs)-1] >= attachmentID {
+			return nil, domain.NewError(domain.CodeInvalidState, "conversation attachment is not committed or exceeds its limit")
+		}
+		attachmentIDs = append(attachmentIDs, attachmentID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate conversation message attachments: %w", err)
+	}
+	return attachmentIDs, nil
+}
+
+func sameCheckpointPostgresAttachmentIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func agentCheckpointInstanceFence(fence app.AgentCheckpointFence, rootSessionID string) app.AgentInstanceFence {
@@ -382,6 +530,14 @@ SELECT EXISTS(SELECT 1 FROM lineage WHERE session_id=$4 AND parent_session_id IS
 }
 
 func checkAgentCheckpointAuthorization(ctx context.Context, tx pgx.Tx, ownerID, taskID, kind, tokenID string, scopes []string, installationID string) error {
+	lock := " FOR SHARE"
+	if permit := projectWorkspaceTaskPermit(ctx, taskID, ownerID); permit != nil {
+		if permit.authorization.Kind != kind || permit.authorization.TokenID != tokenID ||
+			permit.authorization.ClientInstallationID != installationID || !sameStringSlices(permit.authorization.Scopes, scopes) {
+			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization changed")
+		}
+		lock = ""
+	}
 	if kind == string(identity.KindScheduleTask) {
 		if !scheduleTaskScopeStringsValid(scopes) || !schedule.ValidRunID(tokenID) || installationID != "" {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint authorization is unavailable")
@@ -409,9 +565,9 @@ WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND t.execution_location='serve
 		}
 	} else if kind == string(identity.KindSession) || kind == string(identity.KindAPIKey) {
 		var active bool
-		query := `SELECT revoked_at IS NULL AND kind=$3 FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`
+		query := `SELECT revoked_at IS NULL AND kind=$3 FROM tokens WHERE id=$1 AND owner_id=$2` + lock
 		if kind == string(identity.KindAPIKey) {
-			query = `SELECT revoked_at IS NULL AND expires_at>clock_timestamp() AND kind=$3 FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`
+			query = `SELECT revoked_at IS NULL AND expires_at>clock_timestamp() AND kind=$3 FROM tokens WHERE id=$1 AND owner_id=$2` + lock
 		}
 		err := tx.QueryRow(ctx, query, tokenID, ownerID, kind).Scan(&active)
 		if errors.Is(err, pgx.ErrNoRows) || err == nil && !active {
@@ -426,7 +582,7 @@ WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3 AND t.execution_location='serve
 	if installationID != "" {
 		var active bool
 		err := tx.QueryRow(ctx, `SELECT revoked_at IS NULL AND expires_at>clock_timestamp()
-FROM client_installations WHERE id=$1 AND owner_id=$2 FOR SHARE`, installationID, ownerID).Scan(&active)
+FROM client_installations WHERE id=$1 AND owner_id=$2`+lock, installationID, ownerID).Scan(&active)
 		if errors.Is(err, pgx.ErrNoRows) || err == nil && !active {
 			return domain.NewError(domain.CodeUnauthenticated, "checkpoint installation is unavailable")
 		}

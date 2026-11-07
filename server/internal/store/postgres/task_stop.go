@@ -41,11 +41,13 @@ func (s *Store) RequestTaskAction(ctx context.Context, record app.IdempotencyRec
 	var result app.TaskActionResult
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var executionGate executionGate
+		var resumeReplayed bool
 		if action == task.ActionResume {
 			_, replayed, err := findIdempotency(ctx, tx, record)
 			if err != nil {
 				return err
 			}
+			resumeReplayed = replayed
 			if !replayed {
 				executionGate, err = requireOwnerExecutionEnabled(ctx, tx, record.OwnerID, nil)
 				if err != nil {
@@ -54,21 +56,40 @@ func (s *Store) RequestTaskAction(ctx context.Context, record app.IdempotencyRec
 			}
 		}
 		var status, workspaceID, waitingReason, initiatorID string
-		var leaseVersion, workspaceCheckpointRevision int64
+		var leaseVersion, workspaceCheckpointRevision, currentRevision, desiredRevision int64
 		var taskEpoch int64
+		var workspaceFence projectTaskWorkspaceFence
+		if action == task.ActionResume && !resumeReplayed {
+			if _, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, false); err != nil {
+				return err
+			}
+			var err error
+			workspaceFence, err = lockProjectTaskWorkspaceFence(ctx, tx, taskID, false)
+			if err != nil {
+				return err
+			}
+			if workspaceFence.actorID != record.OwnerID {
+				return missingTaskError()
+			}
+		}
 		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, true)
 		if err != nil {
 			return err
 		}
 		err = tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch, COALESCE(workspace_id,''),
-COALESCE(workspace_checkpoint_revision,-1), waiting_reason, initiator_id
+COALESCE(workspace_checkpoint_revision,-1), waiting_reason, initiator_id,current_revision,desired_revision
 FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
-			Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &workspaceCheckpointRevision, &waitingReason, &initiatorID)
+			Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &workspaceCheckpointRevision, &waitingReason, &initiatorID, &currentRevision, &desiredRevision)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		}
 		if err != nil {
 			return fmt.Errorf("lock task for action: %w", err)
+		}
+		if action == task.ActionResume && !resumeReplayed {
+			if err := verifyProjectTaskWorkspaceFence(ctx, tx, taskID, workspaceFence); err != nil {
+				return err
+			}
 		}
 		if action == task.ActionResume && executionGate.epoch > 0 && taskEpoch != executionGate.epoch {
 			return ownerExecutionDisabledError(executionGate)
@@ -85,13 +106,21 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
 			}
 			requestIDToUse = stored.ResourceID
 		} else {
+			if action == task.ActionResume && currentRevision != desiredRevision {
+				return domain.NewError(domain.CodeConflict, "task has an unapplied revision")
+			}
 			if action == task.ActionResume && workspaceID != "" {
-				if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
-					return err
+				workspaceOwnerID := initiatorID
+				if workspaceFence.projectID != "" {
+					workspaceOwnerID = workspaceFence.workspaceOwnerID
+				} else {
+					if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+						return err
+					}
 				}
 				var currentRevision int64
 				var workspaceState string
-				err := tx.QueryRow(ctx, `SELECT revision, state FROM workspaces WHERE id=$1 AND owner_id=$2`, workspaceID, record.OwnerID).
+				err := tx.QueryRow(ctx, `SELECT revision, state FROM workspaces WHERE id=$1 AND owner_id=$2`, workspaceID, workspaceOwnerID).
 					Scan(&currentRevision, &workspaceState)
 				if errors.Is(err, pgx.ErrNoRows) || (err == nil && (workspaceState != "ready" || currentRevision != workspaceCheckpointRevision || waitingReason == "workspace_input_changed")) {
 					return domain.NewError(domain.CodeWorkspaceConflict, "Workspace input changed; submit a new task with the current files")
@@ -163,6 +192,9 @@ WHERE id=$1 AND owner_id=$2 AND status=$4 RETURNING event_seq`,
 				if err != nil {
 					return fmt.Errorf("begin task stop transition: %w", err)
 				}
+				if err := interruptAssistantMessageSnapshot(ctx, tx, taskID, "", true); err != nil {
+					return err
+				}
 				// Fence any in-flight MCP result before the stop request becomes
 				// visible. The Task row is already locked, matching MCP result
 				// settlement's Task-before-operation lock order.
@@ -177,6 +209,14 @@ VALUES ($1,$2,$3,'pending',$4)`, requestIDToUse, taskID, string(action), safeAft
 				}
 				if err := insertTaskStatusEvent(ctx, tx, taskID, sequence, targetStatus, action, requestIDToUse); err != nil {
 					return err
+				}
+				if action == task.ActionCancel {
+					if err := requestActiveTaskAgentChildCancellations(ctx, tx, taskID, taskOwnerID); err != nil {
+						return err
+					}
+					if err := settleStoppedCurrentTaskAgentChildrenIfProven(ctx, tx, taskID, taskOwnerID); err != nil {
+						return err
+					}
 				}
 			case task.ActionResume:
 				var sequence int64
@@ -449,15 +489,28 @@ WHERE task_id=$1 AND status='dispatched'`, taskID); err != nil {
 			deferredConflict = domain.NewError(domain.CodeConflict, "task agent stop is unconfirmed")
 			return nil
 		}
-		var status, ownerID, workspaceID, waitingReason string
+		var status, ownerID, workspaceID, workspaceOwnerID, waitingReason string
 		var workspaceCheckpointRevision int64
-		if err := tx.QueryRow(ctx, `SELECT status, owner_id, COALESCE(workspace_id,''), COALESCE(workspace_checkpoint_revision,-1), waiting_reason
-FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &ownerID, &workspaceID, &workspaceCheckpointRevision, &waitingReason); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT status, owner_id, COALESCE(workspace_id,''), COALESCE(workspace_owner_id,owner_id), COALESCE(workspace_checkpoint_revision,-1), waiting_reason
+FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &ownerID, &workspaceID, &workspaceOwnerID, &workspaceCheckpointRevision, &waitingReason); err != nil {
 			return fmt.Errorf("read task status for stop completion: %w", err)
 		}
+		if action == task.ActionPause && waitingReason == "project_recovery_unavailable" {
+			var unconfirmed bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_instances
+WHERE task_id=$1 AND (state<>'stopped' OR (guardian_task_stop_ack_required AND guardian_stop_acknowledged_at IS NULL)
+ OR NOT ((stop_receipt IS NOT NULL AND stop_receipt_digest=sha256(stop_receipt)) IS TRUE
+      OR (guardian_stop_attestation IS NOT NULL AND guardian_stop_attestation_digest=sha256(guardian_stop_attestation)) IS TRUE)))`, taskID).Scan(&unconfirmed); err != nil {
+				return fmt.Errorf("check project recovery Agent stop evidence: %w", err)
+			}
+			if unconfirmed {
+				deferredConflict = domain.NewError(domain.CodeConflict, "project recovery Agent stop evidence is unconfirmed")
+				return nil
+			}
+		}
 		workspaceInputChanged := false
-		if action == task.ActionPause && workspaceID != "" && workspaceCheckpointRevision >= 0 {
-			changed, err := taskWorkspaceInputChanged(ctx, tx, ownerID, workspaceID, workspaceCheckpointRevision)
+		if action == task.ActionPause && waitingReason != "project_recovery_unavailable" && workspaceID != "" && workspaceCheckpointRevision >= 0 {
+			changed, err := taskWorkspaceInputChanged(ctx, tx, workspaceOwnerID, workspaceID, workspaceCheckpointRevision)
 			if err != nil {
 				return err
 			}
@@ -466,6 +519,8 @@ FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&status, &ownerID, &workspaceID
 		target := task.StatusPaused
 		if action == task.ActionCancel {
 			target = task.StatusCancelled
+		} else if waitingReason == "project_recovery_unavailable" {
+			target = task.StatusWaitingUser
 		}
 		expected := task.StatusPausing
 		if action == task.ActionCancel {
@@ -496,7 +551,16 @@ WHERE id=$1 AND task_id=$2 AND status='pending'`, stopID, taskID)
 		if command.RowsAffected() != 1 {
 			return stopClaimConflict()
 		}
-		if err := insertTaskStatusEvent(ctx, tx, taskID, sequence, target, action, stopID); err != nil {
+		if target == task.StatusWaitingUser {
+			payload, err := json.Marshal(map[string]string{"status": "waiting_user", "reason": "project_recovery_unavailable",
+				"message": "项目任务的权限或原始上下文已变化，无法安全恢复；请重新发送消息。"})
+			if err != nil {
+				return fmt.Errorf("encode project recovery waiting event: %w", err)
+			}
+			if err := insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.waiting_user", Payload: payload}); err != nil {
+				return err
+			}
+		} else if err := insertTaskStatusEvent(ctx, tx, taskID, sequence, target, action, stopID); err != nil {
 			return err
 		}
 		if action == task.ActionPause && workspaceInputChanged {
@@ -527,10 +591,12 @@ WHERE id=$1 AND task_id=$2 AND status='pending'`, stopID, taskID)
 // older Workspace revision and routes them through the existing safe-stop flow.
 func (s *Store) ReconcileStaleWorkspaceTasks(ctx context.Context) error {
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT t.id, t.owner_id, t.workspace_id, t.workspace_checkpoint_revision,
+		rows, err := tx.Query(ctx, `SELECT t.id, t.owner_id, t.workspace_id, COALESCE(t.workspace_owner_id,t.owner_id), t.workspace_checkpoint_revision,
 t.status, t.waiting_reason
 FROM tasks t JOIN workspaces w ON w.id=t.workspace_id
-WHERE t.workspace_checkpoint_revision IS NOT NULL AND (w.state <> 'ready' OR w.revision <> t.workspace_checkpoint_revision)
+WHERE t.workspace_checkpoint_revision IS NOT NULL
+  AND (w.state <> 'ready' OR w.deleted_at IS NOT NULL OR w.owner_id IS DISTINCT FROM t.workspace_owner_id
+       OR w.revision <> t.workspace_checkpoint_revision)
   AND t.status IN ('queued','running','waiting_user','paused')
   AND NOT (t.status='paused' AND t.waiting_reason='workspace_input_changed')
 ORDER BY t.updated_at, t.id LIMIT 100 FOR UPDATE OF t SKIP LOCKED`)
@@ -538,13 +604,13 @@ ORDER BY t.updated_at, t.id LIMIT 100 FOR UPDATE OF t SKIP LOCKED`)
 			return fmt.Errorf("list tasks with stale Workspace inputs: %w", err)
 		}
 		type staleTask struct {
-			id, ownerID, workspaceID, status, waitingReason string
-			workspaceCheckpointRevision                     int64
+			id, ownerID, workspaceID, workspaceOwnerID, status, waitingReason string
+			workspaceCheckpointRevision                                       int64
 		}
 		stale := make([]staleTask, 0)
 		for rows.Next() {
 			var item staleTask
-			if err := rows.Scan(&item.id, &item.ownerID, &item.workspaceID, &item.workspaceCheckpointRevision,
+			if err := rows.Scan(&item.id, &item.ownerID, &item.workspaceID, &item.workspaceOwnerID, &item.workspaceCheckpointRevision,
 				&item.status, &item.waitingReason); err != nil {
 				rows.Close()
 				return fmt.Errorf("read task with stale Workspace input: %w", err)
@@ -558,7 +624,7 @@ ORDER BY t.updated_at, t.id LIMIT 100 FOR UPDATE OF t SKIP LOCKED`)
 		rows.Close()
 
 		for _, item := range stale {
-			changed, err := taskWorkspaceInputChanged(ctx, tx, item.ownerID, item.workspaceID, item.workspaceCheckpointRevision)
+			changed, err := taskWorkspaceInputChanged(ctx, tx, item.workspaceOwnerID, item.workspaceID, item.workspaceCheckpointRevision)
 			if err != nil {
 				return err
 			}

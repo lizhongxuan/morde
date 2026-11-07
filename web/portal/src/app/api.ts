@@ -47,7 +47,11 @@ export const portalApi = {
   preferences: async () => unwrapApiResponse(await api.GET('/api/me/preferences')),
   savePreferences: async (body: components['schemas']['SaveUserPreferencesRequest']) => unwrapApiResponse(await api.PUT('/api/me/preferences', { body })),
   execution: async () => unwrapApiResponse(await api.GET('/api/execution')),
+  enableExecution: async (epoch: number, idempotencyKey: string) => unwrapApiResponse(await api.POST('/api/execution/enable', {
+    params: { header: { 'Idempotency-Key': idempotencyKey } }, body: { expected_epoch: epoch },
+  })),
   onboardingStatus: async () => unwrapApiResponse(await api.GET('/api/onboarding/status')),
+  availableModels: async () => unwrapApiResponse(await api.GET('/api/available-models')),
   ensureDefaultHost: async (body: components['schemas']['EnsureDefaultHostRequest'] = {}) => unwrapApiResponse(await api.POST('/api/me/default-host', { body })),
   login: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/login', { body: { name, password } })),
   register: async (name: string, password: string) => unwrapApiResponse(await api.POST('/api/auth/register', { body: { name, password } })),
@@ -156,6 +160,12 @@ export const portalApi = {
   revokeClient: async (id: string) => unwrapApiResponse(await api.DELETE('/api/clients/{id}', { params: { path: { id } } })),
   capabilities: async () => unwrapApiResponse(await api.GET('/api/capabilities')),
   conversations: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } })),
+  createConversation: async (body: components['schemas']['CreateConversationRequest'], idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    return unwrapApiResponse(await api.POST('/api/conversations', {
+      params: { header: { 'Idempotency-Key': idempotencyKey, 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } }, body,
+    }));
+  },
   conversation: async (id: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}', { params: { path: { id } } })),
   mainConversation: async (): Promise<MainConversation> => {
     const response = await requestFetch('/api/me/main-conversation');
@@ -174,9 +184,30 @@ export const portalApi = {
     });
     return readMainConversation(response);
   },
-  conversationMessages: async (id: string, cursor?: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
-    params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } },
-  })),
+  conversationMessages: async (id: string, cursor?: string, clientMessageID?: string, serviceInstanceID?: string, actorID?: string) => {
+    if (clientMessageID && (!serviceInstanceID || !actorID)) throw new Error('服务或账号身份尚未确认。');
+    return unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
+      params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}), ...(clientMessageID ? { client_message_id: clientMessageID } : {}) },
+        ...(serviceInstanceID || actorID ? { header: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}),
+          ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) },
+    }));
+  },
+  conversationTasks: async (id: string): Promise<components['schemas']['ConversationActiveTaskPage']> => {
+    const items: components['schemas']['ConversationActiveTask'][] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 1000; page += 1) {
+      const result = unwrapApiResponse(await api.GET('/api/conversations/{id}/tasks', {
+        params: { path: { id }, query: { limit: 100, ...(cursor ? { cursor } : {}) } },
+      }));
+      items.push(...result.items);
+      if (!result.next_cursor) return { items, next_cursor: null };
+      if (seen.has(result.next_cursor)) throw new Error('任务分页游标重复，无法继续读取');
+      seen.add(result.next_cursor);
+      cursor = result.next_cursor;
+    }
+    throw new Error('任务页数超过读取上限');
+  },
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
   taskWorkbenchObservationTicket: async (id: string): Promise<TaskWorkbenchObservationTicket> => readTaskWorkbenchObservationTicket(
     await requestFetch(`/api/tasks/${encodeURIComponent(id)}/workbench-observation-ticket`, { method: 'POST' }), id,
@@ -187,10 +218,31 @@ export const portalApi = {
   submitTask: async (body: components['schemas']['SubmitTaskRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
-  appendConversationMessage: async (id: string, body: components['schemas']['AppendConversationMessageRequest'], idempotencyKey = newIdempotencyKey()) => {
-    return unwrapApiResponse(await api.POST('/api/conversations/{id}/messages', {
-      params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  acceptConversationMessage: async (id: string, body: components['schemas']['AcceptConversationMessageRequest'], idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
+    if (idempotencyKey !== body.client_message_id) throw new Error('消息编号与请求编号不一致。');
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    const result = await api.POST('/api/conversations/{id}/messages', {
+      params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey, 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } }, body,
+    });
+    const submission = unwrapApiResponse(result);
+    if (result.response.status !== 202) throw new Error('服务端未确认任务创建，请核对后重试。');
+    return submission;
+  },
+  associateConversationAttachment: async (conversationID: string, messageID: string, clientAttachmentID: string, attachmentID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    unwrapApiResponse(await api.PUT('/api/conversations/{id}/messages/{message_id}/attachments/{client_attachment_id}', {
+      params: { path: { id: conversationID, message_id: messageID, client_attachment_id: clientAttachmentID },
+        header: { 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } }, body: { attachment_id: attachmentID },
     }));
+  },
+  retryConversationMessageProcessing: async (conversationID: string, messageID: string, idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
+    const result = await api.POST('/api/conversations/{id}/messages/{message_id}/retry-processing', {
+      parseAs: 'text',
+      params: { path: { id: conversationID, message_id: messageID },
+        header: { 'Idempotency-Key': idempotencyKey, 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    });
+    if (result.error !== undefined) unwrapApiResponse(result);
+    if (result.response.status !== 202) throw new Error('服务端未确认消息重试。');
   },
   answerTaskInput: async (id: string, body: components['schemas']['TaskInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/inputs', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
@@ -212,9 +264,10 @@ export const portalApi = {
   getPersonalObject: async (type: components['schemas']['PersonalMutationObjectType'], id: string) => unwrapApiResponse(await api.GET('/api/personal-data/{type}/{id}', { params: { path: { type, id } } })),
   replacePersonalObject: async (
     type: components['schemas']['PersonalMutationObjectType'], id: string, baseRevision: number,
-    body: components['schemas']['PersonalObjectPutRequest']['body'], idempotencyKey = newIdempotencyKey(),
+    body: components['schemas']['PersonalObjectPutRequest']['body'], idempotencyKey = newIdempotencyKey(), actorID?: string, serviceInstanceID?: string,
   ) => unwrapApiResponse(await api.PUT('/api/personal-data/{type}/{id}', {
     params: { path: { type, id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { base_revision: baseRevision, body },
+    headers: { ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}), ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}) },
   })),
   deletePersonalObject: async (
     type: components['schemas']['PersonalMutationObjectType'], id: string, baseRevision: number,
@@ -224,19 +277,22 @@ export const portalApi = {
   })),
   personalDataQuota: async () => unwrapApiResponse(await api.GET('/api/personal-data/quota')),
   createPersonalAttachmentUpload: async (
-    body: components['schemas']['PersonalAttachmentUploadRequest'], idempotencyKey = newIdempotencyKey(),
+    body: components['schemas']['PersonalAttachmentUploadRequest'], idempotencyKey = newIdempotencyKey(), serviceInstanceID?: string, actorID?: string,
   ) => unwrapApiResponse(await api.POST('/api/personal-data/uploads', {
     params: { header: { 'Idempotency-Key': idempotencyKey } }, body,
+    headers: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) },
   })),
-  putPersonalAttachmentChunk: async (uploadID: string, sequence: number, body: BodyInit, sha256: string) => {
+  putPersonalAttachmentChunk: async (uploadID: string, sequence: number, body: BodyInit, sha256: string, serviceInstanceID?: string, actorID?: string) => {
     const response = await requestFetch(`/api/personal-data/uploads/${encodeURIComponent(uploadID)}/chunks/${sequence}`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-SHA256': sha256 }, body,
+      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Chunk-SHA256': sha256,
+        ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) }, body,
     });
     if (!response.ok) await throwResponseError(response);
     return unwrapApiResponse(await response.json().then((data) => ({ data, response })));
   },
-  commitPersonalAttachment: async (uploadID: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/personal-data/uploads/{upload_id}/commit', {
+  commitPersonalAttachment: async (uploadID: string, idempotencyKey = newIdempotencyKey(), serviceInstanceID?: string, actorID?: string) => unwrapApiResponse(await api.POST('/api/personal-data/uploads/{upload_id}/commit', {
     params: { path: { upload_id: uploadID }, header: { 'Idempotency-Key': idempotencyKey } },
+    headers: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) },
   })),
   cancelPersonalAttachmentUpload: async (uploadID: string) => unwrapApiResponse(await api.DELETE('/api/personal-data/uploads/{upload_id}', { params: { path: { upload_id: uploadID } } })),
   personalAttachment: async (attachmentID: string): Promise<Blob> => {
@@ -244,7 +300,6 @@ export const portalApi = {
     if (!response.ok) await throwResponseError(response);
     return response.blob();
   },
-  importPersonalHistory: async (body: components['schemas']['PersonalHistoryImportRequest']) => unwrapApiResponse(await api.POST('/api/personal-data/history/import', { body })),
   goals: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/goals', {
     params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } },
   })),
@@ -278,23 +333,36 @@ export const portalApi = {
   createModelConnection: async (body: components['schemas']['CreateModelConnectionRequest']) => unwrapApiResponse(await api.POST('/api/model-connections', { body })),
   updateModelConnection: async (id: string, body: operations['updateModelConnection']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/model-connections/{id}', { params: { path: { id } }, body })),
   deleteModelConnection: async (id: string) => unwrapApiResponse(await api.DELETE('/api/model-connections/{id}', { params: { path: { id } } })),
-  checkModelConnection: async (id: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
-    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } },
+  mcpConnectors: async () => unwrapApiResponse(await api.GET('/api/mcp/connectors')),
+  createMCPConnector: async (body: components['schemas']['CreateMCPConnectorRequest']) => unwrapApiResponse(await api.POST('/api/mcp/connectors', { body })),
+  beginMCPConnectorOAuth: async (id: string, body: components['schemas']['BeginMCPConnectorOAuthRequest']) => unwrapApiResponse(await api.POST('/api/mcp/connectors/{id}/oauth/authorize', { params: { path: { id } }, body })),
+  updateMCPConnector: async (id: string, body: components['schemas']['UpdateMCPConnectorRequest']) => unwrapApiResponse(await api.PUT('/api/mcp/connectors/{id}', { params: { path: { id } }, body })),
+  rotateMCPConnectorCredential: async (id: string, body: components['schemas']['RotateMCPConnectorCredentialRequest']) => unwrapApiResponse(await api.PUT('/api/mcp/connectors/{id}/credential', { params: { path: { id } }, body })),
+  setMCPConnectorEnabled: async (id: string, body: operations['setMCPConnectorEnabled']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/mcp/connectors/{id}/enabled', { params: { path: { id } }, body })),
+  deleteMCPConnector: async (id: string, expectedRevision: number) => unwrapApiResponse(await api.DELETE('/api/mcp/connectors/{id}', { params: { path: { id }, query: { expected_revision: expectedRevision } } })),
+  checkModelConnection: async (id: string, idempotencyKey = newIdempotencyKey()) => {
+    const text = unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
+      params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { capability: 'text' },
+    }));
+    try {
+      return unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
+        params: { path: { id }, header: { 'Idempotency-Key': newIdempotencyKey() } }, body: { capability: 'tools' },
+      }));
+    } catch {
+      return text;
+    }
+  },
+  checkModelTextStreaming: async (id: string, idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/model-connections/{id}/check', {
+    params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body: { capability: 'text_stream' },
   })),
   adminOverview: async () => unwrapApiResponse(await api.GET('/api/admin/overview')),
   adminModelConnections: async () => unwrapApiResponse(await api.GET('/api/admin/model-connections')),
   adminUsage: async (days: 7 | 30 | 90) => unwrapApiResponse(await api.GET('/api/admin/usage', { params: { query: { days } } })),
   adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
-  adminActivity: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/activity', { params: { query: { days } } })),
-  adminPlaces: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/places', { params: { query: { days } } })),
   adminControls: async () => unwrapApiResponse(await api.GET('/api/admin/controls')),
   adminSettings: async () => unwrapApiResponse(await api.GET('/api/admin/settings')),
   updateAdminModelBudgetDefault: async (body: components['schemas']['UpdateAdminModelBudgetDefaultRequest']) => unwrapApiResponse(await api.PUT('/api/admin/settings/model-budget-default', { body })),
-  adminInvites: async (search = '', limit = 25, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/invites', { params: { query: { search, limit, offset } } })),
-  adminSites: async (limit = 25, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/sites', { params: { query: { limit, offset } } })),
-  adminNudges: async () => unwrapApiResponse(await api.GET('/api/admin/nudges')),
-  updateAdminNudges: async (body: components['schemas']['UpdateAdminNudgePolicyRequest']) => unwrapApiResponse(await api.PUT('/api/admin/nudges', { body })),
-  myInviteCode: async () => unwrapApiResponse(await api.GET('/api/me/invite-code')),
+  updateAdminModelDefault: async (body: components['schemas']['UpdateAdminModelDefaultRequest']) => unwrapApiResponse(await api.PUT('/api/admin/settings/model-default', { body })),
   publicNudges: async () => unwrapApiResponse(await api.GET('/api/nudges')),
   createAdminControlRule: async (body: components['schemas']['CreateAdminControlRuleRequest']) => unwrapApiResponse(await api.POST('/api/admin/controls/rules', { body })),
   updateAdminControlRule: async (id: number, body: operations['updateAdminControlRule']['requestBody']['content']['application/json']) => unwrapApiResponse(await api.PUT('/api/admin/controls/rules/{id}', { params: { path: { id } }, body })),
@@ -330,6 +398,7 @@ export const portalApi = {
   adminHosts: async () => unwrapApiResponse(await api.GET('/api/admin/hosts')),
   adminHostResources: async (id: string) => unwrapApiResponse(await api.GET('/api/admin/hosts/{id}/resources', { params: { path: { id } } })),
   updateAdminHostResources: async (id: string, body: components['schemas']['UpdateAdminHostResourcesRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/hosts/{id}/resources', { params: { path: { id } }, body })),
+  adminRecoverHost: async (id: string, body: components['schemas']['AdminHostRecoveryRequest']) => unwrapApiResponse(await api.POST('/api/admin/hosts/{id}/recovery', { params: { path: { id } }, body })),
   adminWorkspaces: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/admin/workspaces', {
     params: { query: { limit: 50, ...(cursor ? { cursor } : {}) } },
   })),

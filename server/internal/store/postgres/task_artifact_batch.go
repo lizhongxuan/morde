@@ -323,6 +323,10 @@ func (s *Store) RecordValidatedArtifact(ctx context.Context, ownerID string, art
 	}
 	var result task.Artifact
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		projectFence, err := lockProjectTaskWorkspaceFence(ctx, tx, artifact.TaskID, false)
+		if err != nil {
+			return err
+		}
 		taskRow, err := loadOwnedTaskForUpdate(ctx, tx, ownerID, artifact.TaskID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
@@ -330,10 +334,21 @@ func (s *Store) RecordValidatedArtifact(ctx context.Context, ownerID string, art
 		if err != nil {
 			return fmt.Errorf("lock task for artifact record: %w", err)
 		}
+		if err := verifyProjectTaskWorkspaceFence(ctx, tx, artifact.TaskID, projectFence); err != nil {
+			return err
+		}
+		taskRow, err = sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: artifact.TaskID, OwnerID: ownerID})
+		if err != nil {
+			return fmt.Errorf("read task for artifact record: %w", err)
+		}
 		if err := requireCurrentLease(ctx, tx, taskRow, leaseOwner, leaseVersion); err != nil {
 			return err
 		}
-		if taskRow.WorkspaceID.Valid {
+		if projectFence.projectID != "" {
+			if err := requireProjectWorkspacePublishAgent(ctx, tx, artifact.TaskID, ownerID, projectFence); err != nil {
+				return err
+			}
+		} else if taskRow.WorkspaceID.Valid {
 			if err := lockTaskWorkspaceForExecution(ctx, tx, taskRow.WorkspaceID.String, taskRow.InitiatorID); err != nil {
 				return err
 			}
@@ -382,7 +397,7 @@ func validateTaskArtifactWorkspaceProof(ctx context.Context, tx pgx.Tx, ownerID 
 	err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1
   FROM tasks t
-  JOIN workspaces w ON w.id=$3 AND w.owner_id=t.owner_id AND w.deleted_at IS NULL
+  JOIN workspaces w ON w.id=$3 AND w.owner_id=t.workspace_owner_id AND w.deleted_at IS NULL
   JOIN workspace_revision_files f ON f.workspace_id=$3 AND f.file_path=$4
     AND f.valid_from_revision <= $5 AND (f.valid_to_revision IS NULL OR f.valid_to_revision > $5)
     AND f.kind='file' AND f.size_bytes=$6 AND f.sha256=$7
@@ -501,7 +516,7 @@ func validateCompletedTaskArtifacts(ctx context.Context, tx pgx.Tx, ownerID, tas
   SELECT 1
   FROM task_artifacts a
   JOIN tasks t ON t.id=a.task_id AND t.owner_id=$2
-  LEFT JOIN workspaces w ON w.id=a.workspace_id AND w.owner_id=t.owner_id AND w.deleted_at IS NULL
+  LEFT JOIN workspaces w ON w.id=a.workspace_id AND w.owner_id=t.workspace_owner_id AND w.deleted_at IS NULL
   LEFT JOIN workspace_revision_files f ON f.workspace_id=a.workspace_id AND f.file_path=a.path
     AND f.valid_from_revision <= a.workspace_revision
     AND (f.valid_to_revision IS NULL OR f.valid_to_revision > a.workspace_revision)

@@ -36,6 +36,9 @@ func (s *Store) CreateWorkspaceCopyReservation(ctx context.Context, ownerID, sou
 	var reservation workspace.CopyReservation
 	replayed := false
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockWorkspaceMutationFence(ctx, tx, sourceWorkspaceID, true); err != nil {
+			return err
+		}
 		stored, replay, err := reserveIdempotency(ctx, tx, record, sourceWorkspaceID, id)
 		if err != nil {
 			return err
@@ -66,14 +69,18 @@ func (s *Store) CreateWorkspaceCopyReservation(ctx context.Context, ownerID, sou
 			return err
 		}
 		var currentOwner, state string
+		var readOnly bool
 		var currentRevision int64
 		var deleted bool
-		if err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL
-FROM workspaces WHERE id=$1`, sourceWorkspaceID).Scan(&currentOwner, &state, &currentRevision, &deleted); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL,is_read_only
+FROM workspaces WHERE id=$1`, sourceWorkspaceID).Scan(&currentOwner, &state, &currentRevision, &deleted, &readOnly); err != nil {
 			return storeError("read source Workspace for copy", "workspace", err)
 		}
 		if currentOwner != ownerID || deleted {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if readOnly {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if state != string(workspace.StateReady) || currentRevision != expectedRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed before copy reservation")
@@ -249,7 +256,7 @@ func (s *Store) TryWorkspaceCopyLock(ctx context.Context, reservationID string) 
 		return nil, false, domain.InvalidArgument("workspace_copy", "Workspace copy reservation ID is invalid")
 	}
 	if s.pool.Config().MaxConns < 2 {
-		return nil, false, fmt.Errorf("Workspace copy lock requires at least two database connections")
+		return nil, false, fmt.Errorf("workspace copy lock requires at least two database connections")
 	}
 	hasher := fnv.New64a()
 	_, _ = hasher.Write([]byte("morde:workspace-copy:" + reservationID))
@@ -282,7 +289,7 @@ func (s *Store) TryWorkspaceCopyLock(ctx context.Context, reservationID string) 
 		}
 		if !unlocked {
 			_ = discardLeaderConnection(conn)
-			return nil, false, errors.New("Workspace copy advisory lock was not held")
+			return nil, false, errors.New("workspace copy advisory lock was not held")
 		}
 		conn.Release()
 		return nil, false, nil

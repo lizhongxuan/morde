@@ -30,6 +30,11 @@ type HostStore interface {
 	TouchHosts(context.Context, []string, time.Time) error
 }
 
+type HostRestoreRecoveryStore interface {
+	RequeueUnknownHostRestore(context.Context, string, int64, string, time.Time) error
+	AdoptFailedHostRestore(context.Context, string, int64, string, string) error
+}
+
 // HostReplicaLivenessStore records authenticated Host Runtime poll activity.
 type HostReplicaLivenessStore interface {
 	RecordHostReplicaHeartbeat(context.Context, string, int64) error
@@ -109,6 +114,7 @@ const (
 
 type TaskWorkspacePublishCommand struct {
 	OwnerID, TaskID, WorkspaceID, HostID, LeaseOwner, OperationKey string
+	ProjectID, InitiatorID, WorkspaceOwnerID                       string
 	BindingVersion, LeaseVersion, InputRevision, BaseRevision      int64
 	HostFence                                                      AgentHostFence
 	ViewID, InputManifestSHA256                                    string
@@ -121,6 +127,7 @@ type TaskWorkspacePublishReceipt struct {
 	BaseRevision      int64
 	PublishedRevision int64
 	ManifestSHA256    string
+	RequestHash       string
 }
 
 // WorkspaceSyncStore owns durable manifests, change cursors, and resumable

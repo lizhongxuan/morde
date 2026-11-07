@@ -205,22 +205,15 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 		t.Fatalf("locate real morde-cloud-runtime entrypoint: %v", err)
 	}
 	stopKey := bytes.Repeat([]byte{0x53}, 32)
-	stopAuthenticator, err := app.NewAgentStopAuthenticator("f01-host-fence-supervisor", stopKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	instances, err := app.NewAgentInstanceService(store, stopAuthenticator)
-	if err != nil {
-		t.Fatal(err)
-	}
+	instances, conversationRuntimeManager, _ := newF01ConversationRuntime(t, store, node, script, "f01-host-fence-supervisor", stopKey)
 	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-host-fence-supervisor",
-		Supervisor: &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}},
-		Instances:  instances, Checkpoints: checkpoints, Models: f01TakeoverFileWriteModel{workspaceID: workspaceValue.ID},
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-host-fence-supervisor",
+		AccountRuntimes: conversationRuntimeManager,
+		Instances:       instances, Checkpoints: checkpoints, Models: f01TakeoverFileWriteModel{workspaceID: workspaceValue.ID},
 		Tools: toolBroker, Completion: toolBroker,
 	})
 	if err != nil {

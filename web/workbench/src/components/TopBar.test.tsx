@@ -67,7 +67,8 @@ describe('TopBar countdown', () => {
       onControlAction={onControlAction}
     />);
 
-    expect(container.querySelector('.control-state')).toHaveTextContent('当前控制者：AI · 桌面只读');
+    expect(container.querySelector('.control-state-full')).toHaveTextContent('当前控制者：AI · 桌面只读');
+    expect(container.querySelector('.control-state-compact')).toHaveTextContent('AI 控制中 · 只读');
     expect(screen.getByText('控制版本 0')).toBeInTheDocument();
     expect(container.querySelector('.desktop-sharing-notice')).toHaveTextContent('桌面画面可能显示此电脑上的文件');
     const takeOver = screen.getByRole('button', { name: '接管电脑' });
@@ -105,7 +106,8 @@ describe('TopBar countdown', () => {
       }}
     />);
 
-    expect(container.querySelector('.control-state')).toHaveTextContent('正在接管电脑，请稍候…');
+    expect(container.querySelector('.control-state-full')).toHaveTextContent('正在接管电脑，请稍候…');
+    expect(container.querySelector('.control-state-compact')).toHaveTextContent('接管中');
     expect(screen.queryByText('当前控制者：用户身份未提供')).not.toBeInTheDocument();
   });
 
@@ -132,6 +134,53 @@ describe('TopBar countdown', () => {
     expect(screen.getByText('当前操作账号：u7654321')).toBeInTheDocument();
     expect(screen.getByText('操作租约有效 · 剩余 00:00:08')).toBeInTheDocument();
     expect(screen.getByText('控制版本 8')).toBeInTheDocument();
+  });
+
+  it('marks verbose host details and renewal for mobile hiding while keeping control recovery actions', () => {
+    const onControlAction = vi.fn();
+    const onRetryControl = vi.fn();
+    const { container } = render(<TopBar
+      host={{ id: 'h1234567', name: '本地测试主机', portal_origin: 'http://127.0.0.1:5183', state: 'running', expires_at: '2026-10-19T01:00:00.000Z', workspaces: [] }}
+      renewing={false}
+      onRenew={vi.fn()}
+      {...controlProps}
+      control={{
+        host_id: 'h1234567',
+        control_state: 'user',
+        control_version: 8,
+        control_actor_user_id: 'u7654321',
+        control_lease_expires_at: '2026-10-19T00:05:00.000Z',
+        control_lease_active: true,
+        control_lease_held_by_me: true,
+        active_transition: null,
+      }}
+      controlError="Synthetic control read failure"
+      controlActionError="Synthetic control action failure"
+      controlActionLabel="交还 AI"
+      onControlAction={onControlAction}
+      onRetryControl={onRetryControl}
+    />);
+
+    for (const selector of [
+      '.host-expiry',
+      '.control-lease',
+      '.control-version',
+      '.desktop-sharing-notice',
+      '.host-renew-button',
+      '.control-state-full',
+      '.control-state-compact',
+    ]) {
+      expect(container.querySelector(selector), `${selector} remains available for the mobile CSS rule`).not.toBeNull();
+    }
+    expect(container.querySelector('.host-state')).toHaveTextContent('运行中');
+    expect(container.querySelector('.control-state-full')).toHaveTextContent('控制状态暂时不可用');
+    expect(container.querySelector('.control-state-compact')).toHaveTextContent('控制不可用');
+    expect(screen.getByRole('alert')).toHaveTextContent('Synthetic control action failure');
+
+    fireEvent.click(screen.getByRole('button', { name: '重试读取' }));
+    fireEvent.click(screen.getByRole('button', { name: '交还 AI' }));
+    expect(onRetryControl).toHaveBeenCalledOnce();
+    expect(onControlAction).toHaveBeenCalledOnce();
   });
 
   it('marks an expired control lease read-only', () => {

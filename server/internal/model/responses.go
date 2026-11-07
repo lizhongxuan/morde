@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +46,7 @@ var (
 	errResponseRead     = errors.New("could not read model provider response")
 )
 
-// ResponsesClient implements the OpenAI Responses API without following redirects
+// ResponsesClient calls allowed model providers without following redirects
 // or allowing requests to resolve to non-public addresses.
 type ResponsesClient struct {
 	allowedHosts map[string]struct{}
@@ -55,8 +56,12 @@ type ResponsesClient struct {
 // NewResponsesClient creates a production Responses API client restricted to
 // the exact DNS hostnames in allowedHosts. Each new connection re-resolves and
 // validates every returned address before dialing it.
-func NewResponsesClient(allowedHosts []string) (*ResponsesClient, error) {
-	return newResponsesClient(allowedHosts, newPublicHTTPTransport(allowedHosts))
+func NewResponsesClient(allowedHosts []string, proxyURL string) (*ResponsesClient, error) {
+	proxyAddress, err := modelProxyAddress(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return newResponsesClient(allowedHosts, newPublicHTTPTransport(allowedHosts, proxyAddress))
 }
 
 func newResponsesClient(allowedHosts []string, transport http.RoundTripper) (*ResponsesClient, error) {
@@ -93,19 +98,25 @@ func (c *ResponsesClient) Complete(ctx context.Context, request app.ModelRequest
 func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest, choice *toolChoice) (app.ModelResponse, error) {
 	endpointURL, err := c.endpointURL(request.Endpoint)
 	if err != nil {
-		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidRequest)
+		return app.ModelResponse{}, modelClientErrorAt(app.ModelErrorInvalidRequest, "client_validation", "")
 	}
-	body, err := encodeRequest(request, choice)
+	zai := isZAIEndpoint(request.Endpoint)
+	var body []byte
+	if zai {
+		body, err = encodeZAIRequest(request, choice)
+	} else {
+		body, err = encodeRequest(request, choice)
+	}
 	if err != nil {
-		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidRequest)
+		return app.ModelResponse{}, modelClientErrorAt(app.ModelErrorInvalidRequest, "client_validation", "")
 	}
 	if len(body) > maxRequestBytes {
-		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidRequest)
+		return app.ModelResponse{}, modelClientErrorAt(app.ModelErrorInvalidRequest, "client_validation", "")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
 	if err != nil {
-		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidRequest)
+		return app.ModelResponse{}, modelClientErrorAt(app.ModelErrorInvalidRequest, "client_validation", "")
 	}
 	req.Header.Set("Authorization", "Bearer "+request.Endpoint.APIKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -139,13 +150,18 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 			}
 			return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
 		}
-		return app.ModelResponse{}, providerStatusError(resp.StatusCode, responseBody, request.Endpoint.APIKey)
+		return app.ModelResponse{}, providerStatusError(resp.StatusCode, responseBody, request.Endpoint.APIKey, zai)
 	}
 	if request.OnTextDelta != nil {
 		if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
 		}
-		response, err := readStreamingResponse(resp.Body, request.OnTextDelta)
+		var response app.ModelResponse
+		if zai {
+			response, err = readZAIStream(resp.Body, request.OnTextDelta)
+		} else {
+			response, err = readStreamingResponse(resp.Body, request.OnTextDelta)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return app.ModelResponse{}, ctx.Err()
@@ -169,11 +185,16 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 		return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
 	}
 
-	var result responseBodyJSON
-	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
+	var response app.ModelResponse
+	if zai {
+		response, err = parseZAIResponse(responseBody)
+	} else {
+		var result responseBodyJSON
+		if err := json.Unmarshal(responseBody, &result); err != nil {
+			return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
+		}
+		response, err = parseResponse(result)
 	}
-	response, err := parseResponse(result)
 	if err != nil {
 		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
 	}
@@ -203,6 +224,7 @@ func (c *ResponsesClient) Check(ctx context.Context, endpoint app.ModelEndpoint)
 			Strict:      true,
 		}},
 		MaxOutputTokens: 64,
+		DisableThinking: true,
 	}
 	response, err := c.complete(ctx, request, &toolChoice{Type: "function", Name: probeTool})
 	if err != nil {
@@ -226,7 +248,7 @@ func (c *ResponsesClient) Check(ctx context.Context, endpoint app.ModelEndpoint)
 }
 
 // endpointURL treats BaseURL as the provider API base, such as
-// https://api.openai.com/v1, and appends the Responses endpoint.
+// https://api.openai.com/v1, and appends the matching provider endpoint.
 func (c *ResponsesClient) endpointURL(endpoint app.ModelEndpoint) (string, error) {
 	if endpoint.APIKey == "" || len(endpoint.APIKey) > maxAPIKeyBytes || strings.IndexFunc(endpoint.APIKey, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
 		return "", errors.New("model API key is missing or invalid")
@@ -251,7 +273,11 @@ func (c *ResponsesClient) endpointURL(endpoint app.ModelEndpoint) (string, error
 	if net.ParseIP(host) != nil || strings.HasSuffix(host, ".") || hasInvalidPathSegment(u.Path) {
 		return "", errors.New("model base URL is invalid")
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/responses"
+	if host == "api.z.ai" {
+		u.Path = strings.TrimRight(u.Path, "/") + "/chat/completions"
+	} else {
+		u.Path = strings.TrimRight(u.Path, "/") + "/responses"
+	}
 	u.RawPath = ""
 	return u.String(), nil
 }
@@ -318,6 +344,13 @@ func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error)
 		Temperature:     request.Temperature,
 		Stream:          request.OnTextDelta != nil,
 		ToolChoice:      choice,
+	}
+	// GPT-6 Luna spends a small capability probe's entire output budget on
+	// its default reasoning effort unless the probe explicitly selects none.
+	// Keep this opt-in limited to the verified first-party model: OpenAI-
+	// compatible endpoints and older models may reject the Responses field.
+	if request.DisableThinking && isOpenAIGPT6Luna(request.Endpoint) {
+		payload.Reasoning = &responseReasoning{Effort: "none"}
 	}
 	if len(tools) == 0 {
 		payload.Tools = nil
@@ -547,7 +580,7 @@ func readStreamingResponse(body io.Reader, onTextDelta func(string) error) (app.
 	return result, nil
 }
 
-func providerStatusError(status int, body []byte, apiKey string) error {
+func providerStatusError(status int, body []byte, apiKey string, zai bool) error {
 	var parsed struct {
 		Error struct {
 			Code string `json:"code"`
@@ -555,6 +588,9 @@ func providerStatusError(status int, body []byte, apiKey string) error {
 		} `json:"error"`
 	}
 	_ = json.Unmarshal(body, &parsed)
+	if zai && parsed.Error.Code == "1113" {
+		return modelClientErrorAt(app.ModelErrorQuota, "provider_status", "")
+	}
 	code := safeProviderCode(parsed.Error.Code)
 	if code == "" {
 		code = safeProviderCode(parsed.Error.Type)
@@ -562,22 +598,24 @@ func providerStatusError(status int, body []byte, apiKey string) error {
 	if strings.Contains(code, apiKey) {
 		code = ""
 	}
+	var kind app.ModelClientErrorKind
 	switch {
 	case code == "insufficient_quota" || code == "billing_hard_limit_reached":
-		return modelClientError(app.ModelErrorQuota)
+		kind = app.ModelErrorQuota
 	case status == http.StatusUnauthorized:
-		return modelClientError(app.ModelErrorAuthentication)
+		kind = app.ModelErrorAuthentication
 	case status == http.StatusForbidden:
-		return modelClientError(app.ModelErrorAccess)
+		kind = app.ModelErrorAccess
 	case status == http.StatusTooManyRequests:
-		return modelClientError(app.ModelErrorRateLimited)
+		kind = app.ModelErrorRateLimited
 	case status >= 400 && status < 500:
-		return modelClientError(app.ModelErrorInvalidRequest)
+		kind = app.ModelErrorInvalidRequest
 	case status >= 500:
-		return modelClientError(app.ModelErrorUnavailable)
+		kind = app.ModelErrorUnavailable
 	default:
-		return modelClientError(app.ModelErrorInvalidResponse)
+		kind = app.ModelErrorInvalidResponse
 	}
+	return modelClientErrorAt(kind, "provider_status", code)
 }
 
 func readResponseBody(body io.Reader, limit int64) ([]byte, error) {
@@ -691,7 +729,31 @@ func redSquarePNG() ([]byte, error) {
 	return encoded.Bytes(), nil
 }
 
-func newPublicHTTPTransport(allowedHosts []string) http.RoundTripper {
+func modelProxyAddress(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", errors.New("model proxy must be an HTTP URL with a host and port")
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || host == "" {
+		return "", errors.New("model proxy must have a host and port")
+	}
+	if net.ParseIP(host) == nil {
+		if _, err := normalizeAllowedHost(host); err != nil {
+			return "", errors.New("model proxy host is invalid")
+		}
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", errors.New("model proxy port is invalid")
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+func newPublicHTTPTransport(allowedHosts []string, proxyAddress string) http.RoundTripper {
 	allowed := make(map[string]struct{}, len(allowedHosts))
 	for _, host := range allowedHosts {
 		name, err := normalizeAllowedHost(host)
@@ -711,13 +773,27 @@ func newPublicHTTPTransport(allowedHosts []string) http.RoundTripper {
 			if _, ok := allowed[host]; !ok || net.ParseIP(host) != nil {
 				return nil, errors.New("model provider host is not allowlisted")
 			}
+			if proxyAddress != "" && host == "api.openai.com" {
+				// Some managed desktop resolvers deliberately return synthetic
+				// non-public records for public APIs. For this fixed, allowlisted
+				// provider only, delegate DNS to the explicitly configured proxy;
+				// TLS still verifies api.openai.com against a public certificate.
+				return dialModelProxy(ctx, dialer, proxyAddress, net.JoinHostPort(host, port))
+			}
 			ips, err := resolvePublicAddresses(ctx, net.DefaultResolver, host)
 			if err != nil {
 				return nil, err
 			}
 			var lastErr error
 			for _, result := range ips {
-				conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(result.IP.String(), port))
+				target := net.JoinHostPort(result.IP.String(), port)
+				var conn net.Conn
+				var dialErr error
+				if proxyAddress == "" {
+					conn, dialErr = dialer.DialContext(ctx, network, target)
+				} else {
+					conn, dialErr = dialModelProxy(ctx, dialer, proxyAddress, target)
+				}
 				if dialErr == nil {
 					return conn, nil
 				}
@@ -734,6 +810,58 @@ func newPublicHTTPTransport(allowedHosts []string) http.RoundTripper {
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	return transport
+}
+
+// dialModelProxy sends only a validated public IP to the explicitly configured proxy;
+// the HTTP transport still verifies TLS against the original provider hostname.
+func dialModelProxy(ctx context.Context, dialer *net.Dialer, proxyAddress, target string) (net.Conn, error) {
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	deadline := time.Now().Add(10 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target}, Host: target, Header: make(http.Header)}
+	if err := request.Write(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	reader := bufio.NewReader(io.LimitReader(conn, 64<<10))
+	response, err := http.ReadResponse(reader, request) //nolint:bodyclose // A successful CONNECT turns this connection into the tunnel.
+	if err != nil || response.StatusCode != http.StatusOK {
+		_ = conn.Close()
+		return nil, errors.New("model proxy refused the connection")
+	}
+	buffered := make([]byte, reader.Buffered())
+	if _, err := io.ReadFull(reader, buffered); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if len(buffered) != 0 {
+		return &bufferedModelProxyConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(buffered), conn)}, nil
+	}
+	return conn, nil
+}
+
+type bufferedModelProxyConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (conn *bufferedModelProxyConn) Read(buffer []byte) (int, error) {
+	return conn.reader.Read(buffer)
 }
 
 type addressResolver interface {
@@ -800,14 +928,27 @@ func isPublicIP(ip net.IP) bool {
 }
 
 type responseRequest struct {
-	Model           string         `json:"model"`
-	Instructions    string         `json:"instructions,omitempty"`
-	Input           []any          `json:"input"`
-	Tools           []responseTool `json:"tools,omitempty"`
-	ToolChoice      *toolChoice    `json:"tool_choice,omitempty"`
-	MaxOutputTokens int            `json:"max_output_tokens"`
-	Temperature     *float64       `json:"temperature,omitempty"`
-	Stream          bool           `json:"stream,omitempty"`
+	Model           string             `json:"model"`
+	Instructions    string             `json:"instructions,omitempty"`
+	Input           []any              `json:"input"`
+	Tools           []responseTool     `json:"tools,omitempty"`
+	ToolChoice      *toolChoice        `json:"tool_choice,omitempty"`
+	MaxOutputTokens int                `json:"max_output_tokens"`
+	Temperature     *float64           `json:"temperature,omitempty"`
+	Stream          bool               `json:"stream,omitempty"`
+	Reasoning       *responseReasoning `json:"reasoning,omitempty"`
+}
+
+type responseReasoning struct {
+	Effort string `json:"effort"`
+}
+
+func isOpenAIGPT6Luna(endpoint app.ModelEndpoint) bool {
+	if endpoint.ModelID != "gpt-6-luna" {
+		return false
+	}
+	parsed, err := url.Parse(endpoint.BaseURL)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "api.openai.com")
 }
 
 type responseInputItem struct {
@@ -880,4 +1021,8 @@ type incompleteDetails struct {
 
 func modelClientError(kind app.ModelClientErrorKind) error {
 	return &app.ModelClientError{Kind: kind}
+}
+
+func modelClientErrorAt(kind app.ModelClientErrorKind, stage, providerCode string) error {
+	return &app.ModelClientError{Kind: kind, Stage: stage, ProviderCode: providerCode}
 }

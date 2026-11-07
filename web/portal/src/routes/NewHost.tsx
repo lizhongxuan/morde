@@ -144,9 +144,9 @@ export function NewHost() {
   if (hosts.isError) return <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>;
   if (hosts.data.items.length >= (user?.quota.hosts ?? 0)) return <div className="notice notice-warning" role="alert">达到云端电脑上限,无法再创建</div>;
   return <section>
-    <div className="page-heading"><div><p className="eyebrow">我的云端电脑</p><h1>创建云端电脑</h1><p className="muted">使用管理员为你设置的规格。</p></div><Link className="button button-quiet" to="/hosts">返回云端电脑列表</Link></div>
     {recoveryError && <div className="notice notice-warning" role="alert">无法读取本机上次创建记录。为避免重复创建，请先到主机列表核实结果，再选择清除记录。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，清除记录</button></div>}
     <form className="form-card form-stack" onSubmit={submit}>
+      <div className="design-panel-header"><div><h2>基本配置</h2><p>使用管理员为你设置的规格。</p></div><Link className="button button-secondary" to="/hosts">← 返回云端电脑</Link></div>
       {recoveryPending && !create.isPending && <div className="notice notice-warning" role="status">上次创建结果尚未确认。继续会用相同请求编号核对结果；若已在主机列表确认，可以放弃恢复并重新填写。<button type="button" className="button button-secondary" onClick={abandonRecovery}>我已核实，放弃恢复并重新填写</button></div>}
       <p className="notice notice-info">默认工作和下载目录位于 <code>/home/gem/workspace</code>。在应用中手动保存到 Workspace 以外的数据属于容器临时数据；旧电脑数据是否迁移需单独核对。</p>
       <label htmlFor="host-name">主机名称 <span className="muted">（可选）</span></label>

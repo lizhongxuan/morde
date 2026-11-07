@@ -476,6 +476,7 @@ func createPendingLegacyWorkspace(t *testing.T, ctx context.Context, store *Stor
 	t.Helper()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, name)
+	removeInitialWorkspaceRootForLegacyTest(t, ctx, store.pool, value.ID)
 	volumeName := "legacy-" + value.ID
 	if _, err := store.pool.Exec(ctx, `
 INSERT INTO workspace_legacy_volumes (workspace_id, volume_name, import_state)

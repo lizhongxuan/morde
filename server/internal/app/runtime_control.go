@@ -50,17 +50,17 @@ func NewRuntimeControl(hosts HostStore, sandboxes SandboxRouter, sealer *Sealer)
 	return &RuntimeControl{hosts: hosts, sandboxes: sandboxes, sealer: sealer}, nil
 }
 
-// ReadTaskFence returns the current Host generation and AI-control gate for an
-// owned, live Host. Callers still recheck it before every runtime operation.
-func (r *RuntimeControl) ReadTaskFence(ctx context.Context, ownerID, hostID string) (AgentHostFence, error) {
-	if ctx == nil || !domain.ValidUserID(ownerID) || !domain.ValidHostID(hostID) {
+// ReadTaskFence returns the current Host generation and AI-control gate for a
+// live Host controlled by the task actor. Callers recheck it before operations.
+func (r *RuntimeControl) ReadTaskFence(ctx context.Context, actorID, hostID string) (AgentHostFence, error) {
+	if ctx == nil || !domain.ValidUserID(actorID) || !domain.ValidHostID(hostID) {
 		return AgentHostFence{}, domain.NewError(domain.CodeNotFound, "Host not found")
 	}
 	value, err := r.hosts.GetHost(ctx, hostID)
 	if err != nil {
 		return AgentHostFence{}, err
 	}
-	if value.OwnerID != ownerID || value.State != host.StateRunning || value.DeletedAt != nil {
+	if value.State != host.StateRunning || value.DeletedAt != nil || authorizeTaskHostControl(ctx, r.hosts, value, actorID) != nil {
 		return AgentHostFence{}, domain.NewError(domain.CodeNotFound, "Host not found")
 	}
 	return AgentHostFence{
@@ -69,6 +69,31 @@ func (r *RuntimeControl) ReadTaskFence(ctx context.Context, ownerID, hostID stri
 		ControlVersion:    value.ControlVersion,
 		AIAllowed:         value.ControlState == host.ControlAI,
 	}, nil
+}
+
+// authorizeTaskHostControl checks the current Host owner and a non-owner's
+// current control grant. The operation store later fences the precise grant
+// version atomically with dispatch and completion.
+func authorizeTaskHostControl(ctx context.Context, hosts HostStore, value host.Host, actorID string) error {
+	if value.OwnerID == actorID {
+		return nil
+	}
+	sharing, ok := hosts.(interface {
+		GetHostActorAccess(context.Context, string, string) (host.ActorAccess, error)
+	})
+	if !ok {
+		return domain.NewError(domain.CodeNotFound, "Host not found")
+	}
+	access, err := sharing.GetHostActorAccess(ctx, value.ID, actorID)
+	if err != nil || access.Disabled || access.OwnerID != value.OwnerID {
+		return domain.NewError(domain.CodeNotFound, "Host not found")
+	}
+	for _, permission := range access.Permissions {
+		if permission == host.PermissionDesktopControl {
+			return nil
+		}
+	}
+	return domain.NewError(domain.CodeNotFound, "Host not found")
 }
 
 // Connect loads the current Host fence, performs a TLS-pinned capabilities

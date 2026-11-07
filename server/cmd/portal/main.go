@@ -286,7 +286,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
-	modelClient, err := model.NewResponsesClient(cfg.Models.AllowedHosts)
+	modelClient, err := model.NewResponsesClient(cfg.Models.AllowedHosts, cfg.Models.ProxyURL)
 	if err != nil {
 		return fmt.Errorf("initialize model client: %w", err)
 	}
@@ -314,8 +314,11 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize project budget service: %w", err)
 	}
-	mcpConnectors, err := app.NewMCPConnectorService(store, sealer,
-		cfg.Domains.Scheme+"://"+cfg.Domains.Portal+"/api/mcp/oauth/callback")
+	var connectorOAuthRedirect string
+	if cfg.Domains.Scheme == "https" {
+		connectorOAuthRedirect = "https://" + cfg.Domains.Portal + "/api/mcp/oauth/callback"
+	}
+	mcpConnectors, err := app.NewMCPConnectorService(store, sealer, connectorOAuthRedirect)
 	if err != nil {
 		return fmt.Errorf("initialize MCP connectors: %w", err)
 	}
@@ -342,6 +345,10 @@ func serve(ctx context.Context, configPath string) error {
 	adminModelBudgetDefaults, err := app.NewAdminModelBudgetDefaultService(store)
 	if err != nil {
 		return fmt.Errorf("initialize admin model budget defaults: %w", err)
+	}
+	adminModelDefaults, err := app.NewAdminModelDefaultService(store)
+	if err != nil {
+		return fmt.Errorf("initialize admin model defaults: %w", err)
 	}
 	recordConsents, err := app.NewRecordConsentService(store)
 	if err != nil {
@@ -383,6 +390,10 @@ func serve(ctx context.Context, configPath string) error {
 	}); err != nil {
 		return fmt.Errorf("configure Workspace copy materializer: %w", err)
 	}
+	workspaceShares, err := app.NewWorkspaceShareService(store, workspaceCopies, workspaceOwnershipTransfers)
+	if err != nil {
+		return fmt.Errorf("initialize Workspace share service: %w", err)
+	}
 	auditService, err := app.NewAuditService(store)
 	if err != nil {
 		return err
@@ -423,7 +434,8 @@ func serve(ctx context.Context, configPath string) error {
 		Hosts: store, Users: store, Workspaces: store, DefaultWorkspaces: workspaces, WorkspaceVolumes: workspaceVolumes, Tokens: store,
 		Sandboxes: router, Probe: aioClient, Runtime: runtimeControl, Audit: auditService, CreateLocks: store, Sealer: sealer, Volumes: volumes, DiskCapacity: volumes,
 		Templates: templates, DefaultTemplateID: cfg.Templates.Default, Capacity: app.Capacity{CPUMilli: cfg.Capacity.CPUMilli, MemMiB: cfg.Capacity.MemMiB},
-		Instance: cfg.Instance, Scheme: cfg.Domains.Scheme, PortalURL: cfg.Domains.Scheme + "://" + cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
+		Instance: cfg.Instance, Scheme: cfg.Domains.Scheme, PortalURL: cfg.Domains.Scheme + "://" + cfg.Domains.Portal,
+		RuntimePortalURL: cfg.Hosts.RuntimePortalURL, HostSuffix: cfg.Domains.HostSuffix,
 		TicketTTL: cfg.Security.TicketTTL, ReadyTimeout: cfg.Hosts.ReadyTimeout,
 		ReadyPollInterval: cfg.Hosts.ReadyPollInterval, NotifyCreate: queue.Notify,
 		ObserveHostReady: func(result string, duration time.Duration) {
@@ -533,11 +545,7 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize conversation service: %w", err)
 	}
-	instantChat, err := app.NewTaskChatCompatibilityService(tasks, conversations)
-	if err != nil {
-		return fmt.Errorf("initialize task chat compatibility: %w", err)
-	}
-	executionAdapters := cloudDSHAdaptersForRuntime(cfg.CloudDSH.Enabled, tasks, schedules, instantChat, schedules)
+	executionAdapters := cloudDSHAdaptersForRuntime(cfg.CloudDSH.Enabled, tasks, schedules, schedules)
 	projectConversations, err := app.NewProjectConversationService(store, projects, projectConversationTaskAppender{tasks: executionAdapters.tasks})
 	if err != nil {
 		return fmt.Errorf("initialize project conversation service: %w", err)
@@ -606,6 +614,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize personal attachment service: %w", err)
 	}
+	projectConversationAttachments, err := app.NewProjectConversationAttachmentService(store)
+	if err != nil {
+		return fmt.Errorf("initialize project conversation attachment service: %w", err)
+	}
 	personalHistoryImportService, err := app.NewPersonalHistoryImportService(store)
 	if err != nil {
 		return fmt.Errorf("initialize personal history import service: %w", err)
@@ -633,18 +645,32 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("initialize record worker: %w", err)
 	}
-	var executionControlService *app.ExecutionControlService
+	resultWorker, err := worker.NewConversationResultAggregationWorker(store, 100*time.Millisecond, logger)
+	if err != nil {
+		return fmt.Errorf("initialize conversation result worker: %w", err)
+	}
+	var executionControlService api.ExecutionControlService
 	var taskWorker *worker.TaskWorker
+	var routeWorker *worker.ConversationRouteWorker
 	if cfg.CloudDSH.Enabled {
 		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
 		if err != nil {
 			return err
 		}
 		taskWorker, err = newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
-			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService, goalService, projects,
+			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
+			personalAttachmentService, goalService, schedules, projects,
 			hubService, workerSuffix, logger)
 		if err != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", err)
+		}
+		routeWorker, err = worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+			Queue: store, Actions: store, Models: modelGateway, WorkerID: workerSuffix + "-route",
+			LeaseDuration: 2 * time.Minute, PollInterval: 500 * time.Millisecond,
+			MaxConcurrent: min(cfg.CloudDSH.MaxConcurrentTasks, 16), Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize conversation routing worker: %w", err)
 		}
 	}
 	mcpRuntimeTools, err := app.NewMCPRuntimeToolExecutor(store, mcpHosts, credentials, store, runtimeControl)
@@ -680,18 +706,19 @@ func serve(ctx context.Context, configPath string) error {
 	apiHandler, err := api.New(api.Deps{
 		Hosts: hosts, HostSharing: hostSharing, HostReplicas: hostReplicas, HostUsage: hostUsageService, TLSAuthorizer: hosts, Verifier: credentials, Auth: authAdapter{service: credentials, users: users},
 		WorkspaceOps: workspaces, WorkspaceSync: workspaceSync, WorkspaceSyncDevices: workspaceSyncDevices, WorkspaceDiff: workspaceSync,
-		WorkspaceCopies: workspaceCopies, WorkspaceTransfers: workspaceOwnershipTransfers,
+		WorkspaceCopies: workspaceCopies, WorkspaceTransfers: workspaceOwnershipTransfers, WorkspaceShares: workspaceShares,
 		Sites: siteService, Templates: templateAdapter{values: templates},
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskObservationTickets: tasks, Conversations: conversations,
-		ProjectConversations:        projectConversations,
-		ProjectWorkItems:            projectWorkItems,
-		ProjectBudget:               projectBudgets,
-		ProjectMCPConnectors:        projectMCPConnectors,
-		ProjectBudgetExecutionReady: len(cfg.Models.ProjectRates) > 0,
-		RuntimeOperationLedger:      store,
-		Projects:                    projects, ProjectContent: projects, InstantChat: executionAdapters.instantChat,
+		ProjectConversations:           projectConversations,
+		ProjectConversationAttachments: projectConversationAttachments,
+		ProjectWorkItems:               projectWorkItems,
+		ProjectBudget:                  projectBudgets,
+		ProjectMCPConnectors:           projectMCPConnectors,
+		ProjectBudgetExecutionReady:    len(cfg.Models.ProjectRates) > 0,
+		RuntimeOperationLedger:         store,
+		Projects:                       projects, ProjectContent: projects,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
 		Goals: goalService, Schedules: executionAdapters.schedules,
@@ -700,8 +727,9 @@ func serve(ctx context.Context, configPath string) error {
 		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
 		AdminOperations:          adminOperations,
 		AdminModelBudgetDefaults: adminModelBudgetDefaults,
+		AdminModelDefaults:       adminModelDefaults,
 		RecordConsents:           recordConsents, RecordAccess: recordAccess, RecordCaptureStatus: recordCapture,
-		AdminHostResources: adminHostResources, AdminWorkspaces: adminWorkspaces,
+		AdminHostResources: adminHostResources, AdminHostRecovery: hosts, AdminWorkspaces: adminWorkspaces,
 		AdminAudit: auditService,
 		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
@@ -760,7 +788,7 @@ func serve(ctx context.Context, configPath string) error {
 	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
 	defer stopPersonalCleanup()
 	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, logger)
-	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, recordWorker, scheduleWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker, resultWorker, recordWorker, scheduleWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
 func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService, logger *zap.Logger) {
@@ -794,8 +822,9 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
 	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
-	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService, goals *app.GoalService,
-	projects *app.ProjectService, hubService *app.HubService, workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
+	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
+	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
+	workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -837,10 +866,19 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	tools, err := app.NewCloudDSHToolBrokerWithPersonalData(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(),
-		recordCapture, personalData, personalSync, goals, projects, hubService)
+	tools, err := app.NewCloudDSHToolBrokerWithPersonalDataAndSchedules(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(),
+		recordCapture, personalData, personalSync, goals, personalFiles, projects, schedules, hubService)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.BuiltinSearch.Enabled {
+		search, err := newBuiltinSearchToolClient(cfg.BuiltinSearch)
+		if err != nil {
+			return nil, fmt.Errorf("configure built-in search: %w", err)
+		}
+		if err := tools.SetBuiltinSearch(search); err != nil {
+			return nil, err
+		}
 	}
 	childSessions, err := app.NewAgentChildSessionService(store)
 	if err != nil {
@@ -852,7 +890,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	}
 	supervisor, err := worker.NewDockerCloudDSHSupervisor(worker.DockerCloudDSHSupervisorOptions{
 		DockerHost: cfg.DockerHost, Image: cfg.Image, NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath,
-		SupervisorID: cfg.SupervisorID, SigningKey: supervisorKey, Guardian: guardian,
+		Guardian: guardian,
 	})
 	if err != nil {
 		return nil, err
@@ -874,9 +912,8 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 		return nil, err
 	}
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
-		NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath, SupervisorID: cfg.SupervisorID,
-		Supervisor: supervisor, AccountRuntimes: accountRuntimes, Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools,
-		Children: childSessions, Completion: tools,
+		SupervisorID: cfg.SupervisorID, AccountRuntimes: accountRuntimes, Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools,
+		Children: childSessions, Completion: tools, RevisionStops: store, TextStreams: store, ProjectContexts: store,
 	})
 	if err != nil {
 		return nil, err
@@ -1276,7 +1313,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, resultWorker *worker.ConversationResultAggregationWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -1303,6 +1340,8 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	go func() { notificationWorkerDone <- notificationWorker.Run(workerCtx) }()
 	recordWorkerDone := make(chan error, 1)
 	go func() { recordWorkerDone <- recordWorker.Run(workerCtx) }()
+	resultWorkerDone := make(chan error, 1)
+	go func() { resultWorkerDone <- resultWorker.Run(workerCtx) }()
 	var scheduleWorkerDone chan error
 	if scheduleWorker != nil {
 		scheduleWorkerDone = make(chan error, 1)
@@ -1315,6 +1354,14 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		cancelTaskWorker = cancel
 		taskWorkerDone = make(chan error, 1)
 		go func() { taskWorkerDone <- taskWorker.Run(taskWorkerCtx) }()
+	}
+	var routeWorkerDone chan error
+	var cancelRouteWorker context.CancelFunc
+	if routeWorker != nil {
+		routeWorkerCtx, cancel := context.WithCancel(context.Background())
+		cancelRouteWorker = cancel
+		routeWorkerDone = make(chan error, 1)
+		go func() { routeWorkerDone <- routeWorker.Run(routeWorkerCtx) }()
 	}
 	serverErrors := make(chan error, len(servers))
 	var serverWG sync.WaitGroup
@@ -1332,6 +1379,8 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	}
 	var runErr error
 	taskWorkerExited := false
+	routeWorkerExited := false
+	resultWorkerExited := false
 	select {
 	case <-ctx.Done():
 	case runErr = <-serverErrors:
@@ -1341,6 +1390,20 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			runErr = errors.New("cloud task worker stopped unexpectedly")
 		} else {
 			runErr = fmt.Errorf("cloud task worker stopped unexpectedly: %w", err)
+		}
+	case err := <-routeWorkerDone:
+		routeWorkerExited = true
+		if err == nil {
+			runErr = errors.New("conversation routing worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("conversation routing worker stopped unexpectedly: %w", err)
+		}
+	case err := <-resultWorkerDone:
+		resultWorkerExited = true
+		if err == nil {
+			runErr = errors.New("conversation result worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("conversation result worker stopped unexpectedly: %w", err)
 		}
 	case err := <-scheduleWorkerDone:
 		if err == nil {
@@ -1363,6 +1426,21 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		closer.CloseConnections()
 	}
 	serverWG.Wait()
+	if cancelRouteWorker != nil {
+		cancelRouteWorker()
+		if !routeWorkerExited {
+			select {
+			case err := <-routeWorkerDone:
+				if err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+					runErr = fmt.Errorf("stop conversation routing worker: %w", err)
+				}
+			case <-shutdownCtx.Done():
+				if runErr == nil {
+					runErr = errors.New("conversation routing worker did not stop before shutdown timeout")
+				}
+			}
+		}
+	}
 	if cancelTaskWorker != nil {
 		cancelTaskWorker()
 		if !taskWorkerExited {
@@ -1381,6 +1459,11 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		}
 	}
 	cancelWorker()
+	if !resultWorkerExited {
+		if err := <-resultWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+			runErr = fmt.Errorf("stop conversation result worker: %w", err)
+		}
+	}
 	if err := <-workerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 		runErr = fmt.Errorf("stop worker: %w", err)
 	}

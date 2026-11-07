@@ -18,7 +18,8 @@ import (
 )
 
 type modelConnectionListResponse struct {
-	Items []modelConnectionResponse `json:"items"`
+	Items               []modelConnectionResponse    `json:"items"`
+	ConfigurationStatus app.ModelConfigurationStatus `json:"configuration_status"`
 }
 
 type modelConnectionResponse struct {
@@ -35,9 +36,28 @@ type modelConnectionResponse struct {
 }
 
 type modelConnectionCapabilities struct {
-	Text   bool `json:"text"`
-	Tools  bool `json:"tools"`
-	Vision bool `json:"vision"`
+	Text            bool                            `json:"text"`
+	TextStream      bool                            `json:"text_stream"`
+	Tools           bool                            `json:"tools"`
+	Vision          bool                            `json:"vision"`
+	MediaGeneration *modelMediaGenerationCapability `json:"media_generation,omitempty"`
+}
+
+type modelMediaGenerationCapability struct {
+	ImageGeneration  bool `json:"image_generation"`
+	VideoGeneration  bool `json:"video_generation"`
+	SpeechGeneration bool `json:"speech_generation"`
+}
+
+func modelConnectionCapabilitiesFrom(value app.ModelCapabilities) modelConnectionCapabilities {
+	result := modelConnectionCapabilities{Text: value.Text, TextStream: value.TextStream, Tools: value.Tools, Vision: value.Vision}
+	if value.MediaGeneration.ImageGeneration || value.MediaGeneration.VideoGeneration || value.MediaGeneration.SpeechGeneration {
+		result.MediaGeneration = &modelMediaGenerationCapability{
+			ImageGeneration: value.MediaGeneration.ImageGeneration, VideoGeneration: value.MediaGeneration.VideoGeneration,
+			SpeechGeneration: value.MediaGeneration.SpeechGeneration,
+		}
+	}
+	return result
 }
 
 type createModelConnectionRequest struct {
@@ -92,17 +112,32 @@ func (h *api) listAvailableModels(c *gin.Context) {
 	}
 	result := make([]model, 0, len(items))
 	for _, item := range items {
-		if item.CheckedAt == nil || !item.Capabilities.Text {
+		if !item.HasAPIKey || item.CheckedAt == nil || !item.Capabilities.Text {
 			continue
 		}
 		result = append(result, model{ID: item.ID, Name: item.Name, ModelName: item.ModelName,
-			Capabilities: modelConnectionCapabilities{Text: item.Capabilities.Text, Tools: item.Capabilities.Tools, Vision: item.Capabilities.Vision}})
+			Capabilities: modelConnectionCapabilitiesFrom(item.Capabilities)})
 	}
-	c.JSON(http.StatusOK, gin.H{"items": result})
+	configured := false
+	var defaultModelID *string
+	if h.deps.AdminModelDefaults != nil {
+		availability, err := h.deps.AdminModelDefaults.Available(c.Request.Context())
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		configured = availability.Configured
+		if configured && domain.ValidModelConnectionID(availability.ModelID) {
+			id := availability.ModelID
+			defaultModelID = &id
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": result, "configuration_status": app.ModelConnectionsConfigurationStatus(items),
+		"default_model_configured": configured, "default_model_id": defaultModelID})
 }
 
 func (h *api) listModelConnections(c *gin.Context) {
-	principal, ok := modelSession(c)
+	principal, ok := modelAccount(c)
 	if !ok {
 		return
 	}
@@ -115,7 +150,7 @@ func (h *api) listModelConnections(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	response := modelConnectionListResponse{Items: make([]modelConnectionResponse, 0, len(items))}
+	response := modelConnectionListResponse{Items: make([]modelConnectionResponse, 0, len(items)), ConfigurationStatus: app.ModelConnectionsConfigurationStatus(items)}
 	for _, item := range items {
 		view, err := toModelConnectionResponse(item)
 		if err != nil {
@@ -128,7 +163,7 @@ func (h *api) listModelConnections(c *gin.Context) {
 }
 
 func (h *api) getModelConnection(c *gin.Context) {
-	principal, ok := modelSession(c)
+	principal, ok := modelAccount(c)
 	if !ok {
 		return
 	}
@@ -154,7 +189,7 @@ func (h *api) getModelConnection(c *gin.Context) {
 }
 
 func (h *api) createModelConnection(c *gin.Context) {
-	principal, ok := modelSession(c)
+	principal, ok := modelAccount(c)
 	if !ok {
 		return
 	}
@@ -190,7 +225,7 @@ func (h *api) createModelConnection(c *gin.Context) {
 }
 
 func (h *api) updateModelConnection(c *gin.Context) {
-	principal, ok := modelSession(c)
+	principal, ok := modelAccount(c)
 	if !ok {
 		return
 	}
@@ -230,7 +265,7 @@ func (h *api) updateModelConnection(c *gin.Context) {
 }
 
 func (h *api) deleteModelConnection(c *gin.Context) {
-	principal, ok := modelSession(c)
+	principal, ok := modelAccount(c)
 	if !ok {
 		return
 	}
@@ -245,14 +280,10 @@ func (h *api) deleteModelConnection(c *gin.Context) {
 	if !h.requireModelConnectionAudit(c, principal) {
 		return
 	}
-	var item app.ModelConnectionView
-	if principal.Role.IsAdmin() {
-		var err error
-		item, err = h.deps.ModelConnections.Get(c.Request.Context(), principal, id)
-		if err != nil {
-			writeError(c, err)
-			return
-		}
+	item, err := h.deps.ModelConnections.Get(c.Request.Context(), principal, id)
+	if err != nil {
+		writeError(c, err)
+		return
 	}
 	if err := h.deps.ModelConnections.Delete(c.Request.Context(), principal, id); err != nil {
 		writeError(c, err)
@@ -267,7 +298,7 @@ func (h *api) deleteModelConnection(c *gin.Context) {
 }
 
 func (h *api) checkModelConnection(c *gin.Context) {
-	principal, ok := modelSession(c)
+	principal, ok := modelAccount(c)
 	if !ok {
 		return
 	}
@@ -294,13 +325,13 @@ func (h *api) checkModelConnection(c *gin.Context) {
 		return
 	}
 	if !h.writeModelConnectionAudit(c, principal, audit.ActionModelConnectionCheck, id, map[string]any{
-		"capability": request.Capability, "text": capabilities.Text, "tools": capabilities.Tools, "vision": capabilities.Vision,
+		"capability": request.Capability, "text": capabilities.Text, "text_stream": capabilities.TextStream, "tools": capabilities.Tools, "vision": capabilities.Vision,
+		"image_generation": capabilities.MediaGeneration.ImageGeneration, "video_generation": capabilities.MediaGeneration.VideoGeneration,
+		"speech_generation": capabilities.MediaGeneration.SpeechGeneration,
 	}) {
 		return
 	}
-	c.JSON(http.StatusOK, modelConnectionCapabilities{
-		Text: capabilities.Text, Tools: capabilities.Tools, Vision: capabilities.Vision,
-	})
+	c.JSON(http.StatusOK, modelConnectionCapabilitiesFrom(capabilities))
 }
 
 func (h *api) requireModelConnectionAudit(c *gin.Context, principal identity.Principal) bool {
@@ -346,14 +377,29 @@ func modelSession(c *gin.Context) (identity.Principal, bool) {
 	return principal, true
 }
 
+func modelAccount(c *gin.Context) (identity.Principal, bool) {
+	principal, ok := principalFrom(c)
+	if !ok {
+		unauthenticated(c)
+		return identity.Principal{}, false
+	}
+	if principal.Kind != identity.KindSession && principal.Kind != identity.KindClient {
+		writeError(c, domain.NewError(domain.CodeForbidden, "user credential required"))
+		return identity.Principal{}, false
+	}
+	return principal, true
+}
+
 func toModelConnectionResponse(item app.ModelConnectionView) (modelConnectionResponse, error) {
 	if !domain.ValidModelConnectionID(item.ID) || item.Name == "" || item.BaseURL == "" || item.ModelName == "" || !item.HasAPIKey ||
-		item.CreatedAt.IsZero() || item.UpdatedAt.IsZero() || (item.CheckedAt == nil && (item.Capabilities.Text || item.Capabilities.Tools || item.Capabilities.Vision)) {
+		item.CreatedAt.IsZero() || item.UpdatedAt.IsZero() || item.Capabilities.TextStream && !item.Capabilities.Text ||
+		(item.CheckedAt == nil && (item.Capabilities.Text || item.Capabilities.TextStream || item.Capabilities.Tools || item.Capabilities.Vision ||
+			item.Capabilities.MediaGeneration.ImageGeneration || item.Capabilities.MediaGeneration.VideoGeneration || item.Capabilities.MediaGeneration.SpeechGeneration)) {
 		return modelConnectionResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return modelConnectionResponse{
 		ID: item.ID, Name: item.Name, BaseURL: item.BaseURL, ModelName: item.ModelName, Shared: item.Shared, HasAPIKey: item.HasAPIKey,
-		Capabilities: modelConnectionCapabilities{Text: item.Capabilities.Text, Tools: item.Capabilities.Tools, Vision: item.Capabilities.Vision},
+		Capabilities: modelConnectionCapabilitiesFrom(item.Capabilities),
 		CheckedAt:    item.CheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}, nil
 }

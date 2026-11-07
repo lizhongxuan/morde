@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -43,6 +44,7 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/dshguardian"
 	"morde/server/internal/storage/workspacefs"
 	storepostgres "morde/server/internal/store/postgres"
 )
@@ -145,6 +147,10 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	conversationService, err := app.NewConversationService(store, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runtimeControl, err := app.NewRuntimeControl(store, f01SandboxRouter{endpoint: runtimeServer.URL}, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -161,17 +167,41 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	personalData, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalSync, err := app.NewPersonalSyncService(store, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goals, err := app.NewGoalService(personalData, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalQuota, err := app.NewPersonalDataQuotaService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalAttachments, err := app.NewPersonalAttachmentService(store, personalQuota)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordCapture, err := app.NewRecordCaptureService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	completionSyncReceipts := make(chan int64, 4)
-	toolBroker, err := app.NewCloudDSHToolBroker(&f01WorkspaceSyncCompletionGateTaskStore{
+	toolBroker, err := app.NewCloudDSHToolBrokerWithPersonalData(&f01WorkspaceSyncCompletionGateTaskStore{
 		TaskStore: store, appliedRevisions: completionSyncReceipts, requiredRevision: 1,
-	}, runtimeTools, nil, nil)
+	}, runtimeTools, nil, nil, recordCapture, personalData, personalSync, goals, personalAttachments, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	apiRouter, err := api.New(api.Deps{
 		Hosts: f01UnusedHostService{}, HostReplicas: hostReplicas, TLSAuthorizer: f01UnusedTLSAuthorizer{},
-		Verifier: credentials, Auth: f01UnusedAuth{}, Tasks: taskService, WorkspaceSync: syncService, MCPDisabled: true,
+		Verifier: credentials, Auth: f01UnusedAuth{}, Tasks: taskService, Conversations: conversationService, WorkspaceSync: syncService, MCPDisabled: true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20, MCPMaxBodyBytes: 16 << 20,
 		SessionTTL: time.Hour, HostScheme: "https", PortalDomain: "portal.example.test", HostSuffix: "hosts.example.test", PreviewPortMin: 1024,
@@ -226,34 +256,27 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		t.Fatalf("locate real morde-cloud-runtime entrypoint: %v", err)
 	}
 	stopKey := bytes.Repeat([]byte{0x3d}, 32)
-	stopAuthenticator, err := app.NewAgentStopAuthenticator("f01-e2e-supervisor", stopKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	instances, err := app.NewAgentInstanceService(store, stopAuthenticator)
-	if err != nil {
-		t.Fatal(err)
-	}
+	instances, conversationRuntimeManager, supervisor := newF01ConversationRuntime(t, store, node, script, "f01-e2e-supervisor", stopKey)
 	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkpointDiagnostics := &f01CheckpointDiagnostics{CloudDSHCheckpoints: checkpoints}
 	childSessions, err := app.NewAgentChildSessionService(store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	model := &f01CloudTaskModel{workspaceID: workspaceValue.ID, approvalFirst: true,
 		secondStarted: make(chan struct{}), content: "Morde kept the cloud task running after the client disconnected.\n"}
-	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-e2e-supervisor", Supervisor: supervisor,
-		Instances: instances, Checkpoints: checkpoints, Children: childSessions, Models: model, Tools: toolBroker, Completion: toolBroker,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-e2e-supervisor", AccountRuntimes: conversationRuntimeManager,
+		Instances: instances, Checkpoints: checkpointDiagnostics, Children: childSessions, Models: model, Tools: toolBroker, Completion: toolBroker,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	executionErrors := make(chan error, 4)
-	recorder := f01RecordingExecutor{inner: executor, errors: executionErrors, supervisor: supervisor, tools: toolBroker}
+	recorder := f01RecordingExecutor{inner: executor, errors: executionErrors, supervisor: supervisor, tools: toolBroker, checkpoints: checkpointDiagnostics}
 	backgroundWorker, err := NewTaskWorker(TaskWorkerOptions{
 		Store: store, Executor: recorder, WorkerID: "f01-e2e-worker", LeaseDuration: 30 * time.Second,
 		PollInterval: 5 * time.Millisecond, Logger: zap.NewNop(),
@@ -262,16 +285,43 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		t.Fatal(err)
 	}
 
+	conversationBody, err := json.Marshal(map[string]string{"title": "Cloud task lifecycle recovery"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversationRequest, err := http.NewRequest(http.MethodPost, portal.URL+"/api/conversations", bytes.NewReader(conversationBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversationRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: sessionCredential})
+	conversationRequest.Header.Set("Content-Type", "application/json")
+	conversationRequest.Header.Set("Origin", portal.URL)
+	conversationRequest.Header.Set("Idempotency-Key", "f01-cloud-lifecycle-conversation-001")
+	conversationResponse, err := httpClient.Do(conversationRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var createdConversation struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(conversationResponse.Body).Decode(&createdConversation); err != nil {
+		_ = conversationResponse.Body.Close()
+		t.Fatal(err)
+	}
+	_ = conversationResponse.Body.Close()
+	if conversationResponse.StatusCode != http.StatusCreated || createdConversation.ID == "" {
+		t.Fatalf("POST /api/conversations = status %d, response %#v", conversationResponse.StatusCode, createdConversation)
+	}
 	postCtx, cancelPost := context.WithCancel(ctx)
 	postBody, err := json.Marshal(map[string]any{
-		"host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(0),
-		"model_id": "p1234567", "objective": "Run an approved bounded Workspace command, then write a short note in the attached Workspace.",
+		"mode": "new", "host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(0),
+		"model_id": "p1234567", "content": "Run an approved bounded Workspace command, then write a short note in the attached Workspace.",
 		"budget": map[string]int64{"active_seconds": 120, "tool_calls": 5, "model_tokens": 1000},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	postRequest, err := http.NewRequestWithContext(postCtx, http.MethodPost, portal.URL+"/api/tasks", bytes.NewReader(postBody))
+	postRequest, err := http.NewRequestWithContext(postCtx, http.MethodPost, portal.URL+"/api/conversations/"+createdConversation.ID+"/messages", bytes.NewReader(postBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,23 +334,56 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		cancelPost()
 		t.Fatal(err)
 	}
-	var accepted struct {
-		ID            string `json:"id"`
-		Status        string `json:"status"`
-		WorkspaceID   string `json:"workspace_id"`
-		InputRevision *int64 `json:"input_revision"`
+	type acceptedTask struct {
+		ID             string `json:"id"`
+		Status         string `json:"status"`
+		WorkspaceID    string `json:"workspace_id"`
+		InputRevision  *int64 `json:"input_revision"`
+		ConversationID string `json:"conversation_id"`
 	}
-	if err := json.NewDecoder(postResponse.Body).Decode(&accepted); err != nil {
+	var submission struct {
+		Message struct {
+			TaskID string `json:"task_id"`
+		} `json:"message"`
+		Task acceptedTask `json:"task"`
+	}
+	if err := json.NewDecoder(postResponse.Body).Decode(&submission); err != nil {
 		_ = postResponse.Body.Close()
 		cancelPost()
 		t.Fatal(err)
 	}
 	_ = postResponse.Body.Close()
 	cancelPost()
+	accepted := submission.Task
 	if postResponse.StatusCode != http.StatusAccepted || accepted.ID == "" || accepted.Status != string(task.StatusQueued) ||
-		accepted.WorkspaceID != workspaceValue.ID || accepted.InputRevision == nil || *accepted.InputRevision != 0 {
-		t.Fatalf("POST /api/tasks acceptance = status %d, response %#v", postResponse.StatusCode, accepted)
+		accepted.WorkspaceID != workspaceValue.ID || accepted.InputRevision == nil || *accepted.InputRevision != 0 ||
+		accepted.ConversationID != createdConversation.ID || submission.Message.TaskID != accepted.ID {
+		t.Fatalf("POST /api/conversations/{id}/messages acceptance = status %d, response %#v", postResponse.StatusCode, submission)
 	}
+	conversationTasksRequest, err := http.NewRequest(http.MethodGet, portal.URL+"/api/conversations/"+createdConversation.ID+"/tasks", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversationTasksRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: sessionCredential})
+	conversationTasksResponse, err := httpClient.Do(conversationTasksRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conversationTasks struct {
+		Items []struct {
+			ID            string `json:"id"`
+			EventSequence int64  `json:"event_sequence"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(conversationTasksResponse.Body).Decode(&conversationTasks); err != nil {
+		_ = conversationTasksResponse.Body.Close()
+		t.Fatal(err)
+	}
+	_ = conversationTasksResponse.Body.Close()
+	if conversationTasksResponse.StatusCode != http.StatusOK || len(conversationTasks.Items) != 1 || conversationTasks.Items[0].ID != accepted.ID {
+		t.Fatalf("GET /api/conversations/{id}/tasks recovery = status %d, response %#v", conversationTasksResponse.StatusCode, conversationTasks)
+	}
+	resumedTask := conversationTasks.Items[0]
 
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan error, 1)
@@ -372,11 +455,12 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	streamRequest, err := http.NewRequestWithContext(streamCtx, http.MethodGet,
-		portal.URL+"/api/tasks/"+accepted.ID+"/events?after=0", nil)
+		portal.URL+"/api/tasks/"+resumedTask.ID+"/events", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	streamRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: sessionCredential})
+	streamRequest.Header.Set("Last-Event-ID", fmt.Sprintf("%d", resumedTask.EventSequence))
 	streamResponse, err := httpClient.Do(streamRequest)
 	if err != nil {
 		cancelStream()
@@ -388,10 +472,32 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		cancelStream()
 		t.Fatalf("task event stream status = %d: %s", streamResponse.StatusCode, body)
 	}
-	if _, err := bufio.NewReader(streamResponse.Body).ReadString('\n'); err != nil && !errors.Is(err, io.EOF) {
+	streamReader := bufio.NewReader(streamResponse.Body)
+	resumeIDLine, err := streamReader.ReadString('\n')
+	if err != nil {
 		_ = streamResponse.Body.Close()
 		cancelStream()
-		t.Fatalf("read first task event: %v", err)
+		t.Fatalf("read resumed task event id: %v", err)
+	}
+	var resumedSequence int64
+	if _, err := fmt.Sscanf(resumeIDLine, "id: %d", &resumedSequence); err != nil || resumedSequence <= resumedTask.EventSequence {
+		_ = streamResponse.Body.Close()
+		cancelStream()
+		t.Fatalf("resumed event id %q is not after cursor %d: %v", resumeIDLine, resumedTask.EventSequence, err)
+	}
+	resumeEventLine, eventErr := streamReader.ReadString('\n')
+	resumeDataLine, dataErr := streamReader.ReadString('\n')
+	var resumedFrame struct {
+		TaskID   string `json:"task_id"`
+		Sequence int64  `json:"sequence"`
+	}
+	decodeErr := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(resumeDataLine, "data:"))), &resumedFrame)
+	if eventErr != nil || dataErr != nil || !strings.HasPrefix(resumeEventLine, "event: ") ||
+		!strings.HasPrefix(resumeDataLine, "data:") || decodeErr != nil || resumedFrame.TaskID != accepted.ID || resumedFrame.Sequence != resumedSequence {
+		_ = streamResponse.Body.Close()
+		cancelStream()
+		t.Fatalf("resumed event does not belong to Task %s: id=%q event=%q data=%q decoded=%+v errors=%v/%v/%v",
+			accepted.ID, resumeIDLine, resumeEventLine, resumeDataLine, resumedFrame, eventErr, dataErr, decodeErr)
 	}
 	cancelStream()
 	_ = streamResponse.Body.Close()
@@ -517,13 +623,24 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		defer cancelDiagnostic()
 		current, taskErr := store.GetTask(diagnosticCtx, accepted.ID, owner.ID)
 		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
+		currentHost, hostErr := store.GetHost(diagnosticCtx, hostValue.ID)
+		currentFence, fenceErr := runtimeControl.ReadTaskFence(diagnosticCtx, current.Task.InitiatorID, current.Task.HostID)
 		approvalOperation, approvalOperationErr := store.GetOperation(diagnosticCtx, owner.ID, accepted.ID, f01OperationKey("f01-workspace-command-001"))
 		writeOperation, writeOperationErr := store.GetOperation(diagnosticCtx, owner.ID, accepted.ID, f01OperationKey("f01-write-note-001"))
-		t.Fatalf("Cloud Task did not complete after publishing its private view: wait_error=%v status=%s waiting_reason=%s pending_request=%#v checkpoint_revision=%v checkpoint_sequence=%d agent_session=%s agent_generation=%d steps=%#v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s approval_operation=%#v approval_operation_error=%v write_operation=%#v write_operation_error=%v task_error=%v binding_error=%v",
+		var verificationOperation task.Operation
+		var verificationOperationErr error
+		for _, step := range current.Steps {
+			if step.Kind == "verification" {
+				verificationOperation, verificationOperationErr = store.GetOperation(diagnosticCtx, owner.ID, accepted.ID,
+					fmt.Sprintf("agent:verify:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
+			}
+		}
+		t.Fatalf("Cloud Task did not complete after publishing its private view: wait_error=%v status=%s waiting_reason=%s pending_request=%#v checkpoint_revision=%v checkpoint_sequence=%d agent_session=%s agent_generation=%d steps=%#v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s approval_operation=%#v approval_operation_error=%v write_operation=%#v write_operation_error=%v verify_operation=%#v verify_operation_error=%v host_state=%s control=%s generation=%d instance=%q control_version=%d host_error=%v current_fence=%+v fence_error=%v task_error=%v binding_error=%v",
 			err, current.Task.Status, current.Task.WaitingReason, current.PendingRequest, current.Task.WorkspaceCheckpointRevision,
 			current.Task.CheckpointThroughSequence, current.Task.AgentSessionID, current.Task.AgentGeneration, current.Steps, model.callCount(),
 			binding.State, binding.BindingVersion, binding.DesiredRevision, binding.AppliedRevision, binding.SyncState,
-			approvalOperation, approvalOperationErr, writeOperation, writeOperationErr, taskErr, bindingErr)
+			approvalOperation, approvalOperationErr, writeOperation, writeOperationErr, verificationOperation, verificationOperationErr, currentHost.State, currentHost.ControlState,
+			currentHost.RuntimeGeneration, currentHost.RuntimeInstanceID, currentHost.ControlVersion, hostErr, currentFence, fenceErr, taskErr, bindingErr)
 	}
 
 	if err := waitF01(t, ctx, func() (bool, error) {
@@ -612,14 +729,15 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 
 	model.enableBackgroundChild()
 	backgroundRequest, err := json.Marshal(map[string]any{
-		"host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(1),
-		"model_id": "p1234567", "objective": "Read the existing Workspace note in a background job, then create and save a completion note in the Workspace.",
+		"mode": "new", "host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(1),
+		"model_id": "p1234567", "content": "Read the existing Workspace note in a background job, then create and save a completion note in the Workspace.",
 		"budget": map[string]int64{"active_seconds": 120, "tool_calls": 20, "model_tokens": 1000},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	backgroundPost, err := http.NewRequest(http.MethodPost, portal.URL+"/api/tasks", bytes.NewReader(backgroundRequest))
+	backgroundPost, err := http.NewRequest(http.MethodPost,
+		portal.URL+"/api/conversations/"+createdConversation.ID+"/messages", bytes.NewReader(backgroundRequest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,17 +749,25 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 	if err != nil {
 		t.Fatal(err)
 	}
-	var backgroundAccepted struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
+	var backgroundSubmission struct {
+		Message struct {
+			TaskID string `json:"task_id"`
+		} `json:"message"`
+		Task struct {
+			ID             string `json:"id"`
+			Status         string `json:"status"`
+			ConversationID string `json:"conversation_id"`
+		} `json:"task"`
 	}
-	if err := json.NewDecoder(backgroundResponse.Body).Decode(&backgroundAccepted); err != nil {
+	if err := json.NewDecoder(backgroundResponse.Body).Decode(&backgroundSubmission); err != nil {
 		_ = backgroundResponse.Body.Close()
 		t.Fatal(err)
 	}
 	_ = backgroundResponse.Body.Close()
-	if backgroundResponse.StatusCode != http.StatusAccepted || backgroundAccepted.ID == "" || backgroundAccepted.Status != string(task.StatusQueued) {
-		t.Fatalf("background POST /api/tasks acceptance = status %d, response %#v", backgroundResponse.StatusCode, backgroundAccepted)
+	backgroundAccepted := backgroundSubmission.Task
+	if backgroundResponse.StatusCode != http.StatusAccepted || backgroundAccepted.ID == "" || backgroundAccepted.Status != string(task.StatusQueued) ||
+		backgroundAccepted.ConversationID != createdConversation.ID || backgroundSubmission.Message.TaskID != backgroundAccepted.ID {
+		t.Fatalf("background POST /api/conversations/{id}/messages acceptance = status %d, response %#v", backgroundResponse.StatusCode, backgroundSubmission)
 	}
 	childWaitCtx, cancelChildWait := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelChildWait()
@@ -759,10 +885,11 @@ type f01CloudTaskModel struct {
 }
 
 type f01RecordingExecutor struct {
-	inner      TaskExecutor
-	errors     chan<- error
-	supervisor *f01CapturingSupervisor
-	tools      interface {
+	inner       TaskExecutor
+	errors      chan<- error
+	supervisor  *f01CapturingSupervisor
+	checkpoints *f01CheckpointDiagnostics
+	tools       interface {
 		Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error)
 	}
 }
@@ -774,13 +901,62 @@ func (e f01RecordingExecutor) ExecuteTask(ctx context.Context, value task.Task) 
 		if definitionsErr != nil {
 			definitions = nil
 		}
-		err = fmt.Errorf("%w; %s", err, f01DSHModelDiagnostic([]byte(e.supervisor.output()), value.ModelID, definitions, definitionsErr))
+		err = fmt.Errorf("%w; checkpoint=%s; %s", err, e.checkpoints.failureForTask(value.ID),
+			f01DSHModelDiagnostic([]byte(e.supervisor.output()), value.ModelID, definitions, definitionsErr))
 		select {
 		case e.errors <- err:
 		default:
 		}
 	}
 	return err
+}
+
+// The production executor deliberately hides checkpoint store details. This
+// test-only wrapper records bounded failure metadata for the synthetic task.
+type f01CheckpointDiagnostics struct {
+	CloudDSHCheckpoints
+	mu       sync.Mutex
+	failures map[string]string
+}
+
+func (d *f01CheckpointDiagnostics) Save(ctx context.Context, command app.AgentCheckpointCommand) (bool, error) {
+	started := time.Now()
+	replayed, err := d.CloudDSHCheckpoints.Save(ctx, command)
+	if err == nil {
+		return replayed, nil
+	}
+	var domainErr *domain.Error
+	message := ""
+	if errors.As(err, &domainErr) {
+		message = domainErr.Message
+	}
+	var sqlError interface{ SQLState() string }
+	sqlState := ""
+	if errors.As(err, &sqlError) {
+		sqlState = sqlError.SQLState()
+	}
+	details := fmt.Sprintf("code=%s message=%q sql_state=%s context=%v elapsed=%s from=%d through=%d root=%t",
+		domain.CodeOf(err), message, sqlState, ctx.Err(), time.Since(started).Round(time.Millisecond),
+		command.From, command.Through, command.Fence.AgentSessionID == command.Fence.AgentRootSessionID)
+	d.mu.Lock()
+	if d.failures == nil {
+		d.failures = make(map[string]string)
+	}
+	d.failures[command.Fence.TaskID] = details
+	d.mu.Unlock()
+	return replayed, err
+}
+
+func (d *f01CheckpointDiagnostics) failureForTask(taskID string) string {
+	if d == nil {
+		return "checkpoint diagnostics disabled"
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if failure := d.failures[taskID]; failure != "" {
+		return failure
+	}
+	return "no checkpoint Save failure captured"
 }
 
 // f01DSHModelDiagnostic reports only request shape and schema comparisons. It
@@ -897,25 +1073,141 @@ func f01DSHModelDiagnostic(output []byte, expectedModel string, definitions []ap
 }
 
 type f01CapturingSupervisor struct {
-	child *cloudDSHTestSupervisor
-	mu    sync.Mutex
-	bytes bytes.Buffer
+	child       *cloudDSHTestSupervisor
+	key         ed25519.PrivateKey
+	mu          sync.Mutex
+	bytes       bytes.Buffer
+	fence       app.AccountAgentRuntimeFence
+	nonceSHA256 string
+	expiresAt   time.Time
 }
 
-func (s *f01CapturingSupervisor) Start(ctx context.Context, launch CloudDSHLaunch) (io.WriteCloser, io.ReadCloser, error) {
-	input, output, err := s.child.Start(ctx, launch)
-	if err != nil {
-		return nil, nil, err
+func (s *f01CapturingSupervisor) StartAccountRuntime(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	nonce []byte, expiry time.Time) (CloudDSHAccountRuntimeProcess, error) {
+	process, err := s.child.StartAccountRuntime(ctx, fence, nonce, expiry)
+	if err == nil {
+		digest := sha256.Sum256(nonce)
+		s.mu.Lock()
+		s.fence, s.nonceSHA256, s.expiresAt = fence, hex.EncodeToString(digest[:]), expiry
+		s.mu.Unlock()
+		process.Output = f01CaptureReader{ReadCloser: process.Output, capture: s}
 	}
-	return input, f01CaptureReader{ReadCloser: output, capture: s}, nil
+	return process, err
 }
 
-func (s *f01CapturingSupervisor) Renew(ctx context.Context, fence app.AgentInstanceFence, expiry time.Time) error {
-	return s.child.Renew(ctx, fence, expiry)
+func (s *f01CapturingSupervisor) RenewAccountRuntime(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	containerID string, expiry time.Time) error {
+	return s.child.RenewAccountRuntime(ctx, fence, containerID, expiry)
 }
 
-func (s *f01CapturingSupervisor) Stop(ctx context.Context, fence app.AgentInstanceFence, nonce []byte) (app.AgentStopReceipt, error) {
-	return s.child.Stop(ctx, fence, nonce)
+func (s *f01CapturingSupervisor) StopAccountRuntime(_ context.Context, fence app.AccountAgentRuntimeFence,
+	nonce string) (app.AccountAgentRuntimeStopAttestation, error) {
+	s.mu.Lock()
+	valid, expiry := s.fence == fence && s.nonceSHA256 == nonce, s.expiresAt
+	s.mu.Unlock()
+	if !valid {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("test runtime stop identity does not match")
+	}
+	s.child.mu.Lock()
+	defer s.child.mu.Unlock()
+	command := s.child.cmd
+	if command == nil || command.Process == nil {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("test runtime process identity is unavailable")
+	}
+	_ = command.Process.Kill()
+	_ = command.Wait()
+	if command.ProcessState == nil {
+		return app.AccountAgentRuntimeStopAttestation{}, errors.New("test runtime process exit is unconfirmed")
+	}
+	s.child.cmd = nil
+	proofs := &signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: s.key}
+	proof, err := proofs.RecoverAccountRuntimeStopped(context.Background(), fence, nonce)
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	proof.ExpiresAt = expiry
+	payload, err := app.AccountAgentRuntimeStopAttestationSigningPayload(proof)
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	proof.Signature = ed25519.Sign(s.key, payload)
+	return proof, nil
+}
+
+func (s *f01CapturingSupervisor) RecoverAccountRuntimeStopped(ctx context.Context, fence app.AccountAgentRuntimeFence,
+	nonce string) (app.AccountAgentRuntimeStopAttestation, error) {
+	return s.StopAccountRuntime(ctx, fence, nonce)
+}
+
+type f01ConversationRuntimeGuardian struct {
+	cloudDSHExecutorTestGuardian
+	key ed25519.PrivateKey
+}
+
+func (g *f01ConversationRuntimeGuardian) StopTaskProcess(ctx context.Context,
+	guard dshguardian.TaskProcessGuard) (app.AccountAgentTaskStopAttestation, error) {
+	attestation, err := g.cloudDSHExecutorTestGuardian.StopTaskProcess(ctx, guard)
+	if err != nil {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	payload, err := app.AccountAgentTaskStopAttestationSigningPayload(attestation)
+	if err != nil {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	attestation.Signature = ed25519.Sign(g.key, payload)
+	return attestation, nil
+}
+
+func newF01ConversationRuntime(t *testing.T, store *storepostgres.Store, node, script, supervisorID string,
+	stopKey []byte) (*app.AgentInstanceService, *CloudDSHAccountRuntimeManager, *f01CapturingSupervisor) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisorAuth, err := app.NewAgentStopAuthenticator(supervisorID, stopKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardianAuth, err := app.NewAgentGuardianStopAuthenticator(supervisorID, publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskGuardianAuth, err := app.NewAccountAgentTaskGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceServiceWithGuardianStops(store, supervisorAuth, agentGuardianAuth, taskGuardianAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopVerifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{node: node,
+		account: filepath.Join(filepath.Dir(script), "bin-account.mjs")}, key: privateKey}
+	guardian := &f01ConversationRuntimeGuardian{key: privateKey}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: control, Supervisor: supervisor, Guardian: guardian, StopVerifier: stopVerifier,
+		TaskStopper: instances, LeaseOwner: supervisorID, MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		supervisor.child.mu.Lock()
+		defer supervisor.child.mu.Unlock()
+		if command := supervisor.child.cmd; command != nil && command.Process != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+	return instances, manager, supervisor
 }
 
 func (s *f01CapturingSupervisor) append(value []byte) {
@@ -978,7 +1270,7 @@ func (m *f01CloudTaskModel) Complete(ctx context.Context, call app.ModelCall) (a
 		if m.approvalFirst {
 			approvalCall := app.ModelToolCall{
 				CallID: "f01-desktop-click-001", Name: "desktop_click",
-				Arguments: `{"window_id":"0x1","x":1,"y":2,"button":"left"}`,
+				Arguments: `{"window_id":"0x1","x":1,"y":2,"screenshot_width":1280,"screenshot_height":720,"screen_width":1280,"screen_height":720,"button":"left"}`,
 			}
 			if m.workspaceID != "" {
 				approvalCall = app.ModelToolCall{

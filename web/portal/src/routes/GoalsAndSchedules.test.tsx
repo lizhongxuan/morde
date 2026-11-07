@@ -13,7 +13,7 @@ const goal: components['schemas']['PersonalObject'] = {
 };
 
 const schedule: components['schemas']['Schedule'] = {
-  id: 'j1234567', version: 2, status: 'enabled', host_id: 'h1234567', model_id: 'model-1', objective: '检查日报',
+  id: 'j1234567', version: 2, status: 'enabled', host_id: 'h1234567', model_id: 'model-1', title: '日报标题', objective: '检查日报',
   timing: { kind: 'daily', starts_on: '2026-11-02', local_time: '09:00', time_zone: 'Asia/Shanghai' },
   budget: { active_seconds: 300, tool_calls: 12, model_tokens: 9000 }, misfire_policy: 'skip',
   notification_events: ['completed', 'failed'], observation: null, next_run_at: '2026-11-03T01:00:00Z',
@@ -30,7 +30,7 @@ describe('GoalsAndSchedules', () => {
 
   function mockAvailableModels() {
     vi.spyOn(api, 'GET').mockResolvedValue({
-      data: { items: [{ id: 'model-1', name: '团队模型', model_name: 'gpt-test', capabilities: { text: true, tools: true, vision: false } }] },
+      data: { items: [{ id: 'model-1', name: '团队模型', model_name: 'gpt-test', capabilities: { text: true, tools: true, vision: false, text_stream: false } }] },
       response: new Response(null, { status: 200 }),
     } as never);
   }
@@ -46,7 +46,7 @@ describe('GoalsAndSchedules', () => {
     mockAvailableModels();
   }
 
-  it('shows cloud goals and schedule states and explains that legacy local data is untouched', async () => {
+  it('shows cloud goals and schedule states', async () => {
     vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [goal], next_cursor: null });
     vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [schedule], next_cursor: '' });
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
@@ -54,8 +54,10 @@ describe('GoalsAndSchedules', () => {
     renderPage();
 
     expect(await screen.findByRole('heading', { level: 3, name: '完成迁移' })).toBeInTheDocument();
-    expect(screen.getByText(/旧 nanoMuse 本机目标和计划不会由此页自动读取、导入、启用或删除/)).toBeInTheDocument();
-    expect(screen.getByRole('heading', { level: 3, name: '检查日报' })).toBeInTheDocument();
+    expect(screen.queryByText(/旧 nanoMuse/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('选择旧客户端导出的计划 JSON')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 3, name: '日报标题' })).toBeInTheDocument();
+    expect(screen.getByText('执行内容：检查日报')).toBeInTheDocument();
     expect(screen.getByText('版本 2')).toBeInTheDocument();
     expect(screen.getByText('每天 09:00 (Asia/Shanghai) · 主机：h1234567 · 模型：团队模型')).toBeInTheDocument();
   });
@@ -106,6 +108,7 @@ describe('GoalsAndSchedules', () => {
     renderPage();
 
     await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
+    await user.selectOptions(screen.getByLabelText('主机'), 'h1234567');
     await user.type(screen.getByLabelText('计划内容'), '检查工作日进度');
     await user.click(screen.getByRole('button', { name: '创建并启用' }));
 
@@ -113,6 +116,26 @@ describe('GoalsAndSchedules', () => {
       host_id: 'h1234567', model_id: 'model-1', objective: '检查工作日进度',
       timing: expect.objectContaining({ kind: 'daily', time_zone: expect.any(String) }),
       budget: { active_seconds: 900, tool_calls: 20, model_tokens: 10000 },
+    })));
+  });
+
+  it('creates a hostless text schedule when no Host is available', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [], next_cursor: '' });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    mockAvailableModels();
+    const create = vi.spyOn(portalApi, 'createSchedule').mockResolvedValue({ ...schedule, host_id: null });
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '＋ 新建云端计划' }));
+    expect(screen.getByLabelText('主机')).toHaveValue('');
+    await user.type(screen.getByLabelText('计划内容'), '每天总结公开新闻');
+    await user.click(screen.getByRole('button', { name: '创建并启用' }));
+
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      host_id: null, model_id: 'model-1', objective: '每天总结公开新闻',
+      timing: expect.objectContaining({ kind: 'daily' }),
     })));
   });
 
@@ -158,6 +181,36 @@ describe('GoalsAndSchedules', () => {
 
     await user.click(await screen.findByRole('button', { name: '停用' }));
     await waitFor(() => expect(action).toHaveBeenCalledWith(schedule.id, { action: 'disable', expected_version: 2 }));
+  });
+
+  it('preserves and previews the schedule cadence anchor when editing an hourly schedule', async () => {
+    const user = userEvent.setup();
+    const anchor = '2026-11-04T10:15:00+08:00';
+    const hourlySchedule: components['schemas']['Schedule'] = {
+      ...schedule,
+      timing: { kind: 'every_n_hours', interval_hours: 6, anchor_at: anchor, time_zone: 'Asia/Shanghai' },
+    };
+    vi.spyOn(portalApi, 'goals').mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(portalApi, 'schedules').mockResolvedValue({ items: [hourlySchedule], next_cursor: '' });
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'getSchedule').mockResolvedValue(hourlySchedule);
+    const update = vi.spyOn(portalApi, 'updateSchedule').mockResolvedValue(hourlySchedule);
+    mockAvailableModels();
+    renderPage();
+
+    expect(await screen.findByText((text, element) => element?.classList.contains('schedule-card-meta') === true && text.includes(`锚点 ${anchor}`))).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '编辑版本' }));
+    expect(await screen.findByText(`调度锚点：${anchor}（编辑时保留该相位）`)).toBeInTheDocument();
+    await user.clear(screen.getByLabelText('计划内容'));
+    await user.type(screen.getByLabelText('计划内容'), '检查新日报');
+    await user.clear(screen.getByLabelText('间隔小时'));
+    await user.type(screen.getByLabelText('间隔小时'), '12');
+    await user.click(screen.getByRole('button', { name: '保存新版本' }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledWith(hourlySchedule.id, expect.objectContaining({
+      objective: '检查新日报',
+      timing: { kind: 'every_n_hours', interval_hours: 12, anchor_at: anchor, time_zone: 'Asia/Shanghai' },
+    })));
   });
 
   it('locks schedule writes after a server permission denial without requesting another credential', async () => {

@@ -53,6 +53,7 @@ type ModelRequest struct {
 	RequiredTool    string
 	MaxOutputTokens int
 	Temperature     *float64
+	DisableThinking bool
 	OnTextDelta     func(string) error
 }
 
@@ -60,6 +61,8 @@ type ModelToolCall struct {
 	CallID    string
 	Name      string
 	Arguments string
+	// TaskFence is attached at broker dispatch; its checkpoint head may advance past the model request.
+	TaskFence *ModelTaskFence `json:"-"`
 }
 
 type ModelUsage struct {
@@ -69,6 +72,7 @@ type ModelUsage struct {
 }
 
 type ModelResponse struct {
+	Reasoning  string `json:"-"`
 	Text       string
 	ToolCalls  []ModelToolCall
 	Usage      ModelUsage
@@ -76,10 +80,32 @@ type ModelResponse struct {
 }
 
 type ModelCapabilities struct {
-	Text    bool
-	Tools   bool
-	Vision  bool
-	ModelID string
+	Text            bool
+	TextStream      bool
+	Tools           bool
+	Vision          bool
+	MediaGeneration ModelMediaGenerationCapabilities
+	ModelID         string
+}
+
+type ModelMediaGenerationCapabilities struct {
+	ImageGeneration  bool
+	VideoGeneration  bool
+	SpeechGeneration bool
+}
+
+type ModelMediaGenerationCapabilityReport struct {
+	Supported                bool
+	ExactTokenReservation    bool
+	ActualTokenUsage         bool
+	IdempotentOperation      bool
+	DurableOperationRecovery bool
+	ConfirmedCancellation    bool
+}
+
+// ModelMediaGenerationCapabilityClient must inspect provider metadata only; it must not dispatch a generation.
+type ModelMediaGenerationCapabilityClient interface {
+	CheckMediaGenerationCapability(context.Context, ModelEndpoint, string) (ModelMediaGenerationCapabilityReport, error)
 }
 
 type ModelClient interface {
@@ -102,7 +128,9 @@ const (
 )
 
 type ModelClientError struct {
-	Kind ModelClientErrorKind
+	Kind         ModelClientErrorKind
+	Stage        string
+	ProviderCode string
 }
 
 func (e *ModelClientError) Error() string {

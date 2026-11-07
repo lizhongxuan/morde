@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,9 +24,11 @@ import (
 
 type f01NodeAccountSupervisor struct {
 	accountRuntimeSupervisorStub
-	node   string
-	script string
-	cmd    *exec.Cmd
+	node     string
+	script   string
+	cmd      *exec.Cmd
+	stderrMu sync.Mutex
+	stderr   bytes.Buffer
 }
 
 type f01RecoveringNodeAccountSupervisor struct {
@@ -51,14 +55,45 @@ func (s *f01NodeAccountSupervisor) StartAccountRuntime(_ context.Context, _ app.
 		_ = input.Close()
 		return CloudDSHAccountRuntimeProcess{}, err
 	}
-	if err := command.Start(); err != nil {
+	stderr, err := command.StderrPipe()
+	if err != nil {
 		_ = input.Close()
 		_ = output.Close()
 		return CloudDSHAccountRuntimeProcess{}, err
 	}
+	if err := command.Start(); err != nil {
+		_ = input.Close()
+		_ = output.Close()
+		_ = stderr.Close()
+		return CloudDSHAccountRuntimeProcess{}, err
+	}
 	s.cmd = command
+	go func() {
+		_, _ = io.Copy(&lockedF01Buffer{mu: &s.stderrMu, buffer: &s.stderr}, stderr)
+	}()
 	return CloudDSHAccountRuntimeProcess{ContainerID: strings.Repeat("a", 64), ContainerName: "f01-node-account",
 		Input: input, Output: output}, nil
+}
+
+type lockedF01Buffer struct {
+	mu     *sync.Mutex
+	buffer *bytes.Buffer
+}
+
+func (b *lockedF01Buffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(value)
+}
+
+func (s *f01NodeAccountSupervisor) stderrSnapshot() string {
+	s.stderrMu.Lock()
+	defer s.stderrMu.Unlock()
+	value := s.stderr.String()
+	if len(value) > 16*1024 {
+		value = value[len(value)-16*1024:]
+	}
+	return value
 }
 
 type f01NodeTaskGuardian struct{ accountRuntimeGuardianStub }
@@ -94,6 +129,7 @@ func TestAccountRuntimePostgresAndRealNodeContinueAfterFirstTaskContextEnds(t *t
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
 	owner := createF01User(t, ctx, store)
+	conversationID := createF01RuntimeConversation(t, ctx, pool, owner.ID)
 	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +155,7 @@ func TestAccountRuntimePostgresAndRealNodeContinueAfterFirstTaskContextEnds(t *t
 		t.Fatal(err)
 	}
 	firstCtx, cancelFirst := context.WithTimeout(ctx, 10*time.Second)
-	session, err := manager.Acquire(firstCtx, owner.ID)
+	session, err := manager.Acquire(firstCtx, owner.ID, conversationID)
 	if err != nil {
 		cancelFirst()
 		t.Fatal(err)
@@ -134,12 +170,12 @@ func TestAccountRuntimePostgresAndRealNodeContinueAfterFirstTaskContextEnds(t *t
 	cancelFirst()
 	secondCtx, cancelSecond := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelSecond()
-	reused, err := manager.Acquire(secondCtx, owner.ID)
+	reused, err := manager.Acquire(secondCtx, owner.ID, conversationID)
 	if err != nil || reused != session {
 		t.Fatalf("second Task did not reuse the account Runtime: reused=%t err=%v", reused == session, err)
 	}
 	f01RunNodeAccountTask(t, secondCtx, manager, session, owner.ID, 2)
-	current, found, err := control.Get(ctx, owner.ID)
+	current, found, err := control.Get(ctx, conversationID)
 	if err != nil || !found || current.State != app.AccountAgentRuntimeRunning || current.Fence != session.runtime.Fence || session.closed() {
 		t.Fatalf("account Runtime did not remain running after sequential Tasks: runtime=%+v found=%t closed=%t err=%v",
 			current, found, session.closed(), err)
@@ -151,6 +187,7 @@ func TestAccountRuntimePostgresAndRealNodeRecoverAfterManagerRestart(t *testing.
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
 	owner := createF01User(t, ctx, store)
+	conversationID := createF01RuntimeConversation(t, ctx, pool, owner.ID)
 	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +237,7 @@ func TestAccountRuntimePostgresAndRealNodeRecoverAfterManagerRestart(t *testing.
 		}
 	}()
 	oldManager := makeManager(oldSupervisor, "f01-node-runtime-old")
-	oldSession, err := oldManager.Acquire(ctx, owner.ID)
+	oldSession, err := oldManager.Acquire(ctx, owner.ID, conversationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,19 +270,19 @@ func TestAccountRuntimePostgresAndRealNodeRecoverAfterManagerRestart(t *testing.
 		}
 	}()
 	newManager := makeManager(newSupervisor, "f01-node-runtime-new")
-	if _, err := newManager.Acquire(ctx, owner.ID); err == nil {
+	if _, err := newManager.Acquire(ctx, owner.ID, conversationID); err == nil {
 		t.Fatal("new Manager replaced a Runtime before its lease expired")
 	}
 	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, oldFence.ServiceInstanceID, owner.ID, oldFence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
-	newSession, err := newManager.Acquire(ctx, owner.ID)
+	newSession, err := newManager.Acquire(ctx, owner.ID, conversationID)
 	if err != nil {
 		t.Fatalf("new Manager failed to recover the stopped Runtime and start Node: %v", err)
 	}
 	defer func() { _ = newSession.process.Input.Close(); _ = newSession.process.Output.Close() }()
-	current, found, err := control.Get(ctx, owner.ID)
+	current, found, err := control.Get(ctx, conversationID)
 	if err != nil || !found || current.State != app.AccountAgentRuntimeRunning ||
 		current.Fence.RuntimeGeneration != oldFence.RuntimeGeneration+1 || current.Fence.RuntimeID == oldFence.RuntimeID {
 		t.Fatalf("recovered account Runtime=%+v found=%t err=%v", current, found, err)

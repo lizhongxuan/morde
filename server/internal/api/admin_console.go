@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 )
 
@@ -206,10 +207,12 @@ func (h *api) listAdminModelConnections(c *gin.Context) {
 		return
 	}
 	response := modelConnectionListResponse{Items: make([]modelConnectionResponse, 0, len(items))}
+	shared := make([]app.ModelConnectionView, 0, len(items))
 	for _, item := range items {
 		if !item.Shared {
 			continue
 		}
+		shared = append(shared, item)
 		view, err := toModelConnectionResponse(item)
 		if err != nil {
 			writeError(c, err)
@@ -217,6 +220,7 @@ func (h *api) listAdminModelConnections(c *gin.Context) {
 		}
 		response.Items = append(response.Items, view)
 	}
+	response.ConfigurationStatus = app.ModelConnectionsConfigurationStatus(shared)
 	c.JSON(http.StatusOK, response)
 }
 

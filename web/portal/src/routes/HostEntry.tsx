@@ -23,7 +23,7 @@ export function resolveHostEntryURL(value: string, hostURL: string, portalHostna
     throw new Error('服务器返回了无效的云端电脑入口。');
   }
   const next = target.searchParams.get('next');
-  const localHTTP = (portalHostname === 'portal.localhost' || portalHostname === 'localhost') && host.protocol === 'http:' && /^h[a-z0-9]{7}\.hosts\.localhost$/.test(host.hostname) && !host.port;
+  const localHTTP = (portalHostname === 'portal.localhost' || portalHostname === 'localhost' || portalHostname === '127.0.0.1') && host.protocol === 'http:' && /^h[a-z0-9]{7}\.hosts\.localhost$/.test(host.hostname) && !host.port;
   if ((!localHTTP && host.protocol !== 'https:') || host.username || host.password || host.hash || host.search || host.pathname !== '/'
     || target.origin !== host.origin || target.pathname !== '/__ch/auth'
     || target.searchParams.getAll('t').length !== 1 || !target.searchParams.get('t')

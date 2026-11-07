@@ -12,6 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain/task"
 )
 
@@ -94,10 +95,16 @@ func NewTaskWorker(options TaskWorkerOptions) (*TaskWorker, error) {
 }
 
 // Run must receive the service lifecycle context, not an HTTP request context.
-func (w *TaskWorker) Run(ctx context.Context) error {
+func (w *TaskWorker) Run(ctx context.Context) (runErr error) {
 	if ctx == nil {
 		return errors.New("task worker context is required")
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("task worker panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+			runErr = errors.New("task worker panicked")
+		}
+	}()
 	w.runMu.Lock()
 	if w.started {
 		w.runMu.Unlock()
@@ -112,8 +119,16 @@ func (w *TaskWorker) Run(ctx context.Context) error {
 	if w.lifecycle != nil {
 		lifecycleDone = make(chan error, 1)
 		go func() {
-			defer cancel()
-			lifecycleDone <- w.lifecycle(runCtx)
+			var lifecycleErr error
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("task worker lifecycle panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+					lifecycleErr = errors.New("task worker lifecycle panicked")
+				}
+				lifecycleDone <- lifecycleErr
+				cancel()
+			}()
+			lifecycleErr = w.lifecycle(runCtx)
 		}()
 	}
 	var workers sync.WaitGroup
@@ -121,7 +136,7 @@ func (w *TaskWorker) Run(ctx context.Context) error {
 	for range w.maxConcurrentTasks {
 		go func() {
 			defer workers.Done()
-			w.runClaimLoop(runCtx)
+			w.runClaimLoopRecovering(runCtx)
 		}()
 	}
 	workers.Wait()
@@ -136,6 +151,24 @@ func (w *TaskWorker) Run(ctx context.Context) error {
 		return fmt.Errorf("task worker lifecycle: %w", lifecycleErr)
 	}
 	return ctx.Err()
+}
+
+func (w *TaskWorker) runClaimLoopRecovering(ctx context.Context) {
+	for ctx.Err() == nil {
+		panicked := func() (panicked bool) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("task worker claim loop panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+					panicked = true
+				}
+			}()
+			w.runClaimLoop(ctx)
+			return false
+		}()
+		if !panicked || !waitTaskWorker(ctx, w.pollInterval) {
+			return
+		}
+	}
 }
 
 func (w *TaskWorker) runClaimLoop(ctx context.Context) {
@@ -166,7 +199,12 @@ func (w *TaskWorker) runClaimLoop(ctx context.Context) {
 		}
 		if err := w.runClaimed(ctx, claimed); err != nil && ctx.Err() == nil {
 			if !errors.Is(err, errTaskExecutorPanicked) {
-				w.logger.Error("task execution stopped", zap.String("task_id", claimed.ID), zap.String("error_type", fmt.Sprintf("%T", err)))
+				fields := []zap.Field{zap.String("task_id", claimed.ID), zap.String("error_type", fmt.Sprintf("%T", err))}
+				var staged interface{ RuntimeStartupStage() string }
+				if errors.As(err, &staged) {
+					fields = append(fields, zap.String("runtime_startup_stage", staged.RuntimeStartupStage()))
+				}
+				w.logger.Error("task execution stopped", fields...)
 			}
 			if !waitTaskWorker(ctx, w.pollInterval) {
 				break
@@ -181,8 +219,9 @@ func (w *TaskWorker) validClaim(value task.Task) bool {
 }
 
 func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
-	executeCtx, cancelExecute := context.WithCancel(ctx)
-	defer cancelExecute()
+	executeCtx, cancelExecute := context.WithCancelCause(ctx)
+	executeCtx = app.WithModelTaskLifecycle(executeCtx, ctx)
+	defer cancelExecute(context.Canceled)
 	executeDone := make(chan error, 1)
 	go func() {
 		executeDone <- w.executeSafely(executeCtx, claimed)
@@ -192,7 +231,7 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 	defer ticker.Stop()
 	for {
 		if ctx.Err() != nil {
-			cancelExecute()
+			cancelExecute(context.Cause(ctx))
 			w.waitForExecution(executeDone, claimed.ID)
 			return ctx.Err()
 		}
@@ -203,12 +242,12 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 			}
 			return err
 		case <-ctx.Done():
-			cancelExecute()
+			cancelExecute(context.Cause(ctx))
 			w.waitForExecution(executeDone, claimed.ID)
 			return ctx.Err()
 		case <-ticker.C:
 			renewCtx, cancelRenew := context.WithTimeout(ctx, w.renewInterval)
-			renewed, err := w.store.RenewTaskLease(
+			renewed, err := w.renewTaskSafely(
 				renewCtx, claimed.ID, w.workerID, claimed.Lease.Version, w.leaseDuration,
 			)
 			cancelRenew()
@@ -216,7 +255,16 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 				err = errors.New("renewed task lease is invalid")
 			}
 			if err != nil {
-				cancelExecute()
+				cause := error(context.Canceled)
+				if witness, ok := w.store.(CloudDSHRevisionStopWitness); ok && ctx.Err() == nil {
+					checkCtx, cancelCheck := context.WithTimeout(ctx, time.Second)
+					proven, checkErr := witness.RevisionStopProven(checkCtx, claimed)
+					cancelCheck()
+					if checkErr == nil && proven && ctx.Err() == nil {
+						cause = app.ErrTaskRevisionInterrupted
+					}
+				}
+				cancelExecute(cause)
 				w.waitForExecution(executeDone, claimed.ID)
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -225,6 +273,17 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 			}
 		}
 	}
+}
+
+func (w *TaskWorker) renewTaskSafely(ctx context.Context, taskID, workerID string, version int64, lease time.Duration) (renewed task.Task, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("task lease renewal panicked", zap.String("task_id", taskID), zap.String("worker_id", workerID), zap.ByteString("stack", debug.Stack()))
+			renewed = task.Task{}
+			err = errors.New("task lease renewal panicked")
+		}
+	}()
+	return w.store.RenewTaskLease(ctx, taskID, workerID, version, lease)
 }
 
 func (w *TaskWorker) waitForExecution(done <-chan error, taskID string) {

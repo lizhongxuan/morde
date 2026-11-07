@@ -11,8 +11,8 @@ export function AdminWorkspaceDetail() {
   const workspace = query.data;
 
   return <section>
-    <Link className="back-link" to="/admin/workspaces">‹ 返回工作区列表</Link>
-    <div className="page-heading detail-heading"><div><p className="eyebrow">工作区详情</p><h2>{workspace.name || workspace.id}</h2><p className="muted mono">{workspace.id}</p></div><span className={`status status-${workspace.state}`}>{workspace.state === 'ready' ? '可用' : workspace.state === 'deleting' ? '删除中' : workspace.state}</span></div>
+    <section className="design-panel">
+    <div className="design-panel-header"><div><h2>{workspace.name || workspace.id}</h2><p className="mono">{workspace.id}</p></div><div className="inline-actions"><span className={`status status-${workspace.state}`}>{workspace.state === 'ready' ? '可用' : workspace.state === 'deleting' ? '删除中' : workspace.state}</span><Link className="button button-secondary" to="/admin/workspaces">← 返回工作区列表</Link></div></div>
     <div className="admin-detail-facts">
       <article><span>所有者</span><strong><Link to={`/admin/users/${encodeURIComponent(workspace.owner_id)}`}>{workspace.owner_name || workspace.owner_id}</Link></strong></article>
       <article><span>逻辑用量 / 配额</span><strong>{formatBytes(workspace.used_bytes)} / {formatBytes(workspace.quota_bytes)}</strong></article>
@@ -20,6 +20,7 @@ export function AdminWorkspaceDetail() {
       <article><span>创建时间</span><strong>{formatDate(workspace.created_at)}</strong></article>
       <article><span>最近更新</span><strong>{formatDate(workspace.updated_at)}</strong></article>
     </div>
+    </section>
     <section className="admin-detail-section">
       <div className="dashboard-section-heading"><div><h2>电脑绑定</h2><p>工作区服务端保存和电脑应用状态分别展示。</p></div></div>
       {!workspace.bindings.length ? <div className="empty-card compact"><p>该工作区未绑定电脑，数据仍保存在服务端。</p></div> : <div className="table-wrap"><table><thead><tr><th>云端电脑</th><th>绑定状态</th><th>服务端期望版本</th><th>电脑已应用版本</th><th>同步状态</th></tr></thead><tbody>

@@ -18,6 +18,7 @@ type adminSettingsResponse struct {
 	DefaultPersonalDataQuotaBytes  int64                      `json:"default_personal_data_quota_bytes"`
 	DefaultPersonalAttachmentBytes int64                      `json:"default_personal_attachment_bytes"`
 	DefaultModelBudget             modelBudgetDefaultResponse `json:"default_model_budget"`
+	DefaultModel                   adminModelDefaultResponse  `json:"default_model"`
 }
 
 type modelBudgetDefaultRequest struct {
@@ -31,6 +32,17 @@ type modelBudgetDefaultResponse struct {
 	TokenLimit    int64 `json:"token_limit"`
 	MaxConcurrent int32 `json:"max_concurrent"`
 	Version       int64 `json:"version"`
+}
+
+type adminModelDefaultRequest struct {
+	ExpectedVersion *int64  `json:"expected_version"`
+	ModelID         *string `json:"model_id"`
+}
+
+type adminModelDefaultResponse struct {
+	Configured bool    `json:"configured"`
+	ModelID    *string `json:"model_id"`
+	Version    int64   `json:"version"`
 }
 
 type adminInviteResponse struct {
@@ -118,6 +130,9 @@ func (h *api) registerAdminOperations(group *gin.RouterGroup) {
 	if h.deps.AdminModelBudgetDefaults != nil {
 		group.PUT("/admin/settings/model-budget-default", h.updateAdminModelBudgetDefault)
 	}
+	if h.deps.AdminModelDefaults != nil {
+		group.PUT("/admin/settings/model-default", h.updateAdminModelDefault)
+	}
 }
 
 func (h *api) getInviteCode(c *gin.Context) {
@@ -144,11 +159,16 @@ func (h *api) getAdminSettings(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	if h.deps.AdminModelBudgetDefaults == nil {
+	if h.deps.AdminModelBudgetDefaults == nil || h.deps.AdminModelDefaults == nil {
 		serviceUnavailable(c)
 		return
 	}
 	modelBudget, err := h.deps.AdminModelBudgetDefaults.Get(c.Request.Context(), principal)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	modelDefault, err := h.deps.AdminModelDefaults.Get(c.Request.Context(), principal)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -161,6 +181,7 @@ func (h *api) getAdminSettings(c *gin.Context) {
 		DefaultPersonalDataQuotaBytes:  value.DefaultPersonalDataQuotaBytes,
 		DefaultPersonalAttachmentBytes: value.DefaultPersonalAttachmentBytes,
 		DefaultModelBudget:             toModelBudgetDefaultResponse(modelBudget),
+		DefaultModel:                   toAdminModelDefaultResponse(modelDefault),
 	})
 }
 
@@ -194,6 +215,35 @@ func toModelBudgetDefaultResponse(value app.ModelBudgetDefault) modelBudgetDefau
 		Configured: value.Configured, TokenLimit: value.TokenLimit,
 		MaxConcurrent: value.MaxConcurrent, Version: value.Version,
 	}
+}
+
+func (h *api) updateAdminModelDefault(c *gin.Context) {
+	principal, ok := requireAdmin(c)
+	if !ok {
+		return
+	}
+	var request adminModelDefaultRequest
+	if !decodeStrictJSON(c, &request) {
+		return
+	}
+	if request.ExpectedVersion == nil || request.ModelID == nil {
+		writeError(c, domain.InvalidArgument("default_model", "expected_version and model_id are required"))
+		return
+	}
+	value, err := h.deps.AdminModelDefaults.Update(c.Request.Context(), principal, *request.ExpectedVersion, *request.ModelID, c.ClientIP())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toAdminModelDefaultResponse(value))
+}
+
+func toAdminModelDefaultResponse(value app.AdminModelDefaultView) adminModelDefaultResponse {
+	var modelID *string
+	if value.ModelID != "" {
+		modelID = &value.ModelID
+	}
+	return adminModelDefaultResponse{Configured: value.Configured, ModelID: modelID, Version: value.Version}
 }
 
 func (h *api) listAdminInvites(c *gin.Context) {

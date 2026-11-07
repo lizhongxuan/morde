@@ -69,8 +69,8 @@ func TestPostgresProjectAgentContextIsSharedBoundedAndMemberScoped(t *testing.T)
 	}
 	appendTask := func(actorID, key string) app.TaskSubmissionResult {
 		t.Helper()
-		result, err := conversations.AppendMessage(ctx, principal(actorID), projectValue.ID, conversationValue.ID,
-			app.AppendMessageCommand{ModelID: "project-test-model", Content: "Read shared project context", IdempotencyKey: key})
+		result, err := submitIndependentProjectTaskForTest(t, ctx, store, owner.ID, actorID, projectValue.ID, conversationValue.ID,
+			"project-test-model", "Read shared project context", key, nil)
 		if err != nil {
 			t.Fatalf("append project Task as %s: %v", actorID, err)
 		}

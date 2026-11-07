@@ -70,6 +70,57 @@ func (*cloudDSHRecordCaptureStore) FailRecordCapture(context.Context, string, st
 	return nil
 }
 
+func TestCloudDSHToolBrokerRejectsChangedTaskIdentity(t *testing.T) {
+	fields := []struct {
+		name   string
+		mutate func(*task.Task)
+	}{
+		{name: "initiator", mutate: func(value *task.Task) { value.InitiatorID = "u7654321" }},
+		{name: "project", mutate: func(value *task.Task) { value.ProjectID = "project_changed" }},
+		{name: "conversation", mutate: func(value *task.Task) { value.ConversationID = "conversation_changed" }},
+		{name: "execution location", mutate: func(value *task.Task) { value.ExecutionLocation = "server" }},
+		{name: "workspace", mutate: func(value *task.Task) { value.WorkspaceID = "w7654321" }},
+	}
+	for _, field := range fields {
+		t.Run(field.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed := store.details.Task
+			store.mu.Lock()
+			field.mutate(&store.details.Task)
+			store.mu.Unlock()
+			if _, err := broker.currentTaskDetails(context.Background(), claimed); domain.CodeOf(err) != domain.CodeInvalidState {
+				t.Fatalf("changed task identity error = %v, want invalid state", err)
+			}
+		})
+	}
+}
+
+func TestCloudDSHToolBrokerAllowsTaskProgressAfterClaim(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	checkpointRevision := int64(2)
+	leaseExpiry := time.Now().Add(time.Minute).UTC()
+	store.mu.Lock()
+	store.details.Task.WorkspaceCheckpointRevision = &checkpointRevision
+	store.details.Task.EventSequence++
+	store.details.Task.Usage.ToolCalls++
+	store.details.Task.Lease.ExpiresAt = &leaseExpiry
+	store.mu.Unlock()
+	if _, err := broker.currentTaskDetails(context.Background(), claimed); err != nil {
+		t.Fatalf("currentTaskDetails() rejected legitimate task progress: %v", err)
+	}
+}
+
 func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progress TaskProgress) (task.Event, error) {
 	if err := ctx.Err(); err != nil {
 		return task.Event{}, err
@@ -251,8 +302,15 @@ func TestCloudDSHToolBrokerLoadsFixedSkillForHostlessServerTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(definitions) != 2 || definitions[0].Name != cloudDSHSkillReadToolName || definitions[1].Name != agentAskUserToolName {
-		t.Fatalf("hostless server task definitions = %#v; want the fixed skill and ask_user", definitions)
+	definitionNames := make(map[string]struct{}, len(definitions))
+	for _, definition := range definitions {
+		definitionNames[definition.Name] = struct{}{}
+	}
+	for _, name := range []string{cloudDSHSkillReadToolName, cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName,
+		cloudDSHWorkspaceWriteToolName, agentAskUserToolName} {
+		if _, exists := definitionNames[name]; !exists {
+			t.Fatalf("hostless server task definitions omit %q: %#v", name, definitions)
+		}
 	}
 	result, err := broker.Execute(context.Background(), claimed, ModelToolCall{
 		CallID: "call_hostless_skill", Name: cloudDSHSkillReadToolName, Arguments: `{"skill_id":"compare-options"}`,
@@ -294,7 +352,8 @@ func TestCloudDSHProjectSkillUsesTaskInitiatorForHostAuthorization(t *testing.T)
 func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	definition := cloudDSHSkillReadDefinition()
 	if len(cloudDSHSkillCatalog) != 11 || len(definition.Description) > 2048 || !strings.Contains(definition.Description, "weekly-review:") ||
-		!strings.Contains(definition.Description, "amap:") {
+		!strings.Contains(definition.Description, "amap:") || !strings.Contains(definition.Description, "Morde skill") ||
+		strings.Contains(definition.Description, "nanoMuse skill") {
 		t.Fatalf("skill catalog does not expose all built-ins: %d, %s", len(cloudDSHSkillCatalog), definition.Description)
 	}
 	var schema struct {
@@ -313,7 +372,8 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 			t.Fatalf("skill metadata is not fixed for %q: %#v", skill.id, metadata)
 		}
 		content, err := cloudDSHSkillBundle.ReadFile("cloud_dsh_skills/" + skill.id + ".md")
-		if err != nil || len(content) == 0 || !utf8.Valid(content) {
+		if err != nil || len(content) == 0 || !utf8.Valid(content) || !strings.Contains(string(content), "author: Morde") ||
+			strings.Contains(string(content), "author: nanoMuse") {
 			t.Fatalf("embedded skill %q is unavailable: %v", skill.id, err)
 		}
 		toolIDs = append(toolIDs, skill.id)
@@ -642,7 +702,7 @@ func TestCloudDSHToolBrokerUsesAuthorizedHostOperationLedger(t *testing.T) {
 	if err := jpeg.Encode(&screenshot, image.NewRGBA(image.Rect(0, 0, 2, 2)), nil); err != nil {
 		t.Fatal(err)
 	}
-	screenshotResult := `{"mime_type":"image/jpeg","width":2,"height":2,"data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`
+	screenshotResult := `{"mime_type":"image/jpeg","width":2,"height":2,"screen_width":100,"screen_height":100,"data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
 		{capability: "file.read", action: "read", result: `{"path":"README.md","text":"from Host"}`},
 		{capability: "desktop.observe", action: "screenshot", result: screenshotResult},
@@ -692,6 +752,9 @@ func TestCloudDSHToolBrokerUsesAuthorizedHostOperationLedger(t *testing.T) {
 		!bytes.Equal(screenshotResultFromBroker.Images[0].Data, screenshot.Bytes()) {
 		t.Fatalf("desktop screenshot was not preserved over the tool broker: %#v, err=%v", screenshotResultFromBroker, err)
 	}
+	if !strings.Contains(screenshotResultFromBroker.Output, `"screen_width":100`) || !strings.Contains(screenshotResultFromBroker.Output, `"screen_height":100`) {
+		t.Fatalf("desktop screenshot geometry not preserved over broker: %s", screenshotResultFromBroker.Output)
+	}
 	result, err := broker.Execute(context.Background(), fixture.store.details.Task, ModelToolCall{
 		CallID: "call_dsh_window_1", Name: runtimeToolWindowList, Arguments: `{}`,
 	})
@@ -708,6 +771,12 @@ func TestCloudDSHToolBrokerUsesAuthorizedHostOperationLedger(t *testing.T) {
 	operation, err := store.GetOperation(context.Background(), fixture.store.details.Task.OwnerID, fixture.store.details.Task.ID, agentOperationKey("call_dsh_window_1"))
 	if err != nil || operation.Status != task.OperationSucceeded || operation.Result != result.Output {
 		t.Fatalf("persisted operation = %#v, err = %v", operation, err)
+	}
+	for _, event := range store.events {
+		if bytes.Contains(event.Payload, []byte(`"output"`)) || bytes.Contains(event.Payload, []byte("Editor")) ||
+			bytes.Contains(event.Payload, []byte("data_base64")) {
+			t.Fatalf("Host tool output was duplicated into a client-visible Task event: %s", event.Payload)
+		}
 	}
 	details, err := store.GetTask(context.Background(), fixture.store.details.Task.ID, fixture.store.details.Task.OwnerID)
 	if err != nil || details.Task.Status != task.StatusRunning || details.Task.Usage.ToolCalls != 3 ||
@@ -827,6 +896,94 @@ func TestCloudDSHToolBrokerPausesUnresolvedRecoveryDurably(t *testing.T) {
 	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "dsh_recovery_unresolved" ||
 		store.details.Task.Usage.ToolCalls != 0 || len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown {
 		t.Fatalf("paused recovery task = %#v, steps=%#v", store.details.Task, store.details.Steps)
+	}
+}
+
+func TestCloudDSHToolBrokerModelRecoveryStoresSafeFailureCategory(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PauseModelRecovery(context.Background(), store.details.Task, "timeout"); err != nil {
+		t.Fatalf("PauseModelRecovery() error = %v", err)
+	}
+	if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "category: timeout") {
+		t.Fatalf("model recovery summary did not include safe category: %#v", store.details.Steps)
+	}
+
+	fixture = newRuntimeToolExecutorFixture(t, nil)
+	store = &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err = NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PauseModelRecovery(context.Background(), store.details.Task, "private response with API key"); err != nil {
+		t.Fatalf("PauseModelRecovery() with unknown category error = %v", err)
+	}
+	if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "category: unknown") ||
+		strings.Contains(store.details.Steps[0].Summary, "private response") {
+		t.Fatalf("model recovery summary leaked untrusted category: %#v", store.details.Steps)
+	}
+}
+
+func TestCloudDSHToolBrokerExplainsModelContextLimit(t *testing.T) {
+	for _, category := range []string{"context_length_exceeded", "provider_context_length_exceeded"} {
+		t.Run(category, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := broker.PauseModelRecovery(context.Background(), store.details.Task, category); err != nil {
+				t.Fatal(err)
+			}
+			if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "原文已保留") ||
+				!strings.Contains(store.details.Steps[0].Summary, "缩短后重新发送") || store.details.Task.Status != task.StatusWaitingUser ||
+				store.details.Task.WaitingReason != "model_context_limit" {
+				t.Fatalf("missing actionable oversized-input explanation: task=%+v steps=%+v", store.details.Task, store.details.Steps)
+			}
+		})
+	}
+}
+
+func TestCloudDSHToolBrokerExplainsUnavailableAttachmentReader(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PauseModelRecovery(context.Background(), store.details.Task, "attachment_reader_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "当前模型无法读取附件") ||
+		!strings.Contains(store.details.Steps[0].Summary, "粘贴") || store.details.Task.Status != task.StatusWaitingUser ||
+		store.details.Task.WaitingReason != "model_attachment_unavailable" {
+		t.Fatalf("missing attachment-reader explanation: task=%+v steps=%+v", store.details.Task, store.details.Steps)
+	}
+}
+
+func TestCloudDSHToolBrokerExplainsInterruptedStream(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PauseModelRecovery(context.Background(), store.details.Task, "stream_result_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "部分回复") ||
+		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "model_stream_interrupted" {
+		t.Fatalf("missing interrupted-stream explanation: task=%+v steps=%+v", store.details.Task, store.details.Steps)
 	}
 }
 
@@ -967,6 +1124,41 @@ func TestCloudDSHToolBrokerCompletesHostTaskWithoutFileOutput(t *testing.T) {
 	if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "No file proof." ||
 		len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepSucceeded {
 		t.Fatalf("completed no-file task = %#v, steps = %#v", store.details.Task, store.details.Steps)
+	}
+}
+
+func TestCloudDSHToolBrokerDoesNotPublishUnverifiedFileClaim(t *testing.T) {
+	for _, test := range []struct {
+		name, result string
+		blocked      bool
+	}{
+		{"affirmative", "我已经将文件保存到工作区。", true},
+		{"negative", "我没有保存文件，当前无法使用工具。", false},
+		{"discussion", "请解释“文件已保存”是什么意思。", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			store.details.Task.Objective = "Answer the question in chat."
+			store.details.Task.FileDeliveryIntent = task.FileDeliveryNone
+			setCloudDSHCompletionFence(&store.details.Task)
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed := store.details.Task
+			if err := broker.Complete(context.Background(), claimed, cloudDSHCompletionFor(claimed, test.result, nil)); err != nil {
+				t.Fatal(err)
+			}
+			if test.blocked {
+				if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "output_verification_pending" || store.details.Task.Result == test.result {
+					t.Fatalf("unsupported claim was published: %+v", store.details.Task)
+				}
+			} else if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != test.result {
+				t.Fatalf("ordinary answer was interrupted: %+v", store.details.Task)
+			}
+		})
 	}
 }
 

@@ -97,6 +97,10 @@ func TestPostgresHostUsageCalculatesBoundedIntervalsAndPreservesSamples(t *testi
 	if err != nil || newGeneration.Samples != 1 || len(newGeneration.Intervals) != 1 || newGeneration.Intervals[0].UnknownReason != host.UsageGenerationChange {
 		t.Fatalf("generation 2 usage history = %#v, %v", newGeneration, err)
 	}
+	// Exercise the older Host usage rollback guard independently of new empty-root metadata.
+	if _, err := store.pool.Exec(ctx, `DELETE FROM workspace_revision_directories WHERE directory_path='.' AND valid_from_revision=0`); err != nil {
+		t.Fatal(err)
+	}
 	provider, closeProvider, err := newMigrationProvider(store.pool)
 	if err != nil {
 		t.Fatal(err)

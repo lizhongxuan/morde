@@ -143,6 +143,21 @@ func (s *workspaceInputRevisionStopStore) ReconcileStaleWorkspaceTasks(context.C
 	return nil
 }
 
+type panickingWorkspaceInputRevisionStopStore struct {
+	*taskStopStoreStub
+	panicked chan struct{}
+	calls    int
+}
+
+func (s *panickingWorkspaceInputRevisionStopStore) ReconcileStaleWorkspaceTasks(context.Context) error {
+	s.calls++
+	if s.calls == 1 {
+		close(s.panicked)
+		panic("workspace reconciler panic")
+	}
+	return nil
+}
+
 func newTestTaskStopWorker(t *testing.T, store TaskStopStore, executor TaskStopOperationExecutor, lease, poll, timeout time.Duration) *TaskStopWorker {
 	t.Helper()
 	worker, err := NewTaskStopWorker(TaskStopWorkerOptions{
@@ -208,6 +223,34 @@ func TestTaskStopWorkerReconcilesWorkspaceInputWhileRecoveringStops(t *testing.T
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestTaskStopWorkerRecoversWorkspaceReconcilerPanic(t *testing.T) {
+	store := &panickingWorkspaceInputRevisionStopStore{taskStopStoreStub: &taskStopStoreStub{}, panicked: make(chan struct{})}
+	worker := newTestTaskStopWorker(t, store, taskStopExecutorFunc(func(context.Context, task.Task, task.Operation) (task.OperationStatus, string, bool, error) {
+		return "", "", false, errors.New("no stop operation expected")
+	}), time.Second, 5*time.Millisecond, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTaskStopWorker(ctx, worker)
+	select {
+	case <-store.panicked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("workspace reconciler did not panic")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled after recovering reconciler panic", err)
+	}
+}
+
+func TestTaskStopWorkerRecoversRunLoopPanic(t *testing.T) {
+	store := &taskStopStoreStub{reconcile: func(context.Context) error { panic("store panic") }}
+	worker := newTestTaskStopWorker(t, store, taskStopExecutorFunc(func(context.Context, task.Task, task.Operation) (task.OperationStatus, string, bool, error) {
+		return "", "", false, errors.New("no stop operation expected")
+	}), time.Second, 5*time.Millisecond, time.Second)
+	if err := worker.Run(context.Background()); err == nil || err.Error() != "task stop worker panicked" {
+		t.Fatalf("Run() error = %v, want recovered worker panic", err)
 	}
 }
 

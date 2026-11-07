@@ -107,10 +107,14 @@ func (c *ConnectorClient) CallTool(ctx context.Context, endpoint string, headers
 	if err != nil || result == nil {
 		return ConnectorToolResult{}, errors.New("MCP connector tool call failed without a confirmed result")
 	}
+	return decodeConnectorToolResult(result), nil
+}
+
+func decodeConnectorToolResult(result *sdk.CallToolResult) ConnectorToolResult {
 	value := ConnectorToolResult{IsError: result.IsError, Text: make([]string, 0, len(result.Content))}
 	if len(result.Content) > 256 {
 		value.UnsupportedContent = true
-		return value, nil
+		return value
 	}
 	resultBytes := 0
 	for _, content := range result.Content {
@@ -122,13 +126,13 @@ func (c *ConnectorClient) CallTool(ctx context.Context, endpoint string, headers
 		if len(text.Text) > 64<<10 || !utf8.ValidString(text.Text) {
 			value.UnsupportedContent = true
 			value.Text = nil
-			return value, nil
+			return value
 		}
 		resultBytes += len(text.Text)
 		if resultBytes > 64<<10 {
 			value.UnsupportedContent = true
 			value.Text = nil
-			return value, nil
+			return value
 		}
 		value.Text = append(value.Text, text.Text)
 	}
@@ -137,17 +141,17 @@ func (c *ConnectorClient) CallTool(ctx context.Context, endpoint string, headers
 		if err != nil || len(encoded) > 64<<10 || !utf8.Valid(encoded) {
 			value.UnsupportedContent = true
 			value.Text = nil
-			return value, nil
+			return value
 		}
 		resultBytes += len(encoded)
 		if resultBytes > 64<<10 {
 			value.UnsupportedContent = true
 			value.Text = nil
-			return value, nil
+			return value
 		}
 		value.StructuredContent = encoded
 	}
-	return value, nil
+	return value
 }
 
 func (c *ConnectorClient) connect(ctx context.Context, endpoint string, headers http.Header) (*sdk.ClientSession, func(), error) {

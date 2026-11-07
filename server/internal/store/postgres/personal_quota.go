@@ -34,7 +34,7 @@ func (s *Store) GetAdminPersonalDataQuota(ctx context.Context, principal identit
 		if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -63,7 +63,7 @@ func (s *Store) SetAdminPersonalDataQuota(ctx context.Context, principal identit
 		if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -131,7 +131,7 @@ func (s *Store) ReservePersonalAttachment(ctx context.Context, principal identit
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -229,7 +229,7 @@ func (s *Store) ReleasePersonalAttachmentReservation(ctx context.Context, ownerI
 		return domain.InvalidArgument("attachment_reservation", "personal attachment reservation is invalid")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}

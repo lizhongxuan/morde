@@ -16,7 +16,7 @@ type ProjectWorkItemStore interface {
 	// GetProjectWorkItemMutation checks the idempotency key before a state transition can reject an exact retry.
 	GetProjectWorkItemMutation(context.Context, string, string, ProjectWorkItemMutation) (project.WorkItem, bool, error)
 	// ListProjectWorkItems must recheck active membership and use a stable cursor scoped to projectID.
-	ListProjectWorkItems(context.Context, string, string, PageRequest) (ProjectWorkItemPage, error)
+	ListProjectWorkItems(context.Context, string, string, bool, PageRequest) (ProjectWorkItemPage, error)
 	CreateProjectWorkItem(context.Context, string, project.WorkItem, string) (project.WorkItem, bool, error)
 	UpdateProjectWorkItem(context.Context, string, project.WorkItem, int64, ProjectWorkItemMutation) (project.WorkItem, error)
 }
@@ -61,11 +61,13 @@ type CreateProjectWorkItemCommand struct {
 	Title              string
 	Description        string
 	AcceptanceCriteria []string
+	Category           project.WorkItemCategory
 	AssigneeID         string
+	Unassigned         bool
 	IdempotencyKey     string
 }
 
-func (s *ProjectWorkItemService) List(ctx context.Context, principal identity.Principal, projectID string, page PageRequest) (ProjectWorkItemPage, error) {
+func (s *ProjectWorkItemService) List(ctx context.Context, principal identity.Principal, projectID string, includeUnassigned bool, page PageRequest) (ProjectWorkItemPage, error) {
 	if _, err := s.access.RequireAccess(ctx, principal, projectID, project.RoleViewer); err != nil {
 		return ProjectWorkItemPage{}, err
 	}
@@ -73,7 +75,7 @@ func (s *ProjectWorkItemService) List(ctx context.Context, principal identity.Pr
 	if err != nil {
 		return ProjectWorkItemPage{}, err
 	}
-	result, err := s.store.ListProjectWorkItems(ctx, principal.UserID, projectID, page)
+	result, err := s.store.ListProjectWorkItems(ctx, principal.UserID, projectID, includeUnassigned, page)
 	if err != nil {
 		return ProjectWorkItemPage{}, err
 	}
@@ -82,7 +84,7 @@ func (s *ProjectWorkItemService) List(ctx context.Context, principal identity.Pr
 	}
 	seen := make(map[string]struct{}, len(result.Items))
 	for _, item := range result.Items {
-		if item.ProjectID != projectID || item.Validate() != nil {
+		if item.ProjectID != projectID || item.Validate() != nil || (item.AssigneeID == "" && !includeUnassigned) {
 			return ProjectWorkItemPage{}, domain.NewError(domain.CodeInternal, "project work item store returned an invalid record")
 		}
 		if _, exists := seen[item.ID]; exists {
@@ -101,8 +103,20 @@ func (s *ProjectWorkItemService) Create(ctx context.Context, principal identity.
 		return project.WorkItem{}, false, err
 	}
 	assigneeID := command.AssigneeID
-	if assigneeID == "" {
+	if command.Unassigned && assigneeID != "" {
+		return project.WorkItem{}, false, domain.InvalidArgument("unassigned", "unassigned work items cannot include an assignee")
+	}
+	if command.Unassigned {
+		assigneeID = ""
+	} else if assigneeID == "" {
 		assigneeID = principal.UserID
+	}
+	category := command.Category
+	if category == "" {
+		category = project.WorkItemCategoryUnclassified
+	}
+	if !category.Valid() || category == "" {
+		return project.WorkItem{}, false, domain.InvalidArgument("category", "project work item category is invalid")
 	}
 	id, err := project.NewID()
 	if err != nil {
@@ -110,7 +124,7 @@ func (s *ProjectWorkItemService) Create(ctx context.Context, principal identity.
 	}
 	item := project.WorkItem{
 		ID: id, ProjectID: projectID, Title: command.Title, Description: command.Description,
-		AcceptanceCriteria: append([]string(nil), command.AcceptanceCriteria...), AssigneeID: assigneeID,
+		AcceptanceCriteria: append([]string(nil), command.AcceptanceCriteria...), Category: category, AssigneeID: assigneeID,
 		State: project.WorkItemOpen, Version: 1,
 	}
 	if err := item.Validate(); err != nil {
@@ -120,14 +134,24 @@ func (s *ProjectWorkItemService) Create(ctx context.Context, principal identity.
 	return result, replay, err
 }
 
-func (s *ProjectWorkItemService) Get(ctx context.Context, principal identity.Principal, projectID, workItemID string) (project.WorkItem, error) {
+func (s *ProjectWorkItemService) Get(ctx context.Context, principal identity.Principal, projectID, workItemID string, includeUnassigned bool) (project.WorkItem, error) {
 	if _, err := s.access.RequireAccess(ctx, principal, projectID, project.RoleViewer); err != nil {
 		return project.WorkItem{}, err
 	}
 	if !project.ValidID(workItemID) {
 		return project.WorkItem{}, domain.NewError(domain.CodeNotFound, "project work item not found")
 	}
-	return s.store.GetProjectWorkItem(ctx, principal.UserID, projectID, workItemID)
+	item, err := s.store.GetProjectWorkItem(ctx, principal.UserID, projectID, workItemID)
+	if err != nil {
+		return project.WorkItem{}, err
+	}
+	if item.ID != workItemID || item.ProjectID != projectID || item.Validate() != nil {
+		return project.WorkItem{}, domain.NewError(domain.CodeInternal, "project work item store returned an invalid record")
+	}
+	if item.AssigneeID == "" && !includeUnassigned {
+		return project.WorkItem{}, domain.NewError(domain.CodeNotFound, "project work item not found")
+	}
+	return item, nil
 }
 
 func (s *ProjectWorkItemService) Assign(ctx context.Context, principal identity.Principal, projectID, workItemID, assigneeID string, expectedVersion int64, idempotencyKey string) (project.WorkItem, error) {
@@ -143,6 +167,22 @@ func (s *ProjectWorkItemService) Assign(ctx context.Context, principal identity.
 		return project.WorkItem{}, domain.InvalidArgument("assignee_id", "project work item assignee is invalid")
 	}
 	item.AssigneeID = assigneeID
+	return s.save(ctx, principal, item, expectedVersion, mutation)
+}
+
+func (s *ProjectWorkItemService) Claim(ctx context.Context, principal identity.Principal, projectID, workItemID string, expectedVersion int64, idempotencyKey string) (project.WorkItem, error) {
+	item, mutation, replay, err := s.loadMutable(ctx, principal, projectID, workItemID, expectedVersion, idempotencyKey,
+		struct{ Claim bool }{true})
+	if err != nil {
+		return project.WorkItem{}, err
+	}
+	if replay {
+		return item, nil
+	}
+	if item.AssigneeID != "" {
+		return project.WorkItem{}, domain.NewError(domain.CodeConflict, "project work item is already assigned")
+	}
+	item.AssigneeID = principal.UserID
 	return s.save(ctx, principal, item, expectedVersion, mutation)
 }
 

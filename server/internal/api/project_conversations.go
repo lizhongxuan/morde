@@ -12,7 +12,6 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
-	"morde/server/internal/domain/task"
 )
 
 type projectConversationRoutesService interface {
@@ -20,7 +19,8 @@ type projectConversationRoutesService interface {
 	Create(context.Context, identity.Principal, string, app.CreateProjectConversationCommand) (conversation.Conversation, bool, error)
 	Get(context.Context, identity.Principal, string, string) (conversation.Conversation, error)
 	ListMessages(context.Context, identity.Principal, string, string, app.PageRequest) (app.MessagePage, error)
-	AppendMessage(context.Context, identity.Principal, string, string, app.AppendMessageCommand) (app.TaskSubmissionResult, error)
+	AcceptMessage(context.Context, identity.Principal, string, string, app.AcceptConversationMessageCommand) (conversation.Message, bool, error)
+	ListTasks(context.Context, identity.Principal, string, string, app.PageRequest) (app.TaskPage, error)
 }
 
 type projectConversationResponse struct {
@@ -53,15 +53,13 @@ type projectConversationMessagePageResponse struct {
 	NextCursor *string                              `json:"next_cursor"`
 }
 
-type projectConversationTaskResponse struct {
-	taskResponse
-	ProjectID   string `json:"project_id"`
-	InitiatorID string `json:"initiator_id"`
+type projectConversationMessageResponseEnvelope struct {
+	Message projectConversationMessageResponse `json:"message"`
 }
 
-type appendProjectConversationMessageResponse struct {
-	Message projectConversationMessageResponse `json:"message"`
-	Task    projectConversationTaskResponse    `json:"task"`
+type acceptedProjectConversationMessageResponse struct {
+	Message  projectConversationMessageResponse `json:"message"`
+	Replayed bool                               `json:"replayed"`
 }
 
 // RegisterProjectConversationRoutes exposes the shared conversation endpoints
@@ -106,6 +104,10 @@ func RegisterProjectConversationRoutes(group *gin.RouterGroup, service projectCo
 		if !ok {
 			return
 		}
+		instanceID, ok := optionalOutboxCreationScope(c, principal)
+		if !ok {
+			return
+		}
 		var request createProjectConversationRequest
 		if !decodeStrictTaskJSON(c, &request) {
 			return
@@ -115,7 +117,7 @@ func RegisterProjectConversationRoutes(group *gin.RouterGroup, service projectCo
 			return
 		}
 		value, replay, err := service.Create(c.Request.Context(), principal, projectID,
-			app.CreateProjectConversationCommand{Title: request.Title, IdempotencyKey: key})
+			app.CreateProjectConversationCommand{Title: request.Title, IdempotencyKey: key, ServiceInstanceID: instanceID})
 		if err != nil {
 			writeError(c, err)
 			return
@@ -157,7 +159,27 @@ func RegisterProjectConversationRoutes(group *gin.RouterGroup, service projectCo
 		if !ok {
 			return
 		}
-		result, err := service.ListMessages(c.Request.Context(), principal, projectID, conversationID, page)
+		var result app.MessagePage
+		var err error
+		if clientID := c.Query("client_message_id"); clientID != "" {
+			if !requiredMessageActor(c, principal) {
+				return
+			}
+			instanceID, ok := requiredMessageServiceInstance(c)
+			if !ok {
+				return
+			}
+			lookup, ok := service.(interface {
+				FindMessageByClientID(context.Context, identity.Principal, string, string, string, string) (app.MessagePage, error)
+			})
+			if !ok {
+				serviceUnavailable(c)
+				return
+			}
+			result, err = lookup.FindMessageByClientID(c.Request.Context(), principal, projectID, conversationID, clientID, instanceID)
+		} else {
+			result, err = service.ListMessages(c.Request.Context(), principal, projectID, conversationID, page)
+		}
 		if err != nil {
 			writeError(c, err)
 			return
@@ -173,40 +195,73 @@ func RegisterProjectConversationRoutes(group *gin.RouterGroup, service projectCo
 		}
 		c.JSON(http.StatusOK, projectConversationMessagePageResponse{Items: items, NextCursor: cursorPointer(result.NextCursor)})
 	})
-	group.POST("/projects/:id/conversations/:conversation_id/messages", func(c *gin.Context) {
+	group.POST("/projects/:id/conversations/:conversation_id/messages", acceptProjectConversationMessage(service))
+	group.GET("/projects/:id/conversations/:conversation_id/tasks", func(c *gin.Context) {
 		principal, projectID, conversationID, ok := projectConversationPrincipalAndConversationID(c)
 		if !ok {
 			return
 		}
-		var request appendMessageRequest
+		page, ok := sitePageRequest(c)
+		if !ok {
+			return
+		}
+		result, err := service.ListTasks(c.Request.Context(), principal, projectID, conversationID, page)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		writeConversationActiveTasks(c, result)
+	})
+}
+
+func acceptProjectConversationMessage(service projectConversationRoutesService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, projectID, conversationID, ok := projectConversationPrincipalAndConversationID(c)
+		if !ok {
+			return
+		}
+		if !requiredMessageActor(c, principal) {
+			return
+		}
+		var request conversationMessageRequest
 		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		instanceID, ok := requiredMessageServiceInstance(c)
+		if !ok {
+			return
+		}
+		key, ok := requiredIdempotencyKey(c)
+		if !ok {
+			return
+		}
+		if request.ClientMessageID == "" || request.ClientMessageID != key {
+			writeError(c, domain.InvalidArgument("client_message_id", "client message id and idempotency key must match"))
 			return
 		}
 		budget, ok := requestBudget(c, request.Budget)
 		if !ok {
 			return
 		}
-		result, err := service.AppendMessage(c.Request.Context(), principal, projectID, conversationID, app.AppendMessageCommand{
-			ProjectID: projectID, ExpectedTaskID: request.ExpectedTaskID, HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
-			MCPConnectorIDs: request.MCPConnectorIDs, ApplicationID: request.ApplicationID, ModelID: request.ModelID,
-			Content: request.Content, Budget: budget, IdempotencyKey: c.GetHeader("Idempotency-Key"),
+		message, replayed, err := service.AcceptMessage(c.Request.Context(), principal, projectID, conversationID, app.AcceptConversationMessageCommand{
+			ProjectID: projectID, ServiceInstanceID: instanceID, ClientMessageID: request.ClientMessageID,
+			PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, MCPConnectorIDs: request.MCPConnectorIDs,
+			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
+			ModelID: request.ModelID, Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)
 			return
 		}
-		message, err := toProjectConversationMessageResponse(result.Message)
+		message.ClientMessageID = request.ClientMessageID
+		view, err := toProjectConversationMessageResponse(message)
 		if err != nil {
 			writeError(c, err)
 			return
 		}
-		taskValue, err := toProjectConversationTaskResponse(result.Task)
-		if err != nil {
-			writeError(c, err)
-			return
-		}
-		c.JSON(http.StatusAccepted, appendProjectConversationMessageResponse{Message: message, Task: taskValue})
-	})
+		c.JSON(http.StatusAccepted, acceptedProjectConversationMessageResponse{Message: view, Replayed: replayed})
+	}
 }
 
 func projectConversationPrincipalAndID(c *gin.Context) (identity.Principal, string, bool) {
@@ -247,20 +302,9 @@ func toProjectConversationMessageResponse(value conversation.Message) (projectCo
 	if !domain.ValidUserID(value.OwnerID) || !domain.ValidUserID(value.ActorID) {
 		return projectConversationMessageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
-	base, err := toMessageResponse(value)
+	base, err := toScopedMessageResponse(value, true)
 	if err != nil {
 		return projectConversationMessageResponse{}, err
 	}
 	return projectConversationMessageResponse{messageResponse: base, OwnerID: value.OwnerID, ActorID: value.ActorID}, nil
-}
-
-func toProjectConversationTaskResponse(value task.Task) (projectConversationTaskResponse, error) {
-	if !project.ValidID(value.ProjectID) || !domain.ValidUserID(value.InitiatorID) {
-		return projectConversationTaskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
-	}
-	base, err := toTaskResponse(app.TaskDetails{Task: value})
-	if err != nil {
-		return projectConversationTaskResponse{}, err
-	}
-	return projectConversationTaskResponse{taskResponse: base, ProjectID: value.ProjectID, InitiatorID: value.InitiatorID}, nil
 }

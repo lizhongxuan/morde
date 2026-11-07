@@ -31,6 +31,34 @@ type adminModelBudgetDefaultServiceStub struct {
 	updateErr error
 }
 
+type adminModelDefaultServiceStub struct {
+	value           app.AdminModelDefaultView
+	availability    app.AdminModelDefaultAvailability
+	expectedVersion int64
+	modelID         string
+	ip              string
+	getErr          error
+	updateErr       error
+	availabilityErr error
+}
+
+func (s *adminModelDefaultServiceStub) Get(context.Context, identity.Principal) (app.AdminModelDefaultView, error) {
+	return s.value, s.getErr
+}
+
+func (s *adminModelDefaultServiceStub) Update(_ context.Context, _ identity.Principal, expectedVersion int64, modelID, ip string) (app.AdminModelDefaultView, error) {
+	s.expectedVersion, s.modelID, s.ip = expectedVersion, modelID, ip
+	if s.updateErr != nil {
+		return app.AdminModelDefaultView{}, s.updateErr
+	}
+	s.value = app.AdminModelDefaultView{Configured: modelID != "", ModelID: modelID, Version: expectedVersion + 1}
+	return s.value, nil
+}
+
+func (s *adminModelDefaultServiceStub) Available(context.Context) (app.AdminModelDefaultAvailability, error) {
+	return s.availability, s.availabilityErr
+}
+
 func (s *adminModelBudgetDefaultServiceStub) Get(context.Context, identity.Principal) (app.ModelBudgetDefault, error) {
 	return s.value, s.getErr
 }
@@ -85,9 +113,11 @@ func TestAdminOperationsRoutesRequireAdminAndReturnSafeEmptyStates(t *testing.T)
 	operations := &adminOperationsServiceStub{settings: settings, invites: app.AdminInvitePage{Items: []app.AdminInvite{}, Total: 0, TotalInviters: 0},
 		sites: app.AdminSitePage{Items: []app.AdminSite{}, Summary: app.AdminSiteSummary{}}, nudge: nudge, code: "0123456789abcdef0123456789abcdef"}
 	modelBudgetDefaults := &adminModelBudgetDefaultServiceStub{}
+	modelDefaults := &adminModelDefaultServiceStub{}
 	deps := services.deps()
 	deps.AdminOperations = operations
 	deps.AdminModelBudgetDefaults = modelBudgetDefaults
+	deps.AdminModelDefaults = modelDefaults
 	router, err := New(deps, validOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -97,7 +127,7 @@ func TestAdminOperationsRoutesRequireAdminAndReturnSafeEmptyStates(t *testing.T)
 	var got adminSettingsResponse
 	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil || response.Code != http.StatusOK || !got.RegistrationReviewRequired ||
 		!got.AutomaticNewUserModelBudget || got.AutomaticInvitationReward || got.AutomaticContributionReward || got.DefaultPersonalDataQuotaBytes != 5<<30 ||
-		got.DefaultModelBudget.Configured || got.DefaultModelBudget.Version != 0 {
+		got.DefaultModelBudget.Configured || got.DefaultModelBudget.Version != 0 || got.DefaultModel.Configured || got.DefaultModel.ModelID != nil || got.DefaultModel.Version != 0 {
 		t.Fatalf("admin settings = %d %+v err=%v body=%s", response.Code, got, err, response.Body)
 	}
 	invites := requestWithCookie(router, http.MethodGet, "/api/admin/invites?limit=10&offset=0", cookie, "")
@@ -120,6 +150,8 @@ func TestAdminOperationsRoutesRequireAdminAndReturnSafeEmptyStates(t *testing.T)
 	services.verifier.role = identity.RoleUser
 	userDeps := services.deps()
 	userDeps.AdminOperations = operations
+	userDeps.AdminModelBudgetDefaults = modelBudgetDefaults
+	userDeps.AdminModelDefaults = modelDefaults
 	userRouter, err := New(userDeps, validOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +185,43 @@ func TestAdminModelBudgetDefaultUpdateRequiresFieldsAndUsesVersionCAS(t *testing
 	defaults.updateErr = domain.NewError(domain.CodeConflict, "default model budget version changed")
 	stale := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-budget-default",
 		`{"expected_version":0,"token_limit":25000,"max_concurrent":2}`, cookie, "https://portal.example.test")
+	assertError(t, stale, http.StatusConflict, "conflict")
+}
+
+func TestAdminModelDefaultUpdateUsesCASAndCanClear(t *testing.T) {
+	services := newServices()
+	services.verifier.role = identity.RoleAdmin
+	defaults := &adminModelDefaultServiceStub{}
+	deps := services.deps()
+	deps.AdminModelDefaults = defaults
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	updated := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-default",
+		`{"expected_version":0,"model_id":"p1234567"}`, cookie, "https://portal.example.test")
+	var got adminModelDefaultResponse
+	if err := json.Unmarshal(updated.Body.Bytes(), &got); err != nil || updated.Code != http.StatusOK || !got.Configured ||
+		got.ModelID == nil || *got.ModelID != "p1234567" || got.Version != 1 || defaults.expectedVersion != 0 ||
+		defaults.modelID != "p1234567" || defaults.ip == "" {
+		t.Fatalf("default model = %d %+v command=(v%d,%q) ip=%q err=%v body=%s", updated.Code, got, defaults.expectedVersion, defaults.modelID, defaults.ip, err, updated.Body)
+	}
+
+	missing := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-default",
+		`{"expected_version":1}`, cookie, "https://portal.example.test")
+	assertError(t, missing, http.StatusBadRequest, "invalid_argument")
+
+	cleared := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-default",
+		`{"expected_version":1,"model_id":""}`, cookie, "https://portal.example.test")
+	if err := json.Unmarshal(cleared.Body.Bytes(), &got); err != nil || cleared.Code != http.StatusOK || got.Configured ||
+		got.ModelID != nil || got.Version != 2 || defaults.expectedVersion != 1 || defaults.modelID != "" {
+		t.Fatalf("cleared default model = %d %+v command=(v%d,%q) err=%v body=%s", cleared.Code, got, defaults.expectedVersion, defaults.modelID, err, cleared.Body)
+	}
+
+	defaults.updateErr = domain.NewError(domain.CodeConflict, "default model version changed")
+	stale := requestWithCookieBody(router, http.MethodPut, "/api/admin/settings/model-default",
+		`{"expected_version":1,"model_id":"p1234567"}`, cookie, "https://portal.example.test")
 	assertError(t, stale, http.StatusConflict, "conflict")
 }
 

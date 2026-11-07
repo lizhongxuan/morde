@@ -34,6 +34,7 @@ func TestWorkspaceSymlinkMigrationDownUpAndPreservesIdentity(t *testing.T) {
 		ctx := context.Background()
 		owner := createTestUser(t, store, 4, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "symlink-down-guard")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		target := "../README.md"
 		digest := sha256.Sum256([]byte(target))
 		if _, err := pool.Exec(ctx, `INSERT INTO workspace_revision_files

@@ -6,8 +6,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import type { components } from '../api/schema';
 import { portalApi } from '../app/api';
+import { messageOutbox } from '../app/message-outbox';
+import type { PendingConversationMessage } from '../app/message-outbox';
 import { projectApi } from '../app/project-api';
-import type { AppendProjectConversationMessageResponse, Project, ProjectBudget, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectWorkItem } from '../app/project-api';
+import type { AcceptedProjectConversationMessageResponse, Project, ProjectBudget, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectWorkItem } from '../app/project-api';
 import { Projects } from './Projects';
 
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'uowner01' } }) }));
@@ -19,33 +21,29 @@ const projectConversation: ProjectConversation = {
   id: 'cproj001', project_id: project.id, owner_id: teammate.user_id, title: '共享执行计划',
   created_at: '2026-11-02T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
 };
-const projectTaskReceipt: AppendProjectConversationMessageResponse = {
-  message: {
+const projectMessageReceipt: AcceptedProjectConversationMessageResponse = {
+    message: {
     id: 'mproj001', conversation_id: projectConversation.id, owner_id: projectConversation.owner_id, actor_id: owner.user_id,
-    role: 'user', content: '检查当前发布状态', task_id: 'qproj001', delivery_status: 'applied', created_at: '2026-11-02T00:01:00Z',
+    sequence: 1, role: 'user', content: '检查当前发布状态', client_message_id: 'project-message-001', routing_status: 'pending', delivery_status: 'pending', created_at: '2026-11-02T00:01:00Z',
   },
-  task: {
-    id: 'qproj001', owner_id: projectConversation.owner_id, initiator_id: owner.user_id, project_id: project.id,
-    execution_location: 'server', conversation_id: projectConversation.id, model_id: 'model-test', objective: '检查当前发布状态',
-    status: 'queued', current_step: null, budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
-    usage: { active_seconds: 0, tool_calls: 0, model_tokens: null }, created_at: '2026-11-02T00:01:00Z', updated_at: '2026-11-02T00:01:00Z',
-    event_sequence: 0, result: null, waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null,
-    clarification_request: null, stop_request: null, assistant_message: null, finished_at: null,
-  },
+  replayed: false,
 };
 const projectHistoryMessage: ProjectConversationMessage = {
-  ...projectTaskReceipt.message, id: 'mhistory1', task_id: 'qhistory1', actor_id: owner.user_id,
-  content: '上一位成员提交的提示', delivery_status: 'applied',
+  ...projectMessageReceipt.message, id: 'mhistory1', task_id: 'qhistory1', actor_id: owner.user_id,
+  content: '上一位成员提交的提示', routing_status: 'routed', delivery_status: 'applied',
+};
+const newerProjectHistoryMessage: ProjectConversationMessage = {
+  ...projectHistoryMessage, id: 'mhistory2', sequence: 2, content: '较新的项目提示',
 };
 const modelConnection: components['schemas']['ModelConnection'] = {
   id: 'model-test', name: '团队文本模型', base_url: 'https://models.example.invalid/v1', model_name: 'test-model',
-  shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false },
+  shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false, text_stream: false },
   checked_at: '2026-11-02T00:00:00Z', created_at: '2026-11-02T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
 };
 const alternateModelConnection = { ...modelConnection, id: 'model-alt01', name: '备用文本模型', model_name: 'alternate-model' };
 const readyCapabilities: Awaited<ReturnType<typeof portalApi.capabilities>> = {
   service_instance_id: '00000000-0000-4000-8000-000000000001', api_version: 'v1', hub_version: null,
-  event_version: null, minimum_client_version: null, supported_features: ['project_budget_execution'], default_max_request_bytes: 1_048_576,
+  event_version: null, minimum_client_version: null, supported_features: ['project_budget_execution', 'conversation_auto_routing_v1'], default_max_request_bytes: 1_048_576,
 };
 const invitation: ProjectInvitation = {
   id: 'i0000001', project_id: project.id, inviter_id: 'umember1', invitee_id: 'uowner01', role: 'viewer', state: 'pending', version: 4,
@@ -56,7 +54,7 @@ const budget: ProjectBudget = {
 };
 const workItem: ProjectWorkItem = {
   id: 'w0000001', project_id: project.id, title: '验证发布', description: '检查服务端流程', acceptance_criteria: ['有持久化证据'],
-  assignee_id: owner.user_id, state: 'open', blocked_reason: '', task_ids: [], version: 1,
+  assignee_id: owner.user_id, category: 'unclassified', state: 'open', blocked_reason: '', task_ids: [], version: 1,
 };
 const task = {
   id: 't0000001', owner_id: owner.user_id, initiator_id: owner.user_id, execution_location: 'server' as const, conversation_id: 'c0000001', model_id: 'model-test',
@@ -71,8 +69,22 @@ function renderProjects() {
   return { ...result, client };
 }
 
+async function openProject() {
+  await userEvent.setup().click(await screen.findByRole('button', { name: '查看项目 交付协作' }));
+}
+
 describe('Projects API integration', () => {
   beforeEach(() => {
+    const values = new Map<string, PendingConversationMessage[]>();
+    const orderings = new Map<string, { heads: Record<string, string>; aliases: Record<string, string> }>();
+    vi.spyOn(messageOutbox, 'read').mockImplementation(async (scope) => values.get(scope) ?? []);
+    vi.spyOn(messageOutbox, 'update').mockImplementation(async (scope, change) => {
+      const ordering = orderings.get(scope) ?? { heads: {}, aliases: {} };
+      const result = change(values.get(scope) ?? [], ordering);
+      orderings.set(scope, ordering);
+      values.set(scope, result);
+      return result;
+    });
     vi.spyOn(projectApi, 'projects').mockResolvedValue([project]);
     vi.spyOn(projectApi, 'getProject').mockResolvedValue(project);
     vi.spyOn(projectApi, 'members').mockResolvedValue([owner, teammate]);
@@ -85,7 +97,10 @@ describe('Projects API integration', () => {
     vi.spyOn(projectApi, 'projectConversations').mockResolvedValue([projectConversation]);
     vi.spyOn(projectApi, 'projectConversationMessages').mockImplementation(async (_id, conversationID) => conversationID === projectConversation.id ? [projectHistoryMessage] : []);
     vi.spyOn(projectApi, 'createProjectConversation').mockResolvedValue(projectConversation);
-    vi.spyOn(projectApi, 'appendProjectConversationMessage').mockResolvedValue(projectTaskReceipt);
+    vi.spyOn(projectApi, 'acceptProjectConversationMessage').mockImplementation(async (_id, conversationID, body) => ({
+      message: { ...projectMessageReceipt.message, conversation_id: conversationID, client_message_id: body.client_message_id, content: body.content },
+      replayed: false,
+    }));
     vi.spyOn(projectApi, 'budget').mockResolvedValue(budget);
     vi.spyOn(projectApi, 'ledger').mockResolvedValue([{
       call_id: 'call-unknown', actor_id: owner.user_id, source: 'task', task_id: task.id, model_id: task.model_id,
@@ -93,20 +108,59 @@ describe('Projects API integration', () => {
       created_at: '2026-11-02T00:00:00Z',
     }]);
     vi.spyOn(projectApi, 'workItems').mockResolvedValue([workItem]);
+    vi.spyOn(projectApi, 'createWorkItem').mockResolvedValue(workItem);
+    vi.spyOn(projectApi, 'claimWorkItem').mockResolvedValue(workItem);
     vi.spyOn(projectApi, 'tasks').mockResolvedValue([task]);
-    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [modelConnection] });
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [modelConnection], configuration_status: 'configured' });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(readyCapabilities);
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
     vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
   });
 
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+  afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+
+  it('shows project attachments from another client using their scoped read route', async () => {
+    const attachmentID = 'pca_0123456789abcdef0123456789abcdef';
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([{ ...projectHistoryMessage, attachment_ids: [attachmentID] }]);
+    renderProjects();
+    await openProject();
+    const link = await screen.findByRole('link', { name: '下载附件 1' });
+    expect(link).toHaveAttribute('href', `/api/projects/${project.id}/conversations/${projectConversation.id}/messages/${projectHistoryMessage.id}/attachments-by-id/${attachmentID}/content`);
+    expect(link).toHaveAttribute('download');
+  });
+
+  it('deduplicates overlapping project history pages by message ID', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([projectHistoryMessage,
+      { ...projectHistoryMessage, content: '较旧的重复版本' }]);
+    renderProjects();
+    await openProject();
+    expect(await screen.findByText(projectHistoryMessage.content)).toBeInTheDocument();
+    expect(screen.queryByText('较旧的重复版本')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('article', { name: '项目对话消息' })).toHaveLength(1);
+  });
+
+  it('stops only the current member’s selected project task', async () => {
+    const mine = { ...task, id: 'qhistory1', conversation_id: projectConversation.id, status: 'running' as const };
+    const other = { ...mine, id: 'qhistory2', initiator_id: teammate.user_id };
+    vi.mocked(projectApi.tasks).mockResolvedValue([mine, other]);
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([projectHistoryMessage,
+      { ...newerProjectHistoryMessage, task_id: other.id, actor_id: teammate.user_id }]);
+    const stop = vi.spyOn(portalApi, 'taskAction').mockResolvedValue({ task_id: mine.id, action: 'cancel', status: 'cancelling', unsettled_operation_ids: [] });
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+    const button = await screen.findByRole('button', { name: '停止此任务' });
+    expect(screen.getAllByRole('button', { name: '停止此任务' })).toHaveLength(1);
+    await user.click(button);
+    await waitFor(() => expect(stop).toHaveBeenCalledWith(mine.id, { action: 'cancel', expected_status: 'running' }, expect.any(String)));
+    expect(await screen.findByText('停止请求已受理，正在等待服务端确认任务状态。')).toBeInTheDocument();
+  });
 
   it('uses the typed project conversation routes and idempotency headers', async () => {
     vi.mocked(projectApi.createProjectConversation).mockRestore();
     vi.mocked(projectApi.projectConversations).mockRestore();
     vi.mocked(projectApi.projectConversationMessages).mockRestore();
-    vi.mocked(projectApi.appendProjectConversationMessage).mockRestore();
+    vi.mocked(projectApi.acceptProjectConversationMessage).mockRestore();
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
@@ -115,26 +169,95 @@ describe('Projects API integration', () => {
         return Response.json({ items: [projectHistoryMessage], next_cursor: null });
       }
       if (request.method === 'GET') return Response.json({ items: [projectConversation], next_cursor: null });
-      if (new URL(request.url).pathname.endsWith('/messages')) return Response.json(projectTaskReceipt, { status: 202 });
+      if (new URL(request.url).pathname.endsWith('/messages')) return Response.json(projectMessageReceipt, { status: 202 });
       return Response.json(projectConversation, { status: 201 });
     }));
 
     await projectApi.createProjectConversation(project.id, { title: projectConversation.title }, 'project-create-key-01');
     await projectApi.projectConversations(project.id);
     await projectApi.projectConversationMessages(project.id, projectConversation.id);
-    await projectApi.appendProjectConversationMessage(project.id, projectConversation.id, {
-      model_id: modelConnection.id, content: projectTaskReceipt.message.content,
-    }, 'project-append-key-01');
+    await projectApi.projectConversationMessages(project.id, projectConversation.id, 'project-message-key-01', readyCapabilities.service_instance_id, owner.user_id);
+    await projectApi.acceptProjectConversationMessage(project.id, projectConversation.id, {
+      client_message_id: 'project-message-key-01', model_id: modelConnection.id, content: projectMessageReceipt.message.content,
+    }, 'project-message-key-01', readyCapabilities.service_instance_id, owner.user_id);
 
     expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
       ['POST', `/api/projects/${project.id}/conversations`],
       ['GET', `/api/projects/${project.id}/conversations`],
       ['GET', `/api/projects/${project.id}/conversations/${projectConversation.id}/messages`],
+      ['GET', `/api/projects/${project.id}/conversations/${projectConversation.id}/messages`],
       ['POST', `/api/projects/${project.id}/conversations/${projectConversation.id}/messages`],
     ]);
     expect(requests[0]?.headers.get('Idempotency-Key')).toBe('project-create-key-01');
-    expect(requests[3]?.headers.get('Idempotency-Key')).toBe('project-append-key-01');
-    expect(await requests[3]?.clone().json()).toEqual({ model_id: modelConnection.id, content: projectTaskReceipt.message.content });
+    expect(requests[3]?.headers.get('X-Morde-Actor-ID')).toBe(owner.user_id);
+    expect(requests[4]?.headers.get('Idempotency-Key')).toBe('project-message-key-01');
+    expect(requests[4]?.headers.get('X-Morde-Service-Instance-ID')).toBe(readyCapabilities.service_instance_id);
+    expect(requests[4]?.headers.get('X-Morde-Actor-ID')).toBe(owner.user_id);
+    expect(await requests[4]?.clone().json()).toEqual({ client_message_id: 'project-message-key-01', model_id: modelConnection.id, content: projectMessageReceipt.message.content });
+  });
+
+  it('offers processing retries only for the sending project member and reuses an uncertain key', async () => {
+    const own = { ...projectHistoryMessage, task_id: undefined, routing_status: 'failed' as const,
+      routing_failure_reason: 'model_unavailable' as const, delivery_status: 'pending' as const };
+    const other = { ...own, id: 'mhistory2', sequence: 2, actor_id: teammate.user_id, content: '其他成员的消息' };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([own, other]);
+    const retry = vi.spyOn(projectApi, 'retryProjectConversationMessageProcessing')
+      .mockRejectedValueOnce(new Error('连接中断')).mockResolvedValueOnce(undefined);
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+    const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
+    const otherMessage = (await screen.findByText(other.content)).closest<HTMLElement>('article')!;
+    expect(within(otherMessage).queryByRole('button', { name: '重试处理' })).not.toBeInTheDocument();
+    await user.click(within(ownMessage).getByRole('button', { name: '重试处理' }));
+    await screen.findByText('连接中断');
+    await user.click(within(ownMessage).getByRole('button', { name: '重试处理' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    expect(retry.mock.calls[0]).toEqual(retry.mock.calls[1]);
+    expect(retry.mock.calls[0]).toEqual([project.id, projectConversation.id, own.id, expect.any(String), readyCapabilities.service_instance_id, owner.user_id]);
+    await screen.findByText('已请求重新处理消息。');
+  });
+
+  it('explains an oversized project message without offering an ineffective retry', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([{ ...projectHistoryMessage, task_id: undefined,
+      routing_status: 'failed', routing_failure_reason: 'message_too_long', delivery_status: 'pending' }]);
+    renderProjects();
+    await openProject();
+    const explanation = await screen.findByText(/消息及上下文超过当前模型输入上限/);
+    expect(explanation).toHaveTextContent('原文已保留；请缩短后重新发送');
+    expect(within(explanation.closest<HTMLElement>('article')!).queryByRole('button', { name: '重试处理' })).not.toBeInTheDocument();
+  });
+
+  it('uses the capability-gated work-item query and idempotent claim endpoint', async () => {
+    vi.mocked(projectApi.workItems).mockRestore();
+    vi.mocked(projectApi.createWorkItem).mockRestore();
+    vi.mocked(projectApi.claimWorkItem).mockRestore();
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      requests.push(request);
+      if (request.method === 'GET') return Response.json({ items: [{ ...workItem, category: 'bug', assignee_id: null }], next_cursor: null });
+      return Response.json({ ...workItem, category: 'bug', assignee_id: owner.user_id, version: 2 });
+    }));
+
+    await projectApi.workItems(project.id);
+    const listed = await projectApi.workItems(project.id, true);
+    await projectApi.createWorkItem(project.id, { title: '新增缺陷', category: 'bug', unassigned: true }, 'work-item-create-v2-01');
+    await projectApi.claimWorkItem(project.id, workItem.id, { expected_version: 1 }, 'work-item-claim-v2-01');
+
+    expect(listed[0]).toMatchObject({ category: 'bug', assignee_id: null });
+    expect(new URL(requests[0]!.url).searchParams.has('include_unassigned')).toBe(false);
+    expect(new URL(requests[1]!.url).searchParams.get('include_unassigned')).toBe('true');
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['GET', `/api/projects/${project.id}/work-items`],
+      ['GET', `/api/projects/${project.id}/work-items`],
+      ['POST', `/api/projects/${project.id}/work-items`],
+      ['POST', `/api/projects/${project.id}/work-items/${workItem.id}/claim`],
+    ]);
+    expect(requests[2]?.headers.get('Idempotency-Key')).toBe('work-item-create-v2-01');
+    expect(await requests[2]?.clone().json()).toMatchObject({ category: 'bug', unassigned: true });
+    expect(requests[3]?.headers.get('Idempotency-Key')).toBe('work-item-claim-v2-01');
+    expect(await requests[3]?.clone().json()).toEqual({ expected_version: 1 });
   });
 
   it('loads server state, keeps unknown usage visible, and creates a project through the API', async () => {
@@ -142,7 +265,8 @@ describe('Projects API integration', () => {
     const user = userEvent.setup();
     renderProjects();
 
-    expect(await screen.findByRole('heading', { name: '项目' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '我的项目' })).toBeInTheDocument();
+    await openProject();
     expect(screen.getByRole('heading', { name: 'Muse 项目能力演示' })).toBeInTheDocument();
     expect(screen.getAllByRole('note').some((note) => /本地演示.*刷新即丢.*不连接服务/.test(note.textContent ?? ''))).toBe(true);
     expect(await screen.findByRole('heading', { name: '验证发布' })).toBeInTheDocument();
@@ -151,11 +275,27 @@ describe('Projects API integration', () => {
     expect(projectApi.projects).toHaveBeenCalled();
     expect(projectApi.getProject).toHaveBeenCalledWith(project.id);
 
+    await user.click(screen.getByRole('button', { name: '← 返回项目' }));
+    await user.click(screen.getByRole('button', { name: '＋ 创建项目' }));
     await user.type(screen.getByLabelText('新项目名称'), '新客户项目');
     await user.type(screen.getByLabelText('项目说明'), '试点协作');
     await user.click(screen.getByRole('button', { name: '创建项目' }));
     await screen.findByText('服务端已确认创建项目。');
     expect(create).toHaveBeenCalledWith({ name: '新客户项目', description: '试点协作' }, expect.any(String));
+  });
+
+  it('opens a project from the list and returns without changing project data', async () => {
+    const user = userEvent.setup();
+    const create = vi.spyOn(projectApi, 'createProject');
+    renderProjects();
+
+    expect(await screen.findByRole('heading', { name: '我的项目' })).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '查看项目 交付协作' }));
+    expect(await screen.findByRole('region', { name: '项目详情' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '我的项目' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '← 返回项目' }));
+    expect(screen.getByRole('heading', { name: '我的项目' })).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('creates a shared project conversation and selects the returned conversation', async () => {
@@ -168,6 +308,7 @@ describe('Projects API integration', () => {
     });
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
     await user.type(screen.getByLabelText('新共享对话标题（可选）'), '上线排查');
@@ -179,17 +320,55 @@ describe('Projects API integration', () => {
 
   it('shows shared history actor, delivery state, and any known Task status', async () => {
     renderProjects();
+    await openProject();
     const message = await screen.findByRole('article', { name: '项目对话消息' });
     expect(within(message).getByText(`执行者 ${owner.user_id} · 对话创建者 ${projectConversation.owner_id}`)).toBeInTheDocument();
-    expect(within(message).getByText('applied')).toBeInTheDocument();
+    expect(within(message).getByText('已发送')).toBeInTheDocument();
     expect(within(message).getByText('Task qhistory1 · 状态 未知')).toBeInTheDocument();
     expect(within(message).getByText('上一位成员提交的提示')).toBeInTheDocument();
+  });
+
+  it('shows a project routing failure instead of an agent delivery status', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{ ...projectHistoryMessage,
+      task_id: undefined, routing_status: 'failed', delivery_status: 'pending' }]);
+    renderProjects();
+    await openProject();
+    const message = await screen.findByRole('article', { name: '项目对话消息' });
+    expect(within(message).getByText('消息处理失败')).toBeInTheDocument();
+  });
+
+  it('shows persisted streaming and interrupted project replies in their conversation order', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([
+      { ...projectHistoryMessage, id: 'mstream1', sequence: 3, role: 'assistant', content: '正在回复',
+        output_status: 'streaming', output_task_revision: 1 },
+      { ...projectHistoryMessage, id: 'minterrupt1', sequence: 2, role: 'assistant', content: '先前片段',
+        output_status: 'interrupted', output_task_revision: 0 },
+    ]);
+    renderProjects();
+    await openProject();
+    const messages = await screen.findAllByRole('article', { name: '项目对话消息' });
+    expect(messages[0]).toHaveTextContent('先前片段');
+    expect(messages[0]).toHaveTextContent('回复已中断');
+    expect(messages[1]).toHaveTextContent('正在回复');
+    expect(messages[1]).toHaveTextContent('正在生成');
+  });
+
+  it('renders newest-first project history pages in sequence order', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([newerProjectHistoryMessage, projectHistoryMessage]);
+    renderProjects();
+    await openProject();
+
+    const messages = await screen.findAllByRole('article', { name: '项目对话消息' });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toHaveTextContent('上一位成员提交的提示');
+    expect(messages[1]).toHaveTextContent('较新的项目提示');
   });
 
   it('keeps shared-history loading, error, and empty states distinct', async () => {
     let resolveMessages!: (messages: ProjectConversationMessage[]) => void;
     vi.spyOn(projectApi, 'projectConversationMessages').mockImplementation(() => new Promise((resolve) => { resolveMessages = resolve; }));
     renderProjects();
+    await openProject();
     expect(await screen.findByText('正在读取共享历史…')).toBeInTheDocument();
     await act(async () => { resolveMessages([]); });
     expect(await screen.findByText('该共享对话暂无消息。')).toBeInTheDocument();
@@ -197,54 +376,93 @@ describe('Projects API integration', () => {
     cleanup();
     vi.spyOn(projectApi, 'projectConversationMessages').mockRejectedValue(new ApiError({ message: '共享历史无权访问', code: 'forbidden', status: 403 }));
     renderProjects();
+    await openProject();
     expect(await screen.findByRole('alert')).toHaveTextContent('读取共享历史失败：没有执行此操作的权限');
   });
 
-  it('submits a shared project prompt with a verified model and displays the Task project, initiator, and status', async () => {
-    const append = vi.spyOn(projectApi, 'appendProjectConversationMessage');
+  it('accepts a shared project message without expecting an immediate Task', async () => {
+    const append = vi.spyOn(projectApi, 'acceptProjectConversationMessage');
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
     await user.type(screen.getByLabelText('提交到共享对话的提示'), '检查当前发布状态');
-    await user.click(screen.getByRole('button', { name: '提交并排队项目 Task' }));
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
 
-    expect(await screen.findByRole('article', { name: '项目 Task 回执' })).toHaveTextContent('qproj001');
-    expect(screen.getByRole('article', { name: '项目 Task 回执' })).toHaveTextContent(`项目 ${project.id}`);
-    expect(screen.getByRole('article', { name: '项目 Task 回执' })).toHaveTextContent(`发起人 ${owner.user_id}`);
-    expect(screen.getByRole('article', { name: '项目 Task 回执' })).toHaveTextContent('queued');
-    expect(append).toHaveBeenCalledWith(project.id, projectConversation.id, {
-      model_id: modelConnection.id, content: '检查当前发布状态',
-    }, expect.any(String));
-    expect(screen.getByText(/真实项目 Task 由服务端检查并预留项目预算/)).toBeInTheDocument();
-    expect(screen.getByText(/服务端会在模型调用前预留项目预算/)).toBeInTheDocument();
+    expect(await screen.findByText('服务端已受理消息，等待分流。')).toBeInTheDocument();
+    expect(append).toHaveBeenCalledWith(project.id, projectConversation.id, expect.objectContaining({
+      client_message_id: expect.any(String), model_id: modelConnection.id, content: '检查当前发布状态',
+    }), expect.any(String), readyCapabilities.service_instance_id, owner.user_id);
+    expect(screen.getByText(/消息受理不代表任务已开始或预算已预留/)).toBeInTheDocument();
+    expect(screen.getByText(/此处展示服务端返回的预算与账本状态/)).toBeInTheDocument();
+  });
+
+  it('stores successive project messages and accepts them in order', async () => {
+    let finishFirst: (() => void) | undefined;
+    const append = vi.mocked(projectApi.acceptProjectConversationMessage).mockImplementation(async (_id, conversationID, body) => {
+      if (body.content === '第一条') await new Promise<void>((resolve) => { finishFirst = resolve; });
+      return { message: { ...projectMessageReceipt.message, id: `m${body.content}`, conversation_id: conversationID,
+        client_message_id: body.client_message_id, content: body.content }, replayed: false };
+    });
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+    const prompt = await screen.findByLabelText('提交到共享对话的提示');
+    await user.type(prompt, '第一条');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    await waitFor(() => expect(append).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(prompt).toHaveValue(''));
+    await user.type(prompt, '第二条');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    await screen.findByText('第二条');
+    expect(append).toHaveBeenCalledTimes(1);
+    finishFirst?.();
+    await waitFor(() => expect(append).toHaveBeenCalledTimes(2));
+    expect(append.mock.calls[1]?.[2].previous_client_message_id).toBe(append.mock.calls[0]?.[2].client_message_id);
+    expect(append.mock.calls[1]?.[2].client_message_id).not.toBe(append.mock.calls[0]?.[2].client_message_id);
+    expect(prompt).toBeEnabled();
   });
 
   it('labels the local mock budget ledger as attribution only', async () => {
     vi.stubEnv('VITE_MOCK_API', '1');
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
-    expect(screen.getByText(/本机 MSW 只展示预算归因并返回合成的 queued Task 回执/)).toBeInTheDocument();
+    expect(screen.getByText(/本机 MSW 只模拟消息接收/)).toBeInTheDocument();
     expect(screen.getByText(/本机 MSW 只展示合成预算归因/)).toBeInTheDocument();
-    expect(screen.queryByText(/真实项目 Task 由服务端检查并预留项目预算/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/消息受理不代表任务已开始或预算已预留/)).not.toBeInTheDocument();
   });
 
-  it('fails closed for live Task submission when the backend has not advertised project execution', async () => {
+  it('allows sending while project execution capability is unavailable', async () => {
     vi.stubEnv('VITE_MOCK_API', '0');
-    vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ ...readyCapabilities, supported_features: [] });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ ...readyCapabilities, supported_features: ['conversation_auto_routing_v1'] });
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
-    expect(screen.getByText(/真实项目 Task 由服务端检查并预留项目预算/)).toBeInTheDocument();
-    expect(await screen.findByText(/真实项目 Task 提交已停用/)).toBeInTheDocument();
+    expect(screen.getByText(/消息受理不代表任务已开始或预算已预留/)).toBeInTheDocument();
+    expect(await screen.findByText(/消息仍可先发送或保存在本机/)).toBeInTheDocument();
     await user.type(screen.getByLabelText('提交到共享对话的提示'), '检查当前发布状态');
-    expect(screen.getByRole('button', { name: '项目 Task 执行未就绪' })).toBeDisabled();
-    expect(projectApi.appendProjectConversationMessage).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    await waitFor(() => expect(projectApi.acceptProjectConversationMessage).toHaveBeenCalledOnce());
   });
 
-  it('only offers project-linked, directly accessible resources and pins the selected Workspace revision', async () => {
+  it('retains a project message when automatic routing is unavailable', async () => {
+    vi.mocked(portalApi.capabilities).mockResolvedValue({ ...readyCapabilities, supported_features: ['project_budget_execution'] });
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+    await user.type(await screen.findByLabelText('提交到共享对话的提示'), '项目待发送消息');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    expect(await screen.findByText(/服务尚不支持自动分流/)).toBeInTheDocument();
+    expect(screen.getByText('项目待发送消息')).toBeInTheDocument();
+    expect(projectApi.acceptProjectConversationMessage).not.toHaveBeenCalled();
+  });
+
+  it('sends explicitly selected project resources without pinning a Workspace revision at receipt', async () => {
     const workspaceID = 'w1234567';
     const hostID = 'h1234567';
     const revision = 6;
@@ -257,7 +475,7 @@ describe('Projects API integration', () => {
       expires_at: null, last_active_at: null, created_at: '2026-11-02T00:00:00Z',
     } satisfies components['schemas']['Host'];
     const workspace = {
-      id: workspaceID, name: '项目空间', revision, used_bytes: 32, quota_bytes: 1000, state: 'ready',
+      id: workspaceID, name: '项目空间', revision, used_bytes: 32, quota_bytes: 1000, is_read_only: false, state: 'ready',
       created_at: '2026-11-02T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
     } satisfies components['schemas']['Workspace'];
     const resources: ProjectResource[] = [
@@ -265,24 +483,26 @@ describe('Projects API integration', () => {
       { project_id: project.id, kind: 'workspace', resource_id: workspaceID, version: 1 },
     ];
     vi.spyOn(projectApi, 'resources').mockResolvedValue(resources);
-    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [modelConnection, alternateModelConnection] });
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [modelConnection, alternateModelConnection], configuration_status: 'configured' });
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [host] });
     vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [workspace] });
-    const append = vi.spyOn(projectApi, 'appendProjectConversationMessage');
+    const append = vi.spyOn(projectApi, 'acceptProjectConversationMessage');
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
     await user.selectOptions(screen.getByLabelText('文本模型'), alternateModelConnection.id);
     await user.selectOptions(screen.getByLabelText('目标电脑（可选）'), hostID);
-    await user.selectOptions(screen.getByLabelText('输入 Workspace 版本（可选）'), workspaceID);
+    await user.selectOptions(screen.getByLabelText('输入 Workspace（可选）'), workspaceID);
     await user.type(screen.getByLabelText('提交到共享对话的提示'), '检查当前发布状态');
-    await user.click(screen.getByRole('button', { name: '提交并排队项目 Task' }));
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
 
-    await screen.findByRole('article', { name: '项目 Task 回执' });
-    expect(append).toHaveBeenCalledWith(project.id, projectConversation.id, {
-      model_id: alternateModelConnection.id, content: '检查当前发布状态', host_id: hostID, workspace_id: workspaceID, input_revision: revision,
-    }, expect.any(String));
+    await screen.findByText('服务端已受理消息，等待分流。');
+    expect(append).toHaveBeenCalledWith(project.id, projectConversation.id, expect.objectContaining({
+      client_message_id: expect.any(String), model_id: alternateModelConnection.id, content: '检查当前发布状态', host_id: hostID, workspace_id: workspaceID,
+    }), expect.any(String), readyCapabilities.service_instance_id, owner.user_id);
+    expect(append.mock.calls[0]?.[2]).not.toHaveProperty('input_revision');
   });
 
   it('shows only sanitized, permission-gated Workspace directory metadata', async () => {
@@ -304,6 +524,7 @@ describe('Projects API integration', () => {
       });
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await user.click(await screen.findByRole('button', { name: '查看文件目录' }));
     expect(await screen.findByText('src/main.go')).toBeInTheDocument();
@@ -319,23 +540,26 @@ describe('Projects API integration', () => {
     expect(screen.queryByText(/sha256|chunks/i)).not.toBeInTheDocument();
   });
 
-  it('retries an uncertain project append with the same exact body and idempotency key', async () => {
-    const append = vi.spyOn(projectApi, 'appendProjectConversationMessage')
+  it('retries an uncertain project message with the same exact body and idempotency key', async () => {
+    const append = vi.spyOn(projectApi, 'acceptProjectConversationMessage')
       .mockRejectedValueOnce(new ApiError({ message: '连接中断', code: 'network_error', status: 503 }))
-      .mockResolvedValueOnce(projectTaskReceipt);
+      .mockImplementationOnce(async (_id, conversationID, body) => ({ message: {
+        ...projectMessageReceipt.message, conversation_id: conversationID, client_message_id: body.client_message_id, content: body.content,
+      }, replayed: false }));
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
     const prompt = screen.getByLabelText('提交到共享对话的提示');
     await user.type(prompt, '检查当前发布状态');
-    await user.click(screen.getByRole('button', { name: '提交并排队项目 Task' }));
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
 
-    expect(await screen.findByRole('button', { name: '重试同一项目 Task' })).toBeInTheDocument();
-    expect(prompt).toHaveValue('检查当前发布状态');
-    expect(prompt).toBeDisabled();
-    await user.click(screen.getByRole('button', { name: '重试同一项目 Task' }));
-    await screen.findByRole('article', { name: '项目 Task 回执' });
+    expect(await screen.findByRole('button', { name: '核对并重试' })).toBeInTheDocument();
+    expect(prompt).toHaveValue('');
+    expect(prompt).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: '核对并重试' }));
+    await screen.findByText('服务端已受理消息，等待分流。');
     expect(append).toHaveBeenCalledTimes(2);
     expect(append.mock.calls[1]?.[0]).toBe(append.mock.calls[0]?.[0]);
     expect(append.mock.calls[1]?.[1]).toBe(append.mock.calls[0]?.[1]);
@@ -343,29 +567,32 @@ describe('Projects API integration', () => {
     expect(append.mock.calls[1]?.[3]).toBe(append.mock.calls[0]?.[3]);
   });
 
-  it('keeps exact retry available if the execution capability disappears after an uncertain append', async () => {
+  it('keeps exact retry available if the execution capability disappears after an uncertain receipt', async () => {
     vi.stubEnv('VITE_MOCK_API', '0');
     const capabilities = vi.spyOn(portalApi, 'capabilities').mockResolvedValue(readyCapabilities);
-    const append = vi.spyOn(projectApi, 'appendProjectConversationMessage')
+    const append = vi.spyOn(projectApi, 'acceptProjectConversationMessage')
       .mockRejectedValueOnce(new ApiError({ message: '连接中断', code: 'network_error', status: 503 }))
-      .mockResolvedValueOnce(projectTaskReceipt);
+      .mockImplementationOnce(async (_id, conversationID, body) => ({ message: {
+        ...projectMessageReceipt.message, conversation_id: conversationID, client_message_id: body.client_message_id, content: body.content,
+      }, replayed: false }));
     const user = userEvent.setup();
     const { client } = renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '项目共享 AI 对话' });
     const prompt = screen.getByLabelText('提交到共享对话的提示');
     await user.type(prompt, '检查当前发布状态');
-    await user.click(screen.getByRole('button', { name: '提交并排队项目 Task' }));
-    const retry = await screen.findByRole('button', { name: '重试同一项目 Task' });
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    const retry = await screen.findByRole('button', { name: '核对并重试' });
     expect(retry).toBeEnabled();
 
-    capabilities.mockResolvedValue({ ...readyCapabilities, supported_features: [] });
+    capabilities.mockResolvedValue({ ...readyCapabilities, supported_features: ['conversation_auto_routing_v1'] });
     await client.invalidateQueries({ queryKey: ['service-capabilities'] });
-    expect(await screen.findByText(/真实项目 Task 提交已停用/)).toBeInTheDocument();
+    expect(await screen.findByText(/消息仍可先发送或保存在本机/)).toBeInTheDocument();
     expect(retry).toBeEnabled();
 
     await user.click(retry);
-    await screen.findByRole('article', { name: '项目 Task 回执' });
+    await screen.findByText('服务端已受理消息，等待分流。');
     expect(append).toHaveBeenCalledTimes(2);
     expect(append.mock.calls[1]?.[2]).toEqual(append.mock.calls[0]?.[2]);
     expect(append.mock.calls[1]?.[3]).toBe(append.mock.calls[0]?.[3]);
@@ -384,6 +611,7 @@ describe('Projects API integration', () => {
     await user.click(within(incoming!).getByRole('button', { name: '接受邀请' }));
     await screen.findByText('服务端已确认接受邀请并建立成员关系。');
     expect(accept).toHaveBeenCalledWith(invitation.id, expect.any(String));
+    await openProject();
 
     await user.type(screen.getByLabelText('被邀请账号 ID'), 'uuser001');
     await user.click(screen.getByRole('button', { name: '创建邀请' }));
@@ -426,6 +654,7 @@ describe('Projects API integration', () => {
     const delivery = vi.spyOn(projectApi, 'deliverWorkItem').mockRejectedValue(new ApiError({ message: '交付校验暂不可用', code: 'not_implemented', status: 501 }));
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '验证发布' });
     await user.clear(screen.getByLabelText('预算限额（主币种单位，最多 6 位小数）'));
@@ -435,6 +664,8 @@ describe('Projects API integration', () => {
     expect(setBudget).toHaveBeenCalledWith(project.id, { currency: 'USD', limit_micros: 12_500_000, expected_version: budget.version }, expect.any(String));
 
     await user.type(screen.getByLabelText('工作项标题'), '部署验收');
+    expect(screen.queryByLabelText('类型')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '待认领' })).not.toBeInTheDocument();
     await user.type(screen.getByLabelText('说明'), '确认已保存版本');
     await user.type(screen.getByLabelText('验收标准（每行一项）'), '版本可读取');
     await user.click(screen.getByRole('button', { name: '创建工作项' }));
@@ -465,6 +696,64 @@ describe('Projects API integration', () => {
     expect(within(itemCard!).queryByText(/服务端交付证据/)).not.toBeInTheDocument();
   });
 
+  it('enables category filters and claims only returned unassigned work items when v2 is advertised', async () => {
+    vi.mocked(portalApi.capabilities).mockResolvedValue({
+      ...readyCapabilities, supported_features: [...readyCapabilities.supported_features, 'project_work_items_v2'],
+    });
+    const unclaimedBug: ProjectWorkItem = { ...workItem, id: 'wbug001', title: '待认领缺陷', category: 'bug', assignee_id: null };
+    const requestItem: ProjectWorkItem = { ...workItem, id: 'wreq001', title: '普通开放需求', category: 'request' };
+    const deliveredItem: ProjectWorkItem = { ...workItem, id: 'wdel001', title: '已交付需求', category: 'request', state: 'delivered' };
+    vi.mocked(projectApi.workItems).mockResolvedValue([workItem, unclaimedBug, requestItem, deliveredItem]);
+    const create = vi.mocked(projectApi.createWorkItem).mockResolvedValue({
+      ...workItem, id: 'wcreated1', title: '新需求', category: 'request', assignee_id: null,
+    });
+    const claim = vi.mocked(projectApi.claimWorkItem).mockResolvedValue({
+      ...unclaimedBug, assignee_id: owner.user_id, version: 2,
+    });
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+
+    expect(await screen.findByRole('button', { name: '待认领' })).toBeInTheDocument();
+    await waitFor(() => expect(projectApi.workItems).toHaveBeenCalledWith(project.id, true));
+    expect(screen.getByText('已交付')).toBeInTheDocument();
+    expect(screen.queryByText('待验收')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '需求' }));
+    expect(await screen.findByRole('heading', { name: '普通开放需求' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '待认领缺陷' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '待认领' }));
+    const unclaimedCard = screen.getByRole('heading', { name: '待认领缺陷' }).closest('article');
+    expect(unclaimedCard).not.toBeNull();
+    expect(screen.queryByRole('heading', { name: '验证发布' })).not.toBeInTheDocument();
+    await user.click(within(unclaimedCard!).getByRole('button', { name: '认领工作项' }));
+    await screen.findByText('服务端已确认认领工作项。');
+    expect(claim).toHaveBeenCalledWith(project.id, unclaimedBug.id, { expected_version: 1 }, expect.any(String));
+
+    await user.click(screen.getByRole('button', { name: '全部' }));
+    await user.selectOptions(screen.getByLabelText('类型'), 'request');
+    await user.type(screen.getByLabelText('工作项标题'), '新需求');
+    await user.click(screen.getByRole('button', { name: '创建工作项' }));
+    await screen.findByText('服务端已创建工作项；没有因此启动 Task。');
+    expect(create).toHaveBeenCalledWith(project.id, { title: '新需求', category: 'request', unassigned: true }, expect.any(String));
+  });
+
+  it('does not offer claim to a viewer even when work-item v2 is available', async () => {
+    vi.mocked(portalApi.capabilities).mockResolvedValue({
+      ...readyCapabilities, supported_features: [...readyCapabilities.supported_features, 'project_work_items_v2'],
+    });
+    vi.mocked(projectApi.members).mockResolvedValue([{ ...owner, role: 'viewer' }]);
+    vi.mocked(projectApi.workItems).mockResolvedValue([{ ...workItem, id: 'wview001', title: '只读可见的未认领项', category: 'bug', assignee_id: null }]);
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+
+    await user.click(await screen.findByRole('button', { name: '待认领' }));
+    const itemCard = screen.getByRole('heading', { name: '只读可见的未认领项' }).closest('article');
+    expect(itemCard).not.toBeNull();
+    expect(within(itemCard!).queryByRole('button', { name: '认领工作项' })).not.toBeInTheDocument();
+  });
+
   it('keeps mutations pending and unknown until the API settles, then retries with the same idempotency key', async () => {
     let rejectFirst!: (error: Error) => void;
     const create = vi.spyOn(projectApi, 'createWorkItem')
@@ -472,6 +761,7 @@ describe('Projects API integration', () => {
       .mockResolvedValueOnce(workItem);
     const user = userEvent.setup();
     renderProjects();
+    await openProject();
 
     await screen.findByRole('heading', { name: '验证发布' });
     await user.type(screen.getByLabelText('工作项标题'), '待确认任务');

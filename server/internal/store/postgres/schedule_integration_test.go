@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -91,6 +92,15 @@ JOIN conversation_messages m ON m.conversation_id=c.id AND m.owner_id=c.owner_id
 WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversationID, &messageID); err != nil {
 		t.Fatal(err)
 	}
+	var conversationTitle, messageContent string
+	if err := store.pool.QueryRow(ctx, `SELECT c.title,m.content FROM conversations c
+JOIN conversation_messages m ON m.conversation_id=c.id AND m.owner_id=c.owner_id
+WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversationTitle, &messageContent); err != nil {
+		t.Fatal(err)
+	}
+	if conversationTitle != value.Title || messageContent != value.Objective {
+		t.Fatalf("scheduled conversation title/objective = %q/%q, want %q/%q", conversationTitle, messageContent, value.Title, value.Objective)
+	}
 	assertAccountChangeLog(t, ctx, store, owner.ID,
 		expectedAccountChange{objectType: "schedule", objectID: value.ID, revision: value.Version},
 		expectedAccountChange{objectType: "conversation", objectID: conversationID, revision: 1},
@@ -121,6 +131,56 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 	replayed, wasReplay, err := store.CreateSchedule(ctx, value, createRecord)
 	if err != nil || !wasReplay || replayed.ID != value.ID || replayed.Status != schedule.StatusCompleted {
 		t.Fatalf("schedule create replay = %#v replay=%t err=%v", replayed, wasReplay, err)
+	}
+}
+
+func TestPostgresScheduleOccurrenceReplayAfterStoreRestartIsIdempotent(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	commit := app.ScheduleOccurrenceCommit{
+		ScheduleID: value.ID, OwnerID: owner.ID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+		Occurrence: schedule.Occurrence{Key: value.NextOccurrenceKey, ScheduledAt: value.NextRunAt,
+			CheckAt: *value.NextCheckAt, Status: schedule.RunQueued}, NotificationEvents: value.NotificationEvents,
+	}
+	first, committed, err := store.CommitScheduleOccurrence(ctx, commit)
+	if err != nil || !committed || first.Status != schedule.RunQueued || first.TaskID == nil {
+		t.Fatalf("first scheduled occurrence commit = %#v committed=%t err=%v", first, committed, err)
+	}
+
+	// Recreate both the Store and its PostgreSQL pool as a process restart would;
+	// durable occurrence state must make a stale poll harmless after restart.
+	restartPool, err := pgxpool.NewWithConfig(ctx, store.pool.Config().Copy())
+	if err != nil {
+		t.Fatalf("reopen PostgreSQL pool after schedule worker restart: %v", err)
+	}
+	t.Cleanup(restartPool.Close)
+	restartedStore := New(restartPool)
+	second, committed, err := restartedStore.CommitScheduleOccurrence(ctx, commit)
+	if err != nil || committed {
+		t.Fatalf("replayed occurrence after restart = %#v committed=%t err=%v; want no second commit", second, committed, err)
+	}
+	loaded, err := restartedStore.GetSchedule(ctx, owner.ID, value.ID)
+	if err != nil || loaded.Status != schedule.StatusCompleted || loaded.LastRun == nil || loaded.LastRun.ID != first.ID {
+		t.Fatalf("schedule after stale post-restart replay = %#v err=%v", loaded, err)
+	}
+	var runs, tasks, conversations, messages int
+	if err := restartPool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM schedule_runs WHERE schedule_id=$1),
+(SELECT count(*) FROM tasks WHERE owner_id=$2),
+(SELECT count(*) FROM conversations WHERE owner_id=$2),
+(SELECT count(*) FROM conversation_messages WHERE owner_id=$2)`, value.ID, owner.ID).
+		Scan(&runs, &tasks, &conversations, &messages); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || tasks != 1 || conversations != 1 || messages != 1 {
+		t.Fatalf("post-restart occurrence effects = runs:%d tasks:%d conversations:%d messages:%d; want one each",
+			runs, tasks, conversations, messages)
 	}
 }
 
@@ -411,6 +471,75 @@ func TestPostgresSkippedScheduleDoesNotBlockLaterDueSchedules(t *testing.T) {
 	}
 }
 
+func TestPostgresScheduleCredentialRevocationSerializesWithOccurrenceCommit(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	commit := app.ScheduleOccurrenceCommit{
+		ScheduleID: value.ID, OwnerID: owner.ID, ExpectedVersion: value.Version, ExpectedEpoch: value.ExecutionEpoch,
+		Occurrence: schedule.Occurrence{Key: value.NextOccurrenceKey, ScheduledAt: value.NextRunAt,
+			CheckAt: *value.NextCheckAt, Status: schedule.RunQueued}, NotificationEvents: value.NotificationEvents,
+	}
+	revokeTx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin credential revocation transaction: %v", err)
+	}
+	revocationCommitted := false
+	defer func() {
+		if !revocationCommitted {
+			_ = revokeTx.Rollback(context.Background())
+		}
+	}()
+	if _, err := revokeTx.Exec(ctx, `UPDATE tokens SET revoked_at=clock_timestamp() WHERE id=$1`, value.Authorization.TokenID); err != nil {
+		t.Fatalf("lock scheduled credential for revocation: %v", err)
+	}
+	type commitResult struct {
+		run       schedule.Run
+		committed bool
+		err       error
+	}
+	commitDone := make(chan commitResult, 1)
+	go func() {
+		run, committed, err := store.CommitScheduleOccurrence(ctx, commit)
+		commitDone <- commitResult{run: run, committed: committed, err: err}
+	}()
+	waitForPostgresLockWait(t, ctx, store.pool, "%SELECT kind,client_installation_id%", 1)
+	if err := revokeTx.Commit(ctx); err != nil {
+		t.Fatalf("commit credential revocation: %v", err)
+	}
+	revocationCommitted = true
+	var result commitResult
+	select {
+	case result = <-commitDone:
+	case <-ctx.Done():
+		t.Fatalf("occurrence commit did not resume after revocation: %v", ctx.Err())
+	}
+	if result.err != nil || !result.committed || result.run.Status != schedule.RunSkipped ||
+		result.run.SkipReason == nil || *result.run.SkipReason != schedule.SkipAuthorizationEnded || result.run.TaskID != nil {
+		t.Fatalf("occurrence commit after serialized revocation = %#v committed=%t err=%v; want authorization-ended skip",
+			result.run, result.committed, result.err)
+	}
+	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
+	if err != nil || loaded.Status != schedule.StatusCompleted || loaded.LastRun == nil || loaded.LastRun.Status != schedule.RunSkipped ||
+		loaded.LastRun.SkipReason == nil || *loaded.LastRun.SkipReason != schedule.SkipAuthorizationEnded {
+		t.Fatalf("schedule after concurrent credential revocation = %#v err=%v", loaded, err)
+	}
+	var tasks, runs int
+	if err := store.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM tasks WHERE owner_id=$1),
+(SELECT count(*) FROM schedule_runs WHERE schedule_id=$2)`, owner.ID, value.ID).Scan(&tasks, &runs); err != nil {
+		t.Fatal(err)
+	}
+	if tasks != 0 || runs != 1 {
+		t.Fatalf("revocation race persisted tasks=%d runs=%d; want no Task and one skipped run", tasks, runs)
+	}
+}
+
 func TestPostgresScheduleTriggerSerializesWithStopAllBarrier(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -535,6 +664,89 @@ func TestPostgresEveryNHoursTimingPersistsAndRestartsAfterEnable(t *testing.T) {
 	}
 }
 
+func TestPostgresAnchoredEveryNHoursTimingPersistsAndRestartsOnPhase(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	anchorTime := time.Now().UTC().Add(-5*time.Hour - 30*time.Minute).Truncate(time.Microsecond)
+	anchor := anchorTime.Format(time.RFC3339Nano)
+	timing := schedule.Timing{Kind: schedule.TimingEveryNHours, IntervalHours: 2, AnchorAt: anchor, TimeZone: "UTC"}
+	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+		[]schedule.NotificationEvent{schedule.NotifyWaitingUser})
+	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
+	if err != nil || loaded.Timing.AnchorAt != anchor {
+		t.Fatalf("persisted anchored timing = %#v, %v", loaded.Timing, err)
+	}
+	assertPhase := func(label string, occurrence *time.Time) {
+		t.Helper()
+		if occurrence == nil {
+			t.Fatalf("%s occurrence is nil", label)
+		}
+		delta := occurrence.Sub(anchorTime)
+		if !occurrence.After(time.Now().UTC()) || delta <= 0 || delta%(2*time.Hour) != 0 {
+			t.Fatalf("%s occurrence %s is not a future two-hour anchor slot", label, occurrence.Format(time.RFC3339Nano))
+		}
+	}
+	assertPhase("created", value.NextRunAt)
+
+	disabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "anchored-every-disable"), value.ID,
+		schedule.StatusDisabled, loaded.Version, loaded.Authorization)
+	if err != nil {
+		t.Fatalf("disable anchored every-N-hours schedule: %v", err)
+	}
+	enabled, err := store.SetScheduleStatus(ctx, scheduleActionIdempotency(owner.ID, value.ID, "anchored-every-enable"), value.ID,
+		schedule.StatusEnabled, disabled.Version, disabled.Authorization)
+	if err != nil {
+		t.Fatalf("re-enable anchored every-N-hours schedule: %v", err)
+	}
+	assertPhase("re-enabled", enabled.NextRunAt)
+}
+
+func TestPostgresSchedulePersistsDSTGapAndFoldOccurrences(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	tests := []struct {
+		name            string
+		startsOn        string
+		localTime       string
+		wantScheduledAt string
+		wantCheckAt     string
+		wantSkip        schedule.SkipReason
+	}{
+		{name: "spring-forward gap", startsOn: "2027-03-14", localTime: "02:30",
+			wantCheckAt: "2027-03-14T07:00:00Z", wantSkip: schedule.SkipDSTGap},
+		{name: "fall-back fold", startsOn: "2027-11-07", localTime: "01:30",
+			wantScheduledAt: "2027-11-07T05:30:00Z", wantCheckAt: "2027-11-07T05:30:00Z"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			timing := schedule.Timing{Kind: schedule.TimingDaily, StartsOn: test.startsOn,
+				LocalTime: test.localTime, TimeZone: "America/New_York"}
+			value, _ := createPostgresSchedule(t, ctx, store, owner.ID, hostValue.ID, timing, schedule.MisfireSkip,
+				[]schedule.NotificationEvent{schedule.NotifyCompleted})
+			loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
+			if err != nil || loaded.Timing.Kind != timing.Kind || loaded.Timing.StartsOn != timing.StartsOn ||
+				loaded.Timing.LocalTime != timing.LocalTime || loaded.Timing.TimeZone != timing.TimeZone || loaded.NextCheckAt == nil ||
+				loaded.NextCheckAt.UTC().Format(time.RFC3339) != test.wantCheckAt {
+				t.Fatalf("persisted timezone occurrence = timing:%#v scheduled:%v check:%v err=%v",
+					loaded.Timing, loaded.NextRunAt, loaded.NextCheckAt, err)
+			}
+			if test.wantSkip != "" {
+				if loaded.NextRunAt != nil || loaded.LastRun != nil {
+					t.Fatalf("DST gap should persist a skipped future occurrence without creating a run: %#v", loaded)
+				}
+				return
+			}
+			if loaded.NextRunAt == nil || loaded.NextRunAt.UTC().Format(time.RFC3339) != test.wantScheduledAt {
+				t.Fatalf("DST fold selected occurrence %v; want earlier instant %s", loaded.NextRunAt, test.wantScheduledAt)
+			}
+		})
+	}
+}
+
 func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
@@ -549,6 +761,7 @@ func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *
 		[]schedule.NotificationEvent{schedule.NotifyCompleted})
 	assertScheduleSyncRevision(t, store, owner.ID, value.ID, value.Version, 1)
 
+	value.Title = "Updated display title"
 	value.Objective = "updated scheduled objective"
 	updateRecord := testIdempotency(owner.ID, "schedule.update", "schedule-sync-update-key")
 	updateRecord.ResourceID = value.ID
@@ -558,7 +771,7 @@ func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *
 	}
 	assertScheduleSyncRevision(t, store, owner.ID, updated.ID, updated.Version, 2)
 	replayed, err := store.UpdateSchedule(ctx, owner.ID, updateRecord, value, value.Version)
-	if err != nil || replayed.ID != updated.ID || replayed.Version != updated.Version || replayed.Objective != updated.Objective {
+	if err != nil || replayed.ID != updated.ID || replayed.Version != updated.Version || replayed.Title != updated.Title || replayed.Objective != updated.Objective {
 		t.Fatalf("replayed schedule update = %#v, %v", replayed, err)
 	}
 	assertScheduleSyncRevision(t, store, owner.ID, updated.ID, updated.Version, 2)
@@ -605,6 +818,10 @@ func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *
 	var objective string
 	if err := json.Unmarshal(body["objective"], &objective); err != nil || objective != enabled.Objective {
 		t.Fatalf("schedule snapshot objective = %q, %v; body=%s", objective, err, snapshot.Items[0].Body)
+	}
+	var title string
+	if err := json.Unmarshal(body["title"], &title); err != nil || title != enabled.Title {
+		t.Fatalf("schedule snapshot title = %q, %v; body=%s", title, err, snapshot.Items[0].Body)
 	}
 	for _, forbidden := range []string{"auth_kind", "auth_token_id", "auth_scopes", "client_installation_id", "authorization", "execution_epoch", "next_run_at"} {
 		if _, exists := body[forbidden]; exists {
@@ -769,7 +986,7 @@ func createPostgresSchedule(t *testing.T, ctx context.Context, store *Store, own
 	id := mustID(t, schedule.NewID)
 	value := schedule.Schedule{
 		ID: id, OwnerID: ownerID, Version: 1, Status: schedule.StatusEnabled, ExecutionEpoch: 1,
-		HostID: hostID, ModelID: "model-test", Objective: "scheduled objective", Timing: timing,
+		HostID: hostID, ModelID: "model-test", Title: "Scheduled display title", Objective: "scheduled objective", Timing: timing,
 		Budget:        task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: testSessionTokenID(ownerID)}, MisfirePolicy: policy,
 		NotificationEvents: events, NextOccurrenceKey: occurrence.Key, NextRunAt: occurrence.ScheduledAt,

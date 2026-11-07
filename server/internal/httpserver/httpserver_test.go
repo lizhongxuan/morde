@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -242,6 +243,32 @@ func TestWriteErrorBodyRetryAfterAndLogOnce(t *testing.T) {
 	if got := response.Header().Get("Retry-After"); got != "5" {
 		t.Fatalf("host waking Retry-After = %q, want 5", got)
 	}
+}
+
+func TestWriteErrorClientCancellationIsNotAnInternalFailure(t *testing.T) {
+	engine, registry, logs := testEngine(t, "api")
+	engine.GET("/canceled", func(c *gin.Context) {
+		WriteError(c, context.Canceled)
+	})
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/canceled", nil))
+	if response.Code != statusClientClosedRequest || response.Body.Len() != 0 {
+		t.Fatalf("canceled response = %d %q, want status %d with no body", response.Code, response.Body.String(), statusClientClosedRequest)
+	}
+	if got := logs.FilterMessage("http request failed").Len(); got != 0 {
+		t.Fatalf("canceled request failure log count = %d, want 0", got)
+	}
+	fields := logs.FilterMessage("http request").All()[0].ContextMap()
+	if got := fields["status"]; got != int64(statusClientClosedRequest) {
+		t.Fatalf("canceled request access-log status = %#v, want %d", got, statusClientClosedRequest)
+	}
+	requestMetric := metricFamily(t, registry, "cloudhost_http_requests_total")
+	if len(requestMetric.Metric) != 1 || requestMetric.Metric[0].Counter.GetValue() != 1 {
+		t.Fatalf("canceled request metric = %+v, want one request", requestMetric.Metric)
+	}
+	assertLabels(t, requestMetric.Metric[0].Label, map[string]string{
+		"server": "api", "route": "/canceled", "method": http.MethodGet, "code": "499",
+	})
 }
 
 func TestWriteErrorStopsDownstreamHandlers(t *testing.T) {

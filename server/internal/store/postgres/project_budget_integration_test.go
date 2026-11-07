@@ -488,6 +488,65 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, principal.UserID, callID).
 			projectActor, projectTask, projectState, actualMicros, accountTask, accountState, accountInput, accountOutput,
 			taskProject, taskInitiator, taskUsage)
 	}
+
+	var personalVersion time.Time
+	if err := store.pool.QueryRow(ctx, `INSERT INTO model_connections(id,owner_id,name,base_url,model_name,api_key_cipher,
+capability_text,capability_tools,checked_at) VALUES ('p7654321',$1,'personal project model','https://model.example/v1','test-model',
+decode(repeat('01',29),'hex'),true,true,now()) RETURNING updated_at`, principal.UserID).Scan(&personalVersion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET model_id='p7654321',budget_model_tokens=1000 WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM model_account_budgets WHERE owner_id=$1`, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM project_budgets WHERE project_id=$1`, projectID); err != nil {
+		t.Fatal(err)
+	}
+	personal := accountCall
+	personal.ModelID, personal.ConnectionVersion, personal.PersonalModel, personal.CallID = "p7654321", personalVersion, true, "personal-project-call-01"
+	if err := store.ReserveModelCall(ctx, personal); err != nil {
+		t.Fatalf("personal project model without account or project budget: %v", err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, personal); err != nil {
+		t.Fatalf("personal project model dispatch: %v", err)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: personal.Source, OwnerID: personal.OwnerID,
+		CallID: personal.CallID, Usage: app.ModelUsage{Known: true, InputTokens: 10, OutputTokens: 5}}); err != nil {
+		t.Fatalf("personal project model settlement: %v", err)
+	}
+	var projectCharges int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM project_budget_ledger WHERE project_id=$1 AND call_id=$2`, projectID, personal.CallID).Scan(&projectCharges); err != nil || projectCharges != 0 {
+		t.Fatalf("personal model charged project budget: %d, %v", projectCharges, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&taskUsage); err != nil || taskUsage != 63 {
+		t.Fatalf("personal model was not included in task usage: %d, %v", taskUsage, err)
+	}
+	stale := personal
+	stale.CallID = "personal-project-stale-01"
+	if err := store.ReserveModelCall(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'
+WHERE owner_id=$1 AND source=$2 AND call_id=$3`, stale.OwnerID, stale.Source, stale.CallID); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := store.MarkStaleModelCallsUnknown(ctx); err != nil || marked != 1 {
+		t.Fatalf("recover personal project call without budgets: marked=%d err=%v", marked, err)
+	}
+	admin := personalQuotaAdminPrincipal(t, store)
+	adminService, err := app.NewModelUsageAdminService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adminService.Reconcile(ctx, admin, app.ModelUsageReconcileCommand{OwnerID: principal.UserID,
+		Source: stale.Source, CallID: stale.CallID, InputTokens: 4, OutputTokens: 2, Evidence: "provider reference"}); err != nil {
+		t.Fatalf("reconcile personal project usage without budgets: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, taskID).Scan(&taskUsage); err != nil || taskUsage != 69 {
+		t.Fatalf("reconciled personal project task usage: %d, %v", taskUsage, err)
+	}
 }
 
 func TestPostgresProjectKnownSettlementFailureLeavesBothHoldsUnknown(t *testing.T) {

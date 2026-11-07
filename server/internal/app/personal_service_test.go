@@ -21,6 +21,7 @@ type personalMutationStoreStub struct {
 	objectType    string
 	objectID      string
 	object        personal.Object
+	objects       map[string]personal.Object
 	readErr       error
 	err           error
 }
@@ -34,6 +35,13 @@ func (s *personalMutationStoreStub) ApplyPersonalMutation(_ context.Context, pri
 func (s *personalMutationStoreStub) GetPersonalObject(_ context.Context, principal identity.Principal, objectType, objectID string) (personal.Object, error) {
 	s.readCalls++
 	s.readPrincipal, s.objectType, s.objectID = principal, objectType, objectID
+	if s.objects != nil {
+		object, ok := s.objects[objectType+"/"+objectID]
+		if !ok {
+			return personal.Object{}, domain.NewError(domain.CodeNotFound, "personal object not found")
+		}
+		return object, s.readErr
+	}
 	return s.object, s.readErr
 }
 

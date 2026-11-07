@@ -384,7 +384,7 @@ func validStoredSchedule(t *testing.T, status schedule.Status) schedule.Schedule
 	}
 	return schedule.Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 4, Status: status, ExecutionEpoch: 1,
-		HostID: "h1234567", ModelID: "model-a", Objective: "check the weekly goal", Timing: timing,
+		HostID: "h1234567", ModelID: "model-a", Title: "Weekly goal", Objective: "check the weekly goal", Timing: timing,
 		Budget:             task.Budget{ActiveSeconds: 300, ToolCalls: 12, ModelTokens: 9000},
 		Authorization:      task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567"},
 		MisfirePolicy:      schedule.MisfireSkip,
@@ -404,13 +404,81 @@ func storedDailyScheduleForProcessing(t *testing.T, policy schedule.MisfirePolic
 	}
 	return schedule.Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 2, Status: schedule.StatusEnabled, ExecutionEpoch: 3,
-		HostID: "h1234567", ModelID: "model-a", Objective: "check the weekly goal", Timing: timing,
+		HostID: "h1234567", ModelID: "model-a", Title: "Weekly goal", Objective: "check the weekly goal", Timing: timing,
 		Budget:             task.Budget{ActiveSeconds: 300, ToolCalls: 12, ModelTokens: 9000},
 		Authorization:      task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567"},
 		MisfirePolicy:      policy,
 		NotificationEvents: []schedule.NotificationEvent{schedule.NotifyCompleted, schedule.NotifyFailed, schedule.NotifyWaitingUser},
 		NextOccurrenceKey:  first.Key, NextRunAt: first.ScheduledAt, NextCheckAt: &first.CheckAt,
 		CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+}
+
+func TestScheduleProcessDueRecoversAfterServiceReconstructionWithoutDuplicateRun(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	value := storedDailyScheduleForProcessing(t, schedule.MisfireSkip)
+	store.values[value.ID] = value
+	now := *value.NextCheckAt
+
+	// A transient authorization-store failure must leave the durable occurrence
+	// due. A newly constructed service can retry it after the dependency recovers.
+	unavailable := &scheduleServiceAuthorizerFake{
+		validateAuthError: domain.NewError(domain.CodeInternal, "authorization store unavailable"),
+	}
+	firstService := newTestScheduleService(t, store, unavailable, &scheduleServiceModelCatalogFake{configured: true})
+	processed, err := firstService.ProcessDue(context.Background(), now, 0)
+	if processed != 0 || domain.CodeOf(err) != domain.CodeInternal || len(store.dueCommits) != 0 {
+		t.Fatalf("ProcessDue() during authorization outage = processed %d commits %d err %v", processed, len(store.dueCommits), err)
+	}
+	if got := store.values[value.ID]; got.NextOccurrenceKey != value.NextOccurrenceKey || got.NextCheckAt == nil || !got.NextCheckAt.Equal(*value.NextCheckAt) {
+		t.Fatalf("authorization outage advanced persisted schedule = %#v", got)
+	}
+
+	recoveredAuthorizer := &scheduleServiceAuthorizerFake{}
+	restartedService := newTestScheduleService(t, store, recoveredAuthorizer, &scheduleServiceModelCatalogFake{configured: true})
+	processed, err = restartedService.ProcessDue(context.Background(), now, 0)
+	if err != nil || processed != 1 || len(store.dueCommits) != 1 || store.dueTaskCount != 1 {
+		t.Fatalf("ProcessDue() after service reconstruction = processed %d commits %d tasks %d err %v", processed, len(store.dueCommits), store.dueTaskCount, err)
+	}
+	commit := store.dueCommits[0]
+	if commit.ScheduleID != value.ID || commit.OwnerID != value.OwnerID || commit.ExpectedVersion != value.Version ||
+		commit.ExpectedEpoch != value.ExecutionEpoch || commit.Occurrence.Key != value.NextOccurrenceKey || commit.Occurrence.Status != schedule.RunQueued {
+		t.Fatalf("recovered occurrence commit = %#v", commit)
+	}
+	if recoveredAuthorizer.validateCalls != 1 || recoveredAuthorizer.validateOwnerID != value.OwnerID ||
+		!reflect.DeepEqual(recoveredAuthorizer.validateAuth, value.Authorization) {
+		t.Fatalf("recovered authorization check = owner %q auth %#v calls %d; want persisted owner/auth", recoveredAuthorizer.validateOwnerID, recoveredAuthorizer.validateAuth, recoveredAuthorizer.validateCalls)
+	}
+
+	// Polling again at the same instant must not enqueue the committed occurrence
+	// a second time. The store is the durable boundary across service restarts.
+	secondRestart := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	processed, err = secondRestart.ProcessDue(context.Background(), now, 0)
+	if err != nil || processed != 0 || len(store.dueCommits) != 1 || store.dueTaskCount != 1 {
+		t.Fatalf("repeated poll after service reconstruction = processed %d commits %d tasks %d err %v", processed, len(store.dueCommits), store.dueTaskCount, err)
+	}
+}
+
+func TestScheduleProcessDuePersistsAuthorizationRevocationAsSkippedRun(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	value := storedDailyScheduleForProcessing(t, schedule.MisfireSkip)
+	store.values[value.ID] = value
+	authorizer := &scheduleServiceAuthorizerFake{
+		validateAuthError: domain.NewError(domain.CodeForbidden, "schedule grant revoked"),
+	}
+	service := newTestScheduleService(t, store, authorizer, &scheduleServiceModelCatalogFake{configured: true})
+
+	processed, err := service.ProcessDue(context.Background(), *value.NextCheckAt, 0)
+	if err != nil || processed != 1 || len(store.dueCommits) != 1 || store.dueTaskCount != 0 {
+		t.Fatalf("ProcessDue() after schedule authorization revocation = processed %d commits %d tasks %d err %v", processed, len(store.dueCommits), store.dueTaskCount, err)
+	}
+	commit := store.dueCommits[0]
+	if commit.Occurrence.Status != schedule.RunSkipped || commit.Occurrence.SkipReason == nil ||
+		*commit.Occurrence.SkipReason != schedule.SkipAuthorizationEnded || commit.ExpectedEpoch != value.ExecutionEpoch {
+		t.Fatalf("revoked schedule occurrence = %#v, want authorization-ended skipped record", commit.Occurrence)
+	}
+	if authorizer.validateCalls != 1 || authorizer.validateOwnerID != value.OwnerID || !reflect.DeepEqual(authorizer.validateAuth, value.Authorization) {
+		t.Fatalf("revocation check = owner %q auth %#v calls %d; want persisted schedule authorization", authorizer.validateOwnerID, authorizer.validateAuth, authorizer.validateCalls)
 	}
 }
 
@@ -558,8 +626,8 @@ func TestScheduleCreateAppliesDefaultsAndUsesIdempotencyRecord(t *testing.T) {
 		created.NextOccurrenceKey == "" || created.NextCheckAt == nil || created.ExecutionEpoch < 1 {
 		t.Fatalf("created Schedule missing normalized state/defaults: %#v", created)
 	}
-	if created.Objective != strings.TrimSpace(command.Objective) || store.createCalls != 1 || len(store.createRecords) != 1 {
-		t.Fatalf("Create() did not normalize objective or persist: objective=%q calls=%d records=%#v", created.Objective, store.createCalls, store.createRecords)
+	if created.Title != strings.TrimSpace(command.Objective) || created.Objective != strings.TrimSpace(command.Objective) || store.createCalls != 1 || len(store.createRecords) != 1 {
+		t.Fatalf("Create() did not default title, normalize objective, or persist: title=%q objective=%q calls=%d records=%#v", created.Title, created.Objective, store.createCalls, store.createRecords)
 	}
 	record := store.createRecords[0]
 	if record.OwnerID != principal.UserID || record.Operation != "schedule.create" || record.Key != "schedule-create-001" ||
@@ -579,6 +647,78 @@ func TestScheduleCreateAppliesDefaultsAndUsesIdempotencyRecord(t *testing.T) {
 	changed.Objective = "different request"
 	if _, err := service.Create(context.Background(), principal, changed, "schedule-create-001"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("Create() reused key with changed request error = %v", err)
+	}
+}
+
+func TestScheduleCreateKeepsDisplayTitleSeparateAndHashesIt(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	command := validScheduleCommand()
+	command.Objective = "  send the exact model instruction  "
+	title := "  Weekly summary  "
+	command.Title = &title
+
+	created, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-title-create-01")
+	if err != nil || created.Title != "Weekly summary" || created.Objective != "send the exact model instruction" {
+		t.Fatalf("Create() title/objective = %q/%q, %v", created.Title, created.Objective, err)
+	}
+	changed := command
+	changedTitle := "Different display name"
+	changed.Title = &changedTitle
+	if _, err := service.Create(context.Background(), scheduleServicePrincipal(), changed, "schedule-title-create-01"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("Create() reused key after title changed: %v", err)
+	}
+}
+
+func TestScheduleCreateKeepsEveryNHoursAnchorAndHashesIt(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	command := validScheduleCommand()
+	anchor := "2030-03-10T06:00:30.123456Z"
+	command.Timing = schedule.Timing{Kind: schedule.TimingEveryNHours, IntervalHours: 6, TimeZone: "UTC", AnchorAt: anchor}
+
+	created, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-anchor-create-01")
+	if err != nil || created.Timing.AnchorAt != anchor {
+		t.Fatalf("Create() anchor = %q, %v", created.Timing.AnchorAt, err)
+	}
+	changed := command
+	changed.Timing.AnchorAt = "2030-03-10T07:00:30.123456Z"
+	if _, err := service.Create(context.Background(), scheduleServicePrincipal(), changed, "schedule-anchor-create-01"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("Create() reused key after anchor changed: %v", err)
+	}
+}
+
+func TestScheduleCreateRejectsInvalidTimingAnchor(t *testing.T) {
+	for _, timing := range []schedule.Timing{
+		{Kind: schedule.TimingEveryNHours, IntervalHours: 1, TimeZone: "UTC", AnchorAt: "2030-03-10T06:00:30"},
+		{Kind: schedule.TimingDaily, StartsOn: "2030-03-10", LocalTime: "06:00", TimeZone: "UTC", AnchorAt: "2030-03-10T06:00:30Z"},
+	} {
+		store := newScheduleServiceStoreFake()
+		service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+		command := validScheduleCommand()
+		command.Timing = timing
+		if _, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-anchor-invalid-01"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Fatalf("Create() accepted invalid timing %#v: %v", timing, err)
+		}
+		if store.createCalls != 0 {
+			t.Fatalf("invalid timing reached storage: %#v", timing)
+		}
+	}
+}
+
+func TestScheduleCreateRejectsInvalidTitleBeforeCollaborators(t *testing.T) {
+	for _, title := range []string{" \t ", strings.Repeat("t", 32769)} {
+		store := newScheduleServiceStoreFake()
+		authorizer := &scheduleServiceAuthorizerFake{}
+		service := newTestScheduleService(t, store, authorizer, &scheduleServiceModelCatalogFake{configured: true})
+		command := validScheduleCommand()
+		command.Title = &title
+		if _, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-title-invalid-01"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Fatalf("Create() title length %d error = %v", len(title), err)
+		}
+		if store.createCalls != 0 || authorizer.actionCalls != 0 {
+			t.Fatalf("invalid title reached collaborators: store=%d authorization=%d", store.createCalls, authorizer.actionCalls)
+		}
 	}
 }
 
@@ -848,6 +988,44 @@ func TestScheduleUpdateUsesExpectedVersionAndRevalidatesHostAndModel(t *testing.
 	}
 }
 
+func TestScheduleUpdatePreservesOrChangesTitleWithoutChangingObjective(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	original := validStoredSchedule(t, schedule.StatusEnabled)
+	original.Title = "Original display name"
+	original.Objective = "original model instruction"
+	store.values[original.ID] = original
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	principal := scheduleServicePrincipal()
+
+	preserved, err := service.Update(context.Background(), principal, original.ID,
+		UpdateScheduleCommand{ExpectedVersion: original.Version}, "schedule-title-update-01")
+	if err != nil || preserved.Title != original.Title || preserved.Objective != original.Objective {
+		t.Fatalf("Update() without title changed schedule text: title=%q objective=%q err=%v", preserved.Title, preserved.Objective, err)
+	}
+
+	requestedTitle := "  Updated display name  "
+	updated, err := service.Update(context.Background(), principal, original.ID,
+		UpdateScheduleCommand{ExpectedVersion: preserved.Version, Title: &requestedTitle}, "schedule-title-update-02")
+	if err != nil || updated.Title != "Updated display name" || updated.Objective != original.Objective {
+		t.Fatalf("Update() changed objective with title: title=%q objective=%q err=%v", updated.Title, updated.Objective, err)
+	}
+	updateCommand := UpdateScheduleCommand{ExpectedVersion: preserved.Version, Title: &requestedTitle}
+	if _, err := service.Update(context.Background(), principal, original.ID, updateCommand, "schedule-title-update-02"); err != nil {
+		t.Fatalf("replay same title update: %v", err)
+	}
+	differentTitle := "Different title"
+	if _, err := service.Update(context.Background(), principal, original.ID,
+		UpdateScheduleCommand{ExpectedVersion: preserved.Version, Title: &differentTitle}, "schedule-title-update-02"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("Update() reused key after title changed: %v", err)
+	}
+	blankTitle := " \t "
+	before := store.updateCalls
+	if _, err := service.Update(context.Background(), principal, original.ID,
+		UpdateScheduleCommand{ExpectedVersion: updated.Version, Title: &blankTitle}, "schedule-title-update-04"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.updateCalls != before {
+		t.Fatalf("Update() accepted blank title: err=%v calls=%d", err, store.updateCalls)
+	}
+}
+
 func TestScheduleActionsEnableDisableAndReplayIdempotently(t *testing.T) {
 	store := newScheduleServiceStoreFake()
 	value := validStoredSchedule(t, schedule.StatusDisabled)
@@ -989,6 +1167,30 @@ func TestScheduleListAndRunsValidateStatusAndPaginationBounds(t *testing.T) {
 		if _, err := service.Runs(context.Background(), principal, value.ID, page); domain.CodeOf(err) != domain.CodeInvalidArgument || store.runsCalls != before {
 			t.Errorf("Runs(%+v) err=%v calls=%d, want invalid_argument before store", page, err, store.runsCalls)
 		}
+	}
+}
+
+func TestScheduleUpdateKeepsEveryNHoursAnchorAndHashesIt(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	value := validStoredSchedule(t, schedule.StatusEnabled)
+	store.values[value.ID] = value
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	anchor := "2030-03-10T06:00:30.123456Z"
+	timing := schedule.Timing{Kind: schedule.TimingEveryNHours, IntervalHours: 6, TimeZone: "UTC", AnchorAt: anchor}
+	command := UpdateScheduleCommand{ExpectedVersion: value.Version, Timing: &timing}
+
+	updated, err := service.Update(context.Background(), scheduleServicePrincipal(), value.ID, command, "schedule-anchor-update-01")
+	if err != nil || updated.Timing.AnchorAt != anchor || updated.Version != value.Version+1 {
+		t.Fatalf("Update() anchored timing/version = %#v, %v", updated, err)
+	}
+	if _, err := service.Update(context.Background(), scheduleServicePrincipal(), value.ID, command, "schedule-anchor-update-01"); err != nil {
+		t.Fatalf("replay same anchored update: %v", err)
+	}
+	changed := timing
+	changed.AnchorAt = "2030-03-10T07:00:30.123456Z"
+	command.Timing = &changed
+	if _, err := service.Update(context.Background(), scheduleServicePrincipal(), value.ID, command, "schedule-anchor-update-01"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("Update() reused key after anchor changed: %v", err)
 	}
 }
 

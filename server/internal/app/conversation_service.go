@@ -14,9 +14,10 @@ import (
 
 // CreateConversationCommand creates a conversation independently of any later task.
 type CreateConversationCommand struct {
-	HostID         string
-	Title          string
-	IdempotencyKey string
+	HostID            string
+	Title             string
+	IdempotencyKey    string
+	ServiceInstanceID string
 }
 
 type ConversationService struct {
@@ -76,9 +77,22 @@ func (s *ConversationService) Create(ctx context.Context, principal identity.Pri
 	if err != nil {
 		return conversation.Conversation{}, false, err
 	}
-	return s.store.CreateConversation(ctx, conversation.Conversation{
+	value := conversation.Conversation{
 		ID: id, OwnerID: principal.UserID, HostID: command.HostID, Title: command.Title,
-	}, record)
+	}
+	if command.ServiceInstanceID != "" {
+		if !domain.ValidServiceInstanceID(command.ServiceInstanceID) {
+			return conversation.Conversation{}, false, domain.InvalidArgument("service_instance_id", "service instance id is invalid")
+		}
+		store, ok := s.store.(interface {
+			CreateConversationForServiceInstance(context.Context, conversation.Conversation, IdempotencyRecord, string) (conversation.Conversation, bool, error)
+		})
+		if !ok {
+			return conversation.Conversation{}, false, domain.NewError(domain.CodeUnsupported, "scoped conversation creation is unavailable")
+		}
+		return store.CreateConversationForServiceInstance(ctx, value, record, command.ServiceInstanceID)
+	}
+	return s.store.CreateConversation(ctx, value, record)
 }
 
 func (s *ConversationService) List(ctx context.Context, principal identity.Principal, page PageRequest) (ConversationPage, error) {
@@ -192,6 +206,39 @@ func (s *ConversationService) ListMessages(ctx context.Context, principal identi
 	return result, nil
 }
 
+type ConversationMessageReceiptLookup interface {
+	FindConversationMessageByClientID(context.Context, string, string, string, string, string) (conversation.Message, bool, error)
+}
+
+func (s *ConversationService) FindMessageByClientID(ctx context.Context, principal identity.Principal, conversationID, clientID, instanceID string) (MessagePage, error) {
+	if _, err := s.Get(ctx, principal, conversationID); err != nil {
+		return MessagePage{}, err
+	}
+	return findConversationMessageByClientID(ctx, s.store, principal.UserID, "", conversationID, clientID, instanceID)
+}
+
+func findConversationMessageByClientID(ctx context.Context, store any, actorID, projectID, conversationID, clientID, instanceID string) (MessagePage, error) {
+	if !idempotencyKeyPattern.MatchString(clientID) {
+		return MessagePage{}, domain.InvalidArgument("client_message_id", "client message id is invalid")
+	}
+	lookup, ok := store.(ConversationMessageReceiptLookup)
+	if !ok {
+		return MessagePage{}, domain.NewError(domain.CodeUnsupported, "conversation receipt lookup is unavailable")
+	}
+	if !domain.ValidServiceInstanceID(instanceID) {
+		return MessagePage{}, domain.InvalidArgument("service_instance_id", "service instance id is invalid")
+	}
+	message, found, err := lookup.FindConversationMessageByClientID(ctx, actorID, projectID, conversationID, clientID, instanceID)
+	if err != nil {
+		return MessagePage{}, err
+	}
+	items := make([]conversation.Message, 0, 1)
+	if found {
+		items = append(items, message)
+	}
+	return MessagePage{Items: items}, nil
+}
+
 func validateConversationPrincipal(principal identity.Principal, scope identity.Scope) error {
 	if err := validateTaskPrincipal(principal); err != nil {
 		return err
@@ -213,7 +260,8 @@ type ProjectConversationStore interface {
 }
 
 type ProjectConversationTaskAppender interface {
-	AppendProjectMessage(context.Context, identity.Principal, string, string, AppendMessageCommand) (TaskSubmissionResult, error)
+	AcceptProjectMessage(context.Context, identity.Principal, string, string, AcceptConversationMessageCommand) (conversation.Message, bool, error)
+	ListConversationActiveTasks(context.Context, identity.Principal, string, string, PageRequest) (TaskPage, error)
 }
 
 type ProjectConversationService struct {
@@ -223,8 +271,9 @@ type ProjectConversationService struct {
 }
 
 type CreateProjectConversationCommand struct {
-	Title          string
-	IdempotencyKey string
+	Title             string
+	IdempotencyKey    string
+	ServiceInstanceID string
 }
 
 func NewProjectConversationService(store ProjectConversationStore, access ProjectAccessChecker, tasks ProjectConversationTaskAppender) (*ProjectConversationService, error) {
@@ -284,9 +333,25 @@ func (s *ProjectConversationService) Create(ctx context.Context, principal ident
 	if err != nil {
 		return conversation.Conversation{}, false, err
 	}
-	value, replay, err := s.store.CreateProjectConversation(ctx, principal.UserID, conversation.Conversation{
+	input := conversation.Conversation{
 		ID: id, OwnerID: principal.UserID, ProjectID: projectID, Title: command.Title,
-	}, record)
+	}
+	var value conversation.Conversation
+	var replay bool
+	if command.ServiceInstanceID != "" {
+		if !domain.ValidServiceInstanceID(command.ServiceInstanceID) {
+			return conversation.Conversation{}, false, domain.InvalidArgument("service_instance_id", "service instance id is invalid")
+		}
+		store, ok := s.store.(interface {
+			CreateProjectConversationForServiceInstance(context.Context, string, conversation.Conversation, IdempotencyRecord, string) (conversation.Conversation, bool, error)
+		})
+		if !ok {
+			return conversation.Conversation{}, false, domain.NewError(domain.CodeUnsupported, "scoped conversation creation is unavailable")
+		}
+		value, replay, err = store.CreateProjectConversationForServiceInstance(ctx, principal.UserID, input, record, command.ServiceInstanceID)
+	} else {
+		value, replay, err = s.store.CreateProjectConversation(ctx, principal.UserID, input, record)
+	}
 	if err != nil {
 		return conversation.Conversation{}, false, err
 	}
@@ -343,12 +408,23 @@ func (s *ProjectConversationService) ListMessages(ctx context.Context, principal
 	return result, nil
 }
 
-func (s *ProjectConversationService) AppendMessage(ctx context.Context, principal identity.Principal, projectID, conversationID string, command AppendMessageCommand) (TaskSubmissionResult, error) {
+func (s *ProjectConversationService) FindMessageByClientID(ctx context.Context, principal identity.Principal, projectID, conversationID, clientID, instanceID string) (MessagePage, error) {
+	if _, err := s.Get(ctx, principal, projectID, conversationID); err != nil {
+		return MessagePage{}, err
+	}
+	return findConversationMessageByClientID(ctx, s.store, principal.UserID, projectID, conversationID, clientID, instanceID)
+}
+
+func (s *ProjectConversationService) AcceptMessage(ctx context.Context, principal identity.Principal, projectID, conversationID string, command AcceptConversationMessageCommand) (conversation.Message, bool, error) {
 	if _, err := s.access.RequireAccess(ctx, principal, projectID, project.RoleMember); err != nil {
-		return TaskSubmissionResult{}, err
+		return conversation.Message{}, false, err
 	}
 	command.ProjectID = projectID
-	return s.tasks.AppendProjectMessage(ctx, principal, projectID, conversationID, command)
+	return s.tasks.AcceptProjectMessage(ctx, principal, projectID, conversationID, command)
+}
+
+func (s *ProjectConversationService) ListTasks(ctx context.Context, principal identity.Principal, projectID, conversationID string, page PageRequest) (TaskPage, error) {
+	return s.tasks.ListConversationActiveTasks(ctx, principal, projectID, conversationID, page)
 }
 
 func validateProjectConversationResult(value conversation.Conversation, projectID string) error {

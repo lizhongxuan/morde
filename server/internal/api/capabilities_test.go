@@ -42,6 +42,7 @@ type clientContractFixture struct {
 		AssistantMessage struct {
 			ID             string `json:"id"`
 			ConversationID string `json:"conversation_id"`
+			Sequence       int64  `json:"sequence"`
 			TaskID         string `json:"task_id"`
 			Role           string `json:"role"`
 			Content        string `json:"content"`
@@ -146,10 +147,40 @@ func TestCapabilitiesArePublicAndOnlyAdvertiseAssembledServices(t *testing.T) {
 			t.Fatalf("missing %s in %v", feature, result.SupportedFeatures)
 		}
 	}
-	for _, feature := range []string{"client_login", "available_models", "task_api", "cloud_tasks", "project_budget_execution", "hub", "personal_sync", "workspace_sync"} {
+	for _, feature := range []string{"client_login", "available_models", "task_api", "cloud_tasks", "task_media_generation", "project_budget_execution", "project_work_items_v2", "hub", "personal_sync", "workspace_sync"} {
 		if slices.Contains(result.SupportedFeatures, feature) {
 			t.Fatalf("unassembled or unimplemented feature %s was advertised", feature)
 		}
+	}
+}
+
+func TestProjectDerivativeCapabilityRequiresAssembledService(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	services := newServices()
+	deps := services.deps()
+	deps.ProjectConversations = &projectConversationRoutesStub{}
+	attachmentService := &projectAttachmentAPIStub{}
+	deps.ProjectConversationAttachments = attachmentService
+	options := validOptions()
+	options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	router, err := New(deps, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() capabilitiesResponse {
+		response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
+		var result capabilitiesResponse
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+			t.Fatalf("capability response=%d", response.Code)
+		}
+		return result
+	}
+	if slices.Contains(read().SupportedFeatures, "project_attachment_derivatives_v1") {
+		t.Fatal("unready derivative service was advertised")
+	}
+	attachmentService.derivativesReady = true
+	if !slices.Contains(read().SupportedFeatures, "project_attachment_derivatives_v1") {
+		t.Fatal("assembled derivative service was not advertised")
 	}
 }
 
@@ -167,7 +198,8 @@ func TestCapabilitiesSeparateTaskAPIFromCloudExecution(t *testing.T) {
 	response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
 	var result capabilitiesResponse
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil ||
-		!slices.Contains(result.SupportedFeatures, "task_api") || slices.Contains(result.SupportedFeatures, "cloud_tasks") {
+		!slices.Contains(result.SupportedFeatures, "task_api") || slices.Contains(result.SupportedFeatures, "cloud_tasks") ||
+		slices.Contains(result.SupportedFeatures, "project_work_items_v2") {
 		t.Fatalf("queued-only task capabilities = %d %s; want task_api without cloud_tasks", response.Code, response.Body)
 	}
 
@@ -182,6 +214,55 @@ func TestCapabilitiesSeparateTaskAPIFromCloudExecution(t *testing.T) {
 		!slices.Contains(result.SupportedFeatures, "task_api") || !slices.Contains(result.SupportedFeatures, "cloud_tasks") ||
 		slices.Contains(result.SupportedFeatures, "project_budget_execution") {
 		t.Fatalf("executable task capabilities = %d %s; want task_api and cloud_tasks without the incomplete project stack", response.Code, response.Body)
+	}
+}
+
+func TestCapabilitiesAdvertiseProjectWorkItemsV2WhenMounted(t *testing.T) {
+	services := newServices()
+	deps := services.deps()
+	deps.ProjectWorkItems = &projectWorkItemRoutesStub{}
+	options := validOptions()
+	options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	router, err := New(deps, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
+	var result capabilitiesResponse
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || result.APIVersion != "1" ||
+		!slices.Contains(result.SupportedFeatures, "project_work_items_v2") {
+		t.Fatalf("project work item capability = %d %s, want v2 capability without a version bump", response.Code, response.Body)
+	}
+}
+
+func TestTaskMediaCapabilityRequiresReadyGenerationService(t *testing.T) {
+	services := newServices()
+	deps := services.deps()
+	deps.Tasks = &taskServiceStub{}
+	deps.Conversations = &conversationServiceStub{}
+	deps.ExecutionControl = &executionControlServiceStub{}
+	deps.WorkspaceSync = &workspaceSyncServiceStub{}
+	deps.ModelConnections = &modelConnectionManagerStub{}
+	deps.ModelGateway = &modelGatewayHTTPTest{}
+	media := &taskMediaPreviewStub{}
+	deps.TaskMedia = media
+	options := validOptions()
+	options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+
+	for _, ready := range []bool{false, true} {
+		media.generationReady = ready
+		router, err := New(deps, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
+		var result capabilitiesResponse
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+			t.Fatalf("media capabilities response = %d %s", response.Code, response.Body)
+		}
+		if slices.Contains(result.SupportedFeatures, "task_media_generation") != ready {
+			t.Fatalf("media generation readiness %t produced features %v", ready, result.SupportedFeatures)
+		}
 	}
 }
 
@@ -277,7 +358,8 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 	if fixture.TaskSnapshot.AssistantMessage.Status == "" ||
 		!slices.Contains(fixture.AssistantMessageStatuses, fixture.TaskSnapshot.AssistantMessage.Status) ||
 		fixture.TaskSnapshot.AssistantMessage.Role != string(conversation.RoleAssistant) ||
-		fixture.TaskSnapshot.AssistantMessage.ID == "" || fixture.TaskSnapshot.AssistantMessage.Content == "" {
+		fixture.TaskSnapshot.AssistantMessage.ID == "" || fixture.TaskSnapshot.AssistantMessage.Sequence < 1 ||
+		fixture.TaskSnapshot.AssistantMessage.Content == "" {
 		t.Fatalf("shared assistant message snapshot fixture is incomplete: %+v", fixture.TaskSnapshot.AssistantMessage)
 	}
 	assistantSchemaStart := strings.Index(string(openAPI), "    TaskAssistantMessage:\n")
@@ -288,6 +370,9 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 	assistantSection := string(openAPI[assistantSchemaStart:taskSchemaStart])
 	if !strings.Contains(assistantSection, "enum: [streaming, completed, interrupted]") {
 		t.Fatal("Portal OpenAPI TaskAssistantMessage status enum differs from the shared fixture")
+	}
+	if !strings.Contains(assistantSection, "required: [id, conversation_id, sequence, task_id, role, content, status, created_at]") {
+		t.Fatal("Portal OpenAPI TaskAssistantMessage must include the conversation sequence")
 	}
 	if !slices.Equal(fixture.AssistantMessageStatuses, []string{"streaming", "completed", "interrupted"}) {
 		t.Fatalf("shared assistant message statuses = %v", fixture.AssistantMessageStatuses)
@@ -410,5 +495,54 @@ func TestCapabilitiesFailClosedWithoutValidInstanceIdentity(t *testing.T) {
 				t.Fatalf("invalid service identity returned %d %s", response.Code, response.Body)
 			}
 		})
+	}
+}
+
+func TestConversationMessageOpenAPIUsesAsyncAcceptanceContract(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI schema: %v", err)
+	}
+	contract := string(openAPI)
+	routeStart := strings.Index(contract, "  /api/conversations/{id}/messages:\n")
+	if routeStart < 0 {
+		t.Fatal("Portal OpenAPI personal conversation messages route is missing")
+	}
+	routeEnd := strings.Index(contract[routeStart+1:], "  /api/conversations/{id}/messages/{message_id}/retry-processing:\n")
+	if routeEnd < 0 {
+		t.Fatal("Portal OpenAPI personal conversation messages route is not bounded")
+	}
+	route := contract[routeStart : routeStart+1+routeEnd]
+	for _, requiredRule := range []string{
+		"operationId: acceptConversationMessage\n",
+		"#/components/schemas/AcceptConversationMessageRequest",
+		"#/components/schemas/AcceptedConversationMessageResponse",
+		"Task selection and execution happen asynchronously after acceptance",
+	} {
+		if !strings.Contains(route, requiredRule) {
+			t.Fatalf("Portal OpenAPI message acceptance route is missing %q:\n%s", requiredRule, route)
+		}
+	}
+	if strings.Contains(route, "appendConversationMessage") || strings.Contains(route, "AppendConversationMessageResponse") {
+		t.Fatal("Portal OpenAPI personal route retains the old direct Task contract")
+	}
+	start := strings.Index(contract, "    AcceptConversationMessageRequest:\n")
+	end := strings.Index(contract[start+1:], "\n    AcceptedConversationMessageResponse:\n")
+	if start < 0 || end < 0 {
+		t.Fatal("Portal OpenAPI message acceptance request schema is missing or unbounded")
+	}
+	section := contract[start : start+1+end]
+	for _, requiredRule := range []string{
+		"required: [client_message_id, content]",
+		"previous_client_message_id:",
+		"reference_task_id:",
+		"client_attachment_ids:",
+	} {
+		if !strings.Contains(section, requiredRule) {
+			t.Fatalf("Portal OpenAPI message acceptance request schema is missing %q:\n%s", requiredRule, section)
+		}
+	}
+	if strings.Contains(section, "mode:") || strings.Contains(section, "input_revision:") || strings.Contains(section, "\n        attachment_ids:") {
+		t.Fatalf("Portal OpenAPI message acceptance request contains direct Task fields:\n%s", section)
 	}
 }

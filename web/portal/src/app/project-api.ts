@@ -10,15 +10,18 @@ export type ProjectResource = components['schemas']['ProjectResource'];
 export type ProjectWorkspaceManifest = components['schemas']['ProjectWorkspaceManifest'];
 export type ProjectBudget = components['schemas']['ProjectBudget'];
 export type ProjectBudgetLedgerEntry = components['schemas']['ProjectBudgetLedgerEntry'];
+export type ProjectWorkItemCategory = components['schemas']['ProjectWorkItemCategory'];
 export type ProjectWorkItem = components['schemas']['ProjectWorkItem'];
+export type CreateProjectWorkItemRequest = components['schemas']['CreateProjectWorkItemRequest'];
+export type ClaimProjectWorkItemRequest = components['schemas']['ClaimProjectWorkItemRequest'];
 export type ProjectConversation = components['schemas']['ProjectConversation'];
 export type ProjectConversationMessage = components['schemas']['ProjectConversationMessage'];
-export type ProjectConversationTask = components['schemas']['ProjectConversationTask'];
-export type AppendProjectConversationMessageResponse = components['schemas']['AppendProjectConversationMessageResponse'];
+export type AcceptedProjectConversationMessageResponse = components['schemas']['AcceptedProjectConversationMessageResponse'];
 export type Task = components['schemas']['Task'];
 
 type Page<T> = { items: T[]; next_cursor: string | null };
 type PageQuery = NonNullable<operations['listProjects']['parameters']['query']>;
+type ProjectWorkItemsPageQuery = NonNullable<operations['listProjectWorkItems']['parameters']['query']>;
 type ProjectConversationPageQuery = NonNullable<operations['listProjectConversations']['parameters']['query']>;
 type ProjectConversationMessagesPageQuery = NonNullable<operations['listProjectConversationMessages']['parameters']['query']>;
 type ProjectWorkspaceManifestQuery = NonNullable<operations['getProjectWorkspaceManifest']['parameters']['query']>;
@@ -90,32 +93,64 @@ export const projectApi = {
     params: { path: { id }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
   })),
   ledger: (id: string) => allPages(async (query) => unwrapApiResponse(await api.GET('/api/projects/{id}/budget/ledger', { params: { path: { id }, query } }))),
-  workItems: (id: string) => allPages(async (query) => unwrapApiResponse(await api.GET('/api/projects/{id}/work-items', { params: { path: { id }, query } }))),
-  createWorkItem: async (id: string, body: components['schemas']['CreateProjectWorkItemRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items', {
-    params: { path: { id }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
-  assignWorkItem: async (id: string, workItemID: string, body: components['schemas']['AssignProjectWorkItemRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.PATCH('/api/projects/{id}/work-items/{work_item_id}', {
+  workItems: (id: string, includeUnassigned = false): Promise<ProjectWorkItem[]> => allPages(async (query) => {
+    const pageQuery: ProjectWorkItemsPageQuery = {
+      ...query,
+      ...(includeUnassigned ? { include_unassigned: true } : {}),
+    };
+    const page = unwrapApiResponse(await api.GET('/api/projects/{id}/work-items', {
+      params: { path: { id }, query: pageQuery },
+    }));
+    return page;
+  }),
+  createWorkItem: async (id: string, body: CreateProjectWorkItemRequest, idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items', {
+    params: { path: { id }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } },
+    body,
+  })) as ProjectWorkItem,
+  assignWorkItem: async (id: string, workItemID: string, body: components['schemas']['AssignProjectWorkItemRequest'], idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.PATCH('/api/projects/{id}/work-items/{work_item_id}', {
     params: { path: { id, work_item_id: workItemID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
-  blockWorkItem: async (id: string, workItemID: string, body: components['schemas']['BlockProjectWorkItemRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/block', {
+  })) as ProjectWorkItem,
+  claimWorkItem: async (id: string, workItemID: string, body: ClaimProjectWorkItemRequest, idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/claim', {
     params: { path: { id, work_item_id: workItemID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
-  resumeWorkItem: async (id: string, workItemID: string, body: components['schemas']['ProjectWorkItemVersionRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/resume', {
+  })) as ProjectWorkItem,
+  blockWorkItem: async (id: string, workItemID: string, body: components['schemas']['BlockProjectWorkItemRequest'], idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/block', {
     params: { path: { id, work_item_id: workItemID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
-  linkWorkItemTask: async (id: string, workItemID: string, body: components['schemas']['LinkProjectWorkItemTaskRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/tasks', {
+  })) as ProjectWorkItem,
+  resumeWorkItem: async (id: string, workItemID: string, body: components['schemas']['ProjectWorkItemVersionRequest'], idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/resume', {
     params: { path: { id, work_item_id: workItemID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
-  deliverWorkItem: async (id: string, workItemID: string, body: components['schemas']['DeliverProjectWorkItemRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/delivery', {
+  })) as ProjectWorkItem,
+  linkWorkItemTask: async (id: string, workItemID: string, body: components['schemas']['LinkProjectWorkItemTaskRequest'], idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/tasks', {
     params: { path: { id, work_item_id: workItemID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
+  })) as ProjectWorkItem,
+  deliverWorkItem: async (id: string, workItemID: string, body: components['schemas']['DeliverProjectWorkItemRequest'], idempotencyKey?: RequestKey): Promise<ProjectWorkItem> => unwrapApiResponse(await api.POST('/api/projects/{id}/work-items/{work_item_id}/delivery', {
+    params: { path: { id, work_item_id: workItemID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
+  })) as ProjectWorkItem,
   tasks: () => allPages(async (query) => unwrapApiResponse(await api.GET('/api/tasks', { params: { query } }))),
   projectConversations: (id: string) => allPages(async (query: ProjectConversationPageQuery) => unwrapApiResponse(await api.GET('/api/projects/{id}/conversations', { params: { path: { id }, query } }))),
-  projectConversationMessages: (id: string, conversationID: string) => allPages(async (query: ProjectConversationMessagesPageQuery) => unwrapApiResponse(await api.GET('/api/projects/{id}/conversations/{conversation_id}/messages', { params: { path: { id, conversation_id: conversationID }, query } }))),
+  projectConversationMessages: (id: string, conversationID: string, clientMessageID?: string, serviceInstanceID?: string, actorID?: string) => {
+    if (clientMessageID && (!serviceInstanceID || !actorID)) throw new Error('服务或账号身份尚未确认。');
+    return allPages(async (query: ProjectConversationMessagesPageQuery) => unwrapApiResponse(await api.GET('/api/projects/{id}/conversations/{conversation_id}/messages', { params: { path: { id, conversation_id: conversationID }, query: { ...query, ...(clientMessageID ? { client_message_id: clientMessageID } : {}) }, ...(serviceInstanceID || actorID ? { header: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) } })));
+  },
   createProjectConversation: async (id: string, body: components['schemas']['CreateProjectConversationRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/conversations', {
     params: { path: { id }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
   })),
-  appendProjectConversationMessage: async (id: string, conversationID: string, body: components['schemas']['AppendProjectConversationMessageRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/conversations/{conversation_id}/messages', {
-    params: { path: { id, conversation_id: conversationID }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
-  })),
+  acceptProjectConversationMessage: async (id: string, conversationID: string, body: components['schemas']['AcceptConversationMessageRequest'], idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
+    if (idempotencyKey !== body.client_message_id) throw new Error('消息编号与请求编号不一致。');
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    const result = await api.POST('/api/projects/{id}/conversations/{conversation_id}/messages', {
+      params: { path: { id, conversation_id: conversationID }, header: { 'Idempotency-Key': idempotencyKey, 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } }, body,
+    });
+    const receipt = unwrapApiResponse(result);
+    if (result.response.status !== 202) throw new Error('服务端未确认消息受理，请核对后重试。');
+    return receipt;
+  },
+  retryProjectConversationMessageProcessing: async (id: string, conversationID: string, messageID: string, idempotencyKey: string, serviceInstanceID: string, actorID: string) => {
+    const result = await api.POST('/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing', {
+      parseAs: 'text',
+      params: { path: { id, conversation_id: conversationID, message_id: messageID },
+        header: { 'Idempotency-Key': idempotencyKey, 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    });
+    if (result.error !== undefined) unwrapApiResponse(result);
+    if (result.response.status !== 202) throw new Error('服务端未确认消息重试。');
+  },
 };

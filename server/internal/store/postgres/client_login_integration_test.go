@@ -327,7 +327,7 @@ func createLoginRenewalSchedule(t *testing.T, ctx context.Context, store *Store,
 	}
 	value := schedule.Schedule{
 		ID: id, OwnerID: ownerID, Version: 1, Status: schedule.StatusEnabled, ExecutionEpoch: 1,
-		HostID: hostID, ModelID: "model-test", Objective: "schedule grant login renewal test", Timing: timing,
+		HostID: hostID, ModelID: "model-test", Title: "schedule grant login renewal", Objective: "schedule grant login renewal test", Timing: timing,
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		Authorization: task.Authorization{Kind: string(grant.Kind), TokenID: grant.TokenID,
 			ClientInstallationID: grant.ClientInstallationID, Scopes: grantScopes},
@@ -532,7 +532,7 @@ func TestClientTaskSubmissionIsVisibleToDesktopAndIOSInstallations(t *testing.T)
 	if _, err := executionControl.Enable(ctx, pcPrincipal, control.Epoch, "cross-client-execution-enable-0001"); err != nil {
 		t.Fatalf("enable owner execution before cross-client task submission: %v", err)
 	}
-	tasks, err := app.NewTaskService(store, credentials, taskChatConfiguredModelCatalog{})
+	tasks, err := app.NewTaskService(store, credentials, testConfiguredModelCatalog{})
 	if err != nil {
 		t.Fatal(err)
 	}

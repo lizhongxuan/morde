@@ -286,13 +286,21 @@ func readExecutionRuntimeSummary(ctx context.Context, tx pgx.Tx, ownerID string,
 	if err != nil {
 		return err
 	}
-	runtime, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, false)
+	var conversationID string
+	err = tx.QueryRow(ctx, `SELECT conversation_id FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id IS NOT NULL
+ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'starting' THEN 1 WHEN 'stopping' THEN 2 ELSE 3 END,updated_at DESC LIMIT 1`,
+		serviceInstanceID, ownerID).Scan(&conversationID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		*target = execution.Runtime{State: execution.RuntimeStateNotStarted}
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("read execution account Runtime summary: %w", err)
+		return fmt.Errorf("select execution conversation Runtime summary: %w", err)
+	}
+	runtime, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, conversationID, false)
+	if err != nil {
+		return fmt.Errorf("read execution conversation Runtime summary: %w", err)
 	}
 	state := execution.RuntimeState(runtime.State)
 	if state != execution.RuntimeStateStarting && state != execution.RuntimeStateRunning && state != execution.RuntimeStateStopping &&
@@ -301,8 +309,8 @@ func readExecutionRuntimeSummary(ctx context.Context, tx pgx.Tx, ownerID string,
 	}
 	var activeTaskCount int64
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_agent_instances
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND account_runtime_id=$3 AND account_runtime_generation=$4 AND state='active'`,
-		runtime.Fence.ServiceInstanceID, ownerID, runtime.Fence.RuntimeID, runtime.Fence.RuntimeGeneration).Scan(&activeTaskCount); err != nil {
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND state='active'`,
+		runtime.Fence.ServiceInstanceID, ownerID).Scan(&activeTaskCount); err != nil {
 		return fmt.Errorf("count active account Runtime tasks: %w", err)
 	}
 	*target = execution.Runtime{State: state, RuntimeID: runtime.Fence.RuntimeID,
@@ -317,32 +325,36 @@ func accountAgentRuntimeStopConfirmed(ctx context.Context, tx pgx.Tx, ownerID st
 	if err != nil {
 		return false, err
 	}
-	runtime, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, true)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return true, nil
-	}
+	rows, err := tx.Query(ctx, `SELECT state,COALESCE(supervisor_nonce_sha256,''),guardian_stop_attestation,guardian_stop_attestation_digest
+FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2 ORDER BY runtime_id FOR UPDATE`, serviceInstanceID, ownerID)
 	if err != nil {
-		return false, fmt.Errorf("lock account Runtime stop proof: %w", err)
+		return false, fmt.Errorf("lock owner Runtime stop proofs: %w", err)
 	}
-	if runtime.State != app.AccountAgentRuntimeStopped || !isLowerHexRuntimeNonce(runtime.NonceSHA256) {
-		return false, nil
+	defer rows.Close()
+	for rows.Next() {
+		var state, nonce string
+		var attestation, digest []byte
+		if err := rows.Scan(&state, &nonce, &attestation, &digest); err != nil {
+			return false, fmt.Errorf("read owner Runtime stop proof: %w", err)
+		}
+		if state != string(app.AccountAgentRuntimeStopped) || !isLowerHexRuntimeNonce(nonce) ||
+			len(attestation) == 0 || len(attestation) > 16384 || len(digest) != sha256.Size {
+			return false, nil
+		}
+		actualDigest := sha256.Sum256(attestation)
+		if !bytes.Equal(actualDigest[:], digest) {
+			return false, nil
+		}
 	}
-	var attestation, digest []byte
-	if err := tx.QueryRow(ctx, `SELECT guardian_stop_attestation,guardian_stop_attestation_digest
-FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`, serviceInstanceID, ownerID).
-		Scan(&attestation, &digest); err != nil {
-		return false, fmt.Errorf("read Guardian Runtime stop proof: %w", err)
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate owner Runtime stop proofs: %w", err)
 	}
-	if len(attestation) == 0 || len(attestation) > 16384 || len(digest) != sha256.Size {
-		return false, nil
-	}
-	actualDigest := sha256.Sum256(attestation)
-	return bytes.Equal(actualDigest[:], digest), nil
+	return true, nil
 }
 
 func readPendingTaskStopRequestCount(ctx context.Context, tx pgx.Tx, ownerID string, target *int64) error {
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests sr JOIN tasks t ON t.id=sr.task_id
-WHERE t.owner_id=$1 AND sr.status='pending'`, ownerID).Scan(target); err != nil {
+WHERE (t.owner_id=$1 OR t.initiator_id=$1) AND sr.status='pending'`, ownerID).Scan(target); err != nil {
 		return fmt.Errorf("count pending owner Task stop requests: %w", err)
 	}
 	return nil
@@ -369,7 +381,26 @@ func lockOwnerExecutionControl(ctx context.Context, tx pgx.Tx, ownerID string, e
 }
 
 func requireOwnerExecutionEnabled(ctx context.Context, tx pgx.Tx, ownerID string, expectedEpoch *int64) (executionGate, error) {
-	gate, err := lockOwnerExecutionControl(ctx, tx, ownerID, false)
+	var gate executionGate
+	var err error
+	permit, _ := ctx.Value(workspaceMutationPermitKey{}).(*workspaceMutationPermit)
+	if permit != nil && permit.active.Load() && (ownerID == permit.actorID || ownerID == permit.workspaceOwnerID) {
+		// The outer project Workspace transaction holds this exact execution
+		// gate. Re-read its current value without waiting behind a queued writer.
+		err = tx.QueryRow(ctx, `SELECT state,epoch FROM owner_execution_controls WHERE owner_id=$1`, ownerID).
+			Scan(&gate.state, &gate.epoch)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return executionGate{}, missingExecutionGateError()
+		}
+		if err != nil {
+			return executionGate{}, fmt.Errorf("read owner execution control: %w", err)
+		}
+		if !gate.state.Valid() || gate.epoch < 1 {
+			return executionGate{}, missingExecutionGateError()
+		}
+	} else {
+		gate, err = lockOwnerExecutionControl(ctx, tx, ownerID, false)
+	}
 	if err != nil {
 		return executionGate{}, err
 	}
@@ -400,7 +431,7 @@ func stopAllOwnerTasks(ctx context.Context, tx pgx.Tx, ownerID string) error {
 	rows, err := tx.Query(ctx, `SELECT t.id, t.status, t.lease_version,
 GREATEST(COALESCE(t.runtime_lease_safe_after, '-infinity'::timestamptz), COALESCE(t.lease_expires_at, '-infinity'::timestamptz),
 COALESCE((SELECT max(sr.safe_after) FROM task_stop_requests sr WHERE sr.task_id=t.id AND sr.status='pending'), '-infinity'::timestamptz), clock_timestamp())
-FROM tasks t WHERE t.owner_id=$1 AND t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
+FROM tasks t WHERE (t.owner_id=$1 OR t.initiator_id=$1) AND t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
 ORDER BY t.id FOR UPDATE OF t`, ownerID)
 	if err != nil {
 		return fmt.Errorf("lock active owner tasks for stop-all: %w", err)
@@ -467,7 +498,7 @@ VALUES ($1,$2,'cancel','pending',$3)`, requestID, item.id, item.safeAfter); err 
 func readActiveExecutionTaskCount(ctx context.Context, tx pgx.Tx, ownerID string, target *int64) error {
 	if err := tx.QueryRow(ctx, `
 SELECT
-  (SELECT count(*) FROM tasks WHERE owner_id=$1 AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')) +
+  (SELECT count(*) FROM tasks WHERE (owner_id=$1 OR initiator_id=$1) AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')) +
   (SELECT count(*) FROM mcp_runtime_sessions s JOIN mcp_runtime_operations o
      ON o.owner_id=s.owner_id AND o.api_key_id=s.api_key_id AND o.session_id=s.session_id AND o.host_id=s.host_id AND o.operation_id=s.active_operation_id
    WHERE s.owner_id=$1 AND o.status IN ('prepared','dispatched','unknown'))`, ownerID).Scan(target); err != nil {
@@ -492,7 +523,7 @@ WHERE s.owner_id=o.owner_id AND s.api_key_id=o.api_key_id AND s.session_id=o.ses
 func readPendingExecutionTaskCount(ctx context.Context, tx pgx.Tx, ownerID string, target *int64) error {
 	if err := tx.QueryRow(ctx, `
 SELECT
-  (SELECT count(*) FROM tasks WHERE owner_id=$1 AND status IN ('pausing','cancelling')) +
+  (SELECT count(*) FROM tasks WHERE (owner_id=$1 OR initiator_id=$1) AND status IN ('pausing','cancelling')) +
   (SELECT count(*) FROM mcp_runtime_sessions s JOIN mcp_runtime_operations o
      ON o.owner_id=s.owner_id AND o.api_key_id=s.api_key_id AND o.session_id=s.session_id AND o.host_id=s.host_id AND o.operation_id=s.active_operation_id
    WHERE s.owner_id=$1 AND o.status IN ('prepared','dispatched','unknown'))`, ownerID).Scan(target); err != nil {

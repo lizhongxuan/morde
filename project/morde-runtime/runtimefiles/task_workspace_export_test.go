@@ -147,6 +147,51 @@ func TestPrepareTaskWorkspaceViewAcceptsLegacyDigestWithoutRootMetadata(t *testi
 	}
 }
 
+func TestPrepareTaskWorkspaceViewAcceptsEmptyRootWithoutModeOrTime(t *testing.T) {
+	root := t.TempDir()
+	workspaceID, taskID := "wabc1234", "qabc1234"
+	viewID := "v" + strings.Repeat("c", 64)
+	sourcePath := filepath.Join(root, workspaceID)
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest, sourceDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil || len(manifest.Directories) != 1 {
+		t.Fatalf("scan empty Workspace: %#v, %v", manifest, err)
+	}
+	initial := manifest
+	initial.Directories = append([]mordesync.Directory(nil), manifest.Directories...)
+	initial.Directories[0].Mode, initial.Directories[0].ModeKnown = 0, false
+	initial.Directories[0].ModTimeNS, initial.Directories[0].ModTimeKnown = 0, false
+	inputDigest, err := taskManifestSHA256(initial)
+	if err != nil || inputDigest == sourceDigest {
+		t.Fatalf("initial Workspace digest = %q, %v; want a digest with unspecified root mode and time", inputDigest, err)
+	}
+	taskRoot := filepath.Join(t.TempDir(), "task-views")
+	workspace, err := OpenTaskWorkspace(root, taskRoot, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	if err := workspace.PrepareTaskWorkspaceView(context.Background(), "habc1234", taskID, workspaceID, viewID, 1, 0, 0, inputDigest); err != nil {
+		t.Fatalf("prepare Task Workspace view from empty initial revision: %v", err)
+	}
+	changed := manifest
+	changed.Directories = append([]mordesync.Directory(nil), manifest.Directories...)
+	changed.Directories[0].Xattrs = []mordesync.ExtendedAttribute{{Name: "user.unexpected", Value: []byte("changed")}}
+	changedDigest, err := taskManifestSHA256(changed)
+	if err != nil || taskManifestMatchesInputSnapshot(changed, changedDigest, inputDigest) {
+		t.Fatalf("Workspace with changed native metadata matched empty input digest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "unexpected.txt"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nonempty, nonemptyDigest, err := scanTaskWorkspace(context.Background(), sourcePath)
+	if err != nil || taskManifestMatchesInputSnapshot(nonempty, nonemptyDigest, inputDigest) {
+		t.Fatalf("nonempty Workspace matched empty input digest: %v", err)
+	}
+}
+
 func TestPrepareTaskWorkspaceViewAcceptsLegacyDigestWithFiles(t *testing.T) {
 	root := t.TempDir()
 	workspaceID, taskID := "wabc1234", "qabc1234"

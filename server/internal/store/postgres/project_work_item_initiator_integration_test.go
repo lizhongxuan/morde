@@ -72,8 +72,8 @@ func TestProjectWorkItemStoreEnforcesTaskInitiatorAndCheckpoint(t *testing.T) {
 	submission.Task.Authorization.TokenID = testSessionTokenID(owner.ID)
 	submission.Message.ConversationID = conversationID
 	submission.Message.ActorID = owner.ID
-	submission.Idempotency = testIdempotency(owner.ID, "conversation.append_message", "work-init-task-01")
-	createdTask, err := store.AppendMessage(ctx, submission)
+	submission.Idempotency = testIdempotency(owner.ID, "task.submit", "work-init-task-01")
+	createdTask, err := store.SubmitTask(ctx, submission)
 	if err != nil {
 		t.Fatalf("create owner-initiated project Task: %v", err)
 	}

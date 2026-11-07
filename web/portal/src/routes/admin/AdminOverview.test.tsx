@@ -27,7 +27,7 @@ describe('admin overview', () => {
     });
     renderPage();
 
-    expect(await screen.findByRole('heading', { name: '管理总览' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '平台概况' })).toBeInTheDocument();
     expect(screen.getByText('就绪')).toBeInTheDocument();
     expect(screen.getByText('3')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Host 状态' })).toBeInTheDocument();

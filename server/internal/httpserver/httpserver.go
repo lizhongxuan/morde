@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -21,13 +22,14 @@ import (
 )
 
 const (
-	requestIDHeader = "X-Request-Id"
-	requestIDKey    = "request_id"
-	authKindKey     = "auth_kind"
-	routeKey        = "httpserver.route"
-	loggerKey       = "httpserver.logger"
-	serverKey       = "httpserver.server"
-	stateKey        = "httpserver.state"
+	statusClientClosedRequest = 499
+	requestIDHeader           = "X-Request-Id"
+	requestIDKey              = "request_id"
+	authKindKey               = "auth_kind"
+	routeKey                  = "httpserver.route"
+	loggerKey                 = "httpserver.logger"
+	serverKey                 = "httpserver.server"
+	stateKey                  = "httpserver.state"
 )
 
 type Options struct {
@@ -65,6 +67,13 @@ func Base(o Options) ([]gin.HandlerFunc, error) {
 
 func WriteError(c *gin.Context, err error) {
 	if err == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		// Long-poll clients cancel requests when their cursor changes or the
+		// caller disconnects. A cancellation is not an internal server error.
+		c.Writer.WriteHeader(statusClientClosedRequest)
+		c.Abort()
 		return
 	}
 

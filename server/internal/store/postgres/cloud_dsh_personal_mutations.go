@@ -8,6 +8,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/task"
 
 	"github.com/jackc/pgx/v5"
@@ -70,6 +71,32 @@ func applyCloudDSHPersonalMutationInTx(ctx context.Context, tx pgx.Tx, current t
 	if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 		return err
 	}
+	if commit.Mutation.ObjectType == personal.ObjectTypeMemory {
+		// Personal mutations always lock the account counter before object rows.
+		// Hold that same lock while checking consent and applying the mutation, so
+		// a concurrent switch-off cannot commit between the check and the write.
+		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if _, err := lockAccountChangeCounter(ctx, tx, instanceID, current.OwnerID); err != nil {
+			return err
+		}
+		var enabled bool
+		err = tx.QueryRow(ctx, `SELECT COALESCE((p.body->>'enabled')::boolean, false)
+FROM personal_objects p JOIN account_object_versions v
+  ON v.service_instance_id=p.service_instance_id AND v.owner_id=p.owner_id
+ AND v.object_type=p.object_type AND v.object_id=p.object_id
+WHERE p.service_instance_id=$1::uuid AND p.owner_id=$2
+  AND p.object_type='skill_setting' AND p.object_id='builtin_memory' AND NOT v.is_deleted`,
+			instanceID, current.OwnerID).Scan(&enabled)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("check personal memory consent: %w", err)
+		}
+		if !enabled {
+			return domain.NewError(domain.CodeForbidden, "personal memory is disabled")
+		}
+	}
 	if _, err := applyPersonalMutationInTx(ctx, tx, principal, commit.Mutation, ""); err != nil {
 		return err
 	}
@@ -104,7 +131,8 @@ func cloudDSHPersonalTaskPrincipal(current task.Task) (identity.Principal, error
 func findCloudDSHPersonalMutationEvent(ctx context.Context, tx pgx.Tx, taskID, callID string) (task.Event, bool, error) {
 	var value task.Event
 	err := tx.QueryRow(ctx, `SELECT task_id,sequence,event_type,payload,created_at FROM task_events
-WHERE task_id=$1 AND event_type='task.step' AND payload #>> '{detail,tool}'='morde_personal_object_update'
+WHERE task_id=$1 AND event_type='task.step' AND payload #>> '{detail,tool}' IN
+ ('morde_personal_object_update','morde_goal_create','morde_goal_update','morde_goal_delete')
 AND payload #>> '{detail,personal_call_id}'=$2 ORDER BY sequence LIMIT 1`, taskID, callID).
 		Scan(&value.TaskID, &value.Sequence, &value.Type, &value.Payload, &value.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

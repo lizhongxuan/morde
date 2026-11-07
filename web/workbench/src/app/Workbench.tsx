@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   gatewayApi,
   type GatewayControl,
@@ -14,6 +14,7 @@ import TaskObservation from '../components/TaskObservation';
 import WorkspaceBrowser from '../components/WorkspaceBrowser';
 
 type Tab = 'browser' | 'terminal' | 'workspace' | 'files' | 'vscode';
+type MobileMenu = 'browser' | 'terminal' | 'files' | null;
 const primaryTabs: { id: Tab; label: string }[] = [
   { id: 'browser', label: '桌面' },
   { id: 'terminal', label: '终端' },
@@ -58,6 +59,7 @@ export default function Workbench() {
   const [browserReconnect, setBrowserReconnect] = useState(0);
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
   const [showWindowHelp, setShowWindowHelp] = useState(false);
+  const [mobileMenu, setMobileMenu] = useState<MobileMenu>(null);
   const [terminalSession, setTerminalSession] = useState<GatewayTerminalSession | null>(null);
   const [terminalError, setTerminalError] = useState('');
   const [terminalRequestPending, setTerminalRequestPending] = useState(false);
@@ -66,6 +68,7 @@ export default function Workbench() {
   const [noticeKind, setNoticeKind] = useState<'success' | 'error'>('success');
   const browserFrameRef = useRef<HTMLIFrameElement>(null);
   const browserPanelRef = useRef<HTMLDivElement>(null);
+  const workbenchTabsRef = useRef<HTMLElement>(null);
   const browserObserverRef = useRef<MutationObserver | null>(null);
   const browserConnectTimeoutRef = useRef<number | undefined>(undefined);
   const browserConnectedRef = useRef(false);
@@ -73,6 +76,9 @@ export default function Workbench() {
   const leaseRenewalRef = useRef(false);
   const terminalRequestRef = useRef(false);
   const terminalReplacementRef = useRef(false);
+  const mobileLongPressTimerRef = useRef<number | undefined>(undefined);
+  const suppressTabClickRef = useRef(false);
+  const suppressTabClickTimerRef = useRef<number | undefined>(undefined);
 
   const applyControl = useCallback((value: GatewayControl) => {
     setControl(value);
@@ -150,13 +156,26 @@ export default function Workbench() {
     }
   }, []);
 
-  useEffect(() => () => stopBrowserWatch(), [stopBrowserWatch]);
+  useEffect(() => () => {
+    stopBrowserWatch();
+    if (mobileLongPressTimerRef.current !== undefined) window.clearTimeout(mobileLongPressTimerRef.current);
+    if (suppressTabClickTimerRef.current !== undefined) window.clearTimeout(suppressTabClickTimerRef.current);
+  }, [stopBrowserWatch]);
 
   useEffect(() => {
     const onFullscreenChange = () => setBrowserFullscreen(document.fullscreenElement === browserPanelRef.current);
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
+
+  useEffect(() => {
+    if (!mobileMenu) return;
+    const dismissOnOutsidePress = (event: PointerEvent) => {
+      if (!workbenchTabsRef.current?.contains(event.target as Node)) setMobileMenu(null);
+    };
+    document.addEventListener('pointerdown', dismissOnOutsidePress, true);
+    return () => document.removeEventListener('pointerdown', dismissOnOutsidePress, true);
+  }, [mobileMenu]);
 
   const leaseHeldByMe = control?.control_state === 'user' && control.control_lease_active && control.control_lease_held_by_me;
   const terminalAvailable = !controlLoading && !controlError && !controlActionPending && leaseHeldByMe;
@@ -258,6 +277,64 @@ export default function Workbench() {
     if (tab === 'vscode' && !vscodeAvailable) return;
     setActive(tab);
     setLoaded((previous) => new Set(previous).add(tab));
+  }
+
+  function cancelMobileLongPress() {
+    if (mobileLongPressTimerRef.current !== undefined) {
+      window.clearTimeout(mobileLongPressTimerRef.current);
+      mobileLongPressTimerRef.current = undefined;
+    }
+  }
+
+  function suppressNextTabClick() {
+    suppressTabClickRef.current = true;
+    if (suppressTabClickTimerRef.current !== undefined) window.clearTimeout(suppressTabClickTimerRef.current);
+    suppressTabClickTimerRef.current = window.setTimeout(() => {
+      suppressTabClickRef.current = false;
+      suppressTabClickTimerRef.current = undefined;
+    }, 800);
+  }
+
+  function clearSuppressedTabClick() {
+    suppressTabClickRef.current = false;
+    if (suppressTabClickTimerRef.current !== undefined) {
+      window.clearTimeout(suppressTabClickTimerRef.current);
+      suppressTabClickTimerRef.current = undefined;
+    }
+  }
+
+  function beginMobileLongPress(menu: Exclude<MobileMenu, null>) {
+    return (event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (event.pointerType !== 'touch') return;
+      cancelMobileLongPress();
+      mobileLongPressTimerRef.current = window.setTimeout(() => {
+        mobileLongPressTimerRef.current = undefined;
+        suppressNextTabClick();
+        setMobileMenu(menu);
+      }, 450);
+    };
+  }
+
+  function openMobileMenuFromContext(event: React.MouseEvent<HTMLButtonElement>, menu: Exclude<MobileMenu, null>) {
+    if (!window.matchMedia?.('(max-width: 760px)').matches) return;
+    event.preventDefault();
+    cancelMobileLongPress();
+    suppressNextTabClick();
+    setMobileMenu(menu);
+  }
+
+  function handleTabClick(tab: Tab) {
+    if (suppressTabClickRef.current) {
+      clearSuppressedTabClick();
+      return;
+    }
+    setMobileMenu(null);
+    selectTab(tab);
+  }
+
+  function runMobileMenuAction(action: () => void) {
+    setMobileMenu(null);
+    action();
   }
 
   function reconnectBrowser() {
@@ -459,11 +536,18 @@ export default function Workbench() {
       ? retryControlRequest.action === 'take_over' ? '重试接管' : '重试交回 AI'
       : control?.control_state === 'ai' ? '接管电脑'
         : leaseHeldByMe ? '交回 AI' : '';
+  const mobileControlStatus = controlError ? '控制不可用'
+    : controlLoading && !control ? '正在连接'
+      : control?.control_state === 'ai' ? 'Codex 正在操作'
+        : leaseHeldByMe ? '你正在操作'
+          : control?.control_state === 'user' ? '他人正在操作'
+            : control?.control_state === 'taking_over' ? '正在接管'
+              : control?.control_state === 'returning' ? '正在交还' : '控制状态未知';
   const visibleActive = active === 'vscode' && !vscodeAvailable ? 'browser' : active;
   const visibleTabs = workspaceOnly ? primaryTabs.filter((tab) => tab.id === 'workspace') : primaryTabs;
   if (taskObservationOnly) return <TaskObservation key={taskObservationID} taskID={taskObservationID} />;
   return (
-    <main className="workbench-app">
+    <main className={`workbench-app${workspaceOnly ? ' is-workspace-only' : ''}`}>
       {!workspaceOnly && <TopBar
         host={host}
         renewing={renewing}
@@ -486,21 +570,50 @@ export default function Workbench() {
         </section>
       ) : (
         <>
-          <nav className="workbench-tabs" aria-label="工作台功能">
+          <nav ref={workbenchTabsRef} className="workbench-tabs" aria-label="工作台功能">
             <div className="primary-tabs">
-              {visibleTabs.map((tab) => (
+              {visibleTabs.map((tab) => {
+                const menu: MobileMenu = tab.id === 'browser' || tab.id === 'terminal' || tab.id === 'files' ? tab.id : null;
+                return (
                 <button
                   key={tab.id}
-                  className={`tab-button${active === tab.id ? ' is-active' : ''}`}
+                  className={`tab-button${active === tab.id || (tab.id === 'files' && visibleActive === 'workspace') ? ' is-active' : ''}`}
+                  data-tab={tab.id}
                   type="button"
-                  aria-current={visibleActive === tab.id ? 'page' : undefined}
+                  aria-current={visibleActive === tab.id || (tab.id === 'files' && visibleActive === 'workspace') ? 'page' : undefined}
                   disabled={tab.id === 'vscode' && !vscodeAvailable}
                   title={tab.id === 'vscode' && !vscodeAvailable ? '请先接管电脑' : undefined}
-                  onClick={() => selectTab(tab.id)}
+                  aria-label={tab.id === 'browser' ? '浏览器' : tab.id === 'files' ? '文件' : tab.label}
+                  aria-description={tab.id === 'browser' ? '长按打开窗口操作' : tab.id === 'terminal' ? '长按打开终端操作' : tab.id === 'files' ? '长按打开更多功能' : undefined}
+                  aria-haspopup={tab.id === 'browser' || tab.id === 'terminal' || tab.id === 'files' ? 'menu' : undefined}
+                  aria-expanded={menu !== null && mobileMenu === menu}
+                  onClick={() => handleTabClick(tab.id)}
+                  onPointerDown={menu ? beginMobileLongPress(menu) : undefined}
+                  onPointerUp={cancelMobileLongPress}
+                  onPointerCancel={cancelMobileLongPress}
+                  onPointerLeave={cancelMobileLongPress}
+                  onContextMenu={menu ? (event) => openMobileMenuFromContext(event, menu) : undefined}
+                  onKeyDown={menu ? (event) => {
+                    if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+                      setMobileMenu(menu);
+                      event.preventDefault();
+                    }
+                  } : undefined}
                 >
-                  {tab.label}
+                  <span className={`tab-icon tab-icon-${tab.id}`} aria-hidden="true">
+                    {tab.id === 'browser' ? (
+                      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17M12 3.5c2.4 2.3 3.6 5.2 3.6 8.5s-1.2 6.2-3.6 8.5c-2.4-2.3-3.6-5.2-3.6-8.5s1.2-6.2 3.6-8.5Z" /></svg>
+                    ) : tab.id === 'terminal' ? (
+                      <svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.5" /><path d="m7 9.5 3 2.5-3 2.5M12.5 15.5H17" /></svg>
+                    ) : tab.id === 'files' ? (
+                      <svg viewBox="0 0 24 24"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2.5h8A1.5 1.5 0 0 1 20.5 9v8.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5Z" /></svg>
+                    ) : null}
+                  </span>
+                  <span className="tab-label-desktop">{tab.label}</span>
+                  <span className="tab-label-mobile" aria-hidden="true">{tab.id === 'browser' ? '浏览器' : tab.id === 'files' ? '文件' : tab.label}</span>
                 </button>
-              ))}
+                );
+              })}
             </div>
             {visibleActive === 'browser' && (
               <div className="browser-actions" aria-label="桌面画面控制">
@@ -526,15 +639,42 @@ export default function Workbench() {
                 </button>
               </div>
             )}
+            {mobileMenu && !workspaceOnly && (
+              <div className="mobile-context-menu" role="menu" aria-label={mobileMenu === 'browser' ? '窗口操作' : mobileMenu === 'terminal' ? '终端操作' : '更多功能'} onKeyDown={(event) => {
+                if (event.key === 'Escape') setMobileMenu(null);
+              }}>
+                {mobileMenu === 'browser' ? (
+                  <>
+                    <button type="button" role="menuitem" disabled={browserViewOnly || browserStatus !== 'connected'} onClick={() => runMobileMenuAction(openMobileKeyboard)}>键盘</button>
+                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(fitBrowser)}>适应窗口</button>
+                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(restoreWindow)}>Alt+Tab</button>
+                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(restoreWindow)}>找回窗口</button>
+                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => void toggleBrowserFullscreen())}>{browserFullscreen ? '退出全屏' : '全屏'}</button>
+                  </>
+                ) : mobileMenu === 'terminal' ? (
+                  <button type="button" role="menuitem" disabled={!terminalAvailable || terminalRequestPending} onClick={() => runMobileMenuAction(() => void createNewTerminalSession())}>新建终端</button>
+                ) : (
+                  <>
+                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('workspace'))}>Workspace</button>
+                    <button type="button" role="menuitem" disabled={!vscodeAvailable} onClick={() => runMobileMenuAction(() => selectTab('vscode'))}>VS Code</button>
+                  </>
+                )}
+              </div>
+            )}
           </nav>
           <div className="workbench-content">
             {loaded.has('browser') && (
               <div ref={browserPanelRef} className="tab-panel tab-panel-browser" aria-hidden={visibleActive !== 'browser'} inert={visibleActive !== 'browser'}>
                 {browserStatus !== 'connected' && (
                   <div className="connection-overlay" role={browserStatus === 'failed' || browserStatus === 'disconnected' ? 'alert' : 'status'}>
-                    <p>{browserStatus === 'failed' ? '远程桌面没有返回连接状态，请确认主机正在运行后重试。'
-                      : browserStatus === 'disconnected' ? '远程桌面连接已中断，可以重新连接当前主机。'
-                        : '正在连接远程桌面…'}</p>
+                    <p>
+                      <span className="connection-message-desktop">{browserStatus === 'failed' ? '远程桌面没有返回连接状态，请确认主机正在运行后重试。'
+                        : browserStatus === 'disconnected' ? '远程桌面连接已中断，可以重新连接当前主机。'
+                          : '正在连接远程桌面…'}</span>
+                      <span className="connection-message-mobile">{browserStatus === 'failed' ? '连接失败'
+                        : browserStatus === 'disconnected' ? '连接已断开'
+                          : '正在连接…'}</span>
+                    </p>
                     {(browserStatus === 'failed' || browserStatus === 'disconnected') && (
                       <button className="button button-secondary" type="button" onClick={reconnectBrowser}>
                         重新连接
@@ -624,7 +764,21 @@ export default function Workbench() {
                     : <p className="panel-loading" role="status">请先接管电脑后使用 VSCode。</p>}
               </div>
             )}
+            {!workspaceOnly && visibleActive === 'browser' && <span className="mobile-status-badge" role="status">{mobileControlStatus}</span>}
           </div>
+          {!workspaceOnly && (
+            <div className="mobile-control-footer" aria-label="电脑控制权">
+              {controlError && <button className="button button-secondary mobile-control-retry" type="button" onClick={reloadControl} disabled={controlLoading}>重试</button>}
+              {controlActionLabel && <button
+                className="button mobile-control-action"
+                type="button"
+                onClick={controlComputer}
+                disabled={controlActionPending || !!controlError}
+              >
+                {controlActionLabel.includes('接管') && !controlActionLabel.includes('重试') ? '接管控制权' : controlActionLabel}
+              </button>}
+            </div>
+          )}
         </>
       )}
     </main>

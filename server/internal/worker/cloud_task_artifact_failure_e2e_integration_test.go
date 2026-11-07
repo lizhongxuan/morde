@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -83,6 +84,18 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspaceDirectory, "recovery-note.txt"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	workspaceFileInfo, err := os.Stat(filepath.Join(workspaceDirectory, "recovery-note.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootInfo, err := os.Stat(workspaceDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootMode := uint32(rootInfo.Mode().Perm())
+	rootModTime := rootInfo.ModTime().UnixNano()
+	fileModTime := workspaceFileInfo.ModTime().UnixNano()
+	rootDirectories := []workspace.Directory{{Path: ".", Mode: &rootMode, ModTimeNS: &rootModTime, MetadataKnown: true}}
 	taskWorkspace, err := runtimefiles.OpenTaskWorkspace(hostRoot,
 		filepath.Join(hostRoot, ".morde-task-views"), uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
@@ -161,10 +174,11 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	contentHash := hex.EncodeToString(contentDigest[:])
 	manifestFile := workspace.File{
 		Path: "recovery-note.txt", SizeBytes: int64(len(content)), SHA256: contentHash, Mode: 0o600,
+		ModTimeNS: &fileModTime, MetadataKnown: true,
 		Chunks: []workspace.Chunk{{SHA256: contentHash, SizeBytes: int64(len(content))}},
 	}
 	initialUpload, err := syncService.CreateSyncSession(ctx, principal, workspaceValue.ID, workspace.CreateSyncSession{
-		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{manifestFile},
+		Direction: workspace.SyncUpload, Policy: workspace.SyncLive, BaseRevision: 0, Files: []workspace.File{manifestFile}, Directories: rootDirectories,
 	}, "f01-artifact-initial-upload")
 	if err != nil {
 		t.Fatalf("create initial Workspace upload session: %v", err)
@@ -180,12 +194,6 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil || !bytes.Equal(localWorkspaceFile, []byte(content)) {
 		t.Fatalf("Host Workspace file before download receipt = %q, err=%v", localWorkspaceFile, err)
 	}
-	rootInfo, err := os.Stat(workspaceDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootMode := uint32(rootInfo.Mode().Perm())
-	rootModTime := rootInfo.ModTime().UnixNano()
 	hostReplicas, err := app.NewHostReplicaService(store, store, store, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -200,11 +208,12 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	}
 	download, err := syncService.CreateSyncSession(ctx, replicaPrincipal, workspaceValue.ID, workspace.CreateSyncSession{
 		Direction: workspace.SyncDownload, Policy: workspace.SyncFillMissing, BaseRevision: 0, Files: []workspace.File{manifestFile},
-		Directories: []workspace.Directory{{Path: ".", Mode: &rootMode, ModTimeNS: &rootModTime, MetadataKnown: true}},
+		Directories: rootDirectories,
 	}, "f01-artifact-host-download")
 	if err != nil {
 		t.Fatalf("create Host replica download session: %v", err)
 	}
+	f01AckArtifactDownloadActions(t, ctx, syncService, replicaPrincipal, workspaceValue.ID, download)
 	completedDownload, err := syncService.CommitSyncSession(ctx, replicaPrincipal, workspaceValue.ID, download.ID, "f01-artifact-host-download-commit")
 	if err != nil || completedDownload.State != workspace.SyncCompleted || completedDownload.TargetRevision != 1 {
 		t.Fatalf("complete Host replica download session: session=%#v err=%v", completedDownload, err)
@@ -300,9 +309,38 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	call := app.ModelToolCall{CallID: callID, Name: "file_write", Arguments: string(arguments)}
+	var writeDefinition app.AgentToolDefinition
+	definitions, err := toolBroker.Definitions(ctx, claimed)
+	if err != nil {
+		t.Fatalf("read Task Workspace tool definitions: %v", err)
+	}
+	for _, definition := range definitions {
+		if definition.Name == call.Name {
+			writeDefinition = definition
+			break
+		}
+	}
+	if writeDefinition.Name == "" {
+		t.Fatalf("Host runtime did not advertise %s", call.Name)
+	}
+	fence, err := runtimeControl.ReadTaskFence(ctx, claimed.InitiatorID, claimed.HostID)
+	if err != nil {
+		t.Fatalf("read Host fence before file_write: %v", err)
+	}
+	preparation, preparationErr := runtimeTools.Prepare(ctx, app.AgentToolRequest{
+		Task: claimed, Call: call, Arguments: []byte(call.Arguments), OperationKey: f01OperationKey(callID),
+		RequiredScope: writeDefinition.RequiredScope, Fence: fence, WorkspaceID: workspaceValue.ID,
+	})
+	if preparationErr != nil {
+		t.Fatalf("prepare Task Workspace file_write: status=%s workspace=%s binding=%d cause=%v", preparation.Status,
+			preparation.WorkspaceID, preparation.BindingVersion, preparationErr)
+	}
 	toolResult, err := toolBroker.Execute(ctx, claimed, call)
 	if err != nil || toolResult.Status != app.AgentToolSucceeded {
-		t.Fatalf("execute Task Workspace file_write: result=%+v err=%v", toolResult, err)
+		currentHost, hostErr := store.GetHost(ctx, claimed.HostID)
+		t.Fatalf("execute Task Workspace file_write: result=%+v err=%v prep_status=%s prep_workspace=%s prep_binding=%d host_state=%s control=%s generation=%d instance=%q control_version=%d host_error=%v",
+			toolResult, err, preparation.Status, preparation.WorkspaceID, preparation.BindingVersion, currentHost.State, currentHost.ControlState, currentHost.RuntimeGeneration,
+			currentHost.RuntimeInstanceID, currentHost.ControlVersion, hostErr)
 	}
 	operationKey := f01OperationKey(callID)
 	writeOperation, err := store.GetOperation(ctx, owner.ID, claimed.ID, operationKey)
@@ -336,8 +374,17 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 
 	if err := toolBroker.Complete(ctx, claimed, completion); !errors.Is(err, errInjectedCloudArtifactCommit) {
 		afterFirstCompletion, readErr := store.GetTask(ctx, claimed.ID, owner.ID)
-		t.Fatalf("first completion error = %v, want injected transient artifact commit error; task=%s waiting=%s steps=%#v inputs=%#v read_error=%v",
-			err, afterFirstCompletion.Task.Status, afterFirstCompletion.Task.WaitingReason, afterFirstCompletion.Steps, completion.Inputs, readErr)
+		var verificationOperation task.Operation
+		var verificationOperationErr error
+		for _, step := range afterFirstCompletion.Steps {
+			if step.Kind == "verification" {
+				verificationOperation, verificationOperationErr = store.GetOperation(ctx, owner.ID, claimed.ID,
+					fmt.Sprintf("agent:verify:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
+			}
+		}
+		t.Fatalf("first completion error = %v, want injected transient artifact commit error; task=%s waiting=%s steps=%#v verify_operation=%#v verify_operation_error=%v inputs=%#v read_error=%v",
+			err, afterFirstCompletion.Task.Status, afterFirstCompletion.Task.WaitingReason, afterFirstCompletion.Steps,
+			verificationOperation, verificationOperationErr, completion.Inputs, readErr)
 	}
 	if !decoratedStore.fired.Load() {
 		t.Fatal("completion did not reach the injected artifact commit boundary")
@@ -363,6 +410,7 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Host download session for published Task revision: %v", err)
 	}
+	f01AckArtifactDownloadActions(t, ctx, syncService, replicaPrincipal, workspaceValue.ID, hostSync)
 	completedHostSync, err := syncService.CommitSyncSession(ctx, replicaPrincipal, workspaceValue.ID, hostSync.ID, "f01-artifact-host-publish-download-commit")
 	if err != nil || completedHostSync.State != workspace.SyncCompleted || completedHostSync.TargetRevision != 2 {
 		t.Fatalf("complete Host download session for published Task revision: session=%#v err=%v", completedHostSync, err)
@@ -418,5 +466,18 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 	hostBytes, err := os.ReadFile(filepath.Join(workspaceDirectory, artifact.Path))
 	if err != nil || string(hostBytes) != content {
 		t.Fatalf("Host file after artifact recovery = %q err=%v", hostBytes, err)
+	}
+}
+
+func f01AckArtifactDownloadActions(t *testing.T, ctx context.Context, syncService *app.WorkspaceSyncService, principal identity.Principal, workspaceID string, session workspace.SyncSession) {
+	t.Helper()
+	for _, action := range session.DownloadActions {
+		digest := ""
+		if action.SHA256 != nil {
+			digest = *action.SHA256
+		}
+		if err := syncService.AckDownloadAction(ctx, principal, workspaceID, session.ID, action.Path, action.Action, digest, action.SizeBytes); err != nil {
+			t.Fatalf("acknowledge applied Host download action %q (%s): %v", action.Path, action.Action, err)
+		}
 	}
 }

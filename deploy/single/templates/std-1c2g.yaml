@@ -1,7 +1,7 @@
 id: std-1c2g
 name: 标准 1 核 2G
 description: 浏览器、终端和文件，适合轻量任务
-image: registry.local/cloudhost/host:arm64-local-20261022-runtime-desktop-ready@sha256:bd295f34b577df6152d3a538201a36f0df89ac6e17fe24d999d5805c8a98a12c
+image: registry.local/cloudhost/host:arm64-local-20261106-runtime-portal-tls-profile-lock-sync-fix@sha256:b99d605ff72db580da2cf32da8405b1e879b1a46d9e75e9b34216d9c55670b7e
 entrypoint: ["/usr/local/bin/morde-host-entrypoint"]
 resources:
   requests: {cpu: "1", memory: "2Gi"}

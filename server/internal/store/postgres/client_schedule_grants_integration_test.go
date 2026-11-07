@@ -182,7 +182,7 @@ func createClientAuthorizedSchedule(t *testing.T, ctx context.Context, store *St
 		StartsOn: time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"), LocalTime: "10:00", TimeZone: "UTC"}
 	value := schedule.Schedule{
 		ID: mustID(t, schedule.NewID), OwnerID: ownerID, Version: 1, Status: status, ExecutionEpoch: 1,
-		HostID: hostID, ModelID: "model-test", Objective: "iOS schedule grant test", Timing: timing,
+		HostID: hostID, ModelID: "model-test", Title: "iOS schedule grant", Objective: "iOS schedule grant test", Timing: timing,
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		Authorization: task.Authorization{Kind: string(identity.KindClient), TokenID: grant.ID,
 			ClientInstallationID: grant.ClientInstallationID,

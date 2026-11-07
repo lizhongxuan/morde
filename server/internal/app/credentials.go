@@ -15,6 +15,8 @@ import (
 	"morde/server/internal/domain/audit"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 )
 
@@ -333,9 +335,63 @@ func (s *CredentialService) AuthorizeTaskAction(ctx context.Context, ownerID str
 	return s.authorizeHostAction(ctx, ownerID, ownerID, kind, tokenID, hostID, approvedScopes, required)
 }
 
+// AuthorizeTaskHostAction checks a task actor's own credential and current
+// Host grant. The task owner, actor and Host owner can be different users.
+func (s *CredentialService) AuthorizeTaskHostAction(ctx context.Context, value task.Task, required identity.Scope) error {
+	actorID, auth := value.InitiatorID, value.Authorization
+	if ctx == nil || !domain.ValidUserID(actorID) || !domain.ValidHostID(value.HostID) ||
+		(required != identity.ScopeComputerObserve && required != identity.ScopeComputerOperate) {
+		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+	}
+	if value.ProjectID != "" {
+		members, ok := s.hosts.(interface {
+			GetProjectMember(context.Context, string, string) (project.Member, error)
+		})
+		if !ok || !project.ValidID(value.ProjectID) {
+			return domain.NewError(domain.CodeUnauthenticated, "project task authorization is unavailable")
+		}
+		member, err := members.GetProjectMember(ctx, value.ProjectID, actorID)
+		if err != nil || member.ProjectID != value.ProjectID || member.UserID != actorID || member.Version < 1 ||
+			!project.RoleAtLeast(member.Role, project.RoleMember) {
+			return domain.NewError(domain.CodeUnauthenticated, "project task authorization is unavailable")
+		}
+	}
+	currentHost, err := s.hosts.GetHost(ctx, value.HostID)
+	if err != nil || currentHost.State == host.StateDeleted || currentHost.DeletedAt != nil {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if currentHost.OwnerID == actorID && (value.ProjectID == "" || auth.Kind == string(identity.KindScheduleTask)) {
+		return s.AuthorizeTaskAction(ctx, actorID, identity.Kind(auth.Kind), auth.TokenID, value.HostID,
+			agentScopeSnapshot(auth.Scopes), required)
+	}
+	if (currentHost.OwnerID != actorID && authorizeTaskHostControl(ctx, s.hosts, currentHost, actorID) != nil) ||
+		(auth.Kind != string(identity.KindSession) && auth.Kind != string(identity.KindClient)) ||
+		!domain.ValidTokenID(auth.TokenID) || auth.Version < 1 || auth.ExpiresAt == nil || !auth.ExpiresAt.After(time.Now()) {
+		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+	}
+	user, err := s.users.GetUserByID(ctx, actorID)
+	if err != nil || user.Status != identity.StatusApproved {
+		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+	}
+	token, err := s.tokens.GetTokenByID(ctx, auth.TokenID)
+	if err != nil || token.OwnerID != actorID || token.Kind != identity.Kind(auth.Kind) || token.RevokedAt != nil ||
+		!token.ExpiresAt.After(time.Now()) || token.ClientInstallationID != auth.ClientInstallationID ||
+		(auth.ClientInstallationID != "" && !s.clientInstallationActive(ctx, auth.ClientInstallationID, actorID)) {
+		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+	}
+	snapshot := identity.Principal{Kind: identity.Kind(auth.Kind), Scopes: agentScopeSnapshot(auth.Scopes)}
+	current := identity.Principal{Kind: token.Kind, Scopes: token.Scopes}
+	if !snapshot.HasScope(required) || !current.HasScope(required) ||
+		(auth.Kind == string(identity.KindSession) && (len(auth.Scopes) != 0 || len(token.Scopes) != 0)) ||
+		(auth.Kind == string(identity.KindClient) && !domain.ValidClientInstallationID(auth.ClientInstallationID)) {
+		return domain.NewError(domain.CodeForbidden, "task authorization does not allow this tool")
+	}
+	return nil
+}
+
 func (s *CredentialService) AuthorizeTaskExecution(ctx context.Context, principal identity.Principal, hostID string, required identity.Scope) (task.Authorization, error) {
 	if principal.Kind == identity.KindScheduleTask {
-		if !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		if !domain.ValidUserID(principal.UserID) || !schedule.ValidRunID(principal.TokenID) ||
 			!identity.IsScheduleTaskExecutionScopeSet(principal.Scopes) || !principal.HasScope(required) || s.scheduledTasks == nil {
 			return task.Authorization{}, domain.NewError(domain.CodeForbidden, "scheduled task execution is not authorized")
 		}

@@ -15,6 +15,10 @@ run_config() {
   python3 "$script" "$1" --home "$home"
 }
 
+run_config_output() {
+  python3 "$script" "$1" --home "$home"
+}
+
 assert_file() {
   local path="$1" expected="$2"
   test "$(cat "$home/$path")" = "$expected"
@@ -188,6 +192,41 @@ MORDE_WORKSPACE_LAYOUT=legacy python3 "$script" workspace-defaults --home "$lega
 test ! -e "$legacy_home/.config/user-dirs.dirs"
 test "$(cat "$legacy_home/Downloads/keep.txt")" = old-downloads
 
+# Only Chromium's generated DeferredBrowserMetrics files are removed; user
+# files, unrelated .pma files, and symlinks remain untouched.
+metrics_home="$test_root/metrics-home"
+metrics_dir="$metrics_home/.config/browser/DeferredBrowserMetrics"
+mkdir -p "$metrics_dir"
+printf 'generated-metrics' > "$metrics_dir/BrowserMetrics-6AED6451-21D0.pma"
+printf 'generated-metrics-short-id' > "$metrics_dir/BrowserMetrics-6AED5594-541.pma"
+printf 'keep-user-file' > "$metrics_dir/keep.pma"
+printf 'keep-nonmatching' > "$metrics_dir/BrowserMetrics-not-a-metric.pma"
+printf 'outside-target' > "$test_root/outside-metric-target"
+ln -s "$test_root/outside-metric-target" "$metrics_dir/BrowserMetrics-6AED6452-21D0.pma"
+removed="$(python3 "$script" prune-browser-metrics --home "$metrics_home")"
+test "$removed" = 2
+test ! -e "$metrics_dir/BrowserMetrics-6AED6451-21D0.pma"
+test ! -e "$metrics_dir/BrowserMetrics-6AED5594-541.pma"
+test -f "$metrics_dir/keep.pma"
+test -f "$metrics_dir/BrowserMetrics-not-a-metric.pma"
+test -L "$metrics_dir/BrowserMetrics-6AED6452-21D0.pma"
+test "$(cat "$test_root/outside-metric-target")" = outside-target
+
+# Chromium's singleton symlinks belong to one container process and become
+# stale when a Host is recreated. Startup removes only those links and keeps
+# the browser profile contents intact.
+browser_lock_home="$test_root/browser-lock-home"
+mkdir -p "$browser_lock_home/.config/browser/Default"
+printf 'keep-browser-profile' > "$browser_lock_home/.config/browser/Default/Bookmarks"
+ln -s 'oldhost-394' "$browser_lock_home/.config/browser/SingletonLock"
+ln -s '123456789' "$browser_lock_home/.config/browser/SingletonCookie"
+ln -s '/tmp/org.chromium.Chromium.StaleSocket' "$browser_lock_home/.config/browser/SingletonSocket"
+python3 "$script" prepare --home "$browser_lock_home"
+for name in SingletonLock SingletonCookie SingletonSocket; do
+  test ! -L "$browser_lock_home/.config/browser/$name"
+done
+test "$(cat "$browser_lock_home/.config/browser/Default/Bookmarks")" = keep-browser-profile
+
 # A deliberate deletion after baseline creation is also restored after AIO recreates it.
 rm -f "$home/.config/matplotlib/matplotlibrc"
 run_config prepare
@@ -206,4 +245,4 @@ if run_config prepare >/dev/null 2>&1; then
 fi
 test "$(cat "$outside")" = leave-unchanged
 
-echo 'PASS: AIO profile overwrite recovery, initial empty config, interrupted startup, deletion, Workspace separation, and fail-closed symlink checks'
+echo 'PASS: AIO profile overwrite recovery, stale Chromium locks, initial empty config, interrupted startup, deletion, Workspace separation, and fail-closed symlink checks'

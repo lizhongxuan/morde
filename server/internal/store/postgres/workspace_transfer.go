@@ -32,6 +32,9 @@ func (s *Store) CreateWorkspaceOwnershipTransfer(ctx context.Context, actorID, w
 	var result workspace.OwnershipTransfer
 	var replayed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockWorkspaceMutationFence(ctx, tx, workspaceID, true); err != nil {
+			return err
+		}
 		stored, found, err := findIdempotency(ctx, tx, record)
 		if err != nil {
 			return err
@@ -49,16 +52,20 @@ func (s *Store) CreateWorkspaceOwnershipTransfer(ctx context.Context, actorID, w
 		}
 
 		var currentOwner, state string
+		var readOnly bool
 		var revision int64
 		var deleted bool
-		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, deleted_at IS NOT NULL
-FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&currentOwner, &state, &revision, &deleted); errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, deleted_at IS NOT NULL, is_read_only
+FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&currentOwner, &state, &revision, &deleted, &readOnly); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		} else if err != nil {
 			return fmt.Errorf("lock Workspace for ownership transfer: %w", err)
 		}
 		if currentOwner != actorID || deleted {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if readOnly {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if state != string(workspace.StateReady) || revision != expectedRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed before ownership transfer")
@@ -125,6 +132,9 @@ func (s *Store) ReconcileWorkspaceOwnershipTransfer(ctx context.Context, actorID
 		return workspace.OwnershipTransfer{}, fmt.Errorf("begin Workspace ownership transfer reconciliation: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMutationFence(ctx, tx, workspaceID, true); err != nil {
+		return workspace.OwnershipTransfer{}, err
+	}
 	if err := lockTransferWorkspace(ctx, tx, workspaceID); err != nil {
 		return workspace.OwnershipTransfer{}, err
 	}
@@ -206,6 +216,9 @@ func (s *Store) StartWorkspaceOwnershipTransferAcceptance(ctx context.Context, a
 	var result workspace.OwnershipTransfer
 	var replayed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockWorkspaceMutationFence(ctx, tx, workspaceID, true); err != nil {
+			return err
+		}
 		stored, found, err := findIdempotency(ctx, tx, record)
 		if err != nil {
 			return err
@@ -297,6 +310,11 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND request_hash=$4`,
 
 func (s *Store) FinishWorkspaceOwnershipTransferAcceptance(ctx context.Context, actorID, workspaceID, transferID, operationID string,
 	maxOwnerBytes int64) (workspace.OwnershipTransfer, error) {
+	return s.FinishWorkspaceOwnershipTransferAcceptanceWithReadOnly(ctx, actorID, workspaceID, transferID, operationID, maxOwnerBytes, false)
+}
+
+func (s *Store) FinishWorkspaceOwnershipTransferAcceptanceWithReadOnly(ctx context.Context, actorID, workspaceID, transferID, operationID string,
+	maxOwnerBytes int64, readOnly bool) (workspace.OwnershipTransfer, error) {
 	if !domain.ValidUserID(actorID) || !domain.ValidWorkspaceID(workspaceID) || !workspace.ValidOwnershipTransferID(transferID) ||
 		!domain.ValidOperationID(operationID) || maxOwnerBytes <= 0 {
 		return workspace.OwnershipTransfer{}, domain.InvalidArgument("ownership_transfer", "workspace ownership acceptance is invalid")
@@ -307,6 +325,9 @@ func (s *Store) FinishWorkspaceOwnershipTransferAcceptance(ctx context.Context, 
 		return workspace.OwnershipTransfer{}, fmt.Errorf("begin Workspace ownership acceptance: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockWorkspaceMutationFence(ctx, tx, workspaceID, true); err != nil {
+		return workspace.OwnershipTransfer{}, err
+	}
 	if err := lockWorkspaceProjectResourcesForTransfer(ctx, tx, workspaceID); err != nil {
 		return workspace.OwnershipTransfer{}, err
 	}
@@ -323,6 +344,13 @@ func (s *Store) FinishWorkspaceOwnershipTransferAcceptance(ctx context.Context, 
 	if value.State == workspace.OwnershipTransferAccepted {
 		if value.OperationID != operationID {
 			return workspace.OwnershipTransfer{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace ownership transfer operation does not match")
+		}
+		var storedReadOnly bool
+		if err := tx.QueryRow(ctx, `SELECT is_read_only FROM workspaces WHERE id=$1`, workspaceID).Scan(&storedReadOnly); err != nil {
+			return workspace.OwnershipTransfer{}, storeError("verify Workspace ownership acceptance mode", "workspace", err)
+		}
+		if storedReadOnly != readOnly {
+			return workspace.OwnershipTransfer{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace ownership acceptance mode does not match")
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return workspace.OwnershipTransfer{}, fmt.Errorf("finish Workspace ownership acceptance read: %w", err)
@@ -372,7 +400,7 @@ FROM workspaces WHERE id=$1`, workspaceID).Scan(&currentOwner, &state, &revision
 			return workspace.OwnershipTransfer{}, resetErr
 		}
 	} else {
-		accepted, failureAfterCommit, err = applyWorkspaceOwnershipTransfer(ctx, tx, actorID, value, maxOwnerBytes)
+		accepted, failureAfterCommit, err = applyWorkspaceOwnershipTransfer(ctx, tx, actorID, value, maxOwnerBytes, readOnly)
 		if err != nil {
 			if domain.CodeOf(err) == domain.CodeQuotaExceeded {
 				if resetErr := failToPending(err); resetErr != nil {
@@ -425,6 +453,9 @@ func (s *Store) CancelWorkspaceOwnershipTransfer(ctx context.Context, actorID, w
 	}
 	var result workspace.OwnershipTransfer
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockWorkspaceMutationFence(ctx, tx, workspaceID, true); err != nil {
+			return err
+		}
 		stored, found, err := findIdempotency(ctx, tx, record)
 		if err != nil {
 			return err
@@ -610,7 +641,8 @@ WHERE workspace_id=$1 AND (state <> 'stored' OR reserved_bytes <> 0))`, workspac
 	return nil
 }
 
-func applyWorkspaceOwnershipTransfer(ctx context.Context, tx pgx.Tx, actorID string, transfer workspace.OwnershipTransfer, maxOwnerBytes int64) (workspace.OwnershipTransfer, error, error) {
+func applyWorkspaceOwnershipTransfer(ctx context.Context, tx pgx.Tx, actorID string, transfer workspace.OwnershipTransfer, maxOwnerBytes int64,
+	readOnly bool) (workspace.OwnershipTransfer, error, error) {
 	ownerIDs := []string{transfer.FromOwnerID, transfer.ToOwnerID}
 	sort.Strings(ownerIDs)
 	usage := make(map[string][2]int64, len(ownerIDs))
@@ -696,9 +728,9 @@ ON CONFLICT (workspace_id,owner_id) DO UPDATE SET
   transfer_id=EXCLUDED.transfer_id, started_at=EXCLUDED.started_at, ended_at=NULL`, transfer.WorkspaceID, transfer.ToOwnerID, transfer.ID); err != nil {
 		return workspace.OwnershipTransfer{}, nil, fmt.Errorf("record new Workspace owner: %w", err)
 	}
-	workspaceUpdate, err := tx.Exec(ctx, `UPDATE workspaces SET owner_id=$2, updated_at=clock_timestamp()
+	workspaceUpdate, err := tx.Exec(ctx, `UPDATE workspaces SET owner_id=$2, is_read_only=$5, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$3 AND revision=$4 AND state='ready' AND deleted_at IS NULL`,
-		transfer.WorkspaceID, transfer.ToOwnerID, transfer.FromOwnerID, transfer.ExpectedRevision)
+		transfer.WorkspaceID, transfer.ToOwnerID, transfer.FromOwnerID, transfer.ExpectedRevision, readOnly)
 	if err != nil {
 		return workspace.OwnershipTransfer{}, nil, fmt.Errorf("update Workspace owner: %w", err)
 	}
@@ -773,6 +805,9 @@ func (s *Store) markWorkspaceOwnershipTransferUnknown(transferID, workspaceID, o
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockWorkspaceMutationFence(ctx, tx, workspaceID, true); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, `UPDATE workspace_ownership_transfers SET state='unknown', version=version+1,
 updated_at=clock_timestamp() WHERE id=$1 AND workspace_id=$2 AND state='accepting' AND operation_id=$3`,
 			transferID, workspaceID, operationID)

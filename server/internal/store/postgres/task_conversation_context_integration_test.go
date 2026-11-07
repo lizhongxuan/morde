@@ -14,7 +14,7 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-func TestPostgresTaskConversationContextFixesSubmitAndAppendBoundaries(t *testing.T) {
+func TestPostgresTaskConversationContextFixesSubmissionBoundaries(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
@@ -57,14 +57,14 @@ func TestPostgresTaskConversationContextFixesSubmitAndAppendBoundaries(t *testin
 	thirdSubmission := newTestTaskSubmission(t, owner.ID, "", "context-third-task", "third request: continue the same topic")
 	thirdSubmission.Task.ConversationID = first.Conversation.ID
 	thirdSubmission.Message.ConversationID = first.Conversation.ID
-	thirdSubmission.Idempotency = testIdempotency(owner.ID, "append-message", "context-third-task")
-	third, err := store.AppendMessage(ctx, thirdSubmission)
+	thirdSubmission.Idempotency = testIdempotency(owner.ID, "task.submit", "context-third-task")
+	third, err := store.SubmitTask(ctx, thirdSubmission)
 	if err != nil {
-		t.Fatalf("AppendMessage new Task: %v", err)
+		t.Fatalf("submit third Task: %v", err)
 	}
 	thirdManifest := readTaskConversationContextManifest(t, ctx, store, third.Task.ID)
 	if thirdManifest.Scope != "personal" || thirdManifest.ThroughSequence != 4 || thirdManifest.MessageCount != 4 {
-		t.Fatalf("AppendMessage manifest = %+v; want four confirmed messages through sequence 4", thirdManifest)
+		t.Fatalf("third Task manifest = %+v; want four confirmed messages through sequence 4", thirdManifest)
 	}
 	thirdClaim, found, err := store.ClaimNextTask(ctx, "context-append-worker", time.Minute)
 	if err != nil || !found || thirdClaim.ID != third.Task.ID {
@@ -76,12 +76,52 @@ func TestPostgresTaskConversationContextFixesSubmitAndAppendBoundaries(t *testin
 		thirdClaim.ConversationContext.Messages[1].Content != "confirmed answer: Cedar is the saved name" ||
 		thirdClaim.ConversationContext.Messages[2].Content != secondSubmission.Task.Objective ||
 		thirdClaim.ConversationContext.Messages[3].Content != "confirmed answer: the saved name is Cedar" {
-		t.Fatalf("claimed AppendMessage context = %+v", thirdClaim.ConversationContext)
+		t.Fatalf("claimed third Task context = %+v", thirdClaim.ConversationContext)
 	}
 	for _, message := range thirdClaim.ConversationContext.Messages {
 		if message.Content == thirdSubmission.Task.Objective {
-			t.Fatal("current AppendMessage input was included in its preceding history")
+			t.Fatal("current Task input was included in its preceding history")
 		}
+	}
+}
+
+func TestPostgresCompletedCloudResultIsConversationHistory(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	first, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "result-history-first", "Remember Cedar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "result-history-worker", time.Minute)
+	if err != nil || !found || claimed.ID != first.Task.ID {
+		t.Fatalf("claim first task: found=%t err=%v", found, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	progress := app.TaskProgress{TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: stepID, Result: "I will remember Cedar.", PublishResultMessage: true,
+		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "result", Status: task.StepSucceeded}},
+		Event: task.Event{Type: "task.result", Payload: []byte(`{}`)}}
+	if _, err := store.CommitTaskProgress(ctx, progress); err != nil {
+		t.Fatalf("complete task: %v", err)
+	}
+	page, err := store.ListMessages(ctx, owner.ID, first.Conversation.ID, app.PageRequest{Limit: 20})
+	if err != nil || len(page.Items) != 2 || page.Items[0].Role != "assistant" || page.Items[0].Content != progress.Result {
+		t.Fatalf("persisted conversation messages = %+v, err=%v", page.Items, err)
+	}
+	other := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	if _, err := store.ListMessages(ctx, other.ID, first.Conversation.ID, app.PageRequest{Limit: 20}); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("another owner accessed completed result: %v", err)
+	}
+	second := newTestTaskSubmission(t, owner.ID, "", "result-history-second", "What name did I mention?")
+	second.Task.ConversationID = first.Conversation.ID
+	if _, err := store.SubmitTask(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	next, found, err := store.ClaimNextTask(ctx, "result-history-next", time.Minute)
+	if err != nil || !found || next.ConversationContext == nil || len(next.ConversationContext.Messages) != 2 ||
+		next.ConversationContext.Messages[1].Content != progress.Result {
+		t.Fatalf("next task history = %+v, found=%t err=%v", next.ConversationContext, found, err)
 	}
 }
 
@@ -175,12 +215,12 @@ func TestPostgresTaskConversationContextRejectsMissingHistoryAndInitialEvent(t *
 			assistantID, owner.ID, first.Conversation.ID); err != nil {
 			t.Fatalf("remove historical assistant row: %v", err)
 		}
-		if _, _, err := store.ClaimNextTask(ctx, "context-corrupt-worker", time.Minute); err == nil {
-			t.Fatal("claim with missing fixed history succeeded; want fail closed")
+		if _, found, err := store.ClaimNextTask(ctx, "context-corrupt-worker", time.Minute); err != nil || found {
+			t.Fatalf("claim with missing fixed history: found=%t err=%v", found, err)
 		}
-		var status string
-		if err := store.pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1`, second.Task.ID).Scan(&status); err != nil || status != string(task.StatusQueued) {
-			t.Fatalf("failed claim changed Task state to %q, err=%v", status, err)
+		var status, result string
+		if err := store.pool.QueryRow(ctx, `SELECT status,result FROM tasks WHERE id=$1`, second.Task.ID).Scan(&status, &result); err != nil || status != string(task.StatusCancelling) || !strings.Contains(result, "无法恢复") {
+			t.Fatalf("unrecoverable Task state=%q result=%q err=%v", status, result, err)
 		}
 	})
 
@@ -195,8 +235,12 @@ func TestPostgresTaskConversationContextRejectsMissingHistoryAndInitialEvent(t *
 		if _, err := store.pool.Exec(ctx, `DELETE FROM task_events WHERE task_id=$1 AND sequence=1`, created.Task.ID); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := store.ClaimNextTask(ctx, "context-missing-event-worker", time.Minute); err == nil {
-			t.Fatal("claim with missing initial event succeeded; want fail closed")
+		if _, found, err := store.ClaimNextTask(ctx, "context-missing-event-worker", time.Minute); err != nil || found {
+			t.Fatalf("claim with missing initial event: found=%t err=%v", found, err)
+		}
+		var status string
+		if err := store.pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1`, created.Task.ID).Scan(&status); err != nil || status != string(task.StatusCancelling) {
+			t.Fatalf("unrecoverable Task status=%q err=%v", status, err)
 		}
 	})
 }

@@ -25,7 +25,7 @@ func (s *Store) RecordHostUsageObservation(ctx context.Context, observation host
 	err := withTx(ctx, s.pool.Begin, func(tx pgx.Tx) error {
 		var generation int64
 		var sandboxID, state, ownerID string
-		if err := tx.QueryRow(ctx, `SELECT runtime_generation,sandbox_id,state,owner_id FROM hosts WHERE id=$1 FOR UPDATE`, observation.HostID).
+		if err := tx.QueryRow(ctx, `SELECT runtime_generation,COALESCE(sandbox_id,''),state,owner_id FROM hosts WHERE id=$1 FOR UPDATE`, observation.HostID).
 			Scan(&generation, &sandboxID, &state, &ownerID); err != nil {
 			return storeError("lock Host for usage observation", "host", err)
 		}

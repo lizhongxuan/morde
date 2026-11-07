@@ -27,7 +27,9 @@ security:
   host_cookie_ttl: 8h
   login_rate_limit: 5/min
 models:
-  allowed_hosts: [api.openai.com]
+  allowed_hosts: [api.openai.com, api.deepseek.com, api.z.ai]
+  # Optional trusted HTTP CONNECT proxy; leave unset for direct connections.
+  # proxy_url: http://127.0.0.1:7897
   # Add one explicit, versioned rate per model before enabling project model calls.
   project_rates: []
 orchestrator:
@@ -43,6 +45,7 @@ templates:
 hosts:
   ready_timeout: 3m
   ready_poll_interval: 2s
+  runtime_portal_url: ${CH_HOST_RUNTIME_PORTAL_URL}
 capacity:
   cpu_milli: 2000
   mem_mib: 4096
@@ -60,6 +63,12 @@ cloud_dsh:
   enabled: false
   max_concurrent_tasks: 4
   max_concurrent_tasks_per_owner: 2
+  builtin_search:
+    enabled: false
+    node_path: /usr/bin/node
+    script_path: ${CH_BUILTIN_SEARCH_SCRIPT}
+    searxng_url: http://127.0.0.1:8189
+    max_concurrent: 4
 workspace_storage:
   root_dir: ${CH_WORKSPACE_STORAGE_ROOT_DIR}
   max_workspace_bytes: ${CH_WORKSPACE_MAX_BYTES}

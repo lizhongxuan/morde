@@ -17,6 +17,7 @@ import (
 	"morde/server/internal/config"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/audit"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
@@ -29,19 +30,17 @@ import (
 type cloudDSHAdapters struct {
 	tasks             api.TaskService
 	schedules         api.ScheduleService
-	instantChat       api.InstantChatService
 	scheduleProcessor worker.ScheduleProcessor
 }
 
 func cloudDSHAdaptersForRuntime(enabled bool, tasks api.TaskService, schedules api.ScheduleService,
-	instantChat api.InstantChatService, scheduleProcessor worker.ScheduleProcessor) cloudDSHAdapters {
+	scheduleProcessor worker.ScheduleProcessor) cloudDSHAdapters {
 	if enabled {
-		return cloudDSHAdapters{tasks: tasks, schedules: schedules, instantChat: instantChat, scheduleProcessor: scheduleProcessor}
+		return cloudDSHAdapters{tasks: tasks, schedules: schedules, scheduleProcessor: scheduleProcessor}
 	}
 	return cloudDSHAdapters{
-		tasks:       runtimeUnavailableTaskService{TaskService: tasks},
-		schedules:   runtimeUnavailableScheduleService{ScheduleService: schedules},
-		instantChat: runtimeUnavailableInstantChatService{InstantChatService: instantChat},
+		tasks:     runtimeUnavailableTaskService{TaskService: tasks},
+		schedules: runtimeUnavailableScheduleService{ScheduleService: schedules},
 	}
 }
 
@@ -51,10 +50,15 @@ func taskRuntimeUnavailable() error {
 
 type projectConversationTaskAppender struct{ tasks api.TaskService }
 
-func (a projectConversationTaskAppender) AppendProjectMessage(ctx context.Context, principal identity.Principal, projectID, conversationID string,
-	command app.AppendMessageCommand) (app.TaskSubmissionResult, error) {
+func (a projectConversationTaskAppender) AcceptProjectMessage(ctx context.Context, principal identity.Principal, projectID, conversationID string,
+	command app.AcceptConversationMessageCommand) (conversation.Message, bool, error) {
 	command.ProjectID = projectID
-	return a.tasks.AppendMessage(ctx, principal, conversationID, command)
+	return a.tasks.AcceptConversationMessage(ctx, principal, conversationID, command)
+}
+
+func (a projectConversationTaskAppender) ListConversationActiveTasks(ctx context.Context, principal identity.Principal,
+	projectID, conversationID string, page app.PageRequest) (app.TaskPage, error) {
+	return a.tasks.ListConversationActiveTasks(ctx, principal, projectID, conversationID, page)
 }
 
 type projectWorkItemTaskLinkAuthorizer struct{ tasks api.TaskService }
@@ -110,10 +114,6 @@ func (a projectWorkItemDeliveryAuthorizer) AuthorizeSavedProjectDelivery(ctx con
 type runtimeUnavailableTaskService struct{ api.TaskService }
 
 func (s runtimeUnavailableTaskService) Submit(context.Context, identity.Principal, app.SubmitTaskCommand) (app.TaskSubmissionResult, error) {
-	return app.TaskSubmissionResult{}, taskRuntimeUnavailable()
-}
-
-func (s runtimeUnavailableTaskService) AppendMessage(context.Context, identity.Principal, string, app.AppendMessageCommand) (app.TaskSubmissionResult, error) {
 	return app.TaskSubmissionResult{}, taskRuntimeUnavailable()
 }
 
@@ -180,12 +180,6 @@ func (s runtimeUnavailableScheduleService) Action(ctx context.Context, principal
 		return app.ScheduleActionResult{}, taskRuntimeUnavailable()
 	}
 	return s.ScheduleService.Action(ctx, principal, id, command, idempotencyKey)
-}
-
-type runtimeUnavailableInstantChatService struct{ api.InstantChatService }
-
-func (s runtimeUnavailableInstantChatService) Send(context.Context, identity.Principal, app.InstantChatSend) (app.InstantChatReply, error) {
-	return app.InstantChatReply{}, taskRuntimeUnavailable()
 }
 
 type authAdapter struct {

@@ -55,7 +55,7 @@ func (s *Store) CreatePersonalAttachmentUpload(ctx context.Context, principal id
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -103,7 +103,7 @@ func (s *Store) ActivatePersonalAttachmentUpload(ctx context.Context, principal 
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -168,7 +168,7 @@ func (s *Store) PutPersonalAttachmentChunk(ctx context.Context, principal identi
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -227,7 +227,7 @@ func (s *Store) CommitPersonalAttachment(ctx context.Context, principal identity
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -311,7 +311,7 @@ func (s *Store) CancelPersonalAttachmentUpload(ctx context.Context, principal id
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -367,7 +367,7 @@ func (s *Store) OpenPersonalAttachment(ctx context.Context, principal identity.P
 		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		currentInstanceID, err := serviceInstanceIDInTx(ctx, tx)
+		currentInstanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -476,7 +476,7 @@ func (s *Store) AcknowledgePersonalAttachmentReservationReleased(ctx context.Con
 		return err
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		instanceID, err := serviceInstanceIDInTx(ctx, tx)
+		instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}

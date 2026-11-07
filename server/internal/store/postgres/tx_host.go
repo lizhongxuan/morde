@@ -228,6 +228,28 @@ WHERE h.deleted_at IS NULL
     ))
   )`
 
+const allocatedResourceUsageExcludingHostSQL = `
+SELECT COALESCE(sum(GREATEST(h.cpu_milli, COALESCE(h.resource_target_cpu_milli, h.cpu_milli),
+                         CASE WHEN h.resource_update_state <> 'idle' THEN h.cpu_limit_milli ELSE 0 END)), 0)::bigint,
+       COALESCE(sum(GREATEST(h.mem_mib, COALESCE(h.resource_target_mem_mib, h.mem_mib),
+                         CASE WHEN h.resource_update_state <> 'idle' THEN h.mem_limit_mib ELSE 0 END)), 0)::bigint
+FROM hosts h
+WHERE h.deleted_at IS NULL
+  AND ($1::text IS NULL OR h.owner_id = $1)
+  AND h.id <> $2
+  AND (
+	    h.resource_update_state <> 'idle'
+	    OR
+	    h.state IN ('creating', 'running', 'stopping', 'deleting')
+    OR (h.state = 'failed' AND (
+      h.sandbox_id IS NOT NULL
+      OR EXISTS (
+        SELECT 1 FROM workspace_bindings wb
+        WHERE wb.host_id = h.id AND wb.state <> 'detached'
+      )
+    ))
+  )`
+
 const insertHostSQL = `
 INSERT INTO hosts (
   id, owner_id, name, template_id, runtime_profile, state, state_reason,
@@ -289,7 +311,7 @@ func lockWorkspacesForBinding(ctx context.Context, tx pgx.Tx, workspaceIDs []str
 		return revisions, nil
 	}
 	rows, err := tx.Query(ctx, `
-SELECT id, owner_id, state, revision
+SELECT id, owner_id, state, revision, is_read_only
 FROM workspaces WHERE id = ANY($1::text[])
 ORDER BY id FOR UPDATE`, ids)
 	if err != nil {
@@ -299,8 +321,9 @@ ORDER BY id FOR UPDATE`, ids)
 	lockedIDs := make([]string, 0, len(ids))
 	for rows.Next() {
 		var id, owner, state string
+		var readOnly bool
 		var revision int64
-		if err := rows.Scan(&id, &owner, &state, &revision); err != nil {
+		if err := rows.Scan(&id, &owner, &state, &revision, &readOnly); err != nil {
 			return nil, fmt.Errorf("read workspace for host binding: %w", err)
 		}
 		if owner != ownerID {
@@ -310,6 +333,9 @@ ORDER BY id FOR UPDATE`, ids)
 			conflict := domain.NewError(domain.CodeWorkspaceBusy, "workspace is not available for binding")
 			conflict.Details["state"] = state
 			return nil, conflict
+		}
+		if readOnly {
+			return nil, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only and cannot be attached to a Host")
 		}
 		revisions[id] = revision
 		lockedIDs = append(lockedIDs, id)

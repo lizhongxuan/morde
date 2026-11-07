@@ -34,6 +34,34 @@ func taskWorkspacePublishFixture(t *testing.T, store WorkspaceSyncStore, blocks 
 	return service, command, file, data
 }
 
+func TestValidateTaskWorkspacePublishCommandKeepsHostlessAndHostBoundFencesSeparate(t *testing.T) {
+	_, hostBound, _, _ := taskWorkspacePublishFixture(t, newSyncServiceStore(), newSyncBlockMemory())
+	if err := ValidateTaskWorkspacePublishCommand(hostBound); err != nil {
+		t.Fatalf("host-bound publish command was rejected: %v", err)
+	}
+	hostless := hostBound
+	hostless.HostID, hostless.BindingVersion, hostless.HostFence, hostless.ViewID = "", 0, AgentHostFence{}, ""
+	if err := ValidateTaskWorkspacePublishCommand(hostless); err != nil {
+		t.Fatalf("Hostless publish command was rejected: %v", err)
+	}
+	for _, mutate := range []func(*TaskWorkspacePublishCommand){
+		func(value *TaskWorkspacePublishCommand) { value.BindingVersion = 1 },
+		func(value *TaskWorkspacePublishCommand) { value.HostFence.RuntimeGeneration = 1 },
+		func(value *TaskWorkspacePublishCommand) { value.ViewID = "v" + strings.Repeat("a", 64) },
+	} {
+		invalid := hostless
+		mutate(&invalid)
+		if err := ValidateTaskWorkspacePublishCommand(invalid); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Errorf("Hostless command with Host-only fields error = %v; want invalid argument", err)
+		}
+	}
+	invalidHostBound := hostBound
+	invalidHostBound.BindingVersion, invalidHostBound.HostFence, invalidHostBound.ViewID = 0, AgentHostFence{}, ""
+	if err := ValidateTaskWorkspacePublishCommand(invalidHostBound); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("host-bound command without its fence error = %v; want invalid argument", err)
+	}
+}
+
 func TestTaskWorkspacePublishPersistsOutputAndReplaysReceipt(t *testing.T) {
 	store := newSyncServiceStore()
 	blocks := newSyncBlockMemory()

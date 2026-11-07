@@ -117,6 +117,7 @@ func TestWorkspaceHardlinkMigrationDownUpAndPreservesIdentity(t *testing.T) {
 		ctx := context.Background()
 		owner := createTestUser(t, store, 6, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "hardlink-down-guard")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		content := []byte("shared inode")
 		digest := sha256.Sum256(content)
 		sha := hex.EncodeToString(digest[:])

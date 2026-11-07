@@ -216,6 +216,10 @@ VALUES ($1,$2,NULL)`, value.ID, value.OwnerID); err != nil {
 		}); err != nil {
 			return fmt.Errorf("create initial workspace revision: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO workspace_revision_directories
+(workspace_id,valid_from_revision,directory_path,folded_path,metadata_known) VALUES ($1,0,'.','.',true)`, value.ID); err != nil {
+			return fmt.Errorf("create initial Workspace root metadata: %w", err)
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO workspace_current_materializations
 (workspace_id, desired_revision, applied_revision) VALUES ($1, 0, -1)`, value.ID); err != nil {
 			return fmt.Errorf("create initial Workspace current materialization: %w", err)
@@ -398,7 +402,7 @@ quota_hosts, quota_cpu_milli, quota_mem_mib, default_host_cpu_milli, default_hos
 			return storeError("update user", "user", err)
 		}
 		updated = userDomain(row)
-		if firstApproval {
+		if firstApproval && defaultModelBudget.Configured {
 			result, err := tx.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent)
 VALUES ($1,$2,$3) ON CONFLICT (owner_id) DO NOTHING`, value.ID, defaultModelBudget.TokenLimit, defaultModelBudget.MaxConcurrent)
 			if err != nil {
@@ -408,7 +412,7 @@ VALUES ($1,$2,$3) ON CONFLICT (owner_id) DO NOTHING`, value.ID, defaultModelBudg
 				grantAudit, err := auditParams(audit.Entry{
 					ActorID: userUpdateAudit.ActorID, ActorKind: audit.ActorKind(userUpdateAudit.ActorKind),
 					Action: audit.ActionModelBudgetUpdate, Target: value.ID, IP: userUpdateAudit.Ip,
-					Detail: map[string]any{"configured": false, "token_limit": defaultModelBudget.TokenLimit,
+					Detail: map[string]any{"configured": true, "token_limit": defaultModelBudget.TokenLimit,
 						"max_concurrent": defaultModelBudget.MaxConcurrent, "source": "registration_review"},
 				})
 				if err != nil {

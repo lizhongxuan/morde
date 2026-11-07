@@ -130,7 +130,7 @@ func TestRetireTaskExecutionWaitsForAccountRuntimeGuardianProof(t *testing.T) {
 	}
 	nonce := make([]byte, 32)
 	nonce[0] = 19
-	runtime, _, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID,
+	runtime, _, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID, ConversationID: runtimeTestConversation(t, store, owner.ID),
 		RuntimeID: "retire-runtime-proof", LeaseOwner: "retire-runtime-worker", SupervisorNonce: nonce,
 		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
 	if err != nil {

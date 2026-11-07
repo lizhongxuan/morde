@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/personal"
 )
 
 const maxAgentCheckpointBytes = 1 << 20
@@ -63,12 +66,18 @@ type StoredAgentCheckpoint struct {
 	Ciphertext                  []byte
 	ConversationMessages        []AgentConversationMessage
 	ConversationMessagesInvalid bool
+	RootTurnStarted             bool
 }
 
 type AgentConversationMessage struct {
-	ID      string
-	Content string
+	ID             string
+	Content        string
+	AttachmentIDs  []string
+	Initial        bool
+	RevisionUpdate bool
 }
+
+const checkpointAttachmentMarkerPrefix = "[MORDE_TASK_ATTACHMENT_IDS_V1:"
 
 type AgentCheckpointStore interface {
 	SaveAgentCheckpoint(context.Context, StoredAgentCheckpoint) (bool, error)
@@ -98,8 +107,14 @@ func (s *AgentCheckpointService) Save(ctx context.Context, command AgentCheckpoi
 	}
 	var messages []AgentConversationMessage
 	var invalidMessages bool
+	var turnStarted bool
 	if command.Fence.AgentSessionID == command.Fence.AgentRootSessionID {
 		messages, invalidMessages = checkpointConversationMessages(command.Payload)
+		var err error
+		turnStarted, err = checkpointRootTurnStarted(command.Payload)
+		if err != nil {
+			return false, err
+		}
 	}
 	aad, err := checkpointAAD(command.Fence, command.From, command.Through)
 	if err != nil {
@@ -112,8 +127,35 @@ func (s *AgentCheckpointService) Save(ctx context.Context, command AgentCheckpoi
 	return s.store.SaveAgentCheckpoint(ctx, StoredAgentCheckpoint{
 		Fence: command.Fence, From: command.From, Through: command.Through,
 		Digest: append([]byte(nil), command.Digest...), Ciphertext: ciphertext,
-		ConversationMessages: messages, ConversationMessagesInvalid: invalidMessages,
+		ConversationMessages: messages, ConversationMessagesInvalid: invalidMessages, RootTurnStarted: turnStarted,
 	})
+}
+
+// Only events in this newly committed segment count; reading old checkpoints
+// during recovery must not claim a new revision has begun.
+func checkpointRootTurnStarted(payload []byte) (bool, error) {
+	var body struct {
+		Events []struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return false, domain.InvalidArgument("checkpoint", "checkpoint turn event is invalid")
+	}
+	started := false
+	for _, event := range body.Events {
+		if event.Type == "turn/start" {
+			var data struct {
+				Turn int64 `json:"turn"`
+			}
+			if json.Unmarshal(event.Data, &data) != nil || data.Turn < 1 {
+				return false, domain.InvalidArgument("checkpoint", "checkpoint turn event is invalid")
+			}
+			started = true
+		}
+	}
+	return started, nil
 }
 
 func (s *AgentCheckpointService) PendingMessages(ctx context.Context, fence AgentCheckpointFence) ([]AgentConversationMessage, error) {
@@ -227,7 +269,7 @@ func checkpointConversationMessages(payload []byte) ([]AgentConversationMessage,
 		return nil, true
 	}
 	messages := make([]AgentConversationMessage, 0)
-	byID := make(map[string]string)
+	byID := make(map[string]AgentConversationMessage)
 	for _, event := range body.Events {
 		if event.Type != "user/message" {
 			continue
@@ -249,18 +291,19 @@ func checkpointConversationMessages(payload []byte) ([]AgentConversationMessage,
 			}
 			return nil, true
 		}
-		content, ok := checkpointTextContent(data.Content)
-		if !ok || strings.TrimSpace(content) == "" || !utf8.ValidString(content) {
+		content, attachmentIDs, ok := checkpointMessageContent(data.Content)
+		if !ok || (strings.TrimSpace(content) == "" && len(attachmentIDs) == 0) || !utf8.ValidString(content) {
 			return nil, true
 		}
+		message := AgentConversationMessage{ID: data.ID, Content: content, AttachmentIDs: attachmentIDs}
 		if previous, exists := byID[data.ID]; exists {
-			if previous != content {
+			if previous.Content != content || !sameCheckpointAttachmentIDs(previous.AttachmentIDs, attachmentIDs) {
 				return nil, true
 			}
 			continue
 		}
-		byID[data.ID] = content
-		messages = append(messages, AgentConversationMessage{ID: data.ID, Content: content})
+		byID[data.ID] = message
+		messages = append(messages, message)
 	}
 	return messages, false
 }
@@ -284,30 +327,63 @@ func checkpointUUID(value string) bool {
 	return true
 }
 
-func checkpointTextContent(raw json.RawMessage) (string, bool) {
+func checkpointMessageContent(raw json.RawMessage) (string, []string, bool) {
 	var content string
 	if json.Unmarshal(raw, &content) == nil {
-		return content, true
+		return content, nil, true
 	}
 	var blocks []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
 	if len(raw) == 0 || json.Unmarshal(raw, &blocks) != nil {
-		return "", false
+		return "", nil, false
+	}
+	var attachmentIDs []string
+	if len(blocks) >= 2 && blocks[len(blocks)-1].Type == "text" && strings.HasPrefix(blocks[len(blocks)-1].Text, checkpointAttachmentMarkerPrefix) {
+		marker := blocks[len(blocks)-1].Text
+		if !strings.HasSuffix(marker, "]") {
+			return "", nil, false
+		}
+		encoded := strings.TrimSuffix(strings.TrimPrefix(marker, checkpointAttachmentMarkerPrefix), "]")
+		if encoded == "" {
+			return "", nil, false
+		}
+		attachmentIDs = strings.Split(encoded, ",")
+		if len(attachmentIDs) > conversation.MaxHistoryImportAttachments || !sort.StringsAreSorted(attachmentIDs) {
+			return "", nil, false
+		}
+		for index, id := range attachmentIDs {
+			if !(personal.ValidPersonalAttachmentID(id) || ValidProjectConversationAttachmentID(id)) || index > 0 && attachmentIDs[index-1] == id {
+				return "", nil, false
+			}
+		}
+		blocks = blocks[:len(blocks)-1]
 	}
 	var text strings.Builder
 	found := false
 	for _, block := range blocks {
 		if block.Type == "text" {
 			if !utf8.ValidString(block.Text) {
-				return "", false
+				return "", nil, false
 			}
 			text.WriteString(block.Text)
 			found = true
 		}
 	}
-	return text.String(), found
+	return text.String(), attachmentIDs, found
+}
+
+func sameCheckpointAttachmentIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func invalidCheckpointLabel(value string, max int) bool {

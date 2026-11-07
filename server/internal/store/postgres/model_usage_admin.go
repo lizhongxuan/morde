@@ -26,10 +26,15 @@ func (s *Store) ListUnknownModelCalls(ctx context.Context, principal identity.Pr
 		if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT owner_id,source,call_id,model_id,provider_model,COALESCE(task_id,''),
- reserved_tokens,created_at,settled_at FROM model_call_ledger
- WHERE state='unknown' AND ($1='' OR owner_id=$1)
- ORDER BY settled_at,owner_id,source,call_id LIMIT $2`, ownerID, limit)
+		rows, err := tx.Query(ctx, `SELECT l.owner_id,l.source,l.call_id,l.model_id,l.provider_model,COALESCE(l.task_id,''),
+ l.reserved_tokens,l.created_at,COALESCE(l.settled_at,c.updated_at) FROM model_call_ledger l
+ LEFT JOIN conversation_route_model_calls c ON c.actor_id=l.owner_id AND c.source=l.source AND c.call_id=l.call_id
+ LEFT JOIN conversation_message_routes r ON r.message_id=c.message_id
+ WHERE (l.state='unknown' OR (l.source='route' AND l.state='dispatched' AND c.state='dispatched'
+   AND (r.state<>'processing' OR r.lease_expires_at IS NULL OR r.lease_expires_at<=clock_timestamp()
+     OR r.lease_version<>c.dispatch_lease_version OR r.lease_owner<>c.dispatch_lease_owner)))
+ AND ($1='' OR l.owner_id=$1)
+ ORDER BY COALESCE(l.settled_at,c.updated_at),l.owner_id,l.source,l.call_id LIMIT $2`, ownerID, limit)
 		if err != nil {
 			return fmt.Errorf("list unknown model usage: %w", err)
 		}
@@ -129,9 +134,9 @@ func loadModelAccountBudget(ctx context.Context, tx pgx.Tx, ownerID string) (app
 	var inFlight int64
 	err := tx.QueryRow(ctx, `SELECT u.id,COALESCE(b.token_limit,0),COALESCE(b.max_concurrent,0),b.owner_id IS NOT NULL,
  COALESCE((SELECT SUM(CASE WHEN l.state='settled' THEN l.input_tokens::numeric+l.output_tokens::numeric ELSE l.reserved_tokens::numeric END)
-   FROM model_call_ledger l WHERE l.owner_id=u.id),0),
-  COALESCE((SELECT count(*) FROM model_call_ledger l WHERE l.owner_id=u.id AND l.state='dispatched'),0),
- COALESCE((SELECT bool_or(l.state='unknown') FROM model_call_ledger l WHERE l.owner_id=u.id),false)
+   FROM model_call_ledger l WHERE l.owner_id=u.id AND NOT l.personal_model),0),
+  COALESCE((SELECT count(*) FROM model_call_ledger l WHERE l.owner_id=u.id AND NOT l.personal_model AND l.state='dispatched'),0),
+ COALESCE((SELECT bool_or(l.state='unknown') FROM model_call_ledger l WHERE l.owner_id=u.id AND NOT l.personal_model),false)
 FROM users u LEFT JOIN model_account_budgets b ON b.owner_id=u.id WHERE u.id=$1`, ownerID).
 		Scan(&budget.OwnerID, &budget.TokenLimit, &concurrent, &budget.Configured, &budget.UsedTokens, &inFlight, &budget.HasUnknown)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -151,12 +156,19 @@ FROM users u LEFT JOIN model_account_budgets b ON b.owner_id=u.id WHERE u.id=$1`
 func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identity.Principal, command app.ModelUsageReconcileCommand) (bool, error) {
 	replayed := false
 	quotaExceeded := false
-	// This transaction shares the account budget lock with normal settlement. A
-	// project Task also updates its project money ledger in the same transaction.
+	// Project charges, when present, settle together with the model ledger.
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		var budget int64
-		if err := tx.QueryRow(ctx, `SELECT token_limit FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, command.OwnerID).Scan(&budget); err != nil {
-			return storeError("lock model usage budget", "model budget", err)
+		if err := lockModelLedgerOwner(ctx, tx, command.OwnerID); err != nil {
+			return err
+		}
+		personal, err := modelCallIsPersonal(ctx, tx, command.OwnerID, command.Source, command.CallID)
+		if err != nil {
+			return err
+		}
+		if !personal {
+			if _, _, err := lockPlatformModelBudget(ctx, tx, command.OwnerID); err != nil {
+				return err
+			}
 		}
 		if err := lockModelUsageAdminUser(ctx, tx, principal); err != nil {
 			return err
@@ -165,13 +177,43 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		var priorInput, priorOutput *int64
 		var accountReserved int64
 		var accountDigest []byte
-		err := tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),model_id,reserved_tokens,input_tokens,output_tokens,request_digest FROM model_call_ledger
+		err = tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),model_id,reserved_tokens,input_tokens,output_tokens,request_digest FROM model_call_ledger
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, command.OwnerID, string(command.Source), command.CallID).
 			Scan(&state, &taskID, &modelID, &accountReserved, &priorInput, &priorOutput, &accountDigest)
 		if err != nil {
 			return storeError("lock model usage", "model call", err)
 		}
 		var taskOwnerID, taskProjectID string
+		if command.Source == app.ModelCallRoute {
+			var routeState, routeMessageID string
+			var abandoned bool
+			if taskID != "" {
+				return domain.NewError(domain.CodeInvalidState, "route model call has unexpected task attribution")
+			}
+			if err := tx.QueryRow(ctx, `SELECT COALESCE(c.project_id,''),c.state,c.message_id,
+ (r.state<>'processing' OR r.lease_expires_at IS NULL OR r.lease_expires_at<=clock_timestamp()
+  OR r.lease_version<>c.dispatch_lease_version OR r.lease_owner<>c.dispatch_lease_owner)
+FROM conversation_route_model_calls c JOIN conversation_message_routes r ON r.message_id=c.message_id
+WHERE c.actor_id=$1 AND c.source='route' AND c.call_id=$2 FOR UPDATE OF c,r`, command.OwnerID, command.CallID).
+				Scan(&taskProjectID, &routeState, &routeMessageID, &abandoned); err != nil ||
+				(routeState != "unknown" && !(routeState == "dispatched" && abandoned)) {
+				return domain.NewError(domain.CodeInvalidState, "unknown route model attribution is unavailable")
+			}
+			if taskProjectID != "" {
+				if err := lockProjectByIDInTx(ctx, tx, taskProjectID); err != nil {
+					return err
+				}
+			}
+			if routeState == "dispatched" {
+				if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
+					return err
+				}
+				if err := markAbandonedRouteCallUnknown(ctx, tx, routeMessageID, command.OwnerID, taskProjectID, command.CallID); err != nil {
+					return err
+				}
+				state = "unknown"
+			}
+		}
 		if taskID != "" {
 			var observedOwner, observedProject, location string
 			if err := tx.QueryRow(ctx, `SELECT owner_id,COALESCE(project_id,''),execution_location FROM tasks
@@ -202,11 +244,18 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		}
 		var projectCall *modelUsageProjectCall
 		if taskProjectID != "" {
-			call, err := lockProjectModelCallForReconciliation(ctx, tx, taskProjectID, command, taskID, modelID, accountDigest)
-			if err != nil {
-				return err
+			var hasProjectCharge bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3)`,
+				taskProjectID, string(command.Source), command.CallID).Scan(&hasProjectCharge); err != nil {
+				return fmt.Errorf("check project model charge: %w", err)
 			}
-			projectCall = &call
+			if !personal || hasProjectCharge {
+				call, err := lockProjectModelCallForReconciliation(ctx, tx, taskProjectID, command, taskID, modelID, accountDigest)
+				if err != nil {
+					return err
+				}
+				projectCall = &call
+			}
 		}
 		if err := lockModelUsageAdminToken(ctx, tx, principal); err != nil {
 			return err
@@ -280,7 +329,7 @@ WHERE project_id=$1 AND source=$2 AND call_id=$3 AND status='unknown'`, taskProj
 		var accountTotalFits bool
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled'
  THEN input_tokens::numeric+output_tokens::numeric ELSE reserved_tokens::numeric END),0) <= 9223372036854775807
- FROM model_call_ledger WHERE owner_id=$1`, command.OwnerID).Scan(&accountTotalFits); err != nil {
+ FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, command.OwnerID).Scan(&accountTotalFits); err != nil {
 			return fmt.Errorf("check reconciled model usage total: %w", err)
 		}
 		if !accountTotalFits {
@@ -342,7 +391,7 @@ func lockProjectModelCallForReconciliation(ctx context.Context, tx pgx.Tx, proje
 	var provider, model string
 	var rateVersion, inputRate, outputRate int64
 	var projectDigest []byte
-	err := tx.QueryRow(ctx, `SELECT actor_id,task_id,model_id,status,currency,rate_provider,rate_model,rate_version,
+	err := tx.QueryRow(ctx, `SELECT actor_id,COALESCE(task_id,''),model_id,status,currency,rate_provider,rate_model,rate_version,
 input_micros_per_million,output_micros_per_million,reserved_input_tokens,reserved_output_tokens,reserved_micros,
 actual_input_tokens,actual_output_tokens,actual_micros,request_digest FROM project_budget_ledger
 WHERE project_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, projectID, string(command.Source), command.CallID).

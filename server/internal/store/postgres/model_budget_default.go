@@ -99,8 +99,11 @@ func loadModelBudgetDefaultInTx(ctx context.Context, tx pgx.Tx) (app.ModelBudget
 	if err != nil {
 		return app.ModelBudgetDefault{}, err
 	}
-	if !configured || value.TokenLimit <= 0 || value.MaxConcurrent < 1 || value.MaxConcurrent > 100 || value.Version < 1 {
-		return app.ModelBudgetDefault{}, domain.NewError(domain.CodeInvalidState, "default model budget must be configured before approving new accounts")
+	if !configured {
+		return app.ModelBudgetDefault{}, nil
+	}
+	if value.TokenLimit <= 0 || value.MaxConcurrent < 1 || value.MaxConcurrent > 100 || value.Version < 1 {
+		return app.ModelBudgetDefault{}, domain.NewError(domain.CodeInvalidState, "default model budget is invalid")
 	}
 	return value, nil
 }

@@ -19,8 +19,15 @@ import (
 
 type TaskService interface {
 	Submit(context.Context, identity.Principal, app.SubmitTaskCommand) (app.TaskSubmissionResult, error)
-	AppendMessage(context.Context, identity.Principal, string, app.AppendMessageCommand) (app.TaskSubmissionResult, error)
+	AcceptConversationMessage(context.Context, identity.Principal, string, app.AcceptConversationMessageCommand) (conversation.Message, bool, error)
+	InitializeConversationMessageUpload(context.Context, identity.Principal, string, app.InitializeConversationMessageUploadCommand) (app.ConversationMessageUpload, error)
+	PutConversationMessageChunk(context.Context, identity.Principal, string, string, string, string, int, []byte, string) error
+	GetConversationMessageUpload(context.Context, identity.Principal, string, string, string, string) (app.ConversationMessageUpload, error)
+	CommitConversationMessageUpload(context.Context, identity.Principal, string, string, string, string, string) (conversation.Message, error)
+	AssociateConversationMessageAttachment(context.Context, identity.Principal, string, string, string, string, string) error
+	RetryConversationMessageProcessing(context.Context, identity.Principal, string, string, string, string, string) error
 	List(context.Context, identity.Principal, app.TaskListRequest) (app.TaskPage, error)
+	ListConversationActiveTasks(context.Context, identity.Principal, string, string, app.PageRequest) (app.TaskPage, error)
 	Get(context.Context, identity.Principal, string) (app.TaskDetails, error)
 	RequestAction(context.Context, identity.Principal, string, task.Action, task.Status, string) (app.TaskActionResult, error)
 	RetryBatchItem(context.Context, identity.Principal, string, string, string) error
@@ -55,6 +62,8 @@ type taskSummaryResponse struct {
 	ExecutionLocation           string             `json:"execution_location"`
 	WorkspaceID                 string             `json:"workspace_id,omitempty"`
 	InputRevision               *int64             `json:"input_revision,omitempty"`
+	CurrentRevision             *int64             `json:"current_revision,omitempty"`
+	DesiredRevision             *int64             `json:"desired_revision,omitempty"`
 	WorkspaceCheckpointRevision *int64             `json:"workspace_checkpoint_revision,omitempty"`
 	ApplicationID               string             `json:"application_id,omitempty"`
 	ConversationID              string             `json:"conversation_id"`
@@ -62,6 +71,8 @@ type taskSummaryResponse struct {
 	Objective                   string             `json:"objective"`
 	Status                      task.Status        `json:"status"`
 	CurrentStep                 *string            `json:"current_step"`
+	StepCount                   int64              `json:"step_count"`
+	CompletedStepCount          int64              `json:"completed_step_count"`
 	Budget                      taskBudgetResponse `json:"budget"`
 	Usage                       taskUsageResponse  `json:"usage"`
 	CreatedAt                   time.Time          `json:"created_at"`
@@ -70,17 +81,20 @@ type taskSummaryResponse struct {
 
 type taskResponse struct {
 	taskSummaryResponse
-	EventSequence        int64                             `json:"event_sequence"`
-	Result               *string                           `json:"result"`
-	WaitingReason        *string                           `json:"waiting_reason"`
-	Steps                []taskStepResponse                `json:"steps"`
-	BatchItems           []taskBatchItemResponse           `json:"batch_items"`
-	Artifacts            []taskArtifactResponse            `json:"artifacts"`
-	PendingRequest       *taskPendingRequestResponse       `json:"pending_request"`
-	ClarificationRequest *taskClarificationRequestResponse `json:"clarification_request"`
-	StopRequest          *taskStopRequestResponse          `json:"stop_request"`
-	AssistantMessage     *taskAssistantMessageResponse     `json:"assistant_message"`
-	FinishedAt           *time.Time                        `json:"finished_at"`
+	EventSequence          int64                             `json:"event_sequence"`
+	Result                 *string                           `json:"result"`
+	CurrentRevisionStarted *bool                             `json:"current_revision_started,omitempty"`
+	ResultMessagePending   bool                              `json:"result_message_pending,omitempty"`
+	ResultMessagePublished bool                              `json:"result_message_published,omitempty"`
+	WaitingReason          *string                           `json:"waiting_reason"`
+	Steps                  []taskStepResponse                `json:"steps"`
+	BatchItems             []taskBatchItemResponse           `json:"batch_items"`
+	Artifacts              []taskArtifactResponse            `json:"artifacts"`
+	PendingRequest         *taskPendingRequestResponse       `json:"pending_request"`
+	ClarificationRequest   *taskClarificationRequestResponse `json:"clarification_request"`
+	StopRequest            *taskStopRequestResponse          `json:"stop_request"`
+	AssistantMessage       *taskAssistantMessageResponse     `json:"assistant_message"`
+	FinishedAt             *time.Time                        `json:"finished_at"`
 }
 
 type taskStopRequestResponse struct {
@@ -92,13 +106,16 @@ type taskStopRequestResponse struct {
 }
 
 type taskAssistantMessageResponse struct {
-	ID             string            `json:"id"`
-	ConversationID string            `json:"conversation_id"`
-	TaskID         string            `json:"task_id"`
-	Role           conversation.Role `json:"role"`
-	Content        string            `json:"content"`
-	Status         string            `json:"status"`
-	CreatedAt      time.Time         `json:"created_at"`
+	ID                  string            `json:"id"`
+	ConversationID      string            `json:"conversation_id"`
+	Sequence            int64             `json:"sequence"`
+	TaskID              string            `json:"task_id"`
+	TaskRevision        *int64            `json:"task_revision,omitempty"`
+	ResultEventSequence *int64            `json:"result_event_sequence,omitempty"`
+	Role                conversation.Role `json:"role"`
+	Content             string            `json:"content"`
+	Status              string            `json:"status"`
+	CreatedAt           time.Time         `json:"created_at"`
 }
 
 type taskActionResponse struct {
@@ -119,13 +136,14 @@ type taskWorkspaceViewDeletionResponse struct {
 }
 
 type taskPendingRequestResponse struct {
-	ID      string `json:"id"`
-	Version int64  `json:"version"`
-	Kind    string `json:"kind"`
-	Title   string `json:"title"`
-	Object  string `json:"object"`
-	Content string `json:"content"`
-	Impact  string `json:"impact"`
+	ID                      string `json:"id"`
+	Version                 int64  `json:"version"`
+	Kind                    string `json:"kind"`
+	Title                   string `json:"title"`
+	Object                  string `json:"object"`
+	Content                 string `json:"content"`
+	Impact                  string `json:"impact"`
+	MediaPreviewOperationID string `json:"media_preview_operation_id,omitempty"`
 }
 
 type taskClarificationRequestResponse struct {
@@ -617,19 +635,24 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 		(value.WorkspaceID == "") != (value.InputRevision == nil) ||
 		(value.WorkspaceID == "") != (value.WorkspaceCheckpointRevision == nil) ||
 		(value.InputRevision != nil && *value.InputRevision < 0) ||
+		(value.CurrentRevision == nil) != (value.DesiredRevision == nil) ||
+		(value.CurrentRevision != nil && (*value.CurrentRevision < 0 || *value.DesiredRevision < *value.CurrentRevision)) ||
 		(value.InputRevision != nil && value.WorkspaceCheckpointRevision != nil && *value.WorkspaceCheckpointRevision < *value.InputRevision) ||
 		(value.ExecutionLocation != "server" && value.ExecutionLocation != "legacy") ||
 		!domain.ValidConversationID(value.ConversationID) || strings.TrimSpace(value.ModelID) == "" ||
 		(value.ApplicationID != "" && !app.ValidHostApplicationID(value.ApplicationID)) || !validTaskStatusResponse(value.Status) ||
+		value.StepCount < 0 || value.CompletedStepCount < 0 || value.CompletedStepCount > value.StepCount ||
 		value.Budget.Validate() != nil || value.Usage.ActiveSeconds < 0 || value.Usage.ToolCalls < 0 || (value.Usage.ModelTokens != nil && *value.Usage.ModelTokens < 0) ||
 		value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() {
 		return taskSummaryResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	return taskSummaryResponse{
 		ID: value.ID, OwnerID: value.OwnerID, InitiatorID: initiatorID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
-		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
+		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, CurrentRevision: value.CurrentRevision,
+		DesiredRevision: value.DesiredRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
 		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, CurrentStep: stringPointer(value.CurrentStep),
+		StepCount: value.StepCount, CompletedStepCount: value.CompletedStepCount,
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,
 		}, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
@@ -637,16 +660,19 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 }
 
 func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
-	summary, err := toTaskSummaryResponse(value.Task)
+	taskSummary := value.Task
+	taskSummary.StepCount, taskSummary.CompletedStepCount = task.StepCounts(value.Steps)
+	summary, err := toTaskSummaryResponse(taskSummary)
 	if err != nil {
 		return taskResponse{}, err
 	}
-	if value.Task.EventSequence < 0 {
+	if value.Task.EventSequence < 0 || (value.CurrentRevisionStarted != nil && value.Task.CurrentRevision == nil) {
 		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	response := taskResponse{
 		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
-		Result: stringPointer(value.Task.Result), WaitingReason: stringPointer(value.Task.WaitingReason),
+		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
+		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
 		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt,
 	}
@@ -654,9 +680,11 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		message := assistant.Message
 		if !domain.ValidMessageID(message.ID) || !domain.ValidConversationID(message.ConversationID) ||
 			message.ConversationID != value.Task.ConversationID || message.TaskID != value.Task.ID ||
-			message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
+			message.Sequence < 1 || message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
 			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) ||
-			strings.ContainsRune(message.Content, '\x00') || message.CreatedAt.IsZero() {
+			strings.ContainsRune(message.Content, '\x00') || message.CreatedAt.IsZero() ||
+			(assistant.TaskRevision != nil && *assistant.TaskRevision < 0) ||
+			(assistant.ResultEventSequence != nil && (*assistant.ResultEventSequence < 1 || assistant.TaskRevision == nil)) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		status := string(assistant.Status)
@@ -666,18 +694,21 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.AssistantMessage = &taskAssistantMessageResponse{
-			ID: message.ID, ConversationID: message.ConversationID, TaskID: message.TaskID,
+			ID: message.ID, ConversationID: message.ConversationID, Sequence: message.Sequence, TaskID: message.TaskID,
+			TaskRevision: assistant.TaskRevision, ResultEventSequence: assistant.ResultEventSequence,
 			Role: message.Role, Content: message.Content, Status: status, CreatedAt: message.CreatedAt,
 		}
 	}
 	if pending := value.PendingRequest; pending != nil && pending.Status == task.PendingRequestPending {
 		if value.Task.Status != task.StatusWaitingUser || !domain.ValidPendingRequestID(pending.ID) || pending.TaskID != value.Task.ID || pending.Version < 1 || pending.Kind != "approval" ||
+			(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
 			!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.PendingRequest = &taskPendingRequestResponse{
 			ID: pending.ID, Version: pending.Version, Kind: pending.Kind, Title: pending.Title,
 			Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
+			MediaPreviewOperationID: pending.MediaPreviewOperationID,
 		}
 	}
 	for _, clarification := range value.ClarificationRequests {
@@ -814,7 +845,7 @@ func validStepStatus(value task.StepStatus) bool {
 
 func validStepKind(value string) bool {
 	switch value {
-	case "plan", "model", "tool", "wait", "clarification", "budget", "verification", "verify", "batch_item", "batch_result", "subagent", "result":
+	case "plan", "model", "tool", "wait", "clarification", "budget", "verification", "verify", "batch_item", "batch_result", "subagent", "progress", "result":
 		return true
 	default:
 		return false

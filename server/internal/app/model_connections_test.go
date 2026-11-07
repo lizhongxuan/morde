@@ -12,7 +12,9 @@ import (
 )
 
 type modelConnectionStoreStub struct {
-	values map[string]ModelConnectionRecord
+	values         map[string]ModelConnectionRecord
+	defaultModelID string
+	defaultVersion int64
 }
 
 func (s *modelConnectionStoreStub) CreateModelConnection(_ context.Context, value ModelConnectionRecord) (ModelConnectionRecord, error) {
@@ -62,13 +64,37 @@ func (s *modelConnectionStoreStub) DeleteModelConnection(_ context.Context, id s
 	return nil
 }
 
+func (s *modelConnectionStoreStub) GetAdminModelDefault(context.Context) (AdminModelDefaultRecord, error) {
+	return AdminModelDefaultRecord{ModelID: s.defaultModelID, Version: s.defaultVersion, UpdatedAt: time.Now().UTC()}, nil
+}
+
+func (s *modelConnectionStoreStub) SetAdminModelDefault(_ context.Context, _ identity.Principal, expectedVersion int64, modelID, _ string) (AdminModelDefaultRecord, error) {
+	if expectedVersion != s.defaultVersion {
+		return AdminModelDefaultRecord{}, domain.NewError(domain.CodeConflict, "default model version changed")
+	}
+	if modelID != "" {
+		record, ok := s.values[modelID]
+		if !ok || record.OwnerID != "" {
+			return AdminModelDefaultRecord{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+		}
+		if record.CheckedAt == nil || !record.Capabilities.Text {
+			return AdminModelDefaultRecord{}, domain.NewError(domain.CodeUnsupported, "model is not an available default")
+		}
+	}
+	s.defaultModelID = modelID
+	s.defaultVersion++
+	return AdminModelDefaultRecord{ModelID: s.defaultModelID, Version: s.defaultVersion, UpdatedAt: time.Now().UTC()}, nil
+}
+
 type modelClientStub struct {
-	capabilities ModelCapabilities
-	endpoint     ModelEndpoint
-	err          error
+	capabilities  ModelCapabilities
+	endpoint      ModelEndpoint
+	err           error
+	completeCalls int
 }
 
 func (c *modelClientStub) Complete(_ context.Context, request ModelRequest) (ModelResponse, error) {
+	c.completeCalls++
 	c.endpoint = request.Endpoint
 	if c.err != nil {
 		return ModelResponse{}, c.err
@@ -85,8 +111,21 @@ func (c *modelClientStub) Check(_ context.Context, endpoint ModelEndpoint) (Mode
 	return c.capabilities, c.err
 }
 
-func modelConnectionTestService(t *testing.T, store *modelConnectionStoreStub, client *modelClientStub) *ModelConnectionService {
+func modelConnectionTestService(t *testing.T, store *modelConnectionStoreStub, client ModelClient) *ModelConnectionService {
 	t.Helper()
+	if store.values == nil {
+		store.values = make(map[string]ModelConnectionRecord)
+	}
+	if store.defaultModelID == "" {
+		checkedAt := time.Now().UTC()
+		store.defaultModelID = "pzzzzzzz"
+		store.defaultVersion = 1
+		store.values[store.defaultModelID] = ModelConnectionRecord{
+			ID: store.defaultModelID, Name: "configured default", BaseURL: "https://api.openai.com/v1", ModelName: "default-model",
+			APIKeyCipher: []byte("test-ciphertext"), Capabilities: ModelCapabilities{Text: true, Tools: true},
+			CheckedAt: &checkedAt, CreatedAt: checkedAt, UpdatedAt: checkedAt,
+		}
+	}
 	sealer, err := NewSealer(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -98,13 +137,158 @@ func modelConnectionTestService(t *testing.T, store *modelConnectionStoreStub, c
 	return service
 }
 
-func checkModelForTest(t *testing.T, service *ModelConnectionService, client *modelClientStub, principal identity.Principal, id string) (ModelCapabilities, error) {
+func checkModelForTest(t *testing.T, service *ModelConnectionService, client ModelClient, principal identity.Principal, id string) (ModelCapabilities, error) {
 	t.Helper()
 	gateway, err := NewModelGatewayService(&modelGatewayStoreTest{}, service, client)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return gateway.CheckModel(context.Background(), principal, id, "probe-key-0001")
+}
+
+type modelMediaCapabilityClientStub struct {
+	*modelClientStub
+	report          ModelMediaGenerationCapabilityReport
+	checked         string
+	mediaCheckCalls int
+	mediaCheckErr   error
+}
+
+func (c *modelMediaCapabilityClientStub) CheckMediaGenerationCapability(_ context.Context, endpoint ModelEndpoint, capability string) (ModelMediaGenerationCapabilityReport, error) {
+	c.endpoint = endpoint
+	c.checked = capability
+	c.mediaCheckCalls++
+	return c.report, c.mediaCheckErr
+}
+
+type modelConnectionStoreDropMediaStub struct {
+	*modelConnectionStoreStub
+}
+
+func (s *modelConnectionStoreDropMediaStub) UpdateModelConnection(ctx context.Context, value ModelConnectionRecord) (ModelConnectionRecord, error) {
+	value.Capabilities.MediaGeneration = ModelMediaGenerationCapabilities{}
+	return s.modelConnectionStoreStub.UpdateModelConnection(ctx, value)
+}
+
+func TestModelMediaCapabilityCheckIsExplicitAndPersistsThroughModelConnection(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelMediaCapabilityClientStub{
+		modelClientStub: &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}},
+		report: ModelMediaGenerationCapabilityReport{Supported: true, ExactTokenReservation: true, ActualTokenUsage: true,
+			IdempotentOperation: true, DurableOperationRecovery: true, ConfirmedCancellation: true},
+	}
+	models := modelConnectionTestService(t, store, client)
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
+	created, err := models.Create(context.Background(), admin, ModelConnectionCommand{
+		Name: "media", BaseURL: "https://api.openai.com/v1", ModelName: "media-test", APIKey: "secret-value", Shared: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := NewModelGatewayService(&modelGatewayStoreTest{}, models, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, probe := range []struct{ capability, key string }{
+		{capability: "image_generation", key: "probe-media-0001"},
+		{capability: "video_generation", key: "probe-media-0002"},
+		{capability: "speech_generation", key: "probe-media-0003"},
+	} {
+		capabilities, err := gateway.CheckModelCapability(context.Background(), admin, created.ID, probe.key, probe.capability)
+		if err != nil || client.checked != probe.capability || client.mediaCheckCalls != i+1 || client.completeCalls != 0 {
+			t.Fatalf("explicit media probe %q = %+v, checked=%q calls=%d/%d err=%v", probe.capability, capabilities, client.checked, client.mediaCheckCalls, client.completeCalls, err)
+		}
+		resolved, err := models.ResolveMediaGenerationEndpoint(context.Background(), admin.UserID, created.ID, probe.capability)
+		if err != nil || resolved.Endpoint.APIKey != "secret-value" || resolved.Endpoint.ModelID != "media-test" {
+			t.Fatalf("ResolveMediaGenerationEndpoint(%q) = %+v, %v", probe.capability, resolved, err)
+		}
+	}
+
+	capabilities, err := gateway.CheckModelCapability(context.Background(), admin, created.ID, "probe-text-0001", "all")
+	if err != nil || !capabilities.Text || !capabilities.Tools || !capabilities.Vision || !capabilities.MediaGeneration.ImageGeneration ||
+		!capabilities.MediaGeneration.VideoGeneration || !capabilities.MediaGeneration.SpeechGeneration || client.mediaCheckCalls != 3 || client.completeCalls != 1 {
+		t.Fatalf("all probe altered media state or probed media: %+v, capability calls=%d, complete calls=%d, err=%v", capabilities, client.mediaCheckCalls, client.completeCalls, err)
+	}
+}
+
+func TestModelMediaCapabilityCheckFailsClosedWithoutProviderAndDurableStorage(t *testing.T) {
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
+	fullReport := ModelMediaGenerationCapabilityReport{Supported: true, ExactTokenReservation: true, ActualTokenUsage: true,
+		IdempotentOperation: true, DurableOperationRecovery: true, ConfirmedCancellation: true}
+	for _, test := range []struct {
+		name      string
+		report    ModelMediaGenerationCapabilityReport
+		dropMedia bool
+	}{
+		{name: "provider has no exact reservation", report: ModelMediaGenerationCapabilityReport{Supported: true, ActualTokenUsage: true, IdempotentOperation: true, DurableOperationRecovery: true, ConfirmedCancellation: true}},
+		{name: "provider cannot reconcile unknown operations", report: ModelMediaGenerationCapabilityReport{Supported: true, ExactTokenReservation: true, ActualTokenUsage: true, IdempotentOperation: true, ConfirmedCancellation: true}},
+		{name: "storage drops media capability", report: fullReport, dropMedia: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := &modelClientStub{}
+			client := &modelMediaCapabilityClientStub{modelClientStub: base, report: test.report}
+			baseStore := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+			defaultCheckedAt := time.Now().UTC()
+			baseStore.defaultModelID, baseStore.defaultVersion = "pzzzzzzz", 1
+			baseStore.values[baseStore.defaultModelID] = ModelConnectionRecord{
+				ID: baseStore.defaultModelID, Name: "default", BaseURL: "https://api.openai.com/v1", ModelName: "default-model",
+				APIKeyCipher: []byte("test-ciphertext"), Capabilities: ModelCapabilities{Text: true, Tools: true},
+				CheckedAt: &defaultCheckedAt,
+			}
+			var store ModelConnectionStore = baseStore
+			if test.dropMedia {
+				store = &modelConnectionStoreDropMediaStub{modelConnectionStoreStub: baseStore}
+			}
+			sealer, err := NewSealer(make([]byte, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			models, err := NewModelConnectionService(store, sealer, client, []string{"api.openai.com"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := models.Create(context.Background(), admin, ModelConnectionCommand{
+				Name: "media", BaseURL: "https://api.openai.com/v1", ModelName: "media-test", APIKey: "secret-value", Shared: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gateway, err := NewModelGatewayService(&modelGatewayStoreTest{}, models, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = gateway.CheckModelCapability(context.Background(), admin, created.ID, "probe-media-0001", "image_generation")
+			if domain.CodeOf(err) != domain.CodeUnsupported || client.completeCalls != 0 {
+				t.Fatalf("media probe = %v, regular provider calls=%d", err, client.completeCalls)
+			}
+			if test.dropMedia {
+				if client.mediaCheckCalls != 1 {
+					t.Fatalf("media provider check calls = %d", client.mediaCheckCalls)
+				}
+				if _, err := models.ResolveMediaGenerationEndpoint(context.Background(), admin.UserID, created.ID, "image_generation"); domain.CodeOf(err) != domain.CodeNotFound {
+					t.Fatalf("connection whose store dropped media capability resolved: %v", err)
+				}
+			} else if client.mediaCheckCalls != 1 || baseStore.values[created.ID].CheckedAt != nil {
+				t.Fatalf("incomplete provider was marked checked: calls=%d record=%+v", client.mediaCheckCalls, baseStore.values[created.ID])
+			}
+		})
+	}
+	base := &modelClientStub{}
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	models := modelConnectionTestService(t, store, base)
+	created, err := models.Create(context.Background(), admin, ModelConnectionCommand{
+		Name: "legacy", BaseURL: "https://api.openai.com/v1", ModelName: "text-test", APIKey: "secret-value", Shared: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := NewModelGatewayService(&modelGatewayStoreTest{}, models, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.CheckModelCapability(context.Background(), admin, created.ID, "probe-media-0002", "speech_generation"); domain.CodeOf(err) != domain.CodeUnsupported || base.completeCalls != 0 {
+		t.Fatalf("provider without metadata-only media contract did not fail closed: calls=%d err=%v", base.completeCalls, err)
+	}
 }
 
 func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
@@ -126,8 +310,8 @@ func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
 		t.Fatal("API key was stored in plaintext or connection was marked checked before probing")
 	}
 	configured, err := service.IsConfiguredModel(context.Background(), principal.UserID, created.ID)
-	if err != nil || configured {
-		t.Fatalf("unverified model configured = %t, err=%v", configured, err)
+	if err != nil || !configured {
+		t.Fatalf("saved but unchecked model configured = %t, err=%v", configured, err)
 	}
 	capabilities, err := checkModelForTest(t, service, client, principal, created.ID)
 	if err != nil || !capabilities.Text || !capabilities.Tools || !capabilities.Vision {
@@ -146,10 +330,181 @@ func TestModelConnectionCreateCheckAndResolveKeepsSecretPrivate(t *testing.T) {
 	}
 }
 
+func TestUserModelConnectionIsPrivateEncryptedAndRunsCloudTasks(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
+	service := modelConnectionTestService(t, store, client)
+	store.defaultModelID = ""
+	owner := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient,
+		TokenID: "t1234567", ClientInstallationID: "i1234567"}
+	created, err := service.Create(context.Background(), owner, ModelConnectionCommand{
+		Name: "my model", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Shared || !created.HasAPIKey || store.values[created.ID].OwnerID != owner.UserID ||
+		string(store.values[created.ID].APIKeyCipher) == "secret-value" {
+		t.Fatalf("user model was shared, plaintext, or not owner-bound: view=%+v stored=%+v", created, store.values[created.ID])
+	}
+	if _, err := service.Create(context.Background(), owner, ModelConnectionCommand{
+		Name: "shared attempt", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
+	}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("user shared model creation = %v", err)
+	}
+
+	items, err := service.List(context.Background(), owner)
+	if err != nil || len(items) != 2 || !items[0].Shared || items[1].ID != created.ID || items[1].Shared {
+		t.Fatalf("owner list = %+v, %v", items, err)
+	}
+	other := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindClient,
+		TokenID: "t7654321", ClientInstallationID: "i7654321"}
+	if _, err := service.Get(context.Background(), other, created.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account read private model = %v", err)
+	}
+	if err := service.Delete(context.Background(), other, created.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account deleted private model = %v", err)
+	}
+
+	capabilities, err := checkModelForTest(t, service, client, owner, created.ID)
+	if err != nil || !capabilities.Text || !capabilities.Tools {
+		t.Fatalf("client model probe = %+v, %v", capabilities, err)
+	}
+	configured, err := service.IsConfiguredModel(context.Background(), owner.UserID, created.ID)
+	if err != nil || !configured {
+		t.Fatalf("owner configured model = %t, %v", configured, err)
+	}
+	if configured, err := service.IsConfiguredModel(context.Background(), other.UserID, created.ID); err != nil || configured {
+		t.Fatalf("other account configured model = %t, %v", configured, err)
+	}
+	endpoint, err := service.ResolveGatewayEndpoint(context.Background(), owner.UserID, created.ID, true, false)
+	if err != nil || endpoint.Endpoint.APIKey != "secret-value" || endpoint.Endpoint.ModelID != "gpt-test" {
+		t.Fatalf("owner gateway endpoint = %+v, %v", endpoint, err)
+	}
+	if _, err := service.ResolveGatewayEndpoint(context.Background(), other.UserID, created.ID, true, false); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account resolved private model = %v", err)
+	}
+
+	updated, err := service.Update(context.Background(), owner, created.ID, ModelConnectionCommand{
+		Name: "renamed", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test",
+	})
+	if err != nil || updated.Name != "renamed" || updated.Shared {
+		t.Fatalf("owner update = %+v, %v", updated, err)
+	}
+	if err := service.Delete(context.Background(), owner, created.ID); err != nil {
+		t.Fatalf("owner delete = %v", err)
+	}
+}
+
+func TestAdminModelDefaultIsVersionedAndOptional(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	service := modelConnectionTestService(t, store, &modelClientStub{})
+	defaults, err := NewAdminModelDefaultService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t7654321"}
+	user := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient,
+		TokenID: "t1234567", ClientInstallationID: "i1234567"}
+	initial, err := defaults.Get(context.Background(), admin)
+	if err != nil || !initial.Configured || initial.ModelID != store.defaultModelID || initial.Version != store.defaultVersion {
+		t.Fatalf("admin default get = %+v, %v", initial, err)
+	}
+	if _, err := defaults.Get(context.Background(), user); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("client read admin default = %v", err)
+	}
+	availability, err := defaults.Available(context.Background())
+	if err != nil || !availability.Configured || availability.ModelID != initial.ModelID {
+		t.Fatalf("available model state = %+v, %v", availability, err)
+	}
+	cleared, err := defaults.Update(context.Background(), admin, initial.Version, "", "192.0.2.1")
+	if err != nil || cleared.Configured || cleared.ModelID != "" || cleared.Version != initial.Version+1 {
+		t.Fatalf("clear default = %+v, %v", cleared, err)
+	}
+	availability, err = defaults.Available(context.Background())
+	if err != nil || availability.Configured || availability.ModelID != "" {
+		t.Fatalf("cleared availability = %+v, %v", availability, err)
+	}
+	configured, err := service.IsConfiguredModel(context.Background(), user.UserID, initial.ModelID)
+	if err != nil || !configured {
+		t.Fatalf("checked shared model unavailable after clearing the default: configured=%t err=%v", configured, err)
+	}
+	if _, err := defaults.Update(context.Background(), admin, initial.Version, initial.ModelID, "192.0.2.1"); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("stale default update = %v", err)
+	}
+}
+
+func TestAdminDefaultAllowsCheckedTextOnlyModel(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	models := modelConnectionTestService(t, store, &modelClientStub{})
+	defaults, err := NewAdminModelDefaultService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t7654321"}
+	shared, err := models.Create(context.Background(), admin, ModelConnectionCommand{
+		Name: "text only", BaseURL: "https://api.openai.com/v1", ModelName: "text-model", APIKey: "test-key", Shared: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaults.Update(context.Background(), admin, store.defaultVersion, shared.ID, "192.0.2.1"); domain.CodeOf(err) != domain.CodeUnsupported {
+		t.Fatalf("unchecked model accepted as default: %v", err)
+	}
+	checked := time.Now().UTC()
+	record := store.values[shared.ID]
+	record.Capabilities, record.CheckedAt = ModelCapabilities{Text: true}, &checked
+	store.values[shared.ID] = record
+	updated, err := defaults.Update(context.Background(), admin, store.defaultVersion, shared.ID, "192.0.2.1")
+	if err != nil || !updated.Configured || updated.ModelID != shared.ID {
+		t.Fatalf("text-only model default = %+v, %v", updated, err)
+	}
+	availability, err := defaults.Available(context.Background())
+	if err != nil || !availability.Configured || availability.ModelID != shared.ID {
+		t.Fatalf("text-only default availability = %+v, %v", availability, err)
+	}
+}
+
+func TestCloudModelGatewayDispatchesSelectedPersonalModelWithoutAdminDefault(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "hello", Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}}
+	service := modelConnectionTestService(t, store, client)
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient,
+		TokenID: "t1234567", ClientInstallationID: "i1234567"}
+	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "candidate", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkedAt := time.Now().UTC()
+	record := store.values[created.ID]
+	record.Capabilities, record.CheckedAt = ModelCapabilities{Text: true, Tools: true}, &checkedAt
+	store.values[created.ID] = record
+	store.defaultModelID, store.defaultVersion = "", 0
+
+	configured, err := service.IsConfiguredModel(context.Background(), principal.UserID, created.ID)
+	if err != nil || !configured {
+		t.Fatalf("model without platform default configured=%t, err=%v", configured, err)
+	}
+	ledger := &modelGatewayStoreTest{}
+	gateway, err := NewModelGatewayService(ledger, service, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := gateway.Complete(context.Background(), ModelCall{
+		Source: ModelCallClient, Principal: principal, ModelID: created.ID, CallID: "no-default-model-01",
+		Request: ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10},
+	})
+	if err != nil || response.Text != "hello" || ledger.reservation.CallID != "no-default-model-01" || client.calls != 1 || client.request.Endpoint.APIKey != "secret-value" {
+		t.Fatalf("model without platform default failed to dispatch: reservation=%+v calls=%d err=%v", ledger.reservation, client.calls, err)
+	}
+}
+
 func TestPlatformConnectionUsesMeteredModelGateway(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	service := modelConnectionTestService(t, store, &modelClientStub{})
-	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession}
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), admin, ModelConnectionCommand{
 		Name: "platform", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "platform-secret", Shared: true,
 	})
@@ -203,26 +558,119 @@ func TestCheckedTextToolModelWithoutVisionCanRunNonVisualTasks(t *testing.T) {
 	}
 }
 
+func TestConfiguredTextOnlyModelSeparatesConfigurationFromCapability(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "hello", StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}}
+	service := modelConnectionTestService(t, store, client)
+	owner := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindClient,
+		TokenID: "t1234567", ClientInstallationID: "i1234567"}
+	created, err := service.Create(context.Background(), owner, ModelConnectionCommand{
+		Name: "text only", BaseURL: "https://api.openai.com/v1", ModelName: "text-model", APIKey: "test-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured, err := service.IsConfiguredModel(context.Background(), owner.UserID, created.ID); err != nil || !configured {
+		t.Fatalf("saved but unchecked model configured = %t, %v", configured, err)
+	}
+	if configured, err := service.IsConfiguredModel(context.Background(), "u7654321", created.ID); err != nil || configured {
+		t.Fatalf("other account can use private model = %t, %v", configured, err)
+	}
+	if _, err := service.ResolveGatewayEndpoint(context.Background(), owner.UserID, created.ID, false, false); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("unchecked model resolved = %v", err)
+	}
+
+	checked := time.Now().UTC()
+	record := store.values[created.ID]
+	record.CheckedAt = &checked
+	record.Capabilities = ModelCapabilities{Text: true}
+	store.values[created.ID] = record
+	if endpoint, err := service.ResolveEndpoint(context.Background(), owner.UserID, created.ID); err != nil || endpoint.ModelID != "text-model" {
+		t.Fatalf("text-only model endpoint = %+v, %v", endpoint, err)
+	}
+	if _, err := service.ResolveGatewayEndpoint(context.Background(), owner.UserID, created.ID, true, false); domain.CodeOf(err) != domain.CodeUnsupported {
+		t.Fatalf("tool request to text-only model = %v", err)
+	}
+	if _, err := service.ResolveGatewayEndpoint(context.Background(), owner.UserID, created.ID, false, true); domain.CodeOf(err) != domain.CodeUnsupported {
+		t.Fatalf("image request to text-only model = %v", err)
+	}
+
+	ledger := &modelGatewayStoreTest{}
+	gateway, err := NewModelGatewayService(ledger, service, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := gateway.Complete(context.Background(), ModelCall{
+		Source: ModelCallClient, Principal: owner, ModelID: created.ID, CallID: "text-model-test-001",
+		Request: ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10},
+	})
+	if err != nil || response.Text != "hello" || client.calls != 1 || ledger.reservation.NeedsTools {
+		t.Fatalf("text-only gateway call: response=%+v calls=%d tools=%t err=%v", response, client.calls, ledger.reservation.NeedsTools, err)
+	}
+	record.APIKeyCipher = nil
+	store.values[created.ID] = record
+	if configured, err := service.IsConfiguredModel(context.Background(), owner.UserID, created.ID); err != nil || configured {
+		t.Fatalf("model with no saved credential configured = %t, %v", configured, err)
+	}
+}
+
+func TestModelConfigurationStatusUsesOnlyAuthorizedConnections(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	client := &modelClientStub{err: errors.New("provider unavailable")}
+	service := modelConnectionTestService(t, store, client)
+	delete(store.values, store.defaultModelID)
+	owner := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	other := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t7654321"}
+	personal, err := service.Create(context.Background(), owner, ModelConnectionCommand{
+		Name: "private", BaseURL: "https://api.openai.com/v1", ModelName: "personal-model", APIKey: "test-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkModelForTest(t, service, client, owner, personal.ID); err == nil {
+		t.Fatal("expected the provider check to fail")
+	}
+	ownerViews, err := service.List(context.Background(), owner)
+	if err != nil || ModelConnectionsConfigurationStatus(ownerViews) != ModelConfigurationConfigured {
+		t.Fatalf("owner configuration after failed probe = %+v, %v", ownerViews, err)
+	}
+	otherViews, err := service.List(context.Background(), other)
+	if err != nil || ModelConnectionsConfigurationStatus(otherViews) != ModelConfigurationNotConfigured {
+		t.Fatalf("other account sees private configuration = %+v, %v", otherViews, err)
+	}
+	if _, err := service.Create(context.Background(), other, ModelConnectionCommand{
+		Name: "shared", BaseURL: "https://api.openai.com/v1", ModelName: "shared-model", APIKey: "test-key", Shared: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	otherViews, err = service.List(context.Background(), other)
+	if err != nil || ModelConnectionsConfigurationStatus(otherViews) != ModelConfigurationConfigured {
+		t.Fatalf("shared configuration unavailable = %+v, %v", otherViews, err)
+	}
+}
+
 func TestModelConnectionScopeSeparatesPersonalAndSharedManagement(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
 	client := &modelClientStub{capabilities: ModelCapabilities{Text: true, Tools: true, Vision: true}}
 	service := modelConnectionTestService(t, store, client)
-	user := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession}
-	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession}
+	user := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	admin := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t7654321"}
 	if _, err := service.Create(context.Background(), user, ModelConnectionCommand{
 		Name: "shared", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
 	}); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("user shared create error = %v", err)
 	}
-	if _, err := service.Create(context.Background(), user, ModelConnectionCommand{
+	personal, err := service.Create(context.Background(), user, ModelConnectionCommand{
 		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
-	}); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("user personal create error = %v", err)
+	})
+	if err != nil || personal.Shared || store.values[personal.ID].OwnerID != user.UserID {
+		t.Fatalf("user personal create = %+v, stored=%+v, err=%v", personal, store.values[personal.ID], err)
 	}
-	if _, err := service.Create(context.Background(), admin, ModelConnectionCommand{
+	adminPersonal, err := service.Create(context.Background(), admin, ModelConnectionCommand{
 		Name: "personal", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value",
-	}); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("admin personal create error = %v", err)
+	})
+	if err != nil || adminPersonal.Shared || store.values[adminPersonal.ID].OwnerID != admin.UserID {
+		t.Fatalf("admin personal create = %+v, err=%v", adminPersonal, err)
 	}
 	shared, err := service.Create(context.Background(), admin, ModelConnectionCommand{
 		Name: "shared", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test", APIKey: "secret-value", Shared: true,
@@ -231,7 +679,7 @@ func TestModelConnectionScopeSeparatesPersonalAndSharedManagement(t *testing.T) 
 		t.Fatalf("admin shared create = %+v, %v", shared, err)
 	}
 	list, err := service.List(context.Background(), user)
-	if err != nil || len(list) != 1 || list[0].ID != shared.ID || list[0].HasAPIKey != true {
+	if err != nil || len(list) != 3 || !list[0].Shared || !list[1].Shared || list[2].ID != personal.ID || list[2].Shared || !list[0].HasAPIKey {
 		t.Fatalf("shared model visibility = %+v, %v", list, err)
 	}
 	if _, err := service.Update(context.Background(), user, shared.ID, ModelConnectionCommand{
@@ -247,12 +695,12 @@ func TestModelConnectionScopeSeparatesPersonalAndSharedManagement(t *testing.T) 
 	if _, err := service.ResolveEndpoint(context.Background(), user.UserID, shared.ID); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("unchecked shared connection resolve error = %v", err)
 	}
-	if err := validateModelPrincipal(identity.Principal{UserID: user.UserID, Role: user.Role, Kind: identity.KindAPIKey}); domain.CodeOf(err) != domain.CodeForbidden {
+	if err := validateModelAccountPrincipal(identity.Principal{UserID: user.UserID, Role: user.Role, Kind: identity.KindAPIKey}); domain.CodeOf(err) != domain.CodeForbidden {
 		t.Fatalf("API key was allowed to manage model connections: %v", err)
 	}
 }
 
-func TestLegacyPersonalModelConnectionsRemainStoredButCannotBeUsed(t *testing.T) {
+func TestLegacyPersonalModelConnectionsRemainPrivate(t *testing.T) {
 	checkedAt := time.Now().UTC()
 	legacy := ModelConnectionRecord{
 		ID: "p1234567", OwnerID: "u1234567", Name: "legacy", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-legacy",
@@ -264,49 +712,15 @@ func TestLegacyPersonalModelConnectionsRemainStoredButCannotBeUsed(t *testing.T)
 	service := modelConnectionTestService(t, store, client)
 	user := identity.Principal{UserID: legacy.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 
-	if items, err := service.List(context.Background(), user); err != nil || len(items) != 0 {
+	if items, err := service.List(context.Background(), user); err != nil || len(items) != 2 || !items[0].Shared || items[1].ID != legacy.ID || items[1].Shared {
 		t.Fatalf("legacy personal list = %+v, %v", items, err)
 	}
-	if _, err := service.Get(context.Background(), user, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy personal get error = %v", err)
+	other := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t7654321"}
+	if _, err := service.Get(context.Background(), other, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account read legacy personal model = %v", err)
 	}
-	if _, err := service.Update(context.Background(), user, legacy.ID, ModelConnectionCommand{}); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy personal update error = %v", err)
-	}
-	if err := service.Delete(context.Background(), user, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy personal delete error = %v", err)
-	}
-	if configured, err := service.IsConfiguredModel(context.Background(), user.UserID, legacy.ID); err != nil || configured {
-		t.Fatalf("legacy personal configured = %t, %v", configured, err)
-	}
-	if _, err := service.ResolveEndpoint(context.Background(), user.UserID, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy direct endpoint error = %v", err)
-	}
-	if _, err := service.ResolveGatewayEndpoint(context.Background(), user.UserID, legacy.ID, false, false); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy gateway endpoint error = %v", err)
-	}
-	if _, err := service.ResolveProbeEndpoint(context.Background(), user, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy probe endpoint error = %v", err)
-	}
-	if _, err := service.SaveProbeCapabilities(context.Background(), user, legacy.ID, checkedAt, ModelCapabilities{}); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("legacy probe save error = %v", err)
-	}
-	ledger := &modelGatewayStoreTest{}
-	gateway, err := NewModelGatewayService(ledger, service, client)
-	if err != nil {
-		t.Fatal(err)
-	}
-	clientPrincipal := identity.Principal{UserID: user.UserID, Role: user.Role, Kind: identity.KindClient, TokenID: "t1234567", ClientInstallationID: "i1234567"}
-	if _, err := gateway.Complete(context.Background(), ModelCall{
-		Source: ModelCallClient, Principal: clientPrincipal, ModelID: legacy.ID, CallID: "legacy-model-01",
-		Request: ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10},
-	}); domain.CodeOf(err) != domain.CodeNotFound || ledger.reservation.CallID != "" {
-		t.Fatalf("legacy client model call reached ledger: reservation=%+v err=%v", ledger.reservation, err)
-	}
-	stored, exists := store.values[legacy.ID]
-	if string(client.endpoint.APIKey) != "" || !exists || stored.OwnerID != legacy.OwnerID ||
-		string(stored.APIKeyCipher) != string(legacy.APIKeyCipher) || stored.UpdatedAt != legacy.UpdatedAt {
-		t.Fatal("legacy personal model was used or its stored connection changed")
+	if _, err := service.ResolveProbeEndpoint(context.Background(), other, legacy.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account probed legacy personal model = %v", err)
 	}
 }
 
@@ -357,7 +771,7 @@ func TestModelConnectionRejectsSingleLabelAllowlist(t *testing.T) {
 
 func TestModelConnectionCheckClassifiesProviderErrorWithoutSecrets(t *testing.T) {
 	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
-	client := &modelClientStub{err: &ModelClientError{Kind: ModelErrorAuthentication}}
+	client := &modelClientStub{err: &ModelClientError{Kind: ModelErrorInvalidRequest, Stage: "provider_status", ProviderCode: "unsupported_parameter"}}
 	service := modelConnectionTestService(t, store, client)
 	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
 	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
@@ -368,7 +782,8 @@ func TestModelConnectionCheckClassifiesProviderErrorWithoutSecrets(t *testing.T)
 	}
 	_, err = checkModelForTest(t, service, client, principal, created.ID)
 	var appErr *domain.Error
-	if !errors.As(err, &appErr) || appErr.Code != domain.CodeUpstreamError || appErr.Details["reason"] != string(ModelErrorAuthentication) || strings.Contains(err.Error(), "secret-value") {
+	if !errors.As(err, &appErr) || appErr.Code != domain.CodeUpstreamError || appErr.Details["reason"] != string(ModelErrorInvalidRequest) ||
+		appErr.Details["stage"] != "provider_status" || appErr.Details["provider_code"] != "unsupported_parameter" || strings.Contains(err.Error(), "secret-value") {
 		t.Fatalf("provider error = %#v", err)
 	}
 }

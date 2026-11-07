@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
@@ -20,12 +21,16 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
 
 type meteredProbeModel struct {
-	calls int
-	usage app.ModelUsage
+	calls                int
+	usage                app.ModelUsage
+	mediaCapability      string
+	mediaReport          app.ModelMediaGenerationCapabilityReport
+	mediaCapabilityCalls int
 }
 
 func (m *meteredProbeModel) Complete(_ context.Context, request app.ModelRequest) (app.ModelResponse, error) {
@@ -40,11 +45,16 @@ func (m *meteredProbeModel) Complete(_ context.Context, request app.ModelRequest
 	if len(request.Input[0].Images) == 1 {
 		text = "RED"
 	}
-	return app.ModelResponse{Usage: m.usage, Text: text}, nil
+	return app.ModelResponse{Usage: m.usage, Text: text, StopReason: "stop"}, nil
 }
 
 func (*meteredProbeModel) Check(context.Context, app.ModelEndpoint) (app.ModelCapabilities, error) {
 	return app.ModelCapabilities{}, domain.NewError(domain.CodeInternal, "unmetered probe was called")
+}
+
+func (m *meteredProbeModel) CheckMediaGenerationCapability(_ context.Context, _ app.ModelEndpoint, capability string) (app.ModelMediaGenerationCapabilityReport, error) {
+	m.mediaCapability, m.mediaCapabilityCalls = capability, m.mediaCapabilityCalls+1
+	return m.mediaReport, nil
 }
 
 func modelProbeFixture(t *testing.T, usage app.ModelUsage) (*Store, *app.ModelGatewayService, *meteredProbeModel, identity.Principal, string) {
@@ -129,9 +139,32 @@ func TestPostgresModelProbeUnknownUsageIsNotMarkedChecked(t *testing.T) {
 	}
 }
 
+func TestPostgresModelMediaCapabilityCheckPersistsAndAllSkipsMedia(t *testing.T) {
+	store, gateway, model, principal, modelID := modelProbeFixture(t, app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4})
+	model.mediaReport = app.ModelMediaGenerationCapabilityReport{Supported: true, ExactTokenReservation: true, ActualTokenUsage: true,
+		IdempotentOperation: true, DurableOperationRecovery: true, ConfirmedCancellation: true}
+	ctx := context.Background()
+	media, err := gateway.CheckModelCapability(ctx, principal, modelID, "probe-media-0001", "image_generation")
+	if err != nil || !media.MediaGeneration.ImageGeneration || model.mediaCapability != "image_generation" || model.mediaCapabilityCalls != 1 || model.calls != 0 {
+		t.Fatalf("media capability check = %+v, media=%d/%q regular=%d err=%v", media, model.mediaCapabilityCalls, model.mediaCapability, model.calls, err)
+	}
+	connection, err := store.GetModelConnection(ctx, modelID)
+	if err != nil || connection.CheckedAt == nil || !connection.Capabilities.MediaGeneration.ImageGeneration {
+		t.Fatalf("media capability not persisted: %+v, %v", connection, err)
+	}
+	if _, err := gateway.CheckModelCapability(ctx, principal, modelID, "probe-text-0001", "all"); err != nil || model.mediaCapabilityCalls != 1 || model.calls != 1 {
+		t.Fatalf("all probe called media or failed text/tools/vision: media=%d regular=%d err=%v", model.mediaCapabilityCalls, model.calls, err)
+	}
+	connection, err = store.GetModelConnection(ctx, modelID)
+	if err != nil || !connection.Capabilities.MediaGeneration.ImageGeneration || !connection.Capabilities.Text || !connection.Capabilities.Tools || !connection.Capabilities.Vision {
+		t.Fatalf("all probe erased persisted media capability: %+v, %v", connection.Capabilities, err)
+	}
+}
+
 func TestPostgresModelGatewayHTTPSettlesUsage(t *testing.T) {
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
+	admin := personalQuotaAdminPrincipal(t, store)
 	portalLogin, err := credentials.Login(ctx, owner.Name, "client-password-123", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
@@ -157,8 +190,15 @@ func TestPostgresModelGatewayHTTPSettlesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET capability_text=true,checked_at=now() WHERE id=$1`, connection.ID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET capability_text=true,capability_tools=true,checked_at=now() WHERE id=$1`, connection.ID); err != nil {
 		t.Fatal(err)
+	}
+	defaults, err := app.NewAdminModelDefaultService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaults.Update(ctx, admin, 0, connection.ID, "192.0.2.15"); err != nil {
+		t.Fatalf("configure default model: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent) VALUES ($1,50000,1)`, owner.ID); err != nil {
 		t.Fatal(err)
@@ -202,6 +242,97 @@ func TestPostgresModelGatewayHTTPSettlesUsage(t *testing.T) {
  WHERE owner_id=$1 AND source='client' AND call_id=$2`, owner.ID, "model-gateway-http-001").Scan(&state, &providerModel, &inputTokens, &outputTokens); err != nil ||
 		state != "settled" || providerModel != "test-model" || inputTokens != 8 || outputTokens != 4 {
 		t.Fatalf("metered model call = %q %q %d/%d, %v", state, providerModel, inputTokens, outputTokens, err)
+	}
+}
+
+func TestPostgresClientModelPersistsChecksAndRunsSelectedModel(t *testing.T) {
+	store, credentials, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &meteredProbeModel{usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}}
+	models, err := app.NewModelConnectionService(store, sealer, model, []string{"model.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "ios", "phone", "", "personal-model-login-01", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifyClient(ctx, login.ClientCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalModel, err := models.Create(ctx, principal, app.ModelConnectionCommand{
+		Name: "personal model", BaseURL: "https://model.example/v1", ModelName: "personal-agent-model", APIKey: "personal-secret",
+	})
+	if err != nil || personalModel.Shared || !personalModel.HasAPIKey {
+		t.Fatalf("create client model = %+v, %v", personalModel, err)
+	}
+	gateway, err := app.NewModelGatewayService(store, models, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.CheckModel(ctx, principal, personalModel.ID, "personal-model-check-0001"); err != nil {
+		t.Fatalf("check client model: %v", err)
+	}
+	var ownerID, modelName string
+	var encrypted []byte
+	if err := store.pool.QueryRow(ctx, `SELECT owner_id,model_name,api_key_cipher FROM model_connections WHERE id=$1`, personalModel.ID).
+		Scan(&ownerID, &modelName, &encrypted); err != nil || ownerID != owner.ID || modelName != "personal-agent-model" || string(encrypted) == "personal-secret" {
+		t.Fatalf("persisted personal model = owner %q, model %q, ciphertext %q, err %v", ownerID, modelName, encrypted, err)
+	}
+	persisted, err := store.GetModelConnection(ctx, personalModel.ID)
+	if err != nil || persisted.CheckedAt == nil || !persisted.Capabilities.Text || !persisted.Capabilities.Tools {
+		t.Fatalf("checked personal model persistence = %+v, %v", persisted, err)
+	}
+	available, err := models.List(ctx, principal)
+	if err != nil || len(available) != 1 || available[0].ID != personalModel.ID || available[0].Shared {
+		t.Fatalf("client model list = %+v, %v", available, err)
+	}
+	reopenedPool, err := pgxpool.NewWithConfig(ctx, store.pool.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedPool.Close()
+	reopenedModels, err := app.NewModelConnectionService(New(reopenedPool), sealer, model, []string{"model.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := reopenedModels.ResolveGatewayEndpoint(ctx, principal.UserID, personalModel.ID, true, false)
+	if err != nil || reopened.Endpoint.APIKey != "personal-secret" {
+		t.Fatalf("resolve persisted personal model after reopening database: %v", err)
+	}
+	otherID, err := domain.NewUserID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPrincipal := principal
+	otherPrincipal.UserID = otherID
+	if _, err := models.Get(ctx, otherPrincipal, personalModel.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other account read personal model = %v", err)
+	}
+	if _, err := gateway.CheckModel(ctx, otherPrincipal, personalModel.ID, "other-personal-model-check-01"); domain.CodeOf(err) != domain.CodeNotFound || model.calls != 1 {
+		t.Fatalf("other account checked personal model = %v, provider calls=%d", err, model.calls)
+	}
+	response, err := gateway.Complete(ctx, app.ModelCall{Source: app.ModelCallChat, Principal: principal,
+		ModelID: personalModel.ID, CallID: "personal-agent-run-0001",
+		Request: app.ModelRequest{Input: []app.ModelInput{{Type: "message", Role: "user", Text: "run selected personal model"}}, MaxOutputTokens: 32},
+	})
+	if err != nil || response.Text != "OK" || model.calls != 2 {
+		t.Fatalf("selected personal model response = %+v, calls=%d err=%v", response, model.calls, err)
+	}
+	var providerModel, ledgerState string
+	var personal bool
+	if err := store.pool.QueryRow(ctx, `SELECT provider_model,state,personal_model FROM model_call_ledger WHERE owner_id=$1 AND source='chat' AND call_id=$2`,
+		owner.ID, "personal-agent-run-0001").Scan(&providerModel, &ledgerState, &personal); err != nil || providerModel != "personal-agent-model" || ledgerState != "settled" || !personal {
+		t.Fatalf("personal model ledger = %q/%q, %v", providerModel, ledgerState, err)
+	}
+	var budgets int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM model_account_budgets WHERE owner_id=$1`, owner.ID).Scan(&budgets); err != nil || budgets != 0 {
+		t.Fatalf("personal model unexpectedly required a platform budget: %d, %v", budgets, err)
 	}
 }
 
@@ -251,6 +382,227 @@ func modelUsageFixture(t *testing.T) (*Store, identity.Principal, app.ModelCallR
 	return store, principal, app.ModelCallReservation{Source: app.ModelCallClient, OwnerID: owner.ID, Principal: principal,
 		ModelID: "p1234567", ProviderModel: "test-model", ConnectionVersion: version, CallID: "test-call-0001",
 		RequestDigest: digest[:], ReservedTokens: 100}
+}
+
+func TestPostgresPersonalModelDoesNotUsePlatformBudget(t *testing.T) {
+	store, adminService, admin, owner, platform := modelUsageAdminFixture(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `DELETE FROM model_account_budgets WHERE owner_id=$1`, owner.UserID); err != nil {
+		t.Fatal(err)
+	}
+	var version time.Time
+	if err := store.pool.QueryRow(ctx, `INSERT INTO model_connections(id,owner_id,name,base_url,model_name,api_key_cipher,
+capability_text,capability_tools,capability_vision,checked_at) VALUES ('p7654321',$1,'personal','https://model.example/v1','test-model',
+decode(repeat('01',29),'hex'),true,true,true,now()) RETURNING updated_at`, owner.UserID).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	personal := platform
+	personal.ModelID, personal.ConnectionVersion, personal.PersonalModel = "p7654321", version, true
+	other := createTestUser(t, store, 1, 1000, 2048)
+	otherToken := createTestCredentials(t, store, other.ID)[0]
+	otherCall := personal
+	otherCall.OwnerID = other.ID
+	otherCall.Principal = identity.Principal{UserID: other.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: otherToken}
+	otherCall.CallID = "other-personal-call-01"
+	if err := store.ReserveModelCall(ctx, otherCall); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("another user reserved a personal model: %v", err)
+	}
+	concurrent := personal
+	concurrent.CallID = "personal-concurrent-01"
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			results <- store.ReserveModelCall(ctx, concurrent)
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	successes, conflicts := 0, 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else if domain.CodeOf(err) == domain.CodeConflict {
+			conflicts++
+		} else {
+			t.Fatalf("concurrent personal reservation: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent personal reservations: successes=%d conflicts=%d", successes, conflicts)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{OwnerID: owner.UserID, Source: concurrent.Source, CallID: concurrent.CallID,
+		Usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	personal.CallID = "personal-known-01"
+	if err := store.ReserveModelCall(ctx, personal); err != nil {
+		t.Fatalf("personal reservation without a platform budget: %v", err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, personal); err != nil {
+		t.Fatalf("personal dispatch without a platform budget: %v", err)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{OwnerID: owner.UserID, Source: personal.Source, CallID: personal.CallID,
+		Usage: app.ModelUsage{Known: true, InputTokens: 10, OutputTokens: 5}}); err != nil {
+		t.Fatalf("personal settlement without a platform budget: %v", err)
+	}
+	stale := personal
+	stale.CallID = "personal-stale-01"
+	if err := store.ReserveModelCall(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'
+WHERE owner_id=$1 AND source=$2 AND call_id=$3`, owner.UserID, stale.Source, stale.CallID); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := store.MarkStaleModelCallsUnknown(ctx); err != nil || marked != 1 {
+		t.Fatalf("recover personal call without platform budget: marked=%d err=%v", marked, err)
+	}
+	if _, err := adminService.Reconcile(ctx, admin, app.ModelUsageReconcileCommand{OwnerID: owner.UserID, Source: stale.Source,
+		CallID: stale.CallID, InputTokens: 3, OutputTokens: 2, Evidence: "provider reference"}); err != nil {
+		t.Fatalf("reconcile personal call without platform budget: %v", err)
+	}
+	unknown := personal
+	unknown.CallID = "personal-unknown-01"
+	if err := store.ReserveModelCall(ctx, unknown); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{OwnerID: owner.UserID, Source: unknown.Source, CallID: unknown.CallID, Unknown: true}); err != nil {
+		t.Fatal(err)
+	}
+	active := personal
+	active.CallID = "personal-active-01"
+	if err := store.ReserveModelCall(ctx, active); err != nil {
+		t.Fatalf("personal unknown usage blocked a different call: %v", err)
+	}
+	if err := store.ReserveModelCall(ctx, platform); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("platform model without a budget = %v", err)
+	}
+	spoof := platform
+	spoof.PersonalModel = true
+	if err := store.ReserveModelCall(ctx, spoof); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("platform model accepted a forged personal attribution: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent) VALUES ($1,1000,1)`, owner.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveModelCall(ctx, platform); err != nil {
+		t.Fatalf("personal calls affected platform quota: %v", err)
+	}
+	budget, err := adminService.Budget(ctx, admin, owner.UserID)
+	if err != nil || budget.UsedTokens != platform.ReservedTokens || budget.InFlight != 1 || budget.HasUnknown {
+		t.Fatalf("platform budget includes personal calls: %+v, %v", budget, err)
+	}
+	undispatched := personal
+	undispatched.CallID = "personal-undispatched-01"
+	if err := store.ReserveModelCall(ctx, undispatched); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET updated_at=updated_at+interval '1 second' WHERE id=$1`, personal.ModelID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, undispatched); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("changed personal model dispatch = %v", err)
+	}
+	if err := store.AbandonModelCallReservation(ctx, undispatched); err != nil {
+		t.Fatalf("release personal model reservation: %v", err)
+	}
+}
+
+func TestPostgresModelReservationReleaseClearsAccountAndProjectHolds(t *testing.T) {
+	store, principal, call := modelUsageFixture(t)
+	ctx := context.Background()
+	projectOwner := createProjectBudgetTestUser(t, store)
+	projectID, err := project.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := project.New(projectID, projectOwner.ID, "Release fixture", "pre-dispatch reservation release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateProject(ctx, projectOwner.ID, value, "release-project-create-01"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO project_members(project_id,user_id,role,version) VALUES ($1,$2,'member',1)`, projectID, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetProjectBudget(ctx, projectOwner.ID, projectID,
+		project.Budget{Currency: "USD", LimitMicros: 500, Version: 1}, 0, "release-budget-create-01"); err != nil {
+		t.Fatal(err)
+	}
+	call.ProjectID, call.CallID = projectID, "release-project-call-01"
+	accountDigest := sha256.Sum256([]byte("pre-dispatch-account-request"))
+	call.RequestDigest = accountDigest[:]
+	rate := project.RateSnapshot{Provider: "test-provider", ModelID: call.ModelID, Model: call.ProviderModel,
+		Currency: "USD", Version: 1, InputMicrosPerMillion: 1_000_000, OutputMicrosPerMillion: 1_000_000}
+	projectDigest := sha256.Sum256([]byte("pre-dispatch-project-request"))
+	reservation := app.ProjectModelReservation{ProjectID: projectID, ActorID: principal.UserID, Source: app.ModelCallClient,
+		CallID: call.CallID, ModelID: call.ModelID, Usage: project.Usage{InputTokens: 90, OutputTokens: 10},
+		ReservedTokens: 100, Rate: rate, ReservedMicros: 100, RequestDigest: projectDigest[:], AccountCall: call}
+	if _, _, err := store.ReserveProjectModelCall(ctx, reservation); err != nil {
+		t.Fatalf("reserve account and project holds: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, call); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("dispatch after membership revoke = %v, want not found", err)
+	}
+	if err := store.AbandonModelCallReservation(ctx, call); err != nil {
+		t.Fatalf("release undispatched account and project holds: %v", err)
+	}
+	var accountRows, projectRows int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM model_call_ledger WHERE owner_id=$1 AND source='client' AND call_id=$2`,
+		principal.UserID, call.CallID).Scan(&accountRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM project_budget_ledger WHERE project_id=$1 AND source='client' AND call_id=$2`,
+		projectID, call.CallID).Scan(&projectRows); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetProjectBudget(ctx, projectOwner.ID, projectID)
+	if err != nil || accountRows != 0 || projectRows != 0 || view.ReservedMicros != 0 || view.HasUnknown {
+		t.Fatalf("released holds remain: account=%d project=%d view=%+v err=%v", accountRows, projectRows, view, err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO project_members(project_id,user_id,role,version) VALUES ($1,$2,'member',2)`, projectID, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ReserveProjectModelCall(ctx, reservation); err != nil {
+		t.Fatalf("released call key cannot be reserved again: %v", err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, call); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SettleProjectModelCall(ctx, app.SettleProjectModelCallCommand{ProjectID: projectID, Source: app.ModelCallClient,
+		CallID: call.CallID, Usage: project.Usage{InputTokens: 1, OutputTokens: 1}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresModelReservationReleasePreservesUnknownCalls(t *testing.T) {
+	store, principal, reservation := modelUsageFixture(t)
+	ctx := context.Background()
+	if err := store.ReserveModelCall(ctx, reservation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: reservation.Source, OwnerID: principal.UserID,
+		CallID: reservation.CallID, Unknown: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonModelCallReservation(ctx, reservation); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("unknown reservation release = %v, want conflict", err)
+	}
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM model_call_ledger WHERE owner_id=$1 AND source='client' AND call_id=$2`,
+		principal.UserID, reservation.CallID).Scan(&state); err != nil || state != "unknown" {
+		t.Fatalf("unknown model hold was released: state=%q err=%v", state, err)
+	}
 }
 
 func TestPostgresModelReservationDeduplicatesConcurrentCallsAndSettlesOnce(t *testing.T) {
@@ -461,6 +813,11 @@ VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engi
 	childReservation.ReservedTokens = 108
 	if err := store.ReserveModelCall(ctx, childReservation); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("child exceeded the Task budget remaining after the root call: %v", err)
+	} else {
+		var domainErr *domain.Error
+		if !errors.As(err, &domainErr) || domainErr.Details["reason"] != "task_model_budget_exhausted" {
+			t.Fatalf("task budget failure reason = %#v, want task_model_budget_exhausted", domainErr)
+		}
 	}
 	childReservation.ReservedTokens = reservation.ReservedTokens
 	if err := store.ReserveModelCall(ctx, childReservation); err != nil {
@@ -507,11 +864,12 @@ VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engi
 			t.Fatalf("cross-account resource must be rejected by ownership constraint: %v", err)
 		}
 	}
-	_, err = store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2 WHERE id=$1`, fence.TaskID, foreignHost.ID)
+	if _, err = store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2 WHERE id=$1`, fence.TaskID, foreignHost.ID); err != nil {
+		t.Fatalf("Task Host reference must allow shared Host IDs; authorization is enforced by the transactional Host grant fence: %v", err)
+	}
+	_, err = store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2,workspace_owner_id=$3,input_revision=0,workspace_checkpoint_revision=0 WHERE id=$1`, fence.TaskID, foreignWorkspace.ID, principal.UserID)
 	assertForeignKey(err)
-	_, err = store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2,input_revision=0,workspace_checkpoint_revision=0 WHERE id=$1`, fence.TaskID, foreignWorkspace.ID)
-	assertForeignKey(err)
-	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2,workspace_id=$3,input_revision=0,workspace_checkpoint_revision=0 WHERE id=$1`, fence.TaskID, host.ID, workspace.ID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2,workspace_id=$3,workspace_owner_id=$4,input_revision=0,workspace_checkpoint_revision=0 WHERE id=$1`, fence.TaskID, host.ID, workspace.ID, principal.UserID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, host.ID); err != nil {
@@ -557,6 +915,14 @@ VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engi
 func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) {
 	store, principal, _ := modelUsageFixture(t)
 	ctx := context.Background()
+	admin := personalQuotaAdminPrincipal(t, store)
+	defaults, err := app.NewAdminModelDefaultService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaults.Update(ctx, admin, 0, "p1234567", "192.0.2.16"); err != nil {
+		t.Fatalf("configure default model: %v", err)
+	}
 	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, principal.UserID); err != nil {
 		t.Fatal(err)
 	}
@@ -564,16 +930,27 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	ciphertext, err := sealer.Seal([]byte("synthetic-provider-key"))
+	model := &meteredProbeModel{usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}}
+	models, err := app.NewModelConnectionService(store, sealer, model, []string{"model.example"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET api_key_cipher=$2,updated_at=clock_timestamp() WHERE id=$1`, "p1234567", ciphertext); err != nil {
+	personalModel, err := models.Create(ctx, principal, app.ModelConnectionCommand{
+		Name: "task personal model", BaseURL: "https://model.example/v1", ModelName: "task-personal-model", APIKey: "synthetic-provider-key",
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := models.SaveProbeCapabilities(ctx, principal, personalModel.ID, personalModel.UpdatedAt, app.ModelCapabilities{Text: true, Tools: true}); err != nil {
+		t.Fatalf("check task personal model: %v", err)
+	}
+	var personalOwner string
+	if err := store.pool.QueryRow(ctx, `SELECT owner_id FROM model_connections WHERE id=$1`, personalModel.ID).Scan(&personalOwner); err != nil || personalOwner != principal.UserID {
+		t.Fatalf("task personal model owner = %q, err %v", personalOwner, err)
 	}
 	expires := time.Now().UTC().Add(time.Minute)
 	submission := newTestTaskSubmission(t, principal.UserID, "", "metered-task-0001", "hello")
-	submission.Task.ModelID = "p1234567"
+	submission.Task.ModelID = personalModel.ID
 	submission.Task.Authorization = task.Authorization{Kind: string(identity.KindClient), TokenID: principal.TokenID,
 		ClientInstallationID: principal.ClientInstallationID, Version: 1, ExpiresAt: &expires}
 	created, err := store.SubmitTask(ctx, submission)
@@ -620,11 +997,6 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	if _, err := checkpoint.Save(ctx, app.AgentCheckpointCommand{Fence: checkpointFence, From: 0, Through: 0, Digest: digest[:], Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	model := &meteredProbeModel{usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}}
-	models, err := app.NewModelConnectionService(store, sealer, model, []string{"model.example"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	gateway, err := app.NewModelGatewayService(store, models, model)
 	if err != nil {
 		t.Fatal(err)
@@ -638,8 +1010,8 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	call := app.ModelCall{Source: app.ModelCallTask, Task: &fence, ModelID: "p1234567", CallID: callID,
-		RawRequest: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":10}`)}
+	call := app.ModelCall{Source: app.ModelCallTask, Task: &fence, ModelID: personalModel.ID, CallID: callID,
+		RawRequest: []byte(`{"provider":"morde","model":"` + personalModel.ID + `","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":10}`)}
 	response, err := gateway.Complete(ctx, call)
 	if err != nil || response.Text != "OK" || model.calls != 1 {
 		t.Fatalf("model response = %#v, calls=%d, %v", response, model.calls, err)
@@ -650,6 +1022,11 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 	result, err := store.GetTask(ctx, claimed.ID, principal.UserID)
 	if err != nil || result.Task.Usage.ModelTokens == nil || *result.Task.Usage.ModelTokens != 12 {
 		t.Fatalf("task model usage = %#v, %v", result.Task.Usage.ModelTokens, err)
+	}
+	var providerModel string
+	if err := store.pool.QueryRow(ctx, `SELECT provider_model FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2`,
+		principal.UserID, callID).Scan(&providerModel); err != nil || providerModel != "task-personal-model" {
+		t.Fatalf("task personal provider model = %q, %v", providerModel, err)
 	}
 	receipt := signAgentLifecycleReceipt(t, key, started.Fence, nonce)
 	if _, err := agents.ConfirmStopped(ctx, receipt); err != nil {

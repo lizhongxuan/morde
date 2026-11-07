@@ -115,7 +115,8 @@ export function Hosts() {
   };
 
   return <section>
-    <div className="page-heading"><div><p className="eyebrow">你的云端电脑</p><h1>云端电脑</h1><p className="muted">电脑与文件都保存在你的云端空间。</p></div><div className="inline-actions"><Link className="button button-secondary" to="/workspaces">工作目录</Link>{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>创建电脑</button> : <Link className="button button-primary" to="/hosts/new">创建电脑</Link>}</div></div>
+    <section className="design-panel hosts-panel" aria-labelledby="my-hosts-title">
+    <div className="design-panel-header"><div><h2 id="my-hosts-title">我的电脑</h2><p>管理你的云端电脑和工作区。</p></div><div className="inline-actions"><Link className="button button-secondary" to="/workspaces">工作区</Link>{atLimit ? <button type="button" className="button button-primary" onClick={() => notify('达到云端电脑上限,无法再创建', 'error')}>＋ 创建电脑</button> : <Link className="button button-primary" to="/hosts/new">＋ 创建电脑</Link>}</div></div>
     {hosts.isPending ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError ? <div className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></div> : !hosts.data?.items.length ? <div className="empty-card"><h2>还没有主机</h2><p>创建一台主机开始使用浏览器、终端和文件工具。</p><Link to="/hosts/new" className="button button-primary">创建第一台主机</Link></div> : <div className="host-list">
       {hosts.data.items.map((host) => {
         const ownsHost = host.owner_id === user?.id;
@@ -144,8 +145,9 @@ export function Hosts() {
           onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ action: 'restore', host })} onDelete={() => setDeleting(host)} />;
       })}
     </div>}
-    <div className="shared-hosts-section">
-      <h2 className="section-title">共享给我的电脑</h2>
+    </section>
+    <div className="shared-hosts-section design-panel">
+      <div className="design-panel-header"><h2>共享给我的电脑</h2></div>
       {sharedHosts.isPending ? <div className="loading-card" role="status">正在加载共享电脑…</div>
         : sharedHosts.isError ? <div className="error-card" role="alert">{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></div>
           : !sharedHosts.data.items.length ? <div className="empty-card compact"><p>还没有人与你共享云端电脑。</p></div>

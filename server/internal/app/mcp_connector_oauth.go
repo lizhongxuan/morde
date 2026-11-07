@@ -48,6 +48,9 @@ func (s *MCPConnectorService) BeginOAuth(ctx context.Context, principal identity
 	if err := validateMCPConnectorPrincipal(principal); err != nil {
 		return MCPConnectorOAuthStart{}, err
 	}
+	if s.redirectURI == "" {
+		return MCPConnectorOAuthStart{}, domain.NewError(domain.CodeUnsupported, "MCP OAuth requires an HTTPS Portal")
+	}
 	if !domain.ValidMCPConnectorID(connectorID) || expectedRevision < 1 {
 		return MCPConnectorOAuthStart{}, domain.InvalidArgument("connector", "connector ID and positive revision are required")
 	}
@@ -99,6 +102,9 @@ func (s *MCPConnectorService) BeginOAuth(ctx context.Context, principal identity
 }
 
 func (s *MCPConnectorService) CompleteOAuth(ctx context.Context, state, code, providerError, issuer string) error {
+	if s.redirectURI == "" {
+		return domain.NewError(domain.CodeUnsupported, "MCP OAuth requires an HTTPS Portal")
+	}
 	if len(state) != 43 || len(code) > 8192 || len(providerError) > 128 || len(issuer) > 4096 {
 		return domain.NewError(domain.CodeNotFound, "MCP OAuth authorization expired or invalid")
 	}
@@ -231,22 +237,95 @@ func (s *MCPConnectorService) CredentialHeaders(ctx context.Context, record MCPC
 	if bundle.Kind == "none" {
 		return headers, nil
 	}
-	if len(credentialHeaders) > 4 {
-		return nil, domain.NewError(domain.CodeInvalidArgument, "MCP connector credential headers exceed their limit")
+	normalized, valid := normalizeMCPConnectorCredentialHeaders(credentialHeaders)
+	if !valid {
+		return nil, domain.NewError(domain.CodeInvalidArgument, "MCP connector credential headers are invalid")
 	}
+	return normalized, nil
+}
+
+func validMCPConnectorCredentialHeadersJSON(value []byte) bool {
+	var bundle mcpConnectorCredentialBundle
+	if err := json.Unmarshal(value, &bundle); err != nil {
+		return false
+	}
+	if bundle.Kind == "" && bundle.Headers == nil {
+		var flat map[string]string
+		if err := json.Unmarshal(value, &flat); err != nil || flat == nil {
+			return false
+		}
+		_, valid := normalizeMCPConnectorCredentialHeaders(flat)
+		return valid
+	}
+	switch bundle.Kind {
+	case "oauth":
+		return bundle.OAuth != nil
+	case "headers", "":
+		_, valid := normalizeMCPConnectorCredentialHeaders(bundle.Headers)
+		return valid
+	case "none":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeMCPConnectorCredentialHeaders(values map[string]string) (http.Header, bool) {
+	if len(values) == 0 || len(values) > 4 {
+		return nil, false
+	}
+	headers := make(http.Header, len(values))
+	seen := make(map[string]struct{}, len(values))
 	total := 0
-	for name, value := range credentialHeaders {
+	for name, value := range values {
 		canonical := textproto.CanonicalMIMEHeaderKey(name)
-		if canonical == "" || len(value) > 4096 || strings.ContainsAny(value, "\r\n\x00") {
-			return nil, domain.NewError(domain.CodeInvalidArgument, "MCP connector credential headers are invalid")
+		if canonical == "" || !validMCPConnectorCredentialHeaderName(name) {
+			return nil, false
+		}
+		normalizedName := strings.ToLower(canonical)
+		if _, duplicate := seen[normalizedName]; duplicate || forbiddenMCPConnectorCredentialHeader(normalizedName) || len(value) > 4096 {
+			return nil, false
+		}
+		seen[normalizedName] = struct{}{}
+		for _, char := range value {
+			if char < 0x20 && char != '\t' || char == 0x7f {
+				return nil, false
+			}
 		}
 		total += len(name) + len(value)
 		if total > 8192 {
-			return nil, domain.NewError(domain.CodeInvalidArgument, "MCP connector credential headers exceed their limit")
+			return nil, false
 		}
 		headers.Set(canonical, value)
 	}
-	return headers, nil
+	return headers, true
+}
+
+func validMCPConnectorCredentialHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' ||
+			strings.ContainsRune("!#$%&'*+-.^_`|~", char) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func forbiddenMCPConnectorCredentialHeader(name string) bool {
+	if strings.HasPrefix(name, "proxy-") {
+		return true
+	}
+	switch name {
+	case "host", "cookie", "set-cookie", "content-length", "transfer-encoding", "connection",
+		"keep-alive", "te", "trailer", "upgrade", "expect":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *MCPConnectorService) openMCPConnectorCredential(record MCPConnectorRecord) (mcpConnectorCredentialBundle, error) {

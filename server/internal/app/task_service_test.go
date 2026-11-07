@@ -23,7 +23,6 @@ type taskStoreStub struct {
 	TaskStore
 	conversations          map[string]conversation.Conversation
 	submissions            []TaskSubmission
-	appends                []TaskSubmission
 	created                []conversation.Conversation
 	listHostIDs            []string
 	listTasksPage          TaskPage
@@ -161,14 +160,6 @@ func (s *taskStoreStub) SubmitTask(_ context.Context, submission TaskSubmission)
 	}, nil
 }
 
-func (s *taskStoreStub) AppendMessage(_ context.Context, submission TaskSubmission) (TaskSubmissionResult, error) {
-	s.appends = append(s.appends, submission)
-	if s.storeErr != nil {
-		return TaskSubmissionResult{}, s.storeErr
-	}
-	return TaskSubmissionResult{Task: submission.Task, Message: submission.Message}, nil
-}
-
 func (s *taskStoreStub) GetTask(context.Context, string, string) (TaskDetails, error) {
 	return s.details, s.storeErr
 }
@@ -189,6 +180,11 @@ func (s *taskStoreStub) SetTaskMCPConnectorToolSchema(context.Context, string, s
 
 func (s *taskStoreStub) ListTasks(_ context.Context, _ string, filter TaskListRequest) (TaskPage, error) {
 	s.listHostIDs = filter.HostIDs
+	return s.listTasksPage, s.storeErr
+}
+
+func (s *taskStoreStub) ListConversationActiveTasks(_ context.Context, _ string, _, _ string, hostIDs []string, _ PageRequest) (TaskPage, error) {
+	s.listHostIDs = hostIDs
 	return s.listTasksPage, s.storeErr
 }
 
@@ -501,6 +497,32 @@ func TestTaskServicePinsCommittedWorkspaceManifestAndHashesInputRevision(t *test
 	}
 }
 
+func TestTaskServicePinsHostlessWorkspaceInputSnapshot(t *testing.T) {
+	emptyDigest := sha256.Sum256(nil)
+	files := []workspace.File{{Path: "notes.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0644, Chunks: []workspace.Chunk{}}}
+	store := &taskWorkspaceStoreStub{
+		taskStoreStub: &taskStoreStub{},
+		value:         workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
+		files:         files,
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := int64(1)
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		WorkspaceID: store.value.ID, InputRevision: &revision, ModelID: "model-a", Objective: "summarize the Workspace notes",
+		IdempotencyKey: "hostless-workspace-submit-01",
+	}); err != nil {
+		t.Fatalf("Submit() Hostless Workspace task: %v", err)
+	}
+	if len(store.submissions) != 1 || store.submissions[0].Task.HostID != "" || store.submissions[0].Task.WorkspaceID != store.value.ID ||
+		store.submissions[0].Task.InputRevision == nil || *store.submissions[0].Task.InputRevision != revision ||
+		len(store.submissions[0].Task.ContextDigest) != sha256.Size || len(store.manifestOwners) != 1 || store.manifestOwners[0] != "u1234567" {
+		t.Fatalf("Hostless Workspace task snapshot = %#v, manifest owners=%#v", store.submissions, store.manifestOwners)
+	}
+}
+
 func TestTaskServiceIncludesEmptyDirectoriesInInputDigest(t *testing.T) {
 	store := &taskWorkspaceStoreStub{
 		taskStoreStub:    &taskStoreStub{},
@@ -595,7 +617,7 @@ func TestTaskServiceRejectsNativeInputMetadataWithoutRootSnapshot(t *testing.T) 
 	}
 }
 
-func TestTaskServiceAppendPinsWorkspaceInputForNewTask(t *testing.T) {
+func TestTaskServiceSubmitPinsWorkspaceInputInExistingConversation(t *testing.T) {
 	emptyDigest := sha256.Sum256(nil)
 	files := []workspace.File{{Path: "notes.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0644, Chunks: []workspace.Chunk{}}}
 	store := &taskWorkspaceStoreStub{
@@ -610,16 +632,16 @@ func TestTaskServiceAppendPinsWorkspaceInputForNewTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	revision := int64(1)
-	_, err = service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", AppendMessageCommand{
-		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
-		ModelID: "model-a", Content: "use the uploaded notes", IdempotencyKey: "workspace-append-001",
+	_, err = service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		ConversationID: "c1234567", HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		ModelID: "model-a", Objective: "use the uploaded notes", IdempotencyKey: "workspace-submit-existing-001",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(store.appends) != 1 || store.appends[0].Task.WorkspaceID != store.value.ID ||
-		store.appends[0].Task.InputRevision == nil || *store.appends[0].Task.InputRevision != revision || len(store.appends[0].Task.ContextDigest) != 32 {
-		t.Fatalf("append task Workspace input = %#v", store.appends)
+	if len(store.submissions) != 1 || store.submissions[0].Task.WorkspaceID != store.value.ID ||
+		store.submissions[0].Task.InputRevision == nil || *store.submissions[0].Task.InputRevision != revision || len(store.submissions[0].Task.ContextDigest) != 32 {
+		t.Fatalf("submitted task Workspace input = %#v", store.submissions)
 	}
 }
 
@@ -671,29 +693,93 @@ func TestTaskServiceApplicationTargetIsValidatedAndBoundToTaskHash(t *testing.T)
 	}
 }
 
-func TestTaskServiceAppendMessageBindsApplicationTarget(t *testing.T) {
-	store := &taskStoreStub{conversations: map[string]conversation.Conversation{
+func TestConversationReceiptBindsApplicationAndReferenceTarget(t *testing.T) {
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
 		"c1234567": {ID: "c1234567", OwnerID: taskTestPrincipal().UserID, HostID: "h1234567"},
-	}}
+	}}}
 	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := AppendMessageCommand{ExpectedTaskID: "q1234567", HostID: "h1234567", ApplicationID: WechatApplicationID, ModelID: "model-a", Content: "continue", IdempotencyKey: "app-append-001"}
-	if _, err := service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", command); err != nil {
+	command := AcceptConversationMessageCommand{ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+		ClientMessageID: "app-message-001", IdempotencyKey: "app-message-001", ReferenceTaskID: "q1234567",
+		HostID: "h1234567", ApplicationID: WechatApplicationID, ModelID: "model-a", Content: "continue"}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.appends) != 1 || store.appends[0].Task.ApplicationID != WechatApplicationID || store.appends[0].ExpectedTaskID != command.ExpectedTaskID {
-		t.Fatalf("append application target = %#v", store.appends)
+	if len(store.receipts) != 1 || store.receipts[0].Input.ApplicationID != WechatApplicationID || store.receipts[0].Input.ReferenceTaskID != command.ReferenceTaskID {
+		t.Fatalf("message application target = %#v", store.receipts)
 	}
-	command.ExpectedTaskID = "invalid"
-	if _, err := service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.appends) != 1 {
-		t.Fatalf("invalid expected Task error=%v, appends=%d", err, len(store.appends))
+	command.ReferenceTaskID = "invalid"
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.receipts) != 1 {
+		t.Fatalf("invalid reference Task error=%v, receipts=%d", err, len(store.receipts))
 	}
 	command.ApplicationID = "unknown"
-	command.ExpectedTaskID = "q1234567"
-	if _, err := service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.appends) != 1 {
-		t.Fatalf("unknown application error=%v, appends=%d", err, len(store.appends))
+	command.ReferenceTaskID = "q1234567"
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.receipts) != 1 {
+		t.Fatalf("unknown application error=%v, receipts=%d", err, len(store.receipts))
+	}
+}
+
+func TestConversationReceiptRoutesAutomaticallyAndBindsReference(t *testing.T) {
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+		"c1234567": {ID: "c1234567", OwnerID: taskTestPrincipal().UserID},
+	}}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := AcceptConversationMessageCommand{ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+		ClientMessageID: "message-auto-route", IdempotencyKey: "message-auto-route", ModelID: "model-a", Content: "work"}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", base); err != nil {
+		t.Fatal(err)
+	}
+	first := store.receipts[0]
+	base.ReferenceTaskID = "q1234567"
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", base); err != nil {
+		t.Fatal(err)
+	}
+	second := store.receipts[1]
+	if first.Input.ReferenceTaskID != "" || second.Input.ReferenceTaskID != "q1234567" ||
+		bytes.Equal(first.RequestHash, second.RequestHash) {
+		t.Fatalf("reference or idempotency fingerprint lost: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestConversationReceiptValidatesAndHashesAttachmentIDs(t *testing.T) {
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+		"c1234567": {ID: "c1234567", OwnerID: taskTestPrincipal().UserID},
+	}}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachmentID := "attachment-slot-001"
+	command := AcceptConversationMessageCommand{ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+		ClientMessageID: "attachment-msg-001", IdempotencyKey: "attachment-msg-001", ModelID: "model-a", Content: "review this", ClientAttachmentIDs: []string{attachmentID}}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.receipts) != 1 || len(store.receipts[0].Input.ClientAttachmentIDs) != 1 ||
+		store.receipts[0].Input.ClientAttachmentIDs[0] != attachmentID {
+		t.Fatalf("attachment slot was not persisted into the receipt: %#v", store.receipts)
+	}
+	firstHash := append([]byte(nil), store.receipts[0].RequestHash...)
+	command.ClientAttachmentIDs = nil
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.receipts) != 2 || bytes.Equal(firstHash, store.receipts[1].RequestHash) {
+		t.Fatal("attachment IDs were not included in the idempotency request hash")
+	}
+
+	command.ClientAttachmentIDs = []string{"invalid slot!"}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.receipts) != 2 {
+		t.Fatalf("invalid attachment error=%v receipts=%d", err, len(store.receipts))
+	}
+	command.ClientAttachmentIDs = []string{attachmentID, attachmentID}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", command); domain.CodeOf(err) != domain.CodeInvalidArgument || len(store.receipts) != 2 {
+		t.Fatalf("duplicate attachment error=%v receipts=%d", err, len(store.receipts))
 	}
 }
 
@@ -729,38 +815,41 @@ func TestTaskServiceRejectsUnscopedAPIKeyBeforeStoreWrite(t *testing.T) {
 	}
 }
 
-func TestTaskServiceAppendMessageMaySwitchHostWithinConversation(t *testing.T) {
-	store := &taskStoreStub{conversations: map[string]conversation.Conversation{
+func TestConversationReceiptRecordsSelectedHostWithinConversation(t *testing.T) {
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
 		"c1234567": {ID: "c1234567", OwnerID: "u1234567", HostID: "h7654321"},
-	}}
+	}}}
 	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", AppendMessageCommand{
-		HostID: "h1234567", ModelID: "model-a", Content: "continue", IdempotencyKey: "retry-key-004",
+	_, _, err = service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", AcceptConversationMessageCommand{
+		ServiceInstanceID: "11111111-1111-4111-8111-111111111111", ClientMessageID: "retry-key-004", IdempotencyKey: "retry-key-004",
+		HostID: "h1234567", ModelID: "model-a", Content: "continue",
 	})
-	if err != nil || len(store.appends) != 1 || store.appends[0].Task.HostID != "h1234567" {
-		t.Fatalf("selected host was not applied per task: error=%v appends=%+v", err, store.appends)
+	if err != nil || len(store.receipts) != 1 || store.receipts[0].Input.HostID != "h1234567" {
+		t.Fatalf("selected host was not recorded per message: error=%v receipts=%+v", err, store.receipts)
 	}
 }
 
-func TestTaskServiceAppendDoesNotReuseConversationHostAuthorization(t *testing.T) {
-	store := &taskStoreStub{conversations: map[string]conversation.Conversation{
+func TestConversationReceiptDefersConversationAndSelectedHostAuthorization(t *testing.T) {
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
 		"c1234567": {ID: "c1234567", OwnerID: "u1234567", HostID: "h7654321"},
-	}}
+	}}}
 	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
 		"h7654321": domain.NewError(domain.CodeNotFound, "host not found"),
+		"h1234567": domain.NewError(domain.CodeNotFound, "host not found"),
 	}}
 	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.AppendMessage(context.Background(), taskTestPrincipal(), "c1234567", AppendMessageCommand{
-		HostID: "h1234567", ModelID: "model-a", Content: "continue", IdempotencyKey: "retry-key-012",
+	_, _, err = service.AcceptConversationMessage(context.Background(), taskTestPrincipal(), "c1234567", AcceptConversationMessageCommand{
+		ServiceInstanceID: "11111111-1111-4111-8111-111111111111", ClientMessageID: "retry-key-012", IdempotencyKey: "retry-key-012",
+		HostID: "h1234567", ModelID: "model-a", Content: "continue",
 	})
-	if err != nil || len(store.appends) != 1 || authorizer.lastHost != "h1234567" {
-		t.Fatalf("selected host authorization error=%v appends=%d authorized_host=%s", err, len(store.appends), authorizer.lastHost)
+	if err != nil || len(store.receipts) != 1 || authorizer.lastHost != "" {
+		t.Fatalf("receipt checked Host availability: error=%v receipts=%d authorized_host=%s", err, len(store.receipts), authorizer.lastHost)
 	}
 }
 
@@ -779,6 +868,29 @@ func TestTaskServiceListRejectsAPIKeyTaskScope(t *testing.T) {
 	}
 	if store.listHostIDs != nil {
 		t.Fatalf("denied API key reached task storage: %#v", store.listHostIDs)
+	}
+}
+
+func TestTaskServiceListHidesTasksWithoutHostReadAccess(t *testing.T) {
+	store := &taskStoreStub{listTasksPage: TaskPage{Items: []task.Task{
+		{ID: "qprivate1", OwnerID: "u1234567", ProjectID: "p1234567", InitiatorID: "u7654321", HostID: "hprivate1", Objective: "private summary"},
+		{ID: "qforbidden1", OwnerID: "u1234567", ProjectID: "p1234567", InitiatorID: "u7654321", HostID: "hforbid01", Objective: "forbidden summary"},
+		{ID: "qvisible1", OwnerID: "u1234567", ProjectID: "p1234567", InitiatorID: "u1234567", HostID: "hvisible1", Objective: "visible summary"},
+	}, NextCursor: "next-page"}}
+	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
+		"hprivate1": domain.NewError(domain.CodeNotFound, "host not found"),
+		"hforbid01": domain.NewError(domain.CodeForbidden, "host access denied"),
+	}}
+	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.List(context.Background(), taskTestPrincipal(), TaskListRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "qvisible1" || page.NextCursor != "next-page" || authorizer.calls != 3 {
+		t.Fatalf("task page exposed an unauthorized project task or lost its cursor: %#v (authorizer calls=%d)", page, authorizer.calls)
 	}
 }
 
@@ -828,39 +940,56 @@ func TestTaskServiceListEventsPreservesAndAuthorizesExpiredCursorSnapshot(t *tes
 }
 
 func TestTaskServiceRedactsArtifactsAfterWorkspaceOwnershipTransfer(t *testing.T) {
-	for _, ownerID := range []string{"u1234567", "u7654321"} {
-		store := &taskWorkspaceStoreStub{
-			taskStoreStub: &taskStoreStub{
-				details: TaskDetails{
-					Task:      task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", WorkspaceID: "w1234567"},
-					Artifacts: []task.Artifact{{ID: "a1234567", TaskID: "q1234567", StepID: "s1234567", Path: "reports/private.txt"}},
+	tests := []struct {
+		name           string
+		taskOwnerID    string
+		initiatorID    string
+		workspaceOwner string
+		requesterID    string
+		visible        bool
+	}{
+		{name: "current owner", taskOwnerID: "u1234567", initiatorID: "u1234567", workspaceOwner: "u1234567", requesterID: "u1234567", visible: true},
+		{name: "previous owner after transfer", taskOwnerID: "u1234567", initiatorID: "u1234567", workspaceOwner: "u7654321", requesterID: "u1234567"},
+		{name: "project initiator owns workspace", taskOwnerID: "u1234567", initiatorID: "u7654321", workspaceOwner: "u7654321", requesterID: "u7654321", visible: true},
+		{name: "project member does not own workspace", taskOwnerID: "u1234567", initiatorID: "u7654321", workspaceOwner: "u7654321", requesterID: "u2345678"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &taskWorkspaceStoreStub{
+				taskStoreStub: &taskStoreStub{
+					details: TaskDetails{
+						Task:      task.Task{ID: "q1234567", OwnerID: test.taskOwnerID, InitiatorID: test.initiatorID, HostID: "h1234567", WorkspaceID: "w1234567"},
+						Artifacts: []task.Artifact{{ID: "a1234567", TaskID: "q1234567", StepID: "s1234567", Path: "reports/private.txt"}},
+					},
+					events: []task.Event{{
+						TaskID: "q1234567", Sequence: 1, Type: "task.artifact", Payload: []byte(`{"path":"reports/private.txt"}`), CreatedAt: time.Now(),
+					}},
 				},
-				events: []task.Event{{
-					TaskID: "q1234567", Sequence: 1, Type: "task.artifact", Payload: []byte(`{"path":"reports/private.txt"}`), CreatedAt: time.Now(),
-				}},
-			},
-			value: workspace.Workspace{ID: "w1234567", OwnerID: ownerID, State: workspace.StateReady},
-		}
-		service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		details, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567")
-		if err != nil {
-			t.Fatal(err)
-		}
-		page, err := service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 0, 50)
-		if err != nil || len(page.Items) != 1 {
-			t.Fatalf("artifact event page = %#v, err=%v", page, err)
-		}
-		if ownerID == taskTestPrincipal().UserID {
-			if len(details.Artifacts) != 1 || string(page.Items[0].Payload) != `{"path":"reports/private.txt"}` {
-				t.Fatalf("current Workspace owner lost artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
+				value: workspace.Workspace{ID: "w1234567", OwnerID: test.workspaceOwner, State: workspace.StateReady},
 			}
-		} else if len(details.Artifacts) != 0 || string(page.Items[0].Payload) != `{"redacted":true}` {
-			t.Fatalf("previous Workspace owner retained artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
-		}
+			service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			principal := taskTestPrincipal()
+			principal.UserID = test.requesterID
+
+			details, err := service.Get(context.Background(), principal, "q1234567")
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, err := service.ListEvents(context.Background(), principal, "q1234567", 0, 50)
+			if err != nil || len(page.Items) != 1 {
+				t.Fatalf("artifact event page = %#v, err=%v", page, err)
+			}
+			if test.visible {
+				if len(details.Artifacts) != 1 || string(page.Items[0].Payload) != `{"path":"reports/private.txt"}` {
+					t.Fatalf("Workspace owner lost artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
+				}
+			} else if len(details.Artifacts) != 0 || string(page.Items[0].Payload) != `{"redacted":true}` {
+				t.Fatalf("non-owner retained artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
+			}
+		})
 	}
 }
 

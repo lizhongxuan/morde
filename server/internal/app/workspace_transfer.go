@@ -17,7 +17,7 @@ type WorkspaceOwnershipTransferStore interface {
 	GetWorkspaceOwnershipTransfer(context.Context, string, string, string) (workspace.OwnershipTransfer, error)
 	ReconcileWorkspaceOwnershipTransfer(context.Context, string, string, string) (workspace.OwnershipTransfer, error)
 	StartWorkspaceOwnershipTransferAcceptance(context.Context, string, string, string, string, IdempotencyRecord) (workspace.OwnershipTransfer, bool, error)
-	FinishWorkspaceOwnershipTransferAcceptance(context.Context, string, string, string, string, int64) (workspace.OwnershipTransfer, error)
+	FinishWorkspaceOwnershipTransferAcceptanceWithReadOnly(context.Context, string, string, string, string, int64, bool) (workspace.OwnershipTransfer, error)
 	CancelWorkspaceOwnershipTransfer(context.Context, string, string, string, IdempotencyRecord) (workspace.OwnershipTransfer, error)
 }
 
@@ -100,6 +100,16 @@ func (s *WorkspaceTransferService) GetWorkspaceTransfer(ctx context.Context, pri
 }
 
 func (s *WorkspaceTransferService) AcceptWorkspaceTransfer(ctx context.Context, principal identity.Principal, workspaceID, transferID, idempotencyKey string) (workspace.OwnershipTransfer, error) {
+	return s.acceptWorkspaceTransfer(ctx, principal, workspaceID, transferID, idempotencyKey, false)
+}
+
+func (s *WorkspaceTransferService) AcceptWorkspaceTransferReadOnly(ctx context.Context, principal identity.Principal,
+	workspaceID, transferID, idempotencyKey string) (workspace.OwnershipTransfer, error) {
+	return s.acceptWorkspaceTransfer(ctx, principal, workspaceID, transferID, idempotencyKey, true)
+}
+
+func (s *WorkspaceTransferService) acceptWorkspaceTransfer(ctx context.Context, principal identity.Principal,
+	workspaceID, transferID, idempotencyKey string, readOnly bool) (workspace.OwnershipTransfer, error) {
 	if err := requireWorkspaceTransferSession(principal); err != nil {
 		return workspace.OwnershipTransfer{}, err
 	}
@@ -177,7 +187,8 @@ func (s *WorkspaceTransferService) AcceptWorkspaceTransfer(ctx context.Context, 
 	if started.State != workspace.OwnershipTransferAccepting {
 		return workspace.OwnershipTransfer{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace ownership transfer acceptance is not ready")
 	}
-	result, err := s.store.FinishWorkspaceOwnershipTransferAcceptance(ctx, principal.UserID, workspaceID, transferID, started.OperationID, s.maxOwnerBytes)
+	result, err := s.store.FinishWorkspaceOwnershipTransferAcceptanceWithReadOnly(ctx, principal.UserID, workspaceID,
+		transferID, started.OperationID, s.maxOwnerBytes, readOnly)
 	if err != nil {
 		cleanupCtx, cancel := workspaceTransferCleanupContext(ctx)
 		defer cancel()

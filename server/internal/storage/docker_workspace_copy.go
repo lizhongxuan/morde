@@ -311,7 +311,7 @@ func workspaceCopyManifestBytes(files []workspace.File) (int64, error) {
 	var total int64
 	for _, file := range files {
 		if err := workspace.ValidateFile(file); err != nil || total > math.MaxInt64-file.SizeBytes {
-			return 0, errors.New("Workspace copy manifest has an invalid file size")
+			return 0, errors.New("workspace copy manifest has an invalid file size")
 		}
 		total += file.SizeBytes
 	}
@@ -487,11 +487,11 @@ func (d *Docker) workspaceCopyVolumePath(ctx context.Context, dockerRoot, name s
 	}
 	expectedPath := filepath.Join(dockerRoot, "volumes", name, "_data")
 	if !filepath.IsAbs(volume.Mountpoint) || filepath.Clean(volume.Mountpoint) != expectedPath {
-		return "", nil, errors.New("Workspace volume mountpoint is outside its expected Docker data root")
+		return "", nil, errors.New("workspace volume mountpoint is outside its expected Docker data root")
 	}
 	resolvedPath, err := filepath.EvalSymlinks(volume.Mountpoint)
 	if err != nil || filepath.Clean(resolvedPath) != expectedPath {
-		return "", nil, errors.New("Workspace volume mountpoint does not resolve to its expected Docker path")
+		return "", nil, errors.New("workspace volume mountpoint does not resolve to its expected Docker path")
 	}
 	root, err := os.OpenRoot(expectedPath)
 	if err != nil {
@@ -501,7 +501,7 @@ func (d *Docker) workspaceCopyVolumePath(ctx context.Context, dockerRoot, name s
 	rootInfo, err := root.Stat(".")
 	pathInfo, pathErr := os.Lstat(expectedPath)
 	if err != nil || pathErr != nil || !pathInfo.IsDir() || !os.SameFile(rootInfo, pathInfo) {
-		return "", nil, errors.Join(errors.New("Workspace volume changed while opening"), err, pathErr)
+		return "", nil, errors.Join(errors.New("workspace volume changed while opening"), err, pathErr)
 	}
 	return expectedPath, rootInfo, nil
 }
@@ -519,7 +519,7 @@ func ensureWorkspaceCopyRootIdentity(path string, expected os.FileInfo) error {
 	rootInfo, err := root.Stat(".")
 	pathInfo, pathErr := os.Lstat(path)
 	if err != nil || pathErr != nil || !pathInfo.IsDir() || !os.SameFile(expected, rootInfo) || !os.SameFile(expected, pathInfo) {
-		return errors.Join(errors.New("Workspace volume root identity changed"), err, pathErr)
+		return errors.Join(errors.New("workspace volume root identity changed"), err, pathErr)
 	}
 	return nil
 }
@@ -545,10 +545,10 @@ func (d *Docker) cleanWorkspaceCopyDestination(ctx context.Context, request Work
 		return fmt.Errorf("verify destination before Workspace copy cleanup: %w", err)
 	}
 	if verifiedPath != path || !os.SameFile(expected, currentInfo) {
-		return errors.New("Workspace copy cleanup skipped a changed destination volume")
+		return errors.New("workspace copy cleanup skipped a changed destination volume")
 	}
 	if err := d.rejectAttachedVolume(cleanupCtx, name); err != nil {
-		return fmt.Errorf("Workspace copy cleanup skipped an attached destination: %w", err)
+		return fmt.Errorf("workspace copy cleanup skipped an attached destination: %w", err)
 	}
 	root, err := os.OpenRoot(path)
 	if err != nil {
@@ -557,7 +557,7 @@ func (d *Docker) cleanWorkspaceCopyDestination(ctx context.Context, request Work
 	defer func() { _ = root.Close() }()
 	rootInfo, err := root.Stat(".")
 	if err != nil || !os.SameFile(expected, rootInfo) {
-		return errors.Join(errors.New("Workspace copy cleanup skipped a changed destination root"), err)
+		return errors.Join(errors.New("workspace copy cleanup skipped a changed destination root"), err)
 	}
 	entries, err := readWorkspaceCopyRoot(root)
 	if err != nil {
@@ -570,7 +570,7 @@ func (d *Docker) cleanWorkspaceCopyDestination(ctx context.Context, request Work
 	}
 	entries, err = readWorkspaceCopyRoot(root)
 	if err != nil || len(entries) != 0 {
-		return errors.Join(errors.New("Workspace copy cleanup did not empty destination"), err)
+		return errors.Join(errors.New("workspace copy cleanup did not empty destination"), err)
 	}
 	if err := ensureWorkspaceCopyRootIdentity(path, expected); err != nil {
 		return err

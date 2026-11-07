@@ -1,0 +1,99 @@
+package app
+
+import (
+	"strings"
+	"testing"
+
+	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/task"
+)
+
+func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
+	candidates := []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 4}}
+	for _, test := range []struct {
+		name   string
+		output string
+		action ConversationRouteAction
+		taskID string
+	}{
+		{"update", `{"action":"update","task_id":"q1234567","question":""}`, ConversationRouteUpdate, "q1234567"},
+		{"independent", `{"action":"new","task_id":"","question":""}`, ConversationRouteNew, ""},
+		{"status", `{"action":"status","task_id":"q1234567","question":""}`, ConversationRouteStatus, "q1234567"},
+		{"stop", `{"action":"stop","task_id":"q1234567","question":""}`, ConversationRouteStop, "q1234567"},
+		{"ambiguous", `{"action":"clarify","task_id":"","question":"你指的是哪个任务？"}`, ConversationRouteClarify, ""},
+		{"unknown task", `{"action":"stop","task_id":"q7654321","question":""}`, ConversationRouteClarify, ""},
+		{"extra fields", `{"action":"update","task_id":"q1234567","question":"","admin":true}`, ConversationRouteClarify, ""},
+		{"malformed", `{"action":"update"`, ConversationRouteClarify, ""},
+		{"trailing data", `{"action":"new","task_id":"","question":""} {}`, ConversationRouteClarify, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecision(test.output, candidates)
+			if decision.Action != test.action || decision.TaskID != test.taskID {
+				t.Fatalf("decision = %+v", decision)
+			}
+			if test.taskID != "" && decision.ExpectedRevision != 4 {
+				t.Fatalf("revision was not taken from the authorized snapshot: %+v", decision)
+			}
+			if test.action == ConversationRouteClarify && decision.Question == "" {
+				t.Fatal("clarification must have a visible question")
+			}
+		})
+	}
+}
+
+func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
+	value := ConversationRouteContext{
+		ActorID: "u1234567", Content: "只看收入和净利润", ReferenceTaskID: "q1234567",
+		History: []ConversationRouteHistory{{MessageID: "m1234567", Sequence: 1, Role: conversation.RoleUser, Content: "整理财报"}},
+		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+			Objective: "整理财报", Status: task.StatusRunning, Revision: 2}},
+	}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil || len(request.Input) != 1 || len(request.Tools) != 0 ||
+		!strings.Contains(request.Input[0].Text, "只看收入和净利润") || !strings.Contains(request.Input[0].Text, "q1234567") ||
+		strings.Contains(request.Input[0].Text, "u1234567") {
+		t.Fatalf("routing request is invalid: %+v err=%v", request, err)
+	}
+	value.Candidates[0].InitiatorID = "u7654321"
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("another actor's task was accepted into routing context: %v", err)
+	}
+	value.Candidates[0].InitiatorID = value.ActorID
+	value.History = append(value.History, ConversationRouteHistory{MessageID: "m2345678", Sequence: 1, Role: conversation.RoleAssistant, Content: "重复序号"})
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("unordered history evidence was accepted: %v", err)
+	}
+	value.History = value.History[:1]
+	value.Content = strings.Repeat("中", maxAgentInputBytes)
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeResultTooLarge {
+		t.Fatalf("oversized routing context should fail without truncation: %v", err)
+	}
+}
+
+func TestUnavailableRouteReferenceIsHiddenAndControlsAreRejected(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "重新整理财报", ReferenceTaskID: "q1234567", ReferenceUnavailable: true}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil || len(request.Input) != 1 || !strings.Contains(request.Input[0].Text, `"reference_unavailable":true`) ||
+		strings.Contains(request.Input[0].Text, "q1234567") || strings.Contains(request.Input[0].Text, `"reference_task_id"`) {
+		t.Fatalf("model input exposed an unavailable reference: request=%+v err=%v", request, err)
+	}
+	for _, action := range []string{"update", "status", "stop"} {
+		decision := ParseConversationRouteDecisionForContext(`{"action":"`+action+`","task_id":"q1234567","question":""}`, value)
+		if decision.Action != ConversationRouteClarify || decision.Question != UnavailableRouteReferenceMessage || decision.TaskID != "" {
+			t.Fatalf("unavailable control was accepted: action=%s decision=%+v", action, decision)
+		}
+	}
+	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteNew {
+		t.Fatalf("new work was not allowed: %+v", decision)
+	}
+	value.Candidates = []ConversationRouteCandidate{{TaskID: value.ReferenceTaskID, InitiatorID: value.ActorID, Status: task.StatusWaitingUser}}
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("unavailable Task leaked through the candidate list: %v", err)
+	}
+	value.Candidates = nil
+	value.ReferenceTaskID = ""
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("unavailable flag without a reference was accepted: %v", err)
+	}
+}

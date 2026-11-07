@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./client";
-import { ERROR_MESSAGES, errorMessage } from "./errors";
+import { ERROR_MESSAGES, errorMessage, modelCheckErrorMessage } from "./errors";
 
 const contractFixture = JSON.parse(readFileSync(
   resolve(process.cwd(), "../../server/openapi/fixtures/morde-client-v1.json"), "utf8",
@@ -33,5 +33,12 @@ describe("portal error messages", () => {
 
   it("shows a readable message when the browser cannot reach the API", () => {
     expect(errorMessage(new TypeError("Failed to fetch"))).toBe("网络连接失败，请检查网络后重试");
+  });
+
+  it("distinguishes model budget and connection errors from host errors", () => {
+    expect(modelCheckErrorMessage(new ApiError({ code: "quota_exceeded", status: 409, message: "quota exceeded" })))
+      .toBe("模型调用额度不足或尚未配置，请在管理后台检查账号的模型预算。");
+    expect(modelCheckErrorMessage(new ApiError({ code: "upstream_error", status: 502, message: "upstream error", details: { reason: "transport" } })))
+      .toBe("无法连接模型服务，请检查网络或代理设置。");
   });
 });

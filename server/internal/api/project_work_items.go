@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -13,10 +14,11 @@ import (
 )
 
 type projectWorkItemRoutesService interface {
-	List(context.Context, identity.Principal, string, app.PageRequest) (app.ProjectWorkItemPage, error)
-	Get(context.Context, identity.Principal, string, string) (project.WorkItem, error)
+	List(context.Context, identity.Principal, string, bool, app.PageRequest) (app.ProjectWorkItemPage, error)
+	Get(context.Context, identity.Principal, string, string, bool) (project.WorkItem, error)
 	Create(context.Context, identity.Principal, string, app.CreateProjectWorkItemCommand) (project.WorkItem, bool, error)
 	Assign(context.Context, identity.Principal, string, string, string, int64, string) (project.WorkItem, error)
+	Claim(context.Context, identity.Principal, string, string, int64, string) (project.WorkItem, error)
 	Block(context.Context, identity.Principal, string, string, string, int64, string) (project.WorkItem, error)
 	Resume(context.Context, identity.Principal, string, string, int64, string) (project.WorkItem, error)
 	LinkTask(context.Context, identity.Principal, string, string, string, int64, string) (project.WorkItem, error)
@@ -29,7 +31,8 @@ type projectWorkItemResponse struct {
 	Title              string                           `json:"title"`
 	Description        string                           `json:"description"`
 	AcceptanceCriteria []string                         `json:"acceptance_criteria"`
-	AssigneeID         string                           `json:"assignee_id"`
+	Category           project.WorkItemCategory         `json:"category"`
+	AssigneeID         *string                          `json:"assignee_id"`
 	State              project.WorkItemState            `json:"state"`
 	BlockedReason      string                           `json:"blocked_reason"`
 	TaskIDs            []string                         `json:"task_ids"`
@@ -49,10 +52,12 @@ type projectWorkItemPageResponse struct {
 }
 
 type createProjectWorkItemRequest struct {
-	Title              string   `json:"title"`
-	Description        string   `json:"description"`
-	AcceptanceCriteria []string `json:"acceptance_criteria"`
-	AssigneeID         string   `json:"assignee_id"`
+	Title              string                   `json:"title"`
+	Description        string                   `json:"description"`
+	AcceptanceCriteria []string                 `json:"acceptance_criteria"`
+	Category           project.WorkItemCategory `json:"category"`
+	AssigneeID         string                   `json:"assignee_id"`
+	Unassigned         bool                     `json:"unassigned"`
 }
 
 type assignProjectWorkItemRequest struct {
@@ -101,7 +106,11 @@ func RegisterProjectWorkItemRoutes(group *gin.RouterGroup, service projectWorkIt
 		if !ok {
 			return
 		}
-		result, err := service.List(c.Request.Context(), principal, projectID, page)
+		includeUnassigned, ok := projectWorkItemIncludeUnassigned(c)
+		if !ok {
+			return
+		}
+		result, err := service.List(c.Request.Context(), principal, projectID, includeUnassigned, page)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -127,7 +136,7 @@ func RegisterProjectWorkItemRoutes(group *gin.RouterGroup, service projectWorkIt
 		}
 		item, replay, err := service.Create(c.Request.Context(), principal, projectID, app.CreateProjectWorkItemCommand{
 			Title: request.Title, Description: request.Description, AcceptanceCriteria: request.AcceptanceCriteria,
-			AssigneeID: request.AssigneeID, IdempotencyKey: key,
+			Category: request.Category, AssigneeID: request.AssigneeID, Unassigned: request.Unassigned, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)
@@ -144,7 +153,11 @@ func RegisterProjectWorkItemRoutes(group *gin.RouterGroup, service projectWorkIt
 		if !ok {
 			return
 		}
-		item, err := service.Get(c.Request.Context(), principal, projectID, itemID)
+		includeUnassigned, ok := projectWorkItemIncludeUnassigned(c)
+		if !ok {
+			return
+		}
+		item, err := service.Get(c.Request.Context(), principal, projectID, itemID, includeUnassigned)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -169,6 +182,30 @@ func RegisterProjectWorkItemRoutes(group *gin.RouterGroup, service projectWorkIt
 			return
 		}
 		item, err := service.Assign(c.Request.Context(), principal, projectID, itemID, request.AssigneeID, *request.ExpectedVersion, key)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, projectWorkItemToResponse(item))
+	})
+	group.POST("/projects/:id/work-items/:work_item_id/claim", func(c *gin.Context) {
+		principal, projectID, itemID, ok := projectWorkItemPrincipalProjectAndItemID(c)
+		if !ok {
+			return
+		}
+		var request projectWorkItemVersionRequest
+		if !decodeStrictJSON(c, &request) {
+			return
+		}
+		if request.ExpectedVersion == nil {
+			writeError(c, domain.InvalidArgument("expected_version", "work item version is required"))
+			return
+		}
+		key, ok := requiredIdempotencyKey(c)
+		if !ok {
+			return
+		}
+		item, err := service.Claim(c.Request.Context(), principal, projectID, itemID, *request.ExpectedVersion, key)
 		if err != nil {
 			writeError(c, err)
 			return
@@ -300,10 +337,31 @@ func projectWorkItemPrincipalProjectAndItemID(c *gin.Context) (identity.Principa
 	return principal, projectID, itemID, true
 }
 
+func projectWorkItemIncludeUnassigned(c *gin.Context) (bool, bool) {
+	raw, present := c.GetQuery("include_unassigned")
+	if !present {
+		return false, true
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		writeError(c, domain.InvalidArgument("include_unassigned", "include_unassigned must be a boolean"))
+		return false, false
+	}
+	return value, true
+}
+
 func projectWorkItemToResponse(value project.WorkItem) projectWorkItemResponse {
+	var assigneeID *string
+	if value.AssigneeID != "" {
+		assigneeID = &value.AssigneeID
+	}
+	category := value.Category
+	if category == "" {
+		category = project.WorkItemCategoryUnclassified
+	}
 	response := projectWorkItemResponse{
 		ID: value.ID, ProjectID: value.ProjectID, Title: value.Title, Description: value.Description,
-		AcceptanceCriteria: append([]string{}, value.AcceptanceCriteria...), AssigneeID: value.AssigneeID,
+		AcceptanceCriteria: append([]string{}, value.AcceptanceCriteria...), Category: category, AssigneeID: assigneeID,
 		State: value.State, BlockedReason: value.BlockedReason, TaskIDs: append([]string{}, value.TaskIDs...), Version: value.Version,
 	}
 	if value.Delivery != nil {

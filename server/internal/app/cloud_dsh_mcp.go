@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -29,6 +32,23 @@ type cloudDSHMCPOutput struct {
 	Text               []string        `json:"text"`
 }
 
+type cloudDSHMCPExecutionSource struct {
+	connectorOwnerID    string
+	connectorID         string
+	connectorName       string
+	connectorRevision   int64
+	credentialVersion   int64
+	grantVersion        int64
+	projectID           string
+	projectGrantVersion int64
+	scope               identity.Scope
+	endpoint            string
+	remoteTool          string
+	taskContextLimit    int
+	client              MCPConnectorToolClient
+	headers             func(context.Context) (http.Header, error)
+}
+
 func (b *CloudDSHToolBroker) currentServerTask(ctx context.Context, claimed task.Task) (TaskDetails, error) {
 	details, err := b.currentTaskDetails(ctx, claimed)
 	if err != nil {
@@ -40,92 +60,6 @@ func (b *CloudDSHToolBroker) currentServerTask(ctx context.Context, claimed task
 	return details, nil
 }
 
-func (b *CloudDSHToolBroker) mcpDefinitions(ctx context.Context, claimed task.Task) ([]AgentToolDefinition, error) {
-	if b.mcpClient == nil || b.mcpCredentials == nil {
-		return nil, nil
-	}
-	grants, ok := b.store.(TaskMCPConnectorGrantStore)
-	if !ok {
-		return nil, domain.NewError(domain.CodeUnsupported, "task MCP connector grants are unavailable")
-	}
-	connectors, ok := b.store.(MCPConnectorStore)
-	if !ok {
-		return nil, domain.NewError(domain.CodeUnsupported, "MCP connector storage is unavailable")
-	}
-	details, err := b.currentServerTask(ctx, claimed)
-	if err != nil {
-		return nil, err
-	}
-	grantsForTask, err := grants.ListTaskMCPConnectorGrants(ctx, details.Task.OwnerID, details.Task.ID)
-	if err != nil {
-		return nil, err
-	}
-	principal := identity.Principal{Kind: identity.Kind(details.Task.Authorization.Kind), Scopes: agentScopeSnapshot(details.Task.Authorization.Scopes)}
-	result := make([]AgentToolDefinition, 0)
-	for _, grant := range grantsForTask {
-		if grant.RevokedAt != nil {
-			continue
-		}
-		if !principal.HasScope(identity.ScopeMCPControl) {
-			return nil, domain.NewError(domain.CodeForbidden, "task authorization does not allow MCP connector tools")
-		}
-		if grant.TaskID != details.Task.ID || grant.OwnerID != details.Task.OwnerID || !domain.ValidUserID(grant.ConnectorOwnerID) ||
-			!domain.ValidMCPConnectorID(grant.ConnectorID) ||
-			grant.ConnectorRevision < 1 || grant.CredentialVersion < 0 || grant.GrantVersion < 1 {
-			return nil, domain.NewError(domain.CodeInternal, "stored MCP connector grant is invalid")
-		}
-		if err := authorizeTaskMCPProjectConnector(ctx, b.store, details.Task, grant); err != nil {
-			return nil, err
-		}
-		connector, err := connectors.GetMCPConnector(ctx, grant.ConnectorOwnerID, grant.ConnectorID)
-		if err != nil {
-			return nil, err
-		}
-		if !connector.Enabled || connector.Revision != grant.ConnectorRevision || connector.CredentialVersion != grant.CredentialVersion {
-			return nil, domain.NewError(domain.CodeConflict, "MCP connector changed after this task was authorized")
-		}
-		headers, err := b.mcpCredentials.CredentialHeaders(ctx, connector)
-		if err != nil {
-			return nil, err
-		}
-		if err := authorizeTaskMCPProjectConnector(ctx, b.store, details.Task, grant); err != nil {
-			return nil, err
-		}
-		remoteTools, err := b.mcpClient.ListTools(ctx, connector.EndpointURL, headers)
-		if err != nil {
-			return nil, domain.NewError(domain.CodeUpstreamError, "MCP connector tools could not be loaded")
-		}
-		// Discovery crosses the network boundary after the first authorization
-		// check. Recheck before pinning or exposing the returned tool catalog.
-		if err := authorizeTaskMCPProjectConnector(ctx, b.store, details.Task, grant); err != nil {
-			return nil, err
-		}
-		encoded, digest, err := canonicalMCPToolSchema(remoteTools)
-		if err != nil {
-			return nil, domain.NewError(domain.CodeUpstreamError, "MCP connector returned an invalid tool catalog")
-		}
-		if len(grant.ToolSchema) == 0 {
-			grant, err = grants.SetTaskMCPConnectorToolSchema(ctx, grant.OwnerID, grant.TaskID, grant.ConnectorID, grant.GrantVersion, encoded, digest)
-			if err != nil {
-				return nil, err
-			}
-		} else if err := validateTaskMCPConnectorToolSchema(grant.ToolSchema, grant.ToolSchemaSHA256); err != nil ||
-			!bytes.Equal(grant.ToolSchema, encoded) || !bytes.Equal(grant.ToolSchemaSHA256, digest) {
-			return nil, domain.NewError(domain.CodeConflict, "MCP connector tool catalog changed after this task was authorized")
-		}
-		for _, tool := range remoteTools {
-			alias := cloudDSHMCPToolName(grant.ConnectorID, tool.Name)
-			result = append(result, AgentToolDefinition{
-				ModelTool: ModelTool{
-					Name: alias, Description: cloudDSHMCPToolDescription(connector.Name, tool), Parameters: append(json.RawMessage(nil), tool.InputSchema...),
-				},
-				RequiredScope: identity.ScopeMCPControl, MCPConnectorID: grant.ConnectorID, MCPRemoteToolName: tool.Name,
-			})
-		}
-	}
-	return result, nil
-}
-
 func canonicalMCPToolSchema(tools []MCPConnectorToolDefinition) ([]byte, []byte, error) {
 	if len(tools) > 256 {
 		return nil, nil, errors.New("MCP tool catalog exceeds its limit")
@@ -134,7 +68,7 @@ func canonicalMCPToolSchema(tools []MCPConnectorToolDefinition) ([]byte, []byte,
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
 	for index := range tools {
 		tool := &tools[index]
-		if tool.Name == "" || len(tool.Name) > 128 || !validUTF8(tool.Name) || len(tool.Description) > 4096 || !validUTF8(tool.Description) ||
+		if tool.Name == "" || len(tool.Name) > 128 || !validUTF8(tool.Name) || strings.IndexFunc(tool.Name, unicode.IsControl) >= 0 || len(tool.Description) > 4096 || !validUTF8(tool.Description) ||
 			!validAgentJSONObject(tool.InputSchema, 64<<10) || index > 0 && tools[index-1].Name == tool.Name {
 			return nil, nil, errors.New("MCP tool definition is invalid")
 		}
@@ -143,6 +77,11 @@ func canonicalMCPToolSchema(tools []MCPConnectorToolDefinition) ([]byte, []byte,
 		var schema any
 		if decoder.Decode(&schema) != nil {
 			return nil, nil, errors.New("MCP tool schema is invalid")
+		}
+		if object, ok := schema.(map[string]any); ok && object["type"] == "object" {
+			if _, declared := object["additionalProperties"]; !declared {
+				object["additionalProperties"] = false
+			}
 		}
 		canonical, err := json.Marshal(schema)
 		if err != nil {
@@ -163,27 +102,12 @@ func cloudDSHMCPToolName(connectorID, remoteName string) string {
 	return cloudDSHMCPToolPrefix + connectorID + "_" + hex.EncodeToString(digest[:6])
 }
 
-func cloudDSHMCPToolDescription(connectorName string, tool MCPConnectorToolDefinition) string {
-	description := "MCP connector " + connectorName + ": " + tool.Name
-	if strings.TrimSpace(tool.Description) != "" {
-		description += ". " + strings.TrimSpace(tool.Description)
-	}
-	if len(description) > 4096 {
-		description = description[:4096]
-		for !validUTF8(description) {
-			description = description[:len(description)-1]
-		}
-	}
-	return description
-}
-
 func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails, call ModelToolCall, arguments json.RawMessage,
 	definition AgentToolDefinition, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	current := details.Task
 	grantStore, grantsOK := b.store.(TaskMCPConnectorGrantStore)
 	connectorStore, connectorsOK := b.store.(MCPConnectorStore)
-	operationStore, operationsOK := b.store.(MCPConnectorOperationStore)
-	if !grantsOK || !connectorsOK || !operationsOK {
+	if !grantsOK || !connectorsOK {
 		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "MCP connector execution storage is unavailable")
 	}
 	principal := identity.Principal{Kind: identity.Kind(current.Authorization.Kind), Scopes: agentScopeSnapshot(current.Authorization.Scopes)}
@@ -191,7 +115,6 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		!domain.ValidMCPConnectorID(definition.MCPConnectorID) || definition.MCPRemoteToolName == "" {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow this MCP connector tool")
 	}
-	actorID := taskActorID(current)
 	grants, err := grantStore.ListTaskMCPConnectorGrants(ctx, current.OwnerID, current.ID)
 	if err != nil {
 		return AgentToolResult{}, err
@@ -220,6 +143,355 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	if _, err := definitionForPinnedMCPTool(grant.ToolSchema, grant.ConnectorID, call.Name, definition.MCPRemoteToolName); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "MCP connector tool is not in this task's authorized catalog")
 	}
+	source := cloudDSHMCPExecutionSource{
+		connectorOwnerID: grant.ConnectorOwnerID, connectorID: grant.ConnectorID, connectorName: connector.Name,
+		connectorRevision: grant.ConnectorRevision, credentialVersion: grant.CredentialVersion,
+		grantVersion: grant.GrantVersion, projectID: grant.ProjectID, projectGrantVersion: grant.ProjectGrantVersion,
+		scope: identity.ScopeMCPControl, endpoint: connector.EndpointURL,
+		remoteTool: definition.MCPRemoteToolName, client: b.mcpClient,
+		headers: func(ctx context.Context) (http.Header, error) {
+			return b.mcpCredentials.CredentialHeaders(ctx, connector)
+		},
+	}
+	if result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source); handled || err != nil {
+		return result, err
+	}
+	return b.executeMCPSource(ctx, details, call, arguments, source, recovering, checkpointOutput)
+}
+
+func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskDetails, call ModelToolCall,
+	arguments json.RawMessage, source cloudDSHMCPExecutionSource) (AgentToolResult, bool, error) {
+	current := details.Task
+	hash, err := cloudDSHMCPApprovalHash(current, call, arguments, source)
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	fence := cloudDSHMCPApprovalFence(source)
+	request := AgentToolRequest{
+		Task: current, Call: call, Arguments: arguments, OperationKey: agentOperationKey(call.CallID),
+		RequiredScope: source.scope, Fence: fence,
+	}
+	pending := details.PendingRequest
+	sameApproval := sameMCPConnectorApproval(pending, current, call, hash, fence)
+	if pending != nil && pending.Status == task.PendingRequestPending {
+		result, err := b.pauseForExistingMCPApproval(ctx, details, pending)
+		return result, true, err
+	}
+	if sameApproval {
+		switch pending.Status {
+		case task.PendingRequestApproved:
+			if pending.Decision != task.PendingDecisionApprove {
+				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+				return result, true, err
+			}
+			return AgentToolResult{}, false, nil
+		case task.PendingRequestRejected:
+			if pending.Decision != task.PendingDecisionReject {
+				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+				return result, true, err
+			}
+			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+				"External MCP action rejected", "The connected service was not called.")
+			if err != nil {
+				return AgentToolResult{}, true, err
+			}
+			result, err := b.rejectApprovedToolCall(ctx, current, step, cloneTaskUsage(current.Usage), request)
+			return result, true, err
+		default:
+			result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+			return result, true, err
+		}
+	}
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+		"Approve external MCP action: "+source.remoteTool, "Waiting for approval before calling the connected service.")
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	preparation := AgentToolPreparation{
+		Status: AgentToolApprovalRequired, Approval: cloudDSHMCPApprovalRequest(source, arguments, hash), Fence: fence,
+	}
+	result, err := b.pauseForApproval(ctx, current, step, cloneTaskUsage(current.Usage), request, hash, preparation, pending)
+	return result, true, err
+}
+
+func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, details TaskDetails, pending *task.PendingRequest) (AgentToolResult, error) {
+	current := details.Task
+	step, err := newAgentStep(details.Task.ID, maxStepSequence(details.Steps)+1, "tool", task.StepWaitingUser,
+		"Approval required: "+pending.ToolName, pending.Content)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if err := b.commitProgress(ctx, current, step, cloneTaskUsage(current.Usage), task.StatusWaitingUser,
+		"approval_required", "task.waiting_user", AgentApprovalRequest{Object: pending.Object, Content: pending.Content, Impact: pending.Impact}); err != nil {
+		return AgentToolResult{}, err
+	}
+	return AgentToolResult{Status: AgentToolNeedsUser}, nil
+}
+
+func cloudDSHMCPApprovalHash(current task.Task, call ModelToolCall, arguments json.RawMessage, source cloudDSHMCPExecutionSource) ([]byte, error) {
+	encoded, err := json.Marshal(struct {
+		TaskID              string          `json:"task_id"`
+		OwnerID             string          `json:"owner_id"`
+		CallID              string          `json:"call_id"`
+		ToolAlias           string          `json:"tool_alias"`
+		ConnectorOwnerID    string          `json:"connector_owner_id"`
+		ConnectorID         string          `json:"connector_id"`
+		ConnectorRevision   int64           `json:"connector_revision"`
+		CredentialVersion   int64           `json:"credential_version"`
+		GrantVersion        int64           `json:"grant_version"`
+		ProjectID           string          `json:"project_id"`
+		ProjectGrantVersion int64           `json:"project_grant_version"`
+		RemoteTool          string          `json:"remote_tool"`
+		Arguments           json.RawMessage `json:"arguments"`
+	}{
+		TaskID: current.ID, OwnerID: current.OwnerID, CallID: call.CallID, ToolAlias: call.Name,
+		ConnectorOwnerID: source.connectorOwnerID, ConnectorID: source.connectorID,
+		ConnectorRevision: source.connectorRevision, CredentialVersion: source.credentialVersion,
+		GrantVersion: source.grantVersion, ProjectID: source.projectID, ProjectGrantVersion: source.projectGrantVersion,
+		RemoteTool: source.remoteTool, Arguments: arguments,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode exact MCP approval request: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return digest[:], nil
+}
+
+func cloudDSHMCPApprovalFence(source cloudDSHMCPExecutionSource) AgentHostFence {
+	// Reuse the pending-request fence slots for the connector revision and task grant version.
+	// The approval hash also binds connector ownership, credential/project grants, tool, and arguments.
+	return AgentHostFence{
+		RuntimeGeneration: source.connectorRevision, RuntimeInstanceID: "mcp-connector:" + source.connectorID,
+		ControlVersion: source.grantVersion, AIAllowed: true,
+	}
+}
+
+func cloudDSHMCPApprovalRequest(source cloudDSHMCPExecutionSource, arguments json.RawMessage, requestHash []byte) AgentApprovalRequest {
+	argumentPreview := cloudDSHMCPApprovalArgumentPreview(arguments)
+	return AgentApprovalRequest{
+		Object:  fmt.Sprintf("External MCP connector %s (%s)", source.connectorName, source.connectorID),
+		Content: fmt.Sprintf("Run tool %q with arguments %s? Request fingerprint: %s", source.remoteTool, argumentPreview, hex.EncodeToString(requestHash)),
+		Impact:  "This may read or change data in the connected external service. Approval is limited to this task, connector version, tool, and exact arguments.",
+	}
+}
+
+func cloudDSHMCPApprovalArgumentPreview(arguments json.RawMessage) string {
+	decoder := json.NewDecoder(bytes.NewReader(arguments))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "unavailable"
+	}
+	hasRedactions := redactMCPApprovalArguments(value)
+	if object, ok := value.(map[string]any); ok {
+		return cloudDSHMCPApprovalObjectPreview(object, hasRedactions)
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "unavailable"
+	}
+	const previewLimit = 240
+	preview := string(encoded)
+	if hasRedactions {
+		preview = "Sensitive values: [redacted]; arguments: " + preview
+	}
+	if utf8.RuneCountInString(preview) > previewLimit {
+		return truncateAgentRunes(preview, previewLimit-1) + "…"
+	}
+	return preview
+}
+
+func cloudDSHMCPApprovalObjectPreview(value map[string]any, hasRedactions bool) string {
+	const (
+		previewLimit    = 240
+		fieldValueLimit = 32
+	)
+	keyFieldsLimit := 190
+	if hasRedactions {
+		keyFieldsLimit = 165
+	}
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	type keyField struct {
+		name     string
+		value    any
+		priority int
+	}
+	fields := make([]keyField, 0, len(keys))
+	other := make(map[string]any, len(value))
+	for _, key := range keys {
+		if priority, ok := cloudDSHMCPApprovalFieldPriority(key); ok {
+			fields = append(fields, keyField{name: key, value: value[key], priority: priority})
+			continue
+		}
+		other[key] = value[key]
+	}
+	if len(fields) == 0 {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "unavailable"
+		}
+		if hasRedactions {
+			encoded = append([]byte("Sensitive values: [redacted]; arguments: "), encoded...)
+		}
+		if utf8.RuneCount(encoded) > previewLimit {
+			return truncateAgentRunes(string(encoded), previewLimit-1) + "…"
+		}
+		return string(encoded)
+	}
+	sort.SliceStable(fields, func(i, j int) bool { return fields[i].priority < fields[j].priority })
+
+	var summary strings.Builder
+	summary.WriteString("Key fields: {")
+	for _, field := range fields {
+		encodedValue, err := json.Marshal(field.value)
+		if err != nil {
+			continue
+		}
+		valuePreview := string(encodedValue)
+		if utf8.RuneCount(encodedValue) > fieldValueLimit {
+			if text, ok := field.value.(string); ok {
+				text = truncateAgentRunes(text, fieldValueLimit-3) + "…"
+				encodedValue, _ = json.Marshal(text)
+				valuePreview = string(encodedValue)
+			} else {
+				valuePreview = `"` + truncateAgentRunes(valuePreview, fieldValueLimit-2) + "…\""
+			}
+		}
+		separator := ""
+		if summary.Len() > len("Key fields: {") {
+			separator = ", "
+		}
+		entry := separator + `"` + field.name + `":` + valuePreview
+		remaining := keyFieldsLimit - utf8.RuneCountInString(summary.String()) - 1
+		if utf8.RuneCountInString(entry) > remaining {
+			valueBudget := remaining - utf8.RuneCountInString(separator) - utf8.RuneCountInString(field.name) - 3
+			if valueBudget < 2 {
+				break
+			}
+			valuePreview = `"` + truncateAgentRunes(valuePreview, valueBudget-1) + "…\""
+			entry = separator + `"` + field.name + `":` + valuePreview
+		}
+		if utf8.RuneCountInString(entry) > remaining {
+			break
+		}
+		summary.WriteString(entry)
+	}
+	summary.WriteByte('}')
+	preview := summary.String()
+	if hasRedactions {
+		preview += "; sensitive values: [redacted]"
+	}
+	if len(other) > 0 {
+		encodedOther, err := json.Marshal(other)
+		if err == nil {
+			const otherArgsLabel = "; other arguments: "
+			remaining := previewLimit - utf8.RuneCountInString(preview) - utf8.RuneCountInString(otherArgsLabel)
+			if remaining > 0 {
+				preview += otherArgsLabel + truncateAgentRunes(string(encodedOther), remaining)
+			}
+		}
+	}
+	if utf8.RuneCountInString(preview) > previewLimit {
+		return truncateAgentRunes(preview, previewLimit-1) + "…"
+	}
+	return preview
+}
+
+func cloudDSHMCPApprovalFieldPriority(key string) (int, bool) {
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(key))
+	switch {
+	case strings.Contains(key, "amount"):
+		return 0, true
+	case strings.Contains(key, "currency"):
+		return 1, true
+	case strings.Contains(key, "project"):
+		return 2, true
+	case strings.Contains(key, "item") || strings.Contains(key, "product"):
+		return 3, true
+	case strings.Contains(key, "merchant") || strings.Contains(key, "vendor") || strings.Contains(key, "seller"):
+		return 4, true
+	case strings.Contains(key, "quantity") || key == "qty":
+		return 5, true
+	case strings.Contains(key, "total") || strings.Contains(key, "price"):
+		return 6, true
+	case strings.Contains(key, "booking") || strings.Contains(key, "reservation") || strings.Contains(key, "order"):
+		return 7, true
+	case strings.Contains(key, "checkin") || strings.Contains(key, "checkout") || strings.Contains(key, "date") || strings.Contains(key, "time"):
+		return 8, true
+	case key == "to" || strings.Contains(key, "recipient"):
+		return 9, true
+	case strings.Contains(key, "subject") || key == "title":
+		return 10, true
+	default:
+		return 0, false
+	}
+}
+
+func redactMCPApprovalArguments(value any) bool {
+	redacted := false
+	switch item := value.(type) {
+	case map[string]any:
+		for key, nested := range item {
+			if sensitiveMCPApprovalKey(key) {
+				item[key] = "[redacted]"
+				redacted = true
+				continue
+			}
+			redacted = redactMCPApprovalArguments(nested) || redacted
+		}
+	case []any:
+		for _, nested := range item {
+			redacted = redactMCPApprovalArguments(nested) || redacted
+		}
+	}
+	return redacted
+}
+
+func sensitiveMCPApprovalKey(key string) bool {
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+	return strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "password") ||
+		strings.Contains(key, "authorization") || strings.Contains(key, "apikey") || key == "cookie" ||
+		key == "card" || key == "creditcard" || key == "debitcard" || key == "pan" || key == "ccnumber" ||
+		strings.Contains(key, "cardnumber") || strings.Contains(key, "carddetails") || strings.Contains(key, "cardinfo") ||
+		strings.Contains(key, "cardcvv") || strings.Contains(key, "cardcvc") ||
+		strings.Contains(key, "cvv") || strings.Contains(key, "cvc") || strings.Contains(key, "securitycode") ||
+		strings.Contains(key, "cardverification") || strings.Contains(key, "paymentmethod") ||
+		strings.Contains(key, "paymentcredential")
+}
+
+func sameMCPConnectorApproval(pending *task.PendingRequest, current task.Task, call ModelToolCall, requestHash []byte, fence AgentHostFence) bool {
+	return pending != nil && pending.TaskID == current.ID && pending.Kind == "approval" && pending.CallID == call.CallID &&
+		pending.ToolName == call.Name && bytes.Equal(pending.RequestHash, requestHash) && samePendingApprovalFence(pending, fence)
+}
+
+func (b *CloudDSHToolBroker) failMCPApprovalMismatch(ctx context.Context, current task.Task, call ModelToolCall, steps []task.Step) (AgentToolResult, error) {
+	step, err := newAgentStep(current.ID, maxStepSequence(steps)+1, "tool", task.StepFailed,
+		"MCP approval no longer matches", "The external connector call changed after approval; it was not executed.")
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	result := AgentToolResult{Status: AgentToolFailed, Output: "The saved approval does not match this exact external MCP action. It was not executed."}
+	if err := b.commitProgress(ctx, current, step, cloneTaskUsage(current.Usage), task.StatusRunning, "", "task.step", map[string]any{
+		"tool": call.Name, "operation_status": result.Status, "approval_decision": "mismatch",
+	}); err != nil {
+		return AgentToolResult{}, err
+	}
+	return result, nil
+}
+
+func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskDetails, call ModelToolCall, arguments json.RawMessage,
+	source cloudDSHMCPExecutionSource, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
+	current := details.Task
+	actorID := taskActorID(current)
+	operationStore, ok := b.store.(MCPConnectorOperationStore)
+	if !ok || source.client == nil || source.headers == nil {
+		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "MCP connector execution storage is unavailable")
+	}
+	var err error
 	arguments, err = validateAgentToolArguments(string(arguments))
 	if err != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
@@ -229,14 +501,14 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		return AgentToolResult{}, err
 	}
 	key := agentOperationKey(call.CallID)
-	operation, lookupErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, grant.ConnectorID, key)
+	operation, lookupErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, source.connectorID, key)
 	hasOperation := lookupErr == nil
 	if lookupErr != nil && domain.CodeOf(lookupErr) != domain.CodeNotFound {
 		return AgentToolResult{}, lookupErr
 	}
-	if hasOperation && (operation.TaskID != current.ID || operation.OwnerID != current.OwnerID || operation.ConnectorID != grant.ConnectorID ||
+	if hasOperation && (operation.TaskID != current.ID || operation.OwnerID != current.OwnerID || operation.ConnectorID != source.connectorID ||
 		operation.Key != key || operation.ToolName != call.Name || !bytes.Equal(operation.RequestHash, hash[:]) ||
-		operation.ConnectorRevision != grant.ConnectorRevision || operation.CredentialVersion != grant.CredentialVersion || operation.GrantVersion != grant.GrantVersion ||
+		operation.ConnectorRevision != source.connectorRevision || operation.CredentialVersion != source.credentialVersion || operation.GrantVersion != source.grantVersion ||
 		!sameMCPConnectorOperationTaskSnapshot(operation, current)) {
 		step, stepErr := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
 			"Review MCP connector recovery", "The prior MCP connector operation does not match this exact request.")
@@ -275,7 +547,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		}
 		usage.ToolCalls++
 		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-			"tool": call.Name, "operation_key": key, "phase": "prepare", "scope": identity.ScopeMCPControl,
+			"tool": call.Name, "operation_key": key, "phase": "prepare", "scope": source.scope,
 		}); err != nil {
 			return AgentToolResult{}, err
 		}
@@ -286,9 +558,9 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		return AgentToolResult{}, fmt.Errorf("generate MCP connector operation ID: %w", err)
 	}
 	preparedFence := MCPConnectorOperation{
-		ID: operationID, TaskID: current.ID, OwnerID: current.OwnerID, ConnectorID: grant.ConnectorID, Key: key,
-		ToolName: call.Name, ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion,
-		GrantVersion: grant.GrantVersion, LeaseVersion: current.Lease.Version, HostID: current.HostID,
+		ID: operationID, TaskID: current.ID, OwnerID: current.OwnerID, ConnectorID: source.connectorID, Key: key,
+		ToolName: call.Name, ConnectorRevision: source.connectorRevision, CredentialVersion: source.credentialVersion,
+		GrantVersion: source.grantVersion, LeaseVersion: current.Lease.Version, HostID: current.HostID,
 		WorkspaceID: current.WorkspaceID, InputRevision: current.InputRevision,
 		WorkspaceCheckpointRevision: current.WorkspaceCheckpointRevision,
 		RequestHash:                 hash[:], Status: task.OperationPrepared,
@@ -317,7 +589,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	if recovering && hasOperation && !replayed {
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector operation disappeared during recovery.")
 	}
-	if operation.ID == "" || operation.TaskID != current.ID || operation.ConnectorID != grant.ConnectorID || operation.Key != key ||
+	if operation.ID == "" || operation.TaskID != current.ID || operation.ConnectorID != source.connectorID || operation.Key != key ||
 		operation.Status == task.OperationPrepared && operation.LeaseVersion != current.Lease.Version || !bytes.Equal(operation.RequestHash, hash[:]) ||
 		!sameMCPConnectorOperationTaskSnapshot(operation, current) || operation.BindingVersion != preparedFence.BindingVersion {
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The stored MCP connector operation does not match this request.")
@@ -354,12 +626,12 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	if operation.Status != task.OperationPrepared {
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector operation is not safe to dispatch.")
 	}
-	headers, err := b.mcpCredentials.CredentialHeaders(ctx, connector)
+	headers, err := source.headers(ctx)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
 	if _, err := operationStore.MarkMCPConnectorOperationDispatched(ctx, operation, current.Lease.Owner); err != nil {
-		if latest, getErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, grant.ConnectorID, key); getErr == nil &&
+		if latest, getErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, source.connectorID, key); getErr == nil &&
 			(latest.Status == task.OperationCancelled || latest.Status == task.OperationUnknown) {
 			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant changed before dispatch.", latest.Status)
 		}
@@ -368,19 +640,33 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		}
 		return AgentToolResult{}, err
 	}
-	remoteResult, callErr := b.mcpClient.CallTool(ctx, connector.EndpointURL, headers, definition.MCPRemoteToolName, arguments)
+	remoteResult, callErr := source.client.CallTool(ctx, source.endpoint, headers, source.remoteTool, arguments)
 	if callErr != nil {
-		if latest, getErr := operationStore.GetMCPConnectorOperation(context.WithoutCancel(ctx), current.OwnerID, current.ID, grant.ConnectorID, key); getErr == nil &&
+		if latest, getErr := operationStore.GetMCPConnectorOperation(context.WithoutCancel(ctx), current.OwnerID, current.ID, source.connectorID, key); getErr == nil &&
 			latest.CancelRequested {
 			if markErr := b.markMCPUnknown(ctx, current, operation, "MCP call ended after connector revocation."); markErr != nil {
 				return AgentToolResult{}, markErr
 			}
 			return b.pauseMCPNeedsUser(ctx, current, step, usage, key, "The connector grant or task was revoked while the MCP call was running.", task.OperationUnknown)
 		}
-		if markErr := b.markMCPUnknown(ctx, current, operation, "MCP call outcome could not be confirmed."); markErr != nil {
+		unknownReason := "MCP call outcome could not be confirmed."
+		unknownSummary := "The MCP connector result is unknown; the action will not be replayed."
+		builtinErrorCategory := ""
+		if source.connectorID == BuiltinSearchMCPConnectorID {
+			builtinErrorCategory = cloudDSHBuiltinSearchErrorCategory(ctx, callErr)
+			unknownReason = "MCP call outcome could not be confirmed (" + builtinErrorCategory + ")."
+			unknownSummary = "The MCP connector result is unknown (" + builtinErrorCategory + "); the action will not be replayed."
+		}
+		if markErr := b.markMCPUnknown(ctx, current, operation, unknownReason); markErr != nil {
+			if source.connectorID == BuiltinSearchMCPConnectorID {
+				return AgentToolResult{}, fmt.Errorf("built-in web tool outcome could not be recorded (%s): %w", builtinErrorCategory, markErr)
+			}
 			return AgentToolResult{}, errors.Join(callErr, markErr)
 		}
-		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector result is unknown; the action will not be replayed.")
+		return b.pauseMCPUnknown(ctx, current, step, usage, key, unknownSummary)
+	}
+	if source.connectorID == BuiltinSearchMCPConnectorID && remoteResult.IsError {
+		remoteResult = cloudDSHBuiltinSearchSafeErrorResult()
 	}
 	output, err := encodeCloudDSHMCPOutput(remoteResult)
 	if err != nil {
@@ -388,6 +674,15 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 			return AgentToolResult{}, errors.Join(err, markErr)
 		}
 		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector result exceeded its durable output limit.")
+	}
+	if source.taskContextLimit > 0 {
+		output, err = boundCloudDSHMCPContextOutput(output, source.taskContextLimit)
+		if err != nil {
+			if markErr := b.markMCPUnknown(ctx, current, operation, "MCP result could not be bounded for task context."); markErr != nil {
+				return AgentToolResult{}, errors.Join(err, markErr)
+			}
+			return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector result could not be bounded for task context.")
+		}
 	}
 	operationStatus := task.OperationSucceeded
 	resultStatus := AgentToolSucceeded
@@ -398,7 +693,7 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	completed, completeErr := operationStore.CompleteMCPConnectorOperation(persistCtx, operation, current.Lease.Owner, operationStatus, output)
 	cancel()
 	if completeErr != nil {
-		latest, getErr := operationStore.GetMCPConnectorOperation(context.WithoutCancel(ctx), current.OwnerID, current.ID, grant.ConnectorID, key)
+		latest, getErr := operationStore.GetMCPConnectorOperation(context.WithoutCancel(ctx), current.OwnerID, current.ID, source.connectorID, key)
 		if getErr == nil && latest.Status == operationStatus && latest.Result == output {
 			// The commit may have succeeded even if its confirmation was lost.
 			completed = latest
@@ -428,6 +723,57 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		return AgentToolResult{Status: AgentToolUnknown}, ctx.Err()
 	}
 	return b.commitMCPResult(ctx, current, step, usage, call.Name, AgentToolResult{Status: resultStatus, Output: output})
+}
+
+func boundCloudDSHMCPContextOutput(output string, limit int) (string, error) {
+	if !utf8.ValidString(output) || limit < 256 {
+		return "", errors.New("MCP task context limit is invalid")
+	}
+	if len(output) <= limit {
+		return output, nil
+	}
+	var value cloudDSHMCPOutput
+	if json.Unmarshal([]byte(output), &value) != nil || len(value.Text) > 256 {
+		return "", errors.New("MCP task context output is invalid")
+	}
+	var content strings.Builder
+	for _, text := range value.Text {
+		if !utf8.ValidString(text) {
+			return "", errors.New("MCP task context text is invalid")
+		}
+		if content.Len() > 0 {
+			content.WriteByte('\n')
+		}
+		content.WriteString(text)
+	}
+	if len(value.StructuredContent) > 0 {
+		if content.Len() > 0 {
+			content.WriteByte('\n')
+		}
+		content.Write(value.StructuredContent)
+	}
+	body := content.String()
+	runes := []rune(body)
+	const marker = "\n[page content truncated for task context]"
+	low, high := 0, len(runes)
+	best := ""
+	for low <= high {
+		mid := (low + high) / 2
+		candidate, err := json.Marshal(cloudDSHMCPOutput{IsError: value.IsError, UnsupportedContent: value.UnsupportedContent, Text: []string{string(runes[:mid]) + marker}})
+		if err != nil {
+			return "", errors.New("MCP task context output cannot be encoded")
+		}
+		if len(candidate) <= limit {
+			best = string(candidate)
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	if best == "" {
+		return "", errors.New("MCP task context limit is too small")
+	}
+	return best, nil
 }
 
 func taskActorID(value task.Task) string {
@@ -565,7 +911,7 @@ func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.T
 		step.Status, step.Summary = task.StepFailed, "The MCP connector reported a definitive tool error."
 	}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": name, "operation_status": result.Status, "output": result.Output,
+		"tool": name, "operation_status": result.Status,
 	}); err != nil {
 		return AgentToolResult{}, err
 	}

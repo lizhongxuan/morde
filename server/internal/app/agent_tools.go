@@ -198,6 +198,11 @@ type AgentVerifiedArtifact struct {
 const maxAgentVerifiedArtifacts = 64
 
 func agentOperationKey(callID string) string {
+	return AgentOperationKey(callID)
+}
+
+// AgentOperationKey returns the stable operation key for a provider tool-call ID.
+func AgentOperationKey(callID string) string {
 	sum := sha256.Sum256([]byte(callID))
 	return "agent:" + hex.EncodeToString(sum[:])
 }
@@ -360,11 +365,13 @@ func validateAgentTools(tools []AgentToolDefinition) (map[string]AgentToolDefini
 		}
 		switch tool.RequiredScope {
 		case identity.ScopeMCPControl:
-			if !domain.ValidMCPConnectorID(tool.MCPConnectorID) || tool.MCPRemoteToolName == "" || len(tool.MCPRemoteToolName) > 128 ||
-				!utf8.ValidString(tool.MCPRemoteToolName) || strings.IndexFunc(tool.MCPRemoteToolName, unicode.IsControl) >= 0 {
+			fixedSelectionTool := (tool.Name == cloudDSHMCPDiscoverToolName || tool.Name == cloudDSHMCPCallToolName) &&
+				tool.MCPConnectorID == "" && tool.MCPRemoteToolName == ""
+			if !fixedSelectionTool && (!domain.ValidMCPConnectorID(tool.MCPConnectorID) || tool.MCPRemoteToolName == "" || len(tool.MCPRemoteToolName) > 128 ||
+				!utf8.ValidString(tool.MCPRemoteToolName) || strings.IndexFunc(tool.MCPRemoteToolName, unicode.IsControl) >= 0) {
 				return nil, errors.New("invalid MCP connector tool definition")
 			}
-		case identity.ScopeTaskRead, identity.ScopeComputerObserve, identity.ScopeComputerOperate, identity.ScopeScheduleRead, identity.ScopeScheduleManage:
+		case identity.ScopeTaskRead, identity.ScopeTaskSubmit, identity.ScopeComputerObserve, identity.ScopeComputerOperate, identity.ScopeScheduleRead, identity.ScopeScheduleManage:
 			if tool.MCPConnectorID != "" || tool.MCPRemoteToolName != "" {
 				return nil, errors.New("non-MCP tool contains connector identity")
 			}
@@ -501,8 +508,4 @@ func agentScopeSnapshot(scopes []string) []identity.Scope {
 		result = append(result, identity.Scope(scope))
 	}
 	return result
-}
-
-func modelToolInput(call ModelToolCall) ModelInput {
-	return ModelInput{Type: "function_call", CallID: call.CallID, Name: call.Name, Arguments: call.Arguments}
 }

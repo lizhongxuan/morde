@@ -126,10 +126,6 @@ func TestNativeDesktopAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	chats, err := app.NewTaskChatCompatibilityService(tasks, conversations)
-	if err != nil {
-		t.Fatal(err)
-	}
 	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
 		Store: store, Executor: taskChatCompatTestExecutor{store: store}, WorkerID: "native-acceptance-task",
 		LeaseDuration: time.Minute, PollInterval: 100 * time.Millisecond,
@@ -193,7 +189,7 @@ func TestNativeDesktopAcceptance(t *testing.T) {
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients,
 		WorkspaceOps: workspaces, WorkspaceSync: syncService, Tokens: nativeAcceptanceTokens{tokens},
 		Notifications: notifications, ModelConnections: models, ModelGateway: modelGateway,
-		Tasks: tasks, Conversations: conversations, InstantChat: chats, Onboarding: onboarding,
+		Tasks: tasks, Conversations: conversations, Onboarding: onboarding,
 		Templates: nativeAcceptanceTemplates{}, MCPDisabled: true,
 	}, api.Options{
 		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 16 << 20,

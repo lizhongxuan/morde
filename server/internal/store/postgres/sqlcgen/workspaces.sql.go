@@ -14,7 +14,7 @@ import (
 const createWorkspace = `-- name: CreateWorkspace :one
 INSERT INTO workspaces (id, owner_id, name, state, revision, used_bytes, quota_bytes, last_error)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, owner_id, name, state, last_error, created_at, updated_at, deleted_at, revision, used_bytes, quota_bytes
+RETURNING id, owner_id, name, state, last_error, created_at, updated_at, deleted_at, revision, used_bytes, quota_bytes, is_read_only
 `
 
 type CreateWorkspaceParams struct {
@@ -52,6 +52,7 @@ func (q *Queries) CreateWorkspace(ctx context.Context, arg CreateWorkspaceParams
 		&i.Revision,
 		&i.UsedBytes,
 		&i.QuotaBytes,
+		&i.IsReadOnly,
 	)
 	return i, err
 }
@@ -137,7 +138,7 @@ func (q *Queries) GetPendingWorkspaceLegacyVolume(ctx context.Context, workspace
 }
 
 const getWorkspace = `-- name: GetWorkspace :one
-SELECT id, owner_id, name, state, last_error, created_at, updated_at, deleted_at, revision, used_bytes, quota_bytes FROM workspaces WHERE id = $1
+SELECT id, owner_id, name, state, last_error, created_at, updated_at, deleted_at, revision, used_bytes, quota_bytes, is_read_only FROM workspaces WHERE id = $1
 `
 
 func (q *Queries) GetWorkspace(ctx context.Context, id string) (Workspace, error) {
@@ -155,6 +156,7 @@ func (q *Queries) GetWorkspace(ctx context.Context, id string) (Workspace, error
 		&i.Revision,
 		&i.UsedBytes,
 		&i.QuotaBytes,
+		&i.IsReadOnly,
 	)
 	return i, err
 }
@@ -525,7 +527,7 @@ func (q *Queries) ListWorkspaceBindingsByWorkspace(ctx context.Context, workspac
 }
 
 const listWorkspacesByOwner = `-- name: ListWorkspacesByOwner :many
-SELECT id, owner_id, name, state, last_error, created_at, updated_at, deleted_at, revision, used_bytes, quota_bytes FROM workspaces WHERE owner_id = $1 AND state <> 'deleted' ORDER BY created_at DESC, id
+SELECT id, owner_id, name, state, last_error, created_at, updated_at, deleted_at, revision, used_bytes, quota_bytes, is_read_only FROM workspaces WHERE owner_id = $1 AND state <> 'deleted' ORDER BY created_at DESC, id
 `
 
 func (q *Queries) ListWorkspacesByOwner(ctx context.Context, ownerID string) ([]Workspace, error) {
@@ -549,6 +551,7 @@ func (q *Queries) ListWorkspacesByOwner(ctx context.Context, ownerID string) ([]
 			&i.Revision,
 			&i.UsedBytes,
 			&i.QuotaBytes,
+			&i.IsReadOnly,
 		); err != nil {
 			return nil, err
 		}

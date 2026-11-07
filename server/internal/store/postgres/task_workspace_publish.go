@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 func (s *Store) ReserveTaskWorkspacePublish(ctx context.Context, value app.TaskWorkspacePublishCommand) (app.TaskWorkspacePublishReceipt, error) {
@@ -22,11 +24,26 @@ func (s *Store) ReserveTaskWorkspacePublish(ctx context.Context, value app.TaskW
 	}
 	var receipt app.TaskWorkspacePublishReceipt
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		gate, err := requireOwnerExecutionEnabled(ctx, tx, value.OwnerID, nil)
+		if err := lockWorkspaceMutationFence(ctx, tx, value.WorkspaceID, false); err != nil {
+			return err
+		}
+		projectFence, err := lockProjectTaskWorkspaceFence(ctx, tx, value.TaskID, true)
 		if err != nil {
 			return err
 		}
-		var ownerID, hostID, status, leaseOwner string
+		if err := requireProjectWorkspacePublishCommand(value, projectFence); err != nil {
+			return err
+		}
+		actorID, expectedWorkspaceOwner := value.OwnerID, value.OwnerID
+		if projectFence.projectID != "" {
+			actorID, expectedWorkspaceOwner = projectFence.actorID, projectFence.workspaceOwnerID
+		}
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, actorID, nil)
+		if err != nil {
+			return err
+		}
+		var ownerID, status, leaseOwner string
+		var hostID pgtype.Text
 		var leaseVersion, executionEpoch int64
 		var leaseActive bool
 		var workspaceID pgtype.Text
@@ -37,6 +54,19 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			&ownerID, &hostID, &status, &leaseOwner, &leaseVersion, &leaseActive, &executionEpoch,
 			&workspaceID, &inputRevision, &checkpointRevision); err != nil {
 			return storeError("lock Task before Workspace publish reservation", "task", err)
+		}
+		if err := verifyProjectTaskWorkspaceFence(ctx, tx, value.TaskID, projectFence); err != nil {
+			return err
+		}
+		if err := requireProjectWorkspacePublishAgent(ctx, tx, value.TaskID, ownerID, projectFence); err != nil {
+			return err
+		}
+		if projectFence.projectID != "" && (status != string(task.StatusRunning) || leaseOwner != value.LeaseOwner ||
+			leaseVersion != value.LeaseVersion || !leaseActive || executionEpoch != gate.epoch) {
+			return taskLeaseConflict()
+		}
+		if !taskWorkspacePublishHostMatches(hostID, value.HostID) {
+			return missingTaskError()
 		}
 		existing, err := getTaskWorkspacePublishReceiptTx(ctx, tx, value, false)
 		if err == nil {
@@ -54,7 +84,7 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
 			return err
 		}
-		if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) {
+		if workspaceOwner != expectedWorkspaceOwner || workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
 		if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
@@ -63,7 +93,7 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := ensureNoWorkspaceSyncReceive(ctx, tx, value.WorkspaceID, ""); err != nil {
 			return err
 		}
-		if ownerID != value.OwnerID || hostID != value.HostID || executionEpoch != gate.epoch {
+		if ownerID != value.OwnerID || !taskWorkspacePublishHostMatches(hostID, value.HostID) || executionEpoch != gate.epoch {
 			return missingTaskError()
 		}
 		if status != string(task.StatusRunning) || leaseOwner != value.LeaseOwner || leaseVersion != value.LeaseVersion || !leaseActive {
@@ -88,6 +118,13 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending') ON CONFLICT (task_id, operation_key) DO NOT
 	return receipt, err
 }
 
+func taskWorkspacePublishHostMatches(storedHostID pgtype.Text, commandHostID string) bool {
+	if commandHostID == "" {
+		return !storedHostID.Valid
+	}
+	return storedHostID.Valid && storedHostID.String == commandHostID
+}
+
 func (s *Store) GetTaskWorkspacePublishReceipt(ctx context.Context, value app.TaskWorkspacePublishCommand) (app.TaskWorkspacePublishReceipt, error) {
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return app.TaskWorkspacePublishReceipt{}, err
@@ -106,7 +143,21 @@ func (s *Store) RejectTaskWorkspacePublishQuota(ctx context.Context, value app.T
 		return err
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		if _, err := requireOwnerExecutionEnabled(ctx, tx, value.OwnerID, nil); err != nil {
+		if err := lockWorkspaceMutationFence(ctx, tx, value.WorkspaceID, false); err != nil {
+			return err
+		}
+		projectFence, err := lockProjectTaskWorkspaceFence(ctx, tx, value.TaskID, true)
+		if err != nil {
+			return err
+		}
+		if err := requireProjectWorkspacePublishCommand(value, projectFence); err != nil {
+			return err
+		}
+		actorID := value.OwnerID
+		if projectFence.projectID != "" {
+			actorID = projectFence.actorID
+		}
+		if _, err := requireOwnerExecutionEnabled(ctx, tx, actorID, nil); err != nil {
 			return err
 		}
 		var ownerID string
@@ -115,6 +166,12 @@ func (s *Store) RejectTaskWorkspacePublishQuota(ctx context.Context, value app.T
 		}
 		if ownerID != value.OwnerID {
 			return missingTaskError()
+		}
+		if err := verifyProjectTaskWorkspaceFence(ctx, tx, value.TaskID, projectFence); err != nil {
+			return err
+		}
+		if err := requireProjectWorkspacePublishAgent(ctx, tx, value.TaskID, ownerID, projectFence); err != nil {
+			return err
 		}
 		receipt, err := getTaskWorkspacePublishReceiptTx(ctx, tx, value, true)
 		if err != nil {
@@ -152,12 +209,13 @@ func (s *Store) FindTaskWorkspacePublishReceipt(ctx context.Context, ownerID, ta
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var storedOwner, storedWorkspace string
 		var state string
+		var requestHash []byte
 		var baseRevision int64
 		var manifestSHA pgtype.Text
 		var publishedRevision pgtype.Int8
-		err := tx.QueryRow(ctx, `SELECT owner_id, workspace_id, base_revision, state, manifest_sha256, published_revision
+		err := tx.QueryRow(ctx, `SELECT owner_id, workspace_id, request_hash, base_revision, state, manifest_sha256, published_revision
 FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, taskID, operationKey).
-			Scan(&storedOwner, &storedWorkspace, &baseRevision, &state, &manifestSHA, &publishedRevision)
+			Scan(&storedOwner, &storedWorkspace, &requestHash, &baseRevision, &state, &manifestSHA, &publishedRevision)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return storeError("find Task Workspace publish receipt", "Task Workspace publish receipt", err)
 		}
@@ -167,7 +225,8 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, tas
 		if storedOwner != ownerID || storedWorkspace != workspaceID {
 			return domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
 		}
-		receipt = app.TaskWorkspacePublishReceipt{State: app.TaskWorkspacePublishState(state), WorkspaceID: storedWorkspace, BaseRevision: baseRevision}
+		receipt = app.TaskWorkspacePublishReceipt{State: app.TaskWorkspacePublishState(state), WorkspaceID: storedWorkspace,
+			BaseRevision: baseRevision, RequestHash: hex.EncodeToString(requestHash)}
 		if manifestSHA.Valid {
 			receipt.ManifestSHA256 = manifestSHA.String
 		}
@@ -201,7 +260,8 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock
 	if ownerID != value.OwnerID || workspaceID != value.WorkspaceID || baseRevision != value.BaseRevision || !equalOperationHash(requestHash, value.RequestHash) {
 		return app.TaskWorkspacePublishReceipt{}, idempotencyConflict()
 	}
-	receipt := app.TaskWorkspacePublishReceipt{State: app.TaskWorkspacePublishState(state), WorkspaceID: workspaceID, BaseRevision: baseRevision}
+	receipt := app.TaskWorkspacePublishReceipt{State: app.TaskWorkspacePublishState(state), WorkspaceID: workspaceID,
+		BaseRevision: baseRevision, RequestHash: hex.EncodeToString(requestHash)}
 	if manifestSHA.Valid {
 		receipt.ManifestSHA256 = manifestSHA.String
 	}
@@ -226,11 +286,26 @@ func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWo
 	var receipt app.TaskWorkspacePublishReceipt
 	var rejected error
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
-		gate, err := requireOwnerExecutionEnabled(ctx, tx, value.OwnerID, nil)
+		if err := lockWorkspaceMutationFence(ctx, tx, value.WorkspaceID, false); err != nil {
+			return err
+		}
+		projectFence, err := lockProjectTaskWorkspaceFence(ctx, tx, value.TaskID, true)
 		if err != nil {
 			return err
 		}
-		var ownerID, hostID, status, leaseOwner string
+		if err := requireProjectWorkspacePublishCommand(value, projectFence); err != nil {
+			return err
+		}
+		actorID, expectedWorkspaceOwner := value.OwnerID, value.OwnerID
+		if projectFence.projectID != "" {
+			actorID, expectedWorkspaceOwner = projectFence.actorID, projectFence.workspaceOwnerID
+		}
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, actorID, nil)
+		if err != nil {
+			return err
+		}
+		var ownerID, status, leaseOwner string
+		var hostID pgtype.Text
 		var leaseVersion, executionEpoch int64
 		var leaseActive bool
 		var workspaceID pgtype.Text
@@ -241,6 +316,15 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			&ownerID, &hostID, &status, &leaseOwner, &leaseVersion, &leaseActive, &executionEpoch,
 			&workspaceID, &inputRevision, &checkpointRevision); err != nil {
 			return storeError("lock Task before Workspace publish", "task", err)
+		}
+		if err := verifyProjectTaskWorkspaceFence(ctx, tx, value.TaskID, projectFence); err != nil {
+			return err
+		}
+		if err := requireProjectWorkspacePublishAgent(ctx, tx, value.TaskID, ownerID, projectFence); err != nil {
+			return err
+		}
+		if ownerID != value.OwnerID || !taskWorkspacePublishHostMatches(hostID, value.HostID) || executionEpoch != gate.epoch {
+			return missingTaskError()
 		}
 		stored, err := getTaskWorkspacePublishReceiptTx(ctx, tx, value, true)
 		if err != nil {
@@ -260,9 +344,6 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		default:
 			return domain.NewError(domain.CodeInternal, "Task Workspace publish receipt state is invalid")
 		}
-		if ownerID != value.OwnerID || hostID != value.HostID || executionEpoch != gate.epoch {
-			return missingTaskError()
-		}
 		if status != string(task.StatusRunning) || leaseOwner != value.LeaseOwner || leaseVersion != value.LeaseVersion || !leaseActive {
 			return taskLeaseConflict()
 		}
@@ -274,17 +355,24 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := ensureNoPendingTaskWorkspacePublishOperation(ctx, tx, value.TaskID); err != nil {
 			return err
 		}
-		var hostOwner, hostState, hostControl string
-		var generation, controlVersion int64
-		var instanceID string
-		var deleted bool
-		if err := tx.QueryRow(ctx, `SELECT owner_id, state, control_state, runtime_generation, COALESCE(runtime_instance_id,''), control_version, deleted_at IS NOT NULL
-FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).Scan(&hostOwner, &hostState, &hostControl, &generation, &instanceID, &controlVersion, &deleted); err != nil {
-			return storeError("lock Host before Task Workspace publish", "host", err)
-		}
-		if hostOwner != value.OwnerID || hostState != string(host.StateRunning) || hostControl != "ai" || deleted ||
-			generation != value.HostFence.RuntimeGeneration || instanceID != value.HostFence.RuntimeInstanceID || controlVersion != value.HostFence.ControlVersion {
-			return domain.NewError(domain.CodeInvalidState, "Host runtime or control state changed before Task Workspace publish")
+		if value.HostID != "" {
+			var hostOwner, hostState, hostControl string
+			var generation, controlVersion int64
+			var instanceID string
+			var deleted bool
+			hostLock := " FOR SHARE"
+			if permit := projectWorkspaceTaskPermit(ctx, value.TaskID, actorID); permit != nil &&
+				permit.taskHostID == value.HostID && permit.grantHostID == value.HostID {
+				hostLock = ""
+			}
+			if err := tx.QueryRow(ctx, `SELECT owner_id, state, control_state, runtime_generation, COALESCE(runtime_instance_id,''), control_version, deleted_at IS NOT NULL
+FROM hosts WHERE id=$1`+hostLock, value.HostID).Scan(&hostOwner, &hostState, &hostControl, &generation, &instanceID, &controlVersion, &deleted); err != nil {
+				return storeError("lock Host before Task Workspace publish", "host", err)
+			}
+			if hostOwner != expectedWorkspaceOwner || hostState != string(host.StateRunning) || hostControl != "ai" || deleted ||
+				generation != value.HostFence.RuntimeGeneration || instanceID != value.HostFence.RuntimeInstanceID || controlVersion != value.HostFence.ControlVersion {
+				return domain.NewError(domain.CodeInvalidState, "Host runtime or control state changed before Task Workspace publish")
+			}
 		}
 		var workspaceOwner, workspaceState string
 		var currentRevision, currentBytes, quotaBytes, currentFileCount, revisionBytes int64
@@ -295,7 +383,7 @@ FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).Scan(&hostOwner, &hostState, &h
 		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
 			return err
 		}
-		if workspaceOwner != value.OwnerID || workspaceState != string(workspace.StateReady) {
+		if workspaceOwner != expectedWorkspaceOwner || workspaceState != string(workspace.StateReady) {
 			return domain.NewError(domain.CodeWorkspaceBusy, "Workspace is not available for Task publish")
 		}
 		if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
@@ -315,17 +403,19 @@ FROM hosts WHERE id=$1 FOR SHARE`, value.HostID).Scan(&hostOwner, &hostState, &h
 		if currentBytes != revisionBytes {
 			return domain.NewError(domain.CodeInternal, "Workspace storage usage does not match its latest manifest")
 		}
-		var bindingOwner, bindingState, syncState string
-		var bindingVersion, desiredRevision, appliedRevision int64
-		if err := tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version, desired_revision, applied_revision
+		if value.HostID != "" {
+			var bindingOwner, bindingState, syncState string
+			var bindingVersion, desiredRevision, appliedRevision int64
+			if err := tx.QueryRow(ctx, `SELECT owner_id, state, sync_state, binding_version, desired_revision, applied_revision
 FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, value.HostID, value.WorkspaceID).
-			Scan(&bindingOwner, &bindingState, &syncState, &bindingVersion, &desiredRevision, &appliedRevision); err != nil {
-			return storeError("lock Host Workspace binding before Task publish", "workspace binding", err)
-		}
-		if bindingOwner != value.OwnerID || bindingState != string(workspace.BindingActive) || syncState != string(workspace.BindingSyncHealthy) ||
-			bindingVersion != value.BindingVersion || desiredRevision != value.BaseRevision || appliedRevision != value.BaseRevision {
-			return markTaskWorkspacePublishRejected(ctx, tx, value, &receipt, &rejected,
-				domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed before Task publish"), app.TaskWorkspacePublishConflict)
+				Scan(&bindingOwner, &bindingState, &syncState, &bindingVersion, &desiredRevision, &appliedRevision); err != nil {
+				return storeError("lock Host Workspace binding before Task publish", "workspace binding", err)
+			}
+			if bindingOwner != expectedWorkspaceOwner || bindingState != string(workspace.BindingActive) || syncState != string(workspace.BindingSyncHealthy) ||
+				bindingVersion != value.BindingVersion || desiredRevision != value.BaseRevision || appliedRevision != value.BaseRevision {
+				return markTaskWorkspacePublishRejected(ctx, tx, value, &receipt, &rejected,
+					domain.NewError(domain.CodeWorkspaceConflict, "Host Workspace binding changed before Task publish"), app.TaskWorkspacePublishConflict)
+			}
 		}
 		mutations, directoryMutations, directoryMetadataMutations, err := taskWorkspacePublishMutations(ctx, tx, value.WorkspaceID, currentRevision, files, emptyDirectories, directories)
 		if err != nil {
@@ -374,6 +464,48 @@ WHERE task_id=$1 AND operation_key=$2 AND state='pending'`, value.TaskID, value.
 		return receipt, rejected
 	}
 	return receipt, nil
+}
+
+func requireProjectWorkspacePublishCommand(value app.TaskWorkspacePublishCommand, fence projectTaskWorkspaceFence) error {
+	if fence.projectID == "" {
+		if value.ProjectID != "" {
+			return domain.NewError(domain.CodeForbidden, "Workspace publish project changed")
+		}
+		return nil
+	}
+	if value.ProjectID != fence.projectID || value.InitiatorID != fence.actorID ||
+		value.WorkspaceID != fence.workspaceID || value.WorkspaceOwnerID != fence.workspaceOwnerID {
+		return domain.NewError(domain.CodeForbidden, "project Workspace publish identity changed")
+	}
+	return nil
+}
+
+func requireProjectWorkspacePublishAgent(ctx context.Context, tx pgx.Tx, taskID, taskOwnerID string, fence projectTaskWorkspaceFence) error {
+	if fence.projectID == "" {
+		return nil
+	}
+	row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: taskID, OwnerID: taskOwnerID})
+	if err != nil {
+		return domain.NewError(domain.CodeUnauthenticated, "project Task Workspace authorization is unavailable")
+	}
+	authorized, err := requireCurrentTaskAuthorization(ctx, tx, row)
+	if err != nil || !authorized {
+		return domain.NewError(domain.CodeUnauthenticated, "project Task Workspace authorization is unavailable")
+	}
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_instances agent JOIN service_identity instance
+ON instance.singleton=true AND instance.instance_id=agent.service_instance_id
+WHERE agent.task_id=$1 AND agent.owner_id=$2 AND agent.agent_instance_id=$3 AND agent.agent_generation=$4
+ AND agent.agent_session_id=$5 AND ((agent.state='active' AND agent.lease_expires_at>clock_timestamp()) OR
+   (agent.state='stopped' AND (NOT agent.guardian_task_stop_ack_required OR agent.guardian_stop_acknowledged_at IS NOT NULL)
+    AND ((agent.stop_receipt IS NOT NULL AND agent.stop_receipt_digest=sha256(agent.stop_receipt)) IS TRUE OR
+         (agent.guardian_stop_attestation IS NOT NULL AND agent.guardian_stop_attestation_digest=sha256(agent.guardian_stop_attestation)) IS TRUE)))
+ AND agent.lease_owner=$6 AND agent.lease_version=$7 AND agent.auth_version=$8)`,
+		row.ID, row.OwnerID, row.AgentInstanceID, row.AgentGeneration, row.AgentSessionID,
+		row.LeaseOwner, row.LeaseVersion, row.AuthVersion).Scan(&active); err != nil || !active {
+		return domain.NewError(domain.CodeUnauthenticated, "project Task Agent lease is unavailable")
+	}
+	return nil
 }
 
 func markTaskWorkspacePublishRejected(ctx context.Context, tx pgx.Tx, value app.TaskWorkspacePublishCommand, receipt *app.TaskWorkspacePublishReceipt, rejected *error, cause error, state app.TaskWorkspacePublishState) error {

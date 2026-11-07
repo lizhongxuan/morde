@@ -238,7 +238,8 @@ ORDER BY created_at DESC,source ASC,call_id DESC LIMIT $5`, projectID, afterTime
 // together so a failed budget check cannot leave either ledger charged alone.
 func (s *Store) ReserveProjectModelCall(ctx context.Context, reservation app.ProjectModelReservation) (app.ProjectModelReservation, bool, error) {
 	call := reservation.AccountCall
-	if !project.ValidID(reservation.ProjectID) || !domain.ValidUserID(reservation.ActorID) ||
+	if reservation.Source == app.ModelCallRoute || !project.ValidID(reservation.ProjectID) || !domain.ValidUserID(reservation.ActorID) ||
+		call.PersonalModel ||
 		!validProjectBudgetSource(string(reservation.Source)) ||
 		(reservation.Source == app.ModelCallTask && !domain.ValidTaskID(reservation.TaskID)) ||
 		(reservation.Source != app.ModelCallTask && reservation.TaskID != "") ||
@@ -285,6 +286,11 @@ func reserveProjectBudgetLedgerInTx(ctx context.Context, tx pgx.Tx, reservation 
 			Scan(&taskOwnerID, &taskInitiatorID, &taskProjectID); err != nil || taskProjectID != reservation.ProjectID ||
 			taskInitiatorID != reservation.ActorID || taskOwnerID != reservation.AccountCall.Task.OwnerID {
 			return domain.NewError(domain.CodeUnauthenticated, "project Task attribution is unavailable")
+		}
+	} else if reservation.Source == app.ModelCallRoute {
+		if reservation.AccountCall.Route == nil || reservation.AccountCall.Route.Claim.Message.ActorID != reservation.ActorID ||
+			reservation.AccountCall.Route.Claim.Input.ProjectID != reservation.ProjectID {
+			return domain.NewError(domain.CodeUnauthenticated, "project route model caller is unavailable")
 		}
 	} else if reservation.Source != app.ModelCallClient && reservation.Source != app.ModelCallChat ||
 		reservation.AccountCall.Principal.UserID != reservation.ActorID {
@@ -357,7 +363,7 @@ func projectLedgerTaskID(reservation app.ProjectModelReservation) any {
 // SettleProjectModelCall reconciles both project money and account token
 // ledgers, keeping both holds unknown when the actual result is unsafe.
 func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.SettleProjectModelCallCommand) error {
-	if ctx == nil || !project.ValidID(settlement.ProjectID) || !validProjectBudgetSource(string(settlement.Source)) ||
+	if ctx == nil || settlement.Source == app.ModelCallRoute || !project.ValidID(settlement.ProjectID) || !validProjectBudgetSource(string(settlement.Source)) ||
 		!validProjectIdempotencyKey(settlement.CallID) || (!settlement.Unknown && !validProjectSettlementUsage(settlement.Usage)) {
 		return domain.InvalidArgument("project_model_settlement", "invalid project model settlement")
 	}
@@ -367,13 +373,16 @@ func (s *Store) SettleProjectModelCall(ctx context.Context, settlement app.Settl
 		settleErr := storeError("find project model settlement", "project model call", err)
 		if !settlement.Unknown {
 			if holdErr := s.bestEffortUnknownProjectModelCall(ctx, settlement, ""); holdErr != nil {
-				return fmt.Errorf("%w; best-effort unknown hold failed: %v", settleErr, holdErr)
+				return fmt.Errorf("%w; best-effort unknown hold failed: %w", settleErr, holdErr)
 			}
 		}
 		return settleErr
 	}
 	var overBudget bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockModelLedgerOwner(ctx, tx, actorID); err != nil {
+			return err
+		}
 		var accountID string
 		if err := tx.QueryRow(ctx, `SELECT owner_id FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, actorID).Scan(&accountID); err != nil {
 			return storeError("lock project model settlement account budget", "model budget", err)
@@ -457,7 +466,7 @@ actual_micros=$6,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$2 
 	if err != nil {
 		if !settlement.Unknown {
 			if holdErr := s.bestEffortUnknownProjectModelCall(ctx, settlement, actorID); holdErr != nil {
-				return fmt.Errorf("%w; best-effort unknown hold failed: %v", err, holdErr)
+				return fmt.Errorf("%w; best-effort unknown hold failed: %w", err, holdErr)
 			}
 		}
 		return err
@@ -484,6 +493,9 @@ func (s *Store) bestEffortUnknownProjectModelCall(ctx context.Context, settlemen
 		}
 	}
 	return s.WithTx(holdCtx, func(tx pgx.Tx) error {
+		if err := lockModelLedgerOwner(holdCtx, tx, actorID); err != nil {
+			return err
+		}
 		var accountID string
 		if err := tx.QueryRow(holdCtx, `SELECT owner_id FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, actorID).Scan(&accountID); err != nil {
 			return storeError("lock project model unknown hold account budget", "model budget", err)
@@ -699,5 +711,5 @@ func decodeProjectBudgetLedgerCursor(value, projectID string) (*projectBudgetLed
 }
 
 func validProjectBudgetSource(value string) bool {
-	return value == string(app.ModelCallClient) || value == string(app.ModelCallChat) || value == string(app.ModelCallTask)
+	return value == string(app.ModelCallClient) || value == string(app.ModelCallChat) || value == string(app.ModelCallTask) || value == string(app.ModelCallRoute)
 }

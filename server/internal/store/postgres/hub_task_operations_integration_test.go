@@ -77,7 +77,7 @@ func TestTaskHubWorkspaceSyncAdvancesTaskCheckpointWithCAS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("submit Task: %v", err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2, input_revision=0, workspace_checkpoint_revision=0
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2, workspace_owner_id=$3, input_revision=0, workspace_checkpoint_revision=0
 WHERE id=$1 AND owner_id=$3`, created.Task.ID, workspaceValue.ID, owner.ID); err != nil {
 		t.Fatalf("attach Task to source Workspace checkpoint: %v", err)
 	}
@@ -269,7 +269,7 @@ VALUES ($1,$2,'Task target','desktop',clock_timestamp()+interval '1 day')`, targ
 	if err != nil {
 		t.Fatalf("submit Task: %v", err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2, input_revision=$3, workspace_checkpoint_revision=$3
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2, workspace_owner_id=$4, input_revision=$3, workspace_checkpoint_revision=$3
 WHERE id=$1 AND owner_id=$4`, created.Task.ID, workspaceValue.ID, workspaceValue.Revision, owner.ID); err != nil {
 		t.Fatalf("attach Task to its Workspace checkpoint: %v", err)
 	}

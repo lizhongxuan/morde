@@ -25,6 +25,7 @@ export function ApiKeys() {
   });
   const [name, setName] = useState('');
   const [ttl, setTtl] = useState('');
+  const [showCreate, setShowCreate] = useState(false);
   const [secret, setSecret] = useState<{ key: string; expires_at: string } | null>(null);
   const [removing, setRemoving] = useState<ApiKey | null>(null);
   const [now, setNow] = useState(0);
@@ -40,6 +41,7 @@ export function ApiKeys() {
       setSecret(result);
       setName('');
       setTtl('');
+      setShowCreate(false);
       void client.invalidateQueries({ queryKey: ['apikeys'] });
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
@@ -61,14 +63,15 @@ export function ApiKeys() {
   };
 
   return <section>
-    <div className="page-heading"><div><p className="eyebrow">账号安全</p><h1>API Key</h1><p className="muted">创建后自动获得你当前可用的权限。密钥明文只显示一次。</p></div></div>
     <section className="connection-section mcp-connection-section" aria-labelledby="mcp-connection-title">
       <div className="connection-section-heading"><div><h2 id="mcp-connection-title">连接 AI 对话工具</h2><p className="muted">接入后，AI 可以在你的账号权限范围内使用云端电脑。</p></div></div>
       <div className="mcp-endpoint"><div><span>本实例 MCP 地址</span><code>{mcpURL}</code></div><button type="button" className="button button-secondary" onClick={() => void copyEndpoint()}>复制地址</button></div>
       <ol className="mcp-setup-steps"><li><strong>创建 API Key</strong><span>无需逐项选择电脑或权限，访问范围随账号当前授权变化。</span></li><li><strong>把地址和 Key 配到 AI 客户端</strong><span>Key 只在创建时显示一次。请保存在客户端的密钥管理或环境变量中。</span></li></ol>
       <div className="notice notice-info">吊销 API Key 后，后续 MCP 请求会被拒绝。</div>
     </section>
-    <form className="form-card apikey-form" onSubmit={(event) => void submit(event)}>
+    <section className="design-panel" aria-labelledby="api-key-list-title">
+    <div className="design-panel-header"><div><h2 id="api-key-list-title">我的密钥</h2><p>创建后自动获得当前账号可用的权限。</p></div><button type="button" className="button button-primary" aria-expanded={showCreate} disabled={create.isPending} onClick={() => setShowCreate((open) => !open)}>{showCreate ? '收起' : '＋ 创建 API Key'}</button></div>
+    {showCreate && <form className="form-card apikey-form" onSubmit={(event) => void submit(event)}>
       <h2>创建 API Key</h2>
       <div className="inline-form">
         <div><label htmlFor="apikey-name">名称</label><input id="apikey-name" required maxLength={100} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：个人自动化" /></div>
@@ -77,9 +80,8 @@ export function ApiKeys() {
       <button className="button button-primary" type="submit" disabled={!name.trim() || create.isPending}>
         {create.isPending ? '创建中…' : '创建 API Key'}
       </button>
-    </form>
+    </form>}
 
-    <h2 className="section-title">已创建的 Key</h2>
     {keys.isPending ? <div className="loading-card">正在加载…</div> : keys.isError ? <div className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></div> : !keys.data?.items.length ? <div className="empty-card compact"><p>尚未创建 API Key。</p></div> : <div className="table-wrap"><table><thead><tr><th>名称</th><th>权限</th><th>创建时间</th><th>最近使用</th><th>过期时间</th><th>状态</th><th>操作</th></tr></thead><tbody>
       {keys.data.items.map((key) => {
         const expired = now > 0 && Date.parse(key.expires_at) <= now;
@@ -92,6 +94,7 @@ export function ApiKeys() {
         </tr>;
       })}
     </tbody></table></div>}
+    </section>
     {removing && <ConfirmDialog title="吊销 API Key" description={`“${removing.name || removing.id}”吊销后，后续请求会被拒绝；已经发出的外部操作仍可能完成。此操作不可撤销。`} confirmLabel="吊销 Key" danger busy={remove.isPending} onClose={() => setRemoving(null)} onConfirm={() => remove.mutate(removing.id)} />}
     {secret && <OnceSecretDialog title="API Key 已创建" secret={secret.key} expiresAt={formatDate(secret.expires_at)} onClose={() => setSecret(null)} />}
   </section>;

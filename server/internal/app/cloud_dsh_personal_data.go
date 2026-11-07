@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,7 +26,25 @@ const (
 	cloudDSHPersonalContextItems   = 32
 	cloudDSHPersonalContextPages   = 10
 	cloudDSHProjectContextBytes    = 24 << 10
+	// The setting is an existing, account-scoped personal object. Absence is
+	// deliberately different from an implicit grant of access to memory.
+	cloudDSHMemorySettingID   = "builtin_memory"
+	CloudDSHMemoryProofPrefix = "MORDE_MEMORY_STATE_V1:"
 )
+
+type CloudDSHMemoryVersion struct {
+	ObjectType string `json:"object_type,omitempty"`
+	ID         string `json:"id"`
+	Revision   int64  `json:"revision"`
+}
+
+type cloudDSHMemoryProof struct {
+	Version  int                     `json:"version"`
+	Enabled  bool                    `json:"enabled"`
+	Revision int64                   `json:"revision"`
+	Items    []CloudDSHMemoryVersion `json:"items"`
+	Objects  []CloudDSHMemoryVersion `json:"objects"`
+}
 
 type cloudDSHPersonalSnapshotReader interface {
 	GetSnapshot(context.Context, identity.Principal, string, int32) (PersonalSnapshotPage, error)
@@ -38,14 +57,14 @@ func cloudDSHPersonalUpdateDefinition() AgentToolDefinition {
 			"object_type":   map[string]any{"type": "string", "enum": []string{personal.ObjectTypeProfile, personal.ObjectTypeMemory, personal.ObjectTypeSoul, personal.ObjectTypeGoal}},
 			"object_id":     map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
 			"base_revision": map[string]any{"type": "integer", "minimum": 0},
-			"body":          map[string]any{"type": "object", "additionalProperties": true},
+			"body":          map[string]any{"type": "string", "description": "A JSON object encoded as a string, with the fields for the selected personal object type."},
 		},
 		"required":             []string{"object_type", "object_id", "base_revision", "body"},
 		"additionalProperties": false,
 	})
 	return AgentToolDefinition{ModelTool: ModelTool{
 		Name:        cloudDSHPersonalUpdateToolName,
-		Description: "Create or update this account's profile, memory, SOUL, or goal using the current revision. Never put credentials, connector secrets, or unrelated private data in the body.",
+		Description: "Create or update this account's profile, memory, SOUL, or goal using the current revision. Only save memories the user authorized. After a SOUL update succeeds, tell the user. Never put credentials, connector secrets, or unrelated private data in the body.",
 		Parameters:  parameters, Strict: true,
 	}, RequiredScope: identity.ScopeTaskSubmit}
 }
@@ -83,6 +102,152 @@ func cloudDSHPersonalPrincipal(value task.Task) (identity.Principal, bool) {
 	return principal, true
 }
 
+func (b *CloudDSHToolBroker) personalMemorySetting(ctx context.Context, principal identity.Principal) (bool, int64, error) {
+	if b.personalData == nil {
+		return false, 0, nil
+	}
+	setting, err := b.personalData.GetPersonalObject(ctx, principal, personal.ObjectTypeSkillSetting, cloudDSHMemorySettingID)
+	if domain.CodeOf(err) == domain.CodeNotFound {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if setting.ObjectType != personal.ObjectTypeSkillSetting || setting.ObjectID != cloudDSHMemorySettingID ||
+		setting.Revision < 1 || personal.ValidateObjectBody(setting.ObjectType, setting.ObjectID, setting.Body) != nil {
+		return false, 0, errors.New("personal memory setting is invalid")
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(setting.Body, &body); err != nil {
+		return false, 0, errors.New("personal memory setting is invalid")
+	}
+	return body.Enabled, setting.Revision, nil
+}
+
+// ValidatePersonalMemoryProof fails closed when a saved context no longer
+// matches the account's live consent and included personal object versions.
+func (b *CloudDSHToolBroker) ValidatePersonalMemoryProof(ctx context.Context, claimed task.Task, encoded string, additional []CloudDSHMemoryVersion) error {
+	if !cloudDSHPersonalContextEligible(claimed) || b.personalData == nil {
+		return domain.NewError(domain.CodeForbidden, "personal memory context is not authorized")
+	}
+	details, err := b.currentServerTask(ctx, claimed)
+	if err != nil {
+		return err
+	}
+	if !cloudDSHPersonalContextEligible(details.Task) || !sameCloudDSHAuthorization(details.Task.Authorization, claimed.Authorization) {
+		return domain.NewError(domain.CodeForbidden, "personal memory context authorization changed")
+	}
+	principal, ok := cloudDSHPersonalPrincipal(details.Task)
+	if !ok {
+		return domain.NewError(domain.CodeForbidden, "personal memory context is not authorized")
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(data) > 8192 {
+		return domain.NewError(domain.CodeInvalidState, "personal memory context cannot be verified")
+	}
+	var proof cloudDSHMemoryProof
+	if decodeStrictRuntimeResult(data, &proof) != nil || proof.Version != 2 || proof.Objects == nil || proof.Revision < 0 ||
+		len(proof.Items) > cloudDSHPersonalContextItems || len(proof.Objects) > cloudDSHPersonalContextItems+20 || len(additional) > 100 {
+		return domain.NewError(domain.CodeInvalidState, "personal memory context cannot be verified")
+	}
+	enabled, revision, err := b.personalMemorySetting(ctx, principal)
+	if err != nil {
+		return err
+	}
+	if enabled != proof.Enabled || revision != proof.Revision || (!enabled && len(proof.Items) != 0) {
+		return domain.NewError(domain.CodeInvalidState, "personal memory permission changed; start a new task")
+	}
+	type objectKey struct{ objectType, id string }
+	versions := make(map[objectKey]int64, len(proof.Items)+len(proof.Objects)+len(additional))
+	register := func(item CloudDSHMemoryVersion, expectedType string) error {
+		objectType := item.ObjectType
+		if objectType == "" {
+			objectType = personal.ObjectTypeMemory
+		}
+		if expectedType != "" && objectType != expectedType {
+			return domain.NewError(domain.CodeInvalidState, "personal context cannot be verified")
+		}
+		switch objectType {
+		case personal.ObjectTypeMemory, personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeGoal:
+		default:
+			return domain.NewError(domain.CodeInvalidState, "personal context cannot be verified")
+		}
+		if item.Revision < 1 || personal.ValidateObjectIdentifier(objectType, item.ID) != nil ||
+			(objectType == personal.ObjectTypeMemory && !enabled) {
+			return domain.NewError(domain.CodeInvalidState, "personal memory context cannot be verified")
+		}
+		key := objectKey{objectType: objectType, id: item.ID}
+		if item.Revision > versions[key] {
+			versions[key] = item.Revision
+		}
+		return nil
+	}
+	for _, item := range proof.Items {
+		if err := register(item, personal.ObjectTypeMemory); err != nil {
+			return err
+		}
+	}
+	for _, item := range proof.Objects {
+		if item.ObjectType == "" || item.ObjectType == personal.ObjectTypeMemory {
+			return domain.NewError(domain.CodeInvalidState, "personal context cannot be verified")
+		}
+		if err := register(item, ""); err != nil {
+			return err
+		}
+	}
+	for _, item := range additional {
+		if err := register(item, ""); err != nil {
+			return err
+		}
+	}
+	for key, expectedRevision := range versions {
+		object, err := b.personalData.GetPersonalObject(ctx, principal, key.objectType, key.id)
+		if domain.CodeOf(err) == domain.CodeNotFound || err == nil &&
+			(object.ObjectType != key.objectType || object.ObjectID != key.id || object.Revision != expectedRevision) {
+			return domain.NewError(domain.CodeInvalidState, "personal context changed; start a new task")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CloudDSHPersonalMemoryProofEnabled reports whether the broker can load and
+// revalidate the complete personal context it attaches to a DSH session.
+func (b *CloudDSHToolBroker) CloudDSHPersonalMemoryProofEnabled() bool {
+	return b != nil && b.personalData != nil && b.personalSync != nil && b.goals != nil
+}
+
+// PausePersonalMemoryRecovery uses the existing fenced waiting state after
+// the runtime has stopped; no checkpoint data or memory text enters the event.
+func (b *CloudDSHToolBroker) PausePersonalMemoryRecovery(ctx context.Context, claimed task.Task) error {
+	if ctx == nil {
+		return domain.InvalidArgument("context", "recovery context is required")
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+	defer cancel()
+	details, err := b.store.GetTask(persistCtx, claimed.ID, claimed.OwnerID)
+	if err != nil {
+		return err
+	}
+	current := details.Task
+	if current.Status != task.StatusRunning || current.Lease.Owner != claimed.Lease.Owner || current.Lease.Version != claimed.Lease.Version ||
+		current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
+		return nil
+	}
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepUnknown,
+		"个人记忆状态无法确认", "记忆设置可能已更改或暂时不可用，此任务无法安全继续，请重新发送消息。")
+	if err != nil {
+		return err
+	}
+	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, "dsh_recovery_unresolved", "task.waiting_user", map[string]any{
+		"phase": "memory_context", "source": "cloud_dsh",
+	})
+}
+
 func (b *CloudDSHToolBroker) InitialContext(ctx context.Context, claimed task.Task) (string, error) {
 	if cloudDSHProjectContextEligible(claimed) {
 		return b.initialProjectContext(ctx, claimed)
@@ -102,6 +267,10 @@ func (b *CloudDSHToolBroker) InitialContext(ctx context.Context, claimed task.Ta
 	if !ok {
 		return "", domain.NewError(domain.CodeForbidden, "personal Task context is not authorized")
 	}
+	memoryEnabled, memoryRevision, err := b.personalMemorySetting(ctx, principal)
+	if err != nil {
+		return "", err
+	}
 
 	objects := make([]personal.Object, 0, cloudDSHPersonalContextItems)
 	cursor := ""
@@ -117,8 +286,12 @@ func (b *CloudDSHToolBroker) InitialContext(ctx context.Context, claimed task.Ta
 				break
 			}
 			switch object.ObjectType {
-			case personal.ObjectTypeProfile, personal.ObjectTypeMemory, personal.ObjectTypeSoul:
+			case personal.ObjectTypeProfile, personal.ObjectTypeSoul:
 				objects = append(objects, object)
+			case personal.ObjectTypeMemory:
+				if memoryEnabled {
+					objects = append(objects, object)
+				}
 			}
 		}
 		if page.NextCursor == "" {
@@ -143,6 +316,8 @@ func (b *CloudDSHToolBroker) InitialContext(ctx context.Context, claimed task.Ta
 	})
 
 	var output strings.Builder
+	proof := cloudDSHMemoryProof{Version: 2, Enabled: memoryEnabled, Revision: memoryRevision,
+		Items: []CloudDSHMemoryVersion{}, Objects: []CloudDSHMemoryVersion{}}
 	output.WriteString("Authorized personal context for this account (bounded snapshot; it may be incomplete):\n")
 	omitted := morePersonalObjects || goals.NextCursor != ""
 	for _, object := range objects {
@@ -168,17 +343,27 @@ func (b *CloudDSHToolBroker) InitialContext(ctx context.Context, claimed task.Ta
 		}
 		output.Write(line)
 		output.WriteByte('\n')
+		if object.ObjectType == personal.ObjectTypeMemory {
+			proof.Items = append(proof.Items, CloudDSHMemoryVersion{ID: object.ObjectID, Revision: object.Revision})
+		} else {
+			proof.Objects = append(proof.Objects, CloudDSHMemoryVersion{ObjectType: object.ObjectType, ID: object.ObjectID, Revision: object.Revision})
+		}
 	}
 	if omitted {
 		output.WriteString("Some personal objects were omitted because the snapshot or context size is bounded.\n")
 	}
-	if output.Len() == len("Authorized personal context for this account (bounded snapshot; it may be incomplete):\n") {
-		return "", nil
-	}
 	if output.Len() > cloudDSHPersonalContextBytes+128 || !utf8.ValidString(output.String()) {
 		return "", domain.NewError(domain.CodeResultTooLarge, "personal Task context exceeds its size limit")
 	}
-	return strings.TrimSpace(output.String()), nil
+	proofJSON, err := json.Marshal(proof)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(proofJSON)
+	if err := b.ValidatePersonalMemoryProof(ctx, claimed, encoded, nil); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output.String()) + "\n" + CloudDSHMemoryProofPrefix + encoded, nil
 }
 
 func cloudDSHProjectContextEligible(value task.Task) bool {
@@ -285,14 +470,12 @@ type cloudDSHPersonalUpdateArguments struct {
 }
 
 func (b *CloudDSHToolBroker) executePersonalUpdate(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
-	if b.personalData == nil || ctx == nil || len(call.Arguments) == 0 || len(call.Arguments) > maxAgentToolArgsBytes ||
-		!validAgentJSONObject([]byte(call.Arguments), maxAgentToolArgsBytes) {
+	if b.personalData == nil || ctx == nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "personal data arguments are invalid")
 	}
-	var arguments cloudDSHPersonalUpdateArguments
-	if decodeStrictRuntimeResult([]byte(call.Arguments), &arguments) != nil || len(arguments.Body) == 0 ||
-		!validAgentJSONObject(arguments.Body, personal.MaxMutationBodyBytes) {
-		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "personal data arguments are invalid")
+	arguments, err := decodeCloudDSHPersonalUpdateArguments(call.Arguments)
+	if err != nil {
+		return AgentToolResult{}, err
 	}
 	details, err := b.currentServerTask(ctx, claimed)
 	if err != nil {
@@ -306,6 +489,15 @@ func (b *CloudDSHToolBroker) executePersonalUpdate(ctx context.Context, claimed 
 	principal, ok := cloudDSHPersonalPrincipal(current)
 	if !ok {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "personal data is not authorized for this Task")
+	}
+	if arguments.ObjectType == personal.ObjectTypeMemory {
+		enabled, _, err := b.personalMemorySetting(ctx, principal)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		if !enabled {
+			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "personal memory is disabled")
+		}
 	}
 	mutationID := cloudDSHPersonalMutationID(current.ID, current.AgentSessionID, call.CallID)
 	mutation, err := b.personalData.PreparePersonalMutation(principal, PersonalMutationCommand{
@@ -340,8 +532,11 @@ func (b *CloudDSHToolBroker) executePersonalUpdate(ctx context.Context, claimed 
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
 	}
 	usage.ToolCalls++
-	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepSucceeded,
-		"Update personal data", "Saved an authorized personal object with revision checking.")
+	stepTitle, stepSummary := "Update personal data", "Saved an authorized personal object with revision checking."
+	if mutation.ObjectType == personal.ObjectTypeSoul {
+		stepTitle, stepSummary = "已更新 SOUL", "我的性格设定已更新。"
+	}
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepSucceeded, stepTitle, stepSummary)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -379,6 +574,24 @@ func cloudDSHPersonalMutationID(taskID, sessionID, callID string) string {
 }
 
 func cloudDSHPersonalMutationFingerprint(value CloudDSHPersonalMutationCommit) string {
+	if value.GoalToolName != "" {
+		input, _ := json.Marshal(struct {
+			TaskID               string `json:"task_id"`
+			OwnerID              string `json:"owner_id"`
+			AgentSessionID       string `json:"agent_session_id"`
+			AuthorizationVersion int64  `json:"authorization_version"`
+			CallID               string `json:"call_id"`
+			MutationID           string `json:"mutation_id"`
+			RequestSHA256        string `json:"request_sha256"`
+			Tool                 string `json:"tool"`
+			ArgumentsSHA256      string `json:"arguments_sha256"`
+			GoalStatus           string `json:"goal_status"`
+		}{value.TaskID, value.OwnerID, value.AgentSessionID, value.AuthorizationVersion, value.CallID,
+			value.Mutation.MutationID, hex.EncodeToString(value.Mutation.RequestHash), value.GoalToolName,
+			value.GoalArgumentsSHA256, value.GoalStatus})
+		digest := sha256.Sum256(input)
+		return hex.EncodeToString(digest[:])
+	}
 	input, _ := json.Marshal(struct {
 		TaskID               string `json:"task_id"`
 		OwnerID              string `json:"owner_id"`
@@ -397,9 +610,43 @@ func ValidCloudDSHPersonalMutationCommit(value CloudDSHPersonalMutationCommit) b
 	if !domain.ValidTaskID(value.TaskID) || !domain.ValidUserID(value.OwnerID) || value.Mutation.OwnerID != value.OwnerID ||
 		value.AgentSessionID == "" || len(value.AgentSessionID) > 128 || !utf8.ValidString(value.AgentSessionID) ||
 		value.AuthorizationVersion < 1 || value.CallID == "" || len(value.CallID) > 256 || !utf8.ValidString(value.CallID) ||
-		value.Mutation.Delete || value.Mutation.MutationID != cloudDSHPersonalMutationID(value.TaskID, value.AgentSessionID, value.CallID) ||
+		value.Mutation.MutationID != cloudDSHPersonalMutationID(value.TaskID, value.AgentSessionID, value.CallID) ||
 		personal.ValidateMutation(value.Mutation) != nil || len(value.Mutation.RequestHash) != sha256.Size || value.Mutation.BaseRevision == math.MaxInt64 {
 		return false
+	}
+	if value.GoalToolName == "" {
+		if value.Mutation.Delete || value.GoalArgumentsSHA256 != "" || value.GoalStatus != "" {
+			return false
+		}
+	} else {
+		argumentsHash, err := hex.DecodeString(value.GoalArgumentsSHA256)
+		if err != nil || len(argumentsHash) != sha256.Size || hex.EncodeToString(argumentsHash) != value.GoalArgumentsSHA256 ||
+			value.Mutation.ObjectType != personal.ObjectTypeGoal {
+			return false
+		}
+		switch value.GoalToolName {
+		case cloudDSHGoalCreateToolName:
+			if value.Mutation.Delete || value.Mutation.BaseRevision != 0 || value.Mutation.ObjectID !=
+				cloudDSHStablePersonalID("goal", value.TaskID, value.AgentSessionID, value.Mutation.MutationID, 0) {
+				return false
+			}
+		case cloudDSHGoalUpdateToolName:
+			if value.Mutation.Delete || value.Mutation.BaseRevision < 1 {
+				return false
+			}
+		case cloudDSHGoalDeleteToolName:
+			if !value.Mutation.Delete || value.Mutation.BaseRevision < 1 || value.GoalStatus != "" {
+				return false
+			}
+		default:
+			return false
+		}
+		if !value.Mutation.Delete {
+			var body cloudDSHGoalBody
+			if decodeStrictRuntimeResult(value.Mutation.Body, &body) != nil || body.Status != value.GoalStatus {
+				return false
+			}
+		}
 	}
 	hash, err := personal.HashMutationContent(value.Mutation)
 	return err == nil && hex.EncodeToString(hash) == hex.EncodeToString(value.Mutation.RequestHash) &&
@@ -422,15 +669,22 @@ func ValidateCloudDSHPersonalMutationEvent(payload []byte, value CloudDSHPersona
 			Revision             int64  `json:"revision"`
 			RequestSHA256        string `json:"request_sha256"`
 			FingerprintSHA256    string `json:"fingerprint_sha256"`
+			GoalArgumentsSHA256  string `json:"goal_arguments_sha256"`
+			GoalStatus           string `json:"goal_status"`
 		} `json:"detail"`
 	}
-	if json.Unmarshal(payload, &event) != nil || event.Detail.Tool != cloudDSHPersonalUpdateToolName ||
+	toolName := cloudDSHPersonalUpdateToolName
+	if value.GoalToolName != "" {
+		toolName = value.GoalToolName
+	}
+	if json.Unmarshal(payload, &event) != nil || event.Detail.Tool != toolName ||
 		event.Detail.CallID != value.CallID || event.Detail.MutationID != value.Mutation.MutationID ||
 		event.Detail.AgentSessionID != value.AgentSessionID || event.Detail.AuthorizationVersion != value.AuthorizationVersion ||
 		event.Detail.ObjectType != value.Mutation.ObjectType || event.Detail.ObjectID != value.Mutation.ObjectID ||
 		event.Detail.Revision != value.Mutation.BaseRevision+1 ||
 		event.Detail.RequestSHA256 != hex.EncodeToString(value.Mutation.RequestHash) ||
-		event.Detail.FingerprintSHA256 != value.FingerprintSHA256 {
+		event.Detail.FingerprintSHA256 != value.FingerprintSHA256 ||
+		event.Detail.GoalArgumentsSHA256 != value.GoalArgumentsSHA256 || event.Detail.GoalStatus != value.GoalStatus {
 		return domain.NewError(domain.CodeInvalidState, "personal mutation event fingerprint changed")
 	}
 	return nil

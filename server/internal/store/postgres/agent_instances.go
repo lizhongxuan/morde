@@ -11,6 +11,8 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
@@ -26,7 +29,7 @@ import (
 
 type agentTaskLock struct {
 	HostID, InstanceID, SessionID, EngineVersion, ProfileVersion string
-	InitiatorID, ProjectID                                       string
+	InitiatorID, ProjectID, ConversationID                       string
 	Generation                                                   int64
 	CheckpointThrough                                            int64
 	CheckpointDigest                                             []byte
@@ -34,6 +37,7 @@ type agentTaskLock struct {
 
 type agentInstanceRow struct {
 	Fence                    app.AgentInstanceFence
+	HostFence                agentHostFence
 	RuntimeServiceInstanceID string
 	RuntimeID                string
 	RuntimeGeneration        int64
@@ -48,6 +52,29 @@ type agentInstanceRow struct {
 	InitialLeaseMillis       int64
 }
 
+// agentHostFence is an immutable snapshot of the Host authorization and
+// runtime that the Agent was allowed to use when its lease was issued.
+type agentHostFence struct {
+	HostID, OwnerID, ActorID, Permission, AuthorizationKind string
+	GrantFingerprint                                        string
+	RuntimeGeneration, ControlVersion                       int64
+	RuntimeInstanceID                                       string
+}
+
+type agentHostTarget struct {
+	TaskHostID, TaskActorID string
+	OwnerID                 string
+	State, ControlState     string
+	Deleted                 bool
+	HasActiveGrant          bool
+	GrantVersion            string
+	GrantCreatedAt          time.Time
+	GrantPermissions        []string
+	RuntimeGeneration       int64
+	RuntimeInstanceID       string
+	ControlVersion          int64
+}
+
 func (s *Store) StartAgentInstance(ctx context.Context, request app.AgentInstanceStart) (app.AgentInstanceLease, bool, error) {
 	if err := validateAgentStart(request); err != nil {
 		return app.AgentInstanceLease{}, false, err
@@ -57,7 +84,7 @@ func (s *Store) StartAgentInstance(ctx context.Context, request app.AgentInstanc
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var runtimeFence *app.AccountAgentRuntimeFence
 		if request.RuntimeFence != nil {
-			gate, err := lockOwnerExecutionControl(ctx, tx, request.Fence.InitiatorID, false)
+			gate, err := lockOwnerExecutionControl(ctx, tx, request.RuntimeFence.OwnerID, false)
 			if err != nil {
 				return err
 			}
@@ -78,16 +105,33 @@ func (s *Store) StartAgentInstance(ctx context.Context, request app.AgentInstanc
 			fence := *request.RuntimeFence
 			runtimeFence = &fence
 		}
+		hostTarget, err := lockAgentHostTarget(ctx, tx, request.Fence.TaskID, request.Fence.OwnerID)
+		if err != nil {
+			return err
+		}
 		current, err := lockAuthorizedAgentTask(ctx, tx, request.Fence)
 		if err != nil {
 			return err
 		}
+		if runtimeFence != nil && current.ConversationID != runtimeFence.ConversationID {
+			return accountAgentRuntimeFenceError()
+		}
+		if current.HostID != hostTarget.TaskHostID || current.InitiatorID != hostTarget.TaskActorID {
+			return agentHostFenceUnavailable()
+		}
 		if request.Fence.AgentInstanceID == current.HostID {
 			return domain.InvalidArgument("agent_instance_id", "agent instance cannot be the Host")
+		}
+		hostFence, hostFenceErr := captureAgentHostFence(ctx, tx, current, hostTarget)
+		if hostFenceErr != nil && domain.CodeOf(hostFenceErr) != domain.CodeInvalidState {
+			return hostFenceErr
 		}
 		nonceHash := sha256.Sum256(request.SupervisorNonce)
 		generation := int64(1)
 		if current.InstanceID == "" && current.Generation == 0 {
+			if hostFenceErr != nil {
+				return hostFenceErr
+			}
 			if current.SessionID != "" || current.EngineVersion != "" || current.ProfileVersion != "" ||
 				current.CheckpointThrough != -1 || len(current.CheckpointDigest) != 0 {
 				return agentStopUnconfirmed()
@@ -108,10 +152,33 @@ func (s *Store) StartAgentInstance(ctx context.Context, request app.AgentInstanc
 				previous.Fence.EngineVersion != current.EngineVersion || previous.Fence.ProfileVersion != current.ProfileVersion {
 				return agentStopUnconfirmed()
 			}
+			if hostFenceErr != nil {
+				// A temporarily unavailable Host cannot prevent recovery of a
+				// text conversation. Keep the previous operation fence, but only
+				// after proving that its owner, actor and exact grant remain valid.
+				if previous.HostFence.HostID != hostTarget.TaskHostID ||
+					(previous.HostFence.HostID != "" && (previous.HostFence.OwnerID != hostTarget.OwnerID ||
+						previous.HostFence.ActorID != current.InitiatorID)) {
+					return agentHostFenceUnavailable()
+				}
+				if err := verifyTaskModelHostAuthorization(ctx, tx, app.ModelTaskFence{TaskID: request.Fence.TaskID,
+					OwnerID: request.Fence.OwnerID, InitiatorID: current.InitiatorID,
+					AgentInstanceID: previous.Fence.AgentInstanceID, AgentGeneration: current.Generation}, hostTarget, current.HostID); err != nil {
+					if domain.CodeOf(err) == domain.CodeUnauthenticated {
+						return agentHostFenceUnavailable()
+					}
+					return err
+				}
+				hostFence = previous.HostFence
+			} else if !sameAgentHostGrant(previous.HostFence, hostFence) {
+				// Regranting access must not revive an old Agent's authority.
+				return agentHostFenceUnavailable()
+			}
 			if previous.State == "active" {
 				candidate := request.Fence
 				candidate.AgentGeneration = current.Generation
-				if previous.Fence == candidate && sameAccountAgentRuntimeBinding(previous, runtimeFence) && bytes.Equal(previous.NonceHash, nonceHash[:]) {
+				if previous.Fence == candidate && sameAccountAgentRuntimeBinding(previous, runtimeFence) &&
+					sameAgentHostFence(previous.HostFence, hostFence) && bytes.Equal(previous.NonceHash, nonceHash[:]) {
 					if previous.InitialLeaseMillis != request.LeaseDuration.Milliseconds() {
 						return domain.NewError(domain.CodeIdempotencyConflict, "agent start was reused with a different lease duration")
 					}
@@ -177,13 +244,25 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_session_id=$3 AND through_seq=$4 AND 
 		inserted, err := tx.Exec(ctx, `INSERT INTO task_agent_instances
 (task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,engine_version,profile_version,supervisor_id,
  stop_nonce_digest,lease_owner,lease_version,auth_version,initial_lease_ms,lease_expires_at,state,
- service_instance_id,account_runtime_id,account_runtime_generation,runtime_sequence)
-SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15::uuid,$16,$17,$18
+ service_instance_id,account_runtime_id,account_runtime_generation,runtime_sequence,
+ host_id,host_owner_id,host_actor_id,host_permission,host_authorization_kind,
+ host_runtime_generation,host_runtime_instance_id,host_control_version,host_grant_fingerprint)
+SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active',$15::uuid,$16,$17,$18,
+ $19,$20,$21,$22,$23,$24,$25,$26,$27
 WHERE $14::timestamptz>clock_timestamp()`,
 			fence.TaskID, fence.OwnerID, fence.AgentInstanceID, fence.AgentGeneration, fence.AgentSessionID,
 			fence.EngineVersion, fence.ProfileVersion, fence.SupervisorID, nonceHash[:], fence.LeaseOwner,
 			fence.LeaseVersion, fence.AuthorizationVersion, request.LeaseDuration.Milliseconds(), expiresAt,
-			runtimeServiceInstanceID, runtimeIDArg, runtimeGenerationArg, runtimeSequenceArg)
+			runtimeServiceInstanceID, runtimeIDArg, runtimeGenerationArg, runtimeSequenceArg,
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.HostID }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.OwnerID }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.ActorID }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.Permission }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.AuthorizationKind }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.RuntimeGeneration }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.RuntimeInstanceID }),
+			hostFenceValue(hostFence, func(value agentHostFence) any { return value.ControlVersion }),
+			hostGrantFingerprintValue(hostFence))
 		if err != nil {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -244,14 +323,14 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3`, fence.TaskID, fence.O
 			return fmt.Errorf("read Agent Runtime binding before renewal: %w", err)
 		}
 		if runtimeServiceInstanceID != "" {
-			gate, err := lockOwnerExecutionControl(ctx, tx, fence.InitiatorID, false)
+			gate, err := lockOwnerExecutionControl(ctx, tx, fence.OwnerID, false)
 			if err != nil {
 				return err
 			}
 			if gate.state != "enabled" {
 				return ownerExecutionDisabledError(gate)
 			}
-			runtime, err := lockCurrentAccountAgentRuntimeForTask(ctx, tx, fence.InitiatorID, runtimeServiceInstanceID, runtimeID, runtimeGeneration)
+			runtime, err := lockCurrentAccountAgentRuntimeForTask(ctx, tx, fence.OwnerID, runtimeServiceInstanceID, runtimeID, runtimeGeneration)
 			if err != nil {
 				return err
 			}
@@ -260,9 +339,19 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3`, fence.TaskID, fence.O
 			}
 			runtimeFence = &runtime.Fence
 		}
+		hostTarget, err := lockAgentHostTarget(ctx, tx, fence.TaskID, fence.OwnerID)
+		if err != nil {
+			return err
+		}
 		current, err := lockAuthorizedAgentTask(ctx, tx, fence)
 		if err != nil {
 			return err
+		}
+		if runtimeFence != nil && current.ConversationID != runtimeFence.ConversationID {
+			return accountAgentRuntimeFenceError()
+		}
+		if current.HostID != hostTarget.TaskHostID || current.InitiatorID != hostTarget.TaskActorID {
+			return agentHostFenceUnavailable()
 		}
 		if current.InstanceID != fence.AgentInstanceID || current.Generation != fence.AgentGeneration || current.SessionID != fence.AgentSessionID ||
 			current.EngineVersion != fence.EngineVersion || current.ProfileVersion != fence.ProfileVersion {
@@ -277,6 +366,22 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3`, fence.TaskID, fence.O
 		}
 		if !sameAccountAgentRuntimeBinding(instance, runtimeFence) {
 			return accountAgentRuntimeFenceError()
+		}
+		// The Host is an optional tool. A stopped runtime or a control handoff
+		// must not terminate an otherwise authorized text-model execution.
+		// Operation admission still checks the full original runtime fence.
+		if instance.HostFence.HostID != hostTarget.TaskHostID ||
+			(instance.HostFence.HostID != "" && (instance.HostFence.OwnerID != hostTarget.OwnerID ||
+				instance.HostFence.ActorID != current.InitiatorID)) {
+			return agentHostFenceUnavailable()
+		}
+		if err := verifyTaskModelHostAuthorization(ctx, tx, app.ModelTaskFence{TaskID: fence.TaskID,
+			OwnerID: fence.OwnerID, InitiatorID: current.InitiatorID, AgentInstanceID: fence.AgentInstanceID,
+			AgentGeneration: fence.AgentGeneration}, hostTarget, current.HostID); err != nil {
+			if domain.CodeOf(err) == domain.CodeUnauthenticated {
+				return agentHostFenceUnavailable()
+			}
+			return err
 		}
 		var stillValid bool
 		if err := tx.QueryRow(ctx, `SELECT lease_expires_at>clock_timestamp() FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`,
@@ -515,14 +620,16 @@ func (s *Store) ConfirmAccountAgentTaskStopped(ctx context.Context, proof app.Ve
 		if err != nil {
 			return err
 		}
-		if runtime.State != app.AccountAgentRuntimeRunning && runtime.State != app.AccountAgentRuntimeStopping {
+		// A failed Runtime still needs a verified stop proof for each Task it owned.
+		if runtime.State != app.AccountAgentRuntimeRunning && runtime.State != app.AccountAgentRuntimeStopping &&
+			runtime.State != app.AccountAgentRuntimeFailed {
 			return accountAgentRuntimeFenceError()
 		}
-		var currentID, currentSession string
+		var currentID, currentSession, currentTaskStatus string
 		var currentGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT agent_instance_id,agent_generation,agent_session_id FROM tasks
+		if err := tx.QueryRow(ctx, `SELECT agent_instance_id,agent_generation,agent_session_id,status FROM tasks
 WHERE id=$1 AND owner_id=$2 FOR UPDATE`, attestation.TaskFence.TaskID, attestation.TaskFence.OwnerID).
-			Scan(&currentID, &currentGeneration, &currentSession); errors.Is(err, pgx.ErrNoRows) {
+			Scan(&currentID, &currentGeneration, &currentSession, &currentTaskStatus); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeUnauthenticated, "account Task stop owner is unavailable")
 		} else if err != nil {
 			return fmt.Errorf("lock Task for Guardian process stop: %w", err)
@@ -542,6 +649,9 @@ WHERE id=$1 AND owner_id=$2 FOR UPDATE`, attestation.TaskFence.TaskID, attestati
 				return domain.NewError(domain.CodeIdempotencyConflict, "Guardian Task stop proof was already recorded differently")
 			}
 			replayed = true
+			if currentTaskStatus == string(task.StatusCancelling) {
+				return settleStoppedAgentChildSessions(ctx, tx, attestation.TaskFence)
+			}
 			return nil
 		}
 		if currentID != attestation.TaskFence.AgentInstanceID || currentGeneration != attestation.TaskFence.AgentGeneration ||
@@ -565,6 +675,9 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3 AND state='active'
 		if command.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "account Task Agent changed while confirming process stop")
 		}
+		if currentTaskStatus == string(task.StatusCancelling) {
+			return settleStoppedAgentChildSessions(ctx, tx, attestation.TaskFence)
+		}
 		return nil
 	})
 	return replayed, err
@@ -580,7 +693,7 @@ func (s *Store) ListPendingAccountAgentTaskStopAttestations(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT i.task_id,i.owner_id,t.initiator_id,i.agent_generation,i.service_instance_id::text,
+		rows, err := tx.Query(ctx, `SELECT i.task_id,i.owner_id,t.initiator_id,t.conversation_id,i.agent_generation,i.service_instance_id::text,
 	i.account_runtime_id,i.account_runtime_generation,i.stop_nonce_digest,i.guardian_stop_attestation,i.guardian_stop_attestation_digest
 FROM task_agent_instances i JOIN tasks t ON t.id=i.task_id AND t.owner_id=i.owner_id
 WHERE i.service_instance_id=$1::uuid AND i.state='stopped' AND i.guardian_task_stop_ack_required
@@ -591,10 +704,10 @@ ORDER BY i.stopped_at,i.task_id,i.agent_generation LIMIT $2`, serviceInstanceID,
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var taskID, ownerID, taskInitiatorID, storedServiceInstanceID, runtimeID string
+			var taskID, ownerID, taskInitiatorID, conversationID, storedServiceInstanceID, runtimeID string
 			var generation, runtimeGeneration int64
 			var nonceDigest, encoded, storedDigest []byte
-			if err := rows.Scan(&taskID, &ownerID, &taskInitiatorID, &generation, &storedServiceInstanceID, &runtimeID,
+			if err := rows.Scan(&taskID, &ownerID, &taskInitiatorID, &conversationID, &generation, &storedServiceInstanceID, &runtimeID,
 				&runtimeGeneration, &nonceDigest, &encoded, &storedDigest); err != nil {
 				return fmt.Errorf("read pending Guardian Task stop acknowledgement: %w", err)
 			}
@@ -617,7 +730,7 @@ ORDER BY i.stopped_at,i.task_id,i.agent_generation LIMIT $2`, serviceInstanceID,
 				!bytes.Equal(storedDigest, digest[:]) || nonceErr != nil || !validAgentNonceDigest(attestation.NonceSHA256) ||
 				!bytes.Equal(nonceDigest, attestationNonceDigest) ||
 				storedServiceInstanceID != serviceInstanceID || attestation.RuntimeFence.ServiceInstanceID != serviceInstanceID ||
-				attestation.RuntimeFence.OwnerID != taskInitiatorID || attestation.RuntimeFence.RuntimeID != runtimeID ||
+				attestation.RuntimeFence.OwnerID != ownerID || attestation.RuntimeFence.ConversationID != conversationID || attestation.RuntimeFence.RuntimeID != runtimeID ||
 				attestation.RuntimeFence.RuntimeGeneration != runtimeGeneration || attestation.TaskFence.TaskID != taskID ||
 				attestation.TaskFence.OwnerID != ownerID || attestation.TaskFence.InitiatorID != taskInitiatorID ||
 				attestation.TaskFence.AgentGeneration != generation {
@@ -692,7 +805,7 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_instance_id=$3 AND agent_generation=$
 
 func validateAccountAgentTaskStopProofForStore(attestation app.AccountAgentTaskStopAttestation, encoded []byte) error {
 	if attestation.RuntimeFence.Validate() != nil || attestation.TaskFence.Validate() != nil ||
-		attestation.TaskFence.InitiatorID != attestation.RuntimeFence.OwnerID || !attestation.Destroyed ||
+		attestation.TaskFence.OwnerID != attestation.RuntimeFence.OwnerID || !attestation.Destroyed ||
 		len(attestation.RuntimeContainerID) != sha256.Size*2 || !validAgentNonceDigest(attestation.RuntimeContainerID) ||
 		attestation.ContainerPID < 1 || attestation.HostPID < 1 || attestation.StartTimeTick == 0 ||
 		!filepath.IsAbs(attestation.CgroupPath) || filepath.Clean(attestation.CgroupPath) != attestation.CgroupPath ||
@@ -711,6 +824,38 @@ func validAgentNonceDigest(value string) bool {
 	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
 }
 
+// settleStoppedCurrentTaskAgentChildrenIfProven covers the ordering where a
+// Task stop proof was committed just before the cancellation transaction. It
+// only settles descendants when the current fenced Agent row is already
+// stopped with persisted proof.
+func settleStoppedCurrentTaskAgentChildrenIfProven(ctx context.Context, tx pgx.Tx, taskID, ownerID string) error {
+	var fence app.AgentInstanceFence
+	var state string
+	var hasStopProof bool
+	err := tx.QueryRow(ctx, `SELECT t.id,t.owner_id,t.initiator_id,t.agent_instance_id,t.agent_generation,t.agent_session_id,
+i.supervisor_id,i.lease_owner,i.lease_version,i.auth_version,i.engine_version,i.profile_version,i.state,
+(i.stop_receipt IS NOT NULL AND i.stop_receipt_digest IS NOT NULL) OR
+(i.guardian_stop_attestation IS NOT NULL AND i.guardian_stop_attestation_digest IS NOT NULL)
+FROM tasks t JOIN task_agent_instances i
+  ON i.task_id=t.id AND i.owner_id=t.owner_id AND i.agent_generation=t.agent_generation
+ AND i.agent_instance_id=t.agent_instance_id AND i.agent_session_id=t.agent_session_id
+WHERE t.id=$1 AND t.owner_id=$2 AND t.status='cancelling'
+FOR UPDATE OF t,i`, taskID, ownerID).Scan(
+		&fence.TaskID, &fence.OwnerID, &fence.InitiatorID, &fence.AgentInstanceID, &fence.AgentGeneration, &fence.AgentSessionID,
+		&fence.SupervisorID, &fence.LeaseOwner, &fence.LeaseVersion, &fence.AuthorizationVersion,
+		&fence.EngineVersion, &fence.ProfileVersion, &state, &hasStopProof)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read current Task Agent stop proof before child settlement: %w", err)
+	}
+	if state != "stopped" || !hasStopProof {
+		return nil
+	}
+	return settleStoppedAgentChildSessions(ctx, tx, fence)
+}
+
 func settleStoppedAgentChildSessions(ctx context.Context, tx pgx.Tx, fence app.AgentInstanceFence) error {
 	var currentID, currentSession, status string
 	var generation int64
@@ -723,27 +868,63 @@ FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, fence.TaskID, fence.OwnerID)
 		generation != fence.AgentGeneration || currentSession != fence.AgentSessionID {
 		return nil
 	}
-	updated, err := tx.Exec(ctx, `UPDATE task_steps st SET status='unknown',
+	rows, err := tx.Query(ctx, `WITH RECURSIVE descendants(session_id) AS (
+  SELECT session_id FROM task_agent_sessions
+  WHERE task_id=$1 AND owner_id=$2 AND parent_session_id=$3
+  UNION
+  SELECT child.session_id FROM task_agent_sessions child
+  JOIN descendants parent ON child.parent_session_id=parent.session_id
+  WHERE child.task_id=$1 AND child.owner_id=$2
+)
+SELECT s.session_id,s.parent_session_id,s.step_id
+FROM descendants d
+JOIN task_agent_sessions s ON s.task_id=$1 AND s.owner_id=$2 AND s.session_id=d.session_id
+JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
+WHERE st.status IN ('queued','running','waiting_user')
+ORDER BY st.sequence
+FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.AgentSessionID)
+	if err != nil {
+		return fmt.Errorf("lock cancelled child Agent Sessions after verified stop: %w", err)
+	}
+	type child struct{ sessionID, parentSessionID, stepID string }
+	children := make([]child, 0)
+	for rows.Next() {
+		var value child
+		if err := rows.Scan(&value.sessionID, &value.parentSessionID, &value.stepID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read cancelled child Agent Session after verified stop: %w", err)
+		}
+		children = append(children, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate cancelled child Agent Sessions after verified stop: %w", err)
+	}
+	rows.Close()
+	for _, child := range children {
+		updated, err := tx.Exec(ctx, `UPDATE task_steps SET status='unknown',
 summary='The parent Task was cancelled after the Agent process tree stopped.'
-FROM task_agent_sessions s
-	WHERE s.task_id=$1 AND s.step_id=st.id AND s.parent_session_id IS NOT NULL
-  AND st.task_id=$1 AND st.status IN ('queued','running','waiting_user')`, fence.TaskID)
-	if err != nil {
-		return fmt.Errorf("settle cancelled child Agent TaskSteps after verified stop: %w", err)
+WHERE task_id=$1 AND id=$2 AND status IN ('queued','running','waiting_user')`, fence.TaskID, child.stepID)
+		if err != nil {
+			return fmt.Errorf("settle cancelled child Agent TaskStep after verified stop: %w", err)
+		}
+		if updated.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "child Agent TaskStep changed during stop settlement")
+		}
+		sequence, err := incrementTaskEventSequence(ctx, tx, fence.TaskID)
+		if err != nil {
+			return err
+		}
+		payload, err := json.Marshal(map[string]string{"phase": "subagent_settled", "status": string(task.StepUnknown),
+			"session_id": child.sessionID, "parent_session_id": child.parentSessionID, "step_id": child.stepID})
+		if err != nil {
+			return fmt.Errorf("encode cancelled child Agent settlement event: %w", err)
+		}
+		if err := insertTaskEvent(ctx, tx, task.Event{TaskID: fence.TaskID, Sequence: sequence, Type: "task.step", Payload: payload}); err != nil {
+			return err
+		}
 	}
-	if updated.RowsAffected() == 0 {
-		return nil
-	}
-	sequence, err := incrementTaskEventSequence(ctx, tx, fence.TaskID)
-	if err != nil {
-		return err
-	}
-	payload, err := json.Marshal(map[string]any{"phase": "subagents_stopped", "status": string(task.StepUnknown),
-		"step_count": updated.RowsAffected()})
-	if err != nil {
-		return fmt.Errorf("encode cancelled child Agent event: %w", err)
-	}
-	return insertTaskEvent(ctx, tx, task.Event{TaskID: fence.TaskID, Sequence: sequence, Type: "task.step", Payload: payload})
+	return nil
 }
 
 func validAgentStopEvidence(instance agentInstanceRow) bool {
@@ -780,7 +961,11 @@ func lockAuthorizedAgentTask(ctx context.Context, tx pgx.Tx, fence app.AgentInst
 		return agentTaskLock{}, err
 	}
 	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id=$1 FOR SHARE`, fence.InitiatorID).Scan(&status); errors.Is(err, pgx.ErrNoRows) {
+	userLock := " FOR SHARE"
+	if projectWorkspaceTaskPermit(ctx, fence.TaskID, fence.InitiatorID) != nil {
+		userLock = ""
+	}
+	if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id=$1`+userLock, fence.InitiatorID).Scan(&status); errors.Is(err, pgx.ErrNoRows) {
 		return agentTaskLock{}, domain.NewError(domain.CodeUnauthenticated, "agent initiator is unavailable")
 	} else if err != nil {
 		return agentTaskLock{}, fmt.Errorf("lock agent initiator: %w", err)
@@ -791,12 +976,12 @@ func lockAuthorizedAgentTask(ctx context.Context, tx pgx.Tx, fence app.AgentInst
 	var current agentTaskLock
 	var authKind, tokenID, installationID string
 	var authScopes []string
-	err = tx.QueryRow(ctx, `SELECT initiator_id,COALESCE(project_id,''),COALESCE(host_id,''),agent_instance_id,agent_generation,agent_session_id,agent_engine_version,
+	err = tx.QueryRow(ctx, `SELECT initiator_id,COALESCE(project_id,''),conversation_id,COALESCE(host_id,''),agent_instance_id,agent_generation,agent_session_id,agent_engine_version,
 agent_profile_version,checkpoint_through_seq,checkpoint_digest,auth_kind,auth_token_id,auth_scopes,COALESCE(auth_client_installation_id,'') FROM tasks
 WHERE id=$1 AND owner_id=$2 AND status='running' AND execution_location='server' AND execution_epoch=$3
  AND lease_owner=$4 AND lease_version=$5 AND lease_expires_at>clock_timestamp()
  AND auth_version=$6 AND (auth_kind='schedule_task' OR auth_expires_at>clock_timestamp()) FOR UPDATE`, fence.TaskID, fence.OwnerID, gate.epoch,
-		fence.LeaseOwner, fence.LeaseVersion, fence.AuthorizationVersion).Scan(&current.InitiatorID, &current.ProjectID, &current.HostID, &current.InstanceID, &current.Generation,
+		fence.LeaseOwner, fence.LeaseVersion, fence.AuthorizationVersion).Scan(&current.InitiatorID, &current.ProjectID, &current.ConversationID, &current.HostID, &current.InstanceID, &current.Generation,
 		&current.SessionID, &current.EngineVersion, &current.ProfileVersion, &current.CheckpointThrough, &current.CheckpointDigest,
 		&authKind, &tokenID, &authScopes, &installationID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -814,12 +999,15 @@ WHERE id=$1 AND owner_id=$2 AND status='running' AND execution_location='server'
 	return current, nil
 }
 
-// lockTaskInitiatorInTx binds worker execution to the immutable task actor and
-// serializes every active project execution transaction with membership changes.
-// OwnerID remains the conversation creator and the FK key for task child rows.
+// lockTaskInitiatorInTx binds worker execution to the immutable task actor.
+// Project membership is locked below, which serializes execution authorization
+// with membership changes. Do not lock the Task row here: callers may update it
+// later in the same transaction, and retaining a shared row lock first can form
+// a PostgreSQL lock-upgrade deadlock with concurrent Task lease renewal.
+// OwnerID remains the conversation creator and the FK key for Task child rows.
 func lockTaskInitiatorInTx(ctx context.Context, tx pgx.Tx, taskID, ownerID, expectedInitiatorID string) (string, error) {
 	var initiatorID, projectID string
-	err := tx.QueryRow(ctx, `SELECT initiator_id,COALESCE(project_id,'') FROM tasks WHERE id=$1 AND owner_id=$2 FOR SHARE`,
+	err := tx.QueryRow(ctx, `SELECT initiator_id,COALESCE(project_id,'') FROM tasks WHERE id=$1 AND owner_id=$2`,
 		taskID, ownerID).Scan(&initiatorID, &projectID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
@@ -835,6 +1023,10 @@ func lockTaskInitiatorInTx(ctx context.Context, tx pgx.Tx, taskID, ownerID, expe
 			return "", domain.NewError(domain.CodeUnauthenticated, "personal task initiator is unavailable")
 		}
 		return "", nil
+	}
+	permit, _ := ctx.Value(workspaceMutationPermitKey{}).(*workspaceMutationPermit)
+	if permit != nil && permit.active.Load() && permit.taskID == taskID && permit.actorID == initiatorID && permit.projectID == projectID {
+		return projectID, nil
 	}
 	if _, _, err := lockProjectForActorInTx(ctx, tx, initiatorID, projectID, project.RoleMember, false); err != nil {
 		return "", domain.NewError(domain.CodeUnauthenticated, "project task authorization is unavailable")
@@ -862,14 +1054,20 @@ func lockAgentInstance(ctx context.Context, tx pgx.Tx, taskID, ownerID string, g
 	row.Fence.TaskID, row.Fence.OwnerID, row.Fence.AgentGeneration = taskID, ownerID, generation
 	err := tx.QueryRow(ctx, `SELECT agent_instance_id,agent_session_id,engine_version,profile_version,supervisor_id,
 stop_nonce_digest,lease_owner,lease_version,auth_version,initial_lease_ms,lease_expires_at,state,stop_receipt,stop_receipt_digest,
-guardian_stop_attestation,guardian_stop_attestation_digest,COALESCE(service_instance_id::text,''),
-COALESCE(account_runtime_id,''),COALESCE(account_runtime_generation,0),COALESCE(runtime_sequence,0)
+	guardian_stop_attestation,guardian_stop_attestation_digest,COALESCE(service_instance_id::text,''),
+COALESCE(account_runtime_id,''),COALESCE(account_runtime_generation,0),COALESCE(runtime_sequence,0),
+COALESCE(host_id,''),COALESCE(host_owner_id,''),COALESCE(host_actor_id,''),COALESCE(host_permission,''),
+COALESCE(host_authorization_kind,''),COALESCE(host_runtime_generation,0),COALESCE(host_runtime_instance_id,''),
+COALESCE(host_control_version,0),COALESCE(host_grant_fingerprint,'')
 FROM task_agent_instances WHERE task_id=$1 AND owner_id=$2 AND agent_generation=$3 FOR UPDATE`, taskID, ownerID, generation).Scan(
 		&row.Fence.AgentInstanceID, &row.Fence.AgentSessionID, &row.Fence.EngineVersion, &row.Fence.ProfileVersion,
 		&row.Fence.SupervisorID, &row.NonceHash, &row.Fence.LeaseOwner, &row.Fence.LeaseVersion,
 		&row.Fence.AuthorizationVersion, &row.InitialLeaseMillis, &row.ExpiresAt, &row.State, &row.Receipt, &row.ReceiptHash,
 		&row.GuardianAttestation, &row.GuardianAttestationHash, &row.RuntimeServiceInstanceID, &row.RuntimeID,
-		&row.RuntimeGeneration, &row.RuntimeSequence)
+		&row.RuntimeGeneration, &row.RuntimeSequence,
+		&row.HostFence.HostID, &row.HostFence.OwnerID, &row.HostFence.ActorID, &row.HostFence.Permission,
+		&row.HostFence.AuthorizationKind, &row.HostFence.RuntimeGeneration, &row.HostFence.RuntimeInstanceID,
+		&row.HostFence.ControlVersion, &row.HostFence.GrantFingerprint)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return agentInstanceRow{}, agentStopUnconfirmed()
 	}
@@ -881,6 +1079,211 @@ FROM task_agent_instances WHERE task_id=$1 AND owner_id=$2 AND agent_generation=
 		return agentInstanceRow{}, fmt.Errorf("read agent task initiator: %w", err)
 	}
 	return row, nil
+}
+
+// lockAgentHostTarget takes the Host lock before lockAuthorizedAgentTask locks
+// the Task row. Host control and member-permission changes also lock Host first,
+// so this ordering makes startup/renewal serialize with revocation.
+func lockAgentHostTarget(ctx context.Context, tx pgx.Tx, taskID, ownerID string) (agentHostTarget, error) {
+	var result agentHostTarget
+	err := tx.QueryRow(ctx, `SELECT COALESCE(host_id,''),initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).
+		Scan(&result.TaskHostID, &result.TaskActorID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agentHostTarget{}, agentStopUnconfirmed()
+	}
+	if err != nil {
+		return agentHostTarget{}, fmt.Errorf("read Agent task Host target: %w", err)
+	}
+	if result.TaskHostID == "" {
+		return result, nil
+	}
+	return lockAgentHostTargetIdentity(ctx, tx, taskID, ownerID, result.TaskHostID, result.TaskActorID)
+}
+
+// Callers first lock the observed Host owner's execution gate, then use the
+// observed Host and actor here. They must recheck the Task identity once its
+// row is locked; a concurrent target change must not switch the locked Host.
+func lockAgentHostTargetIdentity(ctx context.Context, tx pgx.Tx, taskID, ownerID, hostID, actorID string) (agentHostTarget, error) {
+	result := agentHostTarget{TaskHostID: hostID, TaskActorID: actorID}
+	if hostID == "" {
+		return result, nil
+	}
+	hostLock := " FOR SHARE OF h"
+	if permit := projectWorkspaceTaskPermit(ctx, taskID, result.TaskActorID); permit != nil &&
+		permit.taskOwnerID == ownerID && permit.grantHostID == result.TaskHostID {
+		// The outer Workspace guard holds this Host lock for the lifetime of
+		// the nested call. Reacquiring it behind a queued revocation can deadlock.
+		hostLock = ""
+	}
+	err := tx.QueryRow(ctx, `SELECT h.owner_id,h.state,h.control_state,h.deleted_at IS NOT NULL,
+h.runtime_generation,COALESCE(h.runtime_instance_id,''),h.control_version,
+hm.host_id IS NOT NULL,COALESCE(hm.grant_version::text,''),COALESCE(hm.created_at,'epoch'::timestamptz),
+COALESCE(hm.permissions,'{}'::text[])
+FROM hosts h
+LEFT JOIN host_members hm ON hm.host_id=h.id AND hm.owner_id=h.owner_id AND hm.user_id=$2 AND hm.revoked_at IS NULL
+WHERE h.id=$1`+hostLock, result.TaskHostID, result.TaskActorID).Scan(&result.OwnerID, &result.State,
+		&result.ControlState, &result.Deleted, &result.RuntimeGeneration, &result.RuntimeInstanceID, &result.ControlVersion,
+		&result.HasActiveGrant, &result.GrantVersion, &result.GrantCreatedAt, &result.GrantPermissions)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agentHostTarget{}, agentHostFenceUnavailable()
+	}
+	if err != nil {
+		return agentHostTarget{}, fmt.Errorf("lock Agent task Host: %w", err)
+	}
+	return result, nil
+}
+
+func captureAgentHostFence(ctx context.Context, tx pgx.Tx, current agentTaskLock, target agentHostTarget) (agentHostFence, error) {
+	if current.HostID != target.TaskHostID || current.InitiatorID != target.TaskActorID {
+		return agentHostFence{}, agentHostFenceUnavailable()
+	}
+	if current.HostID == "" {
+		return agentHostFence{}, nil
+	}
+	if target.OwnerID == "" || target.State != string(host.StateRunning) || target.ControlState != string(host.ControlAI) ||
+		target.Deleted || target.RuntimeGeneration <= 0 || target.RuntimeInstanceID == "" {
+		return agentHostFence{}, agentHostFenceUnavailable()
+	}
+	allowed, err := hasControlPermission(ctx, tx, current.HostID, target.OwnerID, current.InitiatorID, string(host.PermissionDesktopControl))
+	if err != nil {
+		return agentHostFence{}, fmt.Errorf("authorize Agent task Host control: %w", err)
+	}
+	if !allowed {
+		return agentHostFence{}, agentHostFenceUnavailable()
+	}
+	authorizationKind := "member"
+	grantFingerprint := ""
+	if current.InitiatorID == target.OwnerID {
+		authorizationKind = "owner"
+	} else {
+		if !target.HasActiveGrant || target.GrantVersion == "" || target.GrantCreatedAt.IsZero() || len(target.GrantPermissions) == 0 {
+			return agentHostFence{}, agentHostFenceUnavailable()
+		}
+		grantFingerprint = fingerprintHostMemberGrant(target.GrantCreatedAt, target.GrantVersion, target.GrantPermissions)
+	}
+	return agentHostFence{
+		HostID: current.HostID, OwnerID: target.OwnerID, ActorID: current.InitiatorID,
+		Permission: string(host.PermissionDesktopControl), AuthorizationKind: authorizationKind,
+		GrantFingerprint:  grantFingerprint,
+		RuntimeGeneration: target.RuntimeGeneration, RuntimeInstanceID: target.RuntimeInstanceID,
+		ControlVersion: target.ControlVersion,
+	}, nil
+}
+
+// requireTaskAgentHostAuthorizationFence validates the current Host permit and,
+// when the Task is bound to an Agent instance, proves that instance still holds
+// the exact Host grant snapshot captured at startup. A revoke followed by a
+// regrant therefore cannot revive an old Agent.
+func requireTaskAgentHostAuthorizationFence(ctx context.Context, tx pgx.Tx, taskID, taskOwnerID string,
+	operation task.Operation) error {
+	target, err := lockAgentHostTarget(ctx, tx, taskID, taskOwnerID)
+	if err != nil {
+		return err
+	}
+	if target.TaskHostID == "" || target.TaskHostID != operation.HostID {
+		return agentHostFenceUnavailable()
+	}
+	current := agentTaskLock{HostID: target.TaskHostID, InitiatorID: target.TaskActorID}
+	currentHostFence, err := captureAgentHostFence(ctx, tx, current, target)
+	if err != nil {
+		return err
+	}
+	if operation.RuntimeGeneration != target.RuntimeGeneration || operation.RuntimeInstanceID != target.RuntimeInstanceID ||
+		operation.ControlVersion != target.ControlVersion {
+		return agentHostFenceUnavailable()
+	}
+
+	var agentInstanceID string
+	var agentGeneration int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(agent_instance_id,''),agent_generation
+FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).Scan(&agentInstanceID, &agentGeneration); err != nil {
+		return fmt.Errorf("read Task Agent Host binding: %w", err)
+	}
+	if agentInstanceID == "" {
+		return nil
+	}
+	if agentGeneration < 1 {
+		return agentHostFenceUnavailable()
+	}
+
+	var stored agentHostFence
+	var state string
+	var leaseActive bool
+	err = tx.QueryRow(ctx, `SELECT COALESCE(host_id,''),COALESCE(host_owner_id,''),COALESCE(host_actor_id,''),
+COALESCE(host_permission,''),COALESCE(host_authorization_kind,''),COALESCE(host_grant_fingerprint,''),
+COALESCE(host_runtime_generation,0),COALESCE(host_runtime_instance_id,''),COALESCE(host_control_version,0),
+state,lease_expires_at>clock_timestamp()
+FROM task_agent_instances
+WHERE task_id=$1 AND owner_id=$2 AND agent_instance_id=$3 AND agent_generation=$4`,
+		taskID, taskOwnerID, agentInstanceID, agentGeneration).Scan(&stored.HostID, &stored.OwnerID, &stored.ActorID,
+		&stored.Permission, &stored.AuthorizationKind, &stored.GrantFingerprint, &stored.RuntimeGeneration,
+		&stored.RuntimeInstanceID, &stored.ControlVersion, &state, &leaseActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agentHostFenceUnavailable()
+	}
+	if err != nil {
+		return fmt.Errorf("read Task Agent Host authorization snapshot: %w", err)
+	}
+	verifiedTaskOutput := isTaskWorkspaceVerificationOperation(operation)
+	activeAgent := state == "active" && leaseActive
+	stoppedAgentVerification := verifiedTaskOutput && state == "stopped"
+	if (!activeAgent && !stoppedAgentVerification) || !sameAgentHostFence(stored, currentHostFence) {
+		return agentHostFenceUnavailable()
+	}
+	return nil
+}
+
+func isTaskWorkspaceVerificationOperation(operation task.Operation) bool {
+	parts := strings.Split(operation.Key, ":")
+	if len(parts) != 5 || parts[0] != "agent" || parts[1] != "verify" ||
+		!domain.ValidStepID(parts[2]) || !domain.ValidWorkspaceID(parts[3]) ||
+		operation.WorkspaceID != parts[3] {
+		return false
+	}
+	bindingVersion, err := strconv.ParseInt(parts[4], 10, 64)
+	return err == nil && bindingVersion > 0 && operation.BindingVersion == bindingVersion
+}
+
+func sameAgentHostFence(left, right agentHostFence) bool {
+	return left == right
+}
+
+func sameAgentHostGrant(left, right agentHostFence) bool {
+	return left.HostID == right.HostID && left.OwnerID == right.OwnerID && left.ActorID == right.ActorID &&
+		left.Permission == right.Permission && left.AuthorizationKind == right.AuthorizationKind &&
+		left.GrantFingerprint == right.GrantFingerprint
+}
+
+func hostFenceValue(fence agentHostFence, value func(agentHostFence) any) any {
+	if fence.HostID == "" {
+		return nil
+	}
+	return value(fence)
+}
+
+func hostGrantFingerprintValue(fence agentHostFence) any {
+	if fence.HostID == "" || fence.AuthorizationKind != "member" {
+		return nil
+	}
+	return fence.GrantFingerprint
+}
+
+func fingerprintHostMemberGrant(createdAt time.Time, grantVersion string, permissions []string) string {
+	canonicalPermissions := append([]string(nil), permissions...)
+	sort.Strings(canonicalPermissions)
+	payload, _ := json.Marshal(struct {
+		CreatedAt    string   `json:"created_at"`
+		GrantVersion string   `json:"grant_version"`
+		Permissions  []string `json:"permissions"`
+	}{CreatedAt: createdAt.UTC().Format(time.RFC3339Nano), GrantVersion: grantVersion, Permissions: canonicalPermissions})
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func agentHostFenceUnavailable() error {
+	err := domain.NewError(domain.CodeInvalidState, "Host runtime or control authorization changed")
+	err.Details["reason"] = "control_changed"
+	return err
 }
 
 func lockActiveAgentLease(ctx context.Context, tx pgx.Tx, fence app.AgentInstanceFence) error {

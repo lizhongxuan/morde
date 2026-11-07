@@ -80,7 +80,7 @@ func NewWorkspaceCopyService(store WorkspaceCopyStore, syncService *WorkspaceSyn
 
 func (s *WorkspaceCopyService) SetCurrentMaterializer(materializer WorkspaceCopyMaterializer) error {
 	if s == nil || materializer == nil {
-		return errors.New("Workspace copy materializer is required")
+		return errors.New("workspace copy materializer is required")
 	}
 	s.materialize = materializer
 	return nil
@@ -145,6 +145,9 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		if err != nil {
 			return WorkspaceCopyResult{}, err
 		}
+		if source.ReadOnly {
+			return WorkspaceCopyResult{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
+		}
 		if source.Revision != reservation.SourceRevision || source.State != workspace.StateReady {
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace copy source checkpoint changed")
 		}
@@ -164,6 +167,9 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		source, err = s.sync.authorize(ctx, principal, sourceWorkspaceID)
 		if err != nil {
 			return WorkspaceCopyResult{}, err
+		}
+		if source.ReadOnly {
+			return WorkspaceCopyResult{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if source.Revision != command.ExpectedCurrentRevision || source.State != workspace.StateReady {
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed before copy; refresh and retry")

@@ -21,7 +21,7 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, objective, timing,
+const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
 observation_config_hash, baseline_fingerprint, created_at, updated_at`
@@ -75,12 +75,12 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO schedules (
-id, owner_id, version, status, execution_epoch, host_id, model_id, objective, timing,
+id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes,
 auth_client_installation_id, misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
 observation_config_hash, baseline_fingerprint
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
-			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Objective, timing,
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Title, value.Objective, timing,
 			value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens, value.Authorization.Kind,
 			value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 			notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey,
@@ -542,7 +542,7 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 				return err
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO conversations (id,owner_id,host_id,title) VALUES ($1,$2,$3,$4)`,
-				conversationID, value.OwnerID, nullableText(value.HostID), truncateScheduleTitle(value.Objective)); err != nil {
+				conversationID, value.OwnerID, nullableText(value.HostID), truncateScheduleTitle(value.Title)); err != nil {
 				return fmt.Errorf("create scheduled conversation: %w", err)
 			}
 			scheduledScopes := identity.ScheduleTaskExecutionScopes()
@@ -752,7 +752,7 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	var nextRunAt, nextCheckAt, createdAt, updatedAt pgtype.Timestamptz
 	var hostID pgtype.Text
 	err := row.Scan(&value.ID, &value.OwnerID, &value.Version, &status, &value.ExecutionEpoch, &hostID, &value.ModelID,
-		&value.Objective, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
+		&value.Title, &value.Objective, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
 		&authKind, &value.Authorization.TokenID, &authScopes, &authClientInstallationID, &policy, &notificationEvents, &value.NextOccurrenceKey,
 		&nextRunAt, &nextCheckAt, &observationJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt)
 	if err != nil {
@@ -842,12 +842,12 @@ func updateScheduleRow(ctx context.Context, tx pgx.Tx, ownerID string, value sch
 	if err != nil {
 		return err
 	}
-	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,objective=$8,timing=$9,
-budget_active_seconds=$10,budget_tool_calls=$11,budget_model_tokens=$12,auth_kind=$13,auth_token_id=$14,auth_scopes=$15,
-auth_client_installation_id=$16,misfire_policy=$17,notification_events=$18,next_occurrence_key=$19,next_run_at=$20,next_check_at=$21,observation_spec=$22,
-observation_config_hash=$23,baseline_fingerprint=$24,updated_at=clock_timestamp()
+	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,title=$8,objective=$9,timing=$10,
+budget_active_seconds=$11,budget_tool_calls=$12,budget_model_tokens=$13,auth_kind=$14,auth_token_id=$15,auth_scopes=$16,
+auth_client_installation_id=$17,misfire_policy=$18,notification_events=$19,next_occurrence_key=$20,next_run_at=$21,next_check_at=$22,observation_spec=$23,
+observation_config_hash=$24,baseline_fingerprint=$25,updated_at=clock_timestamp()
 		WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID,
-		value.Objective, timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
+		value.Title, value.Objective, timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
 		value.Authorization.Kind, value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 		notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey, nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt),
 		observation, value.ObservationConfigHash, value.BaselineFingerprint)
@@ -863,7 +863,7 @@ observation_config_hash=$23,baseline_fingerprint=$24,updated_at=clock_timestamp(
 func personalScheduleContentBytesInTx(ctx context.Context, tx pgx.Tx, ownerID, scheduleID string) (int64, error) {
 	var contentBytes int64
 	err := tx.QueryRow(ctx, `SELECT octet_length(jsonb_build_object(
-  'objective',objective,'model',model_id,'host',host_id,'timing',timing,
+  'title',title,'objective',objective,'model',model_id,'host',host_id,'timing',timing,
   'budgets',jsonb_build_object('active_seconds',budget_active_seconds,'tool_calls',budget_tool_calls,'model_tokens',budget_model_tokens),
   'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec
 )::text) FROM schedules WHERE id=$1 AND owner_id=$2`, scheduleID, ownerID).Scan(&contentBytes)

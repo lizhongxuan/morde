@@ -21,9 +21,6 @@ import (
 
 const (
 	maxCommandOutput = 1 << 20
-	maxDisplayWidth  = 16384
-	maxDisplayHeight = 16384
-	maxDisplayPixels = 64 << 20
 )
 
 var dimensionsPattern = regexp.MustCompile(`(?m)^\s*dimensions:\s*([0-9]+)x([0-9]+) pixels`)
@@ -187,6 +184,9 @@ func (b *linuxBackend) activate(ctx context.Context, id string) error {
 }
 
 func (b *linuxBackend) click(ctx context.Context, id string, x, y int, button string) error {
+	if err := b.requireActiveWindow(ctx, id); err != nil {
+		return err
+	}
 	number, err := windowIDDecimal(id)
 	if err != nil {
 		return err

@@ -104,7 +104,7 @@ func cloudDSHSkillReadDefinition() AgentToolDefinition {
 	})
 	return AgentToolDefinition{
 		ModelTool: ModelTool{Name: cloudDSHSkillReadToolName,
-			Description: "Load a reviewed nanoMuse skill only when the request matches its purpose. Skills do not add permissions; use only this task's authorized tools and Workspace. Available: " + strings.Join(descriptions, "; "),
+			Description: "Load a reviewed Morde skill only when the request matches its purpose. Skills do not add permissions; use only this task's authorized tools and Workspace. Available: " + strings.Join(descriptions, "; "),
 			Parameters:  parameters},
 		RequiredScope: identity.ScopeTaskRead,
 	}
@@ -121,7 +121,7 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	}
 	skill, ok := cloudDSHSkillForID(arguments.SkillID)
 	if !ok {
-		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "nanoMuse skill is not in the fixed allowlist")
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Morde skill is not in the fixed allowlist")
 	}
 	details, err := b.currentServerTask(ctx, claimed)
 	if err != nil {
@@ -137,11 +137,11 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "cloud dsh skill task authorization changed")
 	}
 	if err := b.authorizeSkillTask(ctx, current); err != nil {
-		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow nanoMuse skills")
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow Morde skills")
 	}
 	content, err := fs.ReadFile(cloudDSHSkillBundle, skill.resource)
 	if err != nil || len(content) == 0 || len(content) > maxAgentToolOutputBytes || !utf8.Valid(content) {
-		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "fixed nanoMuse skill bundle is invalid")
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "fixed Morde skill bundle is invalid")
 	}
 	contentHash := sha256.Sum256(content)
 	output, err := json.Marshal(cloudDSHSkillReadOutput{
@@ -151,7 +151,7 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 		Content:        string(content),
 	})
 	if err != nil || len(output) > maxAgentToolOutputBytes {
-		return AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "nanoMuse skill exceeds the dsh tool output limit")
+		return AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "Morde skill exceeds the dsh tool output limit")
 	}
 	outputHash := sha256.Sum256(output)
 	commit := CloudDSHSkillReadCommit{
@@ -168,7 +168,7 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	}
 	usage.ToolCalls++
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepSucceeded,
-		"Load nanoMuse skill: "+skill.id, "Loaded the fixed, read-only skill bundle into the dsh session.")
+		"Load Morde skill: "+skill.id, "Loaded the fixed, read-only skill bundle into the dsh session.")
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -182,10 +182,10 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	}
 	payload, err := agentStepEvent(step, usage, detail)
 	if err != nil || len(payload) > MaxCloudDSHSkillEventBytes {
-		return AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "nanoMuse skill event exceeds its limit")
+		return AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "Morde skill event exceeds its limit")
 	}
 	if recovering && checkpointOutput != nil && *checkpointOutput != string(output) {
-		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed nanoMuse skill output changed")
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed Morde skill output changed")
 	}
 	if _, err := b.store.CommitTaskProgress(ctx, TaskProgress{
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
@@ -232,7 +232,7 @@ func (b *CloudDSHToolBroker) authorizeSkillTask(ctx context.Context, current tas
 			return domain.NewError(domain.CodeForbidden, "task submission authorization is unavailable")
 		}
 	default:
-		return domain.NewError(domain.CodeForbidden, "task authorization kind cannot execute nanoMuse skills")
+		return domain.NewError(domain.CodeForbidden, "task authorization kind cannot execute Morde skills")
 	}
 	if current.HostID == "" {
 		return nil

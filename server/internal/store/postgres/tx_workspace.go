@@ -84,8 +84,9 @@ func (s *Store) CreateWorkspaceBinding(ctx context.Context, value workspace.Bind
 			return domain.NewError(domain.CodeCapacityExceeded, "host has reached the workspace binding limit")
 		}
 		var workspaceOwner, workspaceState string
+		var readOnly bool
 		var revision int64
-		err = tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 FOR UPDATE`, value.Workspace.ID).Scan(&workspaceOwner, &workspaceState, &revision)
+		err = tx.QueryRow(ctx, `SELECT owner_id, state, revision, is_read_only FROM workspaces WHERE id=$1 FOR UPDATE`, value.Workspace.ID).Scan(&workspaceOwner, &workspaceState, &revision, &readOnly)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && workspaceOwner != value.OwnerID) {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
 		}
@@ -94,6 +95,9 @@ func (s *Store) CreateWorkspaceBinding(ctx context.Context, value workspace.Bind
 		}
 		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.Workspace.ID); err != nil {
 			return err
+		}
+		if readOnly {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 		if workspaceState != string(workspace.StateReady) || revision != value.DesiredRevision {
 			return domain.NewError(domain.CodeWorkspaceConflict, "workspace changed before binding")

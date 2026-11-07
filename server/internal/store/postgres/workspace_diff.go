@@ -39,13 +39,16 @@ func (s *Store) RestoreWorkspaceRevision(ctx context.Context, ownerID, workspace
 		}
 		var state, storedOwner string
 		var currentRevision, currentFileCount, currentBytes, quotaBytes int64
-		var deleted bool
-		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, used_bytes, quota_bytes, deleted_at IS NOT NULL
-FROM workspaces WHERE id=$1`, workspaceID).Scan(&storedOwner, &state, &currentRevision, &currentBytes, &quotaBytes, &deleted); err != nil {
+		var deleted, readOnly bool
+		if err := tx.QueryRow(ctx, `SELECT owner_id, state, revision, used_bytes, quota_bytes, deleted_at IS NOT NULL, is_read_only
+FROM workspaces WHERE id=$1`, workspaceID).Scan(&storedOwner, &state, &currentRevision, &currentBytes, &quotaBytes, &deleted, &readOnly); err != nil {
 			return storeError("read Workspace before restore", "workspace", err)
 		}
 		if storedOwner != ownerID || deleted {
 			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if readOnly {
+			return domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 		}
 
 		stored, replayed, err := reserveIdempotency(ctx, tx, idempotency, workspaceID, "")

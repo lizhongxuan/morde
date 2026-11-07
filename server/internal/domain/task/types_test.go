@@ -35,6 +35,18 @@ func TestTaskTransitions(t *testing.T) {
 	}
 }
 
+func TestStepCountsExcludeBudgetSteps(t *testing.T) {
+	total, completed := StepCounts([]Step{
+		{Kind: "plan", Status: StepSucceeded},
+		{Kind: "budget", Status: StepSucceeded},
+		{Kind: "model", Status: StepRunning},
+		{Kind: "tool", Status: StepFailed},
+	})
+	if total != 3 || completed != 1 {
+		t.Fatalf("StepCounts = (%d, %d), want (3, 1)", total, completed)
+	}
+}
+
 func TestUnknownOperationMustBeReconciled(t *testing.T) {
 	if !CanTransitionOperation(OperationDispatched, OperationUnknown) ||
 		!CanTransitionOperation(OperationUnknown, OperationSucceeded) ||

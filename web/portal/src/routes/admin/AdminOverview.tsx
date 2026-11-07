@@ -11,7 +11,8 @@ export function AdminOverview() {
   const hostStates = Object.entries(hosts);
   const agentStates = Object.entries(agents);
   return <section className="admin-content">
-    <div className="page-heading"><div><p className="eyebrow">平台状态</p><h1>管理总览</h1><p className="muted">服务就绪、在线安装、云端电脑与 Agent 状态分别统计。</p></div></div>
+    <section className="design-panel" aria-labelledby="admin-overview-title">
+    <div className="design-panel-header"><div><h2 id="admin-overview-title">平台概况</h2><p>服务与资源的当前状态。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>刷新数据</button></div>
     <div className="admin-detail-facts">
       <article><span>服务就绪状态</span><strong><span className={`status ${health.ready ? 'status-ready' : 'status-failed'}`}>{health.ready ? '就绪' : '未就绪'}</span></strong>{health.problem && <p className="muted">{health.problem}</p>}</article>
       <article><span>在线安装数</span><strong>{query.data.online_installations.toLocaleString()}</strong><p className="muted">当前 Hub 进程内的 Client Installation，不代表 Agent 或 Host 数量。</p></article>
@@ -19,6 +20,7 @@ export function AdminOverview() {
       <article><span>CPU 已分配 / 上限</span><strong>{formatCpu(query.data.allocated.cpu_milli)} / {formatCpu(query.data.limit.cpu_milli)}</strong></article>
       <article><span>内存已分配 / 上限</span><strong>{formatMemory(query.data.allocated.mem_mib)} / {formatMemory(query.data.limit.mem_mib)}</strong></article>
     </div>
+    </section>
     <section className="admin-detail-section" aria-labelledby="admin-host-states">
       <h2 id="admin-host-states">Host 状态</h2>
       <div className="state-grid">{hostStates.length

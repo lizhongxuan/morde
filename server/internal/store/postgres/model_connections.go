@@ -34,7 +34,9 @@ func (s *Store) ListModelConnections(ctx context.Context, ownerID string) ([]app
 	if err != nil {
 		return nil, fmt.Errorf("list model connections: %w", err)
 	}
-	return mapRows(rows, modelConnectionDomain), nil
+	result := mapRows(rows, modelConnectionDomain)
+	s.addModelTextStreamingCapabilities(ctx, result)
+	return result, nil
 }
 
 func (s *Store) GetModelConnection(ctx context.Context, id string) (app.ModelConnectionRecord, error) {
@@ -42,14 +44,55 @@ func (s *Store) GetModelConnection(ctx context.Context, id string) (app.ModelCon
 	if err != nil {
 		return app.ModelConnectionRecord{}, storeError("get model connection", "model connection", err)
 	}
-	return modelConnectionDomain(row), nil
+	result := []app.ModelConnectionRecord{modelConnectionDomain(row)}
+	s.addModelTextStreamingCapabilities(ctx, result)
+	return result[0], nil
+}
+
+// Streaming verification is optional. A lookup failure leaves it unknown and
+// must not turn an otherwise configured text model into an unavailable one.
+func (s *Store) addModelTextStreamingCapabilities(ctx context.Context, records []app.ModelConnectionRecord) {
+	if len(records) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(records))
+	for _, record := range records {
+		ids = append(ids, record.ID)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT model_id,connection_version FROM model_text_streaming_capabilities
+WHERE model_id=ANY($1::text[]) AND state='verified'`, ids)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	versions := make(map[string]pgtype.Timestamptz)
+	for rows.Next() {
+		var id string
+		var version pgtype.Timestamptz
+		if err := rows.Scan(&id, &version); err != nil {
+			return
+		}
+		versions[id] = version
+	}
+	if rows.Err() != nil {
+		return
+	}
+	for i := range records {
+		version, ok := versions[records[i].ID]
+		records[i].Capabilities.TextStream = ok && version.Valid && records[i].CheckedAt != nil && records[i].Capabilities.Text &&
+			version.Time.Equal(records[i].UpdatedAt)
+	}
 }
 
 func (s *Store) UpdateModelConnection(ctx context.Context, value app.ModelConnectionRecord) (app.ModelConnectionRecord, error) {
 	row, err := s.q.UpdateModelConnection(ctx, sqlcgen.UpdateModelConnectionParams{
 		ID: value.ID, Name: value.Name, BaseUrl: value.BaseURL, ModelName: value.ModelName,
 		ApiKeyCipher: value.APIKeyCipher, CapabilityText: value.Capabilities.Text, CapabilityTools: value.Capabilities.Tools,
-		CapabilityVision: value.Capabilities.Vision, CheckedAt: nullableTimestamp(value.CheckedAt), ExpectedUpdatedAt: timestamp(value.UpdatedAt),
+		CapabilityVision:                value.Capabilities.Vision,
+		CapabilityMediaImageGeneration:  pgtype.Bool{Bool: value.Capabilities.MediaGeneration.ImageGeneration, Valid: true},
+		CapabilityMediaVideoGeneration:  pgtype.Bool{Bool: value.Capabilities.MediaGeneration.VideoGeneration, Valid: true},
+		CapabilityMediaSpeechGeneration: pgtype.Bool{Bool: value.Capabilities.MediaGeneration.SpeechGeneration, Valid: true},
+		CheckedAt:                       nullableTimestamp(value.CheckedAt), ExpectedUpdatedAt: timestamp(value.UpdatedAt),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -73,8 +116,15 @@ func modelConnectionDomain(row sqlcgen.ModelConnection) app.ModelConnectionRecor
 	return app.ModelConnectionRecord{
 		ID: row.ID, OwnerID: row.OwnerID.String, Name: row.Name, BaseURL: row.BaseUrl, ModelName: row.ModelName,
 		APIKeyCipher: append([]byte(nil), row.ApiKeyCipher...),
-		Capabilities: app.ModelCapabilities{Text: row.CapabilityText, Tools: row.CapabilityTools, Vision: row.CapabilityVision, ModelID: row.ID},
-		CheckedAt:    timePointer(row.CheckedAt), CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
+		Capabilities: app.ModelCapabilities{
+			Text: row.CapabilityText, Tools: row.CapabilityTools, Vision: row.CapabilityVision,
+			MediaGeneration: app.ModelMediaGenerationCapabilities{
+				ImageGeneration: row.CapabilityMediaImageGeneration, VideoGeneration: row.CapabilityMediaVideoGeneration,
+				SpeechGeneration: row.CapabilityMediaSpeechGeneration,
+			},
+			ModelID: row.ID,
+		},
+		CheckedAt: timePointer(row.CheckedAt), CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
 }
 

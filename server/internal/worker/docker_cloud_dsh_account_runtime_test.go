@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -43,9 +44,9 @@ func (p *accountRuntimeArmProbe) StartedAccountRuntime(_ context.Context, guard 
 }
 
 func TestDockerAccountRuntimeNameMatchesGuardianContract(t *testing.T) {
-	docker, engine, guardian, _, _ := newDockerDSHFixture(t)
+	docker, engine, guardian := newDockerDSHFixture(t)
 	fence := app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000",
-		OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
+		ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
 		LeaseOwner: "worker-runtime", LeaseVersion: 1, ExecutionEpoch: 1}
 	nonce := bytes.Repeat([]byte{7}, 32)
 	nonceHash := sha256.Sum256(nonce)
@@ -62,10 +63,33 @@ func TestDockerAccountRuntimeNameMatchesGuardianContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = process.Input.Close(); _ = process.Output.Close() }()
+	if _, err := process.Input.Write([]byte("dsh-input\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-engine.input; got != "dsh-input\n" {
+		t.Fatalf("runtime attach input = %q", got)
+	}
+	if got, err := bufio.NewReader(process.Output).ReadString('\n'); err != nil || got != "dsh-output\n" {
+		t.Fatalf("runtime attach output = %q, %v", got, err)
+	}
 	if !probe.started || !engine.running || process.ContainerName != wantName || process.ContainerID != engine.id ||
 		probe.guard.ContainerName != wantName || engine.name != wantName || probe.guard.Fence != fence ||
 		probe.guard.NonceSHA256 != hex.EncodeToString(nonceHash[:]) || probe.guard.ContainerID != engine.id {
 		t.Fatalf("Docker/Guardian account Runtime startup mismatch: process=%+v Guardian=%+v", process, probe.guard)
+	}
+	engine.mu.Lock()
+	config := engine.created
+	encoded, err := json.Marshal(config)
+	engine.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := config["HostConfig"].(map[string]any)
+	if host["NetworkMode"] != "none" || host["ReadonlyRootfs"] != true || host["Privileged"] != false ||
+		host["Memory"].(float64) <= 0 || host["NanoCpus"].(float64) <= 0 || host["PidsLimit"].(float64) <= 0 ||
+		config["User"] != dockerDSHUser || !strings.Contains(string(encoded), "no-new-privileges:true") ||
+		!strings.Contains(string(encoded), `"ALL"`) || bytes.Contains(encoded, nonce) {
+		t.Fatal("conversation Runtime container violated its isolation or secret boundary")
 	}
 	inspected, err := docker.inspect(context.Background(), process.ContainerID)
 	if err != nil {
@@ -87,12 +111,12 @@ func TestDockerAccountRuntimeCleansContainerWhenGuardianArmFails(t *testing.T) {
 		{name: "removal unconfirmed", keepAfterDelete: true, wantError: "cleanup is unconfirmed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			docker, engine, guardian, _, _ := newDockerDSHFixture(t)
+			docker, engine, guardian := newDockerDSHFixture(t)
 			engine.keepAfterDelete = test.keepAfterDelete
 			probe := &accountRuntimeArmProbe{base: guardian, wantName: "reject-arm"}
 			supervisor := &dockerCloudDSHAccountRuntimeSupervisor{docker: docker, guardian: probe}
 			fence := app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000",
-				OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
+				ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
 				LeaseOwner: "worker-runtime", LeaseVersion: 1, ExecutionEpoch: 1}
 			_, err := supervisor.StartAccountRuntime(context.Background(), fence, bytes.Repeat([]byte{7}, 32), time.Now().Add(10*time.Second))
 			if err == nil || !strings.Contains(err.Error(), test.wantError) {
@@ -109,12 +133,12 @@ func TestDockerAccountRuntimeCleansContainerWhenGuardianArmFails(t *testing.T) {
 }
 
 func TestDockerAccountRuntimeCleansContainerWhenPreflightIdentityChanges(t *testing.T) {
-	docker, engine, guardian, _, _ := newDockerDSHFixture(t)
+	docker, engine, guardian := newDockerDSHFixture(t)
 	engine.badAccountLabel = true
 	probe := &accountRuntimeArmProbe{base: guardian}
 	supervisor := &dockerCloudDSHAccountRuntimeSupervisor{docker: docker, guardian: probe}
 	fence := app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000",
-		OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
+		ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
 		LeaseOwner: "worker-runtime", LeaseVersion: 1, ExecutionEpoch: 1}
 	_, err := supervisor.StartAccountRuntime(context.Background(), fence, bytes.Repeat([]byte{7}, 32), time.Now().Add(10*time.Second))
 	if err == nil || !strings.Contains(err.Error(), "does not match its identity") {

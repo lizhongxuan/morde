@@ -172,6 +172,7 @@ func TestWorkspaceNativeMetadataMigrationDownUpAndGuard(t *testing.T) {
 		ctx := context.Background()
 		owner := createTestUser(t, store, 8, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "native-metadata-down-guard")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		xattrsJSON, aclJSON, err := workspaceNativeMetadataJSON(
 			[]workspace.ExtendedAttribute{{Name: "user.guard", Value: []byte("written")}},
 			&workspace.NativeACL{Platform: "linux", Format: "linux-posix-acl-v1", Data: []byte{9, 8, 7}},
@@ -204,6 +205,7 @@ VALUES ($1,0,'guard.txt','guard.txt',0,$2,420,'[]'::jsonb,$3::jsonb,$4::jsonb,tr
 		ctx := context.Background()
 		owner := createTestUser(t, store, 9, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "native-directory-down-guard")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		if _, err := pool.Exec(ctx, `INSERT INTO workspace_changes (workspace_id,revision,file_path,action,directory)
 VALUES ($1,0,'.','directory_upsert','{"path":".","metadata_known":false}'::jsonb)`, value.ID); err != nil {
 			t.Fatalf("insert root directory change payload: %v", err)

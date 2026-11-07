@@ -17,32 +17,35 @@ import (
 )
 
 type projectWorkItemRoutesStub struct {
-	principal identity.Principal
-	projectID string
-	itemID    string
-	page      app.PageRequest
-	create    app.CreateProjectWorkItemCommand
-	assignee  string
-	reason    string
-	taskID    string
-	delivery  project.WorkItemDelivery
-	expected  int64
-	key       string
-	calls     map[string]int
-	item      project.WorkItem
-	pageValue app.ProjectWorkItemPage
+	principal            identity.Principal
+	projectID            string
+	itemID               string
+	page                 app.PageRequest
+	includeUnassigned    bool
+	getIncludeUnassigned bool
+	create               app.CreateProjectWorkItemCommand
+	assignee             string
+	reason               string
+	taskID               string
+	delivery             project.WorkItemDelivery
+	expected             int64
+	key                  string
+	calls                map[string]int
+	item                 project.WorkItem
+	pageValue            app.ProjectWorkItemPage
 }
 
 var _ projectWorkItemRoutesService = (*projectWorkItemRoutesStub)(nil)
 
-func (s *projectWorkItemRoutesStub) List(_ context.Context, principal identity.Principal, projectID string, page app.PageRequest) (app.ProjectWorkItemPage, error) {
+func (s *projectWorkItemRoutesStub) List(_ context.Context, principal identity.Principal, projectID string, includeUnassigned bool, page app.PageRequest) (app.ProjectWorkItemPage, error) {
 	s.record("list", principal, projectID, "", int64(page.Limit), "")
-	s.page = page
+	s.page, s.includeUnassigned = page, includeUnassigned
 	return s.pageValue, nil
 }
 
-func (s *projectWorkItemRoutesStub) Get(_ context.Context, principal identity.Principal, projectID, itemID string) (project.WorkItem, error) {
+func (s *projectWorkItemRoutesStub) Get(_ context.Context, principal identity.Principal, projectID, itemID string, includeUnassigned bool) (project.WorkItem, error) {
 	s.record("get", principal, projectID, itemID, 0, "")
+	s.getIncludeUnassigned = includeUnassigned
 	return s.item, nil
 }
 
@@ -55,6 +58,11 @@ func (s *projectWorkItemRoutesStub) Create(_ context.Context, principal identity
 func (s *projectWorkItemRoutesStub) Assign(_ context.Context, principal identity.Principal, projectID, itemID, assigneeID string, expected int64, key string) (project.WorkItem, error) {
 	s.record("assign", principal, projectID, itemID, expected, key)
 	s.assignee, s.expected, s.key = assigneeID, expected, key
+	return s.item, nil
+}
+
+func (s *projectWorkItemRoutesStub) Claim(_ context.Context, principal identity.Principal, projectID, itemID string, expected int64, key string) (project.WorkItem, error) {
+	s.record("claim", principal, projectID, itemID, expected, key)
 	return s.item, nil
 }
 
@@ -125,23 +133,26 @@ func TestProjectWorkItemRoutesForwardPageCreateAndMutationContracts(t *testing.T
 	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 	item := project.WorkItem{
 		ID: "j7654321", ProjectID: "j1234567", Title: "Ship module", Description: "Scope", AcceptanceCriteria: []string{"tested"},
-		AssigneeID: principal.UserID, State: project.WorkItemOpen, TaskIDs: []string{}, Version: 2,
+		Category: project.WorkItemCategoryBug, AssigneeID: principal.UserID, State: project.WorkItemOpen, TaskIDs: []string{}, Version: 2,
 	}
 	service := &projectWorkItemRoutesStub{item: item, pageValue: app.ProjectWorkItemPage{Items: []project.WorkItem{item}, NextCursor: "next"}}
 	router := projectWorkItemAPIRouter(&principal, service)
 
-	listed := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items?limit=10&cursor=before", "", "")
+	listed := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items?limit=10&cursor=before&include_unassigned=true", "", "")
 	var page projectWorkItemPageResponse
 	if err := json.Unmarshal(listed.Body.Bytes(), &page); err != nil || listed.Code != http.StatusOK || len(page.Items) != 1 ||
-		page.Items[0].ID != item.ID || page.Items[0].AcceptanceCriteria[0] != "tested" || page.NextCursor == nil || *page.NextCursor != "next" ||
+		page.Items[0].ID != item.ID || page.Items[0].AcceptanceCriteria[0] != "tested" || page.Items[0].Category != project.WorkItemCategoryBug ||
+		page.Items[0].AssigneeID == nil || *page.Items[0].AssigneeID != principal.UserID || page.NextCursor == nil || *page.NextCursor != "next" ||
+		!service.includeUnassigned ||
 		service.page != (app.PageRequest{Limit: 10, Cursor: "before"}) || service.calls["list"] != 1 || !reflect.DeepEqual(service.principal, principal) {
 		t.Fatalf("list = %d %s page=%#v service=%#v err=%v", listed.Code, listed.Body, page, service, err)
 	}
 
 	created := projectWorkItemAPIRequest(router, http.MethodPost, "/api/projects/j1234567/work-items",
-		`{"title":"Ship module","description":"Scope","acceptance_criteria":["tested"]}`, "work-item-create-01")
+		`{"title":"Ship module","description":"Scope","acceptance_criteria":["tested"],"category":"request","unassigned":true}`, "work-item-create-01")
 	if created.Code != http.StatusCreated || !reflect.DeepEqual(service.create, app.CreateProjectWorkItemCommand{
-		Title: "Ship module", Description: "Scope", AcceptanceCriteria: []string{"tested"}, IdempotencyKey: "work-item-create-01",
+		Title: "Ship module", Description: "Scope", AcceptanceCriteria: []string{"tested"},
+		Category: project.WorkItemCategoryRequest, Unassigned: true, IdempotencyKey: "work-item-create-01",
 	}) || service.calls["create"] != 1 {
 		t.Fatalf("create = %d %s command=%#v calls=%#v", created.Code, created.Body, service.create, service.calls)
 	}
@@ -150,6 +161,12 @@ func TestProjectWorkItemRoutesForwardPageCreateAndMutationContracts(t *testing.T
 		`{"assignee_id":"u7654321","expected_version":2}`, "work-item-assign-01")
 	if assigned.Code != http.StatusOK || service.assignee != "u7654321" || service.expected != 2 || service.key != "work-item-assign-01" || service.calls["assign"] != 1 {
 		t.Fatalf("assign = %d %s service=%#v", assigned.Code, assigned.Body, service)
+	}
+
+	claimed := projectWorkItemAPIRequest(router, http.MethodPost, "/api/projects/j1234567/work-items/j7654321/claim",
+		`{"expected_version":3}`, "work-item-claim-01")
+	if claimed.Code != http.StatusOK || service.expected != 3 || service.key != "work-item-claim-01" || service.calls["claim"] != 1 {
+		t.Fatalf("claim = %d %s service=%#v", claimed.Code, claimed.Body, service)
 	}
 
 	blocked := projectWorkItemAPIRequest(router, http.MethodPost, "/api/projects/j1234567/work-items/j7654321/block",
@@ -172,6 +189,43 @@ func TestProjectWorkItemRoutesForwardPageCreateAndMutationContracts(t *testing.T
 	}
 }
 
+func TestProjectWorkItemRoutesBindUnassignedReadsToExplicitOptIn(t *testing.T) {
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	item := project.WorkItem{
+		ID: "j7654321", ProjectID: "j1234567", Title: "Unassigned", Category: project.WorkItemCategoryUnclassified,
+		State: project.WorkItemOpen, TaskIDs: []string{}, Version: 1,
+	}
+	assigned := item
+	assigned.AssigneeID = principal.UserID
+	service := &projectWorkItemRoutesStub{item: assigned, pageValue: app.ProjectWorkItemPage{Items: []project.WorkItem{assigned}}}
+	router := projectWorkItemAPIRouter(&principal, service)
+	listed := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items", "", "")
+	var page projectWorkItemPageResponse
+	if err := json.Unmarshal(listed.Body.Bytes(), &page); err != nil || listed.Code != http.StatusOK || service.includeUnassigned ||
+		len(page.Items) != 1 || page.Items[0].AssigneeID == nil || *page.Items[0].AssigneeID != principal.UserID ||
+		page.Items[0].Category != project.WorkItemCategoryUnclassified {
+		t.Fatalf("default list = %d %s page=%#v service=%#v err=%v", listed.Code, listed.Body, page, service, err)
+	}
+	defaultRead := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items/j7654321", "", "")
+	if defaultRead.Code != http.StatusOK || service.getIncludeUnassigned {
+		t.Fatalf("default get = %d %s service=%#v", defaultRead.Code, defaultRead.Body, service)
+	}
+	service.item = item
+	read := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items/j7654321?include_unassigned=true", "", "")
+	var unassigned projectWorkItemResponse
+	if err := json.Unmarshal(read.Body.Bytes(), &unassigned); err != nil || read.Code != http.StatusOK || !service.getIncludeUnassigned || unassigned.AssigneeID != nil {
+		t.Fatalf("opted-in get = %d %s service=%#v", read.Code, read.Body, service)
+	}
+	badFilter := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items?include_unassigned=maybe", "", "")
+	if badFilter.Code != http.StatusBadRequest || service.calls["list"] != 1 {
+		t.Fatalf("invalid filter = %d %s calls=%#v", badFilter.Code, badFilter.Body, service.calls)
+	}
+	emptyFilter := projectWorkItemAPIRequest(router, http.MethodGet, "/api/projects/j1234567/work-items?include_unassigned=", "", "")
+	if emptyFilter.Code != http.StatusBadRequest || service.calls["list"] != 1 {
+		t.Fatalf("empty filter = %d %s calls=%#v", emptyFilter.Code, emptyFilter.Body, service.calls)
+	}
+}
+
 func TestProjectWorkItemRoutesRequirePrincipalAndStrictMutationPreconditions(t *testing.T) {
 	service := &projectWorkItemRoutesStub{}
 	if got := projectWorkItemAPIRequest(projectWorkItemAPIRouter(nil, service), http.MethodGet, "/api/projects/j1234567/work-items", "", ""); got.Code != http.StatusUnauthorized || service.calls["list"] != 0 {
@@ -184,6 +238,9 @@ func TestProjectWorkItemRoutesRequirePrincipalAndStrictMutationPreconditions(t *
 	}
 	if got := projectWorkItemAPIRequest(router, http.MethodPost, "/api/projects/j1234567/work-items/j7654321/resume", `{"expected_version":2}`, ""); got.Code != http.StatusBadRequest || service.calls["resume"] != 0 {
 		t.Fatalf("missing idempotency key = %d %s calls=%#v", got.Code, got.Body, service.calls)
+	}
+	if got := projectWorkItemAPIRequest(router, http.MethodPost, "/api/projects/j1234567/work-items/j7654321/claim", `{"expected_version":2}`, ""); got.Code != http.StatusBadRequest || service.calls["claim"] != 0 {
+		t.Fatalf("missing claim idempotency key = %d %s calls=%#v", got.Code, got.Body, service.calls)
 	}
 }
 

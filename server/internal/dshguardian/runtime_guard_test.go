@@ -906,7 +906,7 @@ func TestRecoverAbortedAccountRuntimeStartRequiresAbsentContainer(t *testing.T) 
 
 func testAccountRuntimeGuard(now time.Time) AccountRuntimeGuard {
 	fence := app.AccountAgentRuntimeFence{
-		ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", OwnerID: "u1234567", RuntimeID: "runtime-1",
+		ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1",
 		RuntimeGeneration: 1, LeaseOwner: "worker-1", LeaseVersion: 1, ExecutionEpoch: 1,
 	}
 	nonce := testNonceHash("runtime-nonce")

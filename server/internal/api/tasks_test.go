@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,47 +20,79 @@ import (
 )
 
 type taskServiceStub struct {
-	submitCommand        app.SubmitTaskCommand
-	submitCalls          int
-	appendCommand        app.AppendMessageCommand
-	appendID             string
-	appendCalls          int
-	listRequest          app.TaskListRequest
-	listCalls            int
-	getID                string
-	getDetails           *app.TaskDetails
-	actionTaskID         string
-	action               task.Action
-	actionExpected       task.Status
-	actionKey            string
-	actionCalls          int
-	retryTaskID          string
-	retryItemID          string
-	retryKey             string
-	retryCalls           int
-	responseTaskID       string
-	responseID           string
-	responseVersion      int64
-	responseDecision     task.PendingDecision
-	responseKey          string
-	responseCalls        int
-	clarificationTaskID  string
-	clarificationID      string
-	clarificationVersion int64
-	clarificationAnswer  string
-	clarificationKey     string
-	clarificationCalls   int
-	events               []task.Event
-	eventStatus          task.Status
-	eventCurrentSequence int64
-	eventCalls           int
-	eventAfter           int64
-	eventErrorAfterCall  int
-	revokeTaskID         string
-	revokeConnectorID    string
-	revokeVersion        int64
-	revokeCalls          int
-	err                  error
+	submitCommand          app.SubmitTaskCommand
+	submitCalls            int
+	submitReplayed         bool
+	acceptedConversationID string
+	acceptCommand          app.AcceptConversationMessageCommand
+	acceptCalls            int
+	acceptReplayed         bool
+	listRequest            app.TaskListRequest
+	listCalls              int
+	listPage               app.TaskPage
+	conversationTasks      app.TaskPage
+	conversationTaskID     string
+	getID                  string
+	getDetails             *app.TaskDetails
+	actionTaskID           string
+	action                 task.Action
+	actionExpected         task.Status
+	actionKey              string
+	actionCalls            int
+	retryTaskID            string
+	retryItemID            string
+	retryKey               string
+	retryCalls             int
+	responseTaskID         string
+	responseID             string
+	responseVersion        int64
+	responseDecision       task.PendingDecision
+	responseKey            string
+	responseCalls          int
+	clarificationTaskID    string
+	clarificationID        string
+	clarificationVersion   int64
+	clarificationAnswer    string
+	clarificationKey       string
+	clarificationCalls     int
+	events                 []task.Event
+	eventStatus            task.Status
+	eventCurrentSequence   int64
+	eventCalls             int
+	eventAfter             int64
+	eventErrorAfterCall    int
+	revokeTaskID           string
+	revokeConnectorID      string
+	revokeVersion          int64
+	revokeCalls            int
+	err                    error
+}
+
+type conversationRecoveryTaskServiceStub struct {
+	*taskServiceStub
+	activePage     app.TaskPage
+	resumeEvents   map[string]task.Event
+	resumedTaskIDs []string
+	resumeAfter    []int64
+}
+
+func (s *conversationRecoveryTaskServiceStub) ListConversationActiveTasks(_ context.Context, _ identity.Principal, _, id string, _ app.PageRequest) (app.TaskPage, error) {
+	s.conversationTaskID = id
+	return s.activePage, nil
+}
+
+func (s *conversationRecoveryTaskServiceStub) ListEvents(_ context.Context, _ identity.Principal, taskID string, after int64, _ int32) (app.TaskEventPage, error) {
+	s.resumedTaskIDs = append(s.resumedTaskIDs, taskID)
+	s.resumeAfter = append(s.resumeAfter, after)
+	event, ok := s.resumeEvents[taskID]
+	if !ok {
+		return app.TaskEventPage{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	page := app.TaskEventPage{Status: task.StatusQueued, CurrentSequence: event.Sequence}
+	if event.Sequence > after {
+		page.Items = []task.Event{event}
+	}
+	return page, nil
 }
 
 type observationTicketTaskServiceStub struct {
@@ -83,29 +116,70 @@ func (s *taskServiceStub) Submit(_ context.Context, _ identity.Principal, comman
 	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
 	value.WorkspaceID, value.InputRevision = command.WorkspaceID, command.InputRevision
 	value.WorkspaceCheckpointRevision = command.InputRevision
-	return app.TaskSubmissionResult{Task: value}, s.err
+	if command.ConversationID != "" {
+		value.ConversationID = command.ConversationID
+	}
+	if command.ModelID != "" {
+		value.ModelID = command.ModelID
+	}
+	if command.Objective != "" {
+		value.Objective = command.Objective
+	}
+	if command.ClientMessageID == "" {
+		return app.TaskSubmissionResult{Task: value}, s.err
+	}
+	message := conversation.Message{
+		ID: "m1234567", ConversationID: value.ConversationID, Role: conversation.RoleUser,
+		Content: command.Objective, TaskID: value.ID, ClientMessageID: command.ClientMessageID,
+		AttachmentIDs: append([]string(nil), command.AttachmentIDs...), Sequence: 1,
+		DeliveryStatus: conversation.DeliveryApplied, CreatedAt: value.CreatedAt,
+	}
+	return app.TaskSubmissionResult{Task: value, Message: message, Replayed: s.submitReplayed}, s.err
 }
 
-func (s *taskServiceStub) AppendMessage(_ context.Context, _ identity.Principal, id string, command app.AppendMessageCommand) (app.TaskSubmissionResult, error) {
-	s.appendCalls++
-	s.appendCommand, s.appendID = command, id
-	now := time.Now().UTC()
-	value := apiTestTask()
-	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
-	value.WorkspaceID, value.InputRevision = command.WorkspaceID, command.InputRevision
-	value.WorkspaceCheckpointRevision = command.InputRevision
-	return app.TaskSubmissionResult{
-		Task: value, Message: conversation.Message{
-			ID: "m1234567", ConversationID: id, Role: conversation.RoleUser, Content: command.Content,
-			TaskID: "q1234567", CreatedAt: now,
-		},
-	}, s.err
+func (s *taskServiceStub) AcceptConversationMessage(_ context.Context, _ identity.Principal, id string, command app.AcceptConversationMessageCommand) (conversation.Message, bool, error) {
+	s.acceptCalls++
+	s.acceptCommand, s.acceptedConversationID = command, id
+	return conversation.Message{ID: "m1234567", ConversationID: id, Sequence: 1, Role: conversation.RoleUser,
+		Content: command.Content, ClientMessageID: command.ClientMessageID, RoutingStatus: conversation.RoutingPending,
+		DeliveryStatus: conversation.DeliveryPending, CreatedAt: time.Now().UTC()}, s.acceptReplayed, s.err
+}
+
+func (s *taskServiceStub) InitializeConversationMessageUpload(_ context.Context, _ identity.Principal, _ string, command app.InitializeConversationMessageUploadCommand) (app.ConversationMessageUpload, error) {
+	return app.ConversationMessageUpload{ClientMessageID: command.ClientMessageID, State: "uploading", TotalBytes: command.TotalBytes, TotalChunks: command.TotalChunks}, s.err
+}
+
+func (s *taskServiceStub) PutConversationMessageChunk(_ context.Context, _ identity.Principal, _, _, _, _ string, _ int, _ []byte, _ string) error {
+	return s.err
+}
+
+func (s *taskServiceStub) GetConversationMessageUpload(_ context.Context, _ identity.Principal, _, _, clientID, _ string) (app.ConversationMessageUpload, error) {
+	return app.ConversationMessageUpload{ClientMessageID: clientID, State: "uploading"}, s.err
+}
+
+func (s *taskServiceStub) CommitConversationMessageUpload(_ context.Context, _ identity.Principal, _, conversationID, clientID, _, _ string) (conversation.Message, error) {
+	return conversation.Message{ID: "m1234567", ConversationID: conversationID, Sequence: 1, Role: conversation.RoleUser,
+		Content: "uploaded", ClientMessageID: clientID, RoutingStatus: conversation.RoutingPending,
+		DeliveryStatus: conversation.DeliveryPending, CreatedAt: time.Now().UTC()}, s.err
+}
+
+func (s *taskServiceStub) AssociateConversationMessageAttachment(context.Context, identity.Principal, string, string, string, string, string) error {
+	return s.err
+}
+
+func (s *taskServiceStub) RetryConversationMessageProcessing(context.Context, identity.Principal, string, string, string, string, string) error {
+	return s.err
 }
 
 func (s *taskServiceStub) List(_ context.Context, _ identity.Principal, request app.TaskListRequest) (app.TaskPage, error) {
 	s.listCalls++
 	s.listRequest = request
-	return app.TaskPage{}, s.err
+	return s.listPage, s.err
+}
+
+func (s *taskServiceStub) ListConversationActiveTasks(_ context.Context, _ identity.Principal, _ string, id string, _ app.PageRequest) (app.TaskPage, error) {
+	s.conversationTaskID = id
+	return s.conversationTasks, s.err
 }
 
 func (s *taskServiceStub) Get(_ context.Context, _ identity.Principal, id string) (app.TaskDetails, error) {
@@ -209,6 +283,19 @@ func TestTaskSubmitRejectsUnknownFieldsBeforeCallingService(t *testing.T) {
 	engine.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || service.submitCalls != 0 {
 		t.Fatalf("status=%d calls=%d body=%s", response.Code, service.submitCalls, response.Body.String())
+	}
+}
+
+func TestStandaloneTaskSubmitRejectsAttachmentIDs(t *testing.T) {
+	service := &taskServiceStub{}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"model_id":"model-a","objective":"summarize","attachment_ids":["pa_0123456789abcdef0123456789abcdef"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "standalone-attachment-01")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || service.submitCalls != 0 {
+		t.Fatalf("status=%d submit=%d body=%s; want rejection before Task service", response.Code, service.submitCalls, response.Body.String())
 	}
 }
 
@@ -385,7 +472,7 @@ func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
 	current.Status = task.StatusRunning
 	current.EventSequence = 8
 	message := conversation.Message{
-		ID: "m1234567", ConversationID: current.ConversationID, OwnerID: current.OwnerID,
+		ID: "m1234567", ConversationID: current.ConversationID, Sequence: 1, OwnerID: current.OwnerID,
 		Role: conversation.RoleAssistant, Content: "Partial answer", TaskID: current.ID, CreatedAt: time.Now().UTC(),
 	}
 	value := app.TaskDetails{
@@ -409,11 +496,12 @@ func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	var snapshot struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
+		ID       string `json:"id"`
+		Sequence int64  `json:"sequence"`
+		Status   string `json:"status"`
 	}
 	if err := json.Unmarshal(body["assistant_message"], &snapshot); err != nil ||
-		snapshot.ID != message.ID || snapshot.Status != "streaming" {
+		snapshot.ID != message.ID || snapshot.Sequence != message.Sequence || snapshot.Status != "streaming" {
 		t.Fatalf("assistant_message JSON = %s, err=%v", body["assistant_message"], err)
 	}
 
@@ -425,9 +513,53 @@ func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
 		t.Fatalf("mismatched assistant Task error = %v, want internal", err)
 	}
 	invalid = value
+	invalidMessage = message
+	invalidMessage.Sequence = 0
+	invalid.AssistantMessage = &app.AssistantMessageSnapshot{Message: invalidMessage, Status: app.AssistantMessageStreaming}
+	if _, err := toTaskResponse(invalid); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("invalid assistant message sequence error = %v, want internal", err)
+	}
+	invalid = value
 	invalid.AssistantMessage = &app.AssistantMessageSnapshot{Message: message, Status: app.AssistantMessageStatus("unknown")}
 	if _, err := toTaskResponse(invalid); domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("unknown assistant snapshot status error = %v, want internal", err)
+	}
+}
+
+func TestTaskResponseIncludesResultRevisionEvidence(t *testing.T) {
+	current := apiTestTask()
+	current.Status = task.StatusCompleted
+	currentRevision, desiredRevision, eventSequence := int64(2), int64(2), int64(7)
+	started := false
+	current.CurrentRevision, current.DesiredRevision = &currentRevision, &desiredRevision
+	message := conversation.Message{ID: "m1234567", ConversationID: current.ConversationID, Sequence: 1,
+		OwnerID: current.OwnerID, Role: conversation.RoleAssistant, Content: "Answer", TaskID: current.ID, CreatedAt: time.Now().UTC()}
+	value := app.TaskDetails{Task: current, CurrentRevisionStarted: &started, ResultMessagePublished: true, AssistantMessage: &app.AssistantMessageSnapshot{
+		Message: message, Status: app.AssistantMessageCompleted, TaskRevision: &currentRevision, ResultEventSequence: &eventSequence,
+	}}
+	view, err := toTaskResponse(value)
+	if err != nil || view.CurrentRevision == nil || *view.CurrentRevision != 2 || view.DesiredRevision == nil || *view.DesiredRevision != 2 ||
+		view.CurrentRevisionStarted == nil || *view.CurrentRevisionStarted || !view.ResultMessagePublished || view.AssistantMessage == nil || view.AssistantMessage.TaskRevision == nil ||
+		*view.AssistantMessage.TaskRevision != 2 || view.AssistantMessage.ResultEventSequence == nil || *view.AssistantMessage.ResultEventSequence != 7 {
+		t.Fatalf("Task revision response = %+v, err=%v", view, err)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil || !strings.Contains(string(encoded), `"current_revision_started":false`) {
+		t.Fatalf("false Task start evidence was omitted: %s err=%v", encoded, err)
+	}
+	value.Task.CurrentRevision, value.Task.DesiredRevision = nil, nil
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("Task start evidence without revision was accepted: %v", err)
+	}
+	value.Task.CurrentRevision, value.Task.DesiredRevision = &currentRevision, &desiredRevision
+	value.Task.DesiredRevision = nil
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("incomplete Task revision projection was accepted: %v", err)
+	}
+	value.Task.DesiredRevision = &desiredRevision
+	value.AssistantMessage.TaskRevision = nil
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("result event without Task revision was accepted: %v", err)
 	}
 }
 
@@ -438,13 +570,24 @@ func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 		PendingRequest: &task.PendingRequest{
 			ID: "r1234567", TaskID: "q1234567", Version: 2, Kind: "approval", Title: "Approve file upload",
 			Object: "report.txt", Content: "Upload this report?", Impact: "The file will leave this Host.",
-			Status: task.PendingRequestPending, CreatedAt: now,
+			MediaPreviewOperationID: "o1234567",
+			Status:                  task.PendingRequestPending, CreatedAt: now,
 		},
 	}
 	view, err := toTaskResponse(value)
-	if err != nil || view.PendingRequest == nil || view.PendingRequest.ID != "r1234567" || view.PendingRequest.Version != 2 || view.PendingRequest.Impact != "The file will leave this Host." {
+	if err != nil || view.PendingRequest == nil || view.PendingRequest.ID != "r1234567" || view.PendingRequest.Version != 2 ||
+		view.PendingRequest.Impact != "The file will leave this Host." || view.PendingRequest.MediaPreviewOperationID != "o1234567" {
 		t.Fatalf("active pending request response = %#v, %v", view.PendingRequest, err)
 	}
+	encoded, err := json.Marshal(view.PendingRequest)
+	if err != nil || !strings.Contains(string(encoded), `"media_preview_operation_id":"o1234567"`) {
+		t.Fatalf("pending media preview JSON = %s, err=%v", encoded, err)
+	}
+	value.PendingRequest.MediaPreviewOperationID = "invalid"
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("invalid media preview operation ID error = %v, want internal", err)
+	}
+	value.PendingRequest.MediaPreviewOperationID = "o1234567"
 	value.PendingRequest.Status = task.PendingRequestApproved
 	view, err = toTaskResponse(value)
 	if err != nil || view.PendingRequest != nil {
@@ -476,6 +619,7 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 	modelStepID := "s1234567"
 	clarificationStepID := "s1234568"
 	childStepID := "s1234569"
+	progressStepID := "s1234570"
 	clarificationID := "r1234567"
 	taskValue := apiTestTask()
 	taskValue.Status = task.StatusWaitingUser
@@ -486,6 +630,7 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 			{ID: modelStepID, TaskID: taskValue.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded, Title: "Ask model", Summary: "Need a required detail.", CreatedAt: now},
 			{ID: clarificationStepID, TaskID: taskValue.ID, Sequence: 2, Kind: "clarification", Status: task.StepWaitingUser, Title: "Clarification", Summary: "Which environment?", CreatedAt: now},
 			{ID: childStepID, TaskID: taskValue.ID, Sequence: 3, Kind: "subagent", Status: task.StepRunning, Title: "Child Agent", Summary: "Working on a child task.", CreatedAt: now},
+			{ID: progressStepID, TaskID: taskValue.ID, Sequence: 4, Kind: "progress", Status: task.StepSucceeded, Title: "开始处理", Summary: "正在处理你的请求。", CreatedAt: now},
 		},
 		ClarificationRequests: []task.ClarificationRequest{{
 			ID: clarificationID, TaskID: taskValue.ID, Version: 1, ModelStepID: modelStepID,
@@ -514,9 +659,51 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 	for _, step := range body.Steps {
 		kinds[step.Kind] = true
 	}
-	if !kinds["subagent"] || !kinds["clarification"] || body.ClarificationRequest == nil ||
+	if !kinds["subagent"] || !kinds["clarification"] || !kinds["progress"] || body.ClarificationRequest == nil ||
 		body.ClarificationRequest.ID != clarificationID || body.ClarificationRequest.Question != "Which environment?" {
 		t.Fatalf("GET task omitted child/clarification contract: %#v", body)
+	}
+}
+
+func TestGetTaskCountsStepsExcludingBudget(t *testing.T) {
+	now := time.Now().UTC()
+	current := apiTestTask()
+	view, err := toTaskResponse(app.TaskDetails{
+		Task: current,
+		Steps: []task.Step{
+			{ID: "s1234567", TaskID: current.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded, Title: "Model", CreatedAt: now},
+			{ID: "s1234568", TaskID: current.ID, Sequence: 2, Kind: "budget", Status: task.StepSucceeded, Title: "Budget", CreatedAt: now},
+			{ID: "s1234569", TaskID: current.ID, Sequence: 3, Kind: "tool", Status: task.StepFailed, Title: "Tool", CreatedAt: now},
+			{ID: "s1234570", TaskID: current.ID, Sequence: 4, Kind: "progress", Status: task.StepRunning, Title: "Progress", CreatedAt: now},
+		},
+	})
+	if err != nil || view.StepCount != 3 || view.CompletedStepCount != 1 {
+		t.Fatalf("task step counts = (%d, %d), err=%v; want (3, 1)", view.StepCount, view.CompletedStepCount, err)
+	}
+}
+
+func TestListTasksReturnsStepCounts(t *testing.T) {
+	value := apiTestTask()
+	value.StepCount = 3
+	value.CompletedStepCount = 1
+	service := &taskServiceStub{listPage: app.TaskPage{Items: []task.Task{value}}}
+	engine := taskAPIRouter(service, nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks?limit=20", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Items []struct {
+			StepCount          int64 `json:"step_count"`
+			CompletedStepCount int64 `json:"completed_step_count"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Items) != 1 || body.Items[0].StepCount != 3 || body.Items[0].CompletedStepCount != 1 {
+		t.Fatalf("task summary counts = %#v; want total 3, completed 1", body.Items)
 	}
 }
 
@@ -606,20 +793,146 @@ func TestTaskListReturnsNullCursorAndEmptyItems(t *testing.T) {
 	}
 }
 
-func TestAppendConversationMessageRequiresExplicitModelAndReturnsTask(t *testing.T) {
+func TestConversationMessageRequiresMatchingIdempotencyKey(t *testing.T) {
+	service := &taskServiceStub{}
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"client_message_id":"message-0001","content":"继续"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "different-key-0001")
+	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+	request.Header.Set("X-Morde-Actor-ID", "u1234567")
+	response := httptest.NewRecorder()
+	taskAPIRouter(service, nil).ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || service.submitCalls != 0 || service.acceptCalls != 0 {
+		t.Fatalf("mismatched idempotency key = %d submit=%d accept=%d: %s", response.Code, service.submitCalls, service.acceptCalls, response.Body.String())
+	}
+}
+
+func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
+	service := &taskServiceStub{acceptReplayed: true}
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"client_message_id":"message-0001","previous_client_message_id":"message-0000","reference_task_id":"q1234567","host_id":"h1234567","workspace_id":"w1234567","mcp_connector_ids":["kbbbbbbb"],"client_attachment_ids":["client-file-0001"],"application_id":"wechat","model_id":"model-a","content":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "message-0001")
+	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+	request.Header.Set("X-Morde-Actor-ID", "u1234567")
+	response := httptest.NewRecorder()
+	taskAPIRouter(service, nil).ServeHTTP(response, request)
+	var body acceptedConversationMessageResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusAccepted ||
+		service.acceptCalls != 1 || service.submitCalls != 0 || service.acceptedConversationID != "c1234567" ||
+		service.acceptCommand.ServiceInstanceID != "11111111-1111-4111-8111-111111111111" ||
+		service.acceptCommand.IdempotencyKey != "message-0001" || service.acceptCommand.ClientMessageID != "message-0001" ||
+		service.acceptCommand.PreviousClientMessageID != "message-0000" || service.acceptCommand.ReferenceTaskID != "q1234567" ||
+		service.acceptCommand.HostID != "h1234567" || service.acceptCommand.WorkspaceID != "w1234567" ||
+		len(service.acceptCommand.MCPConnectorIDs) != 1 || service.acceptCommand.MCPConnectorIDs[0] != "kbbbbbbb" ||
+		len(service.acceptCommand.ClientAttachmentIDs) != 1 || service.acceptCommand.ClientAttachmentIDs[0] != "client-file-0001" ||
+		service.acceptCommand.ApplicationID != "wechat" || service.acceptCommand.ModelID != "model-a" || service.acceptCommand.Content != "hello" ||
+		body.Message.ID != "m1234567" || body.Message.ClientMessageID != "message-0001" || body.Message.TaskID != "" ||
+		body.Message.RoutingStatus != conversation.RoutingPending || body.Message.DeliveryStatus != conversation.DeliveryPending || !body.Replayed {
+		t.Fatalf("accept conversation message: status=%d body=%s response=%#v service=%#v err=%v", response.Code, response.Body.String(), body, service, err)
+	}
+}
+
+func TestConversationActiveTasksIncludesCursor(t *testing.T) {
+	value := apiTestTask()
+	value.EventSequence = 7
+	service := &taskServiceStub{conversationTasks: app.TaskPage{Items: []task.Task{value}, NextCursor: "next"}}
+	response := httptest.NewRecorder()
+	taskAPIRouter(service, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/tasks?limit=1", nil))
+	var body struct {
+		Items []struct {
+			ID            string `json:"id"`
+			EventSequence int64  `json:"event_sequence"`
+		} `json:"items"`
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK ||
+		service.conversationTaskID != "c1234567" || len(body.Items) != 1 || body.Items[0].ID != value.ID ||
+		body.Items[0].EventSequence != 7 || body.NextCursor != "next" {
+		t.Fatalf("active tasks response=%d body=%s err=%v", response.Code, response.Body.String(), err)
+	}
+}
+
+func TestConversationActiveTasksResumeEachTaskFromItsOwnEventCursor(t *testing.T) {
+	conversationID := "c1234567"
+	taskIDs := []string{"q1234567", "q7654321"}
+	messageIDs := []string{"m1234567", "m7654321"}
+	turnIDs := []string{"s1234567", "s7654321"}
+	cursors := []int64{7, 12}
+	now := time.Now().UTC()
+	tasks := make([]task.Task, len(taskIDs))
+	resumeEvents := make(map[string]task.Event, len(taskIDs))
+	for i, taskID := range taskIDs {
+		value := apiTestTask()
+		value.ID, value.ConversationID, value.EventSequence = taskID, conversationID, cursors[i]
+		tasks[i] = value
+		payload, err := json.Marshal(map[string]string{
+			"role": "assistant", "message_id": messageIDs[i], "turn_id": turnIDs[i], "delta": "resumed answer",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resumeEvents[taskID] = task.Event{TaskID: taskID, Sequence: cursors[i] + 1, Type: "task.message", Payload: payload, CreatedAt: now}
+	}
+	service := &conversationRecoveryTaskServiceStub{
+		taskServiceStub: &taskServiceStub{},
+		activePage:      app.TaskPage{Items: tasks}, resumeEvents: resumeEvents,
+	}
+	engine := taskAPIRouter(service, nil)
+	discovery := httptest.NewRecorder()
+	engine.ServeHTTP(discovery, httptest.NewRequest(http.MethodGet, "/api/conversations/"+conversationID+"/tasks", nil))
+	var recovered struct {
+		Items []struct {
+			ID            string `json:"id"`
+			EventSequence int64  `json:"event_sequence"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(discovery.Body.Bytes(), &recovered); err != nil || discovery.Code != http.StatusOK || len(recovered.Items) != len(taskIDs) {
+		t.Fatalf("discover active conversation tasks: status=%d body=%s err=%v", discovery.Code, discovery.Body.String(), err)
+	}
+
+	for i, item := range recovered.Items {
+		if item.ID != taskIDs[i] || item.EventSequence != cursors[i] {
+			t.Fatalf("discovered task %d=%+v, want id=%s cursor=%d", i, item, taskIDs[i], cursors[i])
+		}
+		request := httptest.NewRequest(http.MethodGet, "/api/tasks/"+item.ID+"/events", nil)
+		request.Header.Set("Last-Event-ID", strconv.FormatInt(item.EventSequence, 10))
+		requestContext, cancel := context.WithCancel(request.Context())
+		request = request.WithContext(requestContext)
+		timer := time.AfterFunc(30*time.Millisecond, cancel)
+		response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		engine.ServeHTTP(response, request)
+		timer.Stop()
+		cancel()
+		resumed := resumeEvents[item.ID]
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "id: "+strconv.FormatInt(resumed.Sequence, 10)) ||
+			!strings.Contains(response.Body.String(), `"delta":"resumed answer"`) ||
+			service.resumedTaskIDs[i] != item.ID || service.resumeAfter[i] != item.EventSequence {
+			t.Fatalf("resume task %s after %d: status=%d target=%v cursor=%v body=%s", item.ID, item.EventSequence,
+				response.Code, service.resumedTaskIDs, service.resumeAfter, response.Body.String())
+		}
+	}
+}
+
+func TestConversationMessageRejectsLegacyFieldsAndInvalidRequest(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
-	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"expected_task_id":"q1234567","host_id":"h1234567","workspace_id":"w1234567","input_revision":7,"mcp_connector_ids":["kaaaaaaa"],"application_id":"wechat","model_id":"model-a","content":"continue","budget":{"active_seconds":120,"tool_calls":20,"model_tokens":4000}}`))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Idempotency-Key", "retry-key-009")
-	response := httptest.NewRecorder()
-	engine.ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted || service.appendCalls != 1 || service.appendID != "c1234567" ||
-		service.appendCommand.ExpectedTaskID != "q1234567" ||
-		service.appendCommand.WorkspaceID != "w1234567" || service.appendCommand.InputRevision == nil || *service.appendCommand.InputRevision != 7 ||
-		service.appendCommand.ApplicationID != "wechat" || service.appendCommand.ModelID != "model-a" || service.appendCommand.Budget.ToolCalls != 20 || service.appendCommand.IdempotencyKey != "retry-key-009" ||
-		len(service.appendCommand.MCPConnectorIDs) != 1 || service.appendCommand.MCPConnectorIDs[0] != "kaaaaaaa" {
-		t.Fatalf("status=%d calls=%d id=%s command=%#v body=%s", response.Code, service.appendCalls, service.appendID, service.appendCommand, response.Body.String())
+	for _, body := range []string{
+		`{"client_message_id":"different-key","content":"hello"}`,
+		`{"client_message_id":"retry-key-009","mode":"new","content":"hello"}`,
+		`{"client_message_id":"retry-key-009","expected_task_id":"q1234567","content":"hello"}`,
+		`{"client_message_id":"retry-key-009","input_revision":3,"content":"hello"}`,
+		`{"client_message_id":"retry-key-009","attachment_ids":["f1234567"],"content":"hello"}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "retry-key-009")
+		request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+		request.Header.Set("X-Morde-Actor-ID", "u1234567")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || service.submitCalls != 0 || service.acceptCalls != 0 {
+			t.Fatalf("invalid message body %s: status=%d submit_calls=%d accept_calls=%d", body, response.Code, service.submitCalls, service.acceptCalls)
+		}
 	}
 }
 
@@ -803,7 +1116,7 @@ func TestTaskEventsEmitsSnapshotWhenCursorExpiresDuringStream(t *testing.T) {
 func TestTaskEventsDoNotExposeModelToolArgumentsOrDuplicateText(t *testing.T) {
 	service := &taskServiceStub{events: []task.Event{{
 		TaskID: "q1234567", Sequence: 1, Type: "task.step",
-		Payload:   []byte(`{"step_id":"s1234567","detail":{"text":"assistant private text","tool_calls":[{"name":"lookup","arguments":"secret"}],"usage_known":true}}`),
+		Payload:   []byte(`{"step_id":"s1234567","detail":{"text":"assistant private text","tool_calls":[{"name":"lookup","arguments":"secret"}],"output":"private tool output","usage_known":true}}`),
 		CreatedAt: time.Now().UTC(),
 	}}}
 	engine := taskAPIRouter(service, nil)
@@ -818,11 +1131,59 @@ func TestTaskEventsDoNotExposeModelToolArgumentsOrDuplicateText(t *testing.T) {
 	response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
 	engine.ServeHTTP(response, request)
 	body := response.Body.String()
-	if response.Code != http.StatusOK || strings.Contains(body, "secret") || strings.Contains(body, "assistant private text") || strings.Contains(body, "tool_calls") {
+	if response.Code != http.StatusOK || strings.Contains(body, "secret") || strings.Contains(body, "assistant private text") ||
+		strings.Contains(body, "tool_calls") || strings.Contains(body, "private tool output") || strings.Contains(body, `"output"`) {
 		t.Fatalf("status=%d exposed internal model detail: %s", response.Code, body)
 	}
 	if !strings.Contains(body, `"usage_known":true`) {
 		t.Fatalf("safe progress detail was removed: %s", body)
+	}
+}
+
+func TestTaskStepEventSanitizationFailsClosedOnUnexpectedShapes(t *testing.T) {
+	tests := []struct {
+		name           string
+		payload        string
+		expectedPublic string
+	}{
+		{
+			name:           "scalar detail",
+			payload:        `{"step_id":"s1234567","output":"private root output","detail":"private scalar detail"}`,
+			expectedPublic: `"detail":{}`,
+		},
+		{
+			name:           "array detail",
+			payload:        `{"step_id":"s1234567","detail":["private array detail"]}`,
+			expectedPublic: `"detail":{}`,
+		},
+		{
+			name:           "non-object root",
+			payload:        `["private root payload"]`,
+			expectedPublic: `"payload":{}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &taskServiceStub{eventStatus: task.StatusRunning, events: []task.Event{{
+				TaskID: "q1234567", Sequence: 1, Type: "task.step", Payload: []byte(test.payload), CreatedAt: time.Now().UTC(),
+			}}}
+			engine := taskAPIRouter(service, nil)
+			request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=0", nil)
+			requestContext, cancel := context.WithCancel(request.Context())
+			request = request.WithContext(requestContext)
+			timer := time.AfterFunc(25*time.Millisecond, cancel)
+			defer func() {
+				timer.Stop()
+				cancel()
+			}()
+			response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			engine.ServeHTTP(response, request)
+			body := response.Body.String()
+			if response.Code != http.StatusOK || !strings.Contains(body, "id: 1\nevent: task.step") ||
+				!strings.Contains(body, test.expectedPublic) || strings.Contains(body, "private") {
+				t.Fatalf("status=%d malformed Task event was leaked or dropped: %s", response.Code, body)
+			}
+		})
 	}
 }
 

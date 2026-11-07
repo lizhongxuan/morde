@@ -25,6 +25,9 @@ type conversationServiceStub struct {
 	conversation conversation.Conversation
 	messageID    string
 	messagePage  app.MessagePage
+	lookupID     string
+	lookupCalls  int
+	lookupPage   app.MessagePage
 	mainValue    conversation.MainConversation
 	getMainCalls int
 	ensureCmd    app.EnsureMainConversationCommand
@@ -63,6 +66,31 @@ func (s *conversationServiceStub) Get(_ context.Context, _ identity.Principal, i
 func (s *conversationServiceStub) ListMessages(_ context.Context, _ identity.Principal, id string, _ app.PageRequest) (app.MessagePage, error) {
 	s.messageID = id
 	return s.messagePage, s.err
+}
+
+func (s *conversationServiceStub) FindMessageByClientID(_ context.Context, _ identity.Principal, id, clientID, _ string) (app.MessagePage, error) {
+	s.messageID, s.lookupID = id, clientID
+	s.lookupCalls++
+	return s.lookupPage, s.err
+}
+
+func TestConversationMessageLookupReturnsReceiptWithoutTask(t *testing.T) {
+	service := &conversationServiceStub{lookupPage: app.MessagePage{Items: []conversation.Message{{
+		ID: "m1234567", ConversationID: "c1234567", Sequence: 1, Role: conversation.RoleUser, Content: "hello",
+		ClientMessageID: "client-message-001", RoutingStatus: conversation.RoutingPending,
+		DeliveryStatus: conversation.DeliveryPending, CreatedAt: time.Now().UTC(),
+	}}}}
+	engine := taskAPIRouter(nil, service)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/messages?client_message_id=client-message-001", nil)
+	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+	request.Header.Set("X-Morde-Actor-ID", "u1234567")
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || service.lookupCalls != 1 || service.lookupID != "client-message-001" ||
+		!strings.Contains(response.Body.String(), `"routing_status":"pending"`) || strings.Contains(response.Body.String(), `"task_id":`) ||
+		!strings.Contains(response.Body.String(), `"next_cursor":null`) {
+		t.Fatalf("message receipt lookup = %d %s", response.Code, response.Body.String())
+	}
 }
 
 func (s *conversationServiceStub) GetMain(context.Context, identity.Principal) (conversation.MainConversation, error) {
@@ -208,12 +236,12 @@ func TestConversationResponsesIncludePersonalScopeAndMainIdentity(t *testing.T) 
 	}
 }
 
-func TestConversationMessagesReturnChronologicalItems(t *testing.T) {
+func TestConversationMessagesReturnSequence(t *testing.T) {
 	older := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 	newer := older.Add(time.Second)
 	service := &conversationServiceStub{messagePage: app.MessagePage{Items: []conversation.Message{
-		{ID: "m1234567", ConversationID: "c1234567", Role: conversation.RoleUser, Content: "first", TaskID: "q1234567", DeliveryStatus: conversation.DeliveryPending, CreatedAt: older},
-		{ID: "m7654321", ConversationID: "c1234567", Role: conversation.RoleAssistant, Content: "second", TaskID: "q1234567", DeliveryStatus: conversation.DeliveryApplied, CreatedAt: newer},
+		{ID: "m1234567", ConversationID: "c1234567", Sequence: 1, Role: conversation.RoleUser, Content: "first", TaskID: "q1234567", DeliveryStatus: conversation.DeliveryPending, CreatedAt: older},
+		{ID: "m7654321", ConversationID: "c1234567", Sequence: 2, Role: conversation.RoleAssistant, Content: "second", TaskID: "q1234567", DeliveryStatus: conversation.DeliveryApplied, CreatedAt: newer},
 	}}}
 	engine := taskAPIRouter(nil, service)
 	response := httptest.NewRecorder()
@@ -225,6 +253,7 @@ func TestConversationMessagesReturnChronologicalItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	if response.Code != http.StatusOK || len(body.Items) != 2 || body.Items[0].Content != "first" || body.Items[1].Content != "second" ||
+		body.Items[0].Sequence != 1 || body.Items[1].Sequence != 2 ||
 		body.Items[0].DeliveryStatus != conversation.DeliveryPending || body.Items[1].DeliveryStatus != conversation.DeliveryApplied || service.messageID != "c1234567" {
 		t.Fatalf("status=%d messages=%#v id=%s body=%s", response.Code, body.Items, service.messageID, response.Body.String())
 	}
@@ -232,7 +261,7 @@ func TestConversationMessagesReturnChronologicalItems(t *testing.T) {
 
 func TestConversationMessagesReturnTasklessImportedHistoryAndAttachmentIDs(t *testing.T) {
 	message := conversation.Message{
-		ID: "m1234567", ConversationID: "c1234567", Role: conversation.RoleUser,
+		ID: "m1234567", ConversationID: "c1234567", Sequence: 1, Role: conversation.RoleUser,
 		Content: "Imported question", AttachmentIDs: []string{"pa_0123456789abcdef0123456789abcdef"},
 		DeliveryStatus: conversation.DeliveryApplied,
 		CreatedAt:      time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC),

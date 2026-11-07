@@ -68,6 +68,10 @@ func validCloudDSHToolImageResult(name string, result app.AgentToolResult) bool 
 	if result.Status != app.AgentToolSucceeded {
 		return len(result.Images) == 0
 	}
+	if name == "morde_read_task_attachment" {
+		return len(result.Images) <= 1 && (len(result.Images) == 0 ||
+			(result.Images[0].MediaType == "image/jpeg" && len(result.Images[0].Data) >= 4 && len(result.Images[0].Data) <= cloudDSHMaxImageBytes))
+	}
 	if name != "desktop_screenshot" && name != "browser_screenshot" {
 		return len(result.Images) == 0
 	}

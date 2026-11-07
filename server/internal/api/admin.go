@@ -59,6 +59,7 @@ func (h *api) registerAdmin(group *gin.RouterGroup) {
 	group.GET("/admin/hosts", h.listAllHosts)
 	group.GET("/admin/hosts/:id/resources", h.getAdminHostResources)
 	group.PATCH("/admin/hosts/:id/resources", h.updateAdminHostResources)
+	group.POST("/admin/hosts/:id/recovery", h.recoverAdminHost)
 	group.GET("/admin/workspaces", h.listAdminWorkspaces)
 	group.GET("/admin/workspaces/:id", h.getAdminWorkspace)
 	group.GET("/admin/users", h.listUsers)

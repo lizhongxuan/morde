@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"morde/server/internal/domain"
-	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -26,6 +25,7 @@ type cloudDSHMCPStoreStub struct {
 	projectGrantVersion   int64
 	projectAuthorizeCalls int
 	completeErr           error
+	markUnknownErr        error
 }
 
 func (s *cloudDSHMCPStoreStub) AuthorizeProjectMCPConnector(_ context.Context, projectID, actorID, connectorOwnerID, connectorID string, expectedVersion int64) error {
@@ -114,6 +114,9 @@ func (s *cloudDSHMCPStoreStub) CompleteMCPConnectorOperation(_ context.Context, 
 }
 
 func (s *cloudDSHMCPStoreStub) MarkMCPConnectorOperationUnknown(_ context.Context, value MCPConnectorOperation, _ string, result string) error {
+	if s.markUnknownErr != nil {
+		return s.markUnknownErr
+	}
 	stored, ok := s.operations[value.Key]
 	if !ok || stored.Status != task.OperationDispatched {
 		return domain.NewError(domain.CodeConflict, "operation is not dispatched")
@@ -166,6 +169,45 @@ func (cloudDSHMCPCredentialStub) CredentialHeaders(context.Context, MCPConnector
 	return make(http.Header), nil
 }
 
+func TestCanonicalMCPToolSchemaDefaultsOmittedAdditionalProperties(t *testing.T) {
+	encoded, digest, err := canonicalMCPToolSchema([]MCPConnectorToolDefinition{
+		{Name: "omitted", InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`)},
+		{Name: "explicit-false", InputSchema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
+		{Name: "explicit-true", InputSchema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":true}`)},
+	})
+	if err != nil || len(digest) == 0 {
+		t.Fatalf("canonical MCP schema = %s, digest=%x, err=%v", encoded, digest, err)
+	}
+	var tools []MCPConnectorToolDefinition
+	if err := json.Unmarshal(encoded, &tools); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		want bool
+	}{
+		{name: "omitted", want: false},
+		{name: "explicit-false", want: false},
+		{name: "explicit-true", want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var schema map[string]any
+			for _, tool := range tools {
+				if tool.Name == test.name {
+					if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
+						t.Fatal(err)
+					}
+					break
+				}
+			}
+			actual, ok := schema["additionalProperties"].(bool)
+			if !ok || actual != test.want {
+				t.Fatalf("additionalProperties = %#v, want %t", schema["additionalProperties"], test.want)
+			}
+		})
+	}
+}
+
 func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	inputRevision, checkpointRevision := int64(4), int64(7)
@@ -196,15 +238,19 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.mcpDefinitions(context.Background(), claimed)
-	if err != nil || len(definitions) != 1 || definitions[0].Name != cloudDSHMCPToolName(connectorID, "lookup") || definitions[0].RequiredScope != identity.ScopeMCPControl {
-		t.Fatalf("MCP definitions = %#v, err=%v", definitions, err)
-	}
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
 	grant := store.grants[0]
 	if len(grant.ToolSchema) == 0 || !bytes.Equal(grant.ToolSchemaSHA256, func() []byte { digest := sha256.Sum256(grant.ToolSchema); return digest[:] }()) {
 		t.Fatalf("pinned MCP schema/digest = %q / %x", grant.ToolSchema, grant.ToolSchemaSHA256)
 	}
-	call := ModelToolCall{CallID: "mcp-call-1", Name: definitions[0].Name, Arguments: `{"query":"agent"}`}
+	call := selectedMCPCallForTest(t, "mcp-call-1", connectorID, "lookup", `{"query":"agent"}`)
+	approval, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 || len(store.operations) != 0 ||
+		store.details.Task.Usage.ToolCalls != 0 || store.details.Task.Status != task.StatusWaitingUser {
+		t.Fatalf("MCP call before approval = %#v err=%v calls=%d operations=%d task=%#v", approval, err, client.callCalls, len(store.operations), store.details.Task)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
 	first, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || first.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "lookup" {
 		t.Fatalf("MCP execution = %#v, err=%v; calls=%d tool=%q", first, err, client.callCalls, client.lastTool)
@@ -212,6 +258,11 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	var output cloudDSHMCPOutput
 	if err := json.Unmarshal([]byte(first.Output), &output); err != nil || output.IsError || string(output.StructuredContent) != `{"count":1}` || len(output.Text) != 1 || output.Text[0] != "one record" {
 		t.Fatalf("MCP result envelope = %#v, err=%v", output, err)
+	}
+	for _, event := range store.events {
+		if bytes.Contains(event.Payload, []byte(`"output"`)) || bytes.Contains(event.Payload, []byte("one record")) {
+			t.Fatalf("MCP result was duplicated into a client-visible Task event: %s", event.Payload)
+		}
 	}
 	stored := store.operations[agentOperationKey(call.CallID)]
 	if store.details.Task.Usage.ToolCalls != 1 || stored.Status != task.OperationSucceeded || stored.HostID != fixture.store.details.Task.HostID ||
@@ -224,8 +275,10 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 		t.Fatalf("replayed MCP result = %#v, err=%v; remote calls=%d", replayed, err, client.callCalls)
 	}
 	client.tools[0].Description = "Changed after the grant"
-	if _, err := broker.mcpDefinitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeConflict {
-		t.Fatalf("changed tool schema error = %v", err)
+	changedCatalog, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: "changed-catalog", Name: cloudDSHMCPDiscoverToolName,
+		Arguments: `{"connector_id":"` + connectorID + `"}`})
+	if err != nil || changedCatalog.Status != AgentToolFailed {
+		t.Fatalf("changed tool schema result = %+v err=%v", changedCatalog, err)
 	}
 }
 
@@ -256,16 +309,25 @@ func TestCloudDSHMCPBrokerPersistsUnknownWithoutReplaying(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.Definitions(context.Background(), claimed)
-	if err != nil {
-		t.Fatal(err)
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	call := selectedMCPCallForTest(t, "mcp-call-timeout", connectorID, "change", `{}`)
+	approval, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 || len(store.operations) != 0 {
+		t.Fatalf("MCP timeout call before approval = %#v err=%v calls=%d operations=%d", approval, err, client.callCalls, len(store.operations))
 	}
-	call := ModelToolCall{CallID: "mcp-call-timeout", Name: definitions[0].Name, Arguments: `{}`}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
 	result, err := broker.Execute(context.Background(), claimed, call)
 	operation := store.operations[agentOperationKey(call.CallID)]
 	if err != nil || result.Status != AgentToolUnknown || operation.Status != task.OperationUnknown || client.callCalls != 1 ||
 		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "mcp_result_unknown" {
 		t.Fatalf("unknown MCP result = %#v, err=%v, operation=%#v, task=%#v, calls=%d", result, err, operation, store.details.Task, client.callCalls)
+	}
+	store.details.Task.Status, store.details.Task.WaitingReason = task.StatusRunning, ""
+	store.details.Task.Lease = claimed.Lease
+	replayed, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || replayed.Status != AgentToolUnknown || client.callCalls != 1 || store.details.Task.WaitingReason != "mcp_result_unknown" {
+		t.Fatalf("unknown MCP operation was retried: result=%+v calls=%d err=%v", replayed, client.callCalls, err)
 	}
 }
 
@@ -295,11 +357,14 @@ func TestCloudDSHMCPConfirmedUnsupportedResultPausesAndReplaysWithoutCallingAgai
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.Definitions(context.Background(), claimed)
-	if err != nil {
-		t.Fatal(err)
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	call := selectedMCPCallForTest(t, "mcp-call-unsupported", connectorID, "change", `{}`)
+	approval, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 || len(store.operations) != 0 {
+		t.Fatalf("unsupported MCP call before approval = %#v err=%v calls=%d operations=%d", approval, err, client.callCalls, len(store.operations))
 	}
-	call := ModelToolCall{CallID: "mcp-call-unsupported", Name: definitions[0].Name, Arguments: `{}`}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
 	first, err := broker.Execute(context.Background(), claimed, call)
 	operation := store.operations[agentOperationKey(call.CallID)]
 	var output cloudDSHMCPOutput
@@ -351,11 +416,15 @@ func TestCloudDSHMCPBrokerDiscardsResultAfterGrantRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.Definitions(context.Background(), claimed)
-	if err != nil {
-		t.Fatal(err)
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	call := selectedMCPCallForTest(t, callID, connectorID, "change", `{}`)
+	approval, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 {
+		t.Fatalf("revoked MCP call before approval = %#v err=%v calls=%d", approval, err, client.callCalls)
 	}
-	result, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: callID, Name: definitions[0].Name, Arguments: `{}`})
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
+	result, err := broker.Execute(context.Background(), claimed, call)
 	operation := store.operations[agentOperationKey(callID)]
 	if err != nil || result.Status != AgentToolNeedsUser || operation.Status != task.OperationUnknown || !operation.CancelRequested ||
 		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "mcp_connector_revoked" {
@@ -387,18 +456,15 @@ func TestCloudDSHMCPBrokerMarksUnknownWhenResultCommitFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.Definitions(context.Background(), claimed)
-	var mcpToolName string
-	for _, definition := range definitions {
-		if definition.MCPConnectorID == connectorID {
-			mcpToolName = definition.Name
-			break
-		}
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	call := selectedMCPCallForTest(t, "result-commit-failed", connectorID, "lookup", `{}`)
+	approval, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 {
+		t.Fatalf("result-commit-failed MCP call before approval = %#v err=%v calls=%d", approval, err, client.callCalls)
 	}
-	if err != nil || mcpToolName == "" {
-		t.Fatalf("discover tools = %#v, err=%v", definitions, err)
-	}
-	result, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: "result-commit-failed", Name: mcpToolName, Arguments: `{}`})
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
+	result, err := broker.Execute(context.Background(), claimed, call)
 	operation := store.operations[agentOperationKey("result-commit-failed")]
 	if err != nil || result.Status != AgentToolUnknown || client.callCalls != 1 || operation.Status != task.OperationUnknown ||
 		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "mcp_result_unknown" {
@@ -434,25 +500,27 @@ func TestCloudDSHMCPBrokerRechecksProjectConnectorAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
-	definitions, err := broker.mcpDefinitions(context.Background(), claimed)
-	if err != nil || len(definitions) != 1 || store.projectAuthorizeCalls != 3 {
-		t.Fatalf("discover project MCP tools = %#v, err=%v authCalls=%d", definitions, err, store.projectAuthorizeCalls)
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	if store.projectAuthorizeCalls != 2 {
+		t.Fatalf("discover project MCP tools: authCalls=%d", store.projectAuthorizeCalls)
 	}
 	store.projectGrantActive = false
-	if _, err := broker.mcpDefinitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("discovery after project grant revoke = %v, want forbidden", err)
+	discovery := ModelToolCall{CallID: "project-mcp-discover", Name: cloudDSHMCPDiscoverToolName,
+		Arguments: `{"connector_id":"` + connectorID + `"}`}
+	if result, err := broker.Execute(context.Background(), claimed, discovery); err != nil || result.Status != AgentToolFailed {
+		t.Fatalf("discovery after project grant revoke = %+v err=%v", result, err)
 	}
-	if _, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: "project-mcp-call", Name: definitions[0].Name, Arguments: `{}`}); domain.CodeOf(err) != domain.CodeForbidden || client.callCalls != 0 {
-		t.Fatalf("dispatch after project grant revoke = err %v, remoteCalls=%d", err, client.callCalls)
+	if result, err := broker.Execute(context.Background(), claimed, selectedMCPCallForTest(t, "project-mcp-call", connectorID, "lookup", `{}`)); err != nil || result.Status != AgentToolFailed || client.callCalls != 0 {
+		t.Fatalf("dispatch after project grant revoke = result=%+v err=%v, remoteCalls=%d", result, err, client.callCalls)
 	}
 	store.projectGrantActive = true
 	store.projectAuthorizeCalls = 0
 	store.grants[0].ToolSchema, store.grants[0].ToolSchemaSHA256 = nil, nil
 	client.onList = func() { store.projectGrantActive = false }
-	if definitions, err := broker.mcpDefinitions(context.Background(), claimed); domain.CodeOf(err) != domain.CodeForbidden || len(definitions) != 0 ||
-		store.projectAuthorizeCalls != 3 || client.listCalls != 2 || len(store.grants[0].ToolSchema) != 0 {
-		t.Fatalf("revocation during project tool discovery = defs=%#v err=%v authCalls=%d listCalls=%d schema=%q",
-			definitions, err, store.projectAuthorizeCalls, client.listCalls, store.grants[0].ToolSchema)
+	if result, err := broker.Execute(context.Background(), claimed, discovery); err != nil || result.Status != AgentToolFailed ||
+		store.projectAuthorizeCalls != 2 || client.listCalls != 2 || len(store.grants[0].ToolSchema) != 0 {
+		t.Fatalf("revocation during project tool discovery = result=%#v err=%v authCalls=%d listCalls=%d schema=%q",
+			result, err, store.projectAuthorizeCalls, client.listCalls, store.grants[0].ToolSchema)
 	}
 }
 

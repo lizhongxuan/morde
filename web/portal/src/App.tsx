@@ -29,7 +29,6 @@ import { AdminOverview } from './routes/admin/AdminOverview';
 import { AdminModels } from './routes/admin/AdminModels';
 import { AdminUsage } from './routes/admin/AdminUsage';
 import { AdminQuality } from './routes/admin/AdminQuality';
-import { AdminActivity } from './routes/admin/AdminActivity';
 import { AdminControls } from './routes/admin/AdminControls';
 import { AdminRecords } from './routes/admin/AdminRecords';
 import { AdminHostDetail } from './routes/admin/AdminHostDetail';
@@ -37,8 +36,6 @@ import { AdminUserDetail } from './routes/admin/AdminUserDetail';
 import { AdminWorkspaces } from './routes/admin/AdminWorkspaces';
 import { AdminWorkspaceDetail } from './routes/admin/AdminWorkspaceDetail';
 import { AdminSettings } from './routes/admin/AdminSettings';
-import { AdminInvites } from './routes/admin/AdminInvites';
-import { AdminSites } from './routes/admin/AdminSites';
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true } } });
 
@@ -91,12 +88,9 @@ function AdminRoutes() {
           <Route path="users/:id/records" element={<AdminRecords />} />
           <Route path="users/:id" element={<AdminUserDetail />} />
           <Route path="settings" element={<AdminSettings />} />
-          <Route path="invites" element={<AdminInvites />} />
-          <Route path="sites" element={<AdminSites />} />
           <Route path="models" element={<AdminModels />} />
           <Route path="usage" element={<AdminUsage />} />
           <Route path="quality" element={<AdminQuality />} />
-          <Route path="activity" element={<AdminActivity />} />
           <Route path="controls" element={<AdminControls />} />
           <Route path="hosts" element={<AdminHosts />} />
           <Route path="hosts/:id" element={<AdminHostDetail />} />

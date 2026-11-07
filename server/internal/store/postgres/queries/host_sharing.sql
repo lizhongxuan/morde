@@ -2,11 +2,13 @@
 INSERT INTO host_members (host_id, owner_id, user_id, permissions)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (host_id, user_id) DO UPDATE SET owner_id = EXCLUDED.owner_id,
-  permissions = EXCLUDED.permissions, created_at = now(), updated_at = now(), revoked_at = NULL
-RETURNING *;
+  permissions = EXCLUDED.permissions, created_at = now(), updated_at = now(), revoked_at = NULL,
+  grant_version = gen_random_uuid()
+RETURNING host_id, owner_id, user_id, permissions, created_at, updated_at, revoked_at;
 
 -- name: ListHostMembers :many
-SELECT * FROM host_members WHERE host_id = $1 AND owner_id = $2 AND revoked_at IS NULL
+SELECT host_id, owner_id, user_id, permissions, created_at, updated_at, revoked_at
+FROM host_members WHERE host_id = $1 AND owner_id = $2 AND revoked_at IS NULL
 ORDER BY created_at, user_id;
 
 -- name: RevokeHostMember :execrows

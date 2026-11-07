@@ -48,6 +48,7 @@ type Deps struct {
 	WorkspaceDiff               WorkspaceDiffService
 	WorkspaceCopies             WorkspaceCopyEndpointService
 	WorkspaceTransfers          WorkspaceOwnershipTransferService
+	WorkspaceShares             WorkspaceShareEndpointService
 	Sites                       SiteService
 	Templates                   TemplateReader
 	Tokens                      TokenService
@@ -56,6 +57,7 @@ type Deps struct {
 	Control                     ControlService
 	ExecutionControl            ExecutionControlService
 	Tasks                       TaskService
+	TaskMedia                   TaskMediaService
 	TaskObservationTickets      TaskWorkbenchObservationTicketService
 	Conversations               ConversationService
 	ProjectConversations        projectConversationRoutesService
@@ -66,7 +68,6 @@ type Deps struct {
 	RuntimeOperationLedger      app.RuntimeOperationLedgerService
 	Projects                    projectRoutesService
 	ProjectContent              projectContentRoutesService
-	InstantChat                 InstantChatService
 	ModelConnections            ModelConnectionManager
 	MCPConnectors               MCPConnectorManager
 	ModelGateway                ModelGateway
@@ -88,15 +89,19 @@ type Deps struct {
 	AdminControls               AdminControlsService
 	AdminOperations             AdminOperationsService
 	AdminModelBudgetDefaults    AdminModelBudgetDefaultService
+	AdminModelDefaults          AdminModelDefaultService
 	RecordConsents              RecordConsentService
 	RecordAccess                RecordAccessService
 	RecordCaptureStatus         RecordCaptureStatusService
 	AdminHostResources          AdminHostResourcesService
+	AdminHostRecovery           AdminHostRecoveryService
 	AdminWorkspaces             AdminWorkspaceService
 	AdminAudit                  AdminAuditWriter
 	Readiness                   ReadinessChecker
 	MCP                         http.Handler
 	MCPDisabled                 bool
+
+	ProjectConversationAttachments projectConversationAttachmentService
 }
 
 type Options struct {
@@ -184,11 +189,15 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	RegisterProjectRoutes(group, deps.Projects)
 	RegisterProjectHostUsageRoutes(group, deps.HostUsage)
 	RegisterProjectConversationRoutes(group, deps.ProjectConversations)
+	RegisterProjectConversationAttachmentRoutes(group, deps.ProjectConversationAttachments)
 	RegisterProjectWorkItemRoutes(group, deps.ProjectWorkItems)
 	RegisterProjectContentRoutes(group, deps.ProjectContent)
 	RegisterProjectBudgetRoutes(group, deps.ProjectBudget)
 	RegisterProjectMCPConnectorRoutes(group, deps.ProjectMCPConnectors)
 	h.registerTasks(group, deps.Tasks)
+	if deps.TaskMedia != nil {
+		group.GET("/tasks/:id/media/:operation_id/preview", h.getTaskMediaPreview)
+	}
 	h.registerTaskWorkbenchObservationTickets(group, deps.TaskObservationTickets)
 	h.registerResources(group)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync)
@@ -196,6 +205,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerWorkspaceDiff(group, deps.WorkspaceDiff)
 	h.registerWorkspaceCopies(group, deps.WorkspaceCopies)
 	h.registerWorkspaceOwnershipTransfers(group, deps.WorkspaceTransfers)
+	h.registerWorkspaceShares(group, deps.WorkspaceShares)
 	workspaceFileOperations, _ := deps.WorkspaceSync.(workspaceFileOperationService)
 	h.registerWorkspaceFileOperations(group, workspaceFileOperations)
 	h.registerSites(group)
@@ -213,7 +223,6 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	RegisterPersonalDataQuotaRoute(personalDataGroup, deps.PersonalDataQuotaUser)
 	RegisterPersonalAttachmentRoutes(personalDataGroup, deps.PersonalAttachments)
 	RegisterPersonalHistoryImportRoutes(personalDataGroup, deps.PersonalHistoryImport)
-	h.registerInstantChat(group)
 	h.registerNotifications(group, deps.Notifications)
 	h.registerModelConnections(group)
 	h.registerMCPConnectors(group)
@@ -246,6 +255,13 @@ func (h *api) limitBody(c *gin.Context) {
 		limit = personalHistoryImportLimit
 	case c.Request.Method == http.MethodPut && c.FullPath() == "/api/personal-data/uploads/:upload_id/chunks/:sequence":
 		limit = personalAttachmentChunkLimit
+	case c.Request.Method == http.MethodPut && c.FullPath() == "/api"+projectConversationAttachmentBase+"/chunks/:sequence":
+		limit = personalAttachmentChunkLimit
+	case c.Request.Method == http.MethodPut && c.FullPath() == "/api"+projectConversationAttachmentBase+"/derivatives":
+		limit = app.ProjectConversationDerivativeMaxJSONBytes
+	case c.Request.Method == http.MethodPut && (c.FullPath() == "/api/conversations/:id/message-uploads/:client_message_id/chunks/:sequence" ||
+		c.FullPath() == "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id/chunks/:sequence"):
+		limit = conversationMessageChunkJSONLimit
 	case (c.Request.Method == http.MethodPut || c.Request.Method == http.MethodDelete) && c.FullPath() == "/api/personal-data/:type/:id":
 		limit = personal.MaxMutationBodyBytes + 4096
 	case (c.Request.Method == http.MethodPost || c.Request.Method == http.MethodPatch || c.Request.Method == http.MethodDelete) &&
@@ -527,15 +543,27 @@ func clientCredentialRoute(method, path string) bool {
 	switch method {
 	case http.MethodGet:
 		switch path {
-		case "/api/me", "/api/me/record-captures", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
+		case "/api/me", "/api/me/record-captures", "/api/me/main-conversation", "/api/clients", "/api/devices", "/api/hosts", "/api/hosts/:id", "/api/hosts/:id/workspace-bindings",
+			"/api/hosts/:id/control",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
-			"/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
+			"/api/conversations/:id/messages", "/api/conversations/:id/tasks", "/api/conversations/:id/message-uploads/:client_message_id",
+			"/api/projects", "/api/projects/:id", "/api/projects/:id/members", "/api/projects/:id/resources",
+			"/api/projects/:id/budget", "/api/projects/:id/budget/ledger", "/api/projects/:id/work-items",
+			"/api/projects/:id/work-items/:work_item_id", "/api/me/project-invitations",
+			"/api/projects/:id/conversations", "/api/projects/:id/conversations/:conversation_id",
+			"/api/projects/:id/conversations/:conversation_id/messages", "/api/projects/:id/conversations/:conversation_id/tasks",
+			"/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/content",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id/content",
+			"/api/tasks", "/api/tasks/:id", "/api/tasks/:id/events",
 			"/api/tasks/:id/workspace-view-deletions", "/api/hub", "/api/personal-data/:type/:id", "/api/personal-data/quota",
 			"/api/personal-data/attachments/:attachment_id",
 			"/api/goals", "/api/goals/:id",
 			"/api/schedules", "/api/schedules/:id", "/api/schedules/:id/runs",
 			"/api/sync/snapshot", "/api/sync/changes",
-			"/api/notifications", "/api/available-models":
+			"/api/notifications", "/api/available-models", "/api/model-connections", "/api/model-connections/:id":
 			return true
 		}
 	case http.MethodPost:
@@ -543,8 +571,15 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/auth/client-web-session", "/api/auth/client-logout", "/api/auth/client-schedule-grant":
 			return true
 		case "/api/conversations", "/api/conversations/:id/messages", "/api/tasks", "/api/tasks/:id/actions",
+			"/api/conversations/:id/message-uploads/:client_message_id/commit",
+			"/api/conversations/:id/messages/:message_id/retry-processing",
+			"/api/projects/:id/conversations", "/api/projects/:id/conversations/:conversation_id/messages",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/retry-processing",
+			"/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id/commit",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/commit",
 			"/api/tasks/:id/workspace-view-deletions",
-			"/api/tasks/:id/inputs", "/api/tasks/:id/approvals/:approval_id/responses":
+			"/api/tasks/:id/inputs", "/api/tasks/:id/approvals/:approval_id/responses",
+			"/api/model-connections", "/api/model-connections/:id/check":
 			return true
 		case "/api/schedules", "/api/schedules/:id/actions":
 			return true
@@ -554,20 +589,30 @@ func clientCredentialRoute(method, path string) bool {
 			return true
 		case "/api/model/v1/chat/completions":
 			return true
-		case "/api/notifications/:id/read", "/api/hosts/:id/enter", "/api/hosts/:id/observation-ticket":
+		case "/api/notifications/:id/read", "/api/hosts/:id/enter", "/api/hosts/:id/observation-ticket",
+			"/api/hosts/:id/control/actions", "/api/hosts/:id/control/lease/renew":
 			return true
 		case "/api/personal-data/uploads", "/api/personal-data/uploads/:upload_id/commit", "/api/personal-data/history/import":
+			return true
+		case "/api/me/main-conversation/ensure":
 			return true
 		}
 	case http.MethodPut:
 		return path == "/api/personal-data/:type/:id" || path == "/api/personal-data/uploads/:upload_id/chunks/:sequence" ||
-			path == "/api/schedules/:id"
+			path == "/api/conversations/:id/message-uploads/:client_message_id" ||
+			path == "/api/conversations/:id/message-uploads/:client_message_id/chunks/:sequence" ||
+			path == "/api/conversations/:id/messages/:message_id/attachments/:client_attachment_id" ||
+			path == "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id" ||
+			path == "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id/chunks/:sequence" ||
+			path == "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id" ||
+			path == "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/chunks/:sequence" ||
+			path == "/api/schedules/:id" || path == "/api/model-connections/:id" || path == "/api/me/main-conversation"
 	case http.MethodPatch:
 		return path == "/api/devices/:id" || path == "/api/goals/:id"
 	case http.MethodDelete:
 		return path == "/api/clients/:id" || path == "/api/devices/:id" || path == "/api/personal-data/:type/:id" ||
 			path == "/api/goals/:id" || path == "/api/auth/client-schedule-grant" ||
-			path == "/api/personal-data/uploads/:upload_id"
+			path == "/api/personal-data/uploads/:upload_id" || path == "/api/model-connections/:id"
 	}
 	return false
 }

@@ -114,7 +114,7 @@ func (s *mcpConnectorStoreStub) ReplaceMCPConnectorOAuthCredential(_ context.Con
 
 func TestMCPConnectorCredentialIsBoundAndNeverReturned(t *testing.T) {
 	service, store, sealer := mcpConnectorTestService(t)
-	secret := []byte(`{"kind":"oauth","access_token":"connector-secret"}`)
+	secret := []byte(`{"kind":"headers","headers":{"Authorization":"Bearer connector-secret"}}`)
 	created, err := service.Create(context.Background(), mcpConnectorPrincipal("u1234567"), CreateMCPConnectorCommand{
 		Name: "  Notion  ", EndpointURL: "https://MCP.Notion.com/mcp", CredentialJSON: secret,
 	})
@@ -151,6 +151,67 @@ func TestMCPConnectorCredentialIsBoundAndNeverReturned(t *testing.T) {
 		if err != nil || strings.Contains(string(encoded), "connector-secret") || strings.Contains(string(encoded), "mcp.notion.com") {
 			t.Fatalf("audit contains credential or endpoint: %s, %v", encoded, err)
 		}
+	}
+}
+
+func TestMCPConnectorRejectsUnsafeCredentialHeaders(t *testing.T) {
+	service, store, sealer := mcpConnectorTestService(t)
+	principal := mcpConnectorPrincipal("u1234567")
+	invalidCredentials := []string{
+		`{"Host":"attacker.example"}`,
+		`{"Content-Length":"0"}`,
+		`{"Connection":"keep-alive"}`,
+		`{"Transfer-Encoding":"chunked"}`,
+		`{"Keep-Alive":"timeout=5"}`,
+		`{"TE":"trailers"}`,
+		`{"Trailer":"X-Internal"}`,
+		`{"Upgrade":"websocket"}`,
+		`{"Expect":"100-continue"}`,
+		`{"Cookie":"session=secret"}`,
+		`{"Set-Cookie":"session=secret"}`,
+		`{"Proxy-Authorization":"Basic secret"}`,
+		`{"Authorization":"Bearer one","authorization":"Bearer two"}`,
+		`{"kind":"headers","headers":{"X-Token":"one","x-token":"two"}}`,
+		`{"X-Token":"line one\nline two"}`,
+		`{"Bad Header":"value"}`,
+	}
+	for _, credential := range invalidCredentials {
+		_, err := service.Create(context.Background(), principal, CreateMCPConnectorCommand{
+			Name: "Invalid", EndpointURL: "https://mcp.example.test/mcp", CredentialJSON: []byte(credential),
+		})
+		if domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Errorf("Create(credential=%s) error = %v; want invalid argument", credential, err)
+		}
+	}
+
+	created, err := service.Create(context.Background(), principal, CreateMCPConnectorCommand{
+		Name: "Valid", EndpointURL: "https://mcp.example.test/mcp",
+		CredentialJSON: []byte(`{"authorization":"Bearer valid","X-API-Key":"valid-key"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := store.values[created.ID]
+	headers, err := service.CredentialHeaders(context.Background(), stored)
+	if err != nil || headers.Get("Authorization") != "Bearer valid" || headers.Get("X-Api-Key") != "valid-key" {
+		t.Fatalf("valid credential headers = %v, %v", headers, err)
+	}
+	legacy := cloneMCPConnectorRecord(stored)
+	legacy.CredentialCipher, err = sealer.sealWithAAD([]byte(`{"Host":"attacker.example"}`),
+		mcpConnectorCredentialAAD(legacy.OwnerID, legacy.ID, legacy.CredentialVersion))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CredentialHeaders(context.Background(), legacy); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("CredentialHeaders(legacy transport header) error = %v; want invalid argument", err)
+	}
+	if _, err := service.RotateCredential(context.Background(), principal, created.ID, RotateMCPConnectorCredentialCommand{
+		CredentialJSON: []byte(`{"Upgrade":"websocket"}`), ExpectedRevision: created.Revision,
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("RotateCredential(transport header) error = %v; want invalid argument", err)
+	}
+	if current := store.values[created.ID]; current.Revision != created.Revision || current.CredentialVersion != created.CredentialVersion {
+		t.Fatalf("invalid rotation changed stored credential: %#v", current)
 	}
 }
 

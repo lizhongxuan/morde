@@ -460,6 +460,16 @@ func taskManifestMatchesInputSnapshot(manifest mordesync.Manifest, sourceDigest,
 	if sourceDigest == inputDigest {
 		return true
 	}
+	// An empty initial revision has a known root with unspecified mode and time.
+	if len(manifest.Files) == 0 && len(manifest.EmptyDirectories) == 0 && len(manifest.Directories) == 1 && manifest.Directories[0].Path == "." {
+		initial := manifest
+		initial.Directories = append([]mordesync.Directory(nil), manifest.Directories...)
+		initial.Directories[0].Mode, initial.Directories[0].ModeKnown = 0, false
+		initial.Directories[0].ModTimeNS, initial.Directories[0].ModTimeKnown = 0, false
+		if digest, err := taskManifestSHA256(initial); err == nil && digest == inputDigest {
+			return true
+		}
+	}
 	contentDigest, err := taskManifestContentSHA256(manifest)
 	return err == nil && contentDigest == inputDigest
 }

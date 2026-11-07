@@ -30,6 +30,10 @@ func TestProjectScopeMigrationBackfillsLegacyPersonalHistory(t *testing.T) {
 	taskID := mustID(t, domain.NewTaskID)
 	userMessageID := mustID(t, domain.NewMessageID)
 	assistantMessageID := mustID(t, domain.NewMessageID)
+	// Recreate the pre-root-metadata fixture before testing the older project migration.
+	if _, err := pool.Exec(ctx, `DELETE FROM workspace_revision_directories WHERE directory_path='.' AND valid_from_revision=0`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := provider.DownTo(ctx, 109); err != nil {
 		t.Fatalf("roll back project scope migration: %v", err)
 	}
@@ -81,19 +85,6 @@ VALUES ($1,$2,$3,'user','legacy question',$4,1),($5,$2,$3,'assistant','legacy an
 	if len(actorIDs) != 2 || actorIDs[0] != owner.ID || actorIDs[1] != owner.ID {
 		t.Fatalf("legacy message actors = %#v, want owner %q", actorIDs, owner.ID)
 	}
-	if _, err := store.GetConversation(ctx, conversationID, owner.ID); err != nil {
-		t.Fatalf("owner cannot read preserved personal conversation: %v", err)
-	}
-	if _, err := store.GetConversation(ctx, conversationID, other.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("other user conversation read = %v, want not found", err)
-	}
-	if _, err := store.GetTask(ctx, taskID, owner.ID); err != nil {
-		t.Fatalf("owner cannot read preserved personal task: %v", err)
-	}
-	if _, err := store.GetTask(ctx, taskID, other.ID); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("other user task read = %v, want not found", err)
-	}
-
 	newConversationID := mustID(t, domain.NewConversationID)
 	newTaskID := mustID(t, domain.NewTaskID)
 	newMessageID := mustID(t, domain.NewMessageID)
@@ -118,6 +109,22 @@ VALUES ($1,$2,$3,'user','current personal message',$4,1)`, newMessageID, newConv
 JOIN conversation_messages m ON m.task_id=t.id WHERE t.id=$1`, newTaskID).Scan(&newInitiatorID, &newActorID); err != nil ||
 		newInitiatorID != owner.ID || newActorID != owner.ID {
 		t.Fatalf("current personal task/message actors = %q/%q, want %q; err=%v", newInitiatorID, newActorID, owner.ID, err)
+	}
+	// The current store needs all later schema changes before reading these records.
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("apply remaining migrations: %v", err)
+	}
+	if _, err := store.GetConversation(ctx, conversationID, owner.ID); err != nil {
+		t.Fatalf("owner cannot read preserved personal conversation: %v", err)
+	}
+	if _, err := store.GetConversation(ctx, conversationID, other.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other user conversation read = %v, want not found", err)
+	}
+	if _, err := store.GetTask(ctx, taskID, owner.ID); err != nil {
+		t.Fatalf("owner cannot read preserved personal task: %v", err)
+	}
+	if _, err := store.GetTask(ctx, taskID, other.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other user task read = %v, want not found", err)
 	}
 }
 

@@ -470,6 +470,7 @@ add set inet cloudhost relay_enabled_ifaces { type ifname; }
 add chain inet cloudhost input { type filter hook input priority filter - 1; policy accept; }
 add chain inet cloudhost forward { type filter hook forward priority filter - 1; policy accept; }
 add rule inet cloudhost input iifname "chbr0" ct state { established, related } accept
+add rule inet cloudhost input iifname "chbr0" ip daddr 172.30.0.1 tcp dport 7443 accept
 add rule inet cloudhost input iifname "chbr0" counter drop
 add rule inet cloudhost input iifname "msync*" meta l4proto tcp ct state established ct original proto-dst 8384 accept
 add rule inet cloudhost input iifname "msync*" counter drop

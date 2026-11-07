@@ -25,6 +25,7 @@ ENV TZ=Asia/Shanghai \
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bubblewrap \
+        ca-certificates \
         fonts-noto-cjk \
         git \
         jq \
@@ -58,6 +59,8 @@ WORKDIR /home/gem/workspace
 EXPOSE 8090
 
 COPY --chmod=755 healthcheck.sh /usr/local/bin/cloudhost-healthcheck
+COPY --chmod=644 runtime-portal-ca.crt /usr/local/share/ca-certificates/morde-runtime-portal-ca.crt
+RUN update-ca-certificates
 # Jammy's packaged 0.6.1 lacks --disable-userns, so Runtime uses the pinned 0.9.0 binary.
 COPY --from=bubblewrap-build --chmod=755 /tmp/bubblewrap-0.9.0/build/bwrap /usr/bin/bwrap
 COPY --from=runtime-build --chmod=755 /usr/local/bin/morde-runtime /usr/local/bin/morde-runtime

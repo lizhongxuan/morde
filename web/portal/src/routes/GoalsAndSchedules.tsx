@@ -64,7 +64,6 @@ export function GoalsAndSchedules() {
   const [scheduleForm, setScheduleForm] = useState<{ mode: 'create' } | { mode: 'edit'; schedule: Schedule } | null>(null);
   const [expandedScheduleID, setExpandedScheduleID] = useState<string | null>(null);
   const [scheduleWriteDenied, setScheduleWriteDenied] = useState(false);
-
   const goals = useInfiniteQuery({
     queryKey: ['goals'],
     queryFn: ({ pageParam }) => portalApi.goals(pageParam),
@@ -183,11 +182,7 @@ export function GoalsAndSchedules() {
   const scheduleWriteError = scheduleCreate.error ?? scheduleUpdate.error ?? scheduleAction.error;
   const goalWriteError = goalCreate.error ?? goalUpdate.error ?? goalDelete.error ?? goalStatus.error;
 
-  return <section>
-    <div className="page-heading"><div><p className="eyebrow">个人计划</p><h1>目标与计划</h1><p className="muted">管理云端目标和定时计划，所有更改通过当前 Portal 登录会话提交。</p></div></div>
-
-    <p className="notice notice-info">旧 nanoMuse 本机目标和计划不会由此页自动读取、导入、启用或删除。要迁入某项计划，请先核对内容，再在此手动创建对应云端计划；确认云端计划已创建后，请在旧端停用对应例程。只有明确提交表单后，云端计划才会创建并启用。</p>
-
+  return <section className="goals-grid">
     <section className="connection-section" aria-labelledby="goals-title">
       <div className="connection-section-heading">
         <div><h2 id="goals-title">目标</h2><p className="muted">目标状态和修订版本保存在你的个人云端数据中。</p></div>
@@ -233,7 +228,7 @@ export function GoalsAndSchedules() {
     <section className="connection-section" aria-labelledby="schedules-title">
       <div className="connection-section-heading">
         <div><h2 id="schedules-title">定时计划</h2><p className="muted">查看计划版本、运行状态和历史记录。</p></div>
-        <button type="button" className="button button-primary" disabled={scheduleWriteDenied || hosts.isPending || models.isPending || !hostItems.length || !modelItems.length} onClick={() => setScheduleForm({ mode: 'create' })}>＋ 新建云端计划</button>
+        <button type="button" className="button button-primary" disabled={scheduleWriteDenied || hosts.isPending || models.isPending || !modelItems.length} onClick={() => setScheduleForm({ mode: 'create' })}>＋ 新建云端计划</button>
       </div>
       {scheduleWriteDenied && <p className="notice notice-warning" role="alert">服务端拒绝了计划写操作（403）。此页已切换为只读状态，不会请求或保存额外授权凭据。</p>}
       {scheduleWriteError && <div className="error-card" role="alert">{errorDetails(scheduleWriteError).message}</div>}
@@ -252,7 +247,7 @@ export function GoalsAndSchedules() {
         <span>{hosts.isError ? `无法读取可用主机：${errorDetails(hosts.error).message}` : `无法读取可用模型：${errorDetails(models.error).message}`}</span>
         <button type="button" className="button button-secondary" onClick={() => { if (hosts.isError) void hosts.refetch(); if (models.isError) void models.refetch(); }}>重试</button>
       </div>}
-      {!hosts.isPending && !hosts.isError && !hostItems.length && <p className="notice notice-warning">当前账号没有可用于计划的主机。创建计划需要先有可访问的云端主机。</p>}
+      {!hosts.isPending && !hosts.isError && !hostItems.length && <p className="notice notice-warning">当前没有可访问的主机。可以创建仅文本计划；使用浏览器观察时必须选择 Host。</p>}
       {!models.isPending && !models.isError && !modelItems.length && <p className="notice notice-warning">当前没有可用模型。创建计划需要先配置模型。</p>}
       {schedules.isPending ? <div className="loading-card" role="status">正在读取定时计划…</div>
         : schedules.isError ? <div className="error-card" role="alert">{errorDetails(schedules.error).message}<button type="button" className="button button-secondary" onClick={() => void schedules.refetch()}>重试</button></div>
@@ -261,8 +256,9 @@ export function GoalsAndSchedules() {
               const currentRunActive = isActiveRun(schedule.current_run);
               const scheduleRuns = expandedScheduleID === schedule.id ? runs.data?.pages.flatMap((page) => page.items) ?? [] : [];
               return <article className="schedule-card" key={schedule.id}>
-                <div className="schedule-card-heading"><div><h3>{schedule.objective}</h3><span className={`status ${schedule.status === 'enabled' ? 'status-running' : schedule.status === 'completed' ? 'status-ready' : ''}`}>{scheduleStatusLabel(schedule.status)}</span></div><span className="muted">版本 {schedule.version}</span></div>
-                <p className="schedule-card-meta">{timingLabel(schedule.timing)} · 主机：{hostItems.find((host) => host.id === schedule.host_id)?.name ?? schedule.host_id} · 模型：{modelItems.find((model) => model.id === schedule.model_id)?.name ?? schedule.model_id}</p>
+                <div className="schedule-card-heading"><div><h3>{schedule.title}</h3><span className={`status ${schedule.status === 'enabled' ? 'status-running' : schedule.status === 'completed' ? 'status-ready' : ''}`}>{scheduleStatusLabel(schedule.status)}</span></div><span className="muted">版本 {schedule.version}</span></div>
+                <p className="schedule-card-meta">执行内容：{schedule.objective}</p>
+                <p className="schedule-card-meta">{timingLabel(schedule.timing)} · 主机：{schedule.host_id ? hostItems.find((host) => host.id === schedule.host_id)?.name ?? schedule.host_id : '无（文本计划）'} · 模型：{modelItems.find((model) => model.id === schedule.model_id)?.name ?? schedule.model_id}</p>
                 <dl className="schedule-facts"><div><dt>下次运行</dt><dd>{schedule.next_run_at ? formatDate(schedule.next_run_at) : '无'}</dd></div><div><dt>当前运行</dt><dd>{schedule.current_run ? runStatusLabel(schedule.current_run.status) : '未运行'}</dd></div><div><dt>上次运行</dt><dd>{schedule.last_run ? `${runStatusLabel(schedule.last_run.status)} · ${formatDate(schedule.last_run.updated_at)}` : '尚无记录'}</dd></div><div><dt>运行预算</dt><dd>{schedule.budget.active_seconds} 秒 · {schedule.budget.tool_calls} 次工具调用 · {schedule.budget.model_tokens.toLocaleString()} tokens</dd></div></dl>
                 <div className="schedule-actions">
                   {!scheduleWriteDenied && schedule.status !== 'completed' && !(schedule.status === 'enabled' && currentRunActive) && <button type="button" className="button button-secondary" disabled={scheduleAction.isPending} onClick={() => scheduleAction.mutate({ id: schedule.id, action: schedule.status === 'enabled' ? 'disable' : 'enable' })}>{schedule.status === 'enabled' ? '停用' : '启用'}</button>}
@@ -314,7 +310,7 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
   onSubmit: (fields: ScheduleFields) => void;
 }) {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-  const [hostID, setHostID] = useState(initial?.host_id ?? hosts[0]?.id ?? '');
+  const [hostID, setHostID] = useState(initial?.host_id ?? '');
   const [modelID, setModelID] = useState(initial?.model_id ?? models[0]?.id ?? '');
   const [objective, setObjective] = useState(initial?.objective ?? '');
   const [kind, setKind] = useState<components['schemas']['ScheduleTiming']['kind']>(initial?.timing.kind ?? 'daily');
@@ -333,7 +329,7 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
 
   const toggleWeekday = (day: number) => setWeekdays((current) => current.includes(day) ? current.filter((value) => value !== day) : [...current, day].sort((a, b) => a - b));
   const toggleNotification = (event: components['schemas']['ScheduleNotificationEvent']) => setNotificationEvents((current) => current.includes(event) ? current.filter((value) => value !== event) : [...current, event]);
-  const selectedHostExists = hosts.some((host) => host.id === hostID) || (initial?.host_id === hostID);
+  const selectedHostExists = hostID === '' ? !initial?.observation : hosts.some((host) => host.id === hostID) || initial?.host_id === hostID;
   const selectedModelExists = models.some((model) => model.id === modelID) || (initial?.model_id === modelID);
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -344,10 +340,13 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
           ? { kind, starts_on: startsOn, local_time: localTime, time_zone: timeZone }
           : kind === 'weekly'
             ? { kind, starts_on: startsOn, local_time: localTime, time_zone: timeZone, weekdays }
-            : { kind, interval_hours: Number(intervalHours), time_zone: timeZone };
+            : {
+              kind, interval_hours: Number(intervalHours), time_zone: timeZone,
+              ...(initial?.timing.kind === 'every_n_hours' && initial.timing.anchor_at !== undefined ? { anchor_at: initial.timing.anchor_at } : {}),
+            };
       setFormError('');
       onSubmit({
-        host_id: hostID,
+        host_id: hostID || null,
         model_id: modelID,
         objective: objective.trim(),
         timing,
@@ -363,7 +362,7 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
   return <form className="form-card form-stack schedule-editor" onSubmit={submit}>
     <h3>{initial ? `编辑计划定义 · 版本 ${initial.version}` : '新建云端计划'}</h3>
     <div className="schedule-form-grid">
-      <label>主机<select value={hostID} required onChange={(event) => setHostID(event.target.value)}>{initial?.host_id && !hosts.some((host) => host.id === initial.host_id) && <option value={initial.host_id}>{initial.host_id}</option>}{hosts.map((host) => <option key={host.id} value={host.id}>{host.name} · {host.state}</option>)}</select></label>
+      <label>主机<select value={hostID} onChange={(event) => setHostID(event.target.value)}>{!initial?.observation && <option value="">仅文本计划（无主机）</option>}{initial?.host_id && !hosts.some((host) => host.id === initial.host_id) && <option value={initial.host_id}>{initial.host_id}</option>}{hosts.map((host) => <option key={host.id} value={host.id}>{host.name} · {host.state}</option>)}</select></label>
       <label>模型<select value={modelID} required onChange={(event) => setModelID(event.target.value)}>{initial && !models.some((model) => model.id === initial.model_id) && <option value={initial.model_id}>{initial.model_id}</option>}{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model_name}</option>)}</select></label>
       <label className="schedule-form-wide">计划内容<textarea value={objective} maxLength={32768} rows={3} required onChange={(event) => setObjective(event.target.value)} placeholder="描述计划运行时需要完成的工作" /></label>
     </div>
@@ -372,7 +371,10 @@ function ScheduleEditor({ initial, hosts, models, busy, onCancel, onSubmit }: {
       <div className="schedule-kind-options">
         {(['once', 'daily', 'weekly', 'every_n_hours'] as const).map((value) => <label className="radio-row" key={value}><input type="radio" name="schedule-kind" checked={kind === value} onChange={() => setKind(value)} />{({ once: '一次', daily: '每天', weekly: '每周', every_n_hours: '每 N 小时' })[value]}</label>)}
       </div>
-      {kind === 'once' ? <label>运行时间<input type="datetime-local" required value={runAt} onChange={(event) => setRunAt(event.target.value)} /></label> : kind === 'every_n_hours' ? <label>间隔小时<input type="number" min={1} max={168} required value={intervalHours} onChange={(event) => setIntervalHours(Number(event.target.value))} /></label> : <div className="schedule-form-grid">
+      {kind === 'once' ? <label>运行时间<input type="datetime-local" required value={runAt} onChange={(event) => setRunAt(event.target.value)} /></label> : kind === 'every_n_hours' ? <>
+        <label>间隔小时<input type="number" min={1} max={168} required value={intervalHours} onChange={(event) => setIntervalHours(Number(event.target.value))} /></label>
+        {initial?.timing.kind === 'every_n_hours' && initial.timing.anchor_at && <p className="muted schedule-form-wide">调度锚点：{initial.timing.anchor_at}（编辑时保留该相位）</p>}
+      </> : <div className="schedule-form-grid">
         <label>开始日期<input type="date" required value={startsOn} onChange={(event) => setStartsOn(event.target.value)} /></label>
         <label>本地时间<input type="time" required value={localTime} onChange={(event) => setLocalTime(event.target.value)} /></label>
       </div>}
@@ -401,7 +403,7 @@ function goalStepStatus(status: GoalStep['status']) {
 
 function timingLabel(timing: components['schemas']['ScheduleTiming']) {
   if (timing.kind === 'once') return `一次 · ${formatDate(timing.run_at)} (${timing.time_zone})`;
-  if (timing.kind === 'every_n_hours') return `每 ${timing.interval_hours} 小时 (${timing.time_zone})`;
+  if (timing.kind === 'every_n_hours') return `每 ${timing.interval_hours} 小时 (${timing.time_zone})${timing.anchor_at ? ` · 锚点 ${timing.anchor_at}` : ''}`;
   if (timing.kind === 'daily') return `每天 ${timing.local_time} (${timing.time_zone})`;
   return `每周 ${timing.weekdays.map((day) => `周${({ 1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六', 7: '日' } as Record<number, string>)[day]}`).join('、')} ${timing.local_time} (${timing.time_zone})`;
 }

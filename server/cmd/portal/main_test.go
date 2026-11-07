@@ -19,6 +19,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/config"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
@@ -27,9 +28,10 @@ import (
 
 type cloudDSHTaskServiceProbe struct {
 	api.TaskService
-	submits, appends, lists, retries, answers int
-	actions                                   []task.Action
-	decisions                                 []task.PendingDecision
+	submits, accepts, lists, conversationLists, retries, answers int
+	actions                                                      []task.Action
+	decisions                                                    []task.PendingDecision
+	conversationProjectID, conversationID, conversationUserID    string
 }
 
 type projectWorkItemTaskServiceProbe struct {
@@ -247,13 +249,19 @@ func (s *cloudDSHTaskServiceProbe) Submit(context.Context, identity.Principal, a
 	return app.TaskSubmissionResult{}, nil
 }
 
-func (s *cloudDSHTaskServiceProbe) AppendMessage(context.Context, identity.Principal, string, app.AppendMessageCommand) (app.TaskSubmissionResult, error) {
-	s.appends++
-	return app.TaskSubmissionResult{}, nil
+func (s *cloudDSHTaskServiceProbe) AcceptConversationMessage(context.Context, identity.Principal, string, app.AcceptConversationMessageCommand) (conversation.Message, bool, error) {
+	s.accepts++
+	return conversation.Message{}, false, nil
 }
 
 func (s *cloudDSHTaskServiceProbe) List(context.Context, identity.Principal, app.TaskListRequest) (app.TaskPage, error) {
 	s.lists++
+	return app.TaskPage{}, nil
+}
+
+func (s *cloudDSHTaskServiceProbe) ListConversationActiveTasks(_ context.Context, principal identity.Principal, projectID, conversationID string, _ app.PageRequest) (app.TaskPage, error) {
+	s.conversationLists++
+	s.conversationProjectID, s.conversationID, s.conversationUserID = projectID, conversationID, principal.UserID
 	return app.TaskPage{}, nil
 }
 
@@ -304,31 +312,10 @@ func (s *cloudDSHScheduleServiceProbe) ProcessDue(context.Context, time.Time, in
 	return 0, nil
 }
 
-type cloudDSHInstantChatServiceProbe struct {
-	api.InstantChatService
-	lists, messages, sends int
-}
-
-func (s *cloudDSHInstantChatServiceProbe) List(context.Context, identity.Principal) ([]app.InstantChatConversation, error) {
-	s.lists++
-	return nil, nil
-}
-
-func (s *cloudDSHInstantChatServiceProbe) Messages(context.Context, identity.Principal, string) ([]app.InstantChatMessage, error) {
-	s.messages++
-	return nil, nil
-}
-
-func (s *cloudDSHInstantChatServiceProbe) Send(context.Context, identity.Principal, app.InstantChatSend) (app.InstantChatReply, error) {
-	s.sends++
-	return app.InstantChatReply{}, nil
-}
-
 func TestCloudDSHDisabledKeepsReadsAndRejectsNewExecution(t *testing.T) {
 	tasks := &cloudDSHTaskServiceProbe{}
 	schedules := &cloudDSHScheduleServiceProbe{}
-	instantChat := &cloudDSHInstantChatServiceProbe{}
-	services := cloudDSHAdaptersForRuntime(false, tasks, schedules, instantChat, schedules)
+	services := cloudDSHAdaptersForRuntime(false, tasks, schedules, schedules)
 	if services.scheduleProcessor != nil {
 		t.Fatal("disabled CloudDSH must not start schedule processing")
 	}
@@ -337,11 +324,14 @@ func TestCloudDSHDisabledKeepsReadsAndRejectsNewExecution(t *testing.T) {
 	if _, err := services.tasks.List(context.Background(), principal, app.TaskListRequest{}); err != nil || tasks.lists != 1 {
 		t.Fatalf("task history read = %v, list calls = %d", err, tasks.lists)
 	}
+	if _, err := services.tasks.ListConversationActiveTasks(context.Background(), principal, "", "c1234567", app.PageRequest{}); err != nil || tasks.conversationLists != 1 {
+		t.Fatalf("conversation task read = %v, list calls = %d", err, tasks.conversationLists)
+	}
 	if _, err := services.tasks.Submit(context.Background(), principal, app.SubmitTaskCommand{}); domain.CodeOf(err) != domain.CodeHostNotReady || tasks.submits != 0 {
 		t.Fatalf("task submit = %v, underlying calls = %d", err, tasks.submits)
 	}
-	if _, err := services.tasks.AppendMessage(context.Background(), principal, "c1234567", app.AppendMessageCommand{}); domain.CodeOf(err) != domain.CodeHostNotReady || tasks.appends != 0 {
-		t.Fatalf("task message append = %v, underlying calls = %d", err, tasks.appends)
+	if _, _, err := services.tasks.AcceptConversationMessage(context.Background(), principal, "c1234567", app.AcceptConversationMessageCommand{}); err != nil || tasks.accepts != 1 {
+		t.Fatalf("message receipt should remain available while runtime is disabled: err=%v calls=%d", err, tasks.accepts)
 	}
 	if _, err := services.tasks.RequestAction(context.Background(), principal, "t1234567", task.ActionResume, task.StatusPaused, "resume-key"); domain.CodeOf(err) != domain.CodeHostNotReady || len(tasks.actions) != 0 {
 		t.Fatalf("task resume = %v, underlying actions = %v", err, tasks.actions)
@@ -374,24 +364,24 @@ func TestCloudDSHDisabledKeepsReadsAndRejectsNewExecution(t *testing.T) {
 	if _, err := services.schedules.Action(context.Background(), principal, "s1234567", app.ScheduleActionCommand{Action: schedule.ActionDisable}, "disable-key"); err != nil || schedules.actions != 1 || schedules.lastAction != schedule.ActionDisable {
 		t.Fatalf("schedule disable = %v, underlying calls/action = %d/%s", err, schedules.actions, schedules.lastAction)
 	}
+}
 
-	if _, err := services.instantChat.List(context.Background(), principal); err != nil || instantChat.lists != 1 {
-		t.Fatalf("instant chat history read = %v, list calls = %d", err, instantChat.lists)
-	}
-	if _, err := services.instantChat.Messages(context.Background(), principal, "c1234567"); err != nil || instantChat.messages != 1 {
-		t.Fatalf("instant chat messages read = %v, calls = %d", err, instantChat.messages)
-	}
-	if _, err := services.instantChat.Send(context.Background(), principal, app.InstantChatSend{}); domain.CodeOf(err) != domain.CodeHostNotReady || instantChat.sends != 0 {
-		t.Fatalf("instant chat send = %v, underlying calls = %d", err, instantChat.sends)
+func TestProjectConversationTaskAppenderForwardsActiveTaskScope(t *testing.T) {
+	probe := &cloudDSHTaskServiceProbe{}
+	adapter := projectConversationTaskAppender{tasks: probe}
+	principal := identity.Principal{UserID: "u1234567"}
+	_, err := adapter.ListConversationActiveTasks(context.Background(), principal, "p1234567", "c1234567", app.PageRequest{Limit: 25})
+	if err != nil || probe.conversationLists != 1 || probe.conversationProjectID != "p1234567" ||
+		probe.conversationID != "c1234567" || probe.conversationUserID != principal.UserID {
+		t.Fatalf("project task scope was not forwarded: %#v, err=%v", probe, err)
 	}
 }
 
 func TestCloudDSHEnabledKeepsExecutionAdapters(t *testing.T) {
 	tasks := &cloudDSHTaskServiceProbe{}
 	schedules := &cloudDSHScheduleServiceProbe{}
-	instantChat := &cloudDSHInstantChatServiceProbe{}
-	services := cloudDSHAdaptersForRuntime(true, tasks, schedules, instantChat, schedules)
-	if services.tasks != tasks || services.schedules != schedules || services.instantChat != instantChat || services.scheduleProcessor != schedules {
+	services := cloudDSHAdaptersForRuntime(true, tasks, schedules, schedules)
+	if services.tasks != tasks || services.schedules != schedules || services.scheduleProcessor != schedules {
 		t.Fatal("enabled CloudDSH must keep the configured task and schedule services")
 	}
 	if _, err := services.tasks.Submit(context.Background(), identity.Principal{}, app.SubmitTaskCommand{}); err != nil || tasks.submits != 1 {

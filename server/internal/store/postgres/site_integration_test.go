@@ -211,7 +211,7 @@ VALUES ($1, 1, $2, $2, 0, $3, 420, '[]'::jsonb)`, workspaceID, file.Path, file.S
 	if _, err := pool.Exec(ctx, `UPDATE workspace_revisions SET file_count=1 WHERE workspace_id=$1 AND revision=1`, workspaceID); err != nil {
 		t.Fatalf("update Workspace revision manifest count: %v", err)
 	}
-	expectedDigest, err := workspace.ManifestSHA256([]workspace.File{file})
+	expectedDigest, err := workspace.ManifestTreeWithMetadataSHA256([]workspace.File{file}, nil, []workspace.Directory{{Path: ".", MetadataKnown: true}})
 	if err != nil {
 		t.Fatal(err)
 	}

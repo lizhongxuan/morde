@@ -153,14 +153,7 @@ func TestCloudTaskApprovalIsRevalidatedAfterHostControlFenceChanges(t *testing.T
 		t.Fatalf("locate real morde-cloud-runtime entrypoint: %v", err)
 	}
 	stopKey := bytes.Repeat([]byte{0x47}, 32)
-	stopAuthenticator, err := app.NewAgentStopAuthenticator("f01-approval-fence-supervisor", stopKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	instances, err := app.NewAgentInstanceService(store, stopAuthenticator)
-	if err != nil {
-		t.Fatal(err)
-	}
+	instances, conversationRuntimeManager, supervisor := newF01ConversationRuntime(t, store, node, script, "f01-approval-fence-supervisor", stopKey)
 	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -169,9 +162,8 @@ func TestCloudTaskApprovalIsRevalidatedAfterHostControlFenceChanges(t *testing.T
 		approvalFirst: true,
 		secondStarted: make(chan struct{}), content: "unused after stale approval",
 	}
-	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-approval-fence-supervisor", Supervisor: supervisor,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-approval-fence-supervisor", AccountRuntimes: conversationRuntimeManager,
 		Instances: instances, Checkpoints: checkpoints, Models: model, Tools: toolBroker, Completion: toolBroker,
 	})
 	if err != nil {

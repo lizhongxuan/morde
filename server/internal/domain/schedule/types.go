@@ -52,6 +52,7 @@ type Timing struct {
 	TimeZone      string     `json:"time_zone"`
 	Weekdays      []int      `json:"weekdays,omitempty"`
 	IntervalHours int        `json:"interval_hours,omitempty"`
+	AnchorAt      string     `json:"anchor_at,omitempty"`
 }
 
 type MisfirePolicy string
@@ -194,6 +195,7 @@ type Schedule struct {
 	Status                Status
 	HostID                string
 	ModelID               string
+	Title                 string
 	Objective             string
 	Timing                Timing
 	Budget                task.Budget
@@ -294,14 +296,14 @@ func (t Timing) Validate() error {
 	}
 	switch t.Kind {
 	case TimingOnce:
-		if t.RunAt == "" || t.StartsOn != "" || t.LocalTime != "" || len(t.Weekdays) != 0 || t.IntervalHours != 0 || !hasRFC3339Offset(t.RunAt) {
+		if t.RunAt == "" || t.StartsOn != "" || t.LocalTime != "" || len(t.Weekdays) != 0 || t.IntervalHours != 0 || t.AnchorAt != "" || !hasRFC3339Offset(t.RunAt) {
 			return errors.New("once timing requires run_at with an explicit RFC3339 offset and time_zone")
 		}
 		if _, err := time.Parse(time.RFC3339Nano, t.RunAt); err != nil {
 			return errors.New("run_at must be RFC3339")
 		}
 	case TimingDaily, TimingWeekly:
-		if t.RunAt != "" || t.IntervalHours != 0 || !datePattern.MatchString(t.StartsOn) || !validDate(t.StartsOn) || !localTimePattern.MatchString(t.LocalTime) {
+		if t.RunAt != "" || t.IntervalHours != 0 || t.AnchorAt != "" || !datePattern.MatchString(t.StartsOn) || !validDate(t.StartsOn) || !localTimePattern.MatchString(t.LocalTime) {
 			return errors.New("recurring timing requires starts_on and local_time")
 		}
 		if t.Kind == TimingDaily && len(t.Weekdays) != 0 {
@@ -327,6 +329,18 @@ func (t Timing) Validate() error {
 			t.IntervalHours < MinIntervalHours || t.IntervalHours > MaxIntervalHours {
 			return errors.New("every_n_hours timing requires interval_hours from 1 to 168")
 		}
+		if t.AnchorAt != "" {
+			if !hasRFC3339Offset(t.AnchorAt) {
+				return errors.New("anchor_at must be an RFC3339 instant with an explicit offset")
+			}
+			anchor, err := time.Parse(time.RFC3339Nano, t.AnchorAt)
+			if err != nil {
+				return errors.New("anchor_at must be RFC3339")
+			}
+			if anchor.Nanosecond()%int(time.Microsecond) != 0 {
+				return errors.New("anchor_at cannot exceed PostgreSQL microsecond precision")
+			}
+		}
 	default:
 		return errors.New("timing kind is invalid")
 	}
@@ -336,7 +350,9 @@ func (t Timing) Validate() error {
 
 func Validate(s Schedule) error {
 	if !ValidID(s.ID) || s.OwnerID == "" || s.Version < 1 || !s.Status.Valid() ||
-		(s.HostID != "" && !domain.ValidHostID(s.HostID)) || s.ModelID == "" || strings.TrimSpace(s.Objective) == "" || len(s.Objective) > 32768 ||
+		(s.HostID != "" && !domain.ValidHostID(s.HostID)) || s.ModelID == "" ||
+		strings.TrimSpace(s.Title) == "" || len(strings.TrimSpace(s.Title)) > 32768 ||
+		strings.TrimSpace(s.Objective) == "" || len(strings.TrimSpace(s.Objective)) > 32768 ||
 		s.Authorization.Kind == "" || !s.MisfirePolicy.Valid() || s.ExecutionEpoch < 1 {
 		return errors.New("schedule fields are invalid")
 	}
@@ -392,6 +408,9 @@ func FirstOccurrence(t Timing, now time.Time) (Occurrence, error) {
 		return Occurrence{Key: "once:" + runAt.Format(time.RFC3339Nano), ScheduledAt: &runAt, CheckAt: runAt, Status: RunQueued}, nil
 	}
 	if t.Kind == TimingEveryNHours {
+		if t.AnchorAt != "" {
+			return firstAnchoredIntervalOccurrence(t, now), nil
+		}
 		return intervalOccurrence(now.UTC().Truncate(time.Microsecond).Add(time.Minute)), nil
 	}
 	date, _ := time.Parse("2006-01-02", t.StartsOn)
@@ -413,6 +432,25 @@ func FirstOccurrence(t Timing, now time.Time) (Occurrence, error) {
 		date = date.AddDate(0, 0, 1)
 	}
 	return Occurrence{}, errors.New("could not find next schedule occurrence")
+}
+
+func firstAnchoredIntervalOccurrence(t Timing, now time.Time) Occurrence {
+	anchor, _ := time.Parse(time.RFC3339Nano, t.AnchorAt)
+	// PostgreSQL stores occurrence timestamps at microsecond precision.
+	anchor = anchor.UTC().Truncate(time.Microsecond)
+	now = now.UTC().Truncate(time.Microsecond)
+	if anchor.After(now) {
+		return intervalOccurrence(anchor)
+	}
+	intervalSeconds := int64(t.IntervalHours * 60 * 60)
+	intervalNanos := intervalSeconds * int64(time.Second)
+	deltaSeconds := now.Unix() - anchor.Unix()
+	deltaNanos := int64(now.Nanosecond() - anchor.Nanosecond())
+	phaseNanos := ((deltaSeconds%intervalSeconds)*int64(time.Second) + deltaNanos) % intervalNanos
+	if phaseNanos < 0 {
+		phaseNanos += intervalNanos
+	}
+	return intervalOccurrence(now.Add(time.Duration(intervalNanos - phaseNanos)))
 }
 
 func NextOccurrence(t Timing, currentKey string) (Occurrence, error) {

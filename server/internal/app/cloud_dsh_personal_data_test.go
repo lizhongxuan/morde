@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -40,6 +41,27 @@ func (s *cloudDSHPersonalSnapshotStub) GetSnapshot(_ context.Context, principal 
 	s.calls++
 	s.principal = principal
 	return PersonalSnapshotPage{Watermark: 1, Items: s.items}, nil
+}
+
+func enabledMemorySetting() personal.Object {
+	return personal.Object{ObjectType: personal.ObjectTypeSkillSetting, ObjectID: cloudDSHMemorySettingID,
+		Revision: 1, Body: json.RawMessage(`{"enabled":true}`)}
+}
+
+func TestCloudDSHMemoryChangePauseIsVisibleAndIdempotent(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	broker := &CloudDSHToolBroker{store: store}
+	claimed := store.details.Task
+	for i := 0; i < 2; i++ {
+		if err := broker.PausePersonalMemoryRecovery(context.Background(), claimed); err != nil {
+			t.Fatalf("pause %d: %v", i, err)
+		}
+	}
+	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "dsh_recovery_unresolved" ||
+		len(store.events) != 1 || store.events[0].Type != "task.waiting_user" || !strings.Contains(string(store.events[0].Payload), "请重新发送消息") {
+		t.Fatalf("unexpected memory pause: task=%+v events=%+v", store.details.Task, store.events)
+	}
 }
 
 func TestCloudDSHPersonalContextRequiresCurrentPersonalOwnerAuthorization(t *testing.T) {
@@ -139,8 +161,22 @@ func TestCloudDSHInitialContextLoadsAuthorizedProfileMemoryAndGoals(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	broker := &CloudDSHToolBroker{store: store, personalSync: reader, goals: goals}
-	contextValue, err := broker.InitialContext(context.Background(), store.details.Task)
+	settingStore := &personalMutationStoreStub{object: enabledMemorySetting()}
+	settingStore.objects = map[string]personal.Object{
+		"skill_setting/builtin_memory":        enabledMemorySetting(),
+		"memory/global":                       reader.items[1],
+		"profile/" + personal.ProfileObjectID: reader.items[0],
+		"soul/default":                        reader.items[2],
+		"goal/g_context1":                     goalStore.result.Items[0],
+	}
+	personalData, err := NewPersonalMutationService(settingStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := &CloudDSHToolBroker{store: store, personalSync: reader, personalData: personalData, goals: goals}
+	claimed := store.details.Task
+	store.details.Task.ConversationContext = nil
+	contextValue, err := broker.InitialContext(context.Background(), claimed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,10 +185,79 @@ func TestCloudDSHInitialContextLoadsAuthorizedProfileMemoryAndGoals(t *testing.T
 			t.Errorf("personal context omitted %q: %s", want, contextValue)
 		}
 	}
+	proof := strings.TrimPrefix(contextValue[strings.LastIndex(contextValue, "\n")+1:], CloudDSHMemoryProofPrefix)
+	if proof == "" || strings.Contains(proof, "concise") || broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, nil) != nil {
+		t.Fatalf("initial memory proof was missing, exposed text, or invalid: %q", proof)
+	}
+	for _, key := range []string{"profile/" + personal.ProfileObjectID, "soul/default", "goal/g_context1"} {
+		original := settingStore.objects[key]
+		delete(settingStore.objects, key)
+		if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+			t.Fatalf("deleted %s remained in a resumable personal context: %v", key, err)
+		}
+		updatedObject := original
+		updatedObject.Revision++
+		settingStore.objects[key] = updatedObject
+		if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+			t.Fatalf("changed %s remained in a resumable personal context: %v", key, err)
+		}
+		if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, []CloudDSHMemoryVersion{{
+			ObjectType: original.ObjectType, ID: original.ObjectID, Revision: updatedObject.Revision,
+		}}); err != nil {
+			t.Fatalf("confirmed in-task change to %s was rejected: %v", key, err)
+		}
+		settingStore.objects[key] = original
+	}
+	legacyProof := base64.RawURLEncoding.EncodeToString([]byte(`{"enabled":true,"revision":1,"items":[]}`))
+	if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, legacyProof, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("old proof without personal object versions was accepted: %v", err)
+	}
+	updated := reader.items[1]
+	updated.Revision = 3
+	settingStore.objects["memory/global"] = updated
+	if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("changed memory was accepted: %v", err)
+	}
+	if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, []CloudDSHMemoryVersion{{ID: "global", Revision: 3}}); err != nil {
+		t.Fatalf("confirmed in-task memory update was rejected: %v", err)
+	}
+	delete(settingStore.objects, "memory/global")
+	if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, []CloudDSHMemoryVersion{{ID: "global", Revision: 3}}); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("deleted memory was accepted: %v", err)
+	}
+	settingStore.objects["memory/global"] = reader.items[1]
 	if reader.calls != 1 || reader.principal.UserID != store.details.Task.OwnerID || goalStore.calls != 1 ||
 		goalStore.principal.UserID != store.details.Task.OwnerID || goalStore.page.Limit != 20 {
 		t.Fatalf("context reads were not owner-scoped/bounded: snapshot=%+v goals=%+v", reader, goalStore)
 	}
+	disabledSetting := enabledMemorySetting()
+	disabledSetting.Body = json.RawMessage(`{"enabled":false}`)
+	settingStore.objects["skill_setting/builtin_memory"] = disabledSetting
+	if err := broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("previously authorized memory remained valid after consent was revoked: %v", err)
+	}
+	withoutMemory, err := broker.InitialContext(context.Background(), claimed)
+	if err != nil || strings.Contains(withoutMemory, "prefers concise explanations") || !strings.Contains(withoutMemory, "Be careful with private data") {
+		t.Fatalf("disabled memory leaked or affected SOUL: %q, %v", withoutMemory, err)
+	}
+	delete(settingStore.objects, "skill_setting/builtin_memory")
+	withoutMemory, err = broker.InitialContext(context.Background(), claimed)
+	if err != nil || strings.Contains(withoutMemory, "prefers concise explanations") {
+		t.Fatalf("missing setting did not default to disabled: %q, %v", withoutMemory, err)
+	}
+	store.details.Task.Authorization.Version++
+	if _, err := broker.InitialContext(context.Background(), claimed); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("changed authorization accepted the claimed snapshot: %v", err)
+	}
+	store.details.Task.Authorization.Version--
+	foreignClaim := claimed
+	foreignContext := *claimed.ConversationContext
+	foreignContext.OwnerID = "u8765432"
+	foreignClaim.ConversationContext = &foreignContext
+	if _, err := broker.currentTaskDetails(context.Background(), foreignClaim); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("foreign conversation context accepted: %v", err)
+	}
+	store.details.Task.ConversationContext = claimed.ConversationContext
 	projectStore := &projectServiceStoreStub{
 		members: map[string]project.Member{
 			store.details.Task.InitiatorID: {ProjectID: "j1234567", UserID: store.details.Task.InitiatorID, Role: project.RoleMember, Version: 1},
@@ -175,7 +280,7 @@ func TestCloudDSHInitialContextLoadsAuthorizedProfileMemoryAndGoals(t *testing.T
 	projectContext, err := broker.InitialContext(context.Background(), store.details.Task)
 	if err != nil || !strings.Contains(projectContext, "shared project memory") || !strings.Contains(projectContext, "shared project document") ||
 		strings.Contains(projectContext, "prefers concise explanations") || projectStore.contextPrincipal.UserID != store.details.Task.InitiatorID ||
-		reader.calls != 1 || goalStore.calls != 1 {
+		reader.calls != 3 || goalStore.calls != 3 {
 		t.Fatalf("project task context = %q err=%v store=%+v personal calls=%d/%d", projectContext, err, projectStore, reader.calls, goalStore.calls)
 	}
 	delete(projectStore.members, store.details.Task.InitiatorID)
@@ -204,7 +309,7 @@ func TestCloudDSHToolBrokerRoutesAuthorizedPersonalUpdateThroughTaskProgress(t *
 		ConversationID: baseStore.details.Task.ConversationID, Scope: "personal",
 	}
 	store := &cloudDSHPersonalCommitTaskStore{cloudDSHBrokerTaskStore: baseStore}
-	mutationStore := &personalMutationStoreStub{}
+	mutationStore := &personalMutationStoreStub{object: enabledMemorySetting()}
 	personalData, err := NewPersonalMutationService(mutationStore)
 	if err != nil {
 		t.Fatal(err)
@@ -233,7 +338,12 @@ func TestCloudDSHToolBrokerRoutesAuthorizedPersonalUpdateThroughTaskProgress(t *
 	}
 	body := `{"content":"private body must stay out of audit"}`
 	call := ModelToolCall{CallID: "call_personal_update_1", Name: cloudDSHPersonalUpdateToolName,
-		Arguments: `{"object_type":"memory","object_id":"global","base_revision":0,"body":{"content":"private body must stay out of audit"}}`}
+		Arguments: `{"object_type":"memory","object_id":"global","base_revision":0,"body":"{\"content\":\"private body must stay out of audit\"}"}`}
+	invalid := call
+	invalid.Arguments = `{"object_type":"memory","object_id":"global","base_revision":0,"body":"[]"}`
+	if _, err := broker.Execute(context.Background(), claimed, invalid); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("non-object encoded body accepted: %v", err)
+	}
 	result, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || result.Status != AgentToolSucceeded || result.Output != `{"object_type":"memory","object_id":"global","revision":1}` {
 		t.Fatalf("personal update result = %+v, err=%v", result, err)
@@ -244,5 +354,29 @@ func TestCloudDSHToolBrokerRoutesAuthorizedPersonalUpdateThroughTaskProgress(t *
 	}
 	if strings.Contains(string(store.events[0].Payload), body) || strings.Contains(result.Output, body) {
 		t.Fatalf("personal update audit/receipt leaked the body: event=%s output=%s", store.events[0].Payload, result.Output)
+	}
+	if string(store.commits[0].Mutation.Body) != body {
+		t.Fatalf("encoded body was not decoded into the personal mutation")
+	}
+	call.CallID = "call_personal_update_legacy"
+	call.Arguments = `{"object_type":"memory","object_id":"global","base_revision":0,"body":{"content":"private body must stay out of audit"}}`
+	if _, err := broker.Execute(context.Background(), claimed, call); err != nil {
+		t.Fatalf("legacy object body was not accepted: %v", err)
+	}
+	mutationStore.object.Body = json.RawMessage(`{"enabled":false}`)
+	call.CallID = "call_disabled_memory"
+	if _, err := broker.Execute(context.Background(), claimed, call); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("disabled memory write was accepted: %v", err)
+	}
+	if len(store.commits) != 2 {
+		t.Fatalf("disabled memory reached transaction: %d commits", len(store.commits))
+	}
+	soul := ModelToolCall{CallID: "call_soul_update", Name: cloudDSHPersonalUpdateToolName,
+		Arguments: `{"object_type":"soul","object_id":"default","base_revision":0,"body":"{\"name\":\"Morde\",\"content\":\"Be helpful.\"}"}`}
+	if _, err := broker.Execute(context.Background(), claimed, soul); err != nil {
+		t.Fatalf("SOUL update with memory disabled: %v", err)
+	}
+	if !strings.Contains(string(store.events[len(store.events)-1].Payload), "已更新 SOUL") {
+		t.Fatalf("SOUL update did not notify via task activity: %s", store.events[len(store.events)-1].Payload)
 	}
 }

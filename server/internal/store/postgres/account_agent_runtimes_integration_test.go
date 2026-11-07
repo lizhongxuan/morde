@@ -13,6 +13,24 @@ import (
 	"morde/server/internal/domain/execution"
 )
 
+func runtimeTestConversation(t *testing.T, store *Store, ownerID string) string {
+	t.Helper()
+	id := mustID(t, domain.NewConversationID)
+	if _, err := store.pool.Exec(context.Background(), `INSERT INTO conversations(id,owner_id,title) VALUES ($1,$2,'runtime test')`, id, ownerID); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func runtimeTaskConversation(t *testing.T, store *Store, taskID string) string {
+	t.Helper()
+	var conversationID string
+	if err := store.pool.QueryRow(context.Background(), `SELECT conversation_id FROM tasks WHERE id=$1`, taskID).Scan(&conversationID); err != nil {
+		t.Fatal(err)
+	}
+	return conversationID
+}
+
 func TestPostgresAccountAgentRuntimeFailureIsReported(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()
@@ -20,7 +38,7 @@ func TestPostgresAccountAgentRuntimeFailureIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, replayed, err := service.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID,
+	runtime, replayed, err := service.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, ConversationID: runtimeTaskConversation(t, f.store, f.request.Fence.TaskID),
 		RuntimeID: "account-runtime-failed", LeaseOwner: "portal-runtime-failed",
 		SupervisorNonce: append([]byte(nil), f.request.SupervisorNonce...), MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
 	if err != nil || replayed {
@@ -29,7 +47,7 @@ func TestPostgresAccountAgentRuntimeFailureIsReported(t *testing.T) {
 	if err := service.Fail(ctx, runtime.Fence, execution.RuntimeFailureStartup); err != nil {
 		t.Fatalf("mark failed account Runtime: %v", err)
 	}
-	loaded, found, err := service.Get(ctx, runtime.Fence.OwnerID)
+	loaded, found, err := service.Get(ctx, runtime.Fence.ConversationID)
 	if err != nil || !found || loaded.State != app.AccountAgentRuntimeFailed || loaded.FailureReason != execution.RuntimeFailureStartup {
 		t.Fatalf("failed Runtime state=%+v found=%t err=%v", loaded, found, err)
 	}
@@ -49,7 +67,7 @@ func TestPostgresAccountAgentRuntimeLeaseAndTaskSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, RuntimeID: "account-runtime-1",
+	request := app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, ConversationID: runtimeTaskConversation(t, f.store, f.request.Fence.TaskID), RuntimeID: "account-runtime-1",
 		LeaseOwner: "portal-runtime-1", SupervisorNonce: append([]byte(nil), f.request.SupervisorNonce...),
 		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second}
 	runtime, replayed, err := runtimeService.Start(ctx, request)
@@ -103,6 +121,7 @@ func TestPostgresAccountAgentRuntimeLeaseAndTaskSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	submission := newTestTaskSubmission(t, f.request.Fence.OwnerID, "", "account-runtime-parallel-task", "run parallel task")
+	submission.Task.ConversationID = original.Task.ConversationID
 	submission.Task.Authorization = original.Task.Authorization
 	created, err := f.store.SubmitTask(ctx, submission)
 	if err != nil {
@@ -183,13 +202,14 @@ func TestPostgresAccountRuntimeCrashRecoveryRequiresExpiredLease(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	conversationID := runtimeTestConversation(t, store, owner.ID)
 	runtimeService, err := app.NewAccountAgentRuntimeService(store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	nonce := make([]byte, 32)
 	nonce[0] = 61
-	runtime, replayed, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID,
+	runtime, replayed, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID, ConversationID: conversationID,
 		RuntimeID: "runtime-crash-recovery", LeaseOwner: "portal-crash-recovery", SupervisorNonce: nonce,
 		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
 	if err != nil || replayed {
@@ -199,7 +219,7 @@ func TestPostgresAccountRuntimeCrashRecoveryRequiresExpiredLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ready account Runtime: %v", err)
 	}
-	identity, err := runtimeService.StopIdentity(ctx, owner.ID)
+	identity, err := runtimeService.StopIdentity(ctx, conversationID)
 	if err != nil {
 		t.Fatalf("read Runtime stop identity: %v", err)
 	}
@@ -266,19 +286,20 @@ func TestPostgresAbortedAccountRuntimeStartRequiresExpiredLeaseAndNoWork(t *test
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	conversationID := runtimeTestConversation(t, store, owner.ID)
 	service, err := app.NewAccountAgentRuntimeService(store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	nonce := make([]byte, 32)
 	nonce[0] = 81
-	request := app.AccountAgentRuntimeStart{OwnerID: owner.ID, RuntimeID: "runtime-aborted-start",
+	request := app.AccountAgentRuntimeStart{OwnerID: owner.ID, ConversationID: conversationID, RuntimeID: "runtime-aborted-start",
 		LeaseOwner: "portal-aborted-start", SupervisorNonce: nonce, MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second}
 	runtime, replayed, err := service.Start(ctx, request)
 	if err != nil || replayed {
 		t.Fatalf("start Runtime: runtime=%+v replayed=%t err=%v", runtime, replayed, err)
 	}
-	identity, err := service.StopIdentity(ctx, owner.ID)
+	identity, err := service.StopIdentity(ctx, conversationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +322,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 	if replayed, err := service.ConfirmGuardianStopped(ctx, proof, verifier); err != nil || replayed {
 		t.Fatalf("confirm aborted start: replayed=%t err=%v", replayed, err)
 	}
-	loaded, found, err := service.Get(ctx, owner.ID)
+	loaded, found, err := service.Get(ctx, conversationID)
 	if err != nil || !found || loaded.State != app.AccountAgentRuntimeStopped {
 		t.Fatalf("aborted start did not stop Runtime: runtime=%+v found=%t err=%v", loaded, found, err)
 	}
@@ -323,7 +344,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 	if _, err := service.Ready(ctx, replacement.Fence); err != nil {
 		t.Fatalf("mark replacement Runtime running: %v", err)
 	}
-	runningIdentity, err := service.StopIdentity(ctx, owner.ID)
+	runningIdentity, err := service.StopIdentity(ctx, conversationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,9 +356,74 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, replaceme
 	if _, err := service.ConfirmGuardianStopped(ctx, runningProof, verifier); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("accepted aborted-start proof for a running Runtime: %v", err)
 	}
-	stillRunning, found, err := service.Get(ctx, owner.ID)
+	stillRunning, found, err := service.Get(ctx, conversationID)
 	if err != nil || !found || stillRunning.State != app.AccountAgentRuntimeRunning {
 		t.Fatalf("rejected aborted-start proof changed running Runtime: runtime=%+v found=%t err=%v", stillRunning, found, err)
+	}
+}
+
+func TestPostgresAbortedStartProofForFailedRuntime(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	service, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		reason     execution.RuntimeFailureReason
+		sequence   int
+		wantAccept bool
+	}{
+		{name: "startup failed before work", reason: execution.RuntimeFailureStartup, wantAccept: true},
+		{name: "startup failed after work", reason: execution.RuntimeFailureStartup, sequence: 1},
+		{name: "runtime failed", reason: execution.RuntimeFailureRuntime},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+			conversationID := runtimeTestConversation(t, store, owner.ID)
+			nonce := make([]byte, 32)
+			nonce[0] = 83
+			runtime, _, err := service.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID, ConversationID: conversationID, RuntimeID: "runtime-failed-" + owner.ID,
+				LeaseOwner: "portal-failed-start", SupervisorNonce: nonce, MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.Fail(ctx, runtime.Fence, tc.reason); err != nil {
+				t.Fatal(err)
+			}
+			identity, err := service.StopIdentity(ctx, conversationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := signedAbortedAccountRuntimeStartProof(t, identity, privateKey)
+			if _, err := service.ConfirmGuardianStopped(ctx, proof, verifier); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("accepted proof before lease expiry: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second',runtime_sequence=$3
+WHERE service_instance_id=$1::uuid AND owner_id=$2`, runtime.Fence.ServiceInstanceID, owner.ID, tc.sequence); err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.ConfirmGuardianStopped(ctx, proof, verifier)
+			if tc.wantAccept && err != nil {
+				t.Fatalf("rejected verified failed start: %v", err)
+			}
+			if !tc.wantAccept && domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("accepted unsafe failed Runtime proof: %v", err)
+			}
+			loaded, found, err := service.Get(ctx, conversationID)
+			if err != nil || !found || (loaded.State == app.AccountAgentRuntimeStopped) != tc.wantAccept {
+				t.Fatalf("unexpected Runtime state: %s, found=%t, err=%v", loaded.State, found, err)
+			}
+		})
 	}
 }
 
@@ -365,9 +451,10 @@ func TestPostgresListsBoundedAccountRuntimeStopCandidates(t *testing.T) {
 	}
 	start := func(ownerID, id string, nonceByte byte) app.AccountAgentRuntime {
 		t.Helper()
+		conversationID := runtimeTestConversation(t, store, ownerID)
 		nonce := make([]byte, 32)
 		nonce[0] = nonceByte
-		runtime, replayed, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: ownerID,
+		runtime, replayed, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: ownerID, ConversationID: conversationID,
 			RuntimeID: id, LeaseOwner: "portal-" + id, SupervisorNonce: nonce,
 			MaxConcurrentTasks: 1, LeaseDuration: 30 * time.Second})
 		if err != nil || replayed {
@@ -386,7 +473,7 @@ func TestPostgresListsBoundedAccountRuntimeStopCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	failedExpired := start(owners[3], "runtime-candidate-failed", 74)
-	start(owners[4], "runtime-candidate-live", 75)
+	failedLive := start(owners[4], "runtime-candidate-failed-live", 75)
 	stopped := start(owners[5], "runtime-candidate-stopped", 76)
 	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopping' WHERE owner_id=$1 AND runtime_id=$2`, owners[0], stopping.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
@@ -400,7 +487,10 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='runtime_failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[3], failedExpired.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
-	identity, err := runtimeService.StopIdentity(ctx, owners[5])
+	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='runtime_failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[4], failedLive.Fence.RuntimeID); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := runtimeService.StopIdentity(ctx, stopped.Fence.ConversationID)
 	if err != nil {
 		t.Fatalf("read stopped-case identity before proof: %v", err)
 	}
@@ -420,15 +510,23 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{owners[0]: true, owners[1]: true, owners[2]: true, owners[3]: true}
+	want := map[string]bool{owners[0]: true, owners[1]: true, owners[2]: true, owners[3]: true, owners[4]: true}
 	for _, candidate := range candidates {
 		if !want[candidate.Fence.OwnerID] || candidate.NonceSHA256 == "" || candidate.ExpiresAt.IsZero() {
 			t.Fatalf("unexpected or incomplete Runtime stop candidate: %+v", candidate)
 		}
 		delete(want, candidate.Fence.OwnerID)
 	}
-	if len(candidates) != 4 || len(want) != 0 {
+	if len(candidates) != 5 || len(want) != 0 {
 		t.Fatalf("Runtime stop candidates = %+v, missing owners=%v", candidates, want)
+	}
+	failedLiveIdentity, err := runtimeService.StopIdentity(ctx, failedLive.Fence.ConversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedLiveProof := signedAccountRuntimeStopProof(t, failedLiveIdentity, privateKey)
+	if _, err := runtimeService.ConfirmGuardianStopped(ctx, failedLiveProof, authenticator); err != nil {
+		t.Fatalf("Guardian proof could not retire failed Runtime before lease expiry: %v", err)
 	}
 	limited, err := runtimeService.ListAccountAgentRuntimeStopCandidates(ctx, 2)
 	if err != nil || len(limited) != 2 {

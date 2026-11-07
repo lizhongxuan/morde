@@ -8,6 +8,9 @@ import (
 	"morde/server/internal/domain/workspace"
 )
 
+// BuiltinSearchMCPConnectorID is reserved for the fixed server-side search tool.
+const BuiltinSearchMCPConnectorID = "builtin:searxng-v2.10.0"
+
 type MCPConnectorOperation struct {
 	ID                          string
 	TaskID                      string

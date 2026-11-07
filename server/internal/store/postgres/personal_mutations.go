@@ -67,7 +67,7 @@ func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identit
 	if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
 		return personal.MutationReceipt{}, err
 	}
-	instanceID, err := serviceInstanceIDInTx(ctx, tx)
+	instanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 	if err != nil {
 		return personal.MutationReceipt{}, err
 	}

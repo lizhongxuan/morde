@@ -15,10 +15,11 @@ const staleModelCallAge = 2 * time.Minute
 const staleModelCallBatchSize = 100
 
 type staleModelCall struct {
-	ownerID string
-	source  string
-	callID  string
-	taskID  string
+	ownerID  string
+	source   string
+	callID   string
+	taskID   string
+	personal bool
 }
 
 func (s *Store) MarkStaleModelCallsUnknown(ctx context.Context) (int, error) {
@@ -28,7 +29,7 @@ func (s *Store) MarkStaleModelCallsUnknown(ctx context.Context) (int, error) {
 	marked := 0
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT DISTINCT owner_id FROM model_call_ledger
-WHERE state='dispatched' AND created_at < clock_timestamp() - ($1 * interval '1 second')
+WHERE state='dispatched' AND source<>'route' AND created_at < clock_timestamp() - ($1 * interval '1 second')
 ORDER BY owner_id LIMIT $2`, staleModelCallAge.Seconds(), staleModelCallBatchSize)
 		if err != nil {
 			return fmt.Errorf("list stale model call owners: %w", err)
@@ -51,16 +52,25 @@ ORDER BY owner_id LIMIT $2`, staleModelCallAge.Seconds(), staleModelCallBatchSiz
 			return nil
 		}
 
-		// Match reservation/settlement lock order: account budget first, ledger rows second.
+		// Match reservation/settlement lock order: owner, platform budget, then ledger.
 		for _, ownerID := range owners {
-			var locked string
-			if err := tx.QueryRow(ctx, `SELECT owner_id FROM model_account_budgets WHERE owner_id=$1 FOR UPDATE`, ownerID).Scan(&locked); err != nil {
-				return fmt.Errorf("lock stale model call budget: %w", err)
+			if err := lockModelLedgerOwner(ctx, tx, ownerID); err != nil {
+				return err
+			}
+			var hasPlatform bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE owner_id=$1 AND state='dispatched' AND source<>'route'
+AND NOT personal_model AND created_at < clock_timestamp() - ($2 * interval '1 second'))`, ownerID, staleModelCallAge.Seconds()).Scan(&hasPlatform); err != nil {
+				return fmt.Errorf("inspect stale model calls: %w", err)
+			}
+			if hasPlatform {
+				if _, _, err := lockPlatformModelBudget(ctx, tx, ownerID); err != nil {
+					return err
+				}
 			}
 		}
 		projectRows, err := tx.Query(ctx, `WITH stale_calls AS (
  SELECT owner_id,source,call_id,task_id FROM model_call_ledger
- WHERE owner_id=ANY($1::text[]) AND state='dispatched'
+ WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source<>'route'
    AND created_at < clock_timestamp() - ($2 * interval '1 second')
  ORDER BY owner_id,created_at,source,call_id LIMIT $3
 )
@@ -92,8 +102,8 @@ ORDER BY p.project_id`, owners, staleModelCallAge.Seconds(), staleModelCallBatch
 			}
 		}
 
-		rows, err = tx.Query(ctx, `SELECT owner_id,source,call_id,COALESCE(task_id,'') FROM model_call_ledger
-WHERE owner_id=ANY($1::text[]) AND state='dispatched'
+		rows, err = tx.Query(ctx, `SELECT owner_id,source,call_id,COALESCE(task_id,''),personal_model FROM model_call_ledger
+WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source<>'route'
   AND created_at < clock_timestamp() - ($2 * interval '1 second')
 ORDER BY owner_id,created_at,source,call_id LIMIT $3 FOR UPDATE SKIP LOCKED`,
 			owners, staleModelCallAge.Seconds(), staleModelCallBatchSize)
@@ -103,7 +113,7 @@ ORDER BY owner_id,created_at,source,call_id LIMIT $3 FOR UPDATE SKIP LOCKED`,
 		calls := make([]staleModelCall, 0, staleModelCallBatchSize)
 		for rows.Next() {
 			var call staleModelCall
-			if err := rows.Scan(&call.ownerID, &call.source, &call.callID, &call.taskID); err != nil {
+			if err := rows.Scan(&call.ownerID, &call.source, &call.callID, &call.taskID, &call.personal); err != nil {
 				rows.Close()
 				return fmt.Errorf("read stale model call: %w", err)
 			}
@@ -151,7 +161,8 @@ FROM project_budget_ledger WHERE actor_id=$1 AND source=$2 AND call_id=$3
 					return fmt.Errorf("read stale model Task attribution: %w", err)
 				}
 				if taskInitiatorID != call.ownerID || (taskProjectID != "" &&
-					(projectLedgerCount != 1 || projectID != taskProjectID || actorID != taskInitiatorID || taskID != call.taskID)) ||
+					((projectLedgerCount == 0 && !call.personal) || (projectLedgerCount == 1 &&
+						(projectID != taskProjectID || actorID != taskInitiatorID || taskID != call.taskID)))) ||
 					(taskProjectID == "" && projectLedgerCount != 0) {
 					return fmt.Errorf("stale model Task and project ledger attribution do not match")
 				}
@@ -186,7 +197,11 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, call.own
 		}
 		return nil
 	})
-	return marked, err
+	if err != nil {
+		return marked, err
+	}
+	routeMarked, err := s.recoverExpiredRouteModelCalls(ctx)
+	return marked + routeMarked, err
 }
 
 var _ app.StaleModelCallStore = (*Store)(nil)

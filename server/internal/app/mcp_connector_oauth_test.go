@@ -13,6 +13,24 @@ import (
 	"morde/server/internal/mcpconnector"
 )
 
+func TestMCPConnectorOAuthDisabledWithoutHTTPSRedirect(t *testing.T) {
+	_, store, sealer := mcpConnectorTestService(t)
+	service, err := NewMCPConnectorService(store, sealer, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := mcpConnectorPrincipal("u1234567")
+	if _, err := service.BeginOAuth(context.Background(), principal, "n1234567", 1, "", ""); domain.CodeOf(err) != domain.CodeUnsupported {
+		t.Fatalf("begin disabled OAuth = %v", err)
+	}
+	if err := service.CompleteOAuth(context.Background(), "", "", "", ""); domain.CodeOf(err) != domain.CodeUnsupported {
+		t.Fatalf("complete disabled OAuth = %v", err)
+	}
+	if _, err := NewMCPConnectorService(store, sealer, "http://portal.example.test/api/mcp/oauth/callback"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("insecure OAuth redirect = %v", err)
+	}
+}
+
 type mcpConnectorOAuthClientStub struct {
 	start          mcpconnector.ConnectorOAuthStart
 	credentials    mcpconnector.ConnectorOAuthCredentials

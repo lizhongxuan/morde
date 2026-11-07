@@ -107,13 +107,13 @@ test.describe("Portal visible error mock flows", () => {
     try {
       await page.getByRole("link", { name: "创建电脑" }).click();
       await page.getByRole("button", { name: "创建主机" }).click();
-      await closeAlert(page, "已达到主机配额上限");
+      await closeAlert(page, "额度不足或尚未配置，请检查相关额度");
 
       await page.getByRole("button", { name: "创建主机" }).click();
       await closeAlert(page, "当前资源容量不足");
 
       await page.getByRole("radio", { name: "绑定已有工作区" }).check();
-      await page.getByRole("checkbox", { name: /本地工作目录/ }).check();
+      await page.getByRole("radio", { name: /本地工作目录/ }).check();
       await page.getByRole("button", { name: "创建主机" }).click();
       await closeAlert(page, "工作目录正在被其他主机使用");
       expect(createBodies.map((body) => body.workspace_ids)).toEqual([

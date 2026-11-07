@@ -36,9 +36,13 @@ WHERE table_schema=current_schema() AND table_name='conversation_messages' AND c
 func TestUnfinishedTaskConversationIndexIncludesPaused(t *testing.T) {
 	_, pool := newTemporaryStore(t)
 	var predicate string
-	if err := pool.QueryRow(context.Background(), `SELECT pg_get_expr(indpred, indrelid) FROM pg_index
-WHERE indexrelid=to_regclass('tasks_one_active_per_conversation')`).Scan(&predicate); err != nil {
+	var unique bool
+	if err := pool.QueryRow(context.Background(), `SELECT pg_get_expr(indpred, indrelid),indisunique FROM pg_index
+WHERE indexrelid=to_regclass('tasks_active_per_conversation')`).Scan(&predicate, &unique); err != nil {
 		t.Fatalf("read unfinished Task conversation index predicate: %v", err)
+	}
+	if unique {
+		t.Fatal("active conversation task lookup must allow multiple tasks")
 	}
 	for _, status := range []string{"queued", "running", "waiting_user", "pausing", "paused", "cancelling"} {
 		if !strings.Contains(predicate, status) {
@@ -50,9 +54,6 @@ WHERE indexrelid=to_regclass('tasks_one_active_per_conversation')`).Scan(&predic
 func TestUnfinishedTaskConflictPreflightIncludesPausedWithoutMutation(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `DROP INDEX tasks_one_active_per_conversation`); err != nil {
-		t.Fatalf("remove post-preflight constraint for legacy conflict fixture: %v", err)
-	}
 	owner := createTestUser(t, store, 1, 1000, 2048)
 	conversation := createMainConversationForTest(t, store, owner.ID)
 	pausedID := mustID(t, domain.NewTaskID)

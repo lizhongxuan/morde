@@ -41,6 +41,7 @@ var (
 	ErrResultTooLarge          = &RuntimeError{Code: "result_too_large"}
 	ErrRuntimeStateUnavailable = &RuntimeError{Code: "runtime_state_unavailable"}
 	ErrDesktopFocusChanged     = &RuntimeError{Code: "desktop_focus_changed"}
+	ErrDesktopGeometryChanged  = &RuntimeError{Code: "desktop_geometry_changed"}
 	// ErrOperationUncertain marks an action whose side effect may have started,
 	// but whose handler could not prove a terminal result. Such operations must
 	// remain queryable as unknown instead of being reported as ordinary failure.
@@ -1512,6 +1513,9 @@ func (m *Manager) runOperation(ctx context.Context, id string, handler ActionHan
 func operationFailureCode(err error) string {
 	if errors.Is(err, ErrDesktopFocusChanged) {
 		return ErrDesktopFocusChanged.Code
+	}
+	if errors.Is(err, ErrDesktopGeometryChanged) {
+		return ErrDesktopGeometryChanged.Code
 	}
 	return "operation_failed"
 }

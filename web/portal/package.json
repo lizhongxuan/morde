@@ -13,6 +13,7 @@
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src vite.config.ts --max-warnings=0",
     "test": "vitest run && node --test scripts/copy-morde-mobile.node-test.mjs",
+    "test:outbox-browser": "node --test scripts/message-outbox-concurrency.node-test.mjs",
     "test:watch": "vitest",
     "test:release": "node --test scripts/validate-desktop-release.node-test.mjs",
     "validate:desktop-release": "node scripts/validate-desktop-release.mjs",

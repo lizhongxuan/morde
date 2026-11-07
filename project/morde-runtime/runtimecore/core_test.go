@@ -211,9 +211,12 @@ func TestOperationIdempotencyConflictAndUnsupportedCapability(t *testing.T) {
 	closeManager(t, manager)
 }
 
-func TestOperationFailureKeepsOnlyTheDesktopFocusCode(t *testing.T) {
+func TestOperationFailureKeepsOnlySafeDesktopCodes(t *testing.T) {
 	if got := operationFailureCode(ErrDesktopFocusChanged); got != "desktop_focus_changed" {
 		t.Fatalf("focus failure code = %q", got)
+	}
+	if got := operationFailureCode(ErrDesktopGeometryChanged); got != "desktop_geometry_changed" {
+		t.Fatalf("geometry failure code = %q", got)
 	}
 	if got := operationFailureCode(errors.New("private action details")); got != "operation_failed" {
 		t.Fatalf("ordinary failure exposed details as %q", got)

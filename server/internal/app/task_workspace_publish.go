@@ -12,6 +12,7 @@ import (
 	"sort"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -20,13 +21,26 @@ var taskWorkspaceViewIDPattern = regexp.MustCompile(`^v[a-f0-9]{64}$`)
 type TaskWorkspaceBlockReader func(context.Context, string) ([]byte, error)
 
 func ValidateTaskWorkspacePublishCommand(value TaskWorkspacePublishCommand) error {
+	hostless := value.HostID == ""
 	if !domain.ValidUserID(value.OwnerID) || !domain.ValidTaskID(value.TaskID) || !domain.ValidWorkspaceID(value.WorkspaceID) ||
-		!domain.ValidHostID(value.HostID) || value.LeaseOwner == "" || len(value.LeaseOwner) > 255 || value.LeaseVersion < 1 ||
-		value.BindingVersion < 1 || value.InputRevision < 0 || value.BaseRevision < value.InputRevision ||
+		(!hostless && !domain.ValidHostID(value.HostID)) || value.LeaseOwner == "" || len(value.LeaseOwner) > 255 || value.LeaseVersion < 1 ||
+		value.InputRevision < 0 || value.BaseRevision < value.InputRevision ||
 		value.OperationKey == "" || len(value.OperationKey) > 255 || len(value.RequestHash) != sha256.Size ||
-		value.HostFence.RuntimeGeneration < 1 || value.HostFence.RuntimeInstanceID == "" || value.HostFence.ControlVersion < 0 || !value.HostFence.AIAllowed ||
-		!taskWorkspaceViewIDPattern.MatchString(value.ViewID) || !validSyncDigest(value.InputManifestSHA256) {
+		!validSyncDigest(value.InputManifestSHA256) {
 		return domain.InvalidArgument("task_workspace_publish", "Task Workspace publish fields are invalid")
+	}
+	if value.ProjectID != "" && (!project.ValidID(value.ProjectID) || !domain.ValidUserID(value.InitiatorID) || !domain.ValidUserID(value.WorkspaceOwnerID)) {
+		return domain.InvalidArgument("task_workspace_publish", "project Workspace publish identity is invalid")
+	}
+	if hostless {
+		if value.BindingVersion != 0 || value.HostFence != (AgentHostFence{}) || value.ViewID != "" {
+			return domain.InvalidArgument("task_workspace_publish", "Hostless Task Workspace publish must not include Host binding fields")
+		}
+		return nil
+	}
+	if value.BindingVersion < 1 || value.HostFence.RuntimeGeneration < 1 || value.HostFence.RuntimeInstanceID == "" ||
+		value.HostFence.ControlVersion < 0 || !value.HostFence.AIAllowed || !taskWorkspaceViewIDPattern.MatchString(value.ViewID) {
+		return domain.InvalidArgument("task_workspace_publish", "Task Workspace publish Host fence is invalid")
 	}
 	return nil
 }
@@ -52,7 +66,28 @@ func (s *WorkspaceSyncService) FindTaskWorkspacePublishReceipt(ctx context.Conte
 	return s.store.FindTaskWorkspacePublishReceipt(ctx, ownerID, taskID, workspaceID, operationKey)
 }
 
-func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
+type projectTaskWorkspacePublishGuard interface {
+	WithProjectTaskWorkspacePublish(context.Context, TaskWorkspacePublishCommand, func(context.Context) error) error
+}
+
+func (s *WorkspaceSyncService) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (TaskWorkspacePublishReceipt, error) {
+	guard, ok := s.store.(projectTaskWorkspacePublishGuard)
+	if !ok {
+		if value.ProjectID != "" {
+			return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeForbidden, "project Workspace publish authorization is unavailable")
+		}
+		return s.commitTaskWorkspacePublish(ctx, value, files, emptyDirectories, directories, manifestSHA, readBlock)
+	}
+	var receipt TaskWorkspacePublishReceipt
+	err := guard.WithProjectTaskWorkspacePublish(ctx, value, func(guardedCtx context.Context) error {
+		var err error
+		receipt, err = s.commitTaskWorkspacePublish(guardedCtx, value, files, emptyDirectories, directories, manifestSHA, readBlock)
+		return err
+	})
+	return receipt, err
+}
+
+func (s *WorkspaceSyncService) commitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string, readBlock TaskWorkspaceBlockReader) (receipt TaskWorkspacePublishReceipt, retErr error) {
 	if err := ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return TaskWorkspacePublishReceipt{}, err
 	}

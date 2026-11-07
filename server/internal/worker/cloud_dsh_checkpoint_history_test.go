@@ -2,6 +2,7 @@ package worker
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"morde/server/internal/app"
@@ -153,6 +154,90 @@ func TestCloudDSHCheckpointHistoryRejectsEmptyFinalAssistantResult(t *testing.T)
 	}
 	if _, err := history.completion(cloudDSHFence("session_1"), 0, make([]byte, 32)); err == nil {
 		t.Fatal("empty assistant result was accepted as a completed task")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsUnfinishedTurnForCompletion(t *testing.T) {
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointAssistantText(0, "Earlier completed result."),
+		checkpointTurnEnd(1, "step/end", map[string]any{"turn": 1, "step": 1}),
+		checkpointTurnEnd(2, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
+		checkpointTurnStart(3, "turn/start", map[string]any{"turn": 2}),
+	), 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.completion(cloudDSHFence("session_1"), 3, make([]byte, 32)); err == nil {
+		t.Fatal("an unfinished turn reused the previous assistant result")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsCompletedTurnWithoutNewAssistantOutput(t *testing.T) {
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointAssistantText(0, "Earlier completed result."),
+		checkpointTurnEnd(1, "step/end", map[string]any{"turn": 1, "step": 1}),
+		checkpointTurnEnd(2, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
+		checkpointTurnStart(3, "turn/start", map[string]any{"turn": 2}),
+		checkpointTurnStart(4, "step/start", map[string]any{"turn": 2, "step": 1}),
+		checkpointTurnEnd(5, "step/end", map[string]any{"turn": 2, "step": 1}),
+		checkpointTurnEnd(6, "turn/end", map[string]any{"turn": 2, "reason": map[string]any{"kind": "completed"}}),
+	), 0, 6); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(history.result) != "" {
+		t.Fatal("the previous turn's result remained current after a new turn started")
+	}
+	if _, err := history.completion(cloudDSHFence("session_1"), 6, make([]byte, 32)); err == nil {
+		t.Fatal("a completed turn without new assistant output reused the previous result")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsAssistantResultFromAnotherTurn(t *testing.T) {
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointAssistantText(0, "Earlier result."),
+		checkpointTurnEnd(1, "turn/end", map[string]any{"turn": 2, "reason": map[string]any{"kind": "completed"}}),
+	), 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.completion(cloudDSHFence("session_1"), 1, make([]byte, 32)); err == nil {
+		t.Fatal("a completed marker for a different turn accepted the old assistant result")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryRejectsRecoveredScreenshotWithoutImageBytes(t *testing.T) {
+	const callID = "call_screenshot_1"
+	const output = `{"mime_type":"image/jpeg","width":1,"height":1}`
+	imageID := "morde_img_" + strings.Repeat("a", 64)
+	history := newCloudDSHCheckpointHistory("session_1")
+	history.beginRestore()
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+		checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+		cloudDSHCheckpointEvent{Sequence: 2, Type: "assistant/message", Data: map[string]any{
+			"turn": 1, "step": 1, "message": map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool-call", "id": callID, "name": "desktop_screenshot", "arguments": `{}`},
+			}},
+		}},
+		cloudDSHCheckpointEvent{Sequence: 3, Type: "tool/call", Data: map[string]any{
+			"turn": 1, "step": 1, "callId": callID, "name": "desktop_screenshot", "arguments": `{}`,
+		}},
+		cloudDSHCheckpointEvent{Sequence: 4, Type: "tool/result", SurfaceOp: "append", SourceEventSeqs: []int64{3}, Data: map[string]any{
+			"turn": 1, "step": 1, "message": map[string]any{"toolCallId": callID, "isError": false,
+				"source": map[string]any{"kind": "tool", "callId": callID}, "content": []any{
+					map[string]any{"type": "text", "text": output},
+					map[string]any{"type": "image", "attachment": map[string]any{
+						"attachmentId": imageID, "mediaType": "image/jpeg", "bytes": 4, "width": 1, "height": 1,
+					}},
+				}},
+		}},
+	), 0, 4); err != nil {
+		t.Fatal(err)
+	}
+	history.finishRestore()
+	if err := history.noteToolResult(callID, "desktop_screenshot", []byte(`{}`), app.AgentToolSucceeded, output, nil); err == nil {
+		t.Fatal("recovered screenshot without its authenticated image bytes was accepted")
 	}
 }
 

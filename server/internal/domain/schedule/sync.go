@@ -14,6 +14,7 @@ type SyncDefinition struct {
 	Status             Status              `json:"status"`
 	HostID             *string             `json:"host_id"`
 	ModelID            string              `json:"model_id"`
+	Title              string              `json:"title"`
 	Objective          string              `json:"objective"`
 	Timing             Timing              `json:"timing"`
 	Budget             SyncBudget          `json:"budget"`
@@ -34,7 +35,7 @@ func NewSyncDefinition(value Schedule) SyncDefinition {
 		hostID = &value.HostID
 	}
 	return SyncDefinition{
-		Status: value.Status, HostID: hostID, ModelID: value.ModelID, Objective: value.Objective,
+		Status: value.Status, HostID: hostID, ModelID: value.ModelID, Title: value.Title, Objective: value.Objective,
 		Timing: value.Timing, Budget: SyncBudget{ActiveSeconds: value.Budget.ActiveSeconds,
 			ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens},
 		MisfirePolicy: value.MisfirePolicy, NotificationEvents: append([]NotificationEvent(nil), value.NotificationEvents...),
@@ -48,7 +49,8 @@ func ValidateSyncDefinition(id string, value SyncDefinition) error {
 		hostID = *value.HostID
 	}
 	if !ValidID(id) || !value.Status.Valid() || (hostID != "" && !domain.ValidHostID(hostID)) || value.ModelID == "" ||
-		len(value.ModelID) > 200 || strings.TrimSpace(value.Objective) == "" || len(value.Objective) > 32768 ||
+		len(value.ModelID) > 200 || strings.TrimSpace(value.Title) == "" || len(strings.TrimSpace(value.Title)) > 32768 ||
+		strings.TrimSpace(value.Objective) == "" || len(strings.TrimSpace(value.Objective)) > 32768 ||
 		!value.MisfirePolicy.Valid() || value.Timing.Validate() != nil ||
 		(task.Budget{ActiveSeconds: value.Budget.ActiveSeconds, ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens}).Validate() != nil {
 		return errors.New("schedule sync definition is invalid")

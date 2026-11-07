@@ -117,6 +117,27 @@ func (a *cloudDSHHubTaskAuthorizer) AuthorizeTaskExecution(_ context.Context, pr
 	return a.authorization, nil
 }
 
+type cloudDSHRevokingTaskAuthorizer struct {
+	authorization task.Authorization
+	validCalls    int
+	calls         int
+}
+
+func (*cloudDSHRevokingTaskAuthorizer) AuthorizeTaskAction(context.Context, string, identity.Kind, string, string, []identity.Scope, identity.Scope) error {
+	return nil
+}
+
+func (a *cloudDSHRevokingTaskAuthorizer) AuthorizeTaskExecution(_ context.Context, principal identity.Principal, _ string, scope identity.Scope) (task.Authorization, error) {
+	a.calls++
+	if a.calls > a.validCalls {
+		return task.Authorization{}, domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
+	}
+	if !principal.HasScope(scope) {
+		return task.Authorization{}, domain.NewError(domain.CodeForbidden, "task scope is unavailable")
+	}
+	return a.authorization, nil
+}
+
 func hubTaskInfoResult(actions []string, targetGrantVersion any) map[string]any {
 	body := map[string]any{
 		"name": "Desktop", "platform": "desktop", "os": "macOS", "version": "1",
@@ -160,12 +181,218 @@ func newCloudDSHHubBroker(t *testing.T, fixture *runtimeToolExecutorFixture, hub
 	return broker, store, value
 }
 
+func TestCloudDSHHubExpiredTaskAuthorizationHidesToolsAndBlocksDispatch(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	expired := time.Now().Add(-time.Minute).UTC()
+	claimed.Authorization.ExpiresAt = &expired
+	fixture.store.details.Task.Authorization = claimed.Authorization
+
+	definitions, err := broker.hubTaskDefinitions(context.Background(), claimed)
+	if err != nil || len(definitions) != 0 {
+		t.Fatalf("expired Task authorization definitions = %#v, err=%v; want no Hub tools", definitions, err)
+	}
+	call := ModelToolCall{CallID: "call-expired-auth", Name: hubTaskToolName("morde_hub_files", "i7654321", 5), Arguments: `{}`}
+	_, err = broker.Execute(context.Background(), claimed, call)
+	if domain.CodeOf(err) != domain.CodeForbidden || len(store.operations) != 0 {
+		t.Fatalf("expired Task authorization dispatch err=%v, operations=%#v; want forbidden before operation creation", err, store.operations)
+	}
+}
+
+func TestCloudDSHHubExpiredTargetInstallationHidesToolsAndBlocksDispatch(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, hubStore := newHubFixture(t)
+	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+	_ = target.next(t, "devices")
+	hubStore.mu.Lock()
+	installation := hubStore.installations["i7654321"]
+	installation.ExpiresAt = time.Now().Add(-time.Minute)
+	hubStore.installations["i7654321"] = installation
+	hubStore.mu.Unlock()
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+
+	definitions, err := broker.hubTaskDefinitions(context.Background(), claimed)
+	if err != nil || len(definitions) != 0 {
+		t.Fatalf("expired target installation definitions = %#v, err=%v; want no Hub tools", definitions, err)
+	}
+	call := ModelToolCall{CallID: "call-expired-target", Name: hubTaskToolName("morde_hub_files", "i7654321", 5), Arguments: `{"path":"workspace"}`}
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolNeedsUser || result.WaitingReason != "hub_target_authorization_changed" || len(store.operations) != 0 {
+		t.Fatalf("expired target installation dispatch = %#v, operations=%#v, err=%v; want no operation", result, store.operations, err)
+	}
+	if frame := target.maybeNext(); frame != nil {
+		t.Fatalf("expired target installation received a Hub action: %#v", frame)
+	}
+}
+
+func TestCloudDSHHubActionScopeHidesAndBlocksCommand(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+	_ = target.next(t, "devices")
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	claimed.Authorization.Kind = string(identity.KindClient)
+	claimed.Authorization.ClientInstallationID = "i1234567"
+	claimed.Authorization.Scopes = []string{string(identity.ScopeComputerObserve), string(identity.ScopeTaskRead)}
+	fixture.store.details.Task.Authorization = claimed.Authorization
+	fixture.executor.authorizer.(*cloudDSHHubTaskAuthorizer).authorization = claimed.Authorization
+
+	definitions := make(chan []AgentToolDefinition, 1)
+	errors := make(chan error, 1)
+	go func() {
+		value, err := broker.hubTaskDefinitions(context.Background(), claimed)
+		definitions <- value
+		errors <- err
+	}()
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionScreenshot, hub.ActionCommand}, int64(5))
+	available := <-definitions
+	if err := <-errors; err != nil {
+		t.Fatalf("definitions without computer.operate scope: %v", err)
+	}
+	commandName := hubTaskToolName("morde_hub_command", "i7654321", 5)
+	for _, definition := range available {
+		if definition.Name == commandName {
+			t.Fatal("command tool was exposed without computer.operate scope")
+		}
+	}
+	call := ModelToolCall{CallID: "call-missing-action-scope", Name: commandName, Arguments: `{"command":"pwd","timeout_ms":1000}`}
+	_, err := broker.Execute(context.Background(), claimed, call)
+	if domain.CodeOf(err) != domain.CodeForbidden || len(store.operations) != 0 {
+		t.Fatalf("command without computer.operate scope err=%v, operations=%#v; want forbidden before operation creation", err, store.operations)
+	}
+	if frame := target.maybeNext(); frame != nil {
+		t.Fatalf("target received action without computer.operate scope: %#v", frame)
+	}
+}
+
+func TestCloudDSHHubAuthorizedCommandUsesTaskFence(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+	_ = target.next(t, "devices")
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	claimed.Authorization.Kind = string(identity.KindClient)
+	claimed.Authorization.ClientInstallationID = "i1234567"
+	claimed.Authorization.Scopes = []string{
+		string(identity.ScopeTaskRead), string(identity.ScopeComputerObserve), string(identity.ScopeComputerOperate),
+	}
+	fixture.store.details.Task.Authorization = claimed.Authorization
+	fixture.executor.authorizer.(*cloudDSHHubTaskAuthorizer).authorization = claimed.Authorization
+
+	definitions := make(chan []AgentToolDefinition, 1)
+	definitionErrors := make(chan error, 1)
+	go func() {
+		value, err := broker.hubTaskDefinitions(context.Background(), claimed)
+		definitions <- value
+		definitionErrors <- err
+	}()
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionCommand}, int64(5))
+	available := <-definitions
+	if err := <-definitionErrors; err != nil {
+		t.Fatalf("definitions with computer.operate scope: %v", err)
+	}
+	toolName := hubTaskToolName("morde_hub_command", "i7654321", 5)
+	found := false
+	for _, definition := range available {
+		found = found || definition.Name == toolName
+	}
+	if !found {
+		t.Fatalf("authorized command tool %q was not exposed: %#v", toolName, available)
+	}
+
+	call := ModelToolCall{CallID: "call-authorized-command", Name: toolName, Arguments: `{"command":"printf ok","timeout_ms":1000}`}
+	resultCh := make(chan AgentToolResult, 1)
+	errorCh := make(chan error, 1)
+	go func() {
+		value, err := broker.Execute(context.Background(), claimed, call)
+		resultCh <- value
+		errorCh <- err
+	}()
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionCommand}, int64(5))
+	action := target.next(t, "call")
+	from, ok := action["from"].(map[string]any)
+	if !ok || from["kind"] != "task" || from["task_id"] != claimed.ID ||
+		from["authorization_version"] != float64(claimed.Authorization.Version) ||
+		from["target_grant_version"] != float64(5) || action["action"] != hub.ActionCommand {
+		t.Fatalf("Task command context = %#v", action)
+	}
+	args, ok := action["args"].(map[string]any)
+	if !ok || args["command"] != "printf ok" || args["timeout_ms"] != float64(1000) {
+		t.Fatalf("command arguments = %#v", action["args"])
+	}
+	target.push(t, map[string]any{"type": "result", "id": action["id"], "ok": true,
+		"body": map[string]any{"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": false, "stopped": false, "target_grant_version": 5}})
+	result := <-resultCh
+	if err := <-errorCh; err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("authorized command result = %#v, err=%v", result, err)
+	}
+	operation, err := store.GetTaskHubOperation(context.Background(), claimed.OwnerID, claimed.ID, agentOperationKey(call.CallID))
+	if err != nil || operation.Status != task.OperationSucceeded || len(operation.ResultHash) != 32 {
+		t.Fatalf("authorized command operation = %#v, err=%v", operation, err)
+	}
+}
+
+func TestCloudDSHHubTaskAuthorizationRevocationFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name                    string
+		validAuthorizationCalls int
+		dispatched              bool
+		wantResult              AgentToolResultStatus
+		wantOperation           task.OperationStatus
+	}{
+		{name: "before dispatch", validAuthorizationCalls: 1, wantResult: AgentToolFailed, wantOperation: task.OperationFailed},
+		{name: "while in flight", validAuthorizationCalls: 2, dispatched: true, wantResult: AgentToolUnknown, wantOperation: task.OperationUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			hubService, _ := newHubFixture(t)
+			target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+			_ = target.next(t, "devices")
+			broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+			fixture.executor.authorizer = &cloudDSHRevokingTaskAuthorizer{
+				authorization: claimed.Authorization, validCalls: test.validAuthorizationCalls,
+			}
+			call := ModelToolCall{
+				CallID: "call-revoked-task-auth", Name: hubTaskToolName("morde_hub_files", "i7654321", 5), Arguments: `{"path":"workspace"}`,
+			}
+			resultCh := make(chan AgentToolResult, 1)
+			errorCh := make(chan error, 1)
+			go func() {
+				value, err := broker.Execute(context.Background(), claimed, call)
+				resultCh <- value
+				errorCh <- err
+			}()
+			answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionFiles}, int64(5))
+			if test.dispatched {
+				action := target.next(t, "call")
+				target.push(t, map[string]any{"type": "result", "id": action["id"], "ok": true,
+					"body": map[string]any{"entries": []any{}, "target_grant_version": 5}})
+			}
+			result := <-resultCh
+			if err := <-errorCh; err != nil || result.Status != test.wantResult {
+				t.Fatalf("revoked Task authorization result = %#v, err=%v; want %s", result, err, test.wantResult)
+			}
+			operation, err := store.GetTaskHubOperation(context.Background(), claimed.OwnerID, claimed.ID, agentOperationKey(call.CallID))
+			if err != nil || operation.Status != test.wantOperation {
+				t.Fatalf("revoked Task authorization operation = %#v, err=%v; want %s", operation, err, test.wantOperation)
+			}
+			if !test.dispatched && target.maybeNext() != nil {
+				t.Fatal("Hub action was dispatched after Task authorization was revoked")
+			}
+			if test.dispatched && fixture.store.details.Task.Status != task.StatusWaitingUser {
+				t.Fatalf("revoked in-flight Task status = %s; want waiting_user", fixture.store.details.Task.Status)
+			}
+		})
+	}
+}
+
 func TestCloudDSHHubToolsStayHiddenUntilTargetAdvertisesGrant(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	hubService, _ := newHubFixture(t)
 	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
 	_ = target.next(t, "devices")
-	broker, _, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
 	definitions := make(chan []AgentToolDefinition, 1)
 	errors := make(chan error, 1)
 	go func() {
@@ -173,7 +400,7 @@ func TestCloudDSHHubToolsStayHiddenUntilTargetAdvertisesGrant(t *testing.T) {
 		definitions <- value
 		errors <- err
 	}()
-	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionOpen, hub.ActionNotify, hub.ActionFilePut}, nil)
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionScreenshot, hub.ActionFiles}, nil)
 	value := <-definitions
 	if err := <-errors; err != nil {
 		t.Fatalf("Definitions() error = %v", err)
@@ -185,6 +412,16 @@ func TestCloudDSHHubToolsStayHiddenUntilTargetAdvertisesGrant(t *testing.T) {
 	}
 	if _, _, _, ok := parseHubTaskToolName("morde_hub_file_put_i7654321_v1"); ok {
 		t.Fatal("file.put remained callable without an advertised server tool")
+	}
+	_, err := broker.Execute(context.Background(), claimed, ModelToolCall{
+		CallID: "call-file-put-unpublished", Name: "morde_hub_file_put_i7654321_v1",
+		Arguments: `{"workspace_id":"w1234567","path":"notes.txt","size_bytes":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+	})
+	if domain.CodeOf(err) != domain.CodeForbidden || len(store.operations) != 0 {
+		t.Fatalf("unpublished file.put dispatch err=%v, operations=%#v; want forbidden before operation creation", err, store.operations)
+	}
+	if frame := target.maybeNext(); frame != nil {
+		t.Fatalf("target received unpublished file.put action: %#v", frame)
 	}
 }
 

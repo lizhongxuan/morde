@@ -60,6 +60,9 @@ DELETE FROM account_object_versions;
 DELETE FROM account_change_counters;`); err != nil {
 		t.Fatalf("prepare legacy account sync fixture: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `DELETE FROM workspace_revision_directories WHERE directory_path='.' AND valid_from_revision=0`); err != nil {
+		t.Fatalf("prepare legacy Workspace directory fixture: %v", err)
+	}
 	if _, err := provider.DownTo(ctx, 71); err != nil {
 		t.Fatalf("prepare pre-admission schema: %v", err)
 	}

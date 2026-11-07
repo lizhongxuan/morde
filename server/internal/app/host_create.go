@@ -46,6 +46,7 @@ type HostServiceOptions struct {
 
 	Scheme            string
 	PortalURL         string
+	RuntimePortalURL  string
 	HostSuffix        string
 	TicketTTL         time.Duration
 	ReadyTimeout      time.Duration
@@ -117,10 +118,14 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 		(options.Scheme != "http" && options.Scheme != "https") || options.HostSuffix == "" || options.PortalURL == "" {
 		return nil, fmt.Errorf("host service instance, capacity, and domains are required")
 	}
-	portalURL, err := url.Parse(options.PortalURL)
-	if err != nil || portalURL.Scheme != options.Scheme || portalURL.Host == "" || portalURL.User != nil ||
+	runtimePortalURL := options.RuntimePortalURL
+	if runtimePortalURL == "" {
+		runtimePortalURL = options.PortalURL
+	}
+	portalURL, err := url.Parse(runtimePortalURL)
+	if err != nil || portalURL.Scheme != "https" || portalURL.Host == "" || portalURL.User != nil ||
 		portalURL.Path != "" || portalURL.RawQuery != "" || portalURL.Fragment != "" {
-		return nil, fmt.Errorf("host service Portal URL is invalid")
+		return nil, fmt.Errorf("host service runtime Portal URL is invalid")
 	}
 	if options.TicketTTL <= 0 || options.ReadyTimeout <= 0 || options.ReadyPollInterval <= 0 {
 		return nil, fmt.Errorf("host service durations are invalid")
@@ -149,7 +154,7 @@ func NewHostService(options HostServiceOptions) (*hostService, error) {
 		sandboxes: options.Sandboxes, volumes: options.Volumes, diskCapacity: options.DiskCapacity,
 		probe: options.Probe, runtime: options.Runtime, audit: options.Audit, createLocks: options.CreateLocks, sealer: options.Sealer,
 		templates: templates, defaultTemplateID: options.DefaultTemplateID, capacity: options.Capacity, instance: options.Instance,
-		scheme: options.Scheme, portalURL: options.PortalURL, hostSuffix: options.HostSuffix,
+		scheme: options.Scheme, portalURL: runtimePortalURL, hostSuffix: options.HostSuffix,
 		ticketTTL: options.TicketTTL, readyTimeout: options.ReadyTimeout,
 		pollInterval: options.ReadyPollInterval, notifyCreate: options.NotifyCreate,
 		observeReady: options.ObserveHostReady, countAudit: options.CountAuditFailure,

@@ -154,7 +154,7 @@ func TestPostgresExecutionStopWaitsForGuardianConfirmedAccountRuntime(t *testing
 	}
 	runtimeNonce := make([]byte, 32)
 	runtimeNonce[0] = 7
-	start := app.AccountAgentRuntimeStart{OwnerID: owner.ID, RuntimeID: "account-runtime-stop-proof", LeaseOwner: "portal-runtime-stop-proof",
+	start := app.AccountAgentRuntimeStart{OwnerID: owner.ID, ConversationID: runtimeTestConversation(t, store, owner.ID), RuntimeID: "account-runtime-stop-proof", LeaseOwner: "portal-runtime-stop-proof",
 		SupervisorNonce: runtimeNonce, MaxConcurrentTasks: 3, LeaseDuration: 30 * time.Second}
 	runtime, replayed, err := runtimeService.Start(ctx, start)
 	if err != nil || replayed || runtime.State != app.AccountAgentRuntimeStarting {
@@ -191,7 +191,7 @@ func TestPostgresExecutionStopWaitsForGuardianConfirmedAccountRuntime(t *testing
 		t.Fatalf("enabled with unconfirmed Runtime stop: %v", err)
 	}
 
-	identity, err := runtimeService.StopIdentity(ctx, owner.ID)
+	identity, err := runtimeService.StopIdentity(ctx, runtime.Fence.ConversationID)
 	if err != nil || identity.Fence != runtime.Fence || identity.NonceSHA256 != runtime.NonceSHA256 || !identity.ExpiresAt.Equal(runtime.LeaseExpiresAt) {
 		t.Fatalf("Runtime stop identity = %+v err=%v", identity, err)
 	}

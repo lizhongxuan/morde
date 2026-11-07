@@ -64,8 +64,8 @@ func TestProjectWorkItemAuthorizersRequireProjectTaskAndSavedDelivery(t *testing
 	submission.Task.Authorization.TokenID = testSessionTokenID(owner.ID)
 	submission.Message.ConversationID = conversationID
 	submission.Message.ActorID = owner.ID
-	submission.Idempotency = testIdempotency(owner.ID, "conversation.append_message", "work-auth-project-task")
-	created, err := store.AppendMessage(ctx, submission)
+	submission.Idempotency = testIdempotency(owner.ID, "task.submit", "work-auth-project-task")
+	created, err := store.SubmitTask(ctx, submission)
 	if err != nil {
 		t.Fatalf("create project Task: %v", err)
 	}

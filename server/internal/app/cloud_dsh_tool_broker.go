@@ -14,6 +14,7 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/record"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // CloudDSHToolBroker routes dsh calls through Morde's durable task gates. It does not run a model loop.
@@ -23,10 +24,14 @@ type CloudDSHToolBroker struct {
 	recordCapture  *RecordCaptureService
 	mcpCredentials MCPConnectorCredentialProvider
 	mcpClient      MCPConnectorToolClient
+	builtinSearch  MCPConnectorToolClient
 	hub            *HubService
 	personalData   *PersonalMutationService
+	personalFiles  *PersonalAttachmentService
+	workspaceTools *cloudDSHWorkspaceTools
 	personalSync   cloudDSHPersonalSnapshotReader
 	goals          *GoalService
+	schedules      *ScheduleService
 	projectContext *ProjectService
 }
 
@@ -39,6 +44,8 @@ type CloudDSHTaskCompletion struct {
 	CheckpointDigest          []byte
 	Result                    string
 	Inputs                    []ModelInput
+	StreamMessageID           string
+	StreamTurnID              string
 }
 
 func NewCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider, mcpClient MCPConnectorToolClient, hubs ...*HubService) (*CloudDSHToolBroker, error) {
@@ -58,15 +65,27 @@ func NewCloudDSHToolBrokerWithRecordCapture(store TaskStore, runtime *RuntimeToo
 // account-scoped business services used by the Portal APIs.
 func NewCloudDSHToolBrokerWithPersonalData(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider,
 	mcpClient MCPConnectorToolClient, recordCapture *RecordCaptureService, personalData *PersonalMutationService,
-	personalSync cloudDSHPersonalSnapshotReader, goals *GoalService, projectContext *ProjectService, hubs ...*HubService) (*CloudDSHToolBroker, error) {
-	if personalData == nil || personalSync == nil || goals == nil {
+	personalSync cloudDSHPersonalSnapshotReader, goals *GoalService, personalFiles *PersonalAttachmentService,
+	projectContext *ProjectService, hubs ...*HubService) (*CloudDSHToolBroker, error) {
+	return NewCloudDSHToolBrokerWithPersonalDataAndSchedules(store, runtime, mcpCredentials, mcpClient, recordCapture,
+		personalData, personalSync, goals, personalFiles, projectContext, nil, hubs...)
+}
+
+// NewCloudDSHToolBrokerWithPersonalDataAndSchedules adds the existing account-scoped
+// ScheduleService to the broker. Passing no ScheduleService keeps schedule tools unavailable.
+func NewCloudDSHToolBrokerWithPersonalDataAndSchedules(store TaskStore, runtime *RuntimeToolExecutor, mcpCredentials MCPConnectorCredentialProvider,
+	mcpClient MCPConnectorToolClient, recordCapture *RecordCaptureService, personalData *PersonalMutationService,
+	personalSync cloudDSHPersonalSnapshotReader, goals *GoalService, personalFiles *PersonalAttachmentService,
+	projectContext *ProjectService, schedules *ScheduleService, hubs ...*HubService) (*CloudDSHToolBroker, error) {
+	if personalData == nil || personalSync == nil || goals == nil || personalFiles == nil {
 		return nil, errors.New("personal Task context dependencies are required")
 	}
 	broker, err := NewCloudDSHToolBrokerWithRecordCapture(store, runtime, mcpCredentials, mcpClient, recordCapture, hubs...)
 	if err != nil {
 		return nil, err
 	}
-	broker.personalData, broker.personalSync, broker.goals = personalData, personalSync, goals
+	broker.personalData, broker.personalSync, broker.goals, broker.personalFiles = personalData, personalSync, goals, personalFiles
+	broker.schedules = schedules
 	broker.projectContext = projectContext
 	return broker, nil
 }
@@ -85,6 +104,7 @@ func newCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, record
 	broker := &CloudDSHToolBroker{
 		store: store, runtime: runtime, recordCapture: recordCapture,
 		mcpCredentials: mcpCredentials, mcpClient: mcpClient,
+		workspaceTools: newCloudDSHWorkspaceTools(runtime.workspaces),
 	}
 	if len(hubs) == 1 {
 		broker.hub = hubs[0]
@@ -98,50 +118,120 @@ func (b *CloudDSHToolBroker) currentTaskDetails(ctx context.Context, claimed tas
 		return TaskDetails{}, err
 	}
 	current := details.Task
-	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.HostID != claimed.HostID ||
-		current.ApplicationID != claimed.ApplicationID || current.ModelID != claimed.ModelID {
+	if current.HostID != claimed.HostID || current.WorkspaceID != claimed.WorkspaceID || current.ApplicationID != claimed.ApplicationID {
+		refreshed, _, routed, refreshErr := b.refreshDeferredTask(ctx, claimed)
+		if refreshErr != nil {
+			return TaskDetails{}, refreshErr
+		}
+		if routed {
+			claimed = refreshed
+			details, err = b.store.GetTask(ctx, claimed.ID, claimed.OwnerID)
+			if err != nil {
+				return TaskDetails{}, err
+			}
+			current = details.Task
+		}
+	}
+	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.InitiatorID != claimed.InitiatorID ||
+		current.ProjectID != claimed.ProjectID || current.ConversationID != claimed.ConversationID ||
+		current.HostID != claimed.HostID || current.ExecutionLocation != claimed.ExecutionLocation ||
+		current.ApplicationID != claimed.ApplicationID || current.ModelID != claimed.ModelID || current.WorkspaceID != claimed.WorkspaceID {
 		return TaskDetails{}, domain.NewError(domain.CodeInvalidState, "cloud task identity changed")
 	}
 	if current.Status == task.StatusRunning && (current.Lease.Owner != claimed.Lease.Owner ||
 		current.Lease.Version != claimed.Lease.Version || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now())) {
 		return TaskDetails{}, domain.NewError(domain.CodeInvalidState, "cloud task lease changed")
 	}
+	if current.ConversationContext == nil && claimed.ConversationContext != nil {
+		contextValue := claimed.ConversationContext
+		scope := "personal"
+		if current.ProjectID != "" {
+			scope = "project"
+		}
+		if contextValue.OwnerID != current.OwnerID || contextValue.InitiatorID != current.InitiatorID ||
+			contextValue.ProjectID != current.ProjectID || contextValue.ConversationID != current.ConversationID ||
+			contextValue.Scope != scope || !sameCloudDSHAuthorization(current.Authorization, claimed.Authorization) {
+			return TaskDetails{}, domain.NewError(domain.CodeForbidden, "cloud task conversation context authorization changed")
+		}
+		// The worker's claimed task owns the immutable conversation snapshot; GetTask omits it.
+		details.Task.ConversationContext = contextValue
+	}
 	return details, nil
 }
 
 func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task) ([]AgentToolDefinition, error) {
 	definitions := make([]AgentToolDefinition, 0)
-	if claimed.HostID != "" {
+	claimed, target, routed, err := b.refreshDeferredTask(ctx, claimed)
+	if err != nil {
+		return nil, err
+	}
+	if routed {
+		definitions = append(definitions, deferredRuntimeToolDefinitions(target, claimed.Authorization)...)
+	} else if claimed.HostID != "" {
 		hostDefinitions, err := b.runtime.Definitions(ctx, claimed)
 		if err != nil {
 			return nil, err
 		}
 		definitions = append(definitions, hostDefinitions...)
 	}
-	mcpDefinitions, err := b.mcpDefinitions(ctx, claimed)
-	if err != nil {
-		return nil, err
-	}
-	definitions = append(definitions, mcpDefinitions...)
+	selectedMCP := b.selectedMCPDefinitions(claimed)
 	if claimed.ExecutionLocation == "server" {
 		details, err := b.currentServerTask(ctx, claimed)
 		if err != nil {
 			return nil, err
+		}
+		if b.workspaceTools != nil && routed && details.Task.HostID == "" {
+			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization)...)
+		} else if b.workspaceTools != nil && cloudDSHWorkspaceToolsEligible(details.Task) {
+			definitions = append(definitions, cloudDSHWorkspaceToolDefinitions(*details.Task.WorkspaceCheckpointRevision)...)
+		}
+		if b.builtinSearch != nil && b.authorizeBuiltinSearch(ctx, details.Task) == nil {
+			definitions = append(definitions, cloudDSHBuiltinSearchDefinitions()...)
 		}
 		if b.authorizeSkillTask(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHSkillReadDefinition())
 		}
 		if b.personalData != nil && cloudDSHPersonalContextEligible(details.Task) {
 			definitions = append(definitions, cloudDSHPersonalUpdateDefinition())
+			principal, ok := cloudDSHPersonalPrincipal(details.Task)
+			if ok {
+				memoryEnabled, _, err := b.personalMemorySetting(ctx, principal)
+				if err != nil {
+					return nil, err
+				}
+				if memoryEnabled {
+					definitions = append(definitions, cloudDSHConversationHistorySearchDefinition())
+					definitions = append(definitions, cloudDSHRecentHistorySummaryDefinition())
+				}
+			}
+		}
+		if b.goals != nil && cloudDSHPersonalContextEligible(details.Task) {
+			definitions = append(definitions, cloudDSHGoalToolDefinitions()...)
+		}
+		if b.schedules != nil && cloudDSHScheduleContextEligible(details.Task) {
+			definitions = append(definitions, cloudDSHScheduleToolDefinitions()...)
+		}
+		attachments, err := b.currentTaskAttachments(ctx, details.Task)
+		if err != nil {
+			return nil, err
+		}
+		if len(attachments) > 0 {
+			definitions = append(definitions, cloudDSHTaskAttachmentReadDefinition(attachments))
 		}
 		hubDefinitions, err := b.hubTaskDefinitions(ctx, details.Task)
 		if err != nil {
 			return nil, err
 		}
 		available := maxCloudDSHToolDefinitions - len(definitions) - 1
+		if available >= len(selectedMCP) {
+			available -= len(selectedMCP)
+		}
 		if available > 0 {
 			definitions = append(definitions, hubDefinitions[:min(len(hubDefinitions), available)]...)
 		}
+	}
+	if len(definitions)+len(selectedMCP)+1 <= maxCloudDSHToolDefinitions {
+		definitions = append(definitions, selectedMCP...)
 	}
 	if len(definitions)+1 > maxCloudDSHToolDefinitions {
 		return nil, domain.NewError(domain.CodeResultTooLarge, "the task has more tools than the model can accept")
@@ -164,7 +254,9 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 // operation ledger, Host runtime, and committed Morde Workspace.
 func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, completion CloudDSHTaskCompletion) error {
 	if ctx == nil || len(completion.CheckpointDigest) != 32 || completion.CheckpointThroughSequence < 0 ||
-		len(completion.Inputs) > int(task.MaxToolCalls)*2 || len(completion.Result) > agentUserVisibleResultBytes {
+		len(completion.Inputs) > int(task.MaxToolCalls)*2 || len(completion.Result) > agentUserVisibleResultBytes ||
+		(completion.StreamMessageID == "") != (completion.StreamTurnID == "") ||
+		completion.StreamMessageID != "" && (!domain.ValidMessageID(completion.StreamMessageID) || !domain.ValidStepID(completion.StreamTurnID)) {
 		return domain.InvalidArgument("dsh_completion", "cloud dsh completion evidence is invalid")
 	}
 	inputBytes := len(completion.Result)
@@ -173,6 +265,10 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if inputBytes > 12<<20 {
 			return domain.InvalidArgument("dsh_completion", "cloud dsh completion evidence exceeds its limit")
 		}
+	}
+	claimed, _, _, err := b.refreshDeferredTask(ctx, claimed)
+	if err != nil {
+		return err
 	}
 	details, err := b.currentTaskDetails(ctx, claimed)
 	if err != nil {
@@ -194,14 +290,22 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if cloudDSHHasHostToolHistory(completion.Inputs) {
 			return domain.NewError(domain.CodeInvalidState, "hostless dsh task contains computer tool history")
 		}
-		if fileIntent != task.FileDeliveryNone {
-			return b.pauseForFileDelivery(ctx, current, details, fileIntent, false)
+		workspaceWrite, err := b.verifyHostlessWorkspaceToolHistory(ctx, current, completion.Inputs)
+		if err != nil {
+			return err
+		}
+		if fileIntent != task.FileDeliveryNone && !workspaceWrite {
+			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
+		}
+		if !workspaceWrite && HasUnverifiedFileDeliveryClaim(completion.Result) {
+			return b.pauseForUnverifiedFileClaim(ctx, current, details)
 		}
 		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
 			"Complete cloud task", "The cloud dsh session completed and its process tree stopped.")
 		if err != nil {
 			return err
 		}
+		useCloudDSHStreamResultStep(&step, details, completion)
 		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
 			map[string]any{"source": "cloud_dsh"}, "", nil)
 	}
@@ -211,11 +315,15 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		if fileIntent != task.FileDeliveryNone {
 			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
 		}
+		if HasUnverifiedFileDeliveryClaim(completion.Result) {
+			return b.pauseForUnverifiedFileClaim(ctx, current, details)
+		}
 		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
 			"Complete cloud task", "The cloud dsh session completed without producing a Workspace file.")
 		if err != nil {
 			return err
 		}
+		useCloudDSHStreamResultStep(&step, details, completion)
 		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
 			map[string]any{"source": "cloud_dsh"}, "", nil)
 	}
@@ -247,7 +355,8 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		return err
 	}
 	if verifyErr != nil || verification.Status != AgentVerified || validateAgentVerificationArtifacts(verification) != nil || len(verification.Artifacts) == 0 {
-		return b.pauseCompletion(ctx, current, step, "output_verification_pending", "Host or committed Workspace could not verify the task output.")
+		return b.pauseCompletion(ctx, current, step, "output_verification_pending",
+			safeStepSummary(verification.Summary, "Host or committed Workspace could not verify the task output."))
 	}
 	artifacts, err := prepareCloudDSHVerifiedArtifacts(details, step, verification.Artifacts)
 	if err != nil {
@@ -257,6 +366,30 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	step.Summary = safeStepSummary(verification.Summary, "Host and committed Workspace verified the task output.")
 	return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result,
 		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts)
+}
+
+func (b *CloudDSHToolBroker) pauseForUnverifiedFileClaim(ctx context.Context, current task.Task, details TaskDetails) error {
+	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepUnknown,
+		"核验文件交付", "没有可验证的文件产物，无法确认文件已保存。")
+	if err != nil {
+		return err
+	}
+	return b.pauseCompletion(ctx, current, step, "output_verification_pending", step.Summary)
+}
+
+// The final Task result may reuse a stream only when the current snapshot
+// belongs to this exact message and revision and is a prefix of the verified
+// checkpointed result. The store repeats the turn/identity check at commit.
+func useCloudDSHStreamResultStep(step *task.Step, details TaskDetails, completion CloudDSHTaskCompletion) {
+	snapshot := details.AssistantMessage
+	if completion.StreamMessageID == "" || completion.StreamTurnID == "" || snapshot == nil ||
+		snapshot.Message.ID != completion.StreamMessageID || snapshot.Message.Content == "" ||
+		(snapshot.Status != AssistantMessageStreaming && snapshot.Status != AssistantMessageInterrupted) ||
+		details.Task.CurrentRevision == nil || snapshot.TaskRevision == nil ||
+		*details.Task.CurrentRevision != *snapshot.TaskRevision || !strings.HasPrefix(completion.Result, snapshot.Message.Content) {
+		return
+	}
+	step.ID = completion.StreamTurnID
 }
 
 func prepareCloudDSHVerifiedArtifacts(details TaskDetails, step task.Step, verifiedArtifacts []AgentVerifiedArtifact) ([]task.Artifact, error) {
@@ -329,6 +462,7 @@ func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, curr
 	_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
 		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		Status: task.StatusCompleted, CurrentStep: step.ID, Result: result, Usage: usage,
+		PublishResultMessage:   strings.TrimSpace(result) != "",
 		ObservationFingerprint: observationFingerprint, Steps: []task.Step{step}, Artifacts: artifacts,
 		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
 	})
@@ -538,7 +672,8 @@ func cloudDSHHasHostToolHistory(inputs []ModelInput) bool {
 		if input.Type != "function_call" {
 			continue
 		}
-		if input.Name == agentAskUserToolName || input.Name == cloudDSHSkillReadToolName || strings.HasPrefix(input.Name, cloudDSHMCPToolPrefix) {
+		if input.Name == agentAskUserToolName || input.Name == cloudDSHSkillReadToolName || cloudDSHWorkspaceToolName(input.Name) ||
+			strings.HasPrefix(input.Name, cloudDSHMCPToolPrefix) {
 			continue
 		}
 		return true
@@ -571,8 +706,42 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if ctx == nil || call.CallID == "" || len(call.CallID) > 256 || len(call.Name) == 0 || len(call.Name) > 128 {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call", "dsh tool call identity is invalid")
 	}
+	claimed, target, routed, err := b.refreshDeferredTask(ctx, claimed)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if mapping, hostTool := runtimeToolMappingByName(call.Name); routed && hostTool && !mapping.internal {
+		if recovering && checkpointOutput != nil && claimed.HostID == "" {
+			return b.pauseDeferredTarget(ctx, claimed, "target_result_unknown")
+		}
+		arguments, parseErr := validateAgentToolArguments(call.Arguments)
+		if parseErr != nil {
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+		}
+		bound, reason, bindErr := b.bindDeferredRuntimeTarget(ctx, claimed, target, mapping, arguments)
+		if bindErr != nil {
+			return AgentToolResult{}, bindErr
+		}
+		if reason != "" {
+			return b.pauseDeferredTarget(ctx, claimed, reason)
+		}
+		claimed = bound
+	}
 	if call.Name == agentAskUserToolName {
 		return b.clarify(ctx, claimed, call, recovering)
+	}
+	if cloudDSHWorkspaceToolName(call.Name) {
+		if routed {
+			bound, resolvedCall, reason, bindErr := b.prepareDeferredWorkspaceCall(ctx, claimed, target, call, recovering, checkpointOutput)
+			if bindErr != nil {
+				return AgentToolResult{}, bindErr
+			}
+			if reason != "" {
+				return b.pauseDeferredTarget(ctx, claimed, reason)
+			}
+			claimed, call = bound, resolvedCall
+		}
+		return b.executeWorkspaceTool(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if call.Name == cloudDSHSkillReadToolName {
 		return b.executeSkillRead(ctx, claimed, call, recovering, checkpointOutput)
@@ -580,34 +749,26 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if call.Name == cloudDSHPersonalUpdateToolName {
 		return b.executePersonalUpdate(ctx, claimed, call, recovering, checkpointOutput)
 	}
+	if call.Name == cloudDSHConversationHistorySearchToolName {
+		return b.executeConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if call.Name == cloudDSHRecentHistorySummaryToolName {
+		return b.executeRecentHistorySummary(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if cloudDSHGoalScheduleToolName(call.Name) {
+		return b.executeGoalScheduleTool(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if call.Name == cloudDSHTaskAttachmentReadToolName {
+		return b.executeTaskAttachmentRead(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if call.Name == cloudDSHWebSearchToolName || call.Name == cloudDSHWebReadToolName {
+		return b.executeBuiltinSearch(ctx, claimed, call, recovering, checkpointOutput)
+	}
 	if strings.HasPrefix(call.Name, "morde_hub_") {
 		return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)
 	}
-	if b.mcpClient != nil && strings.HasPrefix(call.Name, cloudDSHMCPToolPrefix) {
-		details, err := b.currentServerTask(ctx, claimed)
-		if err != nil {
-			return AgentToolResult{}, err
-		}
-		arguments, err := validateAgentToolArguments(call.Arguments)
-		if err != nil {
-			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
-		}
-		definitions, err := b.mcpDefinitions(ctx, details.Task)
-		if err != nil {
-			return AgentToolResult{}, err
-		}
-		for _, definition := range definitions {
-			if definition.Name == call.Name && definition.RequiredScope == identity.ScopeMCPControl {
-				return b.executeMCP(ctx, details, call, arguments, definition, recovering, checkpointOutput)
-			}
-		}
-		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "MCP connector tool is not available for this task")
-	}
-	if recovering {
-		result, handled, err := b.reconcileCheckpointedCall(ctx, claimed, call, checkpointOutput)
-		if err != nil || handled {
-			return result, err
-		}
+	if call.Name == cloudDSHMCPDiscoverToolName || call.Name == cloudDSHMCPCallToolName {
+		return b.executeSelectedMCP(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	current, err := b.runtime.currentTask(ctx, claimed)
 	if err != nil {
@@ -616,6 +777,28 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	arguments, err := validateAgentToolArguments(call.Arguments)
 	if err != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+	}
+	hash, err := agentOperationHash(call.Name, arguments)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	details, err := b.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	pendingApproval := details.PendingRequest
+	if pendingApproval != nil && pendingApproval.MediaPreviewOperationID != "" {
+		if pendingApproval.CallID != call.CallID || pendingApproval.TaskID != current.ID || pendingApproval.Kind != "approval" ||
+			pendingApproval.ToolName != call.Name || !bytes.Equal(pendingApproval.RequestHash, hash[:]) {
+			return b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)
+		}
+		return b.executeApprovedTaskMediaSave(ctx, current, call, details, *pendingApproval, checkpointOutput)
+	}
+	if recovering {
+		result, handled, err := b.reconcileCheckpointedCall(ctx, claimed, call, checkpointOutput)
+		if err != nil || handled {
+			return result, err
+		}
 	}
 	definitions, err := b.Definitions(ctx, current)
 	if err != nil {
@@ -643,15 +826,6 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		Task: current, Call: call, Arguments: arguments, OperationKey: agentOperationKey(call.CallID),
 		RequiredScope: definition.RequiredScope, Fence: fence, WorkspaceID: workspaceID,
 	}
-	hash, err := agentOperationHash(call.Name, arguments)
-	if err != nil {
-		return AgentToolResult{}, err
-	}
-	details, err := b.store.GetTask(ctx, current.ID, current.OwnerID)
-	if err != nil {
-		return AgentToolResult{}, err
-	}
-	pendingApproval := details.PendingRequest
 	approvalCall := pendingApproval != nil && pendingApproval.CallID == call.CallID
 	if approvalCall && (pendingApproval.TaskID != current.ID || pendingApproval.Kind != "approval" || pendingApproval.ToolName != call.Name ||
 		!bytes.Equal(pendingApproval.RequestHash, hash[:]) ||
@@ -809,7 +983,24 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}); err != nil {
 		return AgentToolResult{}, err
 	}
-	result, executeErr := b.runtime.Execute(ctx, request, preparation)
+	var result AgentToolResult
+	var executeErr error
+	if current.ProjectID != "" && request.WorkspaceID != "" {
+		guard, ok := b.store.(projectTaskWorkspaceGuard)
+		mapping, mapped := runtimeToolMappingByName(call.Name)
+		if !ok || !mapped {
+			executeErr = domain.NewError(domain.CodeForbidden, "project Workspace authorization is unavailable")
+		} else {
+			write := mapping.capability != "file.read" && mapping.capability != "file.list" && mapping.capability != "file.find"
+			executeErr = guard.WithProjectTaskWorkspaceAccess(ctx, current, write, func(operationCtx context.Context) error {
+				var err error
+				result, err = b.runtime.Execute(operationCtx, request, preparation)
+				return err
+			})
+		}
+	} else {
+		result, executeErr = b.runtime.Execute(ctx, request, preparation)
+	}
 	if executeErr != nil || result.Status == AgentToolUnknown || len(result.Output) > maxAgentToolOutputBytes ||
 		!validCloudDSHToolImages(call.Name, result) {
 		if err := b.markUnknown(ctx, current, request.OperationKey); err != nil {
@@ -866,11 +1057,125 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	step.Status, step.Summary = stepStatus, summary
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": call.Name, "operation_key": request.OperationKey, "operation_status": operationStatus, "output": output,
+		"tool": call.Name, "operation_key": request.OperationKey, "operation_status": operationStatus,
 	}); err != nil {
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: result.Status, ExternalID: result.ExternalID, Output: output, Images: result.Images}, nil
+}
+
+func (b *CloudDSHToolBroker) executeApprovedTaskMediaSave(ctx context.Context, current task.Task, call ModelToolCall, details TaskDetails,
+	pending task.PendingRequest, checkpointOutput *string) (AgentToolResult, error) {
+	stepID := taskMediaSaveStepID(pending.MediaPreviewOperationID)
+	if stepID == "" {
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "approved Task media step identity is invalid")
+	}
+	step, exists := taskStepByID(details.Steps, stepID)
+	if exists && (step.TaskID != current.ID || step.Kind != "artifact" || step.Title != "Save generated media") {
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task media step identity conflicts with an existing step")
+	}
+	if !exists {
+		if maxStepSequence(details.Steps) == int64(^uint64(0)>>1) {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "task step sequence is exhausted")
+		}
+		step = task.Step{ID: stepID, TaskID: current.ID, Sequence: maxStepSequence(details.Steps) + 1,
+			Kind: "artifact", Status: task.StepRunning, Title: "Save generated media",
+			Summary: "Saving the result approved by the user to the Task Workspace."}
+	}
+	usage := cloneTaskUsage(current.Usage)
+	switch pending.Status {
+	case task.PendingRequestPending:
+		step.Status, step.Summary = task.StepWaitingUser, "The generated media is waiting for the user's save decision."
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", map[string]any{
+			"pending_request_id": pending.ID, "pending_request_version": pending.Version,
+		}); err != nil {
+			return AgentToolResult{}, err
+		}
+		return AgentToolResult{Status: AgentToolNeedsUser}, nil
+	case task.PendingRequestRejected:
+		if pending.Decision != task.PendingDecisionReject {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task media rejection decision is invalid")
+		}
+		output := "The user declined to save the generated media. No Workspace file was written."
+		if checkpointOutput != nil && *checkpointOutput != output {
+			return b.pauseUnknown(ctx, current, step, usage, "task-media-save:"+pending.MediaPreviewOperationID,
+				"The checkpointed media result differs from the approved Task decision.")
+		}
+		if step.Status != task.StepFailed {
+			step.Status, step.Summary = task.StepFailed, "The user declined to save the generated media."
+			if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+				"tool": call.Name, "approval_decision": "reject", "workspace_published": false,
+			}); err != nil {
+				return AgentToolResult{}, err
+			}
+		}
+		return AgentToolResult{Status: AgentToolFailed, Output: output}, nil
+	case task.PendingRequestApproved:
+		if pending.Decision != task.PendingDecisionApprove {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task media approval decision is invalid")
+		}
+	default:
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task media approval state is invalid")
+	}
+	if step.Status == task.StepFailed {
+		output := "The approved media could not be saved to the Task Workspace. Submit a new task after resolving the Workspace issue."
+		if checkpointOutput != nil && *checkpointOutput != output {
+			return b.pauseUnknown(ctx, current, step, usage, "task-media-save:"+pending.MediaPreviewOperationID,
+				"The checkpointed media result differs from the saved Task step.")
+		}
+		return AgentToolResult{Status: AgentToolFailed, Output: output}, nil
+	}
+	if step.Status != task.StepRunning && step.Status != task.StepSucceeded {
+		step.Status, step.Summary = task.StepRunning, "Saving the result approved by the user to the Task Workspace."
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+			"tool": call.Name, "phase": "workspace_publish",
+		}); err != nil {
+			return AgentToolResult{}, err
+		}
+	} else if !exists {
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+			"tool": call.Name, "phase": "workspace_publish",
+		}); err != nil {
+			return AgentToolResult{}, err
+		}
+	}
+	saved, err := b.runtime.SaveApprovedTaskMedia(ctx, current, pending, stepID)
+	if err != nil {
+		if domain.CodeOf(err) != domain.CodeWorkspaceConflict && domain.CodeOf(err) != domain.CodeQuotaExceeded {
+			return AgentToolResult{}, err
+		}
+		output := "The approved media could not be saved because the Task Workspace changed or its storage quota was reached. Submit a new task after resolving the Workspace issue."
+		if checkpointOutput != nil && *checkpointOutput != output {
+			return b.pauseUnknown(ctx, current, step, usage, "task-media-save:"+pending.MediaPreviewOperationID,
+				"The checkpointed media result differs from the failed Workspace save.")
+		}
+		step.Status, step.Summary = task.StepFailed, "The approved media could not be committed to the Task Workspace."
+		if commitErr := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+			"tool": call.Name, "workspace_published": false,
+		}); commitErr != nil {
+			return AgentToolResult{}, errors.Join(err, commitErr)
+		}
+		return AgentToolResult{Status: AgentToolFailed, Output: output}, nil
+	}
+	if workspace.ValidateRelativePath(saved.Path) != nil || saved.Revision < 0 || !taskMediaPreviewTypeAllowed(saved.MediaType) ||
+		saved.SizeBytes < 1 || !validSyncDigest(saved.SHA256) {
+		return b.pauseUnknown(ctx, current, step, usage, "task-media-save:"+pending.MediaPreviewOperationID,
+			"The committed media Artifact proof is invalid.")
+	}
+	output := fmt.Sprintf("Saved approved generated media to Workspace path %q at revision %d.", saved.Path, saved.Revision)
+	if checkpointOutput != nil && *checkpointOutput != output {
+		return b.pauseUnknown(ctx, current, step, usage, "task-media-save:"+pending.MediaPreviewOperationID,
+			"The checkpointed media result differs from the committed Workspace Artifact.")
+	}
+	if step.Status != task.StepSucceeded {
+		step.Status, step.Summary = task.StepSucceeded, "The approved generated media is committed and verified in the Task Workspace."
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+			"tool": call.Name, "workspace_path": saved.Path, "workspace_revision": saved.Revision, "media_type": saved.MediaType,
+		}); err != nil {
+			return AgentToolResult{}, err
+		}
+	}
+	return AgentToolResult{Status: AgentToolSucceeded, Output: output}, nil
 }
 
 func (b *CloudDSHToolBroker) pauseForWorkspaceInputChange(ctx context.Context, current task.Task, step task.Step, usage task.Usage, tool string) (AgentToolResult, error) {
@@ -887,6 +1192,11 @@ func (b *CloudDSHToolBroker) pauseForWorkspaceInputChange(ctx context.Context, c
 func validCloudDSHToolImages(name string, result AgentToolResult) bool {
 	if result.Status != AgentToolSucceeded {
 		return len(result.Images) == 0
+	}
+	if name == cloudDSHTaskAttachmentReadToolName {
+		return len(result.Images) <= 1 && (len(result.Images) == 0 ||
+			((result.Images[0].MediaType == "image/jpeg" || result.Images[0].MediaType == "image/png") &&
+				len(result.Images[0].Data) >= 4 && len(result.Images[0].Data) <= 512<<10))
 	}
 	if name != runtimeToolDesktopScreenshot && name != runtimeToolBrowserScreenshot {
 		return len(result.Images) == 0
@@ -1138,6 +1448,25 @@ func dshToolResultText(result AgentToolResult) string {
 // PauseRecovery moves an unresolved restored session out of the worker claim
 // queue. It records no checkpoint contents or tool arguments in the task event.
 func (b *CloudDSHToolBroker) PauseRecovery(ctx context.Context, claimed task.Task) error {
+	return b.pauseRecovery(ctx, claimed, "")
+}
+
+// PauseModelRecovery records an allowlisted model failure category without
+// persisting provider response content, request data, or credentials.
+func (b *CloudDSHToolBroker) PauseModelRecovery(ctx context.Context, claimed task.Task, category string) error {
+	switch category {
+	case "authentication_rejected", "access_rejected", "rate_limited", "quota_exhausted", "invalid_request",
+		"unavailable", "timeout", "transport", "invalid_response", "upstream_error", "usage_unknown", "unsupported",
+		"client_request_invalid", "context_length_exceeded", "provider_invalid_request", "provider_unsupported_parameter", "provider_context_length_exceeded",
+		"provider_model_not_found", "provider_permission_denied", "provider_invalid_api_key", "provider_rate_limited",
+		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch":
+	default:
+		category = "unknown"
+	}
+	return b.pauseRecovery(ctx, claimed, category)
+}
+
+func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Task, modelFailureCategory string) error {
 	if ctx == nil {
 		return domain.InvalidArgument("context", "recovery context is required")
 	}
@@ -1152,12 +1481,33 @@ func (b *CloudDSHToolBroker) PauseRecovery(ctx context.Context, claimed task.Tas
 		current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 		return nil
 	}
+	title := "Review cloud task recovery"
+	summary := "The previous cloud task checkpoint could not be reconciled safely."
+	waitingReason := "dsh_recovery_unresolved"
+	if modelFailureCategory != "" {
+		summary = "The model request could not be verified (category: " + modelFailureCategory + "); retry after checking the model connection."
+	}
+	if modelFailureCategory == "context_length_exceeded" || modelFailureCategory == "provider_context_length_exceeded" {
+		title = "消息超过模型输入上限"
+		summary = "消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。"
+		waitingReason = "model_context_limit"
+	}
+	if modelFailureCategory == "attachment_reader_unavailable" {
+		title = "当前模型无法读取附件"
+		summary = "当前模型无法读取附件，请切换到支持工具的模型，或将附件内容粘贴到对话中。"
+		waitingReason = "model_attachment_unavailable"
+	}
+	if modelFailureCategory == "stream_result_mismatch" {
+		title = "回复已中断"
+		summary = "已显示的部分回复与模型最终结果不一致，回复已中断；请重新发送消息。"
+		waitingReason = "model_stream_interrupted"
+	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepUnknown,
-		"Review cloud task recovery", "The previous cloud task checkpoint could not be reconciled safely.")
+		title, summary)
 	if err != nil {
 		return err
 	}
-	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, "dsh_recovery_unresolved", "task.waiting_user", map[string]any{
+	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, waitingReason, "task.waiting_user", map[string]any{
 		"phase": "recovery", "source": "cloud_dsh",
 	})
 }
@@ -1168,7 +1518,7 @@ func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task
 		step.Status, step.Summary = task.StepFailed, "The Host runtime reported a definitive tool failure."
 	}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": name, "operation_status": result.Status, "output": boundedToolOutput(result.Output), "reused": true,
+		"tool": name, "operation_status": result.Status, "reused": true,
 	}); err != nil {
 		return AgentToolResult{}, err
 	}

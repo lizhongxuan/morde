@@ -20,6 +20,14 @@ function createApiClient() {
 let api = createApiClient();
 const json = (method: string, body: unknown): RequestInit => ({ method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const waitForHostState = async (hostID: string, expected: string) => {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const response = await api(`/api/hosts/${hostID}`);
+    if (response.ok && (await response.json() as { state?: string }).state === expected) return;
+    await wait(100);
+  }
+  throw new Error(`Host ${hostID} did not reach ${expected}`);
+};
 let workspaceSequence = 0;
 let hostSequence = 0;
 const createWorkspace = (name: string) => api("/api/workspaces", {
@@ -39,6 +47,31 @@ beforeAll(() => server.listen());
 beforeEach(() => { resetMockState(); api = createApiClient(); workspaceSequence = 0; hostSequence = 0; });
 afterEach(() => { server.resetHandlers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 afterAll(() => server.close());
+
+describe("local MCP connector mock routes", () => {
+  it("owner-scopes connectors, checks revisions, and never returns submitted credentials", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const credential = { kind: "headers", headers: { Authorization: "Bearer mock-only-secret" } };
+    const createdResponse = await api("/api/mcp/connectors", json("POST", {
+      name: "日历工具", endpoint_url: "https://mcp.example.test/mcp", credential,
+    }));
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json() as Record<string, unknown>;
+    expect(created).toMatchObject({ name: "日历工具", enabled: false, has_credential: true, credential_version: 1, revision: 1 });
+    expect(JSON.stringify(created)).not.toContain("mock-only-secret");
+
+    const memberAPI = createApiClient();
+    await memberAPI("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect(await (await memberAPI("/api/mcp/connectors")).json()).toEqual({ items: [] });
+    const connectorID = String(created.id);
+    const enabled = await api(`/api/mcp/connectors/${connectorID}/enabled`, json("PUT", { enabled: true, expected_revision: 1 }));
+    expect(enabled.status).toBe(200);
+    expect(await enabled.json()).toMatchObject({ enabled: true, revision: 2 });
+    const stale = await api(`/api/mcp/connectors/${connectorID}/enabled`, json("PUT", { enabled: false, expected_revision: 1 }));
+    expect(stale.status).toBe(409);
+    expect((await (await api("/api/mcp/connectors")).json() as { items: unknown[] }).items).toHaveLength(1);
+  });
+});
 
 describe("portal personal-data mock reads", () => {
   it("serves an empty account snapshot, quota, changes, and metadata-only record page", async () => {
@@ -72,61 +105,119 @@ describe("portal personal-data mock reads", () => {
     const next = await api("/api/personal-data/history/import", json("POST", { ...body, target_conversation_id: responseBody.conversation_id }));
     expect(await next.json()).toMatchObject({ conversation_id: responseBody.conversation_id });
   });
-});
 
-describe("local project mock routes", () => {
-  it("shares project conversations with accepted members and replays a queued Task without dispatching a model", async () => {
+  it("writes selected rooms memories and goals with owner scope and exact idempotent retries", async () => {
+    expect((await api("/api/personal-data/memory/m_1234abcd", json("PUT", { base_revision: 0, body: { content: "Selected memory" } }))).status).toBe(401);
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const projectID = "pdem0001";
-    const createBody = { title: "本机合成对话" };
-    const createHeaders = { "content-type": "application/json", "Idempotency-Key": "project-conversation-create-1" };
-    const created = await api(`/api/projects/${projectID}/conversations`, { method: "POST", headers: createHeaders, body: JSON.stringify(createBody) });
-    const conversation = await created.json() as { id: string; owner_id: string; project_id: string; title: string };
-    expect(created.status).toBe(201);
-    expect(conversation).toMatchObject({ owner_id: "u1a2b3c4", project_id: projectID, title: "本机合成对话" });
-    const replayedCreate = await api(`/api/projects/${projectID}/conversations`, { method: "POST", headers: createHeaders, body: JSON.stringify(createBody) });
-    expect(replayedCreate.status).toBe(200);
-    expect(await replayedCreate.json()).toMatchObject({ id: conversation.id });
-    expect(await (await api(`/api/projects/${projectID}/conversations`)).json()).toMatchObject({ items: [{ id: conversation.id }] });
+    const memoryPath = "/api/personal-data/memory/m_1234abcd";
+    const memoryRequest = { base_revision: 0, body: { content: "Selected memory" } };
+    const memoryHeaders = { "content-type": "application/json", "Idempotency-Key": "legacy-rooms-memory-test-001" };
+    const memoryWrite = await api(memoryPath, { ...json("PUT", memoryRequest), headers: memoryHeaders });
+    expect(memoryWrite.status).toBe(200);
+    expect(await memoryWrite.json()).toMatchObject({ object_type: "memory", object_id: "m_1234abcd", result_revision: 1, replay: false });
+    const memoryReplay = await api(memoryPath, { ...json("PUT", memoryRequest), headers: memoryHeaders });
+    expect(await memoryReplay.json()).toMatchObject({ result_revision: 1, account_change_sequence: 1, replay: true });
+    expect((await api(memoryPath, { ...json("PUT", { ...memoryRequest, body: { content: "Different" } }), headers: memoryHeaders })).status).toBe(409);
+    expect(await (await api(memoryPath)).json()).toMatchObject({ revision: 1, body: { content: "Selected memory" } });
 
-    const prompt = { model_id: "pmodel01", content: "只返回合成任务，不调用模型或读取文件。" };
-    const appendPath = `/api/projects/${projectID}/conversations/${conversation.id}/messages`;
-    const appendHeaders = { "content-type": "application/json", "Idempotency-Key": "project-append-test-1" };
-    const first = await api(appendPath, { method: "POST", headers: appendHeaders, body: JSON.stringify(prompt) });
-    const firstResult = await first.json() as { message: { id: string; owner_id: string; actor_id: string; task_id: string }; task: { id: string; project_id: string; initiator_id: string; status: string; model_id: string } };
-    expect(first.status).toBe(202);
-    expect(firstResult).toMatchObject({
-      message: { owner_id: "u1a2b3c4", actor_id: "u1a2b3c4" },
-      task: { project_id: projectID, initiator_id: "u1a2b3c4", status: "queued", model_id: "pmodel01" },
+    const goal = {
+      id: "legacy_goal_test001",
+      body: { title: "Selected goal", description: "Imported", status: "active", steps: [{ id: "legacy_step_1", title: "First", status: "pending" }], related_material_ids: [] },
+    };
+    const goalHeaders = { "content-type": "application/json", "Idempotency-Key": "legacy-rooms-goal-test-001" };
+    const goalWrite = await api("/api/goals", { ...json("POST", goal), headers: goalHeaders });
+    expect(goalWrite.status).toBe(201);
+    expect(await goalWrite.json()).toMatchObject({ object_type: "goal", object_id: goal.id, result_revision: 1, replay: false });
+    expect(await (await api("/api/goals", { ...json("POST", goal), headers: goalHeaders })).json()).toMatchObject({ result_revision: 1, replay: true });
+    expect((await api(`/api/goals/${goal.id}`)).status).toBe(200);
+    expect(await (await api("/api/goals")).json()).toMatchObject({ items: [{ object_id: goal.id, body: { title: "Selected goal" } }] });
+    expect(await (await api("/api/sync/snapshot")).json()).toMatchObject({ watermark: 2, items: [{ object_id: "m_1234abcd" }, { object_id: goal.id }] });
+    expect(await (await api("/api/sync/changes?after_sequence=0&limit=100")).json()).toMatchObject({
+      items: [{ change_sequence: 1, object_type: "memory" }, { change_sequence: 2, object_type: "goal" }],
+      through_sequence: 2, next_after_sequence: 2, has_more: false,
     });
-    expect(firstResult.message.task_id).toBe(firstResult.task.id);
-    expect(await (await api(appendPath)).json()).toMatchObject({ items: [{ owner_id: "u1a2b3c4", actor_id: "u1a2b3c4", delivery_status: "applied" }] });
-    const replayedAppend = await api(appendPath, { method: "POST", headers: appendHeaders, body: JSON.stringify(prompt) });
-    const replayedResult = await replayedAppend.json() as typeof firstResult;
-    expect(replayedAppend.status).toBe(202);
-    expect(replayedResult.task.id).toBe(firstResult.task.id);
-    expect(replayedResult.message.id).toBe(firstResult.message.id);
-    const mismatchedReplay = await api(appendPath, { method: "POST", headers: appendHeaders, body: JSON.stringify({ ...prompt, content: "不同内容" }) });
-    expect(mismatchedReplay.status).toBe(409);
 
     const member = createApiClient();
     await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
-    expect((await member(`/api/projects/${projectID}/conversations`)).status).toBe(404);
-    await member("/api/project-invitations/rinvite1/accept", {
-      method: "POST", headers: { "Idempotency-Key": "project-member-accept-1" },
-    });
-    const shared = await member(`/api/projects/${projectID}/conversations`);
-    expect(await shared.json()).toMatchObject({ items: [{ id: conversation.id, owner_id: "u1a2b3c4" }] });
-    const memberAppend = await member(appendPath, {
-      method: "POST", headers: { ...appendHeaders, "Idempotency-Key": "project-member-append-1" }, body: JSON.stringify(prompt),
-    });
-    expect(await memberAppend.json()).toMatchObject({
-      message: { owner_id: "u1a2b3c4", actor_id: "umember1" },
-      task: { project_id: projectID, initiator_id: "umember1", status: "queued" },
-    });
-    expect(await (await member(appendPath)).json()).toMatchObject({ items: [
-      { owner_id: "u1a2b3c4", actor_id: "u1a2b3c4" }, { owner_id: "u1a2b3c4", actor_id: "umember1" },
+    expect((await member(memoryPath)).status).toBe(404);
+    expect((await member(`/api/goals/${goal.id}`)).status).toBe(404);
+    expect(await (await member("/api/goals")).json()).toEqual({ items: [], next_cursor: null });
+    expect(await (await member("/api/sync/snapshot")).json()).toEqual({ watermark: 0, items: [], next_cursor: null });
+  });
+
+  it("writes only contract-shaped legacy personal objects with scoped revision and idempotency", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const feedBody = { title: "Imported note", type: "research", body: "Plain text", created_at: "2026-11-04T00:00:00.000Z", liked: true };
+    const feedHeaders = { "content-type": "application/json", "Idempotency-Key": "legacy-feed-post-test-001" };
+    const feedPath = "/api/personal-data/feed_post/legacy_feed_post_abc123";
+    const feed = await api(feedPath, { ...json("PUT", { base_revision: 0, body: feedBody }), headers: feedHeaders });
+    expect(feed.status).toBe(200);
+    expect(await feed.json()).toMatchObject({ object_type: "feed_post", object_id: "legacy_feed_post_abc123", result_revision: 1, replay: false });
+    expect(await (await api(feedPath, { ...json("PUT", { base_revision: 0, body: feedBody }), headers: feedHeaders })).json()).toMatchObject({ replay: true });
+    expect((await api("/api/personal-data/idea_mark/train-watch", json("PUT", {
+      base_revision: 0, body: { state: "saved", session_id: "must-not-transfer" },
+    }))).status).toBe(400);
+    expect((await api("/api/personal-data/library_item/legacy_library_abc123", json("PUT", {
+      base_revision: 0, body: { name: "Index only", kind: "artifact", path: "/private/file" },
+    }))).status).toBe(400);
+
+    const libraryHeaders = { "content-type": "application/json", "Idempotency-Key": "legacy-library-test-001" };
+    const libraryPath = "/api/personal-data/library_item/legacy_library_abc123";
+    const libraryBody = { name: "Index only", kind: "artifact" };
+    expect((await api(libraryPath, { ...json("PUT", { base_revision: 0, body: libraryBody }), headers: libraryHeaders })).status).toBe(200);
+    expect(await (await api(libraryPath)).json()).toMatchObject({ object_type: "library_item", body: libraryBody });
+
+    const soulPath = "/api/personal-data/soul/legacy_soul_abc123";
+    const soulBody = { name: "nanoMuse", lang: "zh-CN", content: "Be thoughtful." };
+    expect((await api(soulPath, { ...json("PUT", { base_revision: 0, body: soulBody }), headers: { ...libraryHeaders, "Idempotency-Key": "legacy-soul-test-001" } })).status).toBe(200);
+    expect(await (await api("/api/sync/snapshot")).json()).toMatchObject({ watermark: 3, items: [
+      { object_type: "feed_post", body: feedBody }, { object_type: "library_item", body: libraryBody }, { object_type: "soul", body: soulBody },
     ] });
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(feedPath)).status).toBe(404);
+    expect((await member(libraryPath)).status).toBe(404);
+    expect(await (await member("/api/sync/snapshot")).json()).toMatchObject({ watermark: 0, items: [] });
+  });
+});
+
+describe("local project mock routes", () => {
+  it("shares project history but reconciles each sender's message only for that sender", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const projectID = "pdem0001";
+    const created = await api(`/api/projects/${projectID}/conversations`, {
+      ...json("POST", { title: "本机合成对话" }), headers: { "content-type": "application/json", "Idempotency-Key": "project-create-1" },
+    });
+    const conversation = await created.json() as { id: string };
+    const path = `/api/projects/${projectID}/conversations/${conversation.id}/messages`;
+    const headers = { "content-type": "application/json", "Idempotency-Key": "project-append-test-1",
+      "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" };
+    const body = { client_message_id: "project-append-test-1", model_id: "pmodel01", content: "只受理此消息" };
+    const first = await api(path, { ...json("POST", body), headers });
+    const receipt = await first.json() as { message: { id: string } };
+    expect(first.status).toBe(202);
+    expect(receipt).toMatchObject({ message: { owner_id: "u1a2b3c4", actor_id: "u1a2b3c4", routing_status: "pending" } });
+    expect(receipt).not.toHaveProperty("task");
+    expect(await (await api(path, { ...json("POST", body), headers })).json()).toMatchObject({ message: { id: receipt.message.id } });
+    expect((await api(path, { ...json("POST", { ...body, content: "不同内容" }), headers })).status).toBe(409);
+    expect((await api(path, { ...json("POST", body), headers: { ...headers, "X-Morde-Service-Instance-ID": "other" } })).status).toBe(409);
+
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(path)).status).toBe(404);
+    await member("/api/project-invitations/rinvite1/accept", { method: "POST", headers: { "Idempotency-Key": "project-member-accept-1" } });
+    expect(await (await member(path)).json()).toMatchObject({ items: [{ id: receipt.message.id }] });
+    expect((await member(`${path}?client_message_id=${body.client_message_id}`, { headers })).status).toBe(409);
+    const memberHeaders = { ...headers, "X-Morde-Actor-ID": "umember1" };
+    expect(await (await member(`${path}?client_message_id=${body.client_message_id}`, { headers: memberHeaders })).json()).toEqual({ items: [], next_cursor: null });
+    const memberBody = { ...body, client_message_id: "member-message-1" };
+    const wrongAccount = await member(path, { ...json("POST", memberBody), headers: { ...headers, "Idempotency-Key": memberBody.client_message_id } });
+    expect(wrongAccount.status).toBe(409);
+    expect((await (await member(path)).json()).items).toHaveLength(1);
+    const second = await member(path, { ...json("POST", memberBody), headers: { ...memberHeaders, "Idempotency-Key": memberBody.client_message_id } });
+    expect(await second.json()).toMatchObject({ message: { owner_id: "u1a2b3c4", actor_id: "umember1", routing_status: "pending" } });
+    expect((await (await member(path)).json()).items).toHaveLength(2);
   });
 
   it("keeps project access behind invitation acceptance and checks work-item versions", async () => {
@@ -160,6 +251,50 @@ describe("local project mock routes", () => {
     expect(stale.status).toBe(409);
     const resumed = await member(`/api/projects/${project.id}/work-items/jdem0001/resume`, json("POST", { expected_version: 2 }));
     expect(await resumed.json()).toMatchObject({ state: "open", blocked_reason: "", version: 3 });
+  });
+
+  it("keeps unassigned items hidden from legacy lists and uses versioned idempotent claims", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const projectID = "pdem0001";
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    const invitation = await member("/api/me/project-invitations");
+    const invitationID = (await invitation.json() as { items: Array<{ id: string }> }).items[0]!.id;
+    expect((await member(`/api/project-invitations/${invitationID}/accept`, {
+      method: "POST", headers: { "Idempotency-Key": "work-item-claim-accept-01" },
+    })).status).toBe(201);
+
+    const create = await api(`/api/projects/${projectID}/work-items`, {
+      ...json("POST", { title: "新增待认领缺陷", category: "bug", unassigned: true }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "work-item-unassigned-create-01" },
+    });
+    const item = await create.json() as { id: string; assignee_id: string | null; category: string; version: number };
+    expect(create.status).toBe(201);
+    expect(item).toMatchObject({ assignee_id: null, category: "bug", version: 1 });
+
+    const legacyList = await (await api(`/api/projects/${projectID}/work-items`)).json() as { items: Array<{ id: string }> };
+    expect(legacyList.items.some((candidate) => candidate.id === item.id)).toBe(false);
+    const v2List = await (await api(`/api/projects/${projectID}/work-items?include_unassigned=true`)).json() as { items: Array<{ id: string; assignee_id: string | null; category: string }> };
+    expect(v2List.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: item.id, assignee_id: null, category: "bug" })]));
+
+    const path = `/api/projects/${projectID}/work-items/${item.id}/claim`;
+    const ownerClaim = api(path, { ...json("POST", { expected_version: item.version }), headers: { "content-type": "application/json", "Idempotency-Key": "work-item-claim-owner-01" } });
+    const memberClaim = member(path, { ...json("POST", { expected_version: item.version }), headers: { "content-type": "application/json", "Idempotency-Key": "work-item-claim-member-01" } });
+    const claims = await Promise.all([ownerClaim, memberClaim]);
+    const winner = claims.find((response) => response.status === 200)!;
+    const loser = claims.find((response) => response.status === 409)!;
+    const claimed = await winner.clone().json() as { assignee_id: string; version: number };
+    expect(claims.map((response) => response.status).sort()).toEqual([200, 409]);
+    expect(claimed).toMatchObject({ version: 2 });
+    expect(["u1a2b3c4", "umember1"]).toContain(claimed.assignee_id);
+    expect(await loser.json()).toMatchObject({ error: { code: "conflict" } });
+
+    const winnerKey = winner === claims[0] ? "work-item-claim-owner-01" : "work-item-claim-member-01";
+    const winnerClient = winner === claims[0] ? api : member;
+    const replay = await winnerClient(path, {
+      ...json("POST", { expected_version: item.version }), headers: { "content-type": "application/json", "Idempotency-Key": winnerKey },
+    });
+    expect(await replay.json()).toMatchObject({ assignee_id: claimed.assignee_id, version: 2 });
   });
 
   it("keeps project Workspace directory reads behind both resource linkage and direct Workspace access", async () => {
@@ -318,6 +453,28 @@ describe("schedule mock routes", () => {
     const listed = await api("/api/schedules");
     expect(await listed.json()).toMatchObject({ items: [{ timing, objective: "每六小时检查一次" }] });
   });
+
+  it("creates a hostless text schedule and rejects hostless observation", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const models = await api("/api/available-models");
+    const model = (await models.json() as { items: Array<{ id: string }> }).items[0];
+    if (!model) throw new Error("mock schedule model is missing");
+    const body = {
+      host_id: null, model_id: model.id, objective: "仅文本计划", timing: { kind: "daily", starts_on: "2026-11-04", local_time: "09:00", time_zone: "UTC" },
+      budget: { active_seconds: 60, tool_calls: 2, model_tokens: 500 }, observation: null,
+    };
+
+    const created = await api("/api/schedules", {
+      ...json("POST", body), headers: { "content-type": "application/json", "Idempotency-Key": "mock-hostless-schedule-001" },
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ host_id: null, title: body.objective, objective: body.objective, status: "enabled" });
+    const rejectedObservation = await api("/api/schedules", {
+      ...json("POST", { ...body, observation: { url: "https://example.test", selector: "h1", field: "text" } }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "mock-hostless-schedule-002" },
+    });
+    expect(rejectedObservation.status).toBe(400);
+  });
 });
 
 describe("admin console mock routes", () => {
@@ -411,6 +568,94 @@ describe("admin console mock routes", () => {
     expect(auditText).not.toContain("local-test-secret");
   });
 
+  it("creates, reads, checks and owner-fences a personal model without returning its key", async () => {
+    await api("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    const secret = "private-local-test-secret";
+    const created = await api("/api/model-connections", json("POST", {
+      name: "个人模型", base_url: "https://models.example.test/v1", model_name: "private-test-model", api_key: secret, shared: false,
+    }));
+    expect(created.status).toBe(201);
+    const createdText = await created.text();
+    expect(createdText).not.toContain(secret);
+    const connection = JSON.parse(createdText) as { id: string; shared: boolean; has_api_key: boolean };
+    expect(connection).toMatchObject({ shared: false, has_api_key: true });
+
+    const listed = await api("/api/model-connections");
+    expect(await listed.json()).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ id: connection.id, shared: false })]) });
+    expect((await api(`/api/model-connections/${connection.id}`)).status).toBe(200);
+    const check = await api(`/api/model-connections/${connection.id}/check`, { method: "POST", headers: { "Idempotency-Key": "personal-model-check-001" } });
+    expect(await check.json()).toEqual({ text: true, tools: true, vision: false, text_stream: false });
+    const catalog = await api("/api/available-models");
+    expect(await catalog.json()).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ id: connection.id })]), default_model_configured: true });
+
+    const preferences = await api("/api/me/preferences", json("PUT", { assistant_name: "Morde", selected_model_id: connection.id }));
+    expect(await preferences.json()).toMatchObject({ selected_model_id: connection.id });
+
+    const ownerTask = await api("/api/tasks", {
+      ...json("POST", { model_id: connection.id, objective: "使用自己的模型" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "personal-model-task-001" },
+    });
+    expect(ownerTask.status).toBe(202);
+    expect(await ownerTask.json()).toMatchObject({ model_id: connection.id, objective: "使用自己的模型" });
+
+    const otherAccount = createApiClient();
+    await otherAccount("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    expect((await otherAccount(`/api/model-connections/${connection.id}`)).status).toBe(404);
+    expect((await otherAccount(`/api/model-connections/${connection.id}/check`, { method: "POST", headers: { "Idempotency-Key": "foreign-model-check-001" } })).status).toBe(404);
+    const otherModels = await otherAccount("/api/model-connections");
+    expect(JSON.stringify(await otherModels.json())).not.toContain(connection.id);
+    const otherCatalog = await otherAccount("/api/available-models");
+    expect(JSON.stringify(await otherCatalog.json())).not.toContain(connection.id);
+    const foreignTask = await otherAccount("/api/tasks", {
+      ...json("POST", { model_id: connection.id, objective: "不能使用其他账号的模型" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "foreign-model-task-001" },
+    });
+    expect(foreignTask.status).toBe(404);
+
+    const invalidURL = await api("/api/model-connections", json("POST", {
+      name: "不安全模型", base_url: "http://models.example.test/v1", model_name: "bad-model", api_key: secret, shared: false,
+    }));
+    expect(invalidURL.status).toBe(400);
+    expect(await (await api("/api/model-connections")).text()).not.toContain(secret);
+  });
+
+  it("sets and clears the versioned platform default using only a checked shared text-and-tools model", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const initial = await api("/api/admin/settings");
+    expect(await initial.json()).toMatchObject({ default_model: { configured: true, model_id: "pmodel01", version: 1 } });
+
+    const invalid = await api("/api/admin/settings/model-default", json("PUT", { expected_version: 1, model_id: "missing" }));
+    expect(invalid.status).toBe(400);
+    const personal = await api("/api/model-connections", json("POST", {
+      name: "个人候选", base_url: "https://private.example.test/v1", model_name: "private-test-model", api_key: "private-test-secret", shared: false,
+    }));
+    const personalID = (await personal.json() as { id: string }).id;
+    const forbiddenDefault = await api("/api/admin/settings/model-default", json("PUT", { expected_version: 1, model_id: personalID }));
+    expect(forbiddenDefault.status).toBe(400);
+    const unverifiedShared = await api("/api/model-connections", json("POST", {
+      name: "未检查共享模型", base_url: "https://unverified.example.test/v1", model_name: "unverified", api_key: "shared-test-secret", shared: true,
+    }));
+    const unverifiedID = (await unverifiedShared.json() as { id: string }).id;
+    const unverifiedDefault = await api("/api/admin/settings/model-default", json("PUT", { expected_version: 1, model_id: unverifiedID }));
+    expect(unverifiedDefault.status).toBe(400);
+    const stale = await api("/api/admin/settings/model-default", json("PUT", { expected_version: 0, model_id: "pmodel01" }));
+    expect(stale.status).toBe(409);
+
+    const selected = await api("/api/admin/settings/model-default", json("PUT", { expected_version: 1, model_id: "pmodel01" }));
+    expect(selected.status).toBe(200);
+    expect(await selected.json()).toMatchObject({ configured: true, model_id: "pmodel01", version: 2 });
+
+    const cleared = await api("/api/admin/settings/model-default", json("PUT", { expected_version: 2, model_id: "" }));
+    expect(await cleared.json()).toMatchObject({ configured: false, model_id: null, version: 3 });
+    expect(await (await api("/api/available-models")).json()).toMatchObject({ default_model_configured: false, default_model_id: null });
+    expect(await (await api("/api/admin/settings")).json()).toMatchObject({ default_model: { configured: false, model_id: null, version: 3 } });
+    const taskWithoutDefault = await api("/api/tasks", {
+      ...json("POST", { model_id: "pmodel01", objective: "使用已验证模型" }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "no-default-task-001" },
+    });
+    expect(taskWithoutDefault.status).toBe(202);
+  });
+
   it("serves only aggregate activity and explicit unavailable quality/place states", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const quality = await api("/api/admin/quality?days=30");
@@ -493,7 +738,7 @@ describe("admin console mock routes", () => {
     }))).status).toBe(403);
     expect((await api("/api/model-connections", json("POST", {
       name: "个人连接", base_url: "https://models.example.test/v1", model_name: "test-model", api_key: "local-test-secret", shared: false,
-    }))).status).toBe(403);
+    }))).status).toBe(201);
   });
 });
 
@@ -616,10 +861,11 @@ describe("portal mock cookie sessions", () => {
     expect(stale.status).toBe(409);
     expect((await stale.json()).error.code).toBe("conflict");
 
-    const unconfiguredApproval = await admin(`/api/admin/users/${user.id}`, json("PATCH", { expected_status: "pending", status: "approved" }));
-    expect(unconfiguredApproval.status).toBe(409);
-    expect((await unconfiguredApproval.json()).error.code).toBe("invalid_state");
-    expect(await (await admin(`/api/admin/users/${user.id}`)).json()).toMatchObject({ status: "pending" });
+    const unbudgetedAccount = await createApiClient()("/api/auth/register", json("POST", { name: "no-budget-user", password: "secret-pass" }));
+    const unbudgeted = (await unbudgetedAccount.json() as { user: { id: string } }).user;
+    const unconfiguredApproval = await admin(`/api/admin/users/${unbudgeted.id}`, json("PATCH", { expected_status: "pending", status: "approved" }));
+    expect(unconfiguredApproval.status).toBe(200);
+    expect(await (await admin(`/api/admin/users/${unbudgeted.id}/model-usage-budget`)).json()).toMatchObject({ configured: false });
 
     const invalidDefault = await admin("/api/admin/settings/model-budget-default", json("PUT", { expected_version: 0, token_limit: 0, max_concurrent: 101 }));
     expect(invalidDefault.status).toBe(400);
@@ -902,35 +1148,44 @@ describe("portal mock admin workspaces", () => {
 });
 
 describe("portal mock durable tasks", () => {
-  it("appends to the expected active Task and rejects a stale Task ID without creating another", async () => {
+  it("creates one independent Task per personal conversation message and replays exact retries", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
-    const submitted = await api("/api/tasks", {
-      ...json("POST", { model_id: "pmodel01", objective: "初始指令" }),
-      headers: { "content-type": "application/json", "Idempotency-Key": "task-append-submit-01" },
-    });
-    const task = await submitted.json() as { id: string; conversation_id: string };
-    expect(submitted.status).toBe(202);
-
-    const appendPath = `/api/conversations/${task.conversation_id}/messages`;
-    const appendBody = { expected_task_id: task.id, model_id: "pmodel01", content: "追加说明" };
-    const appendHeaders = { "content-type": "application/json", "Idempotency-Key": "task-append-message-01" };
-    const first = await api(appendPath, { ...json("POST", appendBody), headers: appendHeaders });
-    const result = await first.json() as { task: { id: string }; message: { id: string; task_id: string; delivery_status: string } };
+    const blocked = await api("/api/conversations", { ...json("POST", {}),
+      headers: { "content-type": "application/json", "Idempotency-Key": "conversation-create-01",
+        "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "other-account" } });
+    expect(blocked.status).toBe(409);
+    const created = await api("/api/conversations", { ...json("POST", {}),
+      headers: { "content-type": "application/json", "Idempotency-Key": "conversation-create-01",
+        "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" } });
+    const conversation = await created.json() as { id: string };
+    const path = `/api/conversations/${conversation.id}/messages`;
+    const headers = { "content-type": "application/json", "Idempotency-Key": "first-message-1",
+      "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" };
+    const body = { client_message_id: "first-message-1", mode: "new", model_id: "pmodel01", content: "第一条" };
+    const first = await api(path, { ...json("POST", body), headers });
+    const result = await first.json() as { message: { id: string; task_id: string; client_message_id: string }; task: { id: string; conversation_id: string; status: string }; replayed: boolean };
     expect(first.status).toBe(202);
-    expect(result).toMatchObject({
-      task: { id: task.id },
-      message: { task_id: task.id, content: "追加说明", delivery_status: "pending" },
-    });
-
-    const replay = await api(appendPath, { ...json("POST", appendBody), headers: appendHeaders });
-    expect(await replay.json()).toMatchObject({ task: { id: task.id }, message: { id: result.message.id } });
-    const stale = await api(appendPath, {
-      ...json("POST", { ...appendBody, expected_task_id: "q7654321" }),
-      headers: { "content-type": "application/json", "Idempotency-Key": "task-append-message-02" },
-    });
-    expect(stale.status).toBe(409);
-    expect(await stale.json()).toMatchObject({ error: { code: "conflict" } });
-    expect((await (await api(appendPath)).json()).items).toHaveLength(2);
+    expect(result).toMatchObject({ message: { client_message_id: body.client_message_id, task_id: expect.any(String), delivery_status: "applied" },
+      task: { conversation_id: conversation.id, status: "queued" }, replayed: false });
+    expect(result.message.task_id).toBe(result.task.id);
+    const replay = await api(path, { ...json("POST", body), headers });
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({ message: { id: result.message.id }, task: { id: result.task.id }, replayed: true });
+    expect((await api(path, { ...json("POST", { ...body, content: "变化" }), headers })).status).toBe(409);
+    expect((await api(path, { ...json("POST", { ...body, mode: "append" }), headers })).status).toBe(400);
+    expect((await api(path, { ...json("POST", { ...body, previous_client_message_id: body.client_message_id }), headers })).status).toBe(400);
+    expect((await api(`${path}?client_message_id=${body.client_message_id}`, { headers })).status).toBe(200);
+    const secondBody = { client_message_id: "second-message-1", mode: "new", model_id: "pmodel01", content: "第二条" };
+    const second = await api(path, { ...json("POST", secondBody), headers: { ...headers, "Idempotency-Key": secondBody.client_message_id } });
+    expect(second.status).toBe(202);
+    const secondResult = await second.json() as { message: { task_id: string }; task: { id: string } };
+    expect(secondResult.message.task_id).toBe(secondResult.task.id);
+    expect(secondResult.task.id).not.toBe(result.task.id);
+    expect((await (await api(path)).json()).items).toHaveLength(2);
+    expect((await (await api(`/api/conversations/${conversation.id}/tasks`)).json()).items).toHaveLength(2);
+    const member = createApiClient();
+    await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
+    expect((await member(path)).status).toBe(404);
   });
 
   it("persists a queued Task, replays an exact retry, and protects conversation ownership", async () => {
@@ -1293,9 +1548,9 @@ describe("portal mock workspace bindings", () => {
     const workspace = await workspaceResponse.json() as { id: string; revision: number };
     const hostResponse = await createHostRequest({ name: "stopped workspace host", workspace_ids: [] });
     const host = await hostResponse.json() as { id: string };
-    await wait(950);
+    await waitForHostState(host.id, "running");
     await api(`/api/hosts/${host.id}/release`, json("POST", { confirm_process_termination: true }));
-    await wait(950);
+    await waitForHostState(host.id, "stopped");
 
     const headers = { "content-type": "application/json", "Idempotency-Key": "stopped-host-bind-01" };
     const bound = await api(`/api/hosts/${host.id}/workspace-bindings`, {

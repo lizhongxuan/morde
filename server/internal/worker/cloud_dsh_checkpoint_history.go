@@ -19,6 +19,8 @@ type cloudDSHCheckpointHistory struct {
 	calls             map[string]*cloudDSHToolCall
 	fileWrites        map[string]struct{}
 	result            string
+	resultTurn        int64
+	completedTurn     int64
 	assistantOutputs  []cloudDSHAssistantOutput
 	bytes             int
 	restoring         bool
@@ -50,6 +52,25 @@ type cloudDSHToolCall struct {
 
 func newCloudDSHCheckpointHistory(sessionID string) *cloudDSHCheckpointHistory {
 	return &cloudDSHCheckpointHistory{sessionID: sessionID, calls: make(map[string]*cloudDSHToolCall), fileWrites: make(map[string]struct{})}
+}
+
+func (h *cloudDSHCheckpointHistory) clone() *cloudDSHCheckpointHistory {
+	clone := *h
+	clone.inputs = append([]app.ModelInput(nil), h.inputs...)
+	clone.calls = make(map[string]*cloudDSHToolCall, len(h.calls))
+	for id, call := range h.calls {
+		callCopy := *call
+		callCopy.arguments = append([]byte(nil), call.arguments...)
+		callCopy.resultImages = append([]cloudDSHImageRef(nil), call.resultImages...)
+		callCopy.runtimeImages = append([]cloudDSHImageRef(nil), call.runtimeImages...)
+		clone.calls[id] = &callCopy
+	}
+	clone.fileWrites = make(map[string]struct{}, len(h.fileWrites))
+	for id := range h.fileWrites {
+		clone.fileWrites[id] = struct{}{}
+	}
+	clone.assistantOutputs = append([]cloudDSHAssistantOutput(nil), h.assistantOutputs...)
+	return &clone
 }
 
 func (h *cloudDSHCheckpointHistory) beginRestore() { h.restoring = true }
@@ -121,8 +142,15 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 				}
 			}
 			h.lastTurnCompleted = ended.Reason.Kind == "completed"
+			h.completedTurn = 0
+			if h.lastTurnCompleted {
+				h.completedTurn = ended.Turn
+			}
 		case "turn/start":
 			h.lastTurnCompleted = false
+			h.completedTurn = 0
+			h.result = ""
+			h.resultTurn = 0
 		}
 		if h.bytes > cloudDSHCompletionInputLimit {
 			return errors.New("dsh file write history exceeds its limit")
@@ -188,6 +216,7 @@ func (h *cloudDSHCheckpointHistory) appendAssistantMessage(sequence int64, data 
 		return errors.New("dsh assistant result exceeds its limit")
 	}
 	h.result = text.String()
+	h.resultTurn = event.Turn
 	if h.result != "" {
 		h.assistantOutputs = append(h.assistantOutputs, cloudDSHAssistantOutput{sequence: sequence, text: h.result})
 	}
@@ -396,8 +425,13 @@ func (h *cloudDSHCheckpointHistory) allHistoricalCallsReconciled() bool {
 	return true
 }
 
+func (h *cloudDSHCheckpointHistory) hasCompletedResult() bool {
+	return h != nil && h.lastTurnCompleted && h.completedTurn > 0 && h.resultTurn == h.completedTurn && strings.TrimSpace(h.result) != ""
+}
+
 func (h *cloudDSHCheckpointHistory) completion(fence app.AgentInstanceFence, through int64, digest []byte) (app.CloudDSHTaskCompletion, error) {
-	if h == nil || h.sessionID != fence.AgentSessionID || h.nextSeq != through+1 || through < 0 || len(digest) != 32 || strings.TrimSpace(h.result) == "" {
+	if h == nil || h.sessionID != fence.AgentSessionID || h.nextSeq != through+1 || through < 0 || len(digest) != 32 ||
+		!h.hasCompletedResult() {
 		return app.CloudDSHTaskCompletion{}, errors.New("dsh final checkpoint does not match session history")
 	}
 	if !h.allCallsReconciled() {

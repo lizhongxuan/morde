@@ -19,8 +19,8 @@ export function AdminWorkspaces() {
     ...workspace.bindings.flatMap((binding) => [binding.host_name, binding.host_id])]
     .some((value) => value.toLocaleLowerCase().includes(normalizedFilter)));
 
-  return <section className="admin-content">
-    <div className="page-heading"><div><p className="eyebrow">存储元数据</p><h1>工作区</h1><p className="muted">只查看名称、所有者、版本、用量和电脑绑定，不展示用户文件内容。</p></div></div>
+  return <section className="admin-content design-panel">
+    <div className="design-panel-header"><div><h2>工作区列表</h2><p>查看所有者、版本、用量和电脑绑定。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>刷新数据</button></div>
     <div className="admin-list-toolbar"><label htmlFor="admin-workspace-search">搜索工作区、用户或电脑</label><input id="admin-workspace-search" type="search" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="输入名称或 ID" /></div>
     {query.isPending ? <div className="loading-card" role="status">正在加载工作区…</div>
       : query.isError && !query.data ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div>

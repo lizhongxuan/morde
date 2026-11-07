@@ -178,6 +178,40 @@ func TestTaskWorkerRetriesClaimError(t *testing.T) {
 	}
 }
 
+func TestTaskWorkerRecoversClaimPanicAndKeepsPolling(t *testing.T) {
+	store := &taskLeaseStoreStub{claimCalls: make(chan struct{}, 4)}
+	calls := 0
+	store.claimWithOwnerLimit = func(context.Context, string, time.Duration, int) (task.Task, bool, error) {
+		calls++
+		if calls == 1 {
+			panic("store panic")
+		}
+		return task.Task{}, false, nil
+	}
+	worker := newTestTaskWorker(t, store, taskExecutorFunc(func(context.Context, task.Task) error { return nil }), time.Second, time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTaskWorker(ctx, worker)
+	waitTaskWorkerSignal(t, store.claimCalls)
+	waitTaskWorkerSignal(t, store.claimCalls)
+	cancel()
+	if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled after recovering claim panic", err)
+	}
+	if calls < 2 {
+		t.Fatalf("claim calls = %d, want retry after panic", calls)
+	}
+}
+
+func TestTaskWorkerConvertsLeaseRenewalPanicToError(t *testing.T) {
+	store := &taskLeaseStoreStub{renew: func(context.Context, string, string, int64, time.Duration) (task.Task, error) {
+		panic("store panic")
+	}}
+	worker := newTestTaskWorker(t, store, taskExecutorFunc(func(context.Context, task.Task) error { return nil }), time.Second, time.Millisecond)
+	if _, err := worker.renewTaskSafely(context.Background(), "task-1", "worker-test", 1, time.Second); err == nil || err.Error() != "task lease renewal panicked" {
+		t.Fatalf("renewTaskSafely() error = %v, want recovered lease renewal panic", err)
+	}
+}
+
 func TestTaskWorkerExecutesClaimedTask(t *testing.T) {
 	store := &taskLeaseStoreStub{}
 	store.claim = func(_ context.Context, workerID string, _ time.Duration) (task.Task, bool, error) {
@@ -434,6 +468,113 @@ func TestTaskWorkerRunsTasksConcurrentlyWithinConfiguredLimit(t *testing.T) {
 	}
 }
 
+func TestTaskWorkerLeaseLossCancelsOnlyThatTasksExecution(t *testing.T) {
+	const firstID, secondID = "task-first", "task-second"
+	store := &taskLeaseStoreStub{}
+	next := 0
+	store.claimWithOwnerLimit = func(_ context.Context, workerID string, _ time.Duration, ownerLimit int) (task.Task, bool, error) {
+		if ownerLimit != 2 {
+			t.Errorf("per-owner task limit = %d, want 2", ownerLimit)
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		next++
+		if next > 2 {
+			return task.Task{}, false, nil
+		}
+		claim := validTaskClaim(workerID)
+		claim.ID = []string{firstID, secondID}[next-1]
+		claim.OwnerID, claim.ConversationID = "owner-1", "conversation-1"
+		return claim, true, nil
+	}
+	started := make(chan string, 2)
+	canceled := make(chan string, 2)
+	siblingRenewed := make(chan struct{}, 4)
+	releaseSibling := make(chan struct{})
+	store.renew = func(_ context.Context, taskID, workerID string, _ int64, _ time.Duration) (task.Task, error) {
+		if taskID == firstID {
+			return task.Task{}, errors.New("first task lease was lost")
+		}
+		if taskID != secondID {
+			return task.Task{}, fmt.Errorf("unexpected Task lease renewal %q", taskID)
+		}
+		select {
+		case siblingRenewed <- struct{}{}:
+		default:
+		}
+		claim := validTaskClaim(workerID)
+		claim.ID = secondID
+		return claim, nil
+	}
+	worker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: store, Executor: taskExecutorFunc(func(ctx context.Context, value task.Task) error {
+			started <- value.ID
+			if value.ID == firstID {
+				<-ctx.Done()
+				canceled <- value.ID
+				return ctx.Err()
+			}
+			select {
+			case <-releaseSibling:
+				return nil
+			case <-ctx.Done():
+				canceled <- value.ID
+				return ctx.Err()
+			}
+		}),
+		WorkerID: "worker-test", LeaseDuration: 90 * time.Millisecond, PollInterval: time.Millisecond,
+		MaxConcurrentTasks: 2, MaxConcurrentTasksPerOwner: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewTaskWorker() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTaskWorker(ctx, worker)
+	joined := false
+	t.Cleanup(func() {
+		cancel()
+		if !joined {
+			if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
+				t.Errorf("Run() error = %v, want context.Canceled", err)
+			}
+		}
+	})
+	seen := map[string]bool{}
+	for range 2 {
+		id := receiveTaskWorkerStart(t, started)
+		if seen[id] {
+			t.Fatalf("worker started duplicate Task %q", id)
+		}
+		seen[id] = true
+	}
+	if !seen[firstID] || !seen[secondID] {
+		t.Fatalf("worker started Tasks %v; want both Tasks from the same conversation", seen)
+	}
+	select {
+	case id := <-canceled:
+		if id != firstID {
+			t.Fatalf("lease loss canceled sibling Task %q; want only %q", id, firstID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TaskWorker did not cancel the execution that lost its lease")
+	}
+	for range 3 {
+		select {
+		case <-siblingRenewed:
+		case id := <-canceled:
+			t.Fatalf("sibling Task %q was canceled while retaining its lease", id)
+		case <-time.After(3 * time.Second):
+			t.Fatal("sibling Task did not continue renewing its own lease")
+		}
+	}
+	close(releaseSibling)
+	cancel()
+	if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	joined = true
+}
+
 func receiveTaskWorkerStart(t *testing.T, started <-chan string) string {
 	t.Helper()
 	select {
@@ -480,5 +621,19 @@ func TestTaskWorkerLifecycleFailureCancelsClaimLoops(t *testing.T) {
 	}
 	if err := worker.Run(context.Background()); !errors.Is(err, lifecycleErr) {
 		t.Fatalf("Run() error = %v, want lifecycle failure", err)
+	}
+}
+
+func TestTaskWorkerRecoversLifecyclePanic(t *testing.T) {
+	worker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: &taskLeaseStoreStub{}, Executor: taskExecutorFunc(func(context.Context, task.Task) error { return nil }),
+		WorkerID: "worker-test", LeaseDuration: time.Second, PollInterval: time.Millisecond,
+		Lifecycle: func(context.Context) error { panic("runtime panic") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Run(context.Background()); err == nil || err.Error() != "task worker lifecycle: task worker lifecycle panicked" {
+		t.Fatalf("Run() error = %v, want recovered lifecycle panic", err)
 	}
 }

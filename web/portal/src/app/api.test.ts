@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { enterHostInNewTab, portalApi } from './api';
+import { projectApi } from './project-api';
 
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -37,6 +38,19 @@ describe('typed Portal API client', () => {
     expect(await request!.json()).toEqual({ expected_version: 0, token_limit: 500_000, max_concurrent: 8 });
   });
 
+  it('sets or clears the platform default model with the settings CAS version', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ configured: false, model_id: null, version: 2 });
+    }));
+
+    await portalApi.updateAdminModelDefault({ expected_version: 1, model_id: '' });
+
+    expect([request!.method, new URL(request!.url).pathname]).toEqual(['PUT', '/api/admin/settings/model-default']);
+    expect(await request!.json()).toEqual({ expected_version: 1, model_id: '' });
+  });
+
   it('reads and updates the server-owned main conversation with stable idempotency headers', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -63,6 +77,35 @@ describe('typed Portal API client', () => {
   it('rejects an invalid main-conversation response instead of trusting its shape', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'ready', conversation_id: null, version: 1 })));
     await expect(portalApi.mainConversation()).rejects.toThrow('主会话响应格式无效');
+  });
+
+  it('fences new conversation creation to the stored account and service identities', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ id: 'c1' }, { status: 201 });
+    }));
+    await portalApi.createConversation({}, 'conversation-create-01', 'service-id', 'actor-id');
+    expect(request?.headers.get('Idempotency-Key')).toBe('conversation-create-01');
+    expect(request?.headers.get('X-Morde-Service-Instance-ID')).toBe('service-id');
+    expect(request?.headers.get('X-Morde-Actor-ID')).toBe('actor-id');
+  });
+
+  it('accepts empty 202 message-processing retries with the correct personal or project scope', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      return new Response(null, { status: 202 });
+    }));
+    await portalApi.retryConversationMessageProcessing('c1234567', 'm1234567', 'retry-key-001', 'instance-a', 'u1234567');
+    await projectApi.retryProjectConversationMessageProcessing('j1234567', 'c1234567', 'm1234567', 'retry-key-002', 'instance-a', 'u1234567');
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['POST', '/api/conversations/c1234567/messages/m1234567/retry-processing'],
+      ['POST', '/api/projects/j1234567/conversations/c1234567/messages/m1234567/retry-processing'],
+    ]);
+    expect(requests.map((request) => request.headers.get('Idempotency-Key'))).toEqual(['retry-key-001', 'retry-key-002']);
+    expect(requests.every((request) => request.headers.get('X-Morde-Actor-ID') === 'u1234567'
+      && request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a')).toBe(true);
   });
 
   it('requests server Workspace diffs and restores selected paths with an idempotency key', async () => {
@@ -174,16 +217,58 @@ describe('typed Portal API client', () => {
   });
 
   it('sends a stable idempotency key for a metered model connection check', async () => {
-    let request: Request | undefined;
+    const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      request = new Request(input, init);
-      return Response.json({ text: true, tools: false, vision: false });
+      requests.push(new Request(input, init));
+      return Response.json({ text: true, tools: false, vision: false, text_stream: false });
     }));
 
     await portalApi.checkModelConnection('p1234567', 'model-probe-key-001');
 
-    expect(new URL(request!.url).pathname).toBe('/api/model-connections/p1234567/check');
-    expect(request!.headers.get('Idempotency-Key')).toBe('model-probe-key-001');
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual(['/api/model-connections/p1234567/check', '/api/model-connections/p1234567/check']);
+    expect(requests[0]!.headers.get('Idempotency-Key')).toBe('model-probe-key-001');
+    expect(requests[1]!.headers.get('Idempotency-Key')).not.toBe(requests[0]!.headers.get('Idempotency-Key'));
+    expect(await requests[0]!.json()).toEqual({ capability: 'text' });
+    expect(await requests[1]!.json()).toEqual({ capability: 'tools' });
+  });
+
+  it('checks streaming separately with its own idempotency key', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ text: true, tools: false, vision: false, text_stream: true });
+    }));
+    await portalApi.checkModelTextStreaming('p1234567', 'stream-probe-key-001');
+    expect(request?.headers.get('Idempotency-Key')).toBe('stream-probe-key-001');
+    expect(await request?.json()).toEqual({ capability: 'text_stream' });
+  });
+
+  it('fences every chat attachment upload step and association to the same service', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init)
+        : new Request(new URL(String(input), window.location.origin), init);
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/attachments/client-attachment-1')) return new Response(null, { status: 204 });
+      if (path.endsWith('/commit')) return Response.json({ attachment_id: 'pa_test', result_revision: 2 });
+      if (path.includes('/chunks/')) return Response.json({ upload_id: 'pu_test', sequence: 0, replay: false });
+      return Response.json({ upload_id: 'pu_test', state: 'active', chunk_count: 1, replay: false });
+    }));
+    const serviceID = '00000000-0000-4000-8000-000000000001';
+    await portalApi.replacePersonalObject('library_item', 'chat-test', 0, { name: 'brief.txt', kind: 'artifact' }, 'attachment-object-1', 'u1', serviceID);
+    await portalApi.createPersonalAttachmentUpload({ object_id: 'chat-test', base_revision: 1, size_bytes: 5,
+      sha256: 'a'.repeat(64), media_type: 'text/plain' }, 'attachment-upload-1', serviceID, 'u1');
+    await portalApi.putPersonalAttachmentChunk('pu_test', 0, new Uint8Array([1, 2]).buffer, 'b'.repeat(64), serviceID, 'u1');
+    await portalApi.commitPersonalAttachment('pu_test', 'attachment-commit-1', serviceID, 'u1');
+    await portalApi.associateConversationAttachment('c1', 'm1', 'client-attachment-1', 'pa_test', serviceID, 'u1');
+    expect(requests).toHaveLength(5);
+    expect(requests.every((request) => request.headers.get('X-Morde-Service-Instance-ID') === serviceID)).toBe(true);
+    expect(requests.every((request) => request.headers.get('X-Morde-Actor-ID') === 'u1')).toBe(true);
+    expect(requests[0]?.headers.get('Idempotency-Key')).toBe('attachment-object-1');
+    expect(requests[1]?.headers.get('Idempotency-Key')).toBe('attachment-upload-1');
+    expect(requests[3]?.headers.get('Idempotency-Key')).toBe('attachment-commit-1');
+    expect(await requests[4]?.json()).toEqual({ attachment_id: 'pa_test' });
   });
 
   it('sends caller-supplied idempotency keys for approval and clarification actions', async () => {
@@ -408,15 +493,19 @@ describe('typed Portal API client', () => {
   it('uses the durable conversation and Task endpoints with stable retry keys', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push(new Request(input, init));
-      return Response.json({});
+      const request = new Request(input, init);
+      requests.push(request);
+      return Response.json({}, { status: request.method === 'POST' && new URL(request.url).pathname === '/api/conversations/c1234567/messages' ? 202 : 200 });
     }));
 
     await portalApi.capabilities();
     await portalApi.conversations();
-    await portalApi.conversationMessages('c1234567');
+    const serviceID = '00000000-0000-4000-8000-000000000001';
+    await portalApi.conversationMessages('c1234567', undefined, 'task-message-key-001', serviceID, 'u1234567');
     await portalApi.submitTask({ model_id: 'p1234567', objective: '你好' }, 'task-submit-key-001');
-    await portalApi.appendConversationMessage('c1234567', { model_id: 'p1234567', content: '继续' }, 'task-message-key-001');
+    await portalApi.acceptConversationMessage('c1234567', {
+      client_message_id: 'task-message-key-001', model_id: 'p1234567', content: '继续',
+    }, 'task-message-key-001', serviceID, 'u1234567');
     await portalApi.task('q1234567');
     await portalApi.answerTaskInput('q1234567', { clarification_id: 'k1234567', clarification_version: 2, answer: '使用默认目录' }, 'task-input-key-001');
     await portalApi.respondToTaskApproval('q1234567', 'k7654321', { version: 3, decision: 'approve' }, 'task-approval-key-001');
@@ -424,7 +513,7 @@ describe('typed Portal API client', () => {
     expect(requests.map((request) => [request.method, new URL(request.url).pathname, new URL(request.url).search])).toEqual([
       ['GET', '/api/capabilities', ''],
       ['GET', '/api/conversations', '?limit=100'],
-      ['GET', '/api/conversations/c1234567/messages', '?limit=100'],
+      ['GET', '/api/conversations/c1234567/messages', '?limit=100&client_message_id=task-message-key-001'],
       ['POST', '/api/tasks', ''],
       ['POST', '/api/conversations/c1234567/messages', ''],
       ['GET', '/api/tasks/q1234567', ''],
@@ -433,11 +522,29 @@ describe('typed Portal API client', () => {
     ]);
     expect(requests[3]?.headers.get('Idempotency-Key')).toBe('task-submit-key-001');
     expect(requests[4]?.headers.get('Idempotency-Key')).toBe('task-message-key-001');
+    expect(requests[2]?.headers.get('X-Morde-Service-Instance-ID')).toBe(serviceID);
+    expect(requests[4]?.headers.get('X-Morde-Service-Instance-ID')).toBe(serviceID);
+    expect(requests[2]?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
+    expect(requests[4]?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
     expect(requests[6]?.headers.get('Idempotency-Key')).toBe('task-input-key-001');
     expect(requests[7]?.headers.get('Idempotency-Key')).toBe('task-approval-key-001');
     expect(await requests[3]?.json()).toEqual({ model_id: 'p1234567', objective: '你好' });
-    expect(await requests[4]?.json()).toEqual({ model_id: 'p1234567', content: '继续' });
+    expect(await requests[4]?.json()).toEqual({ client_message_id: 'task-message-key-001', model_id: 'p1234567', content: '继续' });
     expect(requests.every((request) => request.credentials === 'include')).toBe(true);
+  });
+
+  it('loads every page of active tasks for a conversation', async () => {
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url);
+      requests.push(`${url.pathname}${url.search}`);
+      return Response.json(url.searchParams.has('cursor')
+        ? { items: [{ id: 'q7654321' }], next_cursor: null }
+        : { items: [{ id: 'q1234567' }], next_cursor: 'next-page' });
+    }));
+    const page = await portalApi.conversationTasks('c1234567');
+    expect(page.items.map((item) => item.id)).toEqual(['q1234567', 'q7654321']);
+    expect(requests).toEqual(['/api/conversations/c1234567/tasks?limit=100', '/api/conversations/c1234567/tasks?limit=100&cursor=next-page']);
   });
 
   it('creates a standalone workspace with an idempotency key and deletes hosts without legacy query flags', async () => {
@@ -559,5 +666,21 @@ describe('typed Portal API client', () => {
   it('accepts successful no-content responses', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
     await expect(portalApi.logout()).resolves.toBeUndefined();
+  });
+
+  it('begins MCP OAuth through the authenticated Portal endpoint without putting client secrets in the URL', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = input instanceof Request
+        ? new Request(input, init)
+        : new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      return Response.json({ kind: 'authorize', authorization_url: 'https://auth.example.test/authorize?state=opaque', redirect_uri: 'https://morde.example.test/api/mcp/oauth/callback' });
+    }));
+
+    await portalApi.beginMCPConnectorOAuth('k1234567', { expected_revision: 4, client_id: 'local-client', client_secret: 'local-client-secret' });
+
+    expect([request!.method, new URL(request!.url).pathname, new URL(request!.url).search]).toEqual(['POST', '/api/mcp/connectors/k1234567/oauth/authorize', '']);
+    expect(await request!.json()).toEqual({ expected_revision: 4, client_id: 'local-client', client_secret: 'local-client-secret' });
+    expect(request!.credentials).toBe('include');
   });
 });

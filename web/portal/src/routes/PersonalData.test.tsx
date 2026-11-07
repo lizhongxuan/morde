@@ -8,7 +8,6 @@ const { currentUser, apiMocks } = vi.hoisted(() => ({
   apiMocks: {
     snapshot: vi.fn(), changes: vi.fn(), getObject: vi.fn(), replace: vi.fn(), delete: vi.fn(), quota: vi.fn(),
     createUpload: vi.fn(), putChunk: vi.fn(), commit: vi.fn(), cancelUpload: vi.fn(), getAttachment: vi.fn(), submitTask: vi.fn(),
-    importHistory: vi.fn(),
   },
 }));
 
@@ -31,7 +30,6 @@ vi.mock('../app/api', async (importOriginal) => {
       commitPersonalAttachment: apiMocks.commit,
       cancelPersonalAttachmentUpload: apiMocks.cancelUpload,
       personalAttachment: apiMocks.getAttachment,
-      importPersonalHistory: apiMocks.importHistory,
       submitTask: apiMocks.submitTask,
     },
   };
@@ -68,6 +66,7 @@ beforeEach(() => {
     items: [], through_sequence: through ?? after, next_after_sequence: through ?? after, has_more: false,
   }));
   apiMocks.getObject.mockReset();
+  apiMocks.getObject.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }));
   apiMocks.replace.mockReset().mockResolvedValue({ result_revision: 1, account_change_sequence: 1 });
   apiMocks.delete.mockReset().mockResolvedValue({ result_revision: 1, account_change_sequence: 1 });
   apiMocks.quota.mockReset().mockResolvedValue({ used_bytes: 0, reserved_bytes: 0, quota_bytes: 1024, remaining_bytes: 1024, max_attachment_bytes: 1024 });
@@ -77,9 +76,6 @@ beforeEach(() => {
   apiMocks.cancelUpload.mockReset();
   apiMocks.getAttachment.mockReset();
   apiMocks.submitTask.mockReset();
-  apiMocks.importHistory.mockReset().mockImplementation(async (body: { target_conversation_id?: string }) => ({
-    conversation_id: body.target_conversation_id ?? 'c1234567', title: 'Imported', replay: false, messages: [],
-  }));
   localStorage.clear();
 });
 
@@ -90,6 +86,10 @@ describe('PersonalData', () => {
     const user = userEvent.setup();
     renderPage();
     expect(await screen.findByText(/同步已开启/)).toBeInTheDocument();
+    expect(screen.queryByText(/旧 nanoMuse/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('选择要导入的会话 JSON 文件')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('选择旧版 profile.json')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('选择旧版 rooms.json')).not.toBeInTheDocument();
     expect(screen.getByText('还没有个人资料。保存后会创建默认资料。')).toBeInTheDocument();
     expect(apiMocks.snapshot).toHaveBeenCalledWith(undefined, 100);
 
@@ -115,6 +115,68 @@ describe('PersonalData', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });
 
+  it('saves feed preferences from the preferences tab', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText(/同步已开启/);
+    await user.click(screen.getByRole('tab', { name: '偏好' }));
+    await user.type(screen.getByLabelText('动态偏好'), '关注人工智能');
+    await user.click(screen.getByRole('button', { name: '保存动态偏好' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
+      'feed_preferences', 'default', 0, { content: '关注人工智能' }, expect.any(String),
+    ));
+  });
+
+  it('defaults memory authorization to off and only shows the server-confirmed setting', async () => {
+    const user = userEvent.setup();
+    let confirm!: (value: { result_revision: number; account_change_sequence: number }) => void;
+    apiMocks.replace.mockImplementationOnce(() => new Promise((resolve) => { confirm = resolve; }));
+    renderPage();
+    await screen.findByText(/同步已开启/);
+    await user.click(screen.getByRole('tab', { name: '记忆' }));
+    const toggle = screen.getByRole('checkbox', { name: '允许 AI 使用个人记忆' });
+    expect(toggle).not.toBeChecked();
+    await user.click(toggle);
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
+      'skill_setting', 'builtin_memory', 0, { enabled: true }, expect.any(String),
+    ));
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toBeDisabled();
+    expect(screen.getByText('设置正在同步，服务端确认后生效。')).toBeInTheDocument();
+    confirm({ result_revision: 1, account_change_sequence: 1 });
+    await waitFor(() => expect(toggle).toBeChecked());
+  });
+
+  it('saves a personal Morde SOUL override through the owner-scoped personal-object API', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText(/同步已开启/);
+    await user.click(screen.getByRole('tab', { name: 'AI 个性' }));
+    expect(screen.getByText('当前使用系统默认的 Morde 人格。保存后会为你的个人对话创建覆盖版本。')).toBeInTheDocument();
+    await user.type(screen.getByLabelText('SOUL 内容'), '简洁回答；先检查现有信息再提问。');
+    await user.click(screen.getByRole('button', { name: '保存个人人格' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
+      'soul', 'default', 0,
+      { name: 'Morde', lang: 'zh-CN', content: '简洁回答；先检查现有信息再提问。' },
+      expect.any(String),
+    ));
+  });
+
+  it('deletes the personal SOUL override to restore the system persona', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 1,
+      items: [{ object_type: 'soul', object_id: 'default', revision: 3, body: { name: 'Morde', lang: 'zh-CN', content: 'Use short answers.' } }],
+      next_cursor: null,
+    });
+    renderPage();
+    await screen.findByText(/同步已开启/);
+    await user.click(screen.getByRole('tab', { name: 'AI 个性' }));
+    expect(screen.getByLabelText('SOUL 内容')).toHaveValue('Use short answers.');
+    await user.click(screen.getByRole('button', { name: '删除个人人格' }));
+    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith('soul', 'default', 3, expect.any(String)));
+  });
+
   it('carries an idea into Assistant route state without putting prompt text in the URL or submitting a task', async () => {
     const user = userEvent.setup();
     renderPage();
@@ -130,32 +192,4 @@ describe('PersonalData', () => {
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
   });
 
-  it('previews selected legacy text and imports only after the user confirms', async () => {
-    const user = userEvent.setup();
-    renderPage();
-    await screen.findByText(/同步已开启/);
-    const file = new File([JSON.stringify({ thread: 'main', events: [
-      { id: 'e_user01', type: 'user', text: '旧用户消息' },
-      { id: 'e_tool001', type: 'tool', summary: '本地工具数据' },
-      { id: 'e_asst01', type: 'assistant', text: '旧助手回复' },
-    ] })], 'main.json', { type: 'application/json' });
-
-    await user.upload(screen.getByLabelText('选择要导入的会话 JSON 文件'), file);
-    expect(await screen.findByText(/可导入 1 个会话、2 条文本消息/)).toBeInTheDocument();
-    expect(apiMocks.importHistory).not.toHaveBeenCalled();
-    expect(apiMocks.submitTask).not.toHaveBeenCalled();
-
-    await user.click(screen.getByRole('button', { name: '明确导入所选历史（2 条）' }));
-    await waitFor(() => expect(apiMocks.importHistory).toHaveBeenCalledTimes(1));
-    expect(apiMocks.importHistory.mock.calls[0]![0]).toMatchObject({
-      source_id: 'nanomuse-export-v1', device_account_id: 'nanomuse-local-v1',
-      source_conversation_id: 'main', title: 'main',
-      messages: [
-        { source_message_id: 'e_user01', role: 'user', content: '旧用户消息' },
-        { source_message_id: 'e_asst01', role: 'assistant', content: '旧助手回复' },
-      ],
-    });
-    expect(apiMocks.submitTask).not.toHaveBeenCalled();
-    expect(await screen.findByText(/已导入 1 个会话、2 条文本消息/)).toBeInTheDocument();
-  });
 });

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -118,7 +119,54 @@ func TestPostgresAgentCheckpointFencingAndIdempotency(t *testing.T) {
 	if _, err := service.Save(ctx, makeCommand(2, 2, "gap")); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("sequence gap = %v", err)
 	}
-	stale := makeCommand(1, 1, "stale")
+	makeTurn := func(seq int64) app.AgentCheckpointCommand {
+		payload := []byte(fmt.Sprintf(`{"header":{"id":"session-1"},"from_seq":%d,"events":[{"seq":%d,"type":"turn/start","data":{"turn":%d}}]}`, seq, seq, seq))
+		digest := sha256.Sum256(payload)
+		return app.AgentCheckpointCommand{Fence: fence, From: seq, Through: seq, Digest: digest[:], Payload: payload}
+	}
+	turn := makeTurn(1)
+	if replayed, err := service.Save(ctx, turn); err != nil || replayed {
+		t.Fatalf("start checkpoint: replayed=%t err=%v", replayed, err)
+	}
+	if replayed, err := service.Save(ctx, turn); err != nil || !replayed {
+		t.Fatalf("start checkpoint replay: replayed=%t err=%v", replayed, err)
+	}
+	if _, err := service.Save(ctx, makeTurn(2)); err != nil {
+		t.Fatal(err)
+	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || len(details.Steps) != 1 || details.Steps[0].Kind != "progress" ||
+		details.Steps[0].Title != "开始处理" || details.Steps[0].Summary != "正在处理你的请求。" {
+		t.Fatalf("persisted start step = %+v err=%v", details.Steps, err)
+	}
+	events, err := store.ListTaskEvents(ctx, owner.ID, claimed.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startEvents := 0
+	for _, event := range events {
+		if event.Type == "task.step" {
+			var payload struct {
+				Phase string `json:"phase"`
+			}
+			if json.Unmarshal(event.Payload, &payload) == nil && payload.Phase == "started" {
+				startEvents++
+			}
+		}
+	}
+	if startEvents != 1 {
+		t.Fatalf("expected one visible start event, got %d: %+v", startEvents, events)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET desired_revision=1 WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Save(ctx, makeTurn(3)); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("stale revision start accepted: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET desired_revision=0 WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	stale := makeCommand(3, 3, "stale")
 	stale.Fence.AgentGeneration++
 	if _, err := service.Save(ctx, stale); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("stale agent accepted = %v", err)
@@ -126,11 +174,11 @@ func TestPostgresAgentCheckpointFencingAndIdempotency(t *testing.T) {
 	if err := clients.Revoke(ctx, principal, principal.ClientInstallationID, "127.0.0.1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Save(ctx, makeCommand(1, 1, "after revoke")); domain.CodeOf(err) != domain.CodeUnauthenticated {
+	if _, err := service.Save(ctx, makeTurn(3)); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("revoked installation accepted = %v", err)
 	}
 	var count int
-	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_agent_checkpoints WHERE task_id=$1`, claimed.ID).Scan(&count); err != nil || count != 1 {
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_agent_checkpoints WHERE task_id=$1`, claimed.ID).Scan(&count); err != nil || count != 3 {
 		t.Fatalf("persisted checkpoint count = %d, %v", count, err)
 	}
 }
@@ -258,13 +306,17 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 	if _, err := childSessions.Get(ctx, firstLease.Fence, "session_other", childSessionID); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("unrelated Agent Session read a child Session: %v", err)
 	}
-	childPayload := []byte(fmt.Sprintf(`{"header":{"id":%q},"from_seq":0,"events":[{"seq":0,"text":"child checkpoint"}]}`, childSessionID))
+	childPayload := []byte(fmt.Sprintf(`{"header":{"id":%q},"from_seq":0,"events":[{"seq":0,"type":"turn/start","data":{"turn":1}}]}`, childSessionID))
 	childDigest := sha256.Sum256(childPayload)
 	childFence := checkpointFence(firstLease)
 	childFence.AgentSessionID, childFence.AgentRootSessionID = childSessionID, firstLease.Fence.AgentSessionID
 	if _, err := checkpoints.Save(ctx, app.AgentCheckpointCommand{Fence: childFence, From: 0, Through: 0,
 		Digest: childDigest[:], Payload: childPayload}); err != nil {
 		t.Fatalf("save child checkpoint: %v", err)
+	}
+	var rootStarts int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_revision_starts WHERE task_id=$1`, firstTask.ID).Scan(&rootStarts); err != nil || rootStarts != 0 {
+		t.Fatalf("child turn falsely recorded a root start: count=%d err=%v", rootStarts, err)
 	}
 	var rootThrough int64
 	if err := store.pool.QueryRow(ctx, `SELECT checkpoint_through_seq FROM tasks WHERE id=$1`, firstTask.ID).Scan(&rootThrough); err != nil || rootThrough != 1 {
@@ -375,8 +427,11 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 		Arguments: []byte(`{"instruction":"exceed child limit"}`), Title: "Over limit"}); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("Task accepted more than its child Agent limit: %v", err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status='cancelling' WHERE id=$1`, firstTask.ID); err != nil {
-		t.Fatal(err)
+	cancelID := mustID(t, domain.NewTaskActionID)
+	cancelRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "cancel-child-sessions", firstTask.ID, task.StatusRunning, cancelID)
+	cancelling, err := store.RequestTaskAction(ctx, cancelRecord, firstTask.ID, task.ActionCancel, task.StatusRunning, cancelID)
+	if err != nil || cancelling.Task.Status != task.StatusCancelling {
+		t.Fatalf("request parent task cancellation: task=%#v err=%v", cancelling.Task, err)
 	}
 	if _, err := instances.ConfirmStopped(ctx, stop); err != nil {
 		t.Fatalf("replay stale generation stop receipt: %v", err)

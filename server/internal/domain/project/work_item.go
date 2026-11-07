@@ -10,6 +10,18 @@ import (
 
 type WorkItemState string
 
+type WorkItemCategory string
+
+const (
+	WorkItemCategoryBug          WorkItemCategory = "bug"
+	WorkItemCategoryRequest      WorkItemCategory = "request"
+	WorkItemCategoryUnclassified WorkItemCategory = "unclassified"
+)
+
+func (category WorkItemCategory) Valid() bool {
+	return category == "" || category == WorkItemCategoryBug || category == WorkItemCategoryRequest || category == WorkItemCategoryUnclassified
+}
+
 const (
 	WorkItemOpen      WorkItemState = "open"
 	WorkItemBlocked   WorkItemState = "blocked"
@@ -28,6 +40,7 @@ type WorkItem struct {
 	Title              string
 	Description        string
 	AcceptanceCriteria []string
+	Category           WorkItemCategory
 	AssigneeID         string
 	State              WorkItemState
 	BlockedReason      string
@@ -37,9 +50,9 @@ type WorkItem struct {
 }
 
 func (item WorkItem) Validate() error {
-	if !ValidID(item.ID) || !ValidID(item.ProjectID) || !domain.ValidUserID(item.AssigneeID) ||
+	if !ValidID(item.ID) || !ValidID(item.ProjectID) || (item.AssigneeID != "" && !domain.ValidUserID(item.AssigneeID)) ||
 		!validWorkItemText(item.Title, 1, 200) || !validWorkItemText(item.Description, 0, 4096) ||
-		item.Version < 1 || !item.State.Valid() || len(item.AcceptanceCriteria) > 100 || len(item.TaskIDs) > 100 {
+		item.Version < 1 || !item.State.Valid() || !item.Category.Valid() || len(item.AcceptanceCriteria) > 100 || len(item.TaskIDs) > 100 {
 		return errors.New("project work item is invalid")
 	}
 	for _, criterion := range item.AcceptanceCriteria {

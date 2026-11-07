@@ -107,6 +107,9 @@ func newPendingApproval(current task.Task, call ModelToolCall, requestHash []byt
 		!fence.AIAllowed || fence.RuntimeGeneration < 0 || fence.RuntimeInstanceID == "" || fence.ControlVersion < 0 {
 		return nil, domain.NewError(domain.CodeInvalidState, "approval request is missing a current Host fence")
 	}
+	if _, ok := boundedApproval(approval); !ok {
+		return nil, domain.NewError(domain.CodeInvalidState, "approval request contains invalid display text")
+	}
 	id, err := domain.NewPendingRequestID()
 	if err != nil {
 		return nil, fmt.Errorf("generate pending request ID: %w", err)

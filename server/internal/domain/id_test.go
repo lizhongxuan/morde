@@ -6,6 +6,19 @@ import (
 	"testing"
 )
 
+func TestValidServiceInstanceID(t *testing.T) {
+	for _, value := range []string{"11111111-1111-4111-8111-111111111111", "7fcb32d8-776d-4a9d-bb01-8667815644e2"} {
+		if !ValidServiceInstanceID(value) {
+			t.Errorf("valid service instance id rejected: %q", value)
+		}
+	}
+	for _, value := range []string{"", "00000000-0000-0000-0000-000000000000", "11111111-1111-4111-8111-11111111111Z", "11111111_1111-4111-8111-111111111111"} {
+		if ValidServiceInstanceID(value) {
+			t.Errorf("invalid service instance id accepted: %q", value)
+		}
+	}
+}
+
 func TestIDs(t *testing.T) {
 	for _, tc := range []struct {
 		newID func() (string, error)

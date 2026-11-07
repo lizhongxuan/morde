@@ -241,24 +241,27 @@ func publicTaskEventPayload(event task.Event) (json.RawMessage, error) {
 		return json.RawMessage(event.Payload), nil
 	}
 	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return nil, err
+	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload == nil {
+		return json.RawMessage(`{}`), nil
 	}
-	detailBytes, ok := payload["detail"]
-	if !ok {
-		return json.RawMessage(event.Payload), nil
+	for _, key := range []string{"text", "tool_calls", "output"} {
+		delete(payload, key)
 	}
-	var detail map[string]json.RawMessage
-	if err := json.Unmarshal(detailBytes, &detail); err != nil {
-		return json.RawMessage(event.Payload), nil
+	if detailBytes, ok := payload["detail"]; ok {
+		var detail map[string]json.RawMessage
+		if err := json.Unmarshal(detailBytes, &detail); err != nil || detail == nil {
+			payload["detail"] = json.RawMessage(`{}`)
+		} else {
+			for _, key := range []string{"text", "tool_calls", "output"} {
+				delete(detail, key)
+			}
+			encodedDetail, err := json.Marshal(detail)
+			if err != nil {
+				return nil, err
+			}
+			payload["detail"] = encodedDetail
+		}
 	}
-	delete(detail, "text")
-	delete(detail, "tool_calls")
-	encodedDetail, err := json.Marshal(detail)
-	if err != nil {
-		return nil, err
-	}
-	payload["detail"] = encodedDetail
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err

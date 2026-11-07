@@ -118,6 +118,36 @@ func TestCloudDSHRequiresIndependentPinnedRuntimeAndGuardian(t *testing.T) {
 	}
 }
 
+func TestBuiltinSearchRequiresFixedLoopbackEndpointAndBounds(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.CloudDSH = CloudDSH{
+		Enabled: true, MaxConcurrentTasks: 4, MaxConcurrentPerOwner: 2,
+		DockerHost: "unix:///run/morde-dsh/docker.sock", Image: "morde-dsh@sha256:" + strings.Repeat("a", 64),
+		NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", SupervisorID: "dsh-supervisor-1",
+		SupervisorKeyFile: "/etc/morde/dsh-supervisor.key", GuardianSocket: "/run/morde/dsh-guardian.sock",
+		GuardianPublicKeyFile: "/etc/morde/dsh-guardian.pub",
+		BuiltinSearch: BuiltinSearch{Enabled: true, NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-search/dist/cli.js",
+			SearxngURL: "http://127.0.0.1:8189", MaxConcurrent: 4},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("valid built-in search config: %v", err)
+	}
+	for _, endpoint := range []string{"http://localhost:8189", "http://10.0.0.1:8189", "https://127.0.0.1:8189", "http://127.0.0.1:65536", "http://127.0.0.1:8189/path"} {
+		value := cfg
+		value.CloudDSH.BuiltinSearch.SearxngURL = endpoint
+		if err := value.validate(); err == nil {
+			t.Errorf("accepted unsafe search backend %q", endpoint)
+		}
+	}
+	for _, limit := range []int{0, 17} {
+		value := cfg
+		value.CloudDSH.BuiltinSearch.MaxConcurrent = limit
+		if err := value.validate(); err == nil {
+			t.Errorf("accepted invalid search concurrency %d", limit)
+		}
+	}
+}
+
 func TestWorkspaceSyncNodeRequiresPinnedImageAndSeparateRoots(t *testing.T) {
 	cfg := validConfig(t)
 	root := t.TempDir()

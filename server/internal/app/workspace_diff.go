@@ -242,6 +242,9 @@ func (s *WorkspaceSyncService) Restore(ctx context.Context, principal identity.P
 	if err != nil {
 		return WorkspaceRestoreResult{}, err
 	}
+	if value.ReadOnly {
+		return WorkspaceRestoreResult{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
+	}
 	paths, err := normalizeWorkspaceRestorePaths(command.Paths)
 	if err != nil {
 		return WorkspaceRestoreResult{}, err

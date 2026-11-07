@@ -20,7 +20,9 @@ const (
 	ActionExecutionControl             Action = "execution.control"
 	ActionHostRelease                  Action = "host.release"
 	ActionHostRestore                  Action = "host.restore"
+	ActionHostRestoreRecovery          Action = "host.restore.recovery"
 	ActionModelBudgetUpdate            Action = "model.budget.update"
+	ActionModelDefaultUpdate           Action = "model.default.update"
 	ActionModelUsageReconcile          Action = "model.usage.reconcile"
 	ActionModelConnectionCreate        Action = "model.connection.create"
 	ActionModelConnectionUpdate        Action = "model.connection.update"
@@ -78,11 +80,11 @@ const (
 func (a Action) Valid() bool {
 	switch a {
 	case ActionLogin, ActionLoginFailed, ActionLogout,
-		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter, ActionHostControl, ActionHostResourcesUpdate, ActionHostApplicationInstall, ActionHostApplicationLaunch, ActionHostApplicationStop, ActionHostMemberInvite, ActionHostMemberRevoke, ActionExecutionControl, ActionHostRelease, ActionHostRestore, ActionModelBudgetUpdate, ActionModelUsageReconcile,
+		ActionHostCreate, ActionHostDelete, ActionHostRenew, ActionHostEnter, ActionHostControl, ActionHostResourcesUpdate, ActionHostApplicationInstall, ActionHostApplicationLaunch, ActionHostApplicationStop, ActionHostMemberInvite, ActionHostMemberRevoke, ActionExecutionControl, ActionHostRelease, ActionHostRestore, ActionModelBudgetUpdate, ActionModelDefaultUpdate, ActionModelUsageReconcile,
 		ActionModelConnectionCreate, ActionModelConnectionUpdate, ActionModelConnectionDelete, ActionModelConnectionCheck,
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
 		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientScheduleGrant, ActionClientRevoke,
-		ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionAdminNudgePolicyUpdate,
+		ActionHostRestoreRecovery, ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionAdminNudgePolicyUpdate,
 		ActionAdminControlRuleCreate, ActionAdminControlRuleUpdate, ActionAdminControlRuleDelete,
 		ActionAdminControlRuleFire, ActionAdminControlEvaluate, ActionAdminControlNotifyTest, ActionMCPCall,
 		ActionRecordConsentRead, ActionRecordConsentUpdate, ActionRecordQuotaRead, ActionRecordQuotaUpdate,

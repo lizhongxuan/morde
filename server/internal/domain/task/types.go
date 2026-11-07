@@ -133,13 +133,17 @@ type Task struct {
 	ProjectID string
 	// InitiatorID is the account whose authorization and resources execute this Task.
 	// OwnerID remains the conversation owner so the historical association is stable.
-	InitiatorID                 string
-	ConversationID              string
-	HostID                      string
-	ExecutionLocation           string
-	ApplicationID               string
-	ModelID                     string
-	WorkspaceID                 string
+	InitiatorID       string
+	ConversationID    string
+	HostID            string
+	ExecutionLocation string
+	ApplicationID     string
+	ModelID           string
+	WorkspaceID       string
+	WorkspaceOwnerID  string
+
+	WorkspaceProjectResourceVersion *int64
+
 	InputRevision               *int64
 	WorkspaceCheckpointRevision *int64
 	ContextDigest               []byte
@@ -151,6 +155,8 @@ type Task struct {
 	CheckpointDigest            []byte
 	CheckpointThroughSequence   int64
 	EventSequence               int64
+	CurrentRevision             *int64
+	DesiredRevision             *int64
 	Objective                   string
 	ConversationContext         *ConversationContext
 	FileDeliveryIntent          FileDeliveryIntent
@@ -160,6 +166,10 @@ type Task struct {
 	Usage                       Usage
 	Lease                       Lease
 	CurrentStep                 string
+	// StepCount and CompletedStepCount are read projections for list summaries.
+	// Budget steps are excluded; completed counts include only succeeded steps.
+	StepCount          int64
+	CompletedStepCount int64
 	Result                      string
 	WaitingReason               string
 	CreatedAt                   time.Time
@@ -201,6 +211,19 @@ type Step struct {
 	Title     string
 	Summary   string
 	CreatedAt time.Time
+}
+
+func StepCounts(steps []Step) (total, completed int64) {
+	for _, step := range steps {
+		if step.Kind == "budget" {
+			continue
+		}
+		total++
+		if step.Status == StepSucceeded {
+			completed++
+		}
+	}
+	return total, completed
 }
 
 type Operation struct {
@@ -310,24 +333,25 @@ type ClarificationRequest struct {
 // Agent tool call and Host control fence. RequestHash is internal and omitted
 // from API responses.
 type PendingRequest struct {
-	ID                string
-	TaskID            string
-	Version           int64
-	Kind              string
-	Title             string
-	Object            string
-	Content           string
-	Impact            string
-	CallID            string
-	ToolName          string
-	RequestHash       []byte
-	RuntimeGeneration int64
-	RuntimeInstanceID string
-	ControlVersion    int64
-	Status            PendingRequestStatus
-	Decision          PendingDecision
-	CreatedAt         time.Time
-	RespondedAt       *time.Time
+	ID                      string
+	TaskID                  string
+	Version                 int64
+	Kind                    string
+	Title                   string
+	Object                  string
+	Content                 string
+	Impact                  string
+	CallID                  string
+	MediaPreviewOperationID string
+	ToolName                string
+	RequestHash             []byte
+	RuntimeGeneration       int64
+	RuntimeInstanceID       string
+	ControlVersion          int64
+	Status                  PendingRequestStatus
+	Decision                PendingDecision
+	CreatedAt               time.Time
+	RespondedAt             *time.Time
 }
 
 // StopRequest is the durable task-level request that prevents new operations

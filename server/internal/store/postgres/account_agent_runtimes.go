@@ -47,11 +47,20 @@ func (s *Store) StartAccountAgentRuntime(ctx context.Context, request app.Accoun
 		if status != string(identity.StatusApproved) {
 			return domain.NewError(domain.CodeUnauthenticated, "account runtime owner is unavailable")
 		}
+		var conversationOwner string
+		if err := tx.QueryRow(ctx, `SELECT owner_id FROM conversations WHERE id=$1 FOR SHARE`, request.ConversationID).Scan(&conversationOwner); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeUnauthenticated, "conversation Runtime is unavailable")
+		} else if err != nil {
+			return fmt.Errorf("lock conversation Runtime owner: %w", err)
+		}
+		if conversationOwner != request.OwnerID {
+			return domain.NewError(domain.CodeUnauthenticated, "conversation Runtime is unavailable")
+		}
 		serviceInstanceID, err := serviceInstanceIDInTx(ctx, tx)
 		if err != nil {
 			return err
 		}
-		current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, request.OwnerID, true)
+		current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, request.ConversationID, true)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return insertAccountAgentRuntime(ctx, tx, request, gate.epoch, serviceInstanceID, nonceSHA256, &result)
 		}
@@ -60,7 +69,7 @@ func (s *Store) StartAccountAgentRuntime(ctx context.Context, request app.Accoun
 		}
 		var leaseActive bool
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at>clock_timestamp(),false) FROM account_agent_runtimes
-WHERE service_instance_id=$1::uuid AND owner_id=$2`, serviceInstanceID, request.OwnerID).Scan(&leaseActive); err != nil {
+WHERE service_instance_id=$1::uuid AND conversation_id=$2`, serviceInstanceID, request.ConversationID).Scan(&leaseActive); err != nil {
 			return fmt.Errorf("check account Agent Runtime lease: %w", err)
 		}
 		if current.Fence.RuntimeID != request.RuntimeID || current.Fence.LeaseOwner != request.LeaseOwner ||
@@ -70,7 +79,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2`, serviceInstanceID, request.
 			if current.State == app.AccountAgentRuntimeStopped && nonceSHA256 != current.NonceSHA256 &&
 				len(current.GuardianStopAttestationDigest) == sha256.Size &&
 				current.Fence.RuntimeGeneration < math.MaxInt64 {
-				confirmed, err := accountAgentRuntimeStopConfirmed(ctx, tx, request.OwnerID)
+				confirmed, err := conversationRuntimeStopConfirmed(ctx, tx, current.Fence)
 				if err != nil {
 					return err
 				}
@@ -92,16 +101,16 @@ func insertAccountAgentRuntime(ctx context.Context, tx pgx.Tx, request app.Accou
 	serviceInstanceID, nonceSHA256 string, result *app.AccountAgentRuntime) error {
 	var createdAt, expiresAt, updatedAt time.Time
 	err := tx.QueryRow(ctx, `INSERT INTO account_agent_runtimes
-(service_instance_id,owner_id,runtime_id,runtime_generation,state,lease_owner,lease_version,execution_epoch,
- lease_expires_at,max_concurrent_tasks,supervisor_nonce_sha256)
-VALUES ($1::uuid,$2,$3,1,'starting',$4,1,$5,clock_timestamp()+($6::bigint*interval '1 millisecond'),$7,$8)
+	(service_instance_id,owner_id,runtime_id,runtime_generation,state,lease_owner,lease_version,execution_epoch,
+	 lease_expires_at,max_concurrent_tasks,supervisor_nonce_sha256,conversation_id)
+VALUES ($1::uuid,$2,$3,1,'starting',$4,1,$5,clock_timestamp()+($6::bigint*interval '1 millisecond'),$7,$8,$9)
 RETURNING lease_expires_at,control_version,updated_at,created_at`,
 		serviceInstanceID, request.OwnerID, request.RuntimeID, request.LeaseOwner, executionEpoch,
-		request.LeaseDuration.Milliseconds(), request.MaxConcurrentTasks, nonceSHA256).Scan(&expiresAt, &result.ControlVersion, &updatedAt, &createdAt)
+		request.LeaseDuration.Milliseconds(), request.MaxConcurrentTasks, nonceSHA256, request.ConversationID).Scan(&expiresAt, &result.ControlVersion, &updatedAt, &createdAt)
 	if err != nil {
 		return fmt.Errorf("create account Agent Runtime lease: %w", err)
 	}
-	result.Fence = app.AccountAgentRuntimeFence{ServiceInstanceID: serviceInstanceID, OwnerID: request.OwnerID,
+	result.Fence = app.AccountAgentRuntimeFence{ServiceInstanceID: serviceInstanceID, ConversationID: request.ConversationID, OwnerID: request.OwnerID,
 		RuntimeID: request.RuntimeID, RuntimeGeneration: 1, LeaseOwner: request.LeaseOwner, LeaseVersion: 1, ExecutionEpoch: executionEpoch}
 	result.State, result.LeaseExpiresAt, result.MaxConcurrentTasks, result.RuntimeSequence, result.UpdatedAt =
 		app.AccountAgentRuntimeStarting, expiresAt, request.MaxConcurrentTasks, 0, updatedAt
@@ -121,11 +130,11 @@ state='starting',lease_owner=$4,lease_version=1,execution_epoch=$5,
 lease_expires_at=clock_timestamp()+($6::bigint*interval '1 millisecond'),max_concurrent_tasks=$7,runtime_sequence=0,
 control_version=control_version+1,supervisor_nonce_sha256=$8,failure_reason='',guardian_stop_attestation=NULL,
 guardian_stop_attestation_digest=NULL,guardian_stop_acknowledged_at=NULL,stopped_at=NULL,updated_at=clock_timestamp()
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND state='stopped'
+WHERE service_instance_id=$1::uuid AND conversation_id=$2 AND state='stopped'
  AND guardian_stop_attestation IS NOT NULL AND guardian_stop_attestation_digest IS NOT NULL
  AND guardian_stop_acknowledged_at IS NOT NULL
 RETURNING runtime_generation,lease_expires_at,control_version,updated_at`,
-		current.Fence.ServiceInstanceID, request.OwnerID, request.RuntimeID, request.LeaseOwner, executionEpoch,
+		current.Fence.ServiceInstanceID, request.ConversationID, request.RuntimeID, request.LeaseOwner, executionEpoch,
 		request.LeaseDuration.Milliseconds(), request.MaxConcurrentTasks, nonceSHA256).
 		Scan(&generation, &expiresAt, &controlVersion, &updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -134,7 +143,7 @@ RETURNING runtime_generation,lease_expires_at,control_version,updated_at`,
 	if err != nil {
 		return fmt.Errorf("replace Guardian-stopped account Agent Runtime: %w", err)
 	}
-	result.Fence = app.AccountAgentRuntimeFence{ServiceInstanceID: current.Fence.ServiceInstanceID, OwnerID: request.OwnerID,
+	result.Fence = app.AccountAgentRuntimeFence{ServiceInstanceID: current.Fence.ServiceInstanceID, ConversationID: request.ConversationID, OwnerID: request.OwnerID,
 		RuntimeID: request.RuntimeID, RuntimeGeneration: generation, LeaseOwner: request.LeaseOwner, LeaseVersion: 1, ExecutionEpoch: executionEpoch}
 	result.State, result.LeaseExpiresAt, result.MaxConcurrentTasks = app.AccountAgentRuntimeStarting, expiresAt, request.MaxConcurrentTasks
 	result.RuntimeSequence, result.ControlVersion, result.NonceSHA256, result.UpdatedAt = 0, controlVersion, nonceSHA256, updatedAt
@@ -161,7 +170,7 @@ func (s *Store) MarkAccountAgentRuntimeReady(ctx context.Context, fence app.Acco
 		if current.State == app.AccountAgentRuntimeRunning {
 			var leaseActive bool
 			if err := tx.QueryRow(ctx, `SELECT lease_expires_at>clock_timestamp() FROM account_agent_runtimes
-WHERE service_instance_id=$1::uuid AND owner_id=$2`, fence.ServiceInstanceID, fence.OwnerID).Scan(&leaseActive); err != nil {
+WHERE service_instance_id=$1::uuid AND runtime_id=$2`, fence.ServiceInstanceID, fence.RuntimeID).Scan(&leaseActive); err != nil {
 				return fmt.Errorf("check account Agent Runtime lease: %w", err)
 			}
 			if !leaseActive {
@@ -273,9 +282,9 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 	return result, err
 }
 
-func (s *Store) GetAccountAgentRuntime(ctx context.Context, ownerID string) (app.AccountAgentRuntime, bool, error) {
-	if !domain.ValidUserID(ownerID) {
-		return app.AccountAgentRuntime{}, false, domain.InvalidArgument("owner_id", "account Runtime owner is invalid")
+func (s *Store) GetAccountAgentRuntime(ctx context.Context, conversationID string) (app.AccountAgentRuntime, bool, error) {
+	if !domain.ValidConversationID(conversationID) {
+		return app.AccountAgentRuntime{}, false, domain.InvalidArgument("conversation_id", "conversation Runtime identity is invalid")
 	}
 	var result app.AccountAgentRuntime
 	found := false
@@ -284,7 +293,7 @@ func (s *Store) GetAccountAgentRuntime(ctx context.Context, ownerID string) (app
 		if err != nil {
 			return err
 		}
-		result, err = loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, false)
+		result, err = loadAccountAgentRuntime(ctx, tx, serviceInstanceID, conversationID, false)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -297,8 +306,8 @@ func (s *Store) GetAccountAgentRuntime(ctx context.Context, ownerID string) (app
 	return result, found, err
 }
 
-func (s *Store) AccountAgentRuntimeStopIdentity(ctx context.Context, ownerID string) (app.AccountAgentRuntimeStopIdentity, error) {
-	runtime, found, err := s.GetAccountAgentRuntime(ctx, ownerID)
+func (s *Store) AccountAgentRuntimeStopIdentity(ctx context.Context, conversationID string) (app.AccountAgentRuntimeStopIdentity, error) {
+	runtime, found, err := s.GetAccountAgentRuntime(ctx, conversationID)
 	if err != nil {
 		return app.AccountAgentRuntimeStopIdentity{}, err
 	}
@@ -321,11 +330,11 @@ func (s *Store) ListAccountAgentRuntimeStopCandidates(ctx context.Context, limit
 		if err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT owner_id,runtime_id,runtime_generation,lease_owner,lease_version,execution_epoch,
+		rows, err := tx.Query(ctx, `SELECT conversation_id,owner_id,runtime_id,runtime_generation,lease_owner,lease_version,execution_epoch,
 lease_expires_at,supervisor_nonce_sha256
 FROM account_agent_runtimes
-WHERE service_instance_id=$1::uuid AND supervisor_nonce_sha256 IS NOT NULL AND lease_expires_at IS NOT NULL
- AND (state='stopping' OR (state IN ('starting','running','failed') AND lease_expires_at<=clock_timestamp()))
+WHERE service_instance_id=$1::uuid AND conversation_id IS NOT NULL AND supervisor_nonce_sha256 IS NOT NULL AND lease_expires_at IS NOT NULL
+ AND (state IN ('stopping','failed') OR (state IN ('starting','running') AND lease_expires_at<=clock_timestamp()))
 ORDER BY CASE WHEN state='stopping' THEN 0 ELSE 1 END,updated_at,owner_id LIMIT $2`, serviceInstanceID, limit)
 		if err != nil {
 			return fmt.Errorf("list account Agent Runtime stop candidates: %w", err)
@@ -333,7 +342,7 @@ ORDER BY CASE WHEN state='stopping' THEN 0 ELSE 1 END,updated_at,owner_id LIMIT 
 		defer rows.Close()
 		for rows.Next() {
 			var identity app.AccountAgentRuntimeStopIdentity
-			if err := rows.Scan(&identity.Fence.OwnerID, &identity.Fence.RuntimeID, &identity.Fence.RuntimeGeneration,
+			if err := rows.Scan(&identity.Fence.ConversationID, &identity.Fence.OwnerID, &identity.Fence.RuntimeID, &identity.Fence.RuntimeGeneration,
 				&identity.Fence.LeaseOwner, &identity.Fence.LeaseVersion, &identity.Fence.ExecutionEpoch,
 				&identity.ExpiresAt, &identity.NonceSHA256); err != nil {
 				return fmt.Errorf("read account Agent Runtime stop candidate: %w", err)
@@ -358,10 +367,6 @@ func (s *Store) RequestAccountAgentRuntimeStop(ctx context.Context, fence app.Ac
 	}
 	var result app.AccountAgentRuntime
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		gate, err := lockOwnerExecutionControl(ctx, tx, fence.OwnerID, true)
-		if err != nil {
-			return err
-		}
 		current, err := lockAccountAgentRuntime(ctx, tx, fence)
 		if err != nil {
 			return err
@@ -370,25 +375,20 @@ func (s *Store) RequestAccountAgentRuntimeStop(ctx context.Context, fence app.Ac
 			result = current
 			return nil
 		}
-		if gate.state != execution.StateStopping {
-			gate, err = transitionOwnerExecutionControl(ctx, tx, fence.OwnerID, gate, execution.StateStopping)
+		if current.State == app.AccountAgentRuntimeStarting || current.State == app.AccountAgentRuntimeRunning {
+			command, err := tx.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopping',control_version=control_version+1,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND conversation_id=$2 AND runtime_id=$3 AND runtime_generation=$4
+ AND lease_owner=$5 AND lease_version=$6 AND execution_epoch=$7 AND state IN ('starting','running')
+ AND control_version<9223372036854775807`, fence.ServiceInstanceID, fence.ConversationID, fence.RuntimeID,
+				fence.RuntimeGeneration, fence.LeaseOwner, fence.LeaseVersion, fence.ExecutionEpoch)
 			if err != nil {
-				return err
+				return fmt.Errorf("persist conversation Runtime stop intent: %w", err)
+			}
+			if command.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "conversation Runtime changed while requesting stop")
 			}
 		}
-		if err := requestOwnerAccountAgentRuntimeStop(ctx, tx, fence.OwnerID); err != nil {
-			return err
-		}
-		if err := disableOwnerSchedules(ctx, tx, fence.OwnerID); err != nil {
-			return err
-		}
-		if err := stopAllOwnerTasks(ctx, tx, fence.OwnerID); err != nil {
-			return err
-		}
-		if err := requestOwnerMCPRuntimeCancellations(ctx, tx, fence.OwnerID); err != nil {
-			return err
-		}
-		result, err = loadAccountAgentRuntime(ctx, tx, fence.ServiceInstanceID, fence.OwnerID, false)
+		result, err = loadAccountAgentRuntime(ctx, tx, fence.ServiceInstanceID, fence.ConversationID, false)
 		if err != nil {
 			return fmt.Errorf("read stopped-intent account Agent Runtime: %w", err)
 		}
@@ -423,7 +423,7 @@ func (s *Store) ConfirmAccountAgentRuntimeStopped(ctx context.Context, proof app
 		if current.State == app.AccountAgentRuntimeStopped {
 			var storedProof, storedDigest []byte
 			if err := tx.QueryRow(ctx, `SELECT guardian_stop_attestation,guardian_stop_attestation_digest FROM account_agent_runtimes
-WHERE service_instance_id=$1::uuid AND owner_id=$2`, attestation.Fence.ServiceInstanceID, attestation.Fence.OwnerID).Scan(&storedProof, &storedDigest); err != nil {
+WHERE service_instance_id=$1::uuid AND runtime_id=$2`, attestation.Fence.ServiceInstanceID, attestation.Fence.RuntimeID).Scan(&storedProof, &storedDigest); err != nil {
 				return fmt.Errorf("read stored Guardian Runtime proof: %w", err)
 			}
 			if !bytes.Equal(storedDigest, attestationHash[:]) {
@@ -438,8 +438,9 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2`, attestation.Fence.ServiceIn
 			replayed = true
 			return nil
 		}
-		if gate.state == execution.StateEnabled {
-			// A crashed Portal can recover only after this exact Runtime lease expires.
+		requiresExpiredLease := current.State != app.AccountAgentRuntimeFailed || attestation.StartAborted
+		if gate.state == execution.StateEnabled && requiresExpiredLease {
+			// Crash recovery and aborted-start recovery must wait out the exact Runtime lease.
 			var leaseExpired bool
 			err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at<=clock_timestamp(),false) FROM account_agent_runtimes
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime_generation=$4
@@ -460,7 +461,8 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 			current.State != app.AccountAgentRuntimeStopping && current.State != app.AccountAgentRuntimeFailed {
 			return domain.NewError(domain.CodeConflict, "account Runtime is not awaiting Guardian stop proof")
 		}
-		if attestation.StartAborted && (current.State != app.AccountAgentRuntimeStarting && current.State != app.AccountAgentRuntimeStopping ||
+		failedBeforeStart := current.State == app.AccountAgentRuntimeFailed && current.FailureReason == execution.RuntimeFailureStartup
+		if attestation.StartAborted && (current.State != app.AccountAgentRuntimeStarting && current.State != app.AccountAgentRuntimeStopping && !failedBeforeStart ||
 			current.RuntimeSequence != 0) {
 			return domain.NewError(domain.CodeConflict, "aborted account Runtime start has already admitted work")
 		}
@@ -531,10 +533,10 @@ func (s *Store) ListPendingAccountAgentRuntimeStopAttestations(ctx context.Conte
 		if err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT service_instance_id::text,owner_id,runtime_id,runtime_generation,lease_owner,
+		rows, err := tx.Query(ctx, `SELECT service_instance_id::text,conversation_id,owner_id,runtime_id,runtime_generation,lease_owner,
 lease_version,execution_epoch,supervisor_nonce_sha256,guardian_stop_attestation,guardian_stop_attestation_digest
 FROM account_agent_runtimes
-WHERE service_instance_id=$1::uuid AND state='stopped' AND guardian_stop_attestation IS NOT NULL
+WHERE service_instance_id=$1::uuid AND conversation_id IS NOT NULL AND state='stopped' AND guardian_stop_attestation IS NOT NULL
  AND guardian_stop_acknowledged_at IS NULL
 ORDER BY stopped_at,owner_id LIMIT $2`, serviceInstanceID, limit)
 		if err != nil {
@@ -542,10 +544,10 @@ ORDER BY stopped_at,owner_id LIMIT $2`, serviceInstanceID, limit)
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var storedServiceInstanceID, ownerID, runtimeID, leaseOwner, nonceSHA256 string
+			var storedServiceInstanceID, conversationID, ownerID, runtimeID, leaseOwner, nonceSHA256 string
 			var runtimeGeneration, leaseVersion, executionEpoch int64
 			var encoded, storedDigest []byte
-			if err := rows.Scan(&storedServiceInstanceID, &ownerID, &runtimeID, &runtimeGeneration, &leaseOwner,
+			if err := rows.Scan(&storedServiceInstanceID, &conversationID, &ownerID, &runtimeID, &runtimeGeneration, &leaseOwner,
 				&leaseVersion, &executionEpoch, &nonceSHA256, &encoded, &storedDigest); err != nil {
 				return fmt.Errorf("read pending Guardian Runtime stop acknowledgement: %w", err)
 			}
@@ -565,7 +567,7 @@ ORDER BY stopped_at,owner_id LIMIT $2`, serviceInstanceID, limit)
 			digest := sha256.Sum256(encoded)
 			if validateRuntimeStopProofForStore(attestation, encoded) != nil || !bytes.Equal(storedDigest, digest[:]) ||
 				storedServiceInstanceID != serviceInstanceID || attestation.Fence.ServiceInstanceID != serviceInstanceID ||
-				attestation.Fence.OwnerID != ownerID || attestation.Fence.RuntimeID != runtimeID ||
+				attestation.Fence.ConversationID != conversationID || attestation.Fence.OwnerID != ownerID || attestation.Fence.RuntimeID != runtimeID ||
 				attestation.Fence.RuntimeGeneration != runtimeGeneration || attestation.Fence.LeaseOwner != leaseOwner ||
 				attestation.Fence.LeaseVersion != leaseVersion || attestation.Fence.ExecutionEpoch != executionEpoch ||
 				attestation.NonceSHA256 != nonceSHA256 {
@@ -631,30 +633,19 @@ func requestOwnerAccountAgentRuntimeStop(ctx context.Context, tx pgx.Tx, ownerID
 	if err != nil {
 		return err
 	}
-	current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, true)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
+	var exhausted bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id IS NOT NULL
+ AND state IN ('starting','running') AND control_version=9223372036854775807)`, serviceInstanceID, ownerID).Scan(&exhausted); err != nil {
+		return fmt.Errorf("check conversation Runtime control versions: %w", err)
 	}
+	if exhausted {
+		return domain.NewError(domain.CodeInvalidState, "conversation Runtime control version is exhausted")
+	}
+	_, err = tx.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopping',control_version=control_version+1,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id IS NOT NULL AND state IN ('starting','running')`, serviceInstanceID, ownerID)
 	if err != nil {
-		return fmt.Errorf("lock account Agent Runtime for stop: %w", err)
-	}
-	if current.State != app.AccountAgentRuntimeStarting && current.State != app.AccountAgentRuntimeRunning {
-		return nil
-	}
-	if current.ControlVersion == math.MaxInt64 {
-		return domain.NewError(domain.CodeInvalidState, "account Runtime control version is exhausted")
-	}
-	command, err := tx.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopping',control_version=control_version+1,updated_at=clock_timestamp()
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime_generation=$4
- AND lease_owner=$5 AND lease_version=$6 AND execution_epoch=$7 AND state IN ('starting','running')
- AND control_version<9223372036854775807`, current.Fence.ServiceInstanceID, current.Fence.OwnerID,
-		current.Fence.RuntimeID, current.Fence.RuntimeGeneration, current.Fence.LeaseOwner, current.Fence.LeaseVersion,
-		current.Fence.ExecutionEpoch)
-	if err != nil {
-		return fmt.Errorf("persist account Agent Runtime stop intent: %w", err)
-	}
-	if command.RowsAffected() != 1 {
-		return domain.NewError(domain.CodeConflict, "account Runtime changed while requesting stop")
+		return fmt.Errorf("persist owner conversation Runtime stop intents: %w", err)
 	}
 	return nil
 }
@@ -674,6 +665,36 @@ func validateRuntimeStopProofForStore(attestation app.AccountAgentRuntimeStopAtt
 func isLowerHexRuntimeNonce(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && hex.EncodeToString(decoded) == value && len(decoded) == sha256.Size
+}
+
+func conversationRuntimeStopConfirmed(ctx context.Context, tx pgx.Tx, fence app.AccountAgentRuntimeFence) (bool, error) {
+	var encoded, storedDigest []byte
+	var acknowledged bool
+	err := tx.QueryRow(ctx, `SELECT guardian_stop_attestation,guardian_stop_attestation_digest,
+guardian_stop_acknowledged_at IS NOT NULL FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND conversation_id=$2 AND runtime_id=$3 AND runtime_generation=$4 AND state='stopped'`,
+		fence.ServiceInstanceID, fence.ConversationID, fence.RuntimeID, fence.RuntimeGeneration).Scan(&encoded, &storedDigest, &acknowledged)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read conversation Runtime stop proof: %w", err)
+	}
+	if !acknowledged || len(encoded) == 0 || len(encoded) > 16384 || len(storedDigest) != sha256.Size {
+		return false, nil
+	}
+	digest := sha256.Sum256(encoded)
+	if !bytes.Equal(storedDigest, digest[:]) {
+		return false, nil
+	}
+	var pendingTaskProof bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_instances
+WHERE service_instance_id=$1::uuid AND account_runtime_id=$2 AND account_runtime_generation=$3
+ AND guardian_task_stop_ack_required AND guardian_stop_acknowledged_at IS NULL)`,
+		fence.ServiceInstanceID, fence.RuntimeID, fence.RuntimeGeneration).Scan(&pendingTaskProof); err != nil {
+		return false, fmt.Errorf("check pending Task stop proofs for conversation Runtime: %w", err)
+	}
+	return !pendingTaskProof, nil
 }
 
 func accountAgentRuntimeLeaseActive(ctx context.Context, tx pgx.Tx, fence app.AccountAgentRuntimeFence) (bool, error) {
@@ -717,7 +738,15 @@ func lockCurrentAccountAgentRuntimeForTask(ctx context.Context, tx pgx.Tx, owner
 	if currentServiceID != serviceInstanceID {
 		return app.AccountAgentRuntime{}, accountAgentRuntimeFenceError()
 	}
-	current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, ownerID, true)
+	var conversationID string
+	if err := tx.QueryRow(ctx, `SELECT conversation_id FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND runtime_id=$2 AND owner_id=$3 AND conversation_id IS NOT NULL`,
+		serviceInstanceID, runtimeID, ownerID).Scan(&conversationID); errors.Is(err, pgx.ErrNoRows) {
+		return app.AccountAgentRuntime{}, accountAgentRuntimeFenceError()
+	} else if err != nil {
+		return app.AccountAgentRuntime{}, fmt.Errorf("read conversation Runtime binding: %w", err)
+	}
+	current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, conversationID, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app.AccountAgentRuntime{}, accountAgentRuntimeFenceError()
 	}
@@ -761,7 +790,7 @@ func serviceInstanceIDInTx(ctx context.Context, tx pgx.Tx) (string, error) {
 	return id, nil
 }
 
-func loadAccountAgentRuntime(ctx context.Context, tx pgx.Tx, serviceInstanceID, ownerID string, forUpdate bool) (app.AccountAgentRuntime, error) {
+func loadAccountAgentRuntime(ctx context.Context, tx pgx.Tx, serviceInstanceID, conversationID string, forUpdate bool) (app.AccountAgentRuntime, error) {
 	lock := ""
 	if forUpdate {
 		lock = " FOR UPDATE"
@@ -769,18 +798,18 @@ func loadAccountAgentRuntime(ctx context.Context, tx pgx.Tx, serviceInstanceID, 
 	var result app.AccountAgentRuntime
 	var state, failureReason string
 	var expiresAt pgtype.Timestamptz
-	err := tx.QueryRow(ctx, `SELECT runtime_id,runtime_generation,state,COALESCE(failure_reason,''),lease_owner,lease_version,execution_epoch,
+	err := tx.QueryRow(ctx, `SELECT owner_id,runtime_id,runtime_generation,state,COALESCE(failure_reason,''),lease_owner,lease_version,execution_epoch,
 lease_expires_at,max_concurrent_tasks,runtime_sequence,control_version,COALESCE(supervisor_nonce_sha256,''),
 guardian_stop_attestation_digest,updated_at
-FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`+lock, serviceInstanceID, ownerID).Scan(
-		&result.Fence.RuntimeID, &result.Fence.RuntimeGeneration, &state, &failureReason, &result.Fence.LeaseOwner,
+FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND conversation_id=$2`+lock, serviceInstanceID, conversationID).Scan(
+		&result.Fence.OwnerID, &result.Fence.RuntimeID, &result.Fence.RuntimeGeneration, &state, &failureReason, &result.Fence.LeaseOwner,
 		&result.Fence.LeaseVersion, &result.Fence.ExecutionEpoch, &expiresAt,
 		&result.MaxConcurrentTasks, &result.RuntimeSequence, &result.ControlVersion, &result.NonceSHA256,
 		&result.GuardianStopAttestationDigest, &result.UpdatedAt)
 	if err != nil {
 		return app.AccountAgentRuntime{}, err
 	}
-	result.Fence.ServiceInstanceID, result.Fence.OwnerID = serviceInstanceID, ownerID
+	result.Fence.ServiceInstanceID, result.Fence.ConversationID = serviceInstanceID, conversationID
 	if expiresAt.Valid {
 		result.LeaseExpiresAt = expiresAt.Time
 	}
@@ -797,7 +826,7 @@ func lockAccountAgentRuntime(ctx context.Context, tx pgx.Tx, fence app.AccountAg
 	if serviceInstanceID != fence.ServiceInstanceID {
 		return app.AccountAgentRuntime{}, accountAgentRuntimeFenceError()
 	}
-	current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, fence.OwnerID, true)
+	current, err := loadAccountAgentRuntime(ctx, tx, serviceInstanceID, fence.ConversationID, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app.AccountAgentRuntime{}, accountAgentRuntimeFenceError()
 	}

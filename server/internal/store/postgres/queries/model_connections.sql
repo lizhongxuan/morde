@@ -21,6 +21,9 @@ UPDATE model_connections SET
   name = sqlc.arg(name), base_url = sqlc.arg(base_url), model_name = sqlc.arg(model_name),
   api_key_cipher = sqlc.arg(api_key_cipher), capability_text = sqlc.arg(capability_text),
   capability_tools = sqlc.arg(capability_tools), capability_vision = sqlc.arg(capability_vision),
+  capability_media_image_generation = COALESCE(sqlc.narg(capability_media_image_generation), capability_media_image_generation),
+  capability_media_video_generation = COALESCE(sqlc.narg(capability_media_video_generation), capability_media_video_generation),
+  capability_media_speech_generation = COALESCE(sqlc.narg(capability_media_speech_generation), capability_media_speech_generation),
   checked_at = sqlc.narg(checked_at), updated_at = clock_timestamp()
 WHERE id = sqlc.arg(id) AND updated_at = sqlc.arg(expected_updated_at)
 RETURNING *;

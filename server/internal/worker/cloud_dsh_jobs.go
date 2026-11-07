@@ -179,7 +179,7 @@ func (e *CloudDSHExecutor) executeCloudDSHJobRead(ctx context.Context, _ task.Ta
 
 func (e *CloudDSHExecutor) cloudDSHJobOutput(ctx context.Context, fence app.AgentInstanceFence, child app.AgentChildSession,
 	state *cloudDSHSessionState, after int64) (string, int64, error) {
-	if state != nil && state.history != nil && state.through == child.CheckpointThrough {
+	if state != nil && state.history != nil && !state.history.restoring && state.history.nextSeq == child.CheckpointThrough+1 && state.through == child.CheckpointThrough {
 		return state.history.outputAfter(after, cloudDSHJobOutputMaxBytes)
 	}
 	if after >= child.CheckpointThrough {

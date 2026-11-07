@@ -117,7 +117,7 @@ VALUES ($1,2,'reports','directory_upsert',NULL)`, value.ID); err != nil {
 		t.Fatalf("Workspace restore to unknown directory metadata = %#v, err=%v", result, err)
 	}
 	page, err := store.GetWorkspaceManifestPage(ctx, value.ID, 3, "", "", 10)
-	if err != nil || len(page.Directories) != 2 || !workspace.SameDirectoryMetadata(page.Directories[0], workspace.Directory{Path: "."}) ||
+	if err != nil || len(page.Directories) != 2 || !workspace.SameDirectoryMetadata(page.Directories[0], workspace.Directory{Path: ".", MetadataKnown: true}) ||
 		!workspace.SameDirectoryMetadata(page.Directories[1], workspace.Directory{Path: "reports"}) {
 		t.Fatalf("restored directory metadata = %#v, err=%v", page.Directories, err)
 	}
@@ -253,7 +253,7 @@ func TestPostgresWorkspaceRestoreSerializesTaskFilePut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("submit Task: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2, input_revision=$3, workspace_checkpoint_revision=$3
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2, workspace_owner_id=$4, input_revision=$3, workspace_checkpoint_revision=$3
 WHERE id=$1 AND owner_id=$4`, created.Task.ID, workspaceValue.ID, workspaceValue.Revision, owner.ID); err != nil {
 		t.Fatalf("attach Task to Workspace checkpoint: %v", err)
 	}

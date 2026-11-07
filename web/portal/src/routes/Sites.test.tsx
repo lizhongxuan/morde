@@ -15,7 +15,7 @@ type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type Workspace = Awaited<ReturnType<typeof portalApi.workspaces>>['items'][number];
 
 const workspace: Workspace = {
-  id: 'w1234567', name: '博客项目', revision: 4, used_bytes: 2048, quota_bytes: 1024 * 1024, state: 'ready', created_at: timestamp, updated_at: timestamp,
+  id: 'w1234567', name: '博客项目', revision: 4, used_bytes: 2048, quota_bytes: 1024 * 1024, is_read_only: false, state: 'ready', created_at: timestamp, updated_at: timestamp,
 };
 const binding: Host['workspaces'][number] = {
   workspace: { id: workspace.id, name: workspace.name, revision: workspace.revision, used_bytes: workspace.used_bytes, state: workspace.state },

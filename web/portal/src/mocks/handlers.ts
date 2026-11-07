@@ -13,6 +13,8 @@ type ControlActionRequest = components["schemas"]["ControlActionRequest"];
 type ControlActionResponse = components["schemas"]["ControlActionResponse"];
 type HostMember = { user_id: string; permissions: HostMemberPermission[]; created_at: string };
 type ModelConnection = components["schemas"]["ModelConnection"];
+type MCPConnector = components["schemas"]["MCPConnector"];
+type AdminModelDefault = components["schemas"]["AdminModelDefault"];
 type Conversation = components["schemas"]["Conversation"];
 type ConversationMessage = components["schemas"]["ConversationMessage"];
 type MockConversationMessage = ConversationMessage & { delivery_status?: ConversationDeliveryStatus };
@@ -24,13 +26,23 @@ type ProjectResource = components["schemas"]["ProjectResource"];
 type ProjectWorkspaceManifest = components["schemas"]["ProjectWorkspaceManifest"];
 type ProjectBudget = components["schemas"]["ProjectBudget"];
 type ProjectBudgetLedgerEntry = components["schemas"]["ProjectBudgetLedgerEntry"];
-type ProjectWorkItem = components["schemas"]["ProjectWorkItem"];
+type ProjectWorkItemCategory = "bug" | "request" | "unclassified";
+type ProjectWorkItem = Omit<components["schemas"]["ProjectWorkItem"], "assignee_id" | "category"> & {
+  assignee_id: string | null;
+  category: ProjectWorkItemCategory;
+};
+type CreateProjectWorkItemRequest = Omit<components["schemas"]["CreateProjectWorkItemRequest"], "category" | "unassigned"> & {
+  category?: ProjectWorkItemCategory;
+  unassigned?: boolean;
+};
 type ProjectConversation = components["schemas"]["ProjectConversation"];
 type ProjectConversationMessage = components["schemas"]["ProjectConversationMessage"];
-type ProjectConversationTask = components["schemas"]["ProjectConversationTask"];
-type ProjectConversationAppendResponse = components["schemas"]["AppendProjectConversationMessageResponse"];
+type AcceptedProjectConversationMessageResponse = components["schemas"]["AcceptedProjectConversationMessageResponse"];
 type Schedule = components["schemas"]["Schedule"];
 type ScheduleCreateRequest = components["schemas"]["ScheduleCreateRequest"];
+type PersonalObject = components["schemas"]["PersonalObject"];
+type GoalBody = components["schemas"]["GoalBody"];
+type PersonalMutationReceipt = components["schemas"]["PersonalMutationReceipt"];
 type UserPreferences = components["schemas"]["UserPreferences"];
 type Notification = components["schemas"]["Notification"];
 type ClientInstallation = components["schemas"]["ClientInstallation"];
@@ -47,6 +59,8 @@ type RecordQuota = components["schemas"]["RecordQuota"];
 type RecordAdminGrant = components["schemas"]["RecordAdminGrant"];
 type AdminInvite = components["schemas"]["AdminInvite"];
 type AdminNudgePolicy = components["schemas"]["AdminNudgePolicy"];
+
+const mockServiceInstanceID = "00000000-0000-4000-8000-000000000001";
 
 const defaultPersonalDataQuota = {
   used_bytes: 0,
@@ -74,6 +88,11 @@ let hostMembers = new Map<string, HostMember[]>();
 const hostResourceVersions = new Map<string, number>();
 let apiKeys: Array<Record<string, unknown>> = [];
 let modelConnections: ModelConnection[] = [];
+const modelConnectionOwners = new Map<string, string>();
+let mcpConnectors: MCPConnector[] = [];
+const mcpConnectorOwners = new Map<string, string>();
+let defaultModelID: string | null = null;
+let defaultModelVersion = 0;
 let schedules: Array<{ ownerID: string; value: Schedule }> = [];
 let conversations: Conversation[] = [];
 let conversationMessages: MockConversationMessage[] = [];
@@ -90,10 +109,18 @@ let projectLedgers = new Map<string, ProjectBudgetLedgerEntry[]>();
 let projectWorkItems: ProjectWorkItem[] = [];
 let projectConversations: ProjectConversation[] = [];
 let projectConversationMessages: ProjectConversationMessage[] = [];
+
+function nextConversationMessageSequence(conversationID: string): number {
+  const personal = conversationMessages.filter((message) => message.conversation_id === conversationID);
+  const project = projectConversationMessages.filter((message) => message.conversation_id === conversationID);
+  return Math.max(0, ...personal.map((message) => message.sequence), ...project.map((message) => message.sequence)) + 1;
+}
 const projectConversationCreates = new Map<string, { request: string; response: ProjectConversation }>();
-const projectConversationAppends = new Map<string, { request: string; response: ProjectConversationAppendResponse }>();
+const projectConversationAcceptances = new Map<string, { request: string; response: AcceptedProjectConversationMessageResponse }>();
+const conversationCreates = new Map<string, { request: string; response: Conversation }>();
+const projectWorkItemClaimReplays = new Map<string, { request: string; response: ProjectWorkItem }>();
 const taskSubmitReplays = new Map<string, { request: string; response: Task }>();
-const taskMessageReplays = new Map<string, { request: string; response: { message: ConversationMessage; task: Task } }>();
+const conversationMessageAcceptances = new Map<string, { request: string; response: components["schemas"]["AcceptedConversationMessageResponse"] }>();
 const taskActionReplays = new Map<string, { request: string; response: components["schemas"]["TaskActionResponse"] }>();
 const mainConversationReplays = new Map<string, { request: string; response: MainConversation }>();
 let userPreferences = new Map<string, UserPreferences>();
@@ -103,6 +130,10 @@ const clientOwners = new Map<string, string>();
 const modelBudgets = new Map<string, ModelAccountBudget>();
 let defaultModelBudget: AdminModelBudgetDefault = { configured: false, token_limit: 0, max_concurrent: 0, version: 0 };
 const personalDataQuotas = new Map<string, PersonalDataQuota>();
+let personalObjects = new Map<string, { ownerID: string; value: PersonalObject }>();
+let personalChanges: Array<{ ownerID: string; value: components["schemas"]["PersonalChange"] }> = [];
+const personalSequences = new Map<string, number>();
+const personalMutationReplays = new Map<string, { request: string; response: PersonalMutationReceipt }>();
 const recordConsents = new Map<string, RecordConsent[]>();
 const recordQuotas = new Map<string, RecordQuota>();
 const recordGrants = new Map<string, RecordAdminGrant[]>();
@@ -142,6 +173,76 @@ const empty = (headers?: HeadersInit) => new HttpResponse(null, { status: 204, h
 const failure = (code: string, message: string, status: number, details: Record<string, unknown> = {}) => json({ error: { code, message, details } }, status);
 const id = (prefix: string) => `${prefix}${Math.random().toString(36).slice(2, 9)}`;
 const now = () => new Date().toISOString();
+const personalObjectKey = (ownerID: string, type: string, objectID: string) => `${ownerID}\u0000${type}\u0000${objectID}`;
+function savePersonalObject(ownerID: string, value: PersonalObject, mutationID: string): number {
+  const sequence = (personalSequences.get(ownerID) ?? 0) + 1;
+  personalSequences.set(ownerID, sequence);
+  personalObjects.set(personalObjectKey(ownerID, value.object_type, value.object_id), { ownerID, value });
+  personalChanges.push({ ownerID, value: {
+    change_sequence: sequence, object_type: value.object_type, object_id: value.object_id,
+    revision: value.revision, operation: "upsert", mutation_id: mutationID,
+  } });
+  return sequence;
+}
+
+function validGoalBody(value: unknown): value is GoalBody {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  return typeof body.title === "string" && body.title.length >= 1 && body.title.length <= 200 &&
+    typeof body.description === "string" && body.description.length <= 4096 &&
+    ["active", "paused", "done", "cancelled"].includes(String(body.status)) &&
+    Array.isArray(body.steps) && body.steps.length <= 100 && body.steps.every((raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+      const step = raw as Record<string, unknown>;
+      return typeof step.id === "string" && typeof step.title === "string" &&
+        ["pending", "in_progress", "done", "blocked", "skipped"].includes(String(step.status)) &&
+        (step.note === undefined || typeof step.note === "string");
+    }) && Array.isArray(body.related_material_ids) && body.related_material_ids.length <= 100 &&
+    body.related_material_ids.every((id) => typeof id === "string");
+}
+
+function validPersonalMutation(type: string, objectID: string, value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  const only = (keys: string[]) => Object.keys(body).every((key) => keys.includes(key));
+  if (type === "memory") return /^m_[a-f0-9]{8}$/.test(objectID) && only(["content", "category"]) &&
+    typeof body.content === "string" && body.content.length > 0 && body.content.length <= 65536 &&
+    (body.category === undefined || (typeof body.category === "string" && body.category.length <= 64));
+  if (type === "profile") return objectID === "default" && only(["name", "avatar", "emoji", "color", "description", "style"]) &&
+    typeof body.name === "string" && body.name.trim() === body.name && body.name.length > 0 && body.name.length <= 60 &&
+    (body.avatar === "dragon" || body.avatar === "emoji") &&
+    (body.emoji === undefined || (typeof body.emoji === "string" && [...body.emoji].length <= 16)) &&
+    (body.color === undefined || (typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color))) &&
+    (body.description === undefined || (typeof body.description === "string" && [...body.description].length <= 200)) &&
+    (body.style === undefined || ["", "muse", "flat", "clay", "watercolor", "pixel", "line", "sticker"].includes(String(body.style))) &&
+    (body.avatar === "dragon" ? (!body.emoji || body.emoji === "") && (!body.color || body.color === "") : Boolean(body.emoji) && typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color));
+  if (!/^[A-Za-z0-9._~-]{1,160}$/.test(objectID)) return false;
+  if (type === "feed_post") return only(["title", "type", "emoji", "created_at", "liked", "body"]) &&
+    typeof body.title === "string" && [...body.title].length > 0 && [...body.title].length <= 200 &&
+    typeof body.type === "string" && [...body.type].length > 0 && [...body.type].length <= 32 &&
+    typeof body.body === "string" && [...body.body].length > 0 && [...body.body].length <= 65536 &&
+    (body.emoji === undefined || (typeof body.emoji === "string" && [...body.emoji].length <= 16)) &&
+    (body.created_at === undefined || (typeof body.created_at === "string" && body.created_at.includes("T") && Number.isFinite(Date.parse(body.created_at)))) &&
+    (body.liked === undefined || typeof body.liked === "boolean");
+  if (type === "feed_preferences") return objectID === "default" && only(["content"]) &&
+    typeof body.content === "string" && [...body.content].length > 0 && [...body.content].length <= 8192;
+  if (type === "idea_mark") return only(["state"]) && (body.state === "saved" || body.state === "dismissed");
+  if (type === "library_item") return only(["name", "kind", "mime", "size_bytes", "attachment_id"]) &&
+    typeof body.name === "string" && body.name.trim() === body.name && body.name.length > 0 && body.name.length <= 255 &&
+    body.name !== "." && body.name !== ".." && ![...body.name].some((character) => character === "/" || character === "\\" ||
+      (character.codePointAt(0) ?? 0) < 0x20 || character === "\u007f") &&
+    (body.kind === "artifact" || body.kind === "media") &&
+    (body.mime === undefined || (typeof body.mime === "string" && [...body.mime].length <= 128)) &&
+    (body.size_bytes === undefined || (Number.isSafeInteger(body.size_bytes) && Number(body.size_bytes) >= 0)) &&
+    (body.attachment_id === undefined || (typeof body.attachment_id === "string" && body.attachment_id.length > 0));
+  if (type === "soul") return only(["name", "emoji", "style", "lang", "content"]) &&
+    typeof body.name === "string" && [...body.name].length > 0 && [...body.name].length <= 80 &&
+    typeof body.content === "string" && [...body.content].length > 0 && [...body.content].length <= 65536 &&
+    (body.emoji === undefined || (typeof body.emoji === "string" && [...body.emoji].length <= 16)) &&
+    (body.style === undefined || (typeof body.style === "string" && [...body.style].length <= 64)) &&
+    (body.lang === undefined || (typeof body.lang === "string" && /^[A-Za-z0-9_-]{1,16}$/.test(body.lang)));
+  return false;
+}
 const isVisibleAdminWorkspace = (workspace: Workspace): workspace is VisibleAdminWorkspace => workspace.state !== "deleted";
 const adminWorkspaceView = (workspace: VisibleAdminWorkspace): AdminWorkspace => {
   const ownerId = workspaceOwners.get(workspace.id) ?? "";
@@ -284,7 +385,12 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   workspaceOwners.clear();
   apiKeys = [];
   schedules = [];
-  modelConnections = [{ id: "pmodel01", name: "团队示例模型", base_url: "https://models.example.invalid/v1", model_name: "morde-demo", shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false }, checked_at: now(), created_at: now(), updated_at: now() }];
+  modelConnections = [{ id: "pmodel01", name: "团队示例模型", base_url: "https://models.example.invalid/v1", model_name: "morde-demo", shared: true, has_api_key: true, capabilities: { text: true, tools: true, vision: false, text_stream: false }, checked_at: now(), created_at: now(), updated_at: now() }];
+  modelConnectionOwners.clear();
+  mcpConnectors = [];
+  mcpConnectorOwners.clear();
+  defaultModelID = "pmodel01";
+  defaultModelVersion = 1;
   conversations = [];
   conversationMessages = [];
   conversationOwners = new Map();
@@ -297,13 +403,15 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   projectWorkspaceManifests = new Map();
   projectBudgets = new Map([["pdem0001", { configured: true, currency: "USD", limit_micros: 10_000_000, version: 1, spent_micros: 0, reserved_micros: 500_000, has_unknown: true }]]);
   projectLedgers = new Map([["pdem0001", [{ call_id: "c-demo01", actor_id: demoUser.id, source: "client", model_id: "pmodel01", rate_version: 1, currency: "USD", status: "unknown", reserved_usage: { input_tokens: 100, output_tokens: 25 }, reserved_micros: 500_000, created_at: now() }]]]);
-  projectWorkItems = [{ id: "jdem0001", project_id: "pdem0001", title: "确认交付范围", description: "本机演示工作项；不会启动 Task。", acceptance_criteria: ["确认负责人", "确认验收条件"], assignee_id: demoUser.id, state: "open", blocked_reason: "", task_ids: [], version: 1 }];
+  projectWorkItems = [{ id: "jdem0001", project_id: "pdem0001", title: "确认交付范围", description: "本机演示工作项；不会启动 Task。", acceptance_criteria: ["确认负责人", "确认验收条件"], assignee_id: demoUser.id, category: "unclassified", state: "open", blocked_reason: "", task_ids: [], version: 1 }];
   projectConversations = [];
   projectConversationMessages = [];
   projectConversationCreates.clear();
-  projectConversationAppends.clear();
+  projectConversationAcceptances.clear();
+  conversationCreates.clear();
+  projectWorkItemClaimReplays.clear();
   taskSubmitReplays.clear();
-  taskMessageReplays.clear();
+  conversationMessageAcceptances.clear();
   taskActionReplays.clear();
   mainConversationReplays.clear();
   userPreferences = new Map();
@@ -314,6 +422,10 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   modelBudgets.clear();
   defaultModelBudget = { configured: false, token_limit: 0, max_concurrent: 0, version: 0 };
   personalDataQuotas.clear();
+  personalObjects = new Map();
+  personalChanges = [];
+  personalSequences.clear();
+  personalMutationReplays.clear();
   recordConsents.clear();
   recordQuotas.clear();
   recordGrants.clear();
@@ -409,7 +521,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   }
   if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1" && !workspaceOwners.has("wlocal01")) {
     const timestamp = now();
-    workspaces = [{ id: "wlocal01", name: "本地差异演示工作区", revision: 2, used_bytes: 1024, quota_bytes: 20 * 1024 * 1024 * 1024,
+    workspaces = [{ id: "wlocal01", name: "本地差异演示工作区", revision: 2, used_bytes: 1024, quota_bytes: 20 * 1024 * 1024 * 1024, is_read_only: false,
       state: "ready", created_at: timestamp, updated_at: timestamp }, ...workspaces.filter((workspace) => workspace.id !== "wlocal01")];
     workspaceOwners.set("wlocal01", demoUser.id);
     projectResources = [{ project_id: "pdem0001", kind: "workspace", resource_id: "wlocal01", version: 1 }];
@@ -444,13 +556,45 @@ resetMockState({ restoreAssistantState: true });
 
 const sessionCookieName = "ch_mock_session";
 
+function canAccessModel(user: User, model: ModelConnection): boolean {
+  return model.shared || modelConnectionOwners.get(model.id) === user.id;
+}
+
+function isAutoMessageBody(value: unknown): value is components["schemas"]["AcceptConversationMessageRequest"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  const allowed = ["client_message_id", "previous_client_message_id", "reference_task_id", "model_id", "host_id", "workspace_id",
+    "application_id", "mcp_connector_ids", "client_attachment_ids", "content", "budget"];
+  if (Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.client_message_id !== "string"
+    || !/^[A-Za-z0-9._~-]{8,128}$/.test(body.client_message_id) || typeof body.content !== "string") return false;
+  const attachmentIDs = body.client_attachment_ids;
+  if (attachmentIDs !== undefined && (!Array.isArray(attachmentIDs) || attachmentIDs.length > 16
+    || attachmentIDs.some((item) => typeof item !== "string" || !/^[A-Za-z0-9._~-]{8,128}$/.test(item))
+    || new Set(attachmentIDs).size !== attachmentIDs.length)) return false;
+  return Boolean(body.content.trim() || (Array.isArray(attachmentIDs) && attachmentIDs.length));
+}
+
+function modelConfigurationStatus(user: User): "configured" | "not_configured" | "unknown" {
+  const visible = modelConnections.filter((model) => canAccessModel(user, model));
+  return visible.some((model) => model.has_api_key) ? "configured" : visible.length ? "unknown" : "not_configured";
+}
+
+function adminModelDefault(): AdminModelDefault {
+  const selected = defaultModelID ? modelConnections.find((model) => model.id === defaultModelID) : undefined;
+  return {
+    configured: Boolean(selected?.shared && selected.checked_at && selected.capabilities.text),
+    model_id: defaultModelID,
+    version: defaultModelVersion,
+  };
+}
+
 function preferencesFor(user: User): UserPreferences {
   return userPreferences.get(user.id) ?? { assistant_name: "Morde", selected_model_id: null, default_host_id: null, updated_at: null };
 }
 
 function onboardingStatusFor(user: User): components["schemas"]["OnboardingStatus"] {
   const preferences = preferencesFor(user);
-  const availableModels = modelConnections.filter((model) => model.checked_at && model.capabilities.text);
+  const availableModels = modelConnections.filter((model) => canAccessModel(user, model) && model.checked_at && model.capabilities.text);
   const selectedModelAvailable = availableModels.some((model) => model.id === preferences.selected_model_id);
   const modelStatus = selectedModelAvailable ? "ready" : preferences.selected_model_id ? "selected_unavailable" : availableModels.length ? "selection_required" : "not_configured";
   const ownedHosts = hosts.filter((host) => host.owner_id === user.id);
@@ -538,19 +682,17 @@ function createTaskMessage(user: User, conversation: Conversation, modelID: stri
     clarification_request: null, stop_request: null, assistant_message: null, finished_at: null,
   };
   const message: MockConversationMessage = {
-    id: id("m"), conversation_id: conversation.id, role: "user", content, task_id: task.id, created_at: timestamp,
+    id: id("m"), conversation_id: conversation.id, sequence: nextConversationMessageSequence(conversation.id),
+    role: "user", content, task_id: task.id, created_at: timestamp,
     delivery_status: "applied",
+    ...(typeof request.client_message_id === "string" ? { client_message_id: request.client_message_id } : {}),
+    ...(Array.isArray(request.attachment_ids) ? { attachment_ids: request.attachment_ids as string[] } : {}),
   };
   conversation.updated_at = timestamp;
   tasks.set(task.id, task);
   conversationMessages.push(message);
   persistAssistantState();
   return { task, message };
-}
-
-function activeConversationTask(conversationID: string) {
-  return Array.from(tasks.values()).find((task) => task.conversation_id === conversationID
-    && !["completed", "failed", "cancelled"].includes(task.status));
 }
 
 const isAdmin = (user: User) => user.role === "admin" || user.role === "super_admin";
@@ -779,16 +921,30 @@ export const handlers = [
     projectConversationCreates.set(replayKey, { request: fingerprint, response: value });
     return json(value, 201);
   }),
-  http.get("/api/projects/:projectID/conversations/:conversationID/messages", ({ params, cookies }) => {
+  http.get("/api/projects/:projectID/conversations/:conversationID/messages", ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
     const projectID = String(params.projectID);
     const conversationID = String(params.conversationID);
     if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
     if (!projectConversations.some((item) => item.project_id === projectID && item.id === conversationID)) return failure("not_found", "项目共享对话不存在", 404);
+    const clientMessageID = new URL(request.url).searchParams.get("client_message_id");
+    if (clientMessageID && request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
+    if (clientMessageID && request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
     return json({
-      items: projectConversationMessages.filter((item) => item.conversation_id === conversationID),
+      items: projectConversationMessages.filter((item) => item.conversation_id === conversationID
+        && (!clientMessageID || (item.client_message_id === clientMessageID && item.actor_id === user.id))),
       next_cursor: null,
     });
+  }),
+  http.get("/api/projects/:projectID/conversations/:conversationID/tasks", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    if (!readableProject(projectID, user) || !projectConversations.some((item) => item.project_id === projectID && item.id === conversationID)) {
+      return failure("not_found", "项目共享对话不存在", 404);
+    }
+    return json({ items: Array.from(tasks.values()).filter((task) => task.conversation_id === conversationID
+      && !["completed", "failed", "cancelled"].includes(task.status)), next_cursor: null });
   }),
   http.post("/api/projects/:projectID/conversations/:conversationID/messages", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -797,63 +953,28 @@ export const handlers = [
     if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
     const conversation = projectConversations.find((item) => item.project_id === projectID && item.id === conversationID);
     if (!conversation) return failure("not_found", "项目共享对话不存在", 404);
-    const body = await request.json().catch(() => null) as components["schemas"]["AppendProjectConversationMessageRequest"] | null;
-    if (!body || typeof body.model_id !== "string" || !body.model_id.trim() || body.model_id.length > 256
-      || typeof body.content !== "string" || !body.content.trim() || body.content.length > 32768
-      || (body.workspace_id !== undefined && (!Number.isSafeInteger(body.input_revision) || body.input_revision! < 0))) {
-      return failure("invalid_argument", "项目提示或输入 Workspace 版本无效", 400);
-    }
-    const model = modelConnections.find((item) => item.id === body.model_id && item.checked_at && item.capabilities.text);
-    if (!model) return failure("forbidden", "所选模型未通过文本能力检查", 403);
-    if (body.host_id) {
-      const host = hosts.find((item) => item.id === body.host_id && item.owner_id === user.id);
-      if (!projectResources.some((item) => item.project_id === projectID && item.kind === "host" && item.resource_id === body.host_id)
-        || !host || host.state !== "running" || host.control_state !== "ai") return failure("forbidden", "目标 Host 未关联到项目或当前账号无权使用", 403);
-    }
-    if (body.workspace_id) {
-      const workspace = workspaces.find((item) => item.id === body.workspace_id && workspaceOwners.get(item.id) === user.id && item.state === "ready");
-      if (!projectResources.some((item) => item.project_id === projectID && item.kind === "workspace" && item.resource_id === body.workspace_id)
-        || !workspace || workspace.revision !== body.input_revision) return failure("forbidden", "目标 Workspace 未关联到项目、当前账号无权访问或 revision 已变化", 403);
-      if (body.host_id) {
-        const host = hosts.find((item) => item.id === body.host_id);
-        const binding = host?.workspaces.find((item) => item.workspace.id === workspace.id);
-        if (!binding || binding.state !== "active" || binding.sync_state !== "healthy"
-          || binding.desired_revision !== workspace.revision || binding.applied_revision !== workspace.revision) {
-          return failure("conflict", "目标 Host 尚未应用所选 Workspace revision", 409);
-        }
-      }
-    }
+    const body: unknown = await request.json().catch(() => null);
+    if (!isAutoMessageBody(body)) return failure("invalid_argument", "项目消息无效", 400);
     const key = request.headers.get("Idempotency-Key")?.trim() ?? "";
-    if (!key) return failure("invalid_argument", "缺少 Idempotency-Key", 400);
+    if (request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
+    if (request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
+    if (key !== body.client_message_id) return failure("invalid_argument", "消息编号与请求编号不一致", 400);
     const fingerprint = JSON.stringify(body);
     const replayKey = `${user.id}:${projectID}:${conversationID}:${key}`;
-    const replay = projectConversationAppends.get(replayKey);
+    const replay = projectConversationAcceptances.get(replayKey);
     if (replay) return replay.request === fingerprint
-      ? json(replay.response, 202)
-      : failure("conflict", "幂等键已用于不同的项目 Task 请求", 409);
+      ? json({ ...replay.response, replayed: true }, 202)
+      : failure("conflict", "幂等键已用于不同的项目消息", 409);
     const timestamp = now();
-    const taskID = id("q");
-    const task: ProjectConversationTask = {
-      id: taskID, owner_id: conversation.owner_id, initiator_id: user.id, project_id: projectID,
-      ...(body.host_id ? { host_id: body.host_id } : {}),
-      ...(body.workspace_id ? { workspace_id: body.workspace_id } : {}),
-      ...(body.workspace_id && body.input_revision !== undefined ? { input_revision: body.input_revision } : {}),
-      execution_location: "server", conversation_id: conversationID, model_id: body.model_id,
-      objective: body.content, status: "queued", current_step: null,
-      budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
-      usage: { active_seconds: 0, tool_calls: 0, model_tokens: null },
-      created_at: timestamp, updated_at: timestamp, event_sequence: 0, result: null, waiting_reason: null,
-      steps: [], batch_items: [], artifacts: [], pending_request: null, clarification_request: null,
-      stop_request: null, assistant_message: null, finished_at: null,
-    };
     const message: ProjectConversationMessage = {
-        id: id("m"), conversation_id: conversationID, owner_id: conversation.owner_id, actor_id: user.id,
-        role: "user", content: body.content, task_id: taskID, delivery_status: "applied", created_at: timestamp,
+      id: id("m"), conversation_id: conversationID, owner_id: conversation.owner_id, actor_id: user.id,
+      sequence: nextConversationMessageSequence(conversationID), role: "user", content: body.content,
+      client_message_id: key, routing_status: "pending", delivery_status: "pending", created_at: timestamp,
     };
-    const response: ProjectConversationAppendResponse = { message, task };
+    const response: AcceptedProjectConversationMessageResponse = { message, replayed: false };
     conversation.updated_at = timestamp;
     projectConversationMessages.push(message);
-    projectConversationAppends.set(replayKey, { request: fingerprint, response });
+    projectConversationAcceptances.set(replayKey, { request: fingerprint, response });
     return json(response, 202);
   }),
   http.get("/api/projects/:projectID/members", ({ params, cookies }) => {
@@ -1061,20 +1182,23 @@ export const handlers = [
     if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
     return json({ items: projectLedgers.get(projectID) ?? [], next_cursor: null });
   }),
-  http.get("/api/projects/:projectID/work-items", ({ params, cookies }) => {
+  http.get("/api/projects/:projectID/work-items", ({ params, cookies, request }) => {
     const projectID = String(params.projectID);
     if (!readableProject(projectID, sessionUser(cookies)!)) return failure("not_found", "项目不存在或无权访问", 404);
-    return json({ items: projectWorkItems.filter((item) => item.project_id === projectID), next_cursor: null });
+    const includeUnassigned = new URL(request.url).searchParams.get("include_unassigned") === "true";
+    return json({ items: projectWorkItems.filter((item) => item.project_id === projectID && (includeUnassigned || item.assignee_id !== null)), next_cursor: null });
   }),
   http.post("/api/projects/:projectID/work-items", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
     const projectID = String(params.projectID);
     if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能修改工作项", 403) : failure("not_found", "项目不存在或无权访问", 404);
-    const body = await request.json().catch(() => null) as components["schemas"]["CreateProjectWorkItemRequest"] | null;
+    const body = await request.json().catch(() => null) as CreateProjectWorkItemRequest | null;
     if (!body || typeof body.title !== "string" || !body.title.trim() || body.title.length > 200 || (body.description?.length ?? 0) > 4096 || (body.acceptance_criteria && body.acceptance_criteria.some((criterion) => !criterion.trim() || criterion.length > 1000))) return failure("invalid_argument", "工作项信息无效", 400);
-    const assigneeID = body.assignee_id ?? user.id;
-    if (!projectMemberFor(projectID, assigneeID)) return failure("invalid_argument", "负责人必须是已接受的项目成员", 400);
-    const item: ProjectWorkItem = { id: id("j"), project_id: projectID, title: body.title.trim(), description: body.description ?? "", acceptance_criteria: body.acceptance_criteria ?? [], assignee_id: assigneeID, state: "open", blocked_reason: "", task_ids: [], version: 1 };
+    if (body.category !== undefined && !["bug", "request", "unclassified"].includes(body.category)) return failure("invalid_argument", "工作项类型无效", 400);
+    if (body.unassigned !== undefined && typeof body.unassigned !== "boolean") return failure("invalid_argument", "工作项认领状态无效", 400);
+    const assigneeID = body.unassigned ? null : body.assignee_id ?? user.id;
+    if (assigneeID && !projectMemberFor(projectID, assigneeID)) return failure("invalid_argument", "负责人必须是已接受的项目成员", 400);
+    const item: ProjectWorkItem = { id: id("j"), project_id: projectID, title: body.title.trim(), description: body.description ?? "", acceptance_criteria: body.acceptance_criteria ?? [], assignee_id: assigneeID, category: body.category ?? "unclassified", state: "open", blocked_reason: "", task_ids: [], version: 1 };
     projectWorkItems.push(item);
     return json(item, 201);
   }),
@@ -1097,6 +1221,26 @@ export const handlers = [
     item.assignee_id = body.assignee_id;
     item.version += 1;
     return json(item);
+  }),
+  http.post("/api/projects/:projectID/work-items/:workItemID/claim", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    if (!editableProject(projectID, user)) return readableProject(projectID, user) ? failure("forbidden", "当前项目角色不能认领工作项", 403) : failure("not_found", "项目不存在或无权访问", 404);
+    const item = projectWorkItems.find((workItem) => workItem.project_id === projectID && workItem.id === params.workItemID);
+    if (!item) return failure("not_found", "工作项不存在", 404);
+    const idempotencyKey = request.headers.get("Idempotency-Key");
+    const body = await request.json().catch(() => null) as { expected_version?: unknown } | null;
+    if (!idempotencyKey || !body || !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 1) return failure("invalid_argument", "认领请求或工作项版本无效", 400);
+    const replayKey = `${user.id}:${projectID}:${item.id}:${idempotencyKey}`;
+    const requestBody = JSON.stringify(body);
+    const replay = projectWorkItemClaimReplays.get(replayKey);
+    if (replay) return replay.request === requestBody ? json(replay.response) : failure("conflict", "幂等键已用于不同的认领请求", 409);
+    if (body.expected_version !== item.version || item.assignee_id !== null) return failure("conflict", "工作项已被其他成员认领或版本已变化", 409);
+    item.assignee_id = user.id;
+    item.version += 1;
+    const response = { ...item };
+    projectWorkItemClaimReplays.set(replayKey, { request: requestBody, response });
+    return json(response);
   }),
   http.post("/api/projects/:projectID/work-items/:workItemID/block", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -1179,7 +1323,7 @@ export const handlers = [
     if (!body || typeof body.assistant_name !== "string" || body.assistant_name.length > 80 || typeof body.selected_model_id !== "string") {
       return failure("invalid_argument", "用户偏好信息无效", 400);
     }
-    if (body.selected_model_id && !modelConnections.some((model) => model.id === body.selected_model_id && model.checked_at && model.capabilities.text && model.capabilities.tools)) {
+    if (body.selected_model_id && !modelConnections.some((model) => canAccessModel(user, model) && model.id === body.selected_model_id && model.checked_at && model.capabilities.text)) {
       return failure("invalid_argument", "所选模型尚不可用", 400);
     }
     const prior = preferencesFor(user);
@@ -1212,22 +1356,76 @@ export const handlers = [
     return json({ created, host: selected ? { id: selected.id, name: selected.name, state: selected.state } : null, status: onboardingStatusFor(user) });
   }),
   http.get("/api/templates", () => json({ items: templates })),
-  http.get("/api/available-models", () => json({ items: modelConnections.filter((model) => model.checked_at && model.capabilities.text)
-    .map(({ id: modelID, name, model_name, capabilities }) => ({ id: modelID, name, model_name, capabilities })) })),
+  http.get("/api/available-models", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    const items = modelConnections.filter((model) => canAccessModel(user, model) && model.has_api_key && model.checked_at && model.capabilities.text)
+      .map(({ id: modelID, name, model_name, capabilities }) => ({ id: modelID, name, model_name, capabilities }));
+    const configured = Boolean(defaultModelID && items.some((item) => item.id === defaultModelID)
+      && modelConnections.some((model) => model.id === defaultModelID && model.shared));
+    return json({ items, configuration_status: modelConfigurationStatus(user), default_model_configured: configured, default_model_id: configured ? defaultModelID : null });
+  }),
   http.get("/api/personal-data/quota", ({ cookies }) => {
     const user = sessionUser(cookies)!;
     return json({ owner_id: user.id, used_bytes: 0, reserved_bytes: 0, quota_bytes: defaultPersonalDataQuota.quota_bytes,
       max_attachment_bytes: defaultPersonalDataQuota.max_attachment_bytes, remaining_bytes: defaultPersonalDataQuota.quota_bytes, version: 1 });
   }),
+  http.get("/api/personal-data/:type/:objectID", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const type = String(params.type);
+    const objectID = String(params.objectID);
+    const object = personalObjects.get(personalObjectKey(user.id, type, objectID));
+    return object ? json(object.value) : failure("not_found", "个人资料不存在", 404);
+  }),
+  http.put("/api/personal-data/:type/:objectID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const type = String(params.type);
+    const objectID = String(params.objectID);
+    if (!/^[A-Za-z0-9._~-]{1,160}$/.test(objectID) || (type === "memory" && !/^m_[a-f0-9]{8}$/.test(objectID)) ||
+      ((type === "profile" || type === "feed_preferences") && objectID !== "default")) return failure("invalid_argument", "个人资料编号无效", 400);
+    const mutationID = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(mutationID)) return failure("invalid_argument", "需要有效的 Idempotency-Key", 400);
+    const requestBody = await request.json().catch(() => null) as { base_revision?: unknown; body?: unknown } | null;
+    if (!requestBody || Object.keys(requestBody).some((key) => key !== "base_revision" && key !== "body") ||
+      !Number.isSafeInteger(requestBody.base_revision) || Number(requestBody.base_revision) < 0 ||
+      !requestBody.body || typeof requestBody.body !== "object" || Array.isArray(requestBody.body)) {
+      return failure("invalid_argument", "个人资料变更无效", 400);
+    }
+    if (!validPersonalMutation(type, objectID, requestBody.body)) return failure("invalid_argument", "个人资料内容无效", 400);
+    const body = requestBody.body;
+    const normalizedRequest = JSON.stringify({ type, objectID, base_revision: requestBody.base_revision, body });
+    const replayKey = `${user.id}\u0000${type}\u0000${objectID}\u0000${mutationID}`;
+    const prior = personalMutationReplays.get(replayKey);
+    if (prior) return prior.request === normalizedRequest
+      ? json({ ...prior.response, replay: true }, 200)
+      : failure("idempotency_conflict", "幂等键已用于不同的个人资料变更", 409);
+    const key = personalObjectKey(user.id, type, objectID);
+    const current = personalObjects.get(key)?.value;
+    const baseRevision = Number(requestBody.base_revision);
+    if ((current?.revision ?? 0) !== baseRevision) return failure("conflict", "个人资料版本已变化", 409);
+    const value: PersonalObject = { object_type: type as PersonalObject["object_type"], object_id: objectID, revision: baseRevision + 1, body: body as PersonalObject["body"] };
+    const sequence = savePersonalObject(user.id, value, mutationID);
+    const receipt: PersonalMutationReceipt = { object_type: type as PersonalMutationReceipt["object_type"], object_id: objectID, result_revision: value.revision, account_change_sequence: sequence, replay: false };
+    personalMutationReplays.set(replayKey, { request: normalizedRequest, response: receipt });
+    return json(receipt, 200);
+  }),
   http.get("/api/sync/snapshot", ({ cookies }) => {
-    sessionUser(cookies)!;
-    return json({ watermark: 0, items: [], next_cursor: null });
+    const user = sessionUser(cookies)!;
+    const items = Array.from(personalObjects.values()).filter((item) => item.ownerID === user.id).map((item) => item.value);
+    return json({ watermark: personalSequences.get(user.id) ?? 0, items, next_cursor: null });
   }),
   http.get("/api/sync/changes", ({ request, cookies }) => {
-    sessionUser(cookies)!;
-    const after = Number(new URL(request.url).searchParams.get("after_sequence"));
-    if (!Number.isSafeInteger(after) || after < 0) return failure("invalid_argument", "变更游标无效", 400);
-    return json({ items: [], through_sequence: after, next_after_sequence: after, has_more: false });
+    const user = sessionUser(cookies)!;
+    const query = new URL(request.url).searchParams;
+    const after = Number(query.get("after_sequence"));
+    const rawThrough = query.get("through_sequence");
+    const limit = Number(query.get("limit") ?? 100);
+    const through = rawThrough === null ? Math.max(after, personalSequences.get(user.id) ?? 0) : Number(rawThrough);
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(through) || through < after ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 100) return failure("invalid_argument", "变更游标无效", 400);
+    const available = personalChanges.filter((item) => item.ownerID === user.id && item.value.change_sequence > after && item.value.change_sequence <= through);
+    const items = available.slice(0, limit).map((item) => item.value);
+    const hasMore = available.length > items.length;
+    return json({ items, through_sequence: through, next_after_sequence: hasMore ? items.at(-1)!.change_sequence : through, has_more: hasMore });
   }),
   http.get("/api/me/records", ({ cookies }) => {
     sessionUser(cookies)!;
@@ -1251,20 +1449,51 @@ export const handlers = [
         conversation_id: conversationID, role: message.role, content: message.content, sequence: index + 1,
         attachment_ids: message.attachment_ids ?? [], replay: false })) });
   }),
-  http.get("/api/goals", () => json({ items: [], next_cursor: null })),
+  http.get("/api/goals", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    const items = Array.from(personalObjects.values()).filter((item) => item.ownerID === user.id && item.value.object_type === "goal").map((item) => item.value);
+    return json({ items, next_cursor: null });
+  }),
+  http.post("/api/goals", async ({ request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const mutationID = request.headers.get("Idempotency-Key") ?? "";
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(mutationID)) return failure("invalid_argument", "需要有效的 Idempotency-Key", 400);
+    const body = await request.json().catch(() => null) as { id?: unknown; body?: unknown } | null;
+    if (!body || Object.keys(body).some((key) => key !== "id" && key !== "body") || typeof body.id !== "string" ||
+      !/^[A-Za-z0-9._~-]{1,128}$/.test(body.id) || !validGoalBody(body.body)) return failure("invalid_argument", "目标内容无效", 400);
+    const normalizedRequest = JSON.stringify({ id: body.id, body: body.body });
+    const replayKey = `${user.id}\u0000goal-create\u0000${mutationID}`;
+    const prior = personalMutationReplays.get(replayKey);
+    if (prior) return prior.request === normalizedRequest
+      ? json({ ...prior.response, replay: true }, 201)
+      : failure("idempotency_conflict", "幂等键已用于不同的目标创建请求", 409);
+    if (personalObjects.has(personalObjectKey(user.id, "goal", body.id))) return failure("conflict", "目标已存在", 409);
+    const value: PersonalObject = { object_type: "goal", object_id: body.id, revision: 1, body: body.body };
+    const sequence = savePersonalObject(user.id, value, mutationID);
+    const receipt: PersonalMutationReceipt = { object_type: "goal", object_id: body.id, result_revision: 1, account_change_sequence: sequence, replay: false };
+    personalMutationReplays.set(replayKey, { request: normalizedRequest, response: receipt });
+    return json(receipt, 201);
+  }),
+  http.get("/api/goals/:id", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const object = personalObjects.get(personalObjectKey(user.id, "goal", String(params.id)));
+    return object ? json(object.value) : failure("not_found", "目标不存在", 404);
+  }),
   http.get("/api/schedules", ({ cookies }) => json({
     items: schedules.filter((item) => item.ownerID === sessionUser(cookies)!.id).map((item) => item.value), next_cursor: "",
   })),
   http.post("/api/schedules", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
     const body = await request.json().catch(() => null) as ScheduleCreateRequest | null;
-    if (!body || !body.host_id || !body.model_id || !body.objective || !body.timing || !body.budget) {
+    if (!body || (body.host_id !== null && !body.host_id) || (body.host_id === null && body.observation != null) ||
+      !body.model_id || typeof body.objective !== "string" || !body.objective.trim() ||
+      (body.title !== undefined && (typeof body.title !== "string" || !body.title.trim())) || !body.timing || !body.budget) {
       return failure("invalid_argument", "计划定义无效", 400);
     }
     const timestamp = now();
     const value: Schedule = {
       id: id("j"), version: 1, status: "enabled", host_id: body.host_id, model_id: body.model_id,
-      objective: body.objective, timing: body.timing, budget: body.budget, misfire_policy: body.misfire_policy ?? "skip",
+      title: body.title ?? body.objective.trim(), objective: body.objective, timing: body.timing, budget: body.budget, misfire_policy: body.misfire_policy ?? "skip",
       notification_events: body.notification_events ?? ["completed", "failed", "waiting_user"],
       observation: body.observation ?? null,
       next_run_at: body.timing.kind === "once" ? body.timing.run_at : new Date(Date.now() + 60_000).toISOString(),
@@ -1619,7 +1848,7 @@ export const handlers = [
     const replay = workspaceCreateReplays.get(replayKey);
     if (replay) return replay.request === serializedRequest ? json({ ...replay.response }, 201) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
     const timestamp = now();
-    const workspace: Workspace = { id: id("w"), name: body.name.trim(), revision: 0, used_bytes: 0, quota_bytes: templates[0]!.workspace_size_mib * 1024 * 1024, state: "ready", created_at: timestamp, updated_at: timestamp };
+    const workspace: Workspace = { id: id("w"), name: body.name.trim(), revision: 0, used_bytes: 0, quota_bytes: templates[0]!.workspace_size_mib * 1024 * 1024, is_read_only: false, state: "ready", created_at: timestamp, updated_at: timestamp };
     workspaces = [workspace, ...workspaces];
     workspaceOwners.set(workspace.id, user.id);
     workspaceCreateReplays.set(replayKey, { request: serializedRequest, response: workspace });
@@ -1744,8 +1973,8 @@ export const handlers = [
     scheduleDeletionCompletion();
     return json(item, 202);
   }),
-  http.get("/api/capabilities", () => json({ service_instance_id: "00000000-0000-4000-8000-000000000001", api_version: "1",
-    hub_version: null, event_version: null, minimum_client_version: null, supported_features: ["password_login", "task_api"], default_max_request_bytes: 1048576 })),
+  http.get("/api/capabilities", () => json({ service_instance_id: mockServiceInstanceID, api_version: "1",
+    hub_version: null, event_version: null, minimum_client_version: null, supported_features: ["password_login", "task_api", "cloud_tasks", "project_work_items_v2", "conversation_auto_routing_v1"], default_max_request_bytes: 1048576 })),
   http.get("/api/execution", ({ cookies }) => {
     const user = sessionUser(cookies)!;
     const ownerTasks = Array.from(tasks.values()).filter((task) => task.owner_id === user.id);
@@ -1753,6 +1982,14 @@ export const handlers = [
       owner_id: user.id, state: "disabled", epoch: 1,
       pending_task_count: ownerTasks.filter((task) => task.status === "queued" || task.status === "running" || task.status === "waiting_user" || task.status === "paused").length,
       runtime: { state: "stopped", runtime_generation: 0, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: now(),
+    });
+  }),
+  http.post("/api/execution/enable", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    const ownerTasks = Array.from(tasks.values()).filter((task) => task.owner_id === user.id);
+    return json({ owner_id: user.id, state: "enabled", epoch: 1,
+      pending_task_count: ownerTasks.filter((task) => ["queued", "running", "waiting_user", "paused"].includes(task.status)).length,
+      runtime: { state: "not_started", runtime_generation: 0, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: now(),
     });
   }),
   http.get("/api/me/main-conversation", ({ cookies }) => {
@@ -1823,16 +2060,53 @@ export const handlers = [
     return json({ items: conversations.filter((item) => conversationOwners.get(item.id) === user.id)
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at)), next_cursor: null });
   }),
+  http.post("/api/conversations", async ({ request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const key = request.headers.get("Idempotency-Key") ?? "";
+    if (request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
+    if (request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
+    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || Object.keys(body).some((field) => field !== "host_id" && field !== "title")
+      || (body.title !== undefined && (typeof body.title !== "string" || [...body.title.trim()].length > 120))
+      || (body.host_id !== undefined && typeof body.host_id !== "string")) return failure("invalid_argument", "对话请求无效", 400);
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const hostID = typeof body.host_id === "string" ? body.host_id : "";
+    const fingerprint = JSON.stringify({ host_id: hostID, title });
+    const replayKey = `${user.id}:${key}`;
+    const replay = conversationCreates.get(replayKey);
+    if (replay) return replay.request === fingerprint ? json(replay.response) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    if (hostID && !hosts.some((host) => host.id === hostID && host.owner_id === user.id)) return failure("not_found", "电脑不存在", 404);
+    const timestamp = now();
+    const conversation: Conversation = { id: id("c"), scope: "personal", is_main: false, title, created_at: timestamp, updated_at: timestamp,
+      ...(hostID ? { host_id: hostID } : {}) };
+    conversations.push(conversation);
+    conversationOwners.set(conversation.id, user.id);
+    conversationCreates.set(replayKey, { request: fingerprint, response: conversation });
+    persistAssistantState();
+    return json(conversation, 201);
+  }),
   http.get("/api/conversations/:conversationID", ({ params, cookies }) => {
     const user = sessionUser(cookies)!;
     const conversation = conversations.find((item) => item.id === String(params.conversationID) && conversationOwners.get(item.id) === user.id);
     return conversation ? json(conversation) : failure("not_found", "对话不存在", 404);
   }),
-  http.get("/api/conversations/:conversationID/messages", ({ params, cookies }) => {
+  http.get("/api/conversations/:conversationID/messages", ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
     const conversationID = String(params.conversationID);
     if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
-    return json({ items: conversationMessages.filter((item) => item.conversation_id === conversationID), next_cursor: null });
+    const clientMessageID = new URL(request.url).searchParams.get("client_message_id");
+    if (clientMessageID && request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
+    if (clientMessageID && request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
+    return json({ items: conversationMessages.filter((item) => item.conversation_id === conversationID
+      && (!clientMessageID || item.client_message_id === clientMessageID)), next_cursor: null });
+  }),
+  http.get("/api/conversations/:conversationID/tasks", ({ params, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
+    return json({ items: Array.from(tasks.values()).filter((task) => task.conversation_id === conversationID
+      && task.owner_id === user.id && !["completed", "failed", "cancelled"].includes(task.status)), next_cursor: null });
   }),
   http.post("/api/tasks", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -1851,11 +2125,10 @@ export const handlers = [
     const requestText = JSON.stringify({ ...body, objective: body.objective.trim() });
     const replayKey = `${user.id}:${key}`;
     const replay = taskSubmitReplays.get(replayKey);
-    if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
-    if (!modelConnections.some((item) => item.id === body.model_id && item.checked_at && item.capabilities.text)) return failure("not_found", "模型不存在", 404);
+    if (replay) return replay.request === requestText ? json({ ...replay.response, replayed: true }, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
+    if (!modelConnections.some((item) => item.id === body.model_id && canAccessModel(user, item) && item.has_api_key)) return failure("not_found", "模型不存在", 404);
     let conversation = body.conversation_id ? conversations.find((item) => item.id === body.conversation_id && conversationOwners.get(item.id) === user.id) : undefined;
     if (body.conversation_id && !conversation) return failure("not_found", "对话不存在", 404);
-    if (conversation && activeConversationTask(conversation.id)) return failure("task_busy", "对话中已有任务正在运行", 409);
     if (!conversation) {
       const timestamp = now();
       conversation = { id: id("c"), scope: "personal", is_main: false, title: Array.from(body.objective.trim()).slice(0, 120).join(""), created_at: timestamp, updated_at: timestamp };
@@ -1872,48 +2145,29 @@ export const handlers = [
     const conversationID = String(params.conversationID);
     const conversation = conversations.find((item) => item.id === conversationID && conversationOwners.get(item.id) === user.id);
     if (!conversation) return failure("not_found", "对话不存在", 404);
-    const key = request.headers.get("Idempotency-Key") ?? "";
-    if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
-    const body = await request.json().catch(() => null) as {
-      expected_task_id?: string; host_id?: string; workspace_id?: string; input_revision?: number; application_id?: string; model_id?: string;
-      content?: string; budget?: { active_seconds: number; tool_calls: number; model_tokens: number };
-    } | null;
-    const allowed = ["expected_task_id", "host_id", "workspace_id", "input_revision", "application_id", "model_id", "content", "budget"];
-    if (!body || Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.model_id !== "string"
-      || typeof body.content !== "string" || !body.content.trim() || Array.from(body.content).length > 32768) {
-      return failure("invalid_argument", "对话内容无效", 400);
-    }
-    if (body.expected_task_id !== undefined && typeof body.expected_task_id !== "string") return failure("invalid_argument", "expected_task_id 无效", 400);
-    const requestText = JSON.stringify({ conversation_id: conversationID, ...body, content: body.content.trim() });
-    const replayKey = `${user.id}:${key}`;
-    const replay = taskMessageReplays.get(replayKey);
-    if (replay) return replay.request === requestText ? json(replay.response, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
-    if (!modelConnections.some((item) => item.id === body.model_id && item.checked_at && item.capabilities.text)) return failure("not_found", "模型不存在", 404);
-    const activeTask = activeConversationTask(conversationID);
-    if (body.expected_task_id && activeTask?.id !== body.expected_task_id) return failure("conflict", "活动任务已变化", 409);
-    if (activeTask) {
-      if (["pausing", "cancelling"].includes(activeTask.status) || activeTask.pending_request || activeTask.clarification_request
-        || activeTask.model_id !== body.model_id || (activeTask.host_id ?? "") !== (body.host_id ?? "")
-        || (activeTask.application_id ?? "") !== (body.application_id ?? "")
-        || (body.workspace_id !== undefined && (activeTask.workspace_id !== body.workspace_id || activeTask.input_revision !== body.input_revision))) {
-        return failure("conflict", "活动任务状态或目标已变化", 409);
-      }
-      const message: MockConversationMessage = {
-        id: id("m"), conversation_id: conversationID, role: "user", content: body.content.trim(),
-        task_id: activeTask.id, created_at: now(), delivery_status: "pending",
-      };
-      conversation.updated_at = message.created_at;
-      conversationMessages.push(message);
-      const result = { task: activeTask, message };
-      taskMessageReplays.set(replayKey, { request: requestText, response: result });
-      persistAssistantState();
-      return json(result, 202);
-    }
-    if (body.expected_task_id) return failure("conflict", "活动任务已结束", 409);
-    const result = createTaskMessage(user, conversation, body.model_id, body.content.trim(), body);
-    taskMessageReplays.set(replayKey, { request: requestText, response: result });
+    const body: unknown = await request.json().catch(() => null);
+    if (!isAutoMessageBody(body)) return failure("invalid_argument", "对话消息无效", 400);
+    const key = request.headers.get("Idempotency-Key")?.trim() ?? "";
+    if (request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
+    if (request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
+    if (key !== body.client_message_id) return failure("invalid_argument", "消息编号与请求编号不一致", 400);
+    const requestText = JSON.stringify(body);
+    const replayKey = `${user.id}:${conversationID}:${key}`;
+    const replay = conversationMessageAcceptances.get(replayKey);
+    if (replay) return replay.request === requestText
+      ? json({ ...replay.response, replayed: true }, 202)
+      : failure("conflict", "幂等键已用于不同的对话消息", 409);
+    const timestamp = now();
+    const message: MockConversationMessage = {
+      id: id("m"), conversation_id: conversationID, sequence: nextConversationMessageSequence(conversationID),
+      role: "user", content: body.content, client_message_id: key, routing_status: "pending", delivery_status: "pending", created_at: timestamp,
+    };
+    const response: components["schemas"]["AcceptedConversationMessageResponse"] = { message, replayed: false };
+    conversation.updated_at = timestamp;
+    conversationMessages.push(message);
+    conversationMessageAcceptances.set(replayKey, { request: requestText, response });
     persistAssistantState();
-    return json(result, 202);
+    return json(response, 202);
   }),
   http.post("/api/tasks/:taskID/actions", async ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -1980,36 +2234,52 @@ export const handlers = [
       headers: { "Cache-Control": "no-cache", "Content-Type": "text/event-stream; charset=utf-8" },
     });
   }),
-  http.get("/api/model-connections", () => json({ items: modelConnections.filter((item) => item.shared) })),
+  http.get("/api/model-connections", ({ cookies }) => {
+    const user = sessionUser(cookies)!;
+    return json({ items: modelConnections.filter((item) => canAccessModel(user, item)), configuration_status: modelConfigurationStatus(user) });
+  }),
   http.post("/api/model-connections", async ({ request, cookies }) => {
     const body = await request.json().catch(() => null) as components["schemas"]["CreateModelConnectionRequest"] | null;
-    if (!body || !body.name?.trim() || !body.model_name?.trim() || !body.api_key?.trim()) return failure("invalid_argument", "模型连接信息不完整", 400);
+    if (!body || typeof body.name !== "string" || !body.name.trim() || typeof body.model_name !== "string" || !body.model_name.trim()
+      || typeof body.api_key !== "string" || !body.api_key.trim() || typeof body.base_url !== "string" || typeof body.shared !== "boolean") {
+      return failure("invalid_argument", "模型连接信息不完整", 400);
+    }
     const actor = sessionUser(cookies)!;
-    if (!body.shared || !isAdmin(actor)) return failure("forbidden", "只有管理员可配置团队模型", 403);
+    if (body.shared && !isAdmin(actor)) return failure("forbidden", "只有管理员可配置团队模型", 403);
     let parsedURL: URL;
     try { parsedURL = new URL(body.base_url); } catch { return failure("invalid_argument", "服务地址无效", 400); }
-    if (parsedURL.protocol !== "https:") return failure("invalid_argument", "服务地址必须使用 HTTPS", 400);
+    if (parsedURL.protocol !== "https:" || parsedURL.username || parsedURL.password || parsedURL.hash) return failure("invalid_argument", "服务地址必须是有效的 HTTPS 地址", 400);
     const timestamp = now();
-    const connection: ModelConnection = { id: id("p"), name: body.name.trim(), base_url: body.base_url, model_name: body.model_name.trim(), shared: body.shared, has_api_key: true, capabilities: { text: false, tools: false, vision: false }, checked_at: null, created_at: timestamp, updated_at: timestamp };
+    const connection: ModelConnection = { id: id("p"), name: body.name.trim(), base_url: body.base_url, model_name: body.model_name.trim(), shared: body.shared, has_api_key: true, capabilities: { text: false, tools: false, vision: false, text_stream: false }, checked_at: null, created_at: timestamp, updated_at: timestamp };
     modelConnections.unshift(connection);
+    if (!connection.shared) modelConnectionOwners.set(connection.id, actor.id);
     if (connection.shared) recordMockAudit(actor, "model.connection.create", connection.id, { shared: true, model_name: connection.model_name, base_host: parsedURL.hostname, has_api_key: true });
     return json(connection, 201);
+  }),
+  http.get("/api/model-connections/:connectionID", ({ params, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    const connection = modelConnections.find((item) => item.id === String(params.connectionID) && canAccessModel(actor, item));
+    return connection ? json(connection) : failure("not_found", "模型连接不存在", 404);
   }),
   http.put("/api/model-connections/:connectionID", async ({ params, request, cookies }) => {
     const connection = modelConnections.find((item) => item.id === String(params.connectionID));
     const actor = sessionUser(cookies)!;
-    if (!connection?.shared || !isAdmin(actor)) return failure("not_found", "模型连接不存在", 404);
+    if (!connection || (connection.shared ? !isAdmin(actor) : modelConnectionOwners.get(connection.id) !== actor.id)) return failure("not_found", "模型连接不存在", 404);
     const body = await request.json().catch(() => null) as components["schemas"]["UpdateModelConnectionRequest"] | null;
     if (!body || !body.name.trim() || !body.model_name.trim()) return failure("invalid_argument", "模型连接信息不完整", 400);
     let parsedURL: URL;
     try { parsedURL = new URL(body.base_url); } catch { return failure("invalid_argument", "服务地址无效", 400); }
     if (parsedURL.protocol !== "https:") return failure("invalid_argument", "服务地址必须使用 HTTPS", 400);
+    const changedEndpoint = connection.base_url !== body.base_url || connection.model_name !== body.model_name.trim() || Boolean(body.api_key?.trim());
     connection.name = body.name.trim();
     connection.base_url = body.base_url;
     connection.model_name = body.model_name.trim();
     connection.has_api_key ||= Boolean(body.api_key?.trim());
-    connection.checked_at = null;
-    connection.capabilities = { text: false, tools: false, vision: false };
+    if (changedEndpoint) {
+      connection.checked_at = null;
+      connection.capabilities = { text: false, tools: false, vision: false, text_stream: false };
+    }
+    connection.capabilities.text_stream = false;
     connection.updated_at = now();
     if (connection.shared) recordMockAudit(actor, "model.connection.update", connection.id, { shared: true, model_name: connection.model_name, base_host: parsedURL.hostname, has_api_key: connection.has_api_key, api_key_replaced: Boolean(body.api_key?.trim()) });
     return json(connection);
@@ -2018,20 +2288,109 @@ export const handlers = [
     const index = modelConnections.findIndex((item) => item.id === String(params.connectionID));
     const actor = sessionUser(cookies)!;
     const connection = modelConnections[index];
-    if (!connection?.shared || !isAdmin(actor)) return failure("not_found", "模型连接不存在", 404);
+    if (!connection || (connection.shared ? !isAdmin(actor) : modelConnectionOwners.get(connection.id) !== actor.id)) return failure("not_found", "模型连接不存在", 404);
     modelConnections.splice(index, 1);
-    recordMockAudit(actor, "model.connection.delete", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname });
+    modelConnectionOwners.delete(connection.id);
+    if (connection.shared) recordMockAudit(actor, "model.connection.delete", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname });
     return empty();
   }),
-  http.post("/api/model-connections/:connectionID/check", ({ params, cookies }) => {
+  http.post("/api/model-connections/:connectionID/check", async ({ params, cookies, request }) => {
     const connection = modelConnections.find((item) => item.id === String(params.connectionID));
     const actor = sessionUser(cookies)!;
-    if (!connection?.shared || !isAdmin(actor)) return failure("not_found", "模型连接不存在", 404);
-    connection.capabilities = { text: true, tools: true, vision: false };
+    if (!connection || (connection.shared ? !isAdmin(actor) : modelConnectionOwners.get(connection.id) !== actor.id)) return failure("not_found", "模型连接不存在", 404);
+    const body = await request.json().catch(() => null) as { capability?: string } | null;
+    const capability = body?.capability ?? 'all';
+    connection.capabilities = {
+      ...connection.capabilities,
+      text: connection.capabilities.text || capability === 'text' || capability === 'vision' || capability === 'all',
+      tools: connection.capabilities.tools || capability === 'tools' || capability === 'all',
+      vision: connection.capabilities.vision || capability === 'vision',
+      text_stream: capability === 'text_stream',
+    };
     connection.checked_at = now();
     connection.updated_at = now();
-    recordMockAudit(actor, "model.connection.check", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname, capabilities: connection.capabilities });
+    if (connection.shared) recordMockAudit(actor, "model.connection.check", connection.id, { shared: true, model_name: connection.model_name, base_host: new URL(connection.base_url).hostname, capabilities: connection.capabilities });
     return json(connection.capabilities);
+  }),
+  http.get("/api/mcp/connectors", ({ cookies }) => {
+    const actor = sessionUser(cookies)!;
+    return json({ items: mcpConnectors.filter((connector) => mcpConnectorOwners.get(connector.id) === actor.id) });
+  }),
+  http.post("/api/mcp/connectors", async ({ request, cookies }) => {
+    const body = await request.json().catch(() => null) as components["schemas"]["CreateMCPConnectorRequest"] | null;
+    if (!body || typeof body.name !== "string" || !body.name.trim() || body.name.length > 80 || typeof body.endpoint_url !== "string") {
+      return failure("invalid_argument", "MCP 工具连接信息不完整", 400);
+    }
+    let endpoint: URL;
+    try { endpoint = new URL(body.endpoint_url); } catch { return failure("invalid_argument", "MCP 服务地址无效", 400); }
+    if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return failure("invalid_argument", "MCP 服务地址必须是无凭据的 HTTPS 地址", 400);
+    if (body.credential !== undefined && (!body.credential || typeof body.credential !== "object" || Array.isArray(body.credential))) return failure("invalid_argument", "MCP 凭据必须是 JSON 对象", 400);
+    const actor = sessionUser(cookies)!;
+    const timestamp = now();
+    const connector: MCPConnector = {
+      id: id("k"), name: body.name.trim(), endpoint_url: endpoint.toString(), enabled: false,
+      has_credential: Boolean(body.credential), credential_version: body.credential ? 1 : 0,
+      revision: 1, created_at: timestamp, updated_at: timestamp,
+    };
+    mcpConnectors.unshift(connector);
+    mcpConnectorOwners.set(connector.id, actor.id);
+    return json(connector, 201);
+  }),
+  http.put("/api/mcp/connectors/:connectorID", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    const connector = mcpConnectors.find((item) => item.id === String(params.connectorID) && mcpConnectorOwners.get(item.id) === actor.id);
+    if (!connector) return failure("not_found", "MCP 工具连接不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["UpdateMCPConnectorRequest"] | null;
+    if (!body || !body.name.trim() || body.name.length > 80 || typeof body.endpoint_url !== "string") return failure("invalid_argument", "MCP 工具连接信息无效", 400);
+    if (body.expected_revision !== connector.revision) return failure("conflict", "MCP 工具连接已变化，请刷新后重试", 409);
+    let endpoint: URL;
+    try { endpoint = new URL(body.endpoint_url); } catch { return failure("invalid_argument", "MCP 服务地址无效", 400); }
+    if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return failure("invalid_argument", "MCP 服务地址必须是无凭据的 HTTPS 地址", 400);
+    if (connector.endpoint_url !== endpoint.toString()) {
+      connector.has_credential = false;
+      connector.credential_version += 1;
+    }
+    connector.name = body.name.trim();
+    connector.endpoint_url = endpoint.toString();
+    connector.revision += 1;
+    connector.updated_at = now();
+    return json(connector);
+  }),
+  http.put("/api/mcp/connectors/:connectorID/credential", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    const connector = mcpConnectors.find((item) => item.id === String(params.connectorID) && mcpConnectorOwners.get(item.id) === actor.id);
+    if (!connector) return failure("not_found", "MCP 工具连接不存在", 404);
+    const body = await request.json().catch(() => null) as components["schemas"]["RotateMCPConnectorCredentialRequest"] | null;
+    if (!body || !body.credential || typeof body.credential !== "object" || Array.isArray(body.credential)) return failure("invalid_argument", "MCP 凭据必须是 JSON 对象", 400);
+    if (body.expected_revision !== connector.revision) return failure("conflict", "MCP 工具连接已变化，请刷新后重试", 409);
+    connector.has_credential = true;
+    connector.credential_version += 1;
+    connector.revision += 1;
+    connector.updated_at = now();
+    return json(connector);
+  }),
+  http.put("/api/mcp/connectors/:connectorID/enabled", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    const connector = mcpConnectors.find((item) => item.id === String(params.connectorID) && mcpConnectorOwners.get(item.id) === actor.id);
+    if (!connector) return failure("not_found", "MCP 工具连接不存在", 404);
+    const body = await request.json().catch(() => null) as { enabled?: unknown; expected_revision?: number } | null;
+    if (!body || typeof body.enabled !== "boolean" || typeof body.expected_revision !== "number") return failure("invalid_argument", "连接状态或版本无效", 400);
+    if (body.expected_revision !== connector.revision) return failure("conflict", "MCP 工具连接已变化，请刷新后重试", 409);
+    connector.enabled = body.enabled;
+    connector.revision += 1;
+    connector.updated_at = now();
+    return json(connector);
+  }),
+  http.delete("/api/mcp/connectors/:connectorID", ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    const index = mcpConnectors.findIndex((item) => item.id === String(params.connectorID) && mcpConnectorOwners.get(item.id) === actor.id);
+    const connector = mcpConnectors[index];
+    if (!connector) return failure("not_found", "MCP 工具连接不存在", 404);
+    const expectedRevision = Number(new URL(request.url).searchParams.get("expected_revision"));
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== connector.revision) return failure("conflict", "MCP 工具连接已变化，请刷新后重试", 409);
+    mcpConnectors.splice(index, 1);
+    mcpConnectorOwners.delete(connector.id);
+    return empty();
   }),
   http.get("/api/notifications", ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
@@ -2125,6 +2484,7 @@ export const handlers = [
     default_personal_data_quota_bytes: 5 * 1024 ** 3,
     default_personal_attachment_bytes: 300 * 1024 ** 2,
     default_model_budget: defaultModelBudget,
+    default_model: adminModelDefault(),
   }) : failure("forbidden", "没有执行此操作的权限", 403)),
   http.put("/api/admin/settings/model-budget-default", async ({ request, cookies }) => {
     const actor = sessionUser(cookies)!;
@@ -2144,6 +2504,26 @@ export const handlers = [
     };
     recordMockAudit(actor, "model.budget.default.update", "platform", { token_limit: defaultModelBudget.token_limit, max_concurrent: defaultModelBudget.max_concurrent, version: defaultModelBudget.version });
     return json(defaultModelBudget);
+  }),
+  http.put("/api/admin/settings/model-default", async ({ request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (!isAdmin(actor)) return failure("forbidden", "没有执行此操作的权限", 403);
+    const body = await request.json().catch(() => null) as { expected_version?: unknown; model_id?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 0
+      || typeof body.model_id !== "string") return failure("invalid_argument", "默认模型设置无效", 400);
+    if (Number(body.expected_version) !== defaultModelVersion) return failure("conflict", "默认模型版本已变化，请刷新后重试", 409);
+    if (body.model_id) {
+      const selected = modelConnections.find((model) => model.id === body.model_id);
+      if (!selected?.shared || !selected.checked_at || !selected.capabilities.text) {
+        return failure("invalid_argument", "默认模型必须是已检查且支持文本的共享连接", 400);
+      }
+      defaultModelID = selected.id;
+    } else {
+      defaultModelID = null;
+    }
+    defaultModelVersion += 1;
+    recordMockAudit(actor, "model.default.update", "platform", { configured: Boolean(defaultModelID), model_id: defaultModelID, version: defaultModelVersion });
+    return json(adminModelDefault());
   }),
   http.get("/api/admin/invites", ({ request, cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
@@ -2591,9 +2971,6 @@ export const handlers = [
     const nextStatus = body.status ?? user.status;
     if (body.status !== undefined && !nextAccountStatuses[user.status].includes(body.status)) return failure("conflict", "不允许此账号状态转换", 409);
     const firstApproval = nextStatus === "approved" && (user.status === "pending" || user.status === "rejected");
-    if (firstApproval && !defaultModelBudget.configured) {
-      return failure("invalid_state", "请先配置新用户默认模型额度，再批准账号", 409);
-    }
     if (body.status !== undefined && actor.id === user.id) return failure("forbidden", "不能修改自己的账号状态", 403);
     if (body.role !== undefined) {
       if (user.status !== "approved" || nextStatus !== "approved") return failure("conflict", "只有已通过账号可以调整角色", 409);
@@ -2607,7 +2984,7 @@ export const handlers = [
       return failure("invalid_argument", "默认电脑规格无效", 400);
     }
     const credentialsChanged = nextStatus !== user.status || body.role !== undefined;
-    if (firstApproval && !modelBudgets.has(user.id)) modelBudgets.set(user.id, {
+    if (firstApproval && defaultModelBudget.configured && !modelBudgets.has(user.id)) modelBudgets.set(user.id, {
       owner_id: user.id,
       configured: true,
       token_limit: defaultModelBudget.token_limit,

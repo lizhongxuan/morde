@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -43,7 +44,8 @@ func (s *Store) UpsertHostMember(ctx context.Context, value host.Member) (host.M
 		if err != nil {
 			return fmt.Errorf("upsert host member: %w", err)
 		}
-		result = hostMemberDomain(row)
+		result = hostMemberDomain(row.HostID, row.OwnerID, row.UserID, row.Permissions,
+			row.CreatedAt.Time, row.UpdatedAt.Time, timePointer(row.RevokedAt))
 		if controlActor == value.UserID {
 			allowed, err := hasControlPermission(ctx, tx, value.HostID, value.OwnerID, value.UserID, "")
 			if err != nil {
@@ -75,7 +77,8 @@ func (s *Store) ListHostMembers(ctx context.Context, hostID, ownerID string) ([]
 	}
 	values := make([]host.Member, 0, len(rows))
 	for _, row := range rows {
-		values = append(values, hostMemberDomain(row))
+		values = append(values, hostMemberDomain(row.HostID, row.OwnerID, row.UserID, row.Permissions,
+			row.CreatedAt.Time, row.UpdatedAt.Time, timePointer(row.RevokedAt)))
 	}
 	return values, nil
 }
@@ -147,10 +150,10 @@ func (s *Store) GetHostActorAccess(ctx context.Context, hostID, actorID string) 
 	return host.ActorAccess{OwnerID: row.OwnerID, Disabled: row.Disabled, Permissions: hostPermissions(row.Permissions)}, nil
 }
 
-func hostMemberDomain(row sqlcgen.HostMember) host.Member {
+func hostMemberDomain(hostID, ownerID, userID string, permissions []string, createdAt, updatedAt time.Time, revokedAt *time.Time) host.Member {
 	return host.Member{
-		HostID: row.HostID, OwnerID: row.OwnerID, UserID: row.UserID, Permissions: hostPermissions(row.Permissions),
-		CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time, RevokedAt: timePointer(row.RevokedAt),
+		HostID: hostID, OwnerID: ownerID, UserID: userID, Permissions: hostPermissions(permissions),
+		CreatedAt: createdAt, UpdatedAt: updatedAt, RevokedAt: revokedAt,
 	}
 }
 

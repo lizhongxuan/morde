@@ -38,6 +38,14 @@ type WorkspaceSyncService interface {
 	AckDownloadAction(context.Context, identity.Principal, string, string, string, workspace.ChangeAction, string, int64) error
 }
 
+// TaskMediaService exposes previews. GenerationReady is true only when the
+// provider, Token settlement, operation recovery, and Workspace publication
+// paths are all assembled.
+type TaskMediaService interface {
+	OpenPreview(context.Context, identity.Principal, string, string) (app.TaskMediaPreview, error)
+	GenerationReady() bool
+}
+
 type WorkspaceSyncDeviceService interface {
 	CreateChallenge(context.Context, identity.Principal, string, string, []byte) (app.WorkspaceSyncDeviceChallengeResult, error)
 	Register(context.Context, identity.Principal, string, string, string, []byte) (app.WorkspaceSyncDeviceRegistration, error)
@@ -158,6 +166,12 @@ type AdminModelBudgetDefaultService interface {
 	Update(context.Context, identity.Principal, app.UpdateModelBudgetDefaultCommand, string) (app.ModelBudgetDefault, error)
 }
 
+type AdminModelDefaultService interface {
+	Get(context.Context, identity.Principal) (app.AdminModelDefaultView, error)
+	Update(context.Context, identity.Principal, int64, string, string) (app.AdminModelDefaultView, error)
+	Available(context.Context) (app.AdminModelDefaultAvailability, error)
+}
+
 type RecordConsentService interface {
 	List(context.Context, identity.Principal) ([]record.Consent, error)
 	Set(context.Context, identity.Principal, record.Purpose, bool) (record.Consent, error)
@@ -193,6 +207,10 @@ type AdminAuditWriter interface {
 type AdminHostResourcesService interface {
 	Get(context.Context, identity.Principal, string) (app.HostResourceSnapshot, error)
 	Update(context.Context, identity.Principal, string, app.HostResources, int64) (app.HostResourceSnapshot, error)
+}
+
+type AdminHostRecoveryService interface {
+	RecoverUnknownRestore(context.Context, identity.Principal, string, int64, bool) (app.HostRecoveryResult, error)
 }
 
 type AdminUserRecord struct {

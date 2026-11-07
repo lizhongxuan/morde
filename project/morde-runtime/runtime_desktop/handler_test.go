@@ -19,18 +19,23 @@ import (
 )
 
 type fakeBackend struct {
-	mu          sync.Mutex
-	size        displaySize
-	image       []byte
-	windows     []window
-	activated   string
-	lastClick   [4]any
-	lastTarget  string
-	text        string
-	key         string
-	probeErr    error
-	blockClick  bool
-	clickCalled chan struct{}
+	mu                   sync.Mutex
+	size                 displaySize
+	image                []byte
+	windows              []window
+	activated            string
+	lastClick            [4]any
+	lastTarget           string
+	text                 string
+	key                  string
+	probeErr             error
+	blockClick           bool
+	clickCalled          chan struct{}
+	sizeAfterScreenshot  *displaySize
+	displayCalls         int
+	changeDisplayAt      int
+	sizeAfterDisplay     displaySize
+	focusChangeAtDisplay int
 }
 
 func (b *fakeBackend) probe(context.Context) (displaySize, error) {
@@ -39,8 +44,22 @@ func (b *fakeBackend) probe(context.Context) (displaySize, error) {
 	}
 	return b.size, nil
 }
-func (b *fakeBackend) display(context.Context) (displaySize, error) { return b.size, nil }
-func (b *fakeBackend) screenshot(context.Context) ([]byte, error)   { return b.image, nil }
+func (b *fakeBackend) display(context.Context) (displaySize, error) {
+	b.displayCalls++
+	if b.displayCalls == b.changeDisplayAt {
+		b.size = b.sizeAfterDisplay
+	}
+	if b.displayCalls == b.focusChangeAtDisplay && len(b.windows) > 0 {
+		b.windows[0].Active = false
+	}
+	return b.size, nil
+}
+func (b *fakeBackend) screenshot(context.Context) ([]byte, error) {
+	if b.sizeAfterScreenshot != nil {
+		b.size = *b.sizeAfterScreenshot
+	}
+	return b.image, nil
+}
 func (b *fakeBackend) listWindows(context.Context) ([]window, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -97,7 +116,7 @@ func TestHandlersExposeFrozenDesktopActions(t *testing.T) {
 }
 
 func TestScreenshotIsBoundedJPEGAndReportsHeaderDimensions(t *testing.T) {
-	imageBytes := testJPEG(t, 7, 3)
+	imageBytes := testJPEG(t, 16, 9)
 	backend := &fakeBackend{size: displaySize{width: 1600, height: 900}, image: imageBytes}
 	controller := newTestController(t, backend)
 	defer controller.Close()
@@ -106,10 +125,12 @@ func TestScreenshotIsBoundedJPEGAndReportsHeaderDimensions(t *testing.T) {
 		t.Fatal(err)
 	}
 	var response struct {
-		MIMEType   string `json:"mime_type"`
-		Width      int    `json:"width"`
-		Height     int    `json:"height"`
-		DataBase64 string `json:"data_base64"`
+		MIMEType     string `json:"mime_type"`
+		Width        int    `json:"width"`
+		Height       int    `json:"height"`
+		ScreenWidth  int    `json:"screen_width"`
+		ScreenHeight int    `json:"screen_height"`
+		DataBase64   string `json:"data_base64"`
 	}
 	if err := json.Unmarshal(result, &response); err != nil {
 		t.Fatal(err)
@@ -119,7 +140,8 @@ func TestScreenshotIsBoundedJPEGAndReportsHeaderDimensions(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, err := jpeg.DecodeConfig(bytes.NewReader(decoded))
-	if err != nil || response.MIMEType != "image/jpeg" || response.Width != config.Width || response.Height != config.Height || response.Width != 7 || response.Height != 3 {
+	if err != nil || response.MIMEType != "image/jpeg" || response.Width != config.Width || response.Height != config.Height ||
+		response.Width != 16 || response.Height != 9 || response.ScreenWidth != 1600 || response.ScreenHeight != 900 {
 		t.Fatalf("screenshot metadata = %#v, header = %#v, error = %v", response, config, err)
 	}
 	if !bytes.Equal(decoded, imageBytes) || len(decoded) > maxScreenshotBytes || len(result) > maxScreenshotJSONBytes {
@@ -129,6 +151,89 @@ func TestScreenshotIsBoundedJPEGAndReportsHeaderDimensions(t *testing.T) {
 	backend.image = bytes.Repeat([]byte{0xff}, maxScreenshotBytes+1)
 	if _, err := executeDesktop(t, controller, "desktop.observe", "screenshot", `{}`); !errors.Is(err, runtimecore.ErrResultTooLarge) {
 		t.Fatalf("oversized screenshot error = %v, want result-too-large", err)
+	}
+}
+
+func TestScreenshotRejectsChangedMissingOrInvalidDisplayGeometry(t *testing.T) {
+	tests := []struct {
+		name   string
+		before displaySize
+		after  *displaySize
+		image  []byte
+	}{
+		{name: "missing size", before: displaySize{}, image: testJPEG(t, 16, 9)},
+		{name: "out of bounds", before: displaySize{width: 16385, height: 900}, image: testJPEG(t, 16, 9)},
+		{name: "changed during capture", before: displaySize{width: 1600, height: 900}, after: &displaySize{width: 1920, height: 1080}, image: testJPEG(t, 16, 9)},
+		{name: "image aspect differs", before: displaySize{width: 1600, height: 900}, image: testJPEG(t, 9, 9)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &fakeBackend{size: displaySize{width: 1600, height: 900}, image: test.image}
+			controller := newTestController(t, backend)
+			defer controller.Close()
+			backend.size, backend.sizeAfterScreenshot = test.before, test.after
+			if _, err := executeDesktop(t, controller, "desktop.observe", "screenshot", `{}`); err == nil {
+				t.Fatal("screenshot with invalid or changing geometry was accepted")
+			}
+		})
+	}
+}
+
+func TestDesktopClickRejectsGeometryChangedImmediatelyBeforeDispatch(t *testing.T) {
+	backend := &fakeBackend{size: displaySize{width: 100, height: 50},
+		windows:         []window{{ID: "0x2a", Width: 100, Height: 50, Active: true}},
+		changeDisplayAt: 2, sizeAfterDisplay: displaySize{width: 200, height: 100}}
+	controller := newTestController(t, backend)
+	defer controller.Close()
+	_, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":20,"y":20,"screen_width":100,"screen_height":50,"screenshot_width":50,"screenshot_height":25}`)
+	if !errors.Is(err, runtimecore.ErrDesktopGeometryChanged) || backend.lastClick != [4]any{} {
+		t.Fatalf("click after geometry changed = %#v, %v; want rejected without input", backend.lastClick, err)
+	}
+}
+
+func TestDesktopClickRejectsFocusChangeAfterGeometryValidation(t *testing.T) {
+	backend := &fakeBackend{
+		size:                 displaySize{width: 100, height: 50},
+		windows:              []window{{ID: "0x2a", X: 10, Y: 10, Width: 60, Height: 30, Active: true}},
+		focusChangeAtDisplay: 2,
+	}
+	controller := newTestController(t, backend)
+	defer controller.Close()
+	_, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":20,"y":20,"screen_width":100,"screen_height":50}`)
+	if !errors.Is(err, errDesktopFocusChanged) || backend.lastClick != [4]any{} {
+		t.Fatalf("click after focus changed was dispatched: click=%#v err=%v", backend.lastClick, err)
+	}
+}
+
+func TestDesktopClickMapsScreenshotCoordinatesToDisplayPixels(t *testing.T) {
+	backend := &fakeBackend{size: displaySize{width: 1600, height: 900}, windows: []window{{
+		ID: "0x2a", X: 600, Y: 300, Width: 500, Height: 300, Active: true,
+	}}}
+	controller := newTestController(t, backend)
+	defer controller.Close()
+	result, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":400,"y":225,"screen_width":1600,"screen_height":900,"screenshot_width":800,"screenshot_height":450}`)
+	if err != nil || string(result) != `{"window_id":"0x2a","x":800,"y":450,"button":"left","clicked":true}` ||
+		backend.lastClick != [4]any{"0x2a", 200, 150, "left"} {
+		t.Fatalf("scaled click result=%s recorded=%#v err=%v", result, backend.lastClick, err)
+	}
+}
+
+func TestDesktopClickRejectsInvalidScreenshotCoordinatesAndNeverDispatchesOutOfBounds(t *testing.T) {
+	backend := &fakeBackend{size: displaySize{width: 1600, height: 900}, windows: []window{{
+		ID: "0x2a", X: 600, Y: 300, Width: 500, Height: 300, Active: true,
+	}}}
+	controller := newTestController(t, backend)
+	defer controller.Close()
+	for _, args := range []string{
+		`{"window_id":"0x2a","x":800,"y":225,"screen_width":1600,"screen_height":900,"screenshot_width":800,"screenshot_height":450}`,
+		`{"window_id":"0x2a","x":400,"y":450,"screen_width":1600,"screen_height":900,"screenshot_width":800,"screenshot_height":450}`,
+		`{"window_id":"0x2a","x":400,"y":225,"screen_width":1600,"screen_height":900,"screenshot_width":800,"screenshot_height":600}`,
+		`{"window_id":"0x2a","x":799,"y":449,"screen_width":1600,"screen_height":900,"screenshot_width":800,"screenshot_height":450}`,
+		`{"window_id":"0x2a","x":400,"y":225,"screen_width":1600,"screen_height":900,"screenshot_width":800}`,
+	} {
+		if _, err := executeDesktop(t, controller, "desktop.input", "click", args); !errors.Is(err, runtimecore.ErrInvalidRequest) || backend.lastClick != [4]any{} {
+			t.Errorf("invalid or out-of-window screenshot click dispatched (%s): click=%#v err=%v", args, backend.lastClick, err)
+		}
 	}
 }
 
@@ -165,13 +270,25 @@ func TestClickTypeAndKeyValidationAndResultShapes(t *testing.T) {
 	backend := &fakeBackend{size: displaySize{width: 100, height: 50}, windows: []window{{ID: "0x2a", X: 10, Y: 10, Width: 60, Height: 30, Active: true}}}
 	controller := newTestController(t, backend)
 	defer controller.Close()
-	result, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":69,"y":39}`)
+	result, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":69,"y":39,"screen_width":100,"screen_height":50}`)
 	if err != nil || string(result) != `{"window_id":"0x2a","x":69,"y":39,"button":"left","clicked":true}` || backend.lastClick != [4]any{"0x2a", 59, 29, "left"} {
 		t.Fatalf("click result=%s recorded=%#v err=%v", result, backend.lastClick, err)
 	}
 	backend.size = displaySize{width: 10, height: 10}
+	lastClick := backend.lastClick
+	if _, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":1,"y":1,"screen_width":100,"screen_height":50}`); !errors.Is(err, runtimecore.ErrDesktopGeometryChanged) || backend.lastClick != lastClick {
+		t.Fatalf("click after screen resize was dispatched: click=%#v err=%v", backend.lastClick, err)
+	}
 	for _, args := range []string{
-		`{"window_id":"0x2a","x":10,"y":0}`, `{"window_id":"0x2a","x":-1,"y":0}`, `{"window_id":"0x2a","x":1.0,"y":0}`, `{"window_id":"0x2a","y":0}`, `{"window_id":"0x2a","x":1,"y":2,"button":"side"}`, `{"window_id":"0x2a","x":1,"y":2,"extra":0}`, `{"window_id":"0x2a","x":1,"y":2,"button":null}`, `{"window_id":"0x2a","x":5,"y":5}`,
+		`{"window_id":"0x2a","x":10,"y":0,"screen_width":10,"screen_height":10}`,
+		`{"window_id":"0x2a","x":-1,"y":0,"screen_width":10,"screen_height":10}`,
+		`{"window_id":"0x2a","x":1.0,"y":0,"screen_width":10,"screen_height":10}`,
+		`{"window_id":"0x2a","y":0,"screen_width":10,"screen_height":10}`,
+		`{"window_id":"0x2a","x":1,"y":2,"screen_width":10,"screen_height":10,"button":"side"}`,
+		`{"window_id":"0x2a","x":1,"y":2,"screen_width":10,"screen_height":10,"extra":0}`,
+		`{"window_id":"0x2a","x":1,"y":2,"screen_width":10,"screen_height":10,"button":null}`,
+		`{"window_id":"0x2a","x":5,"y":5,"screen_width":10,"screen_height":10}`,
+		`{"window_id":"0x2a","x":1,"y":2}`,
 	} {
 		if _, err := executeDesktop(t, controller, "desktop.input", "click", args); !errors.Is(err, runtimecore.ErrInvalidRequest) {
 			t.Errorf("invalid click args accepted %s: %v", args, err)
@@ -180,8 +297,8 @@ func TestClickTypeAndKeyValidationAndResultShapes(t *testing.T) {
 
 	backend.size = displaySize{width: 100, height: 50}
 	backend.windows[0].Active = false
-	lastClick := backend.lastClick
-	if _, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":20,"y":20}`); !errors.Is(err, errDesktopFocusChanged) || backend.lastClick != lastClick {
+	lastClick = backend.lastClick
+	if _, err := executeDesktop(t, controller, "desktop.input", "click", `{"window_id":"0x2a","x":20,"y":20,"screen_width":100,"screen_height":50}`); !errors.Is(err, errDesktopFocusChanged) || backend.lastClick != lastClick {
 		t.Fatalf("click on an inactive window was dispatched: click=%#v err=%v", backend.lastClick, err)
 	}
 	backend.windows[0].Active = true
@@ -221,7 +338,7 @@ func TestConcurrentCancellationWaitsForInputProcessToStop(t *testing.T) {
 	defer controller.Close()
 	handler := findHandler(t, controller, "desktop.input", "click")
 	ctx, cancel := context.WithCancel(context.Background())
-	request := contract.ExecuteRequest{OperationID: "o0000001", TaskID: "q0000001", Capability: "desktop.input", Action: "click", Arguments: json.RawMessage(`{"window_id":"0x2a","x":1,"y":2}`)}
+	request := contract.ExecuteRequest{OperationID: "o0000001", TaskID: "q0000001", Capability: "desktop.input", Action: "click", Arguments: json.RawMessage(`{"window_id":"0x2a","x":1,"y":2,"screen_width":10,"screen_height":10}`)}
 	executeDone := make(chan error, 1)
 	go func() { _, err := handler.Execute(ctx, request); executeDone <- err }()
 	select {

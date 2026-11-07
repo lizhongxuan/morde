@@ -1164,7 +1164,16 @@ components:
             lease_version: { type: integer, minimum: 1 }
             capability: { $ref: '#/components/schemas/Capability' }
             action: { type: string, minLength: 1 }
-            arguments: { type: object }
+            arguments:
+              type: object
+              description: >-
+                For desktop.input/click, window_id, x, y, screenshot_width,
+                screenshot_height, screen_width and screen_height are required.
+                x/y are pixel coordinates in the latest desktop_screenshot image;
+                screenshot_width/height are that bounded image's dimensions, while
+                screen_width/height are the actual display dimensions returned by the
+                same screenshot. The Host maps x/y to screen pixels and rejects the
+                click if the current display geometry no longer matches screen_width/height.
     Operation:
       type: object
       required: [host_id, runtime_generation, runtime_instance_id, control_version, task_id, operation_id, lease_version, status]
@@ -1183,7 +1192,13 @@ components:
         capability: { type: string }
         action: { type: string }
         status: { $ref: '#/components/schemas/OperationStatus' }
-        result: { type: object }
+        result:
+          type: object
+          description: >-
+            A successful desktop.observe/screenshot returns mime_type, width and height
+            for the bounded JPEG, screen_width and screen_height for the actual display,
+            and data_base64. A refused click caused by a screen size change returns the
+            bounded failure code desktop_geometry_changed without sending input.
     OperationStatus:
       type: string
       enum: [accepted, running, succeeded, failed, cancelling, cancelled, unknown]

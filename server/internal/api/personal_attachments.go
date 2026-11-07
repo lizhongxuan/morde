@@ -70,6 +70,9 @@ func RegisterPersonalAttachmentRoutes(group *gin.RouterGroup, service personalAt
 			unauthenticated(c)
 			return
 		}
+		if !optionalMessageActor(c, principal) {
+			return
+		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, personalAttachmentUploadMaxBodyBytes)
 		var request personalAttachmentUploadRequest
 		if !decodeStrictJSON(c, &request) {
@@ -108,6 +111,9 @@ func RegisterPersonalAttachmentRoutes(group *gin.RouterGroup, service personalAt
 		principal, ok := principalFrom(c)
 		if !ok {
 			unauthenticated(c)
+			return
+		}
+		if !optionalMessageActor(c, principal) {
 			return
 		}
 		sequenceValue, err := strconv.ParseInt(c.Param("sequence"), 10, 32)
@@ -150,6 +156,9 @@ func RegisterPersonalAttachmentRoutes(group *gin.RouterGroup, service personalAt
 			unauthenticated(c)
 			return
 		}
+		if !optionalMessageActor(c, principal) {
+			return
+		}
 		if !personalAttachmentBodyIsEmpty(c) {
 			return
 		}
@@ -176,6 +185,9 @@ func RegisterPersonalAttachmentRoutes(group *gin.RouterGroup, service personalAt
 		principal, ok := principalFrom(c)
 		if !ok {
 			unauthenticated(c)
+			return
+		}
+		if !optionalMessageActor(c, principal) {
 			return
 		}
 		if !personalAttachmentBodyIsEmpty(c) {

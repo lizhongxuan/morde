@@ -80,7 +80,12 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		return schedule.Schedule{}, err
 	}
 	command.Objective = stringsTrim(command.Objective)
-	if (command.HostID != "" && !domain.ValidHostID(command.HostID)) || command.ModelID == "" || len(command.ModelID) > 200 || command.Objective == "" || len(command.Objective) > 32768 {
+	title := command.Objective
+	if command.Title != nil {
+		title = stringsTrim(*command.Title)
+	}
+	if (command.HostID != "" && !domain.ValidHostID(command.HostID)) || command.ModelID == "" || len(command.ModelID) > 200 ||
+		command.Objective == "" || len(command.Objective) > 32768 || title == "" || len(title) > 32768 {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule fields are invalid")
 	}
 	if command.MisfirePolicy == "" {
@@ -110,7 +115,7 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 	value := schedule.Schedule{
 		ID: id, OwnerID: principal.UserID, Version: 1, Status: schedule.StatusEnabled,
 		ExecutionEpoch: 1, // CreateSchedule replaces this validation placeholder with the locked owner epoch.
-		HostID:         command.HostID, ModelID: command.ModelID, Objective: command.Objective,
+		HostID:         command.HostID, ModelID: command.ModelID, Title: title, Objective: command.Objective,
 		Timing: command.Timing, Budget: command.Budget, Authorization: scheduleAuthorization(principal),
 		MisfirePolicy: command.MisfirePolicy, NotificationEvents: command.NotificationEvents,
 		Observation: command.Observation, NextOccurrenceKey: first.Key, NextRunAt: first.ScheduledAt,
@@ -125,13 +130,14 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 	requestHash, err := hashIdempotencyRequest(struct {
 		HostID             string
 		ModelID            string
+		Title              string
 		Objective          string
 		Timing             schedule.Timing
 		Budget             task.Budget
 		Observation        *schedule.ObservationSpec
 		MisfirePolicy      schedule.MisfirePolicy
 		NotificationEvents []schedule.NotificationEvent
-	}{command.HostID, command.ModelID, command.Objective, command.Timing, command.Budget, command.Observation, command.MisfirePolicy, command.NotificationEvents})
+	}{command.HostID, command.ModelID, value.Title, command.Objective, command.Timing, command.Budget, command.Observation, command.MisfirePolicy, command.NotificationEvents})
 	if err != nil {
 		return schedule.Schedule{}, err
 	}
@@ -167,8 +173,15 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 	if command.ModelID != nil {
 		current.ModelID = *command.ModelID
 	}
+	if command.Title != nil {
+		title := stringsTrim(*command.Title)
+		command.Title = &title
+		current.Title = title
+	}
 	if command.Objective != nil {
-		current.Objective = *command.Objective
+		objective := stringsTrim(*command.Objective)
+		command.Objective = &objective
+		current.Objective = objective
 	}
 	if command.Timing != nil {
 		current.Timing = *command.Timing
@@ -194,6 +207,10 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 	}
 	if command.NotificationEvents != nil {
 		current.NotificationEvents = append([]schedule.NotificationEvent(nil), (*command.NotificationEvents)...)
+	}
+	if stringsTrim(current.Title) == "" || len(stringsTrim(current.Title)) > 32768 ||
+		stringsTrim(current.Objective) == "" || len(stringsTrim(current.Objective)) > 32768 {
+		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule fields are invalid")
 	}
 	current.Authorization = scheduleAuthorization(principal)
 	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Objective, current.Observation); err != nil {

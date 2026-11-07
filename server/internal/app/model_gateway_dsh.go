@@ -60,6 +60,7 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 		return invalid()
 	}
 	request := ModelRequest{MaxOutputTokens: 2048, Temperature: input.Temperature}
+	var instructions strings.Builder
 	if input.MaxTokens != nil {
 		request.MaxOutputTokens = *input.MaxTokens
 	}
@@ -79,6 +80,13 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 				text.WriteString(block.Text)
 				if message.Role != "tool" && block.Text != "" {
 					parts = append(parts, ModelContentPart{Type: "text", Text: block.Text})
+				}
+			case "reasoning":
+				if message.Role != "assistant" || len(calls) != 0 {
+					return invalid()
+				}
+				if block.Text != "" {
+					parts = append(parts, ModelContentPart{Type: "reasoning", Text: block.Text})
 				}
 			case "tool-call":
 				if message.Role != "assistant" {
@@ -117,13 +125,24 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 		if message.ToolCallID != "" || message.IsError {
 			return invalid()
 		}
+		if message.Role == "system" || message.Role == "developer" {
+			if len(calls) != 0 || text.Len() == 0 {
+				return invalid()
+			}
+			if instructions.Len() != 0 {
+				instructions.WriteString("\n\n")
+			}
+			instructions.WriteString(text.String())
+			continue
+		}
 		if len(parts) != 0 {
 			request.Input = append(request.Input, ModelInput{Type: "message", Role: message.Role, Parts: parts})
-		} else if message.Role != "system" && len(calls) == 0 {
+		} else if len(calls) == 0 {
 			return invalid()
 		}
 		request.Input = append(request.Input, calls...)
 	}
+	request.Instructions = instructions.String()
 	for _, tool := range input.Tools {
 		if tool.DeferLoading {
 			return ModelRequest{}, domain.NewError(domain.CodeUnsupported, "deferred task tools are unsupported")

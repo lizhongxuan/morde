@@ -12,7 +12,7 @@ import (
 )
 
 const getTask = `-- name: GetTask :one
-SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent, workspace_checkpoint_revision, project_id, initiator_id FROM tasks WHERE id = $1 AND owner_id = $2
+SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, runtime_lease_safe_after, execution_epoch, application_id, auth_client_installation_id, execution_location, workspace_id, input_revision, context_digest, auth_version, auth_expires_at, agent_instance_id, agent_generation, agent_session_id, agent_engine_version, agent_profile_version, checkpoint_digest, checkpoint_through_seq, file_delivery_intent, workspace_checkpoint_revision, project_id, initiator_id, current_revision, desired_revision, workspace_owner_id, workspace_project_resource_version FROM tasks WHERE id = $1 AND owner_id = $2
 `
 
 type GetTaskParams struct {
@@ -71,8 +71,119 @@ func (q *Queries) GetTask(ctx context.Context, arg GetTaskParams) (Task, error) 
 		&i.WorkspaceCheckpointRevision,
 		&i.ProjectID,
 		&i.InitiatorID,
+		&i.CurrentRevision,
+		&i.DesiredRevision,
+		&i.WorkspaceOwnerID,
+		&i.WorkspaceProjectResourceVersion,
 	)
 	return i, err
+}
+
+const listConversationActiveTasks = `-- name: ListConversationActiveTasks :many
+SELECT tasks.id, tasks.owner_id, tasks.conversation_id, tasks.host_id, tasks.model_id, tasks.objective, tasks.status, tasks.auth_kind, tasks.auth_token_id, tasks.auth_scopes, tasks.budget_active_seconds, tasks.budget_tool_calls, tasks.budget_model_tokens, tasks.usage_active_seconds, tasks.usage_tool_calls, tasks.usage_model_tokens, tasks.lease_owner, tasks.lease_version, tasks.lease_expires_at, tasks.event_seq, tasks.current_step, tasks.result, tasks.waiting_reason, tasks.created_at, tasks.updated_at, tasks.finished_at, tasks.runtime_lease_safe_after, tasks.execution_epoch, tasks.application_id, tasks.auth_client_installation_id, tasks.execution_location, tasks.workspace_id, tasks.input_revision, tasks.context_digest, tasks.auth_version, tasks.auth_expires_at, tasks.agent_instance_id, tasks.agent_generation, tasks.agent_session_id, tasks.agent_engine_version, tasks.agent_profile_version, tasks.checkpoint_digest, tasks.checkpoint_through_seq, tasks.file_delivery_intent, tasks.workspace_checkpoint_revision, tasks.project_id, tasks.initiator_id, tasks.current_revision, tasks.desired_revision, tasks.workspace_owner_id, tasks.workspace_project_resource_version FROM tasks
+WHERE tasks.conversation_id = $1
+  AND tasks.project_id IS NOT DISTINCT FROM $2::text
+  AND ((tasks.project_id IS NULL AND tasks.owner_id = $3 AND tasks.initiator_id = tasks.owner_id)
+    OR (tasks.project_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
+      WHERE pm.project_id = tasks.project_id AND pm.user_id = $3
+    )))
+  AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling')
+  AND ($4::text[] IS NULL OR tasks.host_id = ANY($4::text[]))
+  AND ($5::timestamptz IS NULL OR tasks.created_at < $5::timestamptz
+    OR (tasks.created_at = $5::timestamptz AND tasks.id < $6))
+ORDER BY tasks.created_at DESC, tasks.id DESC
+LIMIT $7
+`
+
+type ListConversationActiveTasksParams struct {
+	ConversationID string             `json:"conversation_id"`
+	ProjectID      pgtype.Text        `json:"project_id"`
+	ActorID        string             `json:"actor_id"`
+	HostIds        []string           `json:"host_ids"`
+	CursorAt       pgtype.Timestamptz `json:"cursor_at"`
+	CursorID       string             `json:"cursor_id"`
+	PageLimit      int32              `json:"page_limit"`
+}
+
+func (q *Queries) ListConversationActiveTasks(ctx context.Context, arg ListConversationActiveTasksParams) ([]Task, error) {
+	rows, err := q.db.Query(ctx, listConversationActiveTasks,
+		arg.ConversationID,
+		arg.ProjectID,
+		arg.ActorID,
+		arg.HostIds,
+		arg.CursorAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Task
+	for rows.Next() {
+		var i Task
+		if err := rows.Scan(
+			&i.ID,
+			&i.OwnerID,
+			&i.ConversationID,
+			&i.HostID,
+			&i.ModelID,
+			&i.Objective,
+			&i.Status,
+			&i.AuthKind,
+			&i.AuthTokenID,
+			&i.AuthScopes,
+			&i.BudgetActiveSeconds,
+			&i.BudgetToolCalls,
+			&i.BudgetModelTokens,
+			&i.UsageActiveSeconds,
+			&i.UsageToolCalls,
+			&i.UsageModelTokens,
+			&i.LeaseOwner,
+			&i.LeaseVersion,
+			&i.LeaseExpiresAt,
+			&i.EventSeq,
+			&i.CurrentStep,
+			&i.Result,
+			&i.WaitingReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.FinishedAt,
+			&i.RuntimeLeaseSafeAfter,
+			&i.ExecutionEpoch,
+			&i.ApplicationID,
+			&i.AuthClientInstallationID,
+			&i.ExecutionLocation,
+			&i.WorkspaceID,
+			&i.InputRevision,
+			&i.ContextDigest,
+			&i.AuthVersion,
+			&i.AuthExpiresAt,
+			&i.AgentInstanceID,
+			&i.AgentGeneration,
+			&i.AgentSessionID,
+			&i.AgentEngineVersion,
+			&i.AgentProfileVersion,
+			&i.CheckpointDigest,
+			&i.CheckpointThroughSeq,
+			&i.FileDeliveryIntent,
+			&i.WorkspaceCheckpointRevision,
+			&i.ProjectID,
+			&i.InitiatorID,
+			&i.CurrentRevision,
+			&i.DesiredRevision,
+			&i.WorkspaceOwnerID,
+			&i.WorkspaceProjectResourceVersion,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listTaskArtifacts = `-- name: ListTaskArtifacts :many
@@ -151,7 +262,7 @@ func (q *Queries) ListTaskBatchItems(ctx context.Context, taskID string) ([]Task
 }
 
 const listTaskEvents = `-- name: ListTaskEvents :many
-SELECT task_id, sequence, event_type, payload, created_at FROM task_events
+SELECT task_id, sequence, event_type, payload, created_at, task_revision, result_content_sha256 FROM task_events
 WHERE task_id = $1 AND sequence > $2
 ORDER BY sequence
 LIMIT $3
@@ -178,6 +289,8 @@ func (q *Queries) ListTaskEvents(ctx context.Context, arg ListTaskEventsParams) 
 			&i.EventType,
 			&i.Payload,
 			&i.CreatedAt,
+			&i.TaskRevision,
+			&i.ResultContentSha256,
 		); err != nil {
 			return nil, err
 		}
@@ -223,7 +336,7 @@ func (q *Queries) ListTaskSteps(ctx context.Context, taskID string) ([]TaskStep,
 }
 
 const listTasks = `-- name: ListTasks :many
-SELECT tasks.id, tasks.owner_id, tasks.conversation_id, tasks.host_id, tasks.model_id, tasks.objective, tasks.status, tasks.auth_kind, tasks.auth_token_id, tasks.auth_scopes, tasks.budget_active_seconds, tasks.budget_tool_calls, tasks.budget_model_tokens, tasks.usage_active_seconds, tasks.usage_tool_calls, tasks.usage_model_tokens, tasks.lease_owner, tasks.lease_version, tasks.lease_expires_at, tasks.event_seq, tasks.current_step, tasks.result, tasks.waiting_reason, tasks.created_at, tasks.updated_at, tasks.finished_at, tasks.runtime_lease_safe_after, tasks.execution_epoch, tasks.application_id, tasks.auth_client_installation_id, tasks.execution_location, tasks.workspace_id, tasks.input_revision, tasks.context_digest, tasks.auth_version, tasks.auth_expires_at, tasks.agent_instance_id, tasks.agent_generation, tasks.agent_session_id, tasks.agent_engine_version, tasks.agent_profile_version, tasks.checkpoint_digest, tasks.checkpoint_through_seq, tasks.file_delivery_intent, tasks.workspace_checkpoint_revision, tasks.project_id, tasks.initiator_id FROM tasks
+SELECT tasks.id, tasks.owner_id, tasks.conversation_id, tasks.host_id, tasks.model_id, tasks.objective, tasks.status, tasks.auth_kind, tasks.auth_token_id, tasks.auth_scopes, tasks.budget_active_seconds, tasks.budget_tool_calls, tasks.budget_model_tokens, tasks.usage_active_seconds, tasks.usage_tool_calls, tasks.usage_model_tokens, tasks.lease_owner, tasks.lease_version, tasks.lease_expires_at, tasks.event_seq, tasks.current_step, tasks.result, tasks.waiting_reason, tasks.created_at, tasks.updated_at, tasks.finished_at, tasks.runtime_lease_safe_after, tasks.execution_epoch, tasks.application_id, tasks.auth_client_installation_id, tasks.execution_location, tasks.workspace_id, tasks.input_revision, tasks.context_digest, tasks.auth_version, tasks.auth_expires_at, tasks.agent_instance_id, tasks.agent_generation, tasks.agent_session_id, tasks.agent_engine_version, tasks.agent_profile_version, tasks.checkpoint_digest, tasks.checkpoint_through_seq, tasks.file_delivery_intent, tasks.workspace_checkpoint_revision, tasks.project_id, tasks.initiator_id, tasks.current_revision, tasks.desired_revision, tasks.workspace_owner_id, tasks.workspace_project_resource_version FROM tasks
 WHERE ((tasks.project_id IS NULL AND tasks.owner_id = $1) OR (tasks.project_id IS NOT NULL AND EXISTS (
     SELECT 1 FROM project_members pm JOIN users u ON u.id=pm.user_id AND u.status='approved'
     WHERE pm.project_id=tasks.project_id AND pm.user_id=$1
@@ -308,6 +421,10 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]Task, e
 			&i.WorkspaceCheckpointRevision,
 			&i.ProjectID,
 			&i.InitiatorID,
+			&i.CurrentRevision,
+			&i.DesiredRevision,
+			&i.WorkspaceOwnerID,
+			&i.WorkspaceProjectResourceVersion,
 		); err != nil {
 			return nil, err
 		}

@@ -41,9 +41,7 @@ export function AdminUsers() {
       notify('账号信息已更新。', 'success');
       void client.invalidateQueries({ queryKey: ['admin', 'users'] });
     },
-    onError: (error) => notify(errorDetails(error).code === 'invalid_state'
-      ? '尚未配置新用户默认模型额度，请先到“设置与默认额度”配置后再批准。'
-      : errorDetails(error).message, 'error'),
+    onError: (error) => notify(errorDetails(error).message, 'error'),
   });
 
   const changeStatus = (item: AdminUser, status: AccountStatus) => update.mutate({
@@ -55,8 +53,8 @@ export function AdminUsers() {
     body: { expected_status: item.status, role: item.role === 'admin' ? 'user' : 'admin' },
   });
 
-  return <section className="admin-content">
-    <div className="page-heading"><div><p className="eyebrow">账号与权限</p><h1>用户</h1><p className="muted">审核注册申请，管理已通过账号的使用状态和管理员权限。</p></div></div>
+  return <section className="admin-content design-panel">
+    <div className="design-panel-header"><div><h2>用户列表</h2><p>审核账号并管理权限。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>刷新数据</button></div>
     <div className="device-manager-actions">
       <label htmlFor="user-status-filter">账号状态</label>
       <select id="user-status-filter" value={filter} onChange={(event) => { setFilter(event.target.value as AccountStatus | 'all'); setOffset(0); }}>

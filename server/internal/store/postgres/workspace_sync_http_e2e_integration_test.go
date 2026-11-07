@@ -294,10 +294,10 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 		t.Fatalf("remote-to-local handoff source update = %#v, %v", remoteEdit.Session, err)
 	}
 	updatedManifest, err := store.GetWorkspaceManifestPage(ctx, value.ID, remoteEdit.Session.TargetRevision, "", "", 100)
-	if err != nil || len(updatedManifest.Directories) < len(manifest.Directories) {
+	if err != nil || len(updatedManifest.Directories) < len(handoffManifest.Directories) {
 		t.Fatalf("remote file content update lost unchanged directory metadata: %#v, %v", updatedManifest.Directories, err)
 	}
-	for _, prior := range manifest.Directories {
+	for _, prior := range handoffManifest.Directories {
 		if prior.Mode == nil && prior.ModTimeNS == nil && !prior.MetadataKnown {
 			continue
 		}

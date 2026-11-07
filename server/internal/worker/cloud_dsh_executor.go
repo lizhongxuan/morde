@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,7 +24,10 @@ import (
 )
 
 const cloudDSHMaxFrame = 4 << 20
-const cloudDSHMaxText = 256 << 10
+const cloudDSHMaxText = app.MaxDSHModelResponseTextBytes
+
+// This is the persisted Morde checkpoint/protocol compatibility identifier, not the upstream DSH package release.
+// Changing it requires migrating existing durable Task agent instances and checkpoints.
 const cloudDSHEngineVersion = "0.2.0-rc.2"
 const cloudDSHProfileVersion = "v1"
 const cloudDSHDelegateToolName = "dsh_delegate"
@@ -42,37 +44,105 @@ var ErrCloudDSHCompletionPending = errors.New("dsh completion requires output ve
 // returning a tool result, so the dsh process must stop without failing it.
 var ErrCloudDSHWaitingForUser = errors.New("dsh task is waiting for user input")
 
+var errCloudDSHModelResultUnavailable = errors.New("dsh model result is unavailable or contains an unauthorized tool")
+
+type cloudDSHModelFailureCategory interface {
+	ModelFailureCategory() string
+}
+
+type cloudDSHModelResultError struct {
+	category string
+}
+
+func (e cloudDSHModelResultError) Error() string { return errCloudDSHModelResultUnavailable.Error() }
+
+func (e cloudDSHModelResultError) Is(target error) bool {
+	return target == errCloudDSHModelResultUnavailable
+}
+
+func (e cloudDSHModelResultError) ModelFailureCategory() string { return e.category }
+
+func cloudDSHModelErrorCategory(err error) string {
+	if err == nil {
+		return "invalid_response"
+	}
+	var category cloudDSHModelFailureCategory
+	if errors.As(err, &category) {
+		return category.ModelFailureCategory()
+	}
+	var domainErr *domain.Error
+	if errors.As(err, &domainErr) {
+		if domainErr.Details["reason"] == "task_model_budget_exhausted" {
+			return "task_budget_exhausted"
+		}
+		if stage, ok := domainErr.Details["stage"].(string); ok {
+			switch stage {
+			case "client_validation":
+				return "client_request_invalid"
+			case "provider_status":
+				switch domainErr.Details["provider_code"] {
+				case "invalid_request_error":
+					return "provider_invalid_request"
+				case "unsupported_parameter":
+					return "provider_unsupported_parameter"
+				case "context_length_exceeded":
+					return "provider_context_length_exceeded"
+				case "model_not_found":
+					return "provider_model_not_found"
+				case "permission_denied":
+					return "provider_permission_denied"
+				case "invalid_api_key":
+					return "provider_invalid_api_key"
+				case "rate_limit_exceeded":
+					return "provider_rate_limited"
+				case "insufficient_quota", "billing_hard_limit_reached":
+					return "provider_quota_exhausted"
+				case "server_error":
+					return "provider_server_error"
+				default:
+					return "provider_request_rejected"
+				}
+			}
+		}
+		if reason, ok := domainErr.Details["reason"].(string); ok {
+			switch app.ModelClientErrorKind(reason) {
+			case app.ModelErrorAuthentication, app.ModelErrorAccess, app.ModelErrorRateLimited, app.ModelErrorQuota,
+				app.ModelErrorInvalidRequest, app.ModelErrorUnavailable, app.ModelErrorTimeout, app.ModelErrorTransport,
+				app.ModelErrorInvalidResponse:
+				return reason
+			}
+		}
+		switch domainErr.Code {
+		case domain.CodeResultTooLarge:
+			return "context_length_exceeded"
+		case domain.CodeInvalidArgument:
+			return "invalid_request"
+		case domain.CodeQuotaExceeded:
+			return "quota_exhausted"
+		case domain.CodeRateLimited:
+			return "rate_limited"
+		case domain.CodeUpstreamTimeout:
+			return "timeout"
+		case domain.CodeUpstreamError:
+			return "upstream_error"
+		case domain.CodeInvalidState:
+			return "usage_unknown"
+		case domain.CodeUnsupported:
+			return "unsupported"
+		}
+	}
+	return "unknown"
+}
+
+func cloudDSHModelResultErrorFor(err error) error {
+	return cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+}
+
 var cloudDSHID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
-
-// CloudDSHLaunch is passed only to the separately trusted supervisor. Nonce and
-// fence must never be placed in the child environment or command line.
-type CloudDSHLaunch struct {
-	NodePath    string
-	ScriptPath  string
-	Environment []string
-	Fence       app.AgentInstanceFence
-	Nonce       []byte
-	ExpiresAt   time.Time
-}
-
-// CloudDSHSupervisor must isolate the child from Portal credentials and its
-// filesystem, enforce ExpiresAt independently of the worker, and supervise the
-// entire process tree. Stop must return a signed, verifiable tree-stop receipt.
-// No production implementation is supplied by this adapter.
-type CloudDSHSupervisor interface {
-	Start(context.Context, CloudDSHLaunch) (io.WriteCloser, io.ReadCloser, error)
-	Renew(context.Context, app.AgentInstanceFence, time.Time) error
-	Stop(context.Context, app.AgentInstanceFence, []byte) (app.AgentStopReceipt, error)
-}
-
-type CloudDSHStopFinalizer interface {
-	AgentStopConfirmed(app.AgentInstanceFence, []byte)
-}
 
 type CloudDSHInstances interface {
 	Start(context.Context, app.AgentInstanceStart) (app.AgentInstanceLease, bool, error)
 	Renew(context.Context, app.AgentInstanceFence, time.Duration) (app.AgentInstanceLease, error)
-	ConfirmStopped(context.Context, app.AgentStopReceipt) (bool, error)
 }
 
 type CloudDSHCheckpoints interface {
@@ -83,6 +153,24 @@ type CloudDSHCheckpoints interface {
 
 type CloudDSHModels interface {
 	Complete(context.Context, app.ModelCall) (app.ModelResponse, error)
+}
+
+// CloudDSHRevisionStopWitness proves that a lease was fenced specifically by
+// a persisted, currently authorized revision stop request.
+type CloudDSHRevisionStopWitness interface {
+	RevisionStopProven(context.Context, task.Task) (bool, error)
+}
+
+// CloudDSHModelToolCapability checks the selected model using the task initiator's scope.
+type CloudDSHModelToolCapability interface {
+	TaskToolCapability(context.Context, task.Task) (bool, error)
+}
+
+// CloudDSHProjectContexts restores the original authorized project snapshot
+// before a recovered Agent may start a Runtime.
+type CloudDSHProjectContexts interface {
+	LoadProjectTaskContext(context.Context, task.Task) (*task.ConversationContext, error)
+	PauseProjectTaskRecovery(context.Context, task.Task) error
 }
 
 type CloudDSHTools interface {
@@ -103,31 +191,52 @@ type CloudDSHRecoveryTools interface {
 	PauseRecovery(context.Context, task.Task) error
 }
 
+type cloudDSHModelRecoveryTools interface {
+	PauseModelRecovery(context.Context, task.Task, string) error
+}
+
+func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task, cause error) error {
+	var failure cloudDSHModelFailureCategory
+	if errors.As(cause, &failure) {
+		if detailed, ok := tools.(cloudDSHModelRecoveryTools); ok {
+			return detailed.PauseModelRecovery(ctx, value, failure.ModelFailureCategory())
+		}
+	}
+	return tools.PauseRecovery(ctx, value)
+}
+
 type CloudDSHCompleter interface {
 	Complete(context.Context, task.Task, app.CloudDSHTaskCompletion) error
 }
 
 type CloudDSHExecutorOptions struct {
-	NodePath        string
-	ScriptPath      string
-	SupervisorID    string
-	Supervisor      CloudDSHSupervisor
-	AccountRuntimes *CloudDSHAccountRuntimeManager
-	Instances       CloudDSHInstances
-	Checkpoints     CloudDSHCheckpoints
-	Models          CloudDSHModels
-	Tools           CloudDSHTools
-	Children        CloudDSHChildSessions
-	Completion      CloudDSHCompleter
+	SupervisorID     string
+	AccountRuntimes  *CloudDSHAccountRuntimeManager
+	Instances        CloudDSHInstances
+	Checkpoints      CloudDSHCheckpoints
+	Models           CloudDSHModels
+	ToolCapabilities CloudDSHModelToolCapability
+	ProjectContexts  CloudDSHProjectContexts
+	StreamCapability CloudDSHTextStreamingCapability
+	TextStreams      CloudDSHTextStreamStore
+	RevisionStops    CloudDSHRevisionStopWitness
+	Tools            CloudDSHTools
+	Children         CloudDSHChildSessions
+	Completion       CloudDSHCompleter
 }
 
 type CloudDSHExecutor struct{ options CloudDSHExecutorOptions }
 
 func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, error) {
-	if !filepath.IsAbs(options.NodePath) || !filepath.IsAbs(options.ScriptPath) ||
-		!cloudDSHID.MatchString(options.SupervisorID) || options.Supervisor == nil ||
+	if !cloudDSHID.MatchString(options.SupervisorID) || options.AccountRuntimes == nil ||
 		options.Instances == nil || options.Checkpoints == nil || options.Models == nil {
-		return nil, errors.New("dsh requires absolute paths and all trusted supervisor and service dependencies")
+		return nil, errors.New("dsh requires a conversation runtime and all trusted service dependencies")
+	}
+	if options.ToolCapabilities == nil {
+		options.ToolCapabilities, _ = options.Models.(CloudDSHModelToolCapability)
+	}
+	if options.StreamCapability == nil {
+		options.StreamCapability, _ = options.Models.(CloudDSHTextStreamingCapability)
 	}
 	return &CloudDSHExecutor{options: options}, nil
 }
@@ -239,6 +348,40 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if recoveringAgent && value.ProjectID != "" && value.CheckpointThroughSequence >= 0 {
+		if e.options.ProjectContexts == nil {
+			return errors.New("project task context verification is unavailable")
+		}
+		original, err := e.options.ProjectContexts.LoadProjectTaskContext(ctx, value)
+		if err != nil || original == nil || original.Scope != "project" || original.OwnerID != value.OwnerID ||
+			original.InitiatorID != value.InitiatorID || original.ProjectID != value.ProjectID || original.ConversationID != value.ConversationID {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			pauseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			return errors.Join(errors.New("project task context could not be verified"),
+				e.options.ProjectContexts.PauseProjectTaskRecovery(pauseCtx, value))
+		}
+		value.ConversationContext = original
+	}
+	toolsAllowed := false
+	if e.options.ToolCapabilities != nil {
+		allowed, err := e.options.ToolCapabilities.TaskToolCapability(ctx, value)
+		if err != nil {
+			return fmt.Errorf("dsh model tool capability is unavailable: %w", err)
+		}
+		toolsAllowed = allowed
+	} else if e.options.Tools != nil || e.options.Children != nil {
+		return errors.New("dsh model tool capability is unavailable")
+	}
+	streamAllowed := false
+	if !toolsAllowed && e.options.TextStreams != nil && e.options.StreamCapability != nil {
+		// An unavailable optional display capability must never prevent the
+		// same authorized model from serving an ordinary non-streamed reply.
+		allowed, err := e.options.StreamCapability.TaskTextStreamingCapability(ctx, value)
+		streamAllowed = err == nil && allowed
+	}
 	instanceID, err := randomCloudDSHID("agent_")
 	if err != nil {
 		return err
@@ -254,68 +397,66 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
-	var accountRuntime *cloudDSHAccountRuntimeSession
-	var runtimeFence *app.AccountAgentRuntimeFence
-	if e.options.AccountRuntimes != nil {
-		accountRuntime, err = e.options.AccountRuntimes.Acquire(ctx, value.InitiatorID)
-		if err != nil {
-			return err
-		}
-		fence := accountRuntime.runtime.Fence
-		runtimeFence = &fence
+	accountRuntime, err := e.options.AccountRuntimes.Acquire(ctx, value.OwnerID, value.ConversationID)
+	if err != nil {
+		return err
 	}
+	runtimeFence := accountRuntime.runtime.Fence
 	fence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, AgentInstanceID: instanceID,
 		AgentSessionID: sessionID, SupervisorID: e.options.SupervisorID, LeaseOwner: value.Lease.Owner,
 		LeaseVersion: value.Lease.Version, AuthorizationVersion: value.Authorization.Version,
 		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
-	var unlockRuntimeTaskStart func()
-	if accountRuntime != nil {
-		accountRuntime.startMu.Lock()
-		unlockRuntimeTaskStart = accountRuntime.startMu.Unlock
-		defer func() {
-			if unlockRuntimeTaskStart != nil {
-				unlockRuntimeTaskStart()
-			}
-		}()
-	}
-	lease, replayed, err := e.options.Instances.Start(ctx, app.AgentInstanceStart{Fence: fence, RuntimeFence: runtimeFence,
+	accountRuntime.startMu.Lock()
+	unlockRuntimeTaskStart := accountRuntime.startMu.Unlock
+	defer func() {
+		if unlockRuntimeTaskStart != nil {
+			unlockRuntimeTaskStart()
+		}
+	}()
+	lease, replayed, err := e.options.Instances.Start(ctx, app.AgentInstanceStart{Fence: fence, RuntimeFence: &runtimeFence,
 		SupervisorNonce: nonce, LeaseDuration: app.MaxAgentLease})
 	if err != nil {
 		return err
 	}
 	fence.AgentGeneration = lease.Fence.AgentGeneration
 	if replayed || fence.AgentGeneration < 1 || lease.Fence != fence || !validCloudDSHLease(lease.ExpiresAt) ||
-		(accountRuntime != nil && (lease.RuntimeFence == nil || *lease.RuntimeFence != accountRuntime.runtime.Fence || lease.RuntimeSequence < 1)) {
+		lease.RuntimeFence == nil || *lease.RuntimeFence != accountRuntime.runtime.Fence || lease.RuntimeSequence < 1 {
 		return errors.New("dsh instance lease was not confirmed")
 	}
+	// Tools receive the identity just granted by the instance service, rather
+	// than the empty or previous-generation identity from the claimed Task.
+	value.AgentInstanceID = fence.AgentInstanceID
+	value.AgentGeneration = fence.AgentGeneration
+	value.AgentSessionID = fence.AgentSessionID
+	value.AgentEngineVersion = fence.EngineVersion
+	value.AgentProfileVersion = fence.ProfileVersion
 	var completion app.CloudDSHTaskCompletion
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		var stopErr error
-		if accountRuntime != nil {
-			stopErr = e.options.AccountRuntimes.StopTask(stopCtx, accountRuntime, fence)
-		} else {
-			receipt, err := e.options.Supervisor.Stop(stopCtx, fence, nonce)
-			stopErr = err
-			if stopErr == nil && (receipt.Fence != fence || subtle.ConstantTimeCompare(receipt.SupervisorNonce, nonce) != 1 || !receipt.TreeStopped) {
-				stopErr = errors.New("supervisor returned an invalid process-tree stop receipt")
-			}
-			if stopErr == nil {
-				_, stopErr = e.options.Instances.ConfirmStopped(stopCtx, receipt)
-				if stopErr == nil {
-					if finalizer, ok := e.options.Supervisor.(CloudDSHStopFinalizer); ok {
-						finalizer.AgentStopConfirmed(fence, nonce)
-					}
-				}
-			}
-		}
+		stopErr := e.options.AccountRuntimes.StopTask(stopCtx, accountRuntime, fence)
 		if stopErr != nil {
 			if errors.Is(retErr, ErrCloudDSHCompletionPending) {
 				retErr = nil
 			}
 			retErr = errors.Join(retErr, errors.New("dsh process-tree stop is unconfirmed"))
 			return
+		}
+		if errors.Is(retErr, errCloudDSHPersonalMemoryChanged) && ctx.Err() == nil {
+			if pauser, ok := e.options.Tools.(interface {
+				PausePersonalMemoryRecovery(context.Context, task.Task) error
+			}); ok {
+				pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				retErr = errors.Join(retErr, pauser.PausePersonalMemoryRecovery(pauseCtx, value))
+				cancelPause()
+			}
+		}
+		if errors.Is(retErr, errCloudDSHModelResultUnavailable) && ctx.Err() == nil {
+			if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
+				pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				retErr = errors.Join(retErr, pauseCloudDSHModelRecovery(pauseCtx, recoveryTools, value, retErr))
+				cancelPause()
+			}
 		}
 		if errors.Is(retErr, ErrCloudDSHCompletionPending) && e.options.Completion != nil {
 			if ctx.Err() != nil {
@@ -335,17 +476,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	defer cancel()
 	runCtx, cancelCause := context.WithCancelCause(runCtx)
 	defer cancelCause(nil)
-	var input io.WriteCloser
-	var output io.ReadCloser
-	if accountRuntime != nil {
-		input, output, err = accountRuntime.StartTask(runCtx, fence, nonce, lease)
-	} else {
-		input, output, err = e.options.Supervisor.Start(runCtx, CloudDSHLaunch{
-			NodePath: e.options.NodePath, ScriptPath: e.options.ScriptPath,
-			Environment: []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"},
-			Fence:       fence, Nonce: append([]byte(nil), nonce...), ExpiresAt: lease.ExpiresAt,
-		})
-	}
+	input, output, err := accountRuntime.StartTask(runCtx, fence, nonce, lease)
 	if err != nil {
 		return errors.New("dsh supervisor could not start the process")
 	}
@@ -364,7 +495,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	renewDone := make(chan struct{})
 	go func() {
 		defer close(renewDone)
-		e.renewCloudDSHLease(runCtx, cancelCause, fence, lease.ExpiresAt, accountRuntime)
+		e.renewCloudDSHLease(runCtx, cancelCause, value, fence, lease.ExpiresAt, accountRuntime)
 	}()
 	releaseRuntimeTaskStart := func() {
 		if unlockRuntimeTaskStart != nil {
@@ -373,11 +504,12 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		}
 	}
 	err = e.runCloudDSH(runCtx, value, fence, input, output,
-		recoveringAgent && value.CheckpointThroughSequence >= 0, &completion, releaseRuntimeTaskStart)
+		recoveringAgent && value.CheckpointThroughSequence >= 0, toolsAllowed, streamAllowed, &completion, releaseRuntimeTaskStart)
 	releaseRuntimeTaskStart()
 	cancelCause(context.Canceled)
 	<-renewDone
-	if err != nil && !errors.Is(err, ErrCloudDSHCompletionPending) && recoveringAgent && ctx.Err() == nil {
+	if err != nil && !errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
+		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			err = errors.Join(err, recoveryTools.PauseRecovery(pauseCtx, value))
@@ -398,7 +530,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	return err
 }
 
-func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel context.CancelCauseFunc, fence app.AgentInstanceFence, expires time.Time,
+func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel context.CancelCauseFunc, value task.Task, fence app.AgentInstanceFence, expires time.Time,
 	accountRuntime *cloudDSHAccountRuntimeSession) {
 	for {
 		delay := time.Until(expires) / 3
@@ -421,14 +553,22 @@ func (e *CloudDSHExecutor) renewCloudDSHLease(ctx context.Context, cancel contex
 		if err == nil && (lease.Fence != fence || !validCloudDSHLease(lease.ExpiresAt)) {
 			err = errors.New("invalid dsh instance renewal")
 		}
-		if err == nil && accountRuntime != nil {
+		if err == nil {
 			err = e.options.AccountRuntimes.RenewTask(renewCtx, accountRuntime, fence, lease.ExpiresAt)
-		} else if err == nil {
-			err = e.options.Supervisor.Renew(renewCtx, fence, lease.ExpiresAt)
 		}
 		cancelRenew()
 		if err != nil {
-			cancel(errors.New("dsh instance lease renewal failed"))
+			cause := error(errors.New("dsh instance lease renewal failed"))
+			lifecycle := app.ModelTaskLifecycle(ctx)
+			if e.options.RevisionStops != nil && ctx.Err() == nil && lifecycle != nil && lifecycle.Err() == nil {
+				checkCtx, cancelCheck := context.WithTimeout(lifecycle, time.Second)
+				proven, checkErr := e.options.RevisionStops.RevisionStopProven(checkCtx, value)
+				cancelCheck()
+				if checkErr == nil && proven && ctx.Err() == nil && lifecycle.Err() == nil {
+					cause = app.ErrTaskRevisionInterrupted
+				}
+			}
+			cancel(cause)
 			return
 		}
 		expires = lease.ExpiresAt
@@ -765,6 +905,10 @@ func validCloudDSHModelRequest(raw []byte, modelID string, definitions []app.Age
 		for _, block := range message.Content {
 			switch block.Type {
 			case "text":
+			case "reasoning":
+				if message.Role != "assistant" || !utf8.ValidString(block.Text) || len(block.Text) > cloudDSHMaxText {
+					return false
+				}
 			case "tool-call":
 				if message.Role != "assistant" || !cloudDSHID.MatchString(block.ID) {
 					return false
@@ -816,26 +960,19 @@ func validCloudDSHJSONObject(raw []byte) bool {
 }
 
 func validCloudDSHModelResponse(response app.ModelResponse, definitions []app.AgentToolDefinition) bool {
-	if !response.Usage.Known || response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
-		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 ||
-		!utf8.ValidString(response.Text) || len(response.Text) > cloudDSHMaxText || len(response.ToolCalls) > 64 {
+	if !app.ValidDSHModelResponse(response) {
 		return false
 	}
 	if len(response.ToolCalls) == 0 {
-		return response.StopReason == "stop" && strings.TrimSpace(response.Text) != ""
+		return true
 	}
-	if response.StopReason != "tool_calls" || len(definitions) == 0 {
+	if len(definitions) == 0 {
 		return false
 	}
-	seen := make(map[string]struct{}, len(response.ToolCalls))
 	for _, call := range response.ToolCalls {
-		if !cloudDSHID.MatchString(call.CallID) || !cloudDSHToolAllowed(definitions, call.Name) || !validCloudDSHJSONObject([]byte(call.Arguments)) {
+		if !cloudDSHToolAllowed(definitions, call.Name) || !validCloudDSHJSONObject([]byte(call.Arguments)) {
 			return false
 		}
-		if _, exists := seen[call.CallID]; exists {
-			return false
-		}
-		seen[call.CallID] = struct{}{}
 	}
 	return true
 }
@@ -896,16 +1033,26 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 		(len(response.ToolCalls) == 0 && response.StopReason != "stop") || (len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") {
 		return errors.New("dsh model usage is invalid")
 	}
-	chunks := make([]any, 0, 4+len(response.ToolCalls))
+	chunks := make([]any, 0, 7+len(response.ToolCalls))
+	blockIndex := 0
+	if response.Reasoning != "" {
+		chunks = append(chunks,
+			map[string]any{"type": "block-start", "index": blockIndex, "blockType": "reasoning"},
+			map[string]any{"type": "reasoning-delta", "index": blockIndex, "text": response.Reasoning},
+			map[string]any{"type": "block-end", "index": blockIndex, "block": map[string]any{"type": "reasoning", "text": response.Reasoning}},
+		)
+		blockIndex++
+	}
 	if response.Text != "" {
 		chunks = append(chunks,
-			map[string]any{"type": "block-start", "index": 0, "blockType": "text"},
-			map[string]any{"type": "text-delta", "index": 0, "text": response.Text},
-			map[string]any{"type": "block-end", "index": 0, "block": map[string]any{"type": "text", "text": response.Text}},
+			map[string]any{"type": "block-start", "index": blockIndex, "blockType": "text"},
+			map[string]any{"type": "text-delta", "index": blockIndex, "text": response.Text},
+			map[string]any{"type": "block-end", "index": blockIndex, "block": map[string]any{"type": "text", "text": response.Text}},
 		)
+		blockIndex++
 	}
 	for index, call := range response.ToolCalls {
-		chunks = append(chunks, map[string]any{"type": "tool-call-delta", "index": index,
+		chunks = append(chunks, map[string]any{"type": "tool-call-delta", "index": blockIndex + index,
 			"id": call.CallID, "name": call.Name, "argumentsDelta": call.Arguments})
 	}
 	finishReason := "stop"

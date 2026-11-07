@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"reflect"
 	"strings"
@@ -19,19 +20,29 @@ import (
 
 func TestProjectWorkItemCursorIsStableAndProjectScoped(t *testing.T) {
 	createdAt := time.Date(2026, 11, 2, 3, 4, 5, 123456000, time.UTC)
-	want := projectWorkItemCursor{ProjectID: "j7654321", CreatedAt: createdAt, ID: "j1234567"}
+	want := projectWorkItemCursor{ProjectID: "j7654321", CreatedAt: createdAt, ID: "j1234567", IncludeUnassigned: true}
 	encoded, err := encodeProjectWorkItemCursor(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := decodeProjectWorkItemCursor(encoded, want.ProjectID)
+	got, err := decodeProjectWorkItemCursor(encoded, want.ProjectID, true)
 	if err != nil || got == nil || !got.CreatedAt.Equal(want.CreatedAt) || *got != want {
 		t.Fatalf("cursor round trip = %#v, %v; want %#v", got, err, want)
 	}
-	if _, err := decodeProjectWorkItemCursor(encoded, "j0000000"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := decodeProjectWorkItemCursor(encoded, want.ProjectID, false); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("cross-filter cursor error = %v, want invalid argument", err)
+	}
+	if _, err := decodeProjectWorkItemCursor(encoded, "j0000000", true); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("cross-project cursor error = %v, want invalid argument", err)
 	}
-	if _, err := decodeProjectWorkItemCursor("!invalid!", want.ProjectID); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	legacy := base64.RawURLEncoding.EncodeToString([]byte(`{"project_id":"j7654321","created_at":"2026-11-02T03:04:05.123456Z","id":"j1234567"}`))
+	if _, err := decodeProjectWorkItemCursor(legacy, want.ProjectID, false); err != nil {
+		t.Fatalf("legacy default-filter cursor error = %v, want success", err)
+	}
+	if _, err := decodeProjectWorkItemCursor(legacy, want.ProjectID, true); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("legacy cursor accepted for expanded filter: %v", err)
+	}
+	if _, err := decodeProjectWorkItemCursor("!invalid!", want.ProjectID, true); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("malformed cursor error = %v, want invalid argument", err)
 	}
 }
@@ -62,6 +73,12 @@ func TestProjectWorkItemIdempotencyDigestsUseLogicalRequest(t *testing.T) {
 	if equalBytes(firstDigest, changedDigest) {
 		t.Fatal("changed create payload retained the same digest")
 	}
+	second = first
+	second.Category = project.WorkItemCategoryBug
+	changedCategoryDigest, err := hashProjectWorkItemCreate(second)
+	if err != nil || equalBytes(firstDigest, changedCategoryDigest) {
+		t.Fatalf("category change retained create digest: %x, %x, %v", firstDigest, changedCategoryDigest, err)
+	}
 
 }
 
@@ -87,7 +104,7 @@ func TestGetProjectWorkItemMutationChecksAndReplaysSameDigest(t *testing.T) {
 			projectWorkItemRowStub{values: []any{"member"}},
 			projectWorkItemRowStub{values: []any{"j7654321", "work_item", "j1234567", int64(2), digest}},
 			projectWorkItemRowStub{values: []any{
-				"j7654321", "j1234567", "Report", "summary", []byte(`[]`), "u1234567", "blocked", "waiting",
+				"j7654321", "j1234567", "Report", "summary", []byte(`[]`), "unclassified", pgtype.Text{String: "u1234567", Valid: true}, "blocked", "waiting",
 				pgtype.Text{}, pgtype.Text{}, pgtype.Int8{}, int64(2), createdAt, []string{},
 			}},
 			projectWorkItemRowStub{values: []any{"member"}},
@@ -107,7 +124,7 @@ func TestGetProjectWorkItemMutationChecksAndReplaysSameDigest(t *testing.T) {
 				projectWorkItemRowStub{values: []any{"member"}},
 				projectWorkItemRowStub{values: []any{"j7654321", "work_item", "j1234567", int64(2), digest}},
 				projectWorkItemRowStub{values: []any{
-					"j7654321", "j1234567", "Report", "summary", []byte(`[]`), "u1234567", "open", "",
+					"j7654321", "j1234567", "Report", "summary", []byte(`[]`), "unclassified", pgtype.Text{String: "u1234567", Valid: true}, "open", "",
 					pgtype.Text{}, pgtype.Text{}, pgtype.Int8{}, int64(2), createdAt, []string{"q1234567"},
 				}},
 				projectWorkItemRowStub{values: []any{"member"}},
@@ -370,7 +387,7 @@ func TestValidateProjectWorkItemUpdatePreservesTaskAndDeliveryEvidence(t *testin
 func TestScanProjectWorkItemKeepsSavedDeliveryEvidence(t *testing.T) {
 	createdAt := time.Date(2026, 11, 2, 3, 4, 5, 0, time.UTC)
 	tx := projectWorkItemRowStub{values: []any{
-		"j7654321", "j1234567", "Report", "summary", []byte(`[]`), "u1234567", "delivered", "",
+		"j7654321", "j1234567", "Report", "summary", []byte(`[]`), "unclassified", pgtype.Text{String: "u1234567", Valid: true}, "delivered", "",
 		pgtype.Text{String: "q1234567", Valid: true}, pgtype.Text{String: "w1234567", Valid: true},
 		pgtype.Int8{Int64: 4, Valid: true}, int64(3), createdAt, []string{"q1234567"},
 	}}
@@ -389,6 +406,15 @@ func TestScanProjectWorkItemKeepsSavedDeliveryEvidence(t *testing.T) {
 	broken.values[9] = pgtype.Text{}
 	if _, err := scanProjectWorkItem(broken); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("partial delivery columns = %v, want an error", err)
+	}
+
+	unassigned := projectWorkItemRowStub{values: []any{
+		"j7654321", "j1234568", "Unclaimed", "", []byte(`[]`), "unclassified", pgtype.Text{}, "open", "",
+		pgtype.Text{}, pgtype.Text{}, pgtype.Int8{}, int64(1), createdAt, []string{},
+	}}
+	got, err = scanProjectWorkItem(unassigned)
+	if err != nil || got.Item.AssigneeID != "" || got.Item.Category != project.WorkItemCategoryUnclassified || got.Item.State != project.WorkItemOpen || got.Item.Validate() != nil {
+		t.Fatalf("scanned unassigned work item = %#v, %v", got, err)
 	}
 }
 

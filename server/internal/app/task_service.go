@@ -13,6 +13,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
@@ -43,6 +44,8 @@ type taskWorkspaceOwnerManifestReader interface {
 }
 
 type SubmitTaskCommand struct {
+	ClientMessageID string
+	AttachmentIDs   []string
 	HostID          string
 	WorkspaceID     string
 	InputRevision   *int64
@@ -52,20 +55,6 @@ type SubmitTaskCommand struct {
 	Objective       string
 	Budget          task.Budget
 	BatchItems      []BatchItemInput
-	MCPConnectorIDs []string
-	IdempotencyKey  string
-}
-
-type AppendMessageCommand struct {
-	ProjectID       string
-	ExpectedTaskID  string
-	HostID          string
-	WorkspaceID     string
-	InputRevision   *int64
-	ApplicationID   string
-	ModelID         string
-	Content         string
-	Budget          task.Budget
 	MCPConnectorIDs []string
 	IdempotencyKey  string
 }
@@ -107,8 +96,8 @@ func (s *TaskService) workspaceInputSnapshot(ctx context.Context, ownerID, hostI
 		}
 		return nil, nil, nil
 	}
-	if !domain.ValidWorkspaceID(workspaceID) || !domain.ValidHostID(hostID) || requestedRevision == nil || *requestedRevision < 0 {
-		return nil, nil, domain.InvalidArgument("workspace_id", "workspace, Host, and input revision are required together")
+	if !domain.ValidWorkspaceID(workspaceID) || (hostID != "" && !domain.ValidHostID(hostID)) || requestedRevision == nil || *requestedRevision < 0 {
+		return nil, nil, domain.InvalidArgument("workspace_id", "workspace and input revision are required together")
 	}
 	reader, ok := s.store.(taskWorkspaceSnapshotReader)
 	if !ok {
@@ -163,9 +152,7 @@ func (s *TaskService) workspaceInputSnapshot(ctx context.Context, ownerID, hostI
 			for _, file := range page.Files {
 				pagePaths = append(pagePaths, file.Path)
 			}
-			for _, directory := range page.EmptyDirectories {
-				pagePaths = append(pagePaths, directory)
-			}
+			pagePaths = append(pagePaths, page.EmptyDirectories...)
 			sort.Strings(pagePaths)
 			previousPath := afterPath
 			for _, path := range pagePaths {
@@ -230,6 +217,22 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	}
 	if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
 		return TaskSubmissionResult{}, err
+	}
+	if command.ClientMessageID != "" && (!idempotencyKeyPattern.MatchString(command.ClientMessageID) || command.ClientMessageID != command.IdempotencyKey) {
+		return TaskSubmissionResult{}, domain.InvalidArgument("client_message_id", "client message id must equal the idempotency key")
+	}
+	if len(command.AttachmentIDs) > conversation.MaxHistoryImportAttachments {
+		return TaskSubmissionResult{}, domain.InvalidArgument("attachment_ids", "message attachment count exceeds the limit")
+	}
+	seenAttachments := make(map[string]struct{}, len(command.AttachmentIDs))
+	for _, attachmentID := range command.AttachmentIDs {
+		if !personal.ValidPersonalAttachmentID(attachmentID) {
+			return TaskSubmissionResult{}, domain.InvalidArgument("attachment_ids", "personal attachment id is invalid")
+		}
+		if _, exists := seenAttachments[attachmentID]; exists {
+			return TaskSubmissionResult{}, domain.InvalidArgument("attachment_ids", "attachment ids must be unique")
+		}
+		seenAttachments[attachmentID] = struct{}{}
 	}
 	connectorIDs, err := normalizeTaskMCPConnectorIDs(command.MCPConnectorIDs)
 	if err != nil {
@@ -299,11 +302,16 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		InputRevision   *int64           `json:"input_revision,omitempty"`
 		ContextDigest   []byte           `json:"context_digest,omitempty"`
 		Objective       string           `json:"objective"`
+		AttachmentIDs   []string         `json:"attachment_ids,omitempty"`
 		Budget          task.Budget      `json:"budget"`
 		BatchItems      []BatchItemInput `json:"batch_items"`
 		MCPConnectorIDs []string         `json:"mcp_connector_ids"`
-	}{command.HostID, command.ApplicationID, command.ModelID, command.ConversationID, command.WorkspaceID, inputRevision, contextDigest,
-		command.Objective, command.Budget, normalizedBatchInputs(command.BatchItems), command.MCPConnectorIDs})
+	}{
+		HostID: command.HostID, ApplicationID: command.ApplicationID, ModelID: command.ModelID,
+		ConversationID: command.ConversationID, WorkspaceID: command.WorkspaceID, InputRevision: inputRevision,
+		ContextDigest: contextDigest, Objective: command.Objective, AttachmentIDs: append([]string(nil), command.AttachmentIDs...),
+		Budget: command.Budget, BatchItems: normalizedBatchInputs(command.BatchItems), MCPConnectorIDs: command.MCPConnectorIDs,
+	})
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
@@ -341,7 +349,8 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		},
 		Message: conversation.Message{
 			ID: messageID, ConversationID: conversationID, OwnerID: principal.UserID, ActorID: principal.UserID,
-			Role: conversation.RoleUser, Content: command.Objective,
+			Role: conversation.RoleUser, Content: command.Objective, ClientMessageID: command.ClientMessageID,
+			AttachmentIDs: append([]string(nil), command.AttachmentIDs...),
 		},
 		InitialEvent: task.Event{TaskID: taskID, Type: initialEventType, Payload: initialEvent},
 		InitialSteps: initialSteps, InitialClarificationRequest: initialClarification,
@@ -356,152 +365,6 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		return TaskSubmissionResult{}, err
 	}
 	return result, nil
-}
-
-func (s *TaskService) AppendMessage(ctx context.Context, principal identity.Principal, conversationID string, command AppendMessageCommand) (TaskSubmissionResult, error) {
-	if err := validateTaskPrincipal(principal); err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	if !domain.ValidConversationID(conversationID) {
-		return TaskSubmissionResult{}, domain.NewError(domain.CodeNotFound, "conversation not found")
-	}
-	if command.ExpectedTaskID != "" && !domain.ValidTaskID(command.ExpectedTaskID) {
-		return TaskSubmissionResult{}, domain.InvalidArgument("expected_task_id", "task id is invalid")
-	}
-	if command.HostID != "" && !domain.ValidHostID(command.HostID) {
-		return TaskSubmissionResult{}, domain.InvalidArgument("host_id", "host id is invalid")
-	}
-	if command.ApplicationID != "" && !ValidHostApplicationID(command.ApplicationID) {
-		return TaskSubmissionResult{}, domain.InvalidArgument("application_id", "application is not supported")
-	}
-	command.ModelID = strings.TrimSpace(command.ModelID)
-	if command.ModelID == "" || len(command.ModelID) > 256 {
-		return TaskSubmissionResult{}, domain.InvalidArgument("model_id", "model id is invalid")
-	}
-	if !validBoundedText(command.Content, 32768) {
-		return TaskSubmissionResult{}, domain.InvalidArgument("content", "message is required and must be at most 32768 characters")
-	}
-	if command.ProjectID != "" && !project.ValidID(command.ProjectID) {
-		return TaskSubmissionResult{}, domain.NewError(domain.CodeNotFound, "project not found")
-	}
-	if err := validateIdempotencyKey(command.IdempotencyKey); err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	connectorIDs, err := normalizeTaskMCPConnectorIDs(command.MCPConnectorIDs)
-	if err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	command.MCPConnectorIDs = connectorIDs
-	budget, err := normalizedBudget(command.Budget)
-	if err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	command.Budget = budget
-	conversationOwnerID := principal.UserID
-	if command.ProjectID != "" {
-		if s.projectAccess == nil {
-			return TaskSubmissionResult{}, domain.NewError(domain.CodeUnsupported, "project task submission is unavailable")
-		}
-		if _, err := s.projectAccess.RequireAccess(ctx, principal, command.ProjectID, project.RoleMember); err != nil {
-			return TaskSubmissionResult{}, err
-		}
-		value, err := s.store.GetProjectConversation(ctx, principal.UserID, command.ProjectID, conversationID)
-		if err != nil {
-			return TaskSubmissionResult{}, err
-		}
-		conversationOwnerID = value.OwnerID
-	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	authorization, err := s.authorizeTask(ctx, principal, command.HostID, taskSubmitScope)
-	if err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	if err := s.validateModel(ctx, principal.UserID, command.ModelID); err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	inputRevision, contextDigest, err := s.workspaceInputSnapshot(ctx, principal.UserID, command.HostID, command.WorkspaceID, command.InputRevision)
-	if err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	taskID, err := domain.NewTaskID()
-	if err != nil {
-		return TaskSubmissionResult{}, fmt.Errorf("generate task id: %w", err)
-	}
-	messageID, err := domain.NewMessageID()
-	if err != nil {
-		return TaskSubmissionResult{}, fmt.Errorf("generate task message id: %w", err)
-	}
-	requestHash, err := hashIdempotencyRequest(struct {
-		ConversationID  string      `json:"conversation_id"`
-		ProjectID       string      `json:"project_id,omitempty"`
-		HostID          string      `json:"host_id"`
-		WorkspaceID     string      `json:"workspace_id,omitempty"`
-		InputRevision   *int64      `json:"input_revision,omitempty"`
-		ContextDigest   []byte      `json:"context_digest,omitempty"`
-		ApplicationID   string      `json:"application_id,omitempty"`
-		ModelID         string      `json:"model_id"`
-		Content         string      `json:"content"`
-		Budget          task.Budget `json:"budget"`
-		MCPConnectorIDs []string    `json:"mcp_connector_ids"`
-		ExpectedTaskID  string      `json:"expected_task_id,omitempty"`
-	}{conversationID, command.ProjectID, command.HostID, command.WorkspaceID, inputRevision, contextDigest, command.ApplicationID, command.ModelID, command.Content, command.Budget, command.MCPConnectorIDs, command.ExpectedTaskID})
-	if err != nil {
-		return TaskSubmissionResult{}, err
-	}
-	fileDeliveryIntent := ClassifyFileDeliveryIntent(command.Content, command.WorkspaceID != "")
-	initialStatus := task.StatusQueued
-	initialEventType := "task.status"
-	initialWaitingReason := ""
-	initialCurrentStep := ""
-	var initialSteps []task.Step
-	var initialClarification *task.ClarificationRequest
-	initialEventPayload := map[string]string{"status": string(initialStatus)}
-	if fileDeliveryIntent == task.FileDeliveryUnclear {
-		initialSteps, initialClarification, err = newFileDeliveryIntentClarification(taskID, command.WorkspaceID != "", 0, 1)
-		if err != nil {
-			return TaskSubmissionResult{}, err
-		}
-		initialStatus, initialEventType, initialWaitingReason, initialCurrentStep = task.StatusWaitingUser, "task.waiting_user", "clarification_required", initialSteps[1].ID
-		initialEventPayload = map[string]string{
-			"status": string(initialStatus), "reason": initialWaitingReason,
-			"clarification_id": initialClarification.ID, "clarification_version": "1",
-		}
-	}
-	initialEvent, err := json.Marshal(initialEventPayload)
-	if err != nil {
-		return TaskSubmissionResult{}, fmt.Errorf("encode initial task event: %w", err)
-	}
-	return s.store.AppendMessage(ctx, TaskSubmission{
-		ExpectedTaskID: command.ExpectedTaskID,
-		Task: task.Task{
-			ID: taskID, OwnerID: conversationOwnerID, ProjectID: command.ProjectID, InitiatorID: principal.UserID, ConversationID: conversationID,
-			HostID: command.HostID, WorkspaceID: command.WorkspaceID, InputRevision: inputRevision, ContextDigest: contextDigest,
-			ApplicationID: command.ApplicationID, ModelID: command.ModelID, Objective: command.Content,
-			FileDeliveryIntent: fileDeliveryIntent,
-			ExecutionLocation:  "server", Status: initialStatus, WaitingReason: initialWaitingReason, CurrentStep: initialCurrentStep,
-			Authorization: authorization, Budget: command.Budget,
-		},
-		Message: conversation.Message{
-			ID: messageID, ConversationID: conversationID, OwnerID: conversationOwnerID, ActorID: principal.UserID,
-			Role: conversation.RoleUser, Content: command.Content,
-		},
-		InitialEvent: task.Event{TaskID: taskID, Type: initialEventType, Payload: initialEvent},
-		InitialSteps: initialSteps, InitialClarificationRequest: initialClarification,
-		MCPConnectorIDs: command.MCPConnectorIDs,
-		Idempotency: IdempotencyRecord{
-			OwnerID: principal.UserID, Operation: "conversation.append_message", Key: command.IdempotencyKey,
-			RequestHash: requestHash, ResourceID: taskID, RelatedID: messageID,
-		},
-	})
-}
-
-func (s *TaskService) AppendProjectMessage(ctx context.Context, principal identity.Principal, projectID, conversationID string, command AppendMessageCommand) (TaskSubmissionResult, error) {
-	if command.ProjectID != "" && command.ProjectID != projectID {
-		return TaskSubmissionResult{}, domain.InvalidArgument("project_id", "project does not match the conversation scope")
-	}
-	command.ProjectID = projectID
-	return s.AppendMessage(ctx, principal, conversationID, command)
 }
 
 func newFileDeliveryIntentClarification(taskID string, hasWorkspace bool, afterSequence, version int64) ([]task.Step, *task.ClarificationRequest, error) {
@@ -557,7 +420,75 @@ func (s *TaskService) List(ctx context.Context, principal identity.Principal, fi
 	if err != nil {
 		return TaskPage{}, err
 	}
-	return s.store.ListTasks(ctx, principal.UserID, TaskListRequest{HostIDs: hostIDs, Status: filter.Status, Page: filter.Page})
+	page, err := s.store.ListTasks(ctx, principal.UserID, TaskListRequest{HostIDs: hostIDs, Status: filter.Status, Page: filter.Page})
+	if err != nil {
+		return TaskPage{}, err
+	}
+	visible := make([]task.Task, 0, len(page.Items))
+	for _, item := range page.Items {
+		if _, err := s.authorizeTask(ctx, principal, item.HostID, taskReadScope); err != nil {
+			switch domain.CodeOf(err) {
+			case domain.CodeNotFound, domain.CodeForbidden:
+				continue
+			default:
+				return TaskPage{}, err
+			}
+		}
+		visible = append(visible, item)
+	}
+	page.Items = visible
+	return page, nil
+}
+
+// ListConversationActiveTasks returns only tasks visible to this caller in the selected conversation.
+func (s *TaskService) ListConversationActiveTasks(ctx context.Context, principal identity.Principal, projectID, conversationID string, page PageRequest) (TaskPage, error) {
+	if err := validateTaskPrincipal(principal); err != nil {
+		return TaskPage{}, err
+	}
+	if !domain.ValidConversationID(conversationID) {
+		return TaskPage{}, domain.NewError(domain.CodeNotFound, "conversation not found")
+	}
+	if err := validatePageRequest(page); err != nil {
+		return TaskPage{}, err
+	}
+	if page.Limit == 0 {
+		page.Limit = defaultPageSize
+	}
+	if projectID != "" {
+		if !project.ValidID(projectID) || s.projectAccess == nil {
+			return TaskPage{}, domain.NewError(domain.CodeNotFound, "project conversation not found")
+		}
+		if _, err := s.projectAccess.RequireAccess(ctx, principal, projectID, project.RoleViewer); err != nil {
+			return TaskPage{}, err
+		}
+		if _, err := s.store.GetProjectConversation(ctx, principal.UserID, projectID, conversationID); err != nil {
+			return TaskPage{}, err
+		}
+	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
+		return TaskPage{}, err
+	}
+	hostIDs, err := authorizedTaskHostIDs(ctx, s.authorizer, principal, taskReadScope)
+	if err != nil {
+		return TaskPage{}, err
+	}
+	result, err := s.store.ListConversationActiveTasks(ctx, principal.UserID, projectID, conversationID, hostIDs, page)
+	if err != nil {
+		return TaskPage{}, err
+	}
+	visible := make([]task.Task, 0, len(result.Items))
+	for _, item := range result.Items {
+		if _, err := s.authorizeTask(ctx, principal, item.HostID, taskReadScope); err != nil {
+			switch domain.CodeOf(err) {
+			case domain.CodeNotFound, domain.CodeForbidden:
+				continue
+			default:
+				return TaskPage{}, err
+			}
+		}
+		visible = append(visible, item)
+	}
+	result.Items = visible
+	return result, nil
 }
 
 func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id string) (TaskDetails, error) {
@@ -575,7 +506,7 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 		return TaskDetails{}, hideTaskAccessError(err)
 	}
 	if len(details.Artifacts) > 0 {
-		visible, err := s.taskArtifactWorkspaceVisible(ctx, details.Task.OwnerID, details.Task.WorkspaceID)
+		visible, err := s.taskArtifactWorkspaceVisible(ctx, principal.UserID, details.Task.WorkspaceID)
 		if err != nil {
 			return TaskDetails{}, err
 		}
@@ -586,16 +517,17 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 	return details, nil
 }
 
-func (s *TaskService) taskArtifactWorkspaceVisible(ctx context.Context, ownerID, workspaceID string) (bool, error) {
+// Project Task owners can differ from the Workspace-owning member reading artifacts.
+func (s *TaskService) taskArtifactWorkspaceVisible(ctx context.Context, requesterID, workspaceID string) (bool, error) {
 	reader, ok := s.store.(taskWorkspaceSnapshotReader)
-	if !ok || ownerID == "" || !domain.ValidWorkspaceID(workspaceID) {
+	if !ok || requesterID == "" || !domain.ValidWorkspaceID(workspaceID) {
 		return false, nil
 	}
 	value, err := reader.GetWorkspace(ctx, workspaceID)
 	if err != nil {
 		return false, err
 	}
-	return value.ID == workspaceID && value.OwnerID == ownerID && value.State == workspace.StateReady && value.DeletedAt == nil, nil
+	return value.ID == workspaceID && value.OwnerID == requesterID && value.State == workspace.StateReady && value.DeletedAt == nil, nil
 }
 
 // RetryBatchItem resets one failed batch item and queues its task for execution.
@@ -791,7 +723,7 @@ func (s *TaskService) ListEvents(ctx context.Context, principal identity.Princip
 		if err != nil {
 			return TaskEventPage{}, err
 		}
-		visible, err := s.taskArtifactWorkspaceVisible(ctx, details.Task.OwnerID, details.Task.WorkspaceID)
+		visible, err := s.taskArtifactWorkspaceVisible(ctx, principal.UserID, details.Task.WorkspaceID)
 		if err != nil {
 			return TaskEventPage{}, err
 		}
@@ -835,7 +767,7 @@ func (s *TaskService) authorizeTask(ctx context.Context, principal identity.Prin
 
 func authorizedTaskHostIDs(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, scope identity.Scope) ([]string, error) {
 	if principal.Kind == identity.KindSession || principal.Kind == identity.KindClient {
-		// The store still filters by owner_id. NULL host_ids means all of this user's Hosts.
+		// The service authorizes each returned Host because the store also lists project Tasks.
 		return nil, nil
 	}
 	if !principal.HasScope(scope) {

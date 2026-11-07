@@ -63,6 +63,15 @@ export default function TopBar({
             : '操作租约已失效 · 桌面只读'
             : control?.control_state === 'taking_over' ? '正在接管电脑，请稍候…'
               : control?.control_state === 'returning' ? '正在交回 AI，请稍候…' : '控制状态未知';
+  const compactControlLabel = controlError ? '控制不可用'
+    : controlLoading && !control ? '读取状态'
+      : transitionFailure ? control?.active_transition?.action === 'take_over' ? '接管失败' : '交还失败'
+        : control?.control_state === 'ai' ? 'AI 控制中 · 只读'
+          : control?.control_state === 'user' ? control.control_lease_active
+            ? control.control_lease_held_by_me ? '你正在控制' : '他人控制中'
+            : '租约已失效'
+            : control?.control_state === 'taking_over' ? '接管中'
+              : control?.control_state === 'returning' ? '交还中' : '状态未知';
 
   return (
     <header className="top-bar">
@@ -75,7 +84,8 @@ export default function TopBar({
           {host ? formatRemaining(host.expires_at, now) : ''}
         </span>
         <span className="control-state" data-state={control?.control_state || 'loading'} role="status">
-          {controlLabel}
+          <span className="control-state-full">{controlLabel}</span>
+          <span className="control-state-compact">{compactControlLabel}</span>
         </span>
         {control && <span className="control-version">控制版本 {control.control_version}</span>}
         {control?.control_state === 'user' && <span className="control-lease">
@@ -93,7 +103,7 @@ export default function TopBar({
             {controlActionLabel}
           </button>
         )}
-        <button className="button" type="button" onClick={onRenew} disabled={!host || renewing}>
+        <button className="button host-renew-button" type="button" onClick={onRenew} disabled={!host || renewing}>
           {renewing ? '续期中…' : '续期'}
         </button>
       </div>

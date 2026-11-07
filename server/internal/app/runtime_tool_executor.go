@@ -58,6 +58,9 @@ const (
 	maxDesktopScreenshotBytes   = 512 << 10
 	maxDesktopScreenshotWidth   = 1280
 	maxDesktopScreenshotHeight  = 720
+	maxDesktopScreenWidth       = 16384
+	maxDesktopScreenHeight      = 16384
+	maxDesktopScreenPixels      = 64 << 20
 	maxRuntimeWindows           = 128
 )
 
@@ -147,7 +150,7 @@ var runtimeToolMappings = []runtimeToolMapping{
 	},
 	{
 		name: runtimeToolDesktopScreenshot, capability: "desktop.observe", action: "screenshot", scope: identity.ScopeComputerObserve,
-		description: "Capture a bounded screenshot of the Host desktop.",
+		description: "Capture a bounded screenshot of the Host desktop. The result gives image width/height and actual screen_width/screen_height. For desktop_click, use the screenshot pixel coordinates directly as x/y and pass all four dimensions from this result; the Host maps them to screen pixels.",
 		parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 	},
 	{
@@ -162,8 +165,8 @@ var runtimeToolMappings = []runtimeToolMapping{
 	},
 	{
 		name: runtimeToolDesktopClick, capability: "desktop.input", action: "click", scope: identity.ScopeComputerOperate,
-		description: "Click a point on the Host desktop.",
-		parameters:  json.RawMessage(`{"type":"object","properties":{"window_id":{"type":"string","pattern":"^0x[1-9a-f][0-9a-f]*$","maxLength":10},"x":{"type":"integer","minimum":0,"maximum":65535},"y":{"type":"integer","minimum":0,"maximum":65535},"button":{"type":"string","enum":["left","middle","right"]}},"required":["window_id","x","y"],"additionalProperties":false}`),
+		description: "Click a point from the most recent desktop_screenshot. Set x/y in screenshot pixels and include screenshot_width/height from that image plus screen_width/height for the actual display. The Host maps the screenshot point to screen pixels and rejects the click if the display size changed.",
+		parameters:  json.RawMessage(`{"type":"object","properties":{"window_id":{"type":"string","pattern":"^0x[1-9a-f][0-9a-f]*$","maxLength":10},"x":{"type":"integer","minimum":0,"maximum":1279},"y":{"type":"integer","minimum":0,"maximum":719},"screenshot_width":{"type":"integer","minimum":1,"maximum":1280},"screenshot_height":{"type":"integer","minimum":1,"maximum":720},"screen_width":{"type":"integer","minimum":1,"maximum":16384},"screen_height":{"type":"integer","minimum":1,"maximum":16384},"button":{"type":"string","enum":["left","middle","right"]}},"required":["window_id","x","y","screenshot_width","screenshot_height","screen_width","screen_height"],"additionalProperties":false}`),
 	},
 	{
 		name: runtimeToolDesktopType, capability: "desktop.input", action: "type", scope: identity.ScopeComputerOperate,
@@ -187,6 +190,8 @@ type RuntimeToolExecutor struct {
 	runtime    *RuntimeControl
 	workspaces *WorkspaceSyncService
 	operations *RuntimeOperationRunner
+	mediaSave  *TaskMediaSaveService
+	mediaStore TaskMediaStagedObjectStore
 	leaseEvery time.Duration
 }
 
@@ -198,6 +203,16 @@ func NewRuntimeToolExecutor(store TaskStore, authorizer TaskAuthorizer, fences A
 		store: store, authorizer: authorizer, fences: fences, runtime: runtime, workspaces: workspaces,
 		operations: NewRuntimeOperationRunner(0), leaseEvery: runtimeToolLeaseRefresh,
 	}, nil
+}
+
+// SetTaskMediaSaveService enables the approved-media save path after the staged
+// object store and verified-content store have been assembled by the host.
+func (e *RuntimeToolExecutor) SetTaskMediaSaveService(service *TaskMediaSaveService, objects TaskMediaStagedObjectStore) error {
+	if e == nil || service == nil || objects == nil {
+		return errors.New("task media save dependencies are required")
+	}
+	e.mediaSave, e.mediaStore = service, objects
+	return nil
 }
 
 func (e *RuntimeToolExecutor) Definitions(ctx context.Context, claimed task.Task) ([]AgentToolDefinition, error) {
@@ -304,7 +319,7 @@ func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequ
 		}
 		if !approved {
 			return AgentToolPreparation{
-				Status: AgentToolApprovalRequired, Approval: runtimeToolApprovalRequest(mapping),
+				Status: AgentToolApprovalRequired, Approval: runtimeToolApprovalRequest(mapping, request.Arguments),
 				Fence: fence, WorkspaceID: workspaceID, BindingVersion: bindingVersion,
 			}, nil
 		}
@@ -365,13 +380,33 @@ func runtimeToolRisk(name string, arguments json.RawMessage) runtimeToolRiskTier
 	}
 }
 
-func runtimeToolApprovalRequest(mapping runtimeToolMapping) AgentApprovalRequest {
+func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMessage) AgentApprovalRequest {
 	switch mapping.name {
 	case runtimeToolShellExec:
 		return AgentApprovalRequest{Object: "Host Workspace command", Content: "Run a command in the Host Workspace?", Impact: "The command can change files or send data from the authorized Workspace."}
 	case runtimeToolBrowserType:
 		return AgentApprovalRequest{Object: "Browser input", Content: "Type text into the selected browser field?", Impact: "The website may receive and store the text."}
 	case runtimeToolDesktopClick:
+		var click struct {
+			WindowID         string `json:"window_id"`
+			X                int    `json:"x"`
+			Y                int    `json:"y"`
+			ScreenshotWidth  int    `json:"screenshot_width"`
+			ScreenshotHeight int    `json:"screenshot_height"`
+			ScreenWidth      int    `json:"screen_width"`
+			ScreenHeight     int    `json:"screen_height"`
+			Button           string `json:"button"`
+		}
+		if json.Unmarshal(arguments, &click) == nil {
+			if click.Button == "" {
+				click.Button = "left"
+			}
+			screenX := screenshotPointToScreen(click.X, click.ScreenshotWidth, click.ScreenWidth)
+			screenY := screenshotPointToScreen(click.Y, click.ScreenshotHeight, click.ScreenHeight)
+			return AgentApprovalRequest{Object: "Host desktop input",
+				Content: fmt.Sprintf("Click window %s at screenshot point (%d, %d) from a %d × %d image (screen point %d, %d) with the %s button?", click.WindowID, click.X, click.Y, click.ScreenshotWidth, click.ScreenshotHeight, screenX, screenY, click.Button),
+				Impact:  "The action is rejected if the screen size changes or the target window is not active."}
+		}
 		return AgentApprovalRequest{Object: "Host desktop input", Content: "Click a point on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
 	case runtimeToolDesktopType:
 		return AgentApprovalRequest{Object: "Host desktop input", Content: "Type text into the current Host desktop window?", Impact: "The text may change app data or be submitted externally."}
@@ -481,7 +516,7 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	leaseKeeperDone := make(chan struct{})
 	go func() {
 		defer close(leaseKeeperDone)
-		e.keepRuntimeTaskLease(operationCtx, cancelOperation, session, current, request.OperationID)
+		e.keepRuntimeTaskLease(operationCtx, ctx, cancelOperation, session, current, request.OperationID, mapping.scope, fence)
 	}()
 	defer func() {
 		cancelOperation()
@@ -498,6 +533,15 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	}
 	operation, err = e.operations.Poll(operationCtx, session, current.ID, request.OperationID, current.Lease.Version, operation)
 	if err != nil {
+		return AgentToolResult{Status: AgentToolUnknown}, nil
+	}
+	// A terminal Host response is not safe to expose after the Task, permission,
+	// or control fence changed while the operation was running.
+	latest, err := e.currentTask(ctx, current)
+	if err != nil || e.authorize(ctx, latest, mapping.scope) != nil {
+		return AgentToolResult{Status: AgentToolUnknown}, nil
+	}
+	if _, err := e.readFence(ctx, latest, &fence); err != nil {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	result, err := mapRuntimeToolResult(mapping, operation, request.Arguments)
@@ -673,7 +717,8 @@ func agentFenceFromRuntime(fence runtimeclient.HostFence) AgentHostFence {
 	}
 }
 
-func (e *RuntimeToolExecutor) keepRuntimeTaskLease(ctx context.Context, cancelOperation context.CancelFunc, session *RuntimeSession, claimed task.Task, operationID string) {
+func (e *RuntimeToolExecutor) keepRuntimeTaskLease(ctx, parentCtx context.Context, cancelOperation context.CancelFunc, session *RuntimeSession,
+	claimed task.Task, operationID string, scope identity.Scope, fence AgentHostFence) {
 	interval := e.leaseEvery
 	if interval <= 0 {
 		interval = runtimeToolLeaseRefresh
@@ -684,11 +729,24 @@ func (e *RuntimeToolExecutor) keepRuntimeTaskLease(ctx context.Context, cancelOp
 	for {
 		select {
 		case <-ctx.Done():
+			if parentCtx.Err() != nil {
+				e.cancelRuntimeOperation(session, operationID)
+			}
 			return
 		case <-ticker.C:
 		}
 		current, err := e.currentTask(ctx, claimed)
 		if err != nil {
+			cancelOperation()
+			e.cancelRuntimeOperation(session, operationID)
+			return
+		}
+		if err := e.authorize(ctx, current, scope); err != nil {
+			cancelOperation()
+			e.cancelRuntimeOperation(session, operationID)
+			return
+		}
+		if _, err := e.readFence(ctx, current, &fence); err != nil {
 			cancelOperation()
 			e.cancelRuntimeOperation(session, operationID)
 			return
@@ -966,7 +1024,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 	leaseKeeperDone := make(chan struct{})
 	go func() {
 		defer close(leaseKeeperDone)
-		e.keepRuntimeTaskLease(operationCtx, cancelOperation, session, current, persisted.ID)
+		e.keepRuntimeTaskLease(operationCtx, ctx, cancelOperation, session, current, persisted.ID, identity.ScopeComputerObserve, fence)
 	}()
 	defer func() {
 		cancelOperation()
@@ -1216,7 +1274,7 @@ func (e *RuntimeToolExecutor) reconcileFileVerificationOperation(ctx context.Con
 	leaseKeeperDone := make(chan struct{})
 	go func() {
 		defer close(leaseKeeperDone)
-		e.keepRuntimeTaskLease(operationCtx, cancelOperation, session, current, persisted.ID)
+		e.keepRuntimeTaskLease(operationCtx, ctx, cancelOperation, session, current, persisted.ID, identity.ScopeComputerObserve, fence)
 	}()
 	defer func() {
 		cancelOperation()
@@ -1381,6 +1439,7 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 	}
 	command := TaskWorkspacePublishCommand{
 		OwnerID: current.OwnerID, TaskID: current.ID, WorkspaceID: group.workspaceID, HostID: current.HostID,
+		ProjectID: current.ProjectID, InitiatorID: current.InitiatorID, WorkspaceOwnerID: taskWorkspaceOwner(current),
 		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, BindingVersion: group.bindingVersion,
 		InputRevision: *current.InputRevision, BaseRevision: *current.WorkspaceCheckpointRevision,
 		HostFence: fence, ViewID: group.viewID, InputManifestSHA256: inputManifestSHA,
@@ -1523,6 +1582,24 @@ func workspaceNativeMetadataFromRuntime(xattrs []contract.WorkspaceExtendedAttri
 }
 
 func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifacts(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup, receipt TaskWorkspacePublishReceipt, result *AgentVerificationResult) AgentVerificationResult {
+	if current.ProjectID != "" {
+		guard, ok := e.store.(projectTaskWorkspaceGuard)
+		if !ok {
+			return unknownAgentVerification("The project Workspace authorization could not be verified.")
+		}
+		var verified AgentVerificationResult
+		if err := guard.WithProjectTaskWorkspaceAccess(ctx, current, false, func(guardedCtx context.Context) error {
+			verified = e.verifyPublishedTaskWorkspaceArtifactsAuthorized(guardedCtx, session, current, group, receipt, result)
+			return nil
+		}); err != nil {
+			return unknownAgentVerification("The project Workspace authorization could not be verified.")
+		}
+		return verified
+	}
+	return e.verifyPublishedTaskWorkspaceArtifactsAuthorized(ctx, session, current, group, receipt, result)
+}
+
+func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifactsAuthorized(ctx context.Context, session *RuntimeSession, current task.Task, group runtimeFileEvidenceGroup, receipt TaskWorkspacePublishReceipt, result *AgentVerificationResult) AgentVerificationResult {
 	if receipt.State != TaskWorkspacePublishSucceeded || receipt.WorkspaceID != group.workspaceID || receipt.PublishedRevision < 0 ||
 		!validSyncDigest(receipt.ManifestSHA256) || current.WorkspaceCheckpointRevision == nil {
 		return unknownAgentVerification("The committed Task Workspace publish receipt is invalid.")
@@ -1556,7 +1633,7 @@ func (e *RuntimeToolExecutor) verifyPublishedTaskWorkspaceArtifacts(ctx context.
 			return AgentVerificationResult{Status: AgentNotVerified, Summary: "The verified file is outside the Task Workspace."}
 		}
 		proof, err := e.workspaces.VerifyCommittedArtifact(ctx, TaskArtifactProof{
-			OwnerID: current.OwnerID, WorkspaceID: group.workspaceID, Revision: receipt.PublishedRevision,
+			OwnerID: taskWorkspaceOwner(current), WorkspaceID: group.workspaceID, Revision: receipt.PublishedRevision,
 			Path: artifact.Path, SizeBytes: artifact.SizeBytes, SHA256: artifact.SHA256,
 		})
 		if err != nil {
@@ -1682,6 +1759,11 @@ func (e *RuntimeToolExecutor) authorize(ctx context.Context, current task.Task, 
 	if !domain.ValidUserID(current.InitiatorID) {
 		return domain.NewError(domain.CodeUnauthenticated, "task initiator is unavailable")
 	}
+	if authorizer, ok := e.authorizer.(interface {
+		AuthorizeTaskHostAction(context.Context, task.Task, identity.Scope) error
+	}); ok {
+		return authorizer.AuthorizeTaskHostAction(ctx, current, scope)
+	}
 	return e.authorizer.AuthorizeTaskAction(ctx, current.InitiatorID, identity.Kind(current.Authorization.Kind), current.Authorization.TokenID,
 		current.HostID, agentScopeSnapshot(current.Authorization.Scopes), scope)
 }
@@ -1785,6 +1867,14 @@ func mapRuntimeToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 	case runtimeclient.OperationFailed:
 		result.Status = AgentToolFailed
 		result.Output = `{"error":"runtime_operation_failed"}`
+		if mapping.name == runtimeToolDesktopClick {
+			var failure struct {
+				Code string `json:"code"`
+			}
+			if decodeStrictRuntimeResult(operation.Result, &failure) == nil && failure.Code == "desktop_geometry_changed" {
+				result.Output = `{"error":"desktop_geometry_changed","message":"The screen size changed. Take a new screenshot before clicking."}`
+			}
+		}
 		return result, nil
 	case runtimeclient.OperationCancelled:
 		// Cancellation proves the handler stopped, not that a side effect was
@@ -1868,12 +1958,16 @@ func mapBrowserToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 		}
 		result.Output = string(encoded)
 	case runtimeToolBrowserType:
+		var request struct {
+			Text string `json:"text"`
+		}
 		var value struct {
 			TargetID   string `json:"target_id"`
 			TypedChars int    `json:"typed_chars"`
 		}
-		if decodeStrictRuntimeResult(operation.Result, &value) != nil || !validBrowserTargetID(value.TargetID) ||
-			!browserResultTargetMatches(mapping.name, arguments, value.TargetID) || value.TypedChars < 0 || value.TypedChars > 4096 {
+		if json.Unmarshal(arguments, &request) != nil || !utf8.ValidString(request.Text) || len(request.Text) > 4096 ||
+			decodeStrictRuntimeResult(operation.Result, &value) != nil || !validBrowserTargetID(value.TargetID) ||
+			!browserResultTargetMatches(mapping.name, arguments, value.TargetID) || value.TypedChars != utf8.RuneCountInString(request.Text) {
 			return invalid("invalid_browser_result")
 		}
 		encoded, err := json.Marshal(value)
@@ -1906,7 +2000,7 @@ func mapBrowserToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 			return invalid("invalid_browser_screenshot")
 		}
 		data, err := base64.StdEncoding.DecodeString(value.DataBase64)
-		if err != nil || len(data) < 4 || len(data) > 512<<10 || !bytes.HasPrefix(data, []byte{0xff, 0xd8}) || !bytes.HasSuffix(data, []byte{0xff, 0xd9}) {
+		if _, _, valid := validateRuntimeScreenshot(data); err != nil || !valid {
 			return invalid("invalid_browser_screenshot")
 		}
 		result.Images = []ModelImage{{MediaType: value.MIMEType, Data: data}}
@@ -1979,26 +2073,27 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 	switch mapping.name {
 	case runtimeToolDesktopScreenshot:
 		var value struct {
-			MIMEType   string `json:"mime_type"`
-			Width      int    `json:"width"`
-			Height     int    `json:"height"`
-			DataBase64 string `json:"data_base64"`
+			MIMEType     string `json:"mime_type"`
+			Width        int    `json:"width"`
+			Height       int    `json:"height"`
+			ScreenWidth  int    `json:"screen_width"`
+			ScreenHeight int    `json:"screen_height"`
+			DataBase64   string `json:"data_base64"`
 		}
 		if decodeStrictRuntimeResult(operation.Result, &value) != nil || value.MIMEType != "image/jpeg" ||
 			value.Width < 1 || value.Width > maxDesktopScreenshotWidth || value.Height < 1 || value.Height > maxDesktopScreenshotHeight ||
+			!validRuntimeScreenshotGeometry(value.Width, value.Height, value.ScreenWidth, value.ScreenHeight) ||
 			len(value.DataBase64) == 0 || len(value.DataBase64) > 700<<10 {
 			return invalid("invalid_desktop_screenshot")
 		}
 		data, err := base64.StdEncoding.DecodeString(value.DataBase64)
-		if err != nil || len(data) < 4 || len(data) > maxDesktopScreenshotBytes || !bytes.HasPrefix(data, []byte{0xff, 0xd8}) || !bytes.HasSuffix(data, []byte{0xff, 0xd9}) {
-			return invalid("invalid_desktop_screenshot")
-		}
-		config, err := jpeg.DecodeConfig(bytes.NewReader(data))
-		if err != nil || config.Width != value.Width || config.Height != value.Height {
+		width, height, valid := validateRuntimeScreenshot(data)
+		if err != nil || !valid || width != value.Width || height != value.Height {
 			return invalid("invalid_desktop_screenshot")
 		}
 		result.Images = []ModelImage{{MediaType: value.MIMEType, Data: data}}
-		result.Output = fmt.Sprintf(`{"mime_type":"image/jpeg","width":%d,"height":%d}`, value.Width, value.Height)
+		result.Output = fmt.Sprintf(`{"mime_type":"image/jpeg","width":%d,"height":%d,"screen_width":%d,"screen_height":%d}`,
+			value.Width, value.Height, value.ScreenWidth, value.ScreenHeight)
 	case runtimeToolWindowList:
 		var value struct {
 			Windows []runtimeDesktopWindow `json:"windows"`
@@ -2038,10 +2133,14 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 		result.Output = `{"window_id":"` + value.WindowID + `","activated":true}`
 	case runtimeToolDesktopClick:
 		var request struct {
-			WindowID string `json:"window_id"`
-			X        int    `json:"x"`
-			Y        int    `json:"y"`
-			Button   string `json:"button"`
+			WindowID         string `json:"window_id"`
+			X                int    `json:"x"`
+			Y                int    `json:"y"`
+			ScreenshotWidth  int    `json:"screenshot_width"`
+			ScreenshotHeight int    `json:"screenshot_height"`
+			ScreenWidth      int    `json:"screen_width"`
+			ScreenHeight     int    `json:"screen_height"`
+			Button           string `json:"button"`
 		}
 		var value struct {
 			WindowID string `json:"window_id"`
@@ -2050,13 +2149,16 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 			Button   string `json:"button"`
 			Clicked  bool   `json:"clicked"`
 		}
-		if json.Unmarshal(arguments, &request) != nil || !validDesktopWindowID(request.WindowID) || decodeStrictRuntimeResult(operation.Result, &value) != nil {
+		if !validRuntimeToolArguments(mapping, arguments) || json.Unmarshal(arguments, &request) != nil ||
+			!validDesktopWindowID(request.WindowID) || decodeStrictRuntimeResult(operation.Result, &value) != nil {
 			return invalid("desktop_click_failed")
 		}
 		if request.Button == "" {
 			request.Button = "left"
 		}
-		if value.WindowID != request.WindowID || value.X != request.X || value.Y != request.Y || value.Button != request.Button || !value.Clicked {
+		expectedX := screenshotPointToScreen(request.X, request.ScreenshotWidth, request.ScreenWidth)
+		expectedY := screenshotPointToScreen(request.Y, request.ScreenshotHeight, request.ScreenHeight)
+		if value.WindowID != request.WindowID || value.X != expectedX || value.Y != expectedY || value.Button != request.Button || !value.Clicked {
 			return invalid("desktop_click_failed")
 		}
 		encoded, _ := json.Marshal(value)
@@ -2096,6 +2198,41 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 		return invalid("unsupported_desktop_tool")
 	}
 	return result, nil
+}
+
+// Validate before recording success: the worker accepts only complete JPEGs
+// within these bounds, regardless of whether they came from the desktop or a
+// browser tab.
+func validateRuntimeScreenshot(data []byte) (int, int, bool) {
+	if len(data) < 4 || len(data) > maxDesktopScreenshotBytes ||
+		!bytes.HasPrefix(data, []byte{0xff, 0xd8}) || !bytes.HasSuffix(data, []byte{0xff, 0xd9}) {
+		return 0, 0, false
+	}
+	config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	if err != nil || config.Width < 1 || config.Width > maxDesktopScreenshotWidth ||
+		config.Height < 1 || config.Height > maxDesktopScreenshotHeight {
+		return 0, 0, false
+	}
+	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+		return 0, 0, false
+	}
+	return config.Width, config.Height, true
+}
+
+func validRuntimeScreenshotGeometry(width, height, screenWidth, screenHeight int) bool {
+	if width < 1 || height < 1 || !validRuntimeScreenSize(screenWidth, screenHeight) || width > screenWidth || height > screenHeight {
+		return false
+	}
+	difference := int64(width)*int64(screenHeight) - int64(height)*int64(screenWidth)
+	if difference < 0 {
+		difference = -difference
+	}
+	return difference <= int64(max(screenWidth, screenHeight))
+}
+
+func validRuntimeScreenSize(width, height int) bool {
+	return width > 0 && width <= maxDesktopScreenWidth && height > 0 && height <= maxDesktopScreenHeight &&
+		int64(width)*int64(height) <= maxDesktopScreenPixels
 }
 
 func validDesktopWindowID(value string) bool {
@@ -2202,7 +2339,7 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 		runtimeToolDesktopScreenshot:   {},
 		runtimeToolWindowList:          {},
 		runtimeToolWindowActivate:      {"window_id": true},
-		runtimeToolDesktopClick:        {"window_id": true, "x": true, "y": true, "button": true},
+		runtimeToolDesktopClick:        {"window_id": true, "x": true, "y": true, "screenshot_width": true, "screenshot_height": true, "screen_width": true, "screen_height": true, "button": true},
 		runtimeToolDesktopType:         {"window_id": true, "text": true},
 		runtimeToolDesktopPressKey:     {"window_id": true, "key": true},
 	}
@@ -2337,7 +2474,21 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 	case runtimeToolDesktopClick:
 		var windowID string
 		if !stringValue("window_id", true) || json.Unmarshal(fields["window_id"], &windowID) != nil || !validDesktopWindowID(windowID) ||
-			!nonnegativeIntValue("x", 65535) || !nonnegativeIntValue("y", 65535) {
+			!nonnegativeIntValue("x", maxDesktopScreenshotWidth-1) || !nonnegativeIntValue("y", maxDesktopScreenshotHeight-1) ||
+			!nonnegativeIntValue("screenshot_width", maxDesktopScreenshotWidth) || !nonnegativeIntValue("screenshot_height", maxDesktopScreenshotHeight) ||
+			!nonnegativeIntValue("screen_width", maxDesktopScreenWidth) || !nonnegativeIntValue("screen_height", maxDesktopScreenHeight) {
+			return false
+		}
+		var click struct {
+			X                int `json:"x"`
+			Y                int `json:"y"`
+			ScreenshotWidth  int `json:"screenshot_width"`
+			ScreenshotHeight int `json:"screenshot_height"`
+			ScreenWidth      int `json:"screen_width"`
+			ScreenHeight     int `json:"screen_height"`
+		}
+		if json.Unmarshal(raw, &click) != nil || !validRuntimeScreenshotGeometry(click.ScreenshotWidth, click.ScreenshotHeight, click.ScreenWidth, click.ScreenHeight) ||
+			click.X >= click.ScreenshotWidth || click.Y >= click.ScreenshotHeight {
 			return false
 		}
 		if value, exists := fields["button"]; exists {
@@ -2360,6 +2511,13 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 		}
 	}
 	return true
+}
+
+func screenshotPointToScreen(point, screenshotSize, screenSize int) int {
+	if point < 0 || screenshotSize < 1 || screenSize < 1 {
+		return -1
+	}
+	return int(int64(point) * int64(screenSize) / int64(screenshotSize))
 }
 
 func runtimeToolWorkspaceID(mapping runtimeToolMapping, raw json.RawMessage) string {

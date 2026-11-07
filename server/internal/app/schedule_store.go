@@ -26,6 +26,7 @@ type ScheduleRunPage struct {
 type CreateScheduleCommand struct {
 	HostID             string
 	ModelID            string
+	Title              *string
 	Objective          string
 	Timing             schedule.Timing
 	Budget             task.Budget
@@ -38,6 +39,7 @@ type UpdateScheduleCommand struct {
 	ExpectedVersion    int64
 	HostID             *string
 	ModelID            *string
+	Title              *string
 	Objective          *string
 	Timing             *schedule.Timing
 	Budget             *task.Budget

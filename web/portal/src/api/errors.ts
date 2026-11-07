@@ -9,7 +9,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   account_disabled: "账号已停用，请联系管理员",
   not_found: "请求的内容不存在",
   conflict: "当前状态已变化，请刷新后核对",
-  quota_exceeded: "已达到主机配额上限",
+  quota_exceeded: "额度不足或尚未配置，请检查相关额度",
   capacity_exceeded: "当前资源容量不足",
   workspace_busy: "工作目录正在被其他主机使用",
   workspace_conflict: "工作区发生冲突，请刷新后核对",
@@ -36,4 +36,21 @@ export function errorMessage(error: unknown): string {
   if (!(error instanceof ApiError)) return error instanceof Error ? error.message : "操作失败，请重试";
   const message = ERROR_MESSAGES[error.code] || error.message || "操作失败，请重试";
   return error.retryAfter && error.retryAfter > 0 ? `${message}（${error.retryAfter} 秒后可重试）` : message;
+}
+
+export function modelCheckErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.code === "quota_exceeded") return "模型调用额度不足或尚未配置，请在管理后台检查账号的模型预算。";
+    if (error.code === "upstream_timeout") return "连接模型服务超时，请检查网络后重试。";
+    if (error.code === "upstream_error") {
+      switch (error.details?.reason) {
+        case "transport": return "无法连接模型服务，请检查网络或代理设置。";
+        case "authentication_rejected": return "模型服务拒绝了 API 密钥，请检查密钥是否有效。";
+        case "access_rejected": return "模型服务拒绝访问，请检查账号和模型权限。";
+        case "quota_exhausted": return "模型服务商的额度已用完，请检查服务商账号。";
+        default: return "模型服务检查失败，请检查服务地址和模型配置。";
+      }
+    }
+  }
+  return errorMessage(error);
 }

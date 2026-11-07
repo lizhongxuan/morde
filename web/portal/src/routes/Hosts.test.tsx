@@ -113,7 +113,7 @@ describe('Hosts', () => {
   it('binds one ready Workspace to a stopped legacy host before enabling restore', async () => {
     const stoppedHost = { ...ownedHost, state: 'stopped' as const, workspaces: [] };
     const workspace = {
-      id: 'w7654321', name: '旧电脑工作区', revision: 4, used_bytes: 0, quota_bytes: 1024,
+      id: 'w7654321', name: '旧电脑工作区', revision: 4, used_bytes: 0, quota_bytes: 1024, is_read_only: false,
       state: 'ready' as const, created_at: '', updated_at: '',
     };
     const preparingBinding: Host['workspaces'][number] = {

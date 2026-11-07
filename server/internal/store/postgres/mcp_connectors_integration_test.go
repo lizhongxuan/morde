@@ -51,7 +51,7 @@ $$ LANGUAGE plpgsql`); err != nil {
 	if _, err := store.pool.Exec(ctx, `DROP FUNCTION reject_mcp_connector_audit()`); err != nil {
 		t.Fatal(err)
 	}
-	credential := []byte(`{"kind":"oauth","access_token":"postgres-secret"}`)
+	credential := []byte(`{"kind":"oauth","oauth":{"access_token":"postgres-secret"}}`)
 	created, err := service.Create(ctx, principal, app.CreateMCPConnectorCommand{
 		Name: "Notion", EndpointURL: "https://mcp.notion.com/mcp", CredentialJSON: credential,
 	})
@@ -97,7 +97,7 @@ $$ LANGUAGE plpgsql`); err != nil {
 		t.Fatalf("SetEnabled() = %#v, %v", enabled, err)
 	}
 	if _, err := service.RotateCredential(ctx, principal, created.ID, app.RotateMCPConnectorCredentialCommand{
-		CredentialJSON: []byte(`{"kind":"oauth","access_token":"rotated-secret"}`), ExpectedRevision: 3,
+		CredentialJSON: []byte(`{"kind":"oauth","oauth":{"access_token":"rotated-secret"}}`), ExpectedRevision: 3,
 	}); err != nil {
 		t.Fatal(err)
 	}

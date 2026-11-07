@@ -40,7 +40,7 @@ func (q *Queries) GetConversation(ctx context.Context, arg GetConversationParams
 }
 
 const getMessage = `-- name: GetMessage :one
-SELECT id, conversation_id, owner_id, role, content, task_id, created_at, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence, delivery_status, actor_id FROM conversation_messages WHERE id = $1 AND owner_id = $2
+SELECT id, conversation_id, owner_id, role, content, task_id, created_at, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence, delivery_status, actor_id, output_status, output_task_revision, output_result_event_sequence FROM conversation_messages WHERE id = $1 AND owner_id = $2
 `
 
 type GetMessageParams struct {
@@ -66,6 +66,9 @@ func (q *Queries) GetMessage(ctx context.Context, arg GetMessageParams) (Convers
 		&i.Sequence,
 		&i.DeliveryStatus,
 		&i.ActorID,
+		&i.OutputStatus,
+		&i.OutputTaskRevision,
+		&i.OutputResultEventSequence,
 	)
 	return i, err
 }
@@ -126,7 +129,7 @@ func (q *Queries) ListConversations(ctx context.Context, arg ListConversationsPa
 }
 
 const listMessages = `-- name: ListMessages :many
-SELECT id, conversation_id, owner_id, role, content, task_id, created_at, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence, delivery_status, actor_id FROM conversation_messages
+SELECT id, conversation_id, owner_id, role, content, task_id, created_at, model_id, source_kind, source_exchange_id, requested_conversation_id, sequence, delivery_status, actor_id, output_status, output_task_revision, output_result_event_sequence FROM conversation_messages
 WHERE owner_id = $1 AND conversation_id = $2
   AND ($3::bigint = 0 OR sequence < $3::bigint)
 ORDER BY sequence DESC
@@ -169,6 +172,9 @@ func (q *Queries) ListMessages(ctx context.Context, arg ListMessagesParams) ([]C
 			&i.Sequence,
 			&i.DeliveryStatus,
 			&i.ActorID,
+			&i.OutputStatus,
+			&i.OutputTaskRevision,
+			&i.OutputResultEventSequence,
 		); err != nil {
 			return nil, err
 		}

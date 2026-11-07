@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -13,9 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacefs"
@@ -145,8 +149,7 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 	file.Xattrs = []workspace.ExtendedAttribute{{Name: "user.task", Value: []byte("kept")}}
 	file.ACL = &workspace.NativeACL{Platform: "linux", Format: "linux-posix-acl-v1", Data: []byte{7, 8, 9}}
 	emptyDirectories := []string{"reports/archive"}
-	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, emptyDirectories)
-	file = files[0]
+	files, directories, _ := taskWorkspacePublishSnapshot(t, []workspace.File{file}, emptyDirectories)
 	directories[0].Xattrs = []workspace.ExtendedAttribute{{Name: "user.root", Value: []byte("task root")}}
 	manifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
 	if err != nil {
@@ -269,6 +272,127 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 	})
 	if err != nil || replayed != receipt || reads != 1 {
 		t.Fatalf("idempotent publish replay = %#v, reads=%d, err=%v", replayed, reads, err)
+	}
+}
+
+func TestTaskWorkspacePublishedArtifactPersistsAcrossPostgresConnectionRestartForOwner(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	_, workspaceValue, _, claimed, command := newTaskWorkspacePublishTask(t, ctx, store, "persisted-owner-artifact")
+	otherOwner := createTestUser(t, store, 2, 4000, 8000)
+
+	blocksRoot := filepath.Join(t.TempDir(), "blocks")
+	blocks, err := workspacefs.Open(blocksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := blocks.Close(); err != nil {
+			t.Errorf("close Workspace block store: %v", err)
+		}
+	})
+	service, err := app.NewWorkspaceSyncService(store, blocks, workspace.MaxSyncManifestBytes, syncTestOwnerQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantContent := []byte("persisted Workspace artifact")
+	file := syncTestFile("reports/generated.txt", wantContent)
+	files, directories, _ := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	manifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, nil, directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusRunning, CurrentStep: stepID,
+		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded, Title: "Save artifact"}},
+		Event: task.Event{Type: "task.step", Payload: []byte(`{"step_id":"` + stepID + `"}`)},
+	}); err != nil {
+		t.Fatalf("persist artifact source step: %v", err)
+	}
+
+	proof := app.TaskArtifactProof{OwnerID: claimed.OwnerID, WorkspaceID: workspaceValue.ID, Revision: 1,
+		Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256}
+	if _, err := service.VerifyCommittedArtifact(ctx, proof); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("verify unpublished artifact = %v; want workspace conflict", err)
+	}
+	if details, err := store.GetTask(ctx, claimed.ID, claimed.OwnerID); err != nil || len(details.Artifacts) != 0 {
+		t.Fatalf("unpublished artifact was reported on Task: artifacts=%#v err=%v", details.Artifacts, err)
+	}
+
+	reserved, err := service.ReserveTaskWorkspacePublish(ctx, command)
+	if err != nil || reserved.State != app.TaskWorkspacePublishPending {
+		t.Fatalf("reserve artifact publication = %#v, err=%v", reserved, err)
+	}
+	receipt, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA,
+		func(_ context.Context, digest string) ([]byte, error) {
+			if digest != file.SHA256 {
+				t.Fatalf("requested output block %q; want %q", digest, file.SHA256)
+			}
+			return append([]byte(nil), wantContent...), nil
+		})
+	if err != nil || receipt.State != app.TaskWorkspacePublishSucceeded || receipt.PublishedRevision != 1 {
+		t.Fatalf("commit artifact publication = %#v, err=%v", receipt, err)
+	}
+	artifact := task.Artifact{ID: mustID(t, domain.NewArtifactID), TaskID: claimed.ID, StepID: stepID,
+		WorkspaceID: workspaceValue.ID, Revision: receipt.PublishedRevision, SizeBytes: file.SizeBytes,
+		SHA256: file.SHA256, Label: "Generated report", Path: file.Path, MediaType: "text/plain"}
+	if _, err := store.RecordValidatedArtifact(ctx, claimed.OwnerID, artifact, claimed.Lease.Owner, claimed.Lease.Version); err != nil {
+		t.Fatalf("record committed Workspace artifact: %v", err)
+	}
+	if _, err := service.VerifyCommittedArtifact(ctx, app.TaskArtifactProof{
+		OwnerID: claimed.OwnerID, WorkspaceID: workspaceValue.ID, Revision: receipt.PublishedRevision + 1,
+		Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256,
+	}); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+		t.Fatalf("verify artifact at an uncommitted revision = %v; want workspace conflict", err)
+	}
+
+	// Close the only application pool and create a fresh one against the same
+	// temporary PostgreSQL database. The Workspace block store remains durable
+	// independently of PostgreSQL, matching the production storage boundary.
+	reopenConfig := pool.Config().Copy()
+	pool.Close()
+	reopenedPool, err := pgxpool.NewWithConfig(ctx, reopenConfig)
+	if err != nil {
+		t.Fatalf("reopen temporary PostgreSQL database: %v", err)
+	}
+	t.Cleanup(func() { reopenedPool.Close() })
+	reopenedStore := New(reopenedPool)
+	reopenedService, err := app.NewWorkspaceSyncService(reopenedStore, blocks, workspace.MaxSyncManifestBytes, syncTestOwnerQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ownerDetails, err := reopenedStore.GetTask(ctx, claimed.ID, claimed.OwnerID)
+	if err != nil || len(ownerDetails.Artifacts) != 1 || ownerDetails.Artifacts[0].ID != artifact.ID ||
+		ownerDetails.Artifacts[0].Path != file.Path || ownerDetails.Artifacts[0].Revision != receipt.PublishedRevision {
+		t.Fatalf("owner Task artifacts after PostgreSQL reconnect = %#v, err=%v", ownerDetails.Artifacts, err)
+	}
+	if _, err := reopenedStore.GetTask(ctx, claimed.ID, otherOwner.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other owner's Task artifact lookup = %v; want not found", err)
+	}
+	principal := identity.Principal{UserID: claimed.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	page, err := reopenedService.GetManifest(ctx, principal, workspaceValue.ID, receipt.PublishedRevision, "", "", 10)
+	if err != nil || len(page.Files) != 1 || page.Files[0].Path != file.Path || page.Files[0].SHA256 != file.SHA256 {
+		t.Fatalf("owner manifest after PostgreSQL reconnect = %#v, err=%v", page, err)
+	}
+	otherPrincipal := identity.Principal{UserID: otherOwner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t7654321"}
+	if _, err := reopenedService.GetManifest(ctx, otherPrincipal, workspaceValue.ID, receipt.PublishedRevision, "", "", 10); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("other owner's Workspace manifest lookup = %v; want not found", err)
+	}
+	if _, err := reopenedService.VerifyCommittedArtifact(ctx, proof); err != nil {
+		t.Fatalf("verify published artifact after PostgreSQL reconnect: %v", err)
+	}
+	block, err := blocks.Open(workspaceValue.ID, file.Chunks[0].SHA256)
+	if err != nil {
+		t.Fatalf("open persisted artifact block: %v", err)
+	}
+	gotContent, readErr := io.ReadAll(block)
+	closeErr := block.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(gotContent, wantContent) {
+		t.Fatalf("persisted artifact content = %q, read err=%v close err=%v", gotContent, readErr, closeErr)
 	}
 }
 
@@ -546,7 +670,6 @@ func TestTaskWorkspacePublishQuotaRejectionReleasesOperationBarrier(t *testing.T
 	service, _ := taskWorkspacePublishTestService(t, store)
 	file := syncTestFile("reports/result.txt", []byte("over quota"))
 	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
-	file = files[0]
 	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil {
 		t.Fatal(err)
 	}

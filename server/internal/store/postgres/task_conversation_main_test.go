@@ -60,6 +60,75 @@ func TestMainConversationEnsureSelectionSwitchAndReplay(t *testing.T) {
 	}
 }
 
+func TestMainConversationIgnoresProjectConversationCandidates(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 1, 1000, 2048)
+	projectValue := createProjectStoreFixture(t, ctx, store, owner.ID, "Project chat", "personal main isolation", "main-project-create-01")
+	projectConversationID := mustID(t, domain.NewConversationID)
+	projectConversation := conversation.Conversation{ID: projectConversationID, OwnerID: owner.ID, ProjectID: projectValue.ID, Title: "Project only"}
+	requestHash := sha256.Sum256([]byte(projectConversationID))
+	if _, replayed, err := store.CreateProjectConversation(ctx, owner.ID, projectConversation, app.IdempotencyRecord{
+		OwnerID: owner.ID, Operation: "project_conversation.create", Key: "main-project-conversation-01",
+		RequestHash: requestHash[:], ResourceID: projectConversationID,
+	}); err != nil || replayed {
+		t.Fatalf("create project conversation = replay %t, err %v", replayed, err)
+	}
+	state, err := store.GetMainConversation(ctx, owner.ID)
+	if err != nil || state.Status != conversation.MainConversationUninitialized {
+		t.Fatalf("project conversation became personal main candidate: %+v, err=%v", state, err)
+	}
+
+	main, replayed, _ := ensureMainConversationForTest(t, store, owner.ID, "main-ensure-project-only")
+	if replayed || main.Status != conversation.MainConversationReady || main.ConversationID == projectConversationID || main.Version != 1 {
+		t.Fatalf("ensure selected a project conversation: %+v, replay=%t", main, replayed)
+	}
+	var personalCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversations WHERE id=$1 AND owner_id=$2 AND project_id IS NULL`, main.ConversationID, owner.ID).Scan(&personalCount); err != nil || personalCount != 1 {
+		t.Fatalf("ensured main conversation is not personal: count=%d, err=%v", personalCount, err)
+	}
+	state, err = store.GetMainConversation(ctx, owner.ID)
+	if err != nil || state != main {
+		t.Fatalf("read ensured main conversation = %+v, err=%v; want %+v", state, err, main)
+	}
+}
+
+func TestMainConversationFailsClosedForLegacyProjectPointerAndReplay(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 1, 1000, 2048)
+	projectValue := createProjectStoreFixture(t, ctx, store, owner.ID, "Project chat", "legacy main pointer", "main-legacy-project-create")
+	projectConversationID := mustID(t, domain.NewConversationID)
+	projectConversation := conversation.Conversation{ID: projectConversationID, OwnerID: owner.ID, ProjectID: projectValue.ID, Title: "Project only"}
+	requestHash := sha256.Sum256([]byte(projectConversationID))
+	if _, _, err := store.CreateProjectConversation(ctx, owner.ID, projectConversation, app.IdempotencyRecord{
+		OwnerID: owner.ID, Operation: "project_conversation.create", Key: "main-legacy-project-conversation",
+		RequestHash: requestHash[:], ResourceID: projectConversationID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var serviceInstanceID string
+	if err := pool.QueryRow(ctx, `SELECT instance_id::text FROM service_identity WHERE singleton=true`).Scan(&serviceInstanceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO account_main_conversations(service_instance_id,owner_id,conversation_id,version) VALUES ($1::uuid,$2,$3,1)`,
+		serviceInstanceID, owner.ID, projectConversationID); err != nil {
+		t.Fatal(err)
+	}
+	ensureRecord := ensureMainConversationRecord(owner.ID, "main-legacy-project-replay", mustID(t, domain.NewConversationID))
+	if _, err := pool.Exec(ctx, `INSERT INTO idempotency_keys(owner_id,operation,key,request_hash,resource_id,related_id) VALUES ($1,$2,$3,$4,$5,'1')`,
+		ensureRecord.OwnerID, ensureRecord.Operation, ensureRecord.Key, ensureRecord.RequestHash, projectConversationID); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := store.GetMainConversation(ctx, owner.ID); domain.CodeOf(err) != domain.CodeInternal || value.ConversationID != "" {
+		t.Fatalf("legacy project pointer was returned as a personal main conversation: %+v, err=%v", value, err)
+	}
+	value, replayed, err := store.EnsureMainConversation(ctx, conversation.Conversation{ID: mustID(t, domain.NewConversationID), OwnerID: owner.ID}, ensureRecord)
+	if domain.CodeOf(err) != domain.CodeNotFound || replayed || value.ConversationID != "" {
+		t.Fatalf("legacy project ensure replay was not rejected: %+v, replay=%t, err=%v", value, replayed, err)
+	}
+}
+
 func TestMainConversationEnsureSelectionAndConcurrentInitialization(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()

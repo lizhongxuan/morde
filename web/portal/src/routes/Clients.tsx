@@ -4,6 +4,7 @@ import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Link } from 'react-router';
 
 type Client = Awaited<ReturnType<typeof portalApi.clients>>['items'][number];
 const platformName: Record<string, string> = { desktop: '电脑', android: 'Android', ios: 'iOS' };
@@ -29,8 +30,8 @@ export function Clients() {
   const queryClient = useQueryClient();
   const clients = useQuery({ queryKey: ['clients'], queryFn: portalApi.clients });
   const refresh = () => { void queryClient.invalidateQueries({ queryKey: ['clients'] }); };
-  return <section>
-    <div className="page-heading"><div><p className="eyebrow">账号安全</p><h1>客户端</h1><p className="muted">管理已登录的电脑和手机。撤销后，该客户端需要重新登录。</p></div></div>
+  return <section className="design-panel">
+    <div className="design-panel-header"><div><h2>已登录设备</h2><p>管理已登录的电脑和手机。</p></div><Link className="button button-secondary" to="/download">下载客户端</Link></div>
     {clients.isPending ? <div className="loading-card" role="status">正在加载客户端…</div>
       : clients.isError ? <div className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></div>
         : !clients.data.items.length ? <div className="empty-card compact"><p>还没有已登录的客户端。请在 Morde 电脑或手机应用使用账号密码登录。</p></div>

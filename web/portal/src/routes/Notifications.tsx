@@ -25,8 +25,8 @@ export function Notifications() {
   const items = notifications.data?.pages.flatMap((page) => page.items) ?? [];
   const unreadCount = items.filter((item) => item.read_at === null).length;
 
-  return <section>
-    <div className="page-heading"><div><p className="eyebrow">站内消息</p><h1>通知</h1><p className="muted">这里保留历史通知，标记已读不会触发任何操作。</p></div></div>
+  return <section className="design-panel">
+    <div className="design-panel-header"><div><h2>通知列表</h2><p>查看你的站内消息。</p></div></div>
     <div className="notification-filters" aria-label="通知筛选">
       <button type="button" className={`button button-small ${unreadOnly ? 'button-secondary' : 'button-primary'}`} aria-pressed={!unreadOnly} onClick={() => setUnreadOnly(false)}>全部</button>
       <button type="button" className={`button button-small ${unreadOnly ? 'button-primary' : 'button-secondary'}`} aria-pressed={unreadOnly} onClick={() => setUnreadOnly(true)}>未读</button>

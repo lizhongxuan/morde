@@ -3,14 +3,12 @@ package api
 import (
 	"context"
 	"net/http"
-	"regexp"
 
 	"github.com/gin-gonic/gin"
 
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 )
-
-var serviceInstanceIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type capabilitiesResponse struct {
 	ServiceInstanceID      string   `json:"service_instance_id"`
@@ -24,7 +22,7 @@ type capabilitiesResponse struct {
 
 func (h *api) capabilities(c *gin.Context) {
 	// A missing identity cannot safely partition client data across servers.
-	if !serviceInstanceIDPattern.MatchString(h.options.ServiceInstanceID) || h.options.ServiceInstanceID == "00000000-0000-0000-0000-000000000000" {
+	if !domain.ValidServiceInstanceID(h.options.ServiceInstanceID) {
 		serviceUnavailable(c)
 		return
 	}
@@ -56,9 +54,22 @@ func (h *api) capabilities(c *gin.Context) {
 	if taskAPIAvailable {
 		features = append(features, "task_api")
 	}
+	if h.deps.ProjectWorkItems != nil {
+		features = append(features, "project_work_items_v2")
+	}
+	if derivatives, ok := h.deps.ProjectConversationAttachments.(interface {
+		projectConversationDerivativeService
+		DerivativesReady() bool
+	}); ok && derivatives.DerivativesReady() && h.deps.ProjectConversations != nil && clientVerifier {
+		features = append(features, "project_attachment_derivatives_v1")
+	}
 	cloudTasksAvailable := h.deps.ExecutionControl != nil && taskAPIAvailable
 	if cloudTasksAvailable {
 		features = append(features, "cloud_tasks")
+	}
+	if h.deps.TaskMedia != nil && h.deps.TaskMedia.GenerationReady() && clientVerifier && cloudTasksAvailable && h.deps.WorkspaceSync != nil &&
+		h.deps.ModelConnections != nil && h.deps.ModelGateway != nil {
+		features = append(features, "task_media_generation")
 	}
 	if h.deps.ProjectBudgetExecutionReady && cloudTasksAvailable && h.deps.Projects != nil &&
 		h.deps.ProjectContent != nil && h.deps.ProjectConversations != nil && h.deps.ProjectWorkItems != nil &&

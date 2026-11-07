@@ -44,7 +44,7 @@ func (r AgentInstanceStart) Validate() error {
 		return err
 	}
 	if r.RuntimeFence != nil {
-		if err := r.RuntimeFence.Validate(); err != nil || r.RuntimeFence.OwnerID != r.Fence.InitiatorID {
+		if err := r.RuntimeFence.Validate(); err != nil || r.RuntimeFence.OwnerID != r.Fence.OwnerID {
 			return domain.InvalidArgument("agent_instance", "account runtime fence is invalid")
 		}
 	}

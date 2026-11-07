@@ -13,7 +13,7 @@ export interface paths {
         };
         /**
          * Discover this Morde service before login
-         * @description The persisted service identifier partitions client data across installations. A null protocol or minimum version means it is not declared, not that an unfinished capability is available. Only assembled capabilities are listed. The default request size has route-specific exceptions.
+         * @description The persisted service identifier partitions client data across installations. A null protocol or minimum version means it is not declared, not that an unfinished capability is available. Only assembled capabilities are listed. The default request size has route-specific exceptions. task_media_generation is present only when server-managed image/video/speech generation, token reservation and settlement, durable idempotent provider-operation recovery, owner-authorized preview, save confirmation, and verified Workspace artifact publication are all assembled. Task media inputs and cloud speech recognition are not included.
          */
         get: operations["getCapabilities"];
         put?: never;
@@ -56,8 +56,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Run one metered platform-model inference
-         * @description Requires a user Session or installation-bound Client, an explicitly configured model budget, and an Idempotency-Key. This endpoint returns tool calls without executing them. It supports text, inline base64 images, function tools, temperature and text streaming; unsupported options such as stop sequences, remote image URLs and forced tool choice are rejected. A repeated call is not dispatched again; if its result was not saved by the caller, reconcile instead of retrying with a new key. No complete request or response is retained by the model ledger.
+         * Run one model inference
+         * @description Requires a user Session or installation-bound Client and an Idempotency-Key. Shared platform models require a configured account model budget; caller-owned personal models do not consume it. This endpoint returns tool calls without executing them. It supports text, inline base64 images, function tools, temperature and text streaming; unsupported options such as stop sequences, remote image URLs and forced tool choice are rejected. A repeated call is not dispatched again; if its result was not saved by the caller, reconcile instead of retrying with a new key. No complete request or response is retained by the model ledger.
          */
         post: operations["createPlatformChatCompletion"];
         delete?: never;
@@ -97,7 +97,7 @@ export interface paths {
         put?: never;
         /**
          * Register a standard user account
-         * @description Creates a pending user account with role=user. Registration is rate limited and does not create a login session. The name admin is reserved case-insensitively.
+         * @description Requires only a username and password; an optional invite_code is attribution-only and no SMS step is used. Creates a pending user account with role=user, is rate limited, and does not create a login session. The name admin is reserved case-insensitively.
          */
         post: operations["register"];
         delete?: never;
@@ -1299,6 +1299,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/workspaces/{id}/shares": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a single-recipient Workspace copy link
+         * @description Portal owner sessions only. The link expires after seven days if unclaimed. The response contains the random token once; only its SHA-256 hash is stored. A successful claim creates an independent Workspace owned by the recipient. View permission is enforced by the server and prevents Workspace writes and Host attachment.
+         */
+        post: operations["createWorkspaceShareLink"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspace-shares/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a Workspace copy link
+         * @description Portal session only. The token is sent in the request body and responses are not cacheable. Preview does not claim or consume the link.
+         */
+        post: operations["previewWorkspaceShareLink"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspace-shares/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim a Workspace copy link
+         * @description Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
+         */
+        post: operations["acceptWorkspaceShareLink"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/workspaces/{id}/restore": {
         parameters: {
             query?: never;
@@ -1912,68 +1974,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/instant-chat/conversations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List conversations through the legacy instant chat route
-         * @description Returns the same durable Task-backed conversations as the canonical conversation API.
-         */
-        get: operations["listInstantChatConversations"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/instant-chat/conversations/{id}/messages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["schemas"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        /**
-         * List conversation messages through the legacy instant chat route
-         * @description Returns the same persisted messages as the canonical conversation API.
-         */
-        get: operations["listInstantChatMessages"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/instant-chat/messages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Submit a durable Task through the legacy reply shape
-         * @description Submits to the canonical Task and Conversation services, then waits for the Task's terminal result to preserve the legacy response shape. Disconnecting while waiting does not cancel the durable Task. Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
-         */
-        post: operations["sendInstantChatMessage"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/execution": {
         parameters: {
             query?: never;
@@ -2358,6 +2358,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{id}/conversations/{conversation_id}/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        /** List visible active tasks in a shared conversation */
+        get: operations["listProjectConversationActiveTasks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{id}/conversations/{conversation_id}/messages": {
         parameters: {
             query?: never;
@@ -2375,10 +2395,332 @@ export interface paths {
         get: operations["listProjectConversationMessages"];
         put?: never;
         /**
-         * Append a message and queue a Task in the shared conversation
-         * @description Accepted project members may append messages. The conversation owner remains the creator while the Task initiator is the caller; current membership and the caller's independent Host, Workspace, model, and token access are rechecked by the write transaction.
+         * Accept a message in a shared project conversation
+         * @description Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. The Idempotency-Key must equal client_message_id.
          */
-        post: operations["appendProjectConversationMessage"];
+        post: operations["acceptProjectConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/message-uploads/{client_message_id}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        /** Read upload progress */
+        get: operations["getProjectConversationMessageUpload"];
+        /** Initialize or resume a long message */
+        put: operations["initializeProjectConversationMessageUpload"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/message-uploads/{client_message_id}/chunks/{sequence}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Idempotently store one 16 KiB byte chunk */
+        put: operations["putChunkProjectConversationMessageUpload"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/message-uploads/{client_message_id}/commit": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically accept the verified message */
+        post: operations["commitProjectConversationMessageUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry processing of an accepted failed message
+         * @description Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+         */
+        post: operations["retryProjectConversationMessageProcessing"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        /** Read received chunks for an upload by the original sender */
+        get: operations["getProjectConversationAttachmentUpload"];
+        /**
+         * Initialize or resume an attachment declared by a project message
+         * @description The original sender and current project member can initialize the declared slot. Exact retries reuse its ID; changed metadata conflicts. Expired incomplete uploads can restart with the same metadata. This slot is its idempotency identity.
+         */
+        put: operations["initializeProjectConversationAttachment"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/chunks/{sequence}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                "Content-Length": number;
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Upload or replay one project attachment chunk
+         * @description Send raw 4 MiB chunks in any order; the last chunk has the exact remaining length. Identical retries succeed and changed bytes conflict.
+         */
+        put: operations["putProjectConversationAttachmentChunk"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/commit": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify all chunks and associate the project attachment
+         * @description Empty request body. Size and full SHA-256 are verified before this slot becomes available to the Task; an exact retry is safe.
+         */
+        post: operations["commitProjectConversationAttachment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/derivatives": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Atomically commit or skip a project's attachment representations
+         * @description The original sender submits a complete ordered set after the original attachment is committed. The original slot must have been initialized with pdf or image mode. The JSON request is limited to 8 MiB. Identical retries succeed, changed content or a different outcome conflicts. Only this message's routing waits for the set; other messages remain eligible.
+         */
+        put: operations["putProjectConversationAttachmentDerivatives"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/content": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        /** Read a committed project attachment as a current project member */
+        get: operations["getProjectConversationAttachmentContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments-by-id/{attachment_id}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                attachment_id: components["schemas"]["ProjectConversationAttachmentId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read committed attachment metadata by its project attachment ID
+         * @description Requires current project viewer access. The attachment must belong to the specified message and service instance.
+         */
+        get: operations["getProjectConversationAttachmentMetadata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments-by-id/{attachment_id}/content": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                attachment_id: components["schemas"]["ProjectConversationAttachmentId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a committed project attachment by its ID
+         * @description Requires current project viewer access. The attachment must belong to the specified message and service instance.
+         */
+        get: operations["getProjectConversationAttachmentContentByID"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2578,7 +2920,7 @@ export interface paths {
         };
         /**
          * List project model usage attribution
-         * @description Available to accepted project members. Task model calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
+         * @description Available to accepted project members. Platform-model Task calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Caller-owned personal model calls do not consume either platform budget. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
          */
         get: operations["listProjectBudgetLedger"];
         put?: never;
@@ -2603,7 +2945,7 @@ export interface paths {
         put?: never;
         /**
          * Create a project work item
-         * @description Owner/member only. The default assignee is the caller; any supplied assignee must be an accepted member. Task and Workspace fields are added only through separately authorized operations.
+         * @description Owner/member only. Omitted category defaults to unclassified. By default, the caller is the assignee unless assignee_id is supplied. Set unassigned=true with assignee_id omitted to create an unassigned item. Task and Workspace fields are added only through separately authorized operations.
          */
         post: operations["createProjectWorkItem"];
         delete?: never;
@@ -2631,6 +2973,29 @@ export interface paths {
         head?: never;
         /** Assign a work item to an accepted project member */
         patch: operations["assignProjectWorkItem"];
+        trace?: never;
+    };
+    "/api/projects/{id}/work-items/{work_item_id}/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim an unassigned work item for the current member
+         * @description Owner/member only. Claims only an unassigned item for the authenticated member. It cannot replace an existing assignee; expected_version and Idempotency-Key make concurrent claims compare-and-set and exact retries idempotent.
+         */
+        post: operations["claimProjectWorkItem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/projects/{id}/work-items/{work_item_id}/block": {
@@ -2759,6 +3124,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/conversations/{id}/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ConversationId"];
+            };
+            cookie?: never;
+        };
+        /** List visible active tasks in this conversation */
+        get: operations["listConversationActiveTasks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations/{id}/messages": {
         parameters: {
             query?: never;
@@ -2772,10 +3156,146 @@ export interface paths {
         get: operations["listConversationMessages"];
         put?: never;
         /**
-         * Append a message to a conversation or its active cloud task
-         * @description When expected_task_id is supplied, the message is appended only if that Task is still active; a changed or finished Task returns a conflict instead of creating a new Task. Without it, a new Task may be queued. The server-side dsh Agent can continue after the client disconnects.
+         * Accept a message in a personal conversation
+         * @description Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The Idempotency-Key must equal client_message_id.
          */
-        post: operations["appendConversationMessage"];
+        post: operations["acceptConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/messages/{message_id}/retry-processing": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry processing of an accepted failed message
+         * @description Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+         */
+        post: operations["retryConversationMessageProcessing"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/messages/{message_id}/attachments/{client_attachment_id}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Associate a committed personal attachment with its stable message slot
+         * @description Exact retries succeed; changing the attachment for a slot conflicts. The authenticated owner, message, declared slot, and committed attachment must belong to the same service instance.
+         */
+        put: operations["associateConversationMessageAttachment"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/message-uploads/{client_message_id}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        /** Read upload progress */
+        get: operations["getConversationMessageUpload"];
+        /** Initialize or resume a long message */
+        put: operations["initializeConversationMessageUpload"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/message-uploads/{client_message_id}/chunks/{sequence}": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Idempotently store one 16 KiB byte chunk */
+        put: operations["putChunkConversationMessageUpload"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/message-uploads/{client_message_id}/commit": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically accept the verified message */
+        post: operations["commitConversationMessageUpload"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2814,6 +3334,29 @@ export interface paths {
         };
         /** Get an owned task and its durable progress */
         get: operations["getTask"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/media/{operation_id}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                operation_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a pending generated-media preview
+         * @description Requires the Task owner's session or client credential. Returns only server-staged generated media tied to the exact Task operation while its save confirmation is pending. Provider URLs and credentials are never returned. The response is private and non-cacheable; the staged bytes are deleted after approval, rejection, cancellation, or expiry. The service advertises task_media_generation only when this route and the complete generation, metering, recovery, and Workspace publication flow are assembled.
+         */
+        get: operations["getTaskMediaPreview"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3486,13 +4029,13 @@ export interface paths {
         };
         /**
          * List model connections available to the current user
-         * @description Portal sessions only. Lists shared connections and the current user's personal connections. API keys are not accepted.
+         * @description Approved Portal sessions or an installation-bound Morde Client credential may list shared and caller-owned personal connections. Ordinary API-key credentials are not accepted; client credentials can only access the caller's personal connections and shared models.
          */
         get: operations["listModelConnections"];
         put?: never;
         /**
          * Create a personal or shared model connection
-         * @description Portal sessions only. A personal connection is owned by the caller. Setting shared=true creates a shared connection and requires an administrator; ownership and authorization are enforced by the server. The API key is encrypted at rest and never returned.
+         * @description Approved Portal sessions or an installation-bound Morde Client credential may create a personal connection owned by the caller. Only an administrator Portal session may set shared=true. Ordinary API-key credentials are not accepted. Ownership and authorization are enforced by the server. The API key is encrypted at rest and never returned.
          */
         post: operations["createModelConnection"];
         delete?: never;
@@ -3512,18 +4055,18 @@ export interface paths {
         };
         /**
          * Get a model connection
-         * @description Portal sessions only. The response includes has_api_key but never the secret. Shared and personal access is checked by the server; inaccessible connections return not found.
+         * @description Approved Portal sessions or an installation-bound Morde Client credential may read shared and caller-owned personal connection metadata. Ordinary API-key credentials are not accepted. The response includes has_api_key but never the secret; inaccessible connections return not found.
          */
         get: operations["getModelConnection"];
         /**
          * Update a model connection
-         * @description Portal sessions only. Only the owner may update a personal connection; only an administrator may update a shared connection. shared is immutable here. Omit api_key or send an empty string to retain the existing secret; any supplied secret replaces it. The server never returns the secret.
+         * @description Approved Portal sessions or an installation-bound Morde Client credential may update caller-owned personal connections; only an administrator Portal session may update shared connections. shared is immutable here. Ordinary API-key credentials are not accepted. Omit api_key or send an empty string to retain the existing secret; any supplied secret replaces it. The server never returns the secret.
          */
         put: operations["updateModelConnection"];
         post?: never;
         /**
          * Delete a model connection
-         * @description Portal sessions only. Only the owner may delete a personal connection; only an administrator may delete a shared connection. Authorization is enforced by the server.
+         * @description Approved Portal sessions or an installation-bound Morde Client credential may delete caller-owned personal connections; only an administrator Portal session may delete shared connections. Ordinary API-key credentials are not accepted. Authorization is enforced by the server.
          */
         delete: operations["deleteModelConnection"];
         options?: never;
@@ -3544,7 +4087,7 @@ export interface paths {
         put?: never;
         /**
          * Check a model connection and discover capabilities
-         * @description Portal sessions only. Requires a configured account model budget and an Idempotency-Key. The selected probe is reserved and settled in the same ledger as model requests. An omitted capability means all; text, tools and vision can also be checked independently, using a new key for each. False means not yet verified or unsupported. Verified capabilities are combined only while the connection version is unchanged. Unknown usage remains pending for reconciliation and cannot be silently retried; the API key is never returned.
+         * @description Approved Portal sessions or an installation-bound Morde Client credential may check shared or caller-owned personal connections; shared connection checks require an administrator Portal session. Ordinary API-key credentials are not accepted. Requires an Idempotency-Key. Shared platform model checks require a configured account model budget; caller-owned personal checks do not consume it. The selected probe is recorded and settled in the same ledger as model requests. An omitted capability or all checks text, tools and vision; media generation probes are explicit because they may incur provider charges and require a new key. False means not yet verified or unsupported. Verified capabilities are combined only while the connection version is unchanged. Media generation is verified only when the provider reports actual input/output Token usage that can be reserved and settled exactly; seconds, images, characters or cost are never converted to Tokens. Unknown usage remains pending for reconciliation and cannot be silently retried; the API key is never returned.
          */
         post: operations["checkModelConnection"];
         delete?: never;
@@ -3664,7 +4207,7 @@ export interface paths {
         put?: never;
         /**
          * Begin server-side OAuth authorization for a connector
-         * @description Portal sessions only. Discovers the MCP protected resource and authorization server, reuses or dynamically registers an OAuth client, and returns a PKCE authorization URL. If dynamic registration is unavailable, returns the issuer and callback URI so the user can provide an OAuth client ID and optional secret. Client secrets are accepted only in this request and are never returned.
+         * @description Portal sessions only. OAuth authorization is unavailable when the Portal uses HTTP. Discovers the MCP protected resource and authorization server, reuses or dynamically registers an OAuth client, and returns a PKCE authorization URL. If dynamic registration is unavailable, returns the issuer and callback URI so the user can provide an OAuth client ID and optional secret. Client secrets are accepted only in this request and are never returned.
          */
         post: operations["beginMCPConnectorOAuth"];
         delete?: never;
@@ -3701,8 +4244,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Read account, model budget, reward, and quota policy
-         * @description Requires an approved administrator's unbound Portal session. Newly registered accounts receive the configured default model budget only on their first approval; administrators must configure a positive default before approving any new account. Invitation and contribution rewards remain disabled.
+         * Read account, model budget, model selection, reward, and quota policy
+         * @description Requires an approved administrator's unbound Portal session. A configured default platform-model budget is granted only on first approval; approval is also allowed when no default is configured, and personal models do not require one. Cloud Agent execution requires a checked text-and-tools model available to the user. Invitation and contribution rewards remain disabled.
          */
         get: operations["getAdminSettings"];
         put?: never;
@@ -3726,6 +4269,26 @@ export interface paths {
          * @description Requires an approved administrator's unbound Portal session. The default must be positive and is applied to a new account only on its first approval. Existing account budgets are never overwritten. expected_version is 0 when no default has been configured and increments after each successful update. The setting and audit record are committed atomically.
          */
         put: operations["updateAdminModelBudgetDefault"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/settings/model-default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Select or clear the global Cloud Agent model
+         * @description Requires an approved administrator's unbound Portal session. The selected connection must be shared, checked, and support text plus tools; setting an empty model_id clears the default. Updates use expected_version compare-and-set. Users may select another checked model they are authorized to use. The model ID may remain visible in admin settings when its connection is temporarily unchecked, while configured is false.
+         */
+        put: operations["updateAdminModelDefault"];
         post?: never;
         delete?: never;
         options?: never;
@@ -3834,6 +4397,28 @@ export interface paths {
         patch: operations["updateAdminHostResources"];
         trace?: never;
     };
+    "/api/admin/hosts/{id}/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Safely recover an uncertain Host restore
+         * @description Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+         */
+        post: operations["recoverAdminHost"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/workspaces": {
         parameters: {
             query?: never;
@@ -3905,7 +4490,7 @@ export interface paths {
         head?: never;
         /**
          * Review a user's status, change their role, or update quota
-         * @description Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, the configured default model budget is created in the same transaction as the status change and audit. If no valid default is configured, approval fails and the account remains unchanged. Disabling and restoring an account does not grant or reset a budget.
+         * @description Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, a configured default platform model budget is created in the same transaction as the status change and audit. If no default is configured, approval succeeds without granting a platform model budget. Disabling and restoring an account does not grant or reset a budget.
          */
         patch: operations["updateUser"];
         trace?: never;
@@ -4683,6 +5268,7 @@ export interface components {
         ScheduleId: string;
         PersonalAttachmentUploadId: string;
         PersonalAttachmentId: string;
+        ProjectConversationAttachmentId: string;
         ConversationId: string;
         TaskId: string;
         TaskWorkspaceViewDeletionId: string;
@@ -4724,8 +5310,16 @@ export interface components {
         };
         ModelConnectionCapabilities: {
             text: boolean;
+            /** @description True only after an explicit successful SSE probe for the current connection version. False includes unknown or unsupported. */
+            text_stream: boolean;
             tools: boolean;
             vision: boolean;
+            /** @description Optional verified server-managed output capabilities. A provider may advertise a modality only when it supplies a precise Token reservation upper bound, settleable actual Token usage, durable idempotent operation recovery, and confirmed cancellation; providers missing any of these remain disabled. Omitted or false means unavailable or unverified. Voice here means speech synthesis only; it does not enable audio input or cloud ASR. */
+            media_generation?: {
+                image_generation: boolean;
+                video_generation: boolean;
+                speech_generation: boolean;
+            };
         };
         /** @description API keys and other secret material are never present in this response. */
         ModelConnection: {
@@ -4744,7 +5338,13 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /**
+         * @description Configuration availability for the authenticated account, independent of health, budget and tool capability. Failed requests and stale cache must be treated as unknown.
+         * @enum {string}
+         */
+        ModelConfigurationStatus: "configured" | "not_configured" | "unknown";
         ModelConnectionList: {
+            configuration_status: components["schemas"]["ModelConfigurationStatus"];
             items: components["schemas"]["ModelConnection"][];
         };
         CreateMCPConnectorRequest: {
@@ -4830,7 +5430,9 @@ export interface components {
             usage: components["schemas"]["Usage"];
         };
         RegisterRequest: {
+            /** @description Username is trimmed and limited to 3–64 UTF-8 bytes. */
             name: string;
+            /** @description Password is limited to 8–72 UTF-8 bytes. */
             password: string;
             /** @description Optional Morde invitation attribution. The account remains pending review and receives no reward. */
             invite_code?: string;
@@ -4851,6 +5453,7 @@ export interface components {
             /** Format: int64 */
             default_personal_attachment_bytes: number;
             default_model_budget: components["schemas"]["AdminModelBudgetDefault"];
+            default_model: components["schemas"]["AdminModelDefault"];
         };
         AdminModelBudgetDefault: {
             configured: boolean;
@@ -4866,6 +5469,17 @@ export interface components {
             /** Format: int64 */
             token_limit: number;
             max_concurrent: number;
+        };
+        AdminModelDefault: {
+            configured: boolean;
+            model_id: components["schemas"]["ModelConnectionId"] | null;
+            /** Format: int64 */
+            version: number;
+        };
+        UpdateAdminModelDefaultRequest: {
+            /** Format: int64 */
+            expected_version: number;
+            model_id: components["schemas"]["ModelConnectionId"] | string;
         };
         AdminInvite: {
             inviter_id: components["schemas"]["UserId"];
@@ -5326,12 +5940,45 @@ export interface components {
             used_bytes: number;
             /** Format: int64 */
             quota_bytes: number;
+            /** @description True for a copy accepted with view permission. Server-side file mutations and Host attachment are denied. */
+            is_read_only: boolean;
             /** @enum {string} */
             state: "ready" | "deleting" | "deleted";
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        CreateWorkspaceShareRequest: {
+            /** Format: int64 */
+            expected_current_revision: number;
+            /** @enum {string} */
+            permission: "view" | "edit";
+        };
+        WorkspaceShareCreated: {
+            workspace_name: string;
+            /** @enum {string} */
+            permission: "view" | "edit";
+            /** @description High-entropy token returned only once. Store only a hash on the server. */
+            token: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        WorkspaceShareTokenRequest: {
+            token: string;
+        };
+        WorkspaceSharePreview: {
+            workspace_name: string;
+            /** @enum {string} */
+            permission: "view" | "edit";
+            /** Format: date-time */
+            expires_at: string;
+        };
+        WorkspaceShareAccepted: {
+            workspace_id: components["schemas"]["WorkspaceId"];
+            workspace_name: string;
+            /** @enum {string} */
+            permission: "view" | "edit";
         };
         CreateSiteRequest: {
             host_id: components["schemas"]["HostId"];
@@ -5985,6 +6632,11 @@ export interface components {
             kind: "every_n_hours";
             /** @description Elapsed hours between occurrences. */
             interval_hours: number;
+            /**
+             * Format: date-time
+             * @description Optional RFC3339 instant with an explicit UTC offset and at most six fractional-second digits (the existing PostgreSQL timestamp precision), used as the cadence phase. For every_n_hours, each slot is anchor_at + k * interval_hours for integer k >= 0. Creation or re-enabling selects the earliest slot strictly after now; anchor_at is used when still in the future and elapsed slots are skipped. Omission preserves creation/re-enabling-relative cadence.
+             */
+            anchor_at?: string;
             /** @description Must be a valid IANA time-zone identifier; the server rejects unknown identifiers. */
             time_zone: string;
         };
@@ -5995,6 +6647,9 @@ export interface components {
             status: components["schemas"]["ScheduleStatus"];
             host_id: components["schemas"]["ScheduleHostId"];
             model_id: string;
+            /** @description Display title must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; independent of the model objective. */
+            title: string;
+            /** @description Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective: string;
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
@@ -6022,6 +6677,9 @@ export interface components {
         ScheduleCreateRequest: {
             host_id?: components["schemas"]["ScheduleHostId"];
             model_id: string;
+            /** @description Optional display title; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; when omitted the server derives it from the trimmed objective. */
+            title?: string;
+            /** @description Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
@@ -6034,6 +6692,9 @@ export interface components {
             expected_version: number;
             host_id?: components["schemas"]["ScheduleHostId"];
             model_id?: string;
+            /** @description Optional independent display-title update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; omission preserves the current title. */
+            title?: string;
+            /** @description Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective?: string;
             timing?: components["schemas"]["ScheduleTiming"];
             budget?: components["schemas"]["ScheduleBudget"];
@@ -6084,6 +6745,9 @@ export interface components {
             status: components["schemas"]["ScheduleStatus"];
             host_id: components["schemas"]["ScheduleHostId"];
             model_id: string;
+            /** @description Display title, non-empty after trimming and limited to 1–32768 UTF-8 bytes; independent of the model objective. */
+            title: string;
+            /** @description Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
@@ -6425,34 +7089,6 @@ export interface components {
             /** Format: date-time */
             expires_at: string;
         };
-        InstantChatConversation: {
-            id: components["schemas"]["ConversationId"];
-            title: string;
-            model_id: string;
-            /** Format: date-time */
-            created_at: string;
-            /** Format: date-time */
-            updated_at: string;
-        };
-        InstantChatMessage: {
-            id: string;
-            conversation_id: components["schemas"]["ConversationId"];
-            /** @enum {string} */
-            role: "user" | "assistant";
-            content: string;
-            /** Format: date-time */
-            created_at: string;
-        };
-        InstantChatSendRequest: {
-            conversation_id?: components["schemas"]["ConversationId"];
-            model_id: string;
-            content: string;
-        };
-        InstantChatSendResponse: {
-            conversation: components["schemas"]["InstantChatConversation"];
-            message: components["schemas"]["InstantChatMessage"];
-            reply: components["schemas"]["InstantChatMessage"];
-        };
         Conversation: {
             id: components["schemas"]["ConversationId"];
             /** @enum {string} */
@@ -6508,22 +7144,22 @@ export interface components {
             items: components["schemas"]["ProjectConversation"][];
             next_cursor: string | null;
         };
-        ProjectConversationMessage: components["schemas"]["ConversationMessage"] & {
+        ProjectConversationMessage: components["schemas"]["ConversationMessageBase"] & {
             owner_id: components["schemas"]["UserId"];
             actor_id: components["schemas"]["UserId"];
+            attachment_ids?: components["schemas"]["ProjectConversationAttachmentId"][];
         };
         ProjectConversationMessagePage: {
             items: components["schemas"]["ProjectConversationMessage"][];
             next_cursor: string | null;
         };
-        AppendProjectConversationMessageRequest: components["schemas"]["AppendConversationMessageRequest"];
-        AppendProjectConversationMessageResponse: {
+        ProjectConversationMessageEnvelope: {
             message: components["schemas"]["ProjectConversationMessage"];
-            task: components["schemas"]["ProjectConversationTask"];
         };
-        ProjectConversationTask: components["schemas"]["Task"] & {
-            project_id: components["schemas"]["ProjectId"];
-            initiator_id: components["schemas"]["UserId"];
+        AcceptedProjectConversationMessageResponse: {
+            message: components["schemas"]["ProjectConversationMessage"];
+            /** @description True when an identical accepted receipt was returned. */
+            replayed: boolean;
         };
         CreateProjectRequest: {
             name: string;
@@ -6804,7 +7440,7 @@ export interface components {
             /** @description Present only for source=task. */
             task_id?: components["schemas"]["TaskId"];
             /** @enum {string} */
-            source: "client" | "chat" | "task";
+            source: "client" | "chat" | "task" | "route";
             model_id: components["schemas"]["ModelConnectionId"];
             /** Format: int64 */
             rate_version: number;
@@ -6825,6 +7461,11 @@ export interface components {
             next_cursor: string | null;
         };
         /** @enum {string} */
+        ProjectWorkItemCategory: "bug" | "request" | "unclassified";
+        /**
+         * @description Execution lifecycle independent from whether the item is claimed. delivered is terminal saved delivery evidence; no acceptance/review state is currently supported.
+         * @enum {string}
+         */
         ProjectWorkItemState: "open" | "blocked" | "delivered";
         ProjectWorkItemDelivery: {
             task_id: components["schemas"]["TaskId"];
@@ -6838,7 +7479,8 @@ export interface components {
             title: string;
             description: string;
             acceptance_criteria: string[];
-            assignee_id: components["schemas"]["UserId"];
+            category: components["schemas"]["ProjectWorkItemCategory"];
+            assignee_id: components["schemas"]["UserId"] | null;
             state: components["schemas"]["ProjectWorkItemState"];
             blocked_reason: string;
             task_ids: components["schemas"]["TaskId"][];
@@ -6856,9 +7498,17 @@ export interface components {
             acceptance_criteria?: string[];
             /** @description Defaults to the caller. */
             assignee_id?: components["schemas"]["UserId"];
+            /** @description Defaults to unclassified. */
+            category?: components["schemas"]["ProjectWorkItemCategory"];
+            /** @description Omission defaults to false; set true to create without an assignee and omit assignee_id. */
+            unassigned?: boolean;
         };
         AssignProjectWorkItemRequest: {
             assignee_id: components["schemas"]["UserId"];
+            /** Format: int64 */
+            expected_version: number;
+        };
+        ClaimProjectWorkItemRequest: {
             /** Format: int64 */
             expected_version: number;
         };
@@ -6888,43 +7538,172 @@ export interface components {
             items: components["schemas"]["Conversation"][];
             next_cursor: string | null;
         };
-        ConversationMessage: {
+        ConversationMessageBase: {
             id: components["schemas"]["MessageId"];
             conversation_id: components["schemas"]["ConversationId"];
+            /**
+             * Format: int64
+             * @description Monotonic sequence within the conversation; clients sort messages in ascending order for display.
+             */
+            sequence: number;
             /** @enum {string} */
             role: "user" | "assistant";
             content: string;
             task_id?: components["schemas"]["TaskId"];
-            attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
+            client_message_id?: string;
+            /** @enum {string} */
+            routing_status?: "pending" | "processing" | "routed" | "waiting_user" | "waiting_adjustment" | "failed";
+            /** @enum {string} */
+            routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
+            /**
+             * @description Status of a persisted streamed assistant message.
+             * @enum {string}
+             */
+            output_status?: "streaming" | "interrupted" | "completed";
+            /**
+             * Format: int64
+             * @description Task revision that produced this streamed message.
+             */
+            output_task_revision?: number;
+            /**
+             * Format: int64
+             * @description Present only after completion and identifies the corresponding Task result event.
+             */
+            output_result_event_sequence?: number;
+            /** @description Confirmed task results combined into this assistant message, in display order. */
+            sources?: components["schemas"]["ConversationMessageSource"][];
             /** @enum {string} */
             delivery_status: "pending" | "applied" | "unknown";
             /** Format: date-time */
             created_at: string;
         };
+        ConversationMessage: components["schemas"]["ConversationMessageBase"] & {
+            attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
+        };
+        ConversationMessageSource: {
+            user_message_id: components["schemas"]["MessageId"];
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            event_sequence: number;
+            content: string;
+        };
         ConversationMessagePage: {
             items: components["schemas"]["ConversationMessage"][];
             next_cursor: string | null;
+        };
+        ConversationMessageEnvelope: {
+            message: components["schemas"]["ConversationMessage"];
         };
         CreateConversationRequest: {
             host_id?: components["schemas"]["HostId"];
             title?: string;
         };
-        AppendConversationMessageRequest: {
-            /** @description Active Task that must receive this message; if it is no longer active */
-            expected_task_id?: components["schemas"]["TaskId"];
+        AcceptConversationMessageRequest: {
+            /** @description Must equal the Idempotency-Key header. */
+            client_message_id: string;
+            previous_client_message_id?: string;
+            reference_task_id?: components["schemas"]["TaskId"];
             host_id?: components["schemas"]["HostId"];
             workspace_id?: components["schemas"]["WorkspaceId"];
-            /** @description Immutable committed Workspace revision used by this task. Required with workspace_id. */
-            input_revision?: number;
             application_id?: string;
-            model_id: string;
+            /** @description Optional routing hint; a server default may be selected asynchronously. */
+            model_id?: string;
             content: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
+            client_attachment_ids?: string[];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
         };
-        AppendConversationMessageResponse: {
+        AcceptedConversationMessageResponse: {
             message: components["schemas"]["ConversationMessage"];
-            task: components["schemas"]["Task"];
+            /** @description True when an identical message receipt was returned. */
+            replayed: boolean;
+        };
+        ProjectConversationAttachmentInit: {
+            name: string;
+            media_type: string;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
+            /**
+             * @description Fixed when the original slot is initialized; pdf requires a PDF original, image requires an image original.
+             * @default none
+             * @enum {string}
+             */
+            derivative_mode: "none" | "pdf" | "image";
+        };
+        /** @description A completed PDF has one extracted text (page 0) and up to ten JPEG page previews (pages 1–10). An image conversion has one JPEG (page 0). A skipped set has no files. All bytes and SHA-256 values are verified. */
+        ProjectConversationDerivatives: {
+            /** @enum {string} */
+            outcome: "completed" | "skipped";
+            files: {
+                /** @enum {string} */
+                kind: "extracted_text" | "page_preview" | "image_conversion";
+                page: number;
+                name: string;
+                /** @enum {string} */
+                media_type: "text/plain" | "image/jpeg";
+                sha256: string;
+                /** Format: byte */
+                content_base64: string;
+            }[];
+        };
+        ProjectConversationAttachmentMetadata: {
+            attachment_id: components["schemas"]["ProjectConversationAttachmentId"];
+            name: string;
+            media_type: string;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
+            /** @enum {string} */
+            derivative_mode?: "none" | "pdf" | "image";
+        };
+        ProjectConversationAttachmentStatus: {
+            attachment_id: components["schemas"]["ProjectConversationAttachmentId"];
+            name: string;
+            media_type: string;
+            /** Format: int64 */
+            size_bytes: number;
+            sha256: string;
+            /** @enum {string} */
+            state: "uploading" | "committed" | "expired";
+            total_chunks: number;
+            received_sequences: number[];
+            replay: boolean;
+            /** @enum {string} */
+            derivative_mode?: "none" | "pdf" | "image";
+            /** @enum {string} */
+            derivative_state?: "none" | "awaiting" | "completed" | "skipped";
+        };
+        /** @description Idempotency-Key equals the client_message_id path value. Chunks are zero-based 16384-byte slices; the last slice may be shorter. */
+        ConversationMessageUploadInit: {
+            total_bytes: number;
+            total_chunks: number;
+            sha256: string;
+            previous_client_message_id?: string;
+            reference_task_id?: components["schemas"]["TaskId"];
+            host_id?: components["schemas"]["HostId"];
+            workspace_id?: components["schemas"]["WorkspaceId"];
+            application_id?: string;
+            model_id?: string;
+            mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
+            client_attachment_ids?: string[];
+            budget?: components["schemas"]["TaskBudgetRequest"] | null;
+        };
+        ConversationMessageChunk: {
+            content_base64: string;
+            sha256: string;
+        };
+        ConversationMessageUpload: {
+            client_message_id: string;
+            /** @enum {string} */
+            state: "uploading" | "committed";
+            total_bytes: number;
+            total_chunks: number;
+            received_sequences: number[];
+            /** @description Present when committed. */
+            message?: components["schemas"]["ConversationMessage"] | components["schemas"]["ProjectConversationMessage"];
         };
         /** @enum {string} */
         TaskStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "cancelling" | "completed" | "failed" | "cancelled";
@@ -6955,6 +7734,16 @@ export interface components {
             workspace_id?: components["schemas"]["WorkspaceId"];
             /** @description Immutable committed Workspace revision this task started from. */
             input_revision?: number;
+            /**
+             * Format: int64
+             * @description Task execution revision
+             */
+            current_revision?: number;
+            /**
+             * Format: int64
+             * @description Latest requested Task execution revision.
+             */
+            desired_revision?: number;
             /** @description Current confirmed Workspace revision available to this task; advances only after a durable task-owned publish. */
             workspace_checkpoint_revision?: number;
             application_id?: string;
@@ -6963,6 +7752,16 @@ export interface components {
             objective: string;
             status: components["schemas"]["TaskStatus"];
             current_step: string | null;
+            /**
+             * Format: int64
+             * @description Count of Task steps excluding budget steps.
+             */
+            step_count?: number;
+            /**
+             * Format: int64
+             * @description Count of succeeded Task steps excluding budget steps; never greater than step_count.
+             */
+            completed_step_count?: number;
             budget: components["schemas"]["TaskBudget"];
             usage: components["schemas"]["TaskUsage"];
             /** Format: date-time */
@@ -6974,7 +7773,7 @@ export interface components {
             id: components["schemas"]["StepId"];
             sequence: number;
             /** @enum {string} */
-            kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "result";
+            kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "progress" | "result";
             /** @enum {string} */
             status: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
             title: string;
@@ -6991,6 +7790,7 @@ export interface components {
             result: string | null;
             error: string | null;
         };
+        /** @description A saved Task output. Generated media becomes an artifact only after the Task owner confirms saving and the Workspace revision, relative path, size and digest are verified. */
         TaskArtifact: {
             id: components["schemas"]["ArtifactId"];
             step_id: components["schemas"]["StepId"];
@@ -7027,6 +7827,8 @@ export interface components {
             object: string;
             content: string;
             impact: string;
+            /** @description Present only while an image */
+            media_preview_operation_id?: components["schemas"]["OperationId"];
         };
         TaskClarificationRequest: {
             id: components["schemas"]["ClarificationId"];
@@ -7047,7 +7849,19 @@ export interface components {
         TaskAssistantMessage: {
             id: components["schemas"]["MessageId"];
             conversation_id: components["schemas"]["ConversationId"];
+            /**
+             * Format: int64
+             * @description Monotonic sequence within the conversation
+             */
+            sequence: number;
             task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            task_revision?: number;
+            /**
+             * Format: int64
+             * @description Exact event identifying this completed result.
+             */
+            result_event_sequence?: number;
             /** @constant */
             role: "assistant";
             content: string;
@@ -7095,6 +7909,13 @@ export interface components {
              */
             event_sequence: number;
             result: string | null;
+            /** @description True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. */
+            current_revision_started?: boolean;
+            /** @description A completed result is being held for a conversation reply; do not display it as a separate final message until published. */
+            result_message_pending?: boolean;
+            /** @description The final result is published as a conversation message with sources; use that message rather than displaying a separate Task result. */
+            result_message_published?: boolean;
+            /** @description Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available. */
             waiting_reason: string | null;
             steps: components["schemas"]["TaskStep"][];
             batch_items: components["schemas"]["TaskBatchItem"][];
@@ -7110,6 +7931,15 @@ export interface components {
             items: components["schemas"]["TaskSummary"][];
             next_cursor: string | null;
         };
+        ConversationActiveTask: components["schemas"]["TaskSummary"] & {
+            /** Format: int64 */
+            event_sequence: number;
+        };
+        ConversationActiveTaskPage: {
+            items: components["schemas"]["ConversationActiveTask"][];
+            next_cursor: string | null;
+        };
+        /** @description Text-only Task input. No image, video or audio attachment field is accepted. If task_media_generation is advertised, the server may generate image, video or speech outputs through verified media-capable connections; uploaded media and cloud speech recognition remain unavailable. */
         SubmitTaskRequest: {
             host_id?: components["schemas"]["HostId"];
             workspace_id?: components["schemas"]["WorkspaceId"];
@@ -7160,6 +7990,7 @@ export interface components {
             status: components["schemas"]["TaskStatus"];
             unsettled_operation_ids: components["schemas"]["OperationId"][];
         };
+        /** @description Media-generation progress uses the existing task.operation and task.waiting_user events. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication. */
         TaskEvent: {
             task_id: components["schemas"]["TaskId"];
             sequence: number;
@@ -7228,6 +8059,20 @@ export interface components {
             /** Format: int64 */
             expected_version: number;
         };
+        AdminHostRecoveryRequest: {
+            /** Format: int64 */
+            runtime_generation: number;
+            /** @description Confirm that the external issue is fixed before creating a replacement sandbox. */
+            confirm_retry: boolean;
+        };
+        AdminHostRecoveryResult: {
+            host_id: components["schemas"]["HostId"];
+            /** Format: int64 */
+            runtime_generation: number;
+            /** @enum {string} */
+            action: "adopt_existing" | "retry_create";
+            sandbox_count: number;
+        };
         AdminUser: {
             id: components["schemas"]["UserId"];
             name: string;
@@ -7294,7 +8139,7 @@ export interface components {
         /** @description Request digests and prompt or response content are not returned. */
         AdminModelCall: {
             /** @enum {string} */
-            source: "client" | "chat" | "task" | "probe";
+            source: "client" | "chat" | "task" | "route" | "probe";
             call_id: string;
             model_id: string;
             provider_model: string;
@@ -7860,6 +8705,14 @@ export interface components {
         ProjectWorkItemId: components["schemas"]["ProjectWorkItemId"];
         /** @description Reuse only for an exact retry of the same operation and normalized request. */
         IdempotencyKey: string;
+        /** @description Current service instance UUID; a mismatch fails without writing. */
+        ServiceInstanceID: string;
+        /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+        OptionalServiceInstanceID: string;
+        /** @description Original outbox account ID, which must match the authenticated account. */
+        MessageActor: components["schemas"]["UserId"];
+        /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+        OptionalMessageActor: components["schemas"]["UserId"];
         PageLimit: number;
         /** @description Opaque cursor from the previous page. */
         PageCursor: string;
@@ -7893,7 +8746,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, both project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;
@@ -9932,6 +10785,99 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    createWorkspaceShareLink: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWorkspaceShareRequest"];
+            };
+        };
+        responses: {
+            /** @description Link created; do not cache this response because it contains the one-time raw token. */
+            201: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceShareCreated"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    previewWorkspaceShareLink: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceShareTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Workspace name, permission, and link expiry. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceSharePreview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    acceptWorkspaceShareLink: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkspaceShareTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Independent Workspace copy claimed. */
+            201: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceShareAccepted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     restoreWorkspacePaths: {
         parameters: {
             query?: never;
@@ -10931,84 +11877,6 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listInstantChatConversations: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Conversations */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        items: components["schemas"]["InstantChatConversation"][];
-                    };
-                };
-            };
-            default: components["responses"]["Error"];
-        };
-    };
-    listInstantChatMessages: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["schemas"]["ConversationId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Messages */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        items: components["schemas"]["InstantChatMessage"][];
-                    };
-                };
-            };
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    sendInstantChatMessage: {
-        parameters: {
-            query?: never;
-            header: {
-                "Idempotency-Key": string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InstantChatSendRequest"];
-            };
-        };
-        responses: {
-            /** @description Saved exchange */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InstantChatSendResponse"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
     getExecutionControl: {
         parameters: {
             query?: never;
@@ -11723,6 +12591,10 @@ export interface operations {
             header: {
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
             };
             path: {
                 id: components["parameters"]["ProjectId"];
@@ -11815,7 +12687,7 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listProjectConversationMessages: {
+    listProjectConversationActiveTasks: {
         parameters: {
             query?: {
                 limit?: components["parameters"]["PageLimit"];
@@ -11823,6 +12695,44 @@ export interface operations {
                 cursor?: components["parameters"]["PageCursor"];
             };
             header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active task page and task event cursors */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationActiveTaskPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listProjectConversationMessages: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+                /** @description Reconcile a message submitted by the authenticated member in this conversation. */
+                client_message_id?: string;
+            };
+            header?: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
+            };
             path: {
                 id: components["parameters"]["ProjectId"];
                 conversation_id: components["parameters"]["ProjectConversationId"];
@@ -11846,12 +12756,16 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    appendProjectConversationMessage: {
+    acceptProjectConversationMessage: {
         parameters: {
             query?: never;
             header: {
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
             };
             path: {
                 id: components["parameters"]["ProjectId"];
@@ -11861,17 +12775,17 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AppendProjectConversationMessageRequest"];
+                "application/json": components["schemas"]["AcceptConversationMessageRequest"];
             };
         };
         responses: {
-            /** @description Shared message and queued project Task */
+            /** @description The shared message and routing receipt were durably accepted. A Task may be created later. */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AppendProjectConversationMessageResponse"];
+                    "application/json": components["schemas"]["AcceptedProjectConversationMessageResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -11879,6 +12793,474 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Upload state and received chunks; committed state contains the receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageUpload"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    initializeProjectConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationMessageUploadInit"];
+            };
+        };
+        responses: {
+            /** @description Upload state and received chunks; committed state contains the receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageUpload"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putChunkProjectConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationMessageChunk"];
+            };
+        };
+        responses: {
+            /** @description Chunk stored or exact retry accepted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitProjectConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Message durably accepted for routing */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationMessageEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryProjectConversationMessageProcessing: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retry accepted or exact replay */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversationAttachmentUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current upload state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationAttachmentStatus"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    initializeProjectConversationAttachment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectConversationAttachmentInit"];
+            };
+        };
+        responses: {
+            /** @description Current upload state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationAttachmentStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putProjectConversationAttachmentChunk: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                "Content-Length": number;
+                "X-Chunk-SHA256": string;
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Durable chunk receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        sequence: number;
+                        replay: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitProjectConversationAttachment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Committed attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationAttachmentStatus"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putProjectConversationAttachmentDerivatives: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectConversationDerivatives"];
+            };
+        };
+        responses: {
+            /** @description Current original attachment and derivative state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationAttachmentStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversationAttachmentContent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Committed attachment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversationAttachmentMetadata: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                attachment_id: components["schemas"]["ProjectConversationAttachmentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project attachment metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectConversationAttachmentMetadata"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversationAttachmentContentByID: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                attachment_id: components["schemas"]["ProjectConversationAttachmentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project attachment bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
             default: components["responses"]["Error"];
         };
     };
@@ -12369,6 +13751,8 @@ export interface operations {
                 limit?: components["parameters"]["PageLimit"];
                 /** @description Opaque cursor from the previous page. */
                 cursor?: components["parameters"]["PageCursor"];
+                /** @description Defaults to false for compatibility with older clients. true includes items whose assignee_id is null; the cursor is bound to this filter. */
+                include_unassigned?: boolean;
             };
             header?: never;
             path: {
@@ -12387,6 +13771,7 @@ export interface operations {
                     "application/json": components["schemas"]["ProjectWorkItemPage"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -12439,7 +13824,10 @@ export interface operations {
     };
     getProjectWorkItem: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Defaults to false for compatibility with older clients. Set true to read an unassigned item; otherwise it is returned as not found. */
+                include_unassigned?: boolean;
+            };
             header?: never;
             path: {
                 id: components["parameters"]["ProjectId"];
@@ -12458,6 +13846,7 @@ export interface operations {
                     "application/json": components["schemas"]["ProjectWorkItem"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -12484,6 +13873,42 @@ export interface operations {
         };
         responses: {
             /** @description Updated work item */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectWorkItem"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    claimProjectWorkItem: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                work_item_id: components["parameters"]["ProjectWorkItemId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClaimProjectWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Work item claimed by the current member */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12677,6 +14102,10 @@ export interface operations {
             header: {
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
             };
             path?: never;
             cookie?: never;
@@ -12733,7 +14162,7 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    listConversationMessages: {
+    listConversationActiveTasks: {
         parameters: {
             query?: {
                 limit?: components["parameters"]["PageLimit"];
@@ -12741,6 +14170,42 @@ export interface operations {
                 cursor?: components["parameters"]["PageCursor"];
             };
             header?: never;
+            path: {
+                id: components["schemas"]["ConversationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active task page and task event cursors */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationActiveTaskPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listConversationMessages: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque cursor from the previous page. */
+                cursor?: components["parameters"]["PageCursor"];
+                /** @description Reconcile a message submitted by the authenticated account in this conversation. */
+                client_message_id?: string;
+            };
+            header?: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
+            };
             path: {
                 id: components["schemas"]["ConversationId"];
             };
@@ -12761,12 +14226,16 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    appendConversationMessage: {
+    acceptConversationMessage: {
         parameters: {
             query?: never;
             header: {
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
             };
             path: {
                 id: components["schemas"]["ConversationId"];
@@ -12775,21 +14244,238 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["AppendConversationMessageRequest"];
+                "application/json": components["schemas"]["AcceptConversationMessageRequest"];
             };
         };
         responses: {
-            /** @description Message and queued task */
+            /** @description The message and routing receipt were durably accepted. A Task may be created later. */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AppendConversationMessageResponse"];
+                    "application/json": components["schemas"]["AcceptedConversationMessageResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryConversationMessageProcessing: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retry accepted or exact replay */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    associateConversationMessageAttachment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+                client_attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    attachment_id: components["schemas"]["PersonalAttachmentId"];
+                };
+            };
+        };
+        responses: {
+            /** @description Attachment associated or exact retry accepted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Upload state and received chunks; committed state contains the receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageUpload"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    initializeConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationMessageUploadInit"];
+            };
+        };
+        responses: {
+            /** @description Upload state and received chunks; committed state contains the receipt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageUpload"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putChunkConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+                sequence: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationMessageChunk"];
+            };
+        };
+        responses: {
+            /** @description Chunk stored or exact retry accepted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitConversationMessageUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                client_message_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Message durably accepted for routing */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageEnvelope"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -12869,6 +14555,43 @@ export interface operations {
                     "application/json": components["schemas"]["Task"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskMediaPreview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                operation_id: components["schemas"]["OperationId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Generated preview bytes; this response does not create a Workspace artifact. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "private, no-store";
+                    "X-Content-Type-Options"?: "nosniff";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/png": string;
+                    "image/jpeg": string;
+                    "image/webp": string;
+                    "video/mp4": string;
+                    "audio/mpeg": string;
+                    "audio/ogg": string;
+                    "audio/opus": string;
+                    "audio/wav": string;
+                    "audio/aac": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
@@ -13625,6 +15348,10 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
             };
@@ -13661,6 +15388,10 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
             };
@@ -13697,6 +15428,10 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
             };
@@ -13730,6 +15465,10 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
                 "Content-Length": number;
                 "X-Chunk-SHA256": string;
             };
@@ -13767,6 +15506,10 @@ export interface operations {
         parameters: {
             query?: never;
             header: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
                 /** @description Reuse only for an exact retry of the same operation and normalized request. */
                 "Idempotency-Key": components["parameters"]["IdempotencyKey"];
             };
@@ -13797,7 +15540,12 @@ export interface operations {
     cancelPersonalAttachmentUpload: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID. */
+                "X-Morde-Service-Instance-ID"?: components["parameters"]["OptionalServiceInstanceID"];
+                /** @description Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header. */
+                "X-Morde-Actor-ID"?: components["parameters"]["OptionalMessageActor"];
+            };
             path: {
                 upload_id: components["schemas"]["PersonalAttachmentUploadId"];
             };
@@ -14001,6 +15749,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
+                        configuration_status: components["schemas"]["ModelConfigurationStatus"];
                         items: {
                             id: components["schemas"]["ModelConnectionId"];
                             name: string;
@@ -14011,6 +15760,10 @@ export interface operations {
                                 vision: boolean;
                             };
                         }[];
+                        /** @description True while the configured global shared model is checked and supports text. Tool use still requires verified tool capability; shared platform models require an account budget. */
+                        default_model_configured: boolean;
+                        /** @description Configured global model ID only when it is currently usable; null otherwise. */
+                        default_model_id: components["schemas"]["ModelConnectionId"] | null;
                     };
                 };
             };
@@ -14177,10 +15930,11 @@ export interface operations {
             content: {
                 "application/json": {
                     /**
+                     * @description text_stream is an explicit metered inference that verifies SSE and can incur usage; all does not trigger it.
                      * @default all
                      * @enum {string}
                      */
-                    capability?: "all" | "text" | "tools" | "vision";
+                    capability?: "all" | "text" | "text_stream" | "tools" | "vision" | "image_generation" | "video_generation" | "speech_generation";
                 };
             };
         };
@@ -14502,7 +16256,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current policy, default model budget configuration, and personal-data quota defaults */
+            /** @description Current policy, default model budget and model selection, and personal-data quota defaults */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14542,6 +16296,45 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    updateAdminModelDefault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAdminModelDefaultRequest"];
+            };
+        };
+        responses: {
+            /** @description Saved default model selection and version */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminModelDefault"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            /** @description Connection is not checked or does not support text and tools */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             default: components["responses"]["Error"];
         };
     };
@@ -14724,6 +16517,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AdminHostResources"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    recoverAdminHost: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["HostId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminHostRecoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Host recovery queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminHostRecoveryResult"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -15682,7 +17506,7 @@ export interface operations {
                         items: {
                             owner_id: components["schemas"]["UserId"];
                             /** @enum {string} */
-                            source: "client" | "chat" | "task" | "probe";
+                            source: "client" | "chat" | "task" | "route" | "probe";
                             call_id: string;
                             model_id: string;
                             provider_model: string;
@@ -15715,7 +17539,7 @@ export interface operations {
                 "application/json": {
                     owner_id: components["schemas"]["UserId"];
                     /** @enum {string} */
-                    source: "client" | "chat" | "task" | "probe";
+                    source: "client" | "chat" | "task" | "route" | "probe";
                     call_id: string;
                     /** Format: int64 */
                     input_tokens: number;

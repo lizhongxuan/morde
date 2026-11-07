@@ -37,6 +37,18 @@ describe('RouteGuard', () => {
     expect(screen.queryByText('受保护页面')).toBeNull();
   });
 
+  it('首次登录用户端时引导修改密码', async () => {
+    vi.mocked(portalApi.me).mockResolvedValue({ id: 'u1234567', name: 'admin', role: 'super_admin', must_change_password: true } as never);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={queryClient}><AuthProvider><MemoryRouter initialEntries={['/assistant']}><Routes>
+      <Route element={<RouteGuard />}><Route path="/assistant" element={<p>助手页面</p>} /></Route>
+      <Route path="/settings/password" element={<p>修改密码页面</p>} />
+    </Routes></MemoryRouter></AuthProvider></QueryClientProvider>);
+
+    expect(await screen.findByText('修改密码页面')).toBeInTheDocument();
+    expect(screen.queryByText('助手页面')).toBeNull();
+  });
+
   it('管理 API 返回 403 后隐藏并清理已缓存的管理数据', async () => {
     vi.mocked(portalApi.me).mockResolvedValue({ id: 'u1234567', name: 'admin', role: 'admin' } as never);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

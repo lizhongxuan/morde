@@ -44,6 +44,11 @@ if [ -n "${RUN_HOOK_PRE_SERVICES:-}" ]; then
 fi
 export MORDE_AIO_ORIGINAL_PRE_HOOK_FILE=/run/morde-aio-profile/pre-hook
 
+case " ${BROWSER_COMMANDLINE_ARGS:-} " in
+    *' --disable-metrics '*) ;;
+    *) export BROWSER_COMMANDLINE_ARGS="${BROWSER_COMMANDLINE_ARGS:+${BROWSER_COMMANDLINE_ARGS} }--disable-metrics" ;;
+esac
+
 /usr/local/bin/morde-aio-profile-config prepare
 unset RUN_HOOK_PRE_SERVICES
 export RUN_HOOK_PRE_SERVICES='exec /usr/local/bin/morde-aio-profile-hook'

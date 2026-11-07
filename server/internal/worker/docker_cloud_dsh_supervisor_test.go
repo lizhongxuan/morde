@@ -4,12 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,9 +16,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"morde/server/internal/app"
 )
 
 type dockerDSHFakeGuardian struct {
@@ -88,6 +82,7 @@ type dockerDSHFakeEngine struct {
 	keepAfterDelete bool
 	waitHang        bool
 	unsafeImageEnv  bool
+	barePathEnv     bool
 	badLabel        bool
 	badAccountLabel bool
 	missingPID      bool
@@ -106,6 +101,9 @@ func (f *dockerDSHFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	switch {
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json"):
 		env := []string{"PATH=/usr/bin:/bin"}
+		if f.barePathEnv {
+			env = []string{"PATH"}
+		}
 		if f.unsafeImageEnv {
 			env = append(env, "LD_PRELOAD=/hostile.so")
 		}
@@ -141,9 +139,6 @@ func (f *dockerDSHFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		encoded, _ := json.Marshal(f.created)
 		var config map[string]any
 		_ = json.Unmarshal(encoded, &config)
-		if f.badLabel {
-			config["Labels"].(map[string]any)[dockerDSHNonceLabel] = strings.Repeat("0", 64)
-		}
 		if f.badAccountLabel {
 			config["Labels"].(map[string]any)[dockerAccountRuntimeNonceLabel] = strings.Repeat("0", 64)
 		}
@@ -225,7 +220,7 @@ func (f *dockerDSHFakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-func newDockerDSHFixture(t *testing.T) (*DockerCloudDSHSupervisor, *dockerDSHFakeEngine, *dockerDSHFakeGuardian, CloudDSHLaunch, []byte) {
+func newDockerDSHFixture(t *testing.T) (*DockerCloudDSHSupervisor, *dockerDSHFakeEngine, *dockerDSHFakeGuardian) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "morde-dsh-socket-")
 	if err != nil {
@@ -252,156 +247,23 @@ func newDockerDSHFixture(t *testing.T) (*DockerCloudDSHSupervisor, *dockerDSHFak
 		engine.mu.Unlock()
 		server.Close()
 	})
-	key := bytes.Repeat([]byte{5}, 32)
 	supervisor, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{DockerHost: "unix://" + socket,
-		Image: image, NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", SupervisorID: "supervisor-test", SigningKey: key, Guardian: guardian})
+		Image: image, NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", Guardian: guardian})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
-		AgentSessionID: "session-1", SupervisorID: "supervisor-test", LeaseOwner: "worker-1", LeaseVersion: 1, AuthorizationVersion: 1,
-		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
-	launch := CloudDSHLaunch{NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs",
-		Environment: []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}, Fence: fence,
-		Nonce: bytes.Repeat([]byte{8}, 32), ExpiresAt: time.Now().Add(10 * time.Second)}
-	return supervisor, engine, guardian, launch, key
-}
-
-func TestDockerCloudDSHIsolationAttachAndVerifiedStop(t *testing.T) {
-	supervisor, engine, guardian, launch, key := newDockerDSHFixture(t)
-	input, output, err := supervisor.Start(context.Background(), launch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = input.Close(); _ = output.Close() }()
-	if _, err := input.Write([]byte("dsh-input\n")); err != nil {
-		t.Fatal(err)
-	}
-	if got := <-engine.input; got != "dsh-input\n" {
-		t.Fatalf("attach input = %q", got)
-	}
-	got, err := bufio.NewReader(output).ReadString('\n')
-	if err != nil || got != "dsh-output\n" {
-		t.Fatalf("attach output = %q, %v", got, err)
-	}
-	engine.mu.Lock()
-	config := engine.created
-	encoded, _ := json.Marshal(config)
-	engine.mu.Unlock()
-	host := config["HostConfig"].(map[string]any)
-	if host["NetworkMode"] != "none" || host["ReadonlyRootfs"] != true || host["Privileged"] != false || host["Memory"].(float64) <= 0 || host["NanoCpus"].(float64) <= 0 || host["PidsLimit"].(float64) <= 0 {
-		t.Fatalf("container isolation config = %#v", host)
-	}
-	if config["User"] != dockerDSHUser || !strings.Contains(string(encoded), "no-new-privileges:true") || !strings.Contains(string(encoded), `"ALL"`) || bytes.Contains(encoded, key) || bytes.Contains(encoded, launch.Nonce) {
-		t.Fatal("container config violated identity or secret isolation")
-	}
-	labels := config["Labels"].(map[string]any)
-	fenceJSON, _ := json.Marshal(launch.Fence)
-	nonceHash := sha256.Sum256(launch.Nonce)
-	if labels[dockerDSHFenceLabel] != string(fenceJSON) || labels[dockerDSHNonceLabel] != fmt.Sprintf("%x", nonceHash) ||
-		!strings.HasPrefix(engine.name, "morde-dsh-") || !strings.Contains(string(encoded), `"-i"`) {
-		t.Fatal("container does not bind its fence, nonce digest and clean environment")
-	}
-	updatedExpiry := time.Now().Add(15 * time.Second)
-	if err := supervisor.Renew(context.Background(), launch.Fence, updatedExpiry); err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := app.AgentStopReceiptSigningPayload(receipt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write(payload)
-	if !receipt.TreeStopped || !hmac.Equal(receipt.Signature, mac.Sum(nil)) || guardian.confirmations != 1 || guardian.renewals != 1 {
-		t.Fatal("stop receipt, guard confirmation, or renewal is invalid")
-	}
-	store := &cloudDSHTestInstanceStore{}
-	store.active, store.generation = launch.Fence, launch.Fence.AgentGeneration
-	auth, _ := app.NewAgentStopAuthenticator("supervisor-test", key)
-	service, _ := app.NewAgentInstanceService(store, auth)
-	if _, err := service.ConfirmStopped(context.Background(), receipt); err != nil || store.stopped != 1 {
-		t.Fatalf("receipt verification = %v", err)
-	}
-	supervisor.AgentStopConfirmed(launch.Fence, launch.Nonce)
-	supervisor.mu.Lock()
-	active := len(supervisor.active)
-	supervisor.mu.Unlock()
-	if active != 0 {
-		t.Fatalf("confirmed Docker supervisor state retained: %d", active)
-	}
-}
-
-func TestDockerCloudDSHRejectsForgedIdentityAndNonce(t *testing.T) {
-	supervisor, engine, _, launch, _ := newDockerDSHFixture(t)
-	in, out, err := supervisor.Start(context.Background(), launch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = in.Close(); _ = out.Close() }()
-	badNonce := bytes.Repeat([]byte{9}, 32)
-	if receipt, err := supervisor.Stop(context.Background(), launch.Fence, badNonce); err == nil || len(receipt.Signature) != 0 {
-		t.Fatal("forged nonce was accepted")
-	}
-	engine.mu.Lock()
-	engine.badLabel = true
-	engine.mu.Unlock()
-	if receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce); err == nil || len(receipt.Signature) != 0 {
-		t.Fatal("forged container label was accepted")
-	}
-	engine.mu.Lock()
-	kills := engine.kills
-	engine.mu.Unlock()
-	if kills != 0 {
-		t.Fatal("forged identity affected a container")
-	}
-}
-
-func TestDockerCloudDSHDoesNotSignWithoutStopAndNamespaceProof(t *testing.T) {
-	for _, scenario := range []string{"wait_timeout", "not_removed", "namespace_unknown", "missing_pid"} {
-		t.Run(scenario, func(t *testing.T) {
-			supervisor, engine, guardian, launch, _ := newDockerDSHFixture(t)
-			in, out, err := supervisor.Start(context.Background(), launch)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = in.Close(); _ = out.Close() }()
-			engine.mu.Lock()
-			engine.waitHang = scenario == "wait_timeout"
-			engine.keepAfterDelete = scenario == "not_removed"
-			engine.missingPID = scenario == "missing_pid"
-			engine.mu.Unlock()
-			guardian.mu.Lock()
-			guardian.destroyed = scenario != "namespace_unknown"
-			guardian.mu.Unlock()
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
-			defer cancel()
-			receipt, err := supervisor.Stop(ctx, launch.Fence, launch.Nonce)
-			if err == nil || len(receipt.Signature) != 0 || receipt.TreeStopped {
-				t.Fatalf("unsafe stop receipt: %#v, %v", receipt, err)
-			}
-			guardian.mu.Lock()
-			confirmations := guardian.confirmations
-			guardian.mu.Unlock()
-			if scenario != "namespace_unknown" && confirmations != 0 {
-				t.Fatal("guardian was consulted before container removal was confirmed")
-			}
-		})
-	}
+	return supervisor, engine, guardian
 }
 
 func TestDockerCloudDSHRejectsUnsafeConfiguration(t *testing.T) {
 	if _, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{}); err == nil {
 		t.Fatal("missing guard and digest accepted")
 	}
-	supervisor, engine, _, launch, _ := newDockerDSHFixture(t)
+	supervisor, engine, _ := newDockerDSHFixture(t)
 	engine.mu.Lock()
 	engine.unsafeImageEnv = true
 	engine.mu.Unlock()
-	if _, _, err := supervisor.Start(context.Background(), launch); err == nil {
+	if err := supervisor.validateImage(context.Background()); err == nil {
 		t.Fatal("image with inherited loader setting accepted")
 	}
 	engine.mu.Lock()
@@ -415,76 +277,13 @@ func TestDockerCloudDSHRejectsUnsafeConfiguration(t *testing.T) {
 	}
 }
 
-func TestDockerCloudDSHStartFailureBeforeRunIsSafelyStopped(t *testing.T) {
-	supervisor, engine, guardian, launch, _ := newDockerDSHFixture(t)
-	guardian.mu.Lock()
-	guardian.armError = true
-	guardian.mu.Unlock()
-	if _, _, err := supervisor.Start(context.Background(), launch); err == nil {
-		t.Fatal("container started without an independent expiry guard")
-	}
+func TestDockerCloudDSHAcceptsBareDefaultPathEnvironment(t *testing.T) {
+	supervisor, engine, _ := newDockerDSHFixture(t)
 	engine.mu.Lock()
-	running := engine.running
+	engine.barePathEnv = true
 	engine.mu.Unlock()
-	if running {
-		t.Fatal("container is running without a guard")
-	}
-	receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce)
-	if err != nil || !receipt.TreeStopped || len(receipt.Signature) != sha256.Size {
-		t.Fatalf("never-started process did not produce a verified stop receipt: %#v, %v", receipt, err)
-	}
-	guardian.mu.Lock()
-	confirmations := guardian.confirmations
-	guardian.mu.Unlock()
-	if confirmations != 0 {
-		t.Fatal("guardian was asked to prove a process that was never started")
-	}
-	supervisor.AgentStopConfirmed(launch.Fence, launch.Nonce)
-	supervisor.mu.Lock()
-	active := len(supervisor.active)
-	supervisor.mu.Unlock()
-	if active != 0 {
-		t.Fatalf("confirmed failed startup state retained: %d", active)
-	}
-}
-
-func TestDockerCloudDSHImageValidationFailureHasNoProcessToStop(t *testing.T) {
-	supervisor, engine, _, launch, _ := newDockerDSHFixture(t)
-	engine.mu.Lock()
-	engine.unsafeImageEnv = true
-	engine.mu.Unlock()
-	if _, _, err := supervisor.Start(context.Background(), launch); err == nil {
-		t.Fatal("unsafe image passed validation")
-	}
-	receipt, err := supervisor.Stop(context.Background(), launch.Fence, launch.Nonce)
-	if err != nil || !receipt.TreeStopped || len(receipt.Signature) != sha256.Size {
-		t.Fatalf("failed pre-create startup was not safely stopped: %#v, %v", receipt, err)
-	}
-	engine.mu.Lock()
-	creates := engine.creates
-	engine.mu.Unlock()
-	if creates != 0 {
-		t.Fatalf("unsafe image created %d containers", creates)
-	}
-}
-
-func TestDockerCloudDSHRejectsExpiredLeaseRenewal(t *testing.T) {
-	supervisor, _, guardian, launch, _ := newDockerDSHFixture(t)
-	launch.ExpiresAt = time.Now().Add(300 * time.Millisecond)
-	in, out, err := supervisor.Start(context.Background(), launch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = in.Close(); _ = out.Close() }()
-	time.Sleep(time.Until(launch.ExpiresAt) + 20*time.Millisecond)
-	if err := supervisor.Renew(context.Background(), launch.Fence, time.Now().Add(5*time.Second)); err == nil {
-		t.Fatal("expired lease was renewed")
-	}
-	guardian.mu.Lock()
-	renewals := guardian.renewals
-	guardian.mu.Unlock()
-	if renewals != 0 {
-		t.Fatal("expired lease was sent to the guardian")
+	if err := supervisor.validateImage(context.Background()); err != nil {
+		t.Fatalf("official slim image PATH declaration should be accepted: %v", err)
 	}
 }
 

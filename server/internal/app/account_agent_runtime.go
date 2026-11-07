@@ -36,6 +36,7 @@ func ValidAccountAgentRuntimeOwnerID(ownerID string) bool { return domain.ValidU
 
 type AccountAgentRuntimeFence struct {
 	ServiceInstanceID string `json:"service_instance_id"`
+	ConversationID    string `json:"conversation_id,omitempty"`
 	OwnerID           string `json:"owner_id"`
 	RuntimeID         string `json:"runtime_id"`
 	RuntimeGeneration int64  `json:"runtime_generation"`
@@ -45,7 +46,7 @@ type AccountAgentRuntimeFence struct {
 }
 
 func (f AccountAgentRuntimeFence) Validate() error {
-	if !serviceInstanceIDPattern.MatchString(f.ServiceInstanceID) || !domain.ValidUserID(f.OwnerID) ||
+	if !serviceInstanceIDPattern.MatchString(f.ServiceInstanceID) || !domain.ValidConversationID(f.ConversationID) || !domain.ValidUserID(f.OwnerID) ||
 		!agentCheckpointIDPattern.MatchString(f.RuntimeID) || f.RuntimeGeneration < 1 ||
 		invalidCheckpointLabel(f.LeaseOwner, 255) || f.LeaseVersion < 1 || f.ExecutionEpoch < 1 {
 		return domain.InvalidArgument("account_runtime", "account runtime fence is invalid")
@@ -55,6 +56,7 @@ func (f AccountAgentRuntimeFence) Validate() error {
 
 type AccountAgentRuntimeStart struct {
 	OwnerID            string
+	ConversationID     string
 	RuntimeID          string
 	LeaseOwner         string
 	SupervisorNonce    []byte
@@ -63,7 +65,7 @@ type AccountAgentRuntimeStart struct {
 }
 
 func (r AccountAgentRuntimeStart) Validate() error {
-	if !domain.ValidUserID(r.OwnerID) || !agentCheckpointIDPattern.MatchString(r.RuntimeID) ||
+	if !domain.ValidUserID(r.OwnerID) || !domain.ValidConversationID(r.ConversationID) || !agentCheckpointIDPattern.MatchString(r.RuntimeID) ||
 		invalidCheckpointLabel(r.LeaseOwner, 255) || len(r.SupervisorNonce) != 32 || bytes.Equal(r.SupervisorNonce, make([]byte, 32)) ||
 		r.MaxConcurrentTasks < 1 || r.MaxConcurrentTasks > maxAccountAgentRuntimeTasks ||
 		!validAgentLease(r.LeaseDuration) {
@@ -260,18 +262,18 @@ func (a *AccountAgentTaskGuardianStopAuthenticator) VerifyAccountAgentTaskStop(c
 	return VerifiedAccountAgentTaskStop{value: verifiedAccountAgentTaskStop{attestation: attestation, encoded: encoded}}, nil
 }
 
-func (s *AccountAgentRuntimeService) Get(ctx context.Context, ownerID string) (AccountAgentRuntime, bool, error) {
-	if ctx == nil || !domain.ValidUserID(ownerID) {
-		return AccountAgentRuntime{}, false, domain.InvalidArgument("account_runtime", "account Runtime query is invalid")
+func (s *AccountAgentRuntimeService) Get(ctx context.Context, conversationID string) (AccountAgentRuntime, bool, error) {
+	if ctx == nil || !domain.ValidConversationID(conversationID) {
+		return AccountAgentRuntime{}, false, domain.InvalidArgument("account_runtime", "conversation Runtime query is invalid")
 	}
-	return s.store.GetAccountAgentRuntime(ctx, ownerID)
+	return s.store.GetAccountAgentRuntime(ctx, conversationID)
 }
 
-func (s *AccountAgentRuntimeService) StopIdentity(ctx context.Context, ownerID string) (AccountAgentRuntimeStopIdentity, error) {
-	if ctx == nil || !domain.ValidUserID(ownerID) {
-		return AccountAgentRuntimeStopIdentity{}, domain.InvalidArgument("account_runtime", "account Runtime recovery identity is invalid")
+func (s *AccountAgentRuntimeService) StopIdentity(ctx context.Context, conversationID string) (AccountAgentRuntimeStopIdentity, error) {
+	if ctx == nil || !domain.ValidConversationID(conversationID) {
+		return AccountAgentRuntimeStopIdentity{}, domain.InvalidArgument("account_runtime", "conversation Runtime recovery identity is invalid")
 	}
-	return s.store.AccountAgentRuntimeStopIdentity(ctx, ownerID)
+	return s.store.AccountAgentRuntimeStopIdentity(ctx, conversationID)
 }
 
 func (s *AccountAgentRuntimeService) ListAccountAgentRuntimeStopCandidates(ctx context.Context, limit int) ([]AccountAgentRuntimeStopIdentity, error) {
@@ -445,7 +447,7 @@ func validateAccountAgentRuntimeStopAttestation(attestation AccountAgentRuntimeS
 
 func validateAccountAgentTaskStopAttestation(attestation AccountAgentTaskStopAttestation) error {
 	if err := attestation.RuntimeFence.Validate(); err != nil || attestation.TaskFence.Validate() != nil ||
-		attestation.TaskFence.InitiatorID != attestation.RuntimeFence.OwnerID || !attestation.Destroyed ||
+		attestation.TaskFence.OwnerID != attestation.RuntimeFence.OwnerID || !attestation.Destroyed ||
 		!isLowerHex(attestation.RuntimeContainerID) || len(attestation.RuntimeContainerID) != sha256.Size*2 ||
 		attestation.ContainerPID < 1 || attestation.HostPID < 1 || attestation.StartTimeTick == 0 ||
 		!validCgroupPath(attestation.CgroupPath) || !isLowerHex(attestation.NonceSHA256) ||

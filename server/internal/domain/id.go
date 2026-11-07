@@ -96,6 +96,24 @@ func ValidTemplateID(id string) bool {
 	return true
 }
 
+func ValidServiceInstanceID(id string) bool {
+	if len(id) != 36 || id == "00000000-0000-0000-0000-000000000000" {
+		return false
+	}
+	for i := range len(id) {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if id[i] != '-' {
+				return false
+			}
+			continue
+		}
+		if (id[i] < '0' || id[i] > '9') && (id[i] < 'a' || id[i] > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func WorkspaceRootVolumeName(hostID string) string { return "workspaces-" + hostID }
 
 func RuntimeVolumeName(hostID string) string { return "runtime-" + hostID }

@@ -13,7 +13,7 @@ import (
 	"morde/server/internal/domain/identity"
 )
 
-func TestPostgresFirstApprovalRequiresAndGrantsConfiguredModelBudget(t *testing.T) {
+func TestPostgresFirstApprovalAllowsMissingAndGrantsConfiguredModelBudget(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()
 	admin := personalQuotaAdminPrincipal(t, store)
@@ -26,18 +26,18 @@ func TestPostgresFirstApprovalRequiresAndGrantsConfiguredModelBudget(t *testing.
 		t.Fatal(err)
 	}
 	approved := identity.StatusApproved
-	if _, err := users.Update(ctx, admin, member.ID, app.UpdateUserCommand{ExpectedStatus: identity.StatusPending, Status: &approved}); domain.CodeOf(err) != domain.CodeInvalidState {
+	if _, err := users.Update(ctx, admin, member.ID, app.UpdateUserCommand{ExpectedStatus: identity.StatusPending, Status: &approved}); err != nil {
 		t.Fatalf("approval without default budget = %v", err)
 	}
 	stored, err := store.GetUserByID(ctx, member.ID)
 	var budgetRows, auditRows int
-	if err != nil || stored.Status != identity.StatusPending {
+	if err != nil || stored.Status != identity.StatusApproved {
 		t.Fatalf("account after missing-default approval = %+v, %v", stored, err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM model_account_budgets WHERE owner_id=$1`, member.ID).Scan(&budgetRows); err != nil || budgetRows != 0 {
 		t.Fatalf("budget after missing-default approval = %d, %v", budgetRows, err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='user.update' AND target=$1`, member.ID).Scan(&auditRows); err != nil || auditRows != 0 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='user.update' AND target=$1`, member.ID).Scan(&auditRows); err != nil || auditRows != 1 {
 		t.Fatalf("audit after missing-default approval = %d, %v", auditRows, err)
 	}
 
@@ -47,6 +47,10 @@ func TestPostgresFirstApprovalRequiresAndGrantsConfiguredModelBudget(t *testing.
 	}
 	if _, err := defaults.Update(ctx, admin, app.UpdateModelBudgetDefaultCommand{ExpectedVersion: 0, TokenLimit: 45000, MaxConcurrent: 3}, "192.0.2.10"); err != nil {
 		t.Fatalf("configure default model budget: %v", err)
+	}
+	member, err = store.CreateUser(ctx, pendingTestUser(t))
+	if err != nil {
+		t.Fatal(err)
 	}
 	if _, err := users.Update(ctx, admin, member.ID, app.UpdateUserCommand{ExpectedStatus: identity.StatusPending, Status: &approved}); err != nil {
 		t.Fatalf("approve registered account: %v", err)
@@ -66,6 +70,11 @@ func TestPostgresFirstApprovalRequiresAndGrantsConfiguredModelBudget(t *testing.
 	assertModelBudget(t, ctx, pool, member.ID, 45000, 3)
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_logs WHERE action='model.budget.update' AND target=$1`, member.ID).Scan(&auditRows); err != nil || auditRows != 1 {
 		t.Fatalf("first approval budget audits = %d, %v", auditRows, err)
+	}
+	var configured, source string
+	if err := pool.QueryRow(ctx, `SELECT detail->>'configured',detail->>'source' FROM audit_logs WHERE action='model.budget.update' AND target=$1`, member.ID).
+		Scan(&configured, &source); err != nil || configured != "true" || source != "registration_review" {
+		t.Fatalf("first approval budget audit details = configured:%q source:%q err=%v", configured, source, err)
 	}
 }
 
@@ -237,24 +246,37 @@ func TestPostgresFirstApprovalBudgetWorksWithModelGatewaySubstitute(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection, err := models.Create(ctx, principal, app.ModelConnectionCommand{
+	connection, err := models.Create(ctx, admin, app.ModelConnectionCommand{
 		Name: "approval model", BaseURL: "https://model.example/v1", ModelName: "test-model", APIKey: "synthetic-key", Shared: true,
 	})
 	if err != nil {
 		t.Fatalf("create model connection: %v", err)
 	}
+	if _, err := models.SaveProbeCapabilities(ctx, admin, connection.ID, connection.UpdatedAt, app.ModelCapabilities{Text: true, Tools: true}); err != nil {
+		t.Fatalf("verify shared text/tools model: %v", err)
+	}
+	defaultModel, err := app.NewAdminModelDefaultService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaultModel.Update(ctx, admin, 0, connection.ID, "192.0.2.14"); err != nil {
+		t.Fatalf("set shared model as cloud-agent default: %v", err)
+	}
 	gateway, err := app.NewModelGatewayService(store, models, model)
 	if err != nil {
 		t.Fatal(err)
 	}
-	capabilities, err := gateway.CheckModel(ctx, principal, connection.ID, "approval-budget-check-0001")
-	if err != nil || !capabilities.Text || model.calls != 1 {
-		t.Fatalf("model gateway result = %+v calls=%d err=%v", capabilities, model.calls, err)
+	response, err := gateway.Complete(ctx, app.ModelCall{
+		Source: app.ModelCallChat, Principal: principal, ModelID: connection.ID, CallID: "approval-default-budget-call-0001",
+		Request: app.ModelRequest{Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 16},
+	})
+	if err != nil || response.Text != "OK" || model.calls != 1 {
+		t.Fatalf("model gateway response = %+v calls=%d err=%v", response, model.calls, err)
 	}
 	assertModelBudget(t, ctx, store.pool, member.ID, 50000, 1)
 	var state string
 	var settledTokens int64
-	if err := store.pool.QueryRow(ctx, `SELECT state,input_tokens+output_tokens FROM model_call_ledger WHERE owner_id=$1`, member.ID).
+	if err := store.pool.QueryRow(ctx, `SELECT state,input_tokens+output_tokens FROM model_call_ledger WHERE owner_id=$1 AND source='chat'`, member.ID).
 		Scan(&state, &settledTokens); err != nil || state != "settled" || settledTokens != 12 {
 		t.Fatalf("approved account model usage = %q/%d err=%v", state, settledTokens, err)
 	}

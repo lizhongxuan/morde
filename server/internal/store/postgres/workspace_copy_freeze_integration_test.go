@@ -139,6 +139,8 @@ func TestWorkspaceCopyReservationMigrationDownPreservesRecordedData(t *testing.T
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "copy-down-guard")
 	insertWorkspaceCopyReservationForTest(t, ctx, store, owner.ID, value.ID, "w7654321")
+	removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
+	removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, "w7654321")
 
 	provider, closeProvider, err := newMigrationProvider(pool)
 	if err != nil {
@@ -159,6 +161,7 @@ func TestWorkspaceFileModificationTimeMigrationDownPreservesRecordedData(t *test
 	ctx := context.Background()
 	owner := createTestUser(t, store, 3, 10_000, 20_000)
 	value := createTestWorkspace(t, ctx, store, owner.ID, "mtime-down-guard")
+	removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 	if _, err := pool.Exec(ctx, `INSERT INTO workspace_revision_files
 (workspace_id,valid_from_revision,file_path,folded_path,size_bytes,sha256,mode,chunks,mod_time_ns)
 VALUES ($1,0,'notes.txt','notes.txt',0,$2,384,'[]'::jsonb,123)`, value.ID, strings.Repeat("0", 64)); err != nil {

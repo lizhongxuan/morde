@@ -19,7 +19,7 @@ describe('NewHost workspace loading', () => {
     const workspaces = vi.spyOn(portalApi, 'workspaces')
       .mockReturnValueOnce(initialRequest)
       .mockResolvedValue({ items: [{
-        id: 'w1234567', name: '待挂载目录', revision: 3, used_bytes: 2048, quota_bytes: 1024 * 1024, state: 'ready', created_at: '', updated_at: '',
+        id: 'w1234567', name: '待挂载目录', revision: 3, used_bytes: 2048, quota_bytes: 1024 * 1024, is_read_only: false, state: 'ready', created_at: '', updated_at: '',
       }] });
     vi.spyOn(portalApi, 'templates').mockResolvedValue({ items: [{
       id: 'std', name: '标准规格', description: '', isolation: 'container',
@@ -72,8 +72,8 @@ describe('NewHost workspace loading', () => {
 
   it('binds exactly one existing Workspace when multiple are available', async () => {
     vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [
-      { id: 'w1234567', name: '工作区一', revision: 3, used_bytes: 100, quota_bytes: 1024, state: 'ready', created_at: '', updated_at: '' },
-      { id: 'w7654321', name: '工作区二', revision: 4, used_bytes: 200, quota_bytes: 2048, state: 'ready', created_at: '', updated_at: '' },
+      { id: 'w1234567', name: '工作区一', revision: 3, used_bytes: 100, quota_bytes: 1024, is_read_only: false, state: 'ready', created_at: '', updated_at: '' },
+      { id: 'w7654321', name: '工作区二', revision: 4, used_bytes: 200, quota_bytes: 2048, is_read_only: false, state: 'ready', created_at: '', updated_at: '' },
     ] });
     const createHost = vi.spyOn(portalApi, 'createHost').mockResolvedValue({
       id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'creating', state_reason: '', runtime_generation: 1, control_version: 0, control_state: 'ai', url: '', workspaces: [],
@@ -99,7 +99,7 @@ describe('NewHost workspace loading', () => {
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 },
       workspace_size_mib: 1024, ttl_seconds: 3600, idle_timeout_seconds: 0, on_idle: 'disabled', keep_workspace_default: true,
     }] });
-    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace').mockResolvedValue({ id: 'w7654321', name: '新工作区', revision: 0, used_bytes: 0, quota_bytes: 1024, state: 'ready', created_at: '', updated_at: '' });
+    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace').mockResolvedValue({ id: 'w7654321', name: '新工作区', revision: 0, used_bytes: 0, quota_bytes: 1024, is_read_only: false, state: 'ready', created_at: '', updated_at: '' });
     const createHost = vi.spyOn(portalApi, 'createHost').mockResolvedValue({
       id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'creating', state_reason: '', runtime_generation: 1, control_version: 0, control_state: 'ai', url: '', workspaces: [],
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
@@ -127,7 +127,7 @@ describe('NewHost workspace loading', () => {
       const idempotencyKey = key!;
       let result = accepted.get(idempotencyKey);
       if (!result) {
-        result = { id: 'w7654321', name: '项目工作区', revision: 0, used_bytes: 0, quota_bytes: 1024, state: 'ready', created_at: '', updated_at: '' };
+        result = { id: 'w7654321', name: '项目工作区', revision: 0, used_bytes: 0, quota_bytes: 1024, is_read_only: false, state: 'ready', created_at: '', updated_at: '' };
         accepted.set(idempotencyKey, result);
       }
       if (workspaceAttempts++ === 0) throw new TypeError('服务器已创建工作区，但响应丢失');
@@ -171,7 +171,7 @@ describe('NewHost workspace loading', () => {
       resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 },
       workspace_size_mib: 1024, ttl_seconds: 3600, idle_timeout_seconds: 0, on_idle: 'disabled', keep_workspace_default: true,
     }] });
-    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace').mockResolvedValue({ id: 'w7654321', name: '项目工作区', revision: 0, used_bytes: 0, quota_bytes: 1024, state: 'ready', created_at: '', updated_at: '' });
+    const createWorkspace = vi.spyOn(portalApi, 'createWorkspace').mockResolvedValue({ id: 'w7654321', name: '项目工作区', revision: 0, used_bytes: 0, quota_bytes: 1024, is_read_only: false, state: 'ready', created_at: '', updated_at: '' });
     const createHost = vi.spyOn(portalApi, 'createHost')
       .mockRejectedValueOnce(new TypeError('响应丢失'))
       .mockResolvedValue({

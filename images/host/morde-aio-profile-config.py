@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -20,6 +21,8 @@ EPHEMERAL_NAMES = frozenset({"code-server-ipc.sock"})
 # Codex recreates disposable command shims in this tree, including symlinks.
 CODEX_EPHEMERAL_PATH = "tmp"
 AIO_UID = 1000
+CHROMIUM_BROWSER_METRIC = re.compile(r"BrowserMetrics-[A-F0-9]{8}-[A-F0-9]{3,4}\.pma\Z")
+CHROMIUM_SINGLETON_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 WORKSPACE_DIRECTORIES = (
     ("DESKTOP", "Desktop"),
     ("DOWNLOAD", "Downloads"),
@@ -223,6 +226,53 @@ def workspace_defaults(home: Path) -> None:
         atomic_text(preferences, json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", home)
 
 
+def prune_browser_metrics(home: Path) -> int:
+    directory = check_safe_parent(home, ".config/browser/DeferredBrowserMetrics")
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return 0
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SafeguardError("browser metrics directory is unsafe")
+    removed = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not CHROMIUM_BROWSER_METRIC.fullmatch(entry.name):
+                continue
+            try:
+                file_info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(file_info.st_mode):
+                continue
+            os.unlink(entry.path)
+            removed += 1
+    if removed:
+        fsync_dir(directory)
+    return removed
+
+
+def prune_stale_browser_singletons(home: Path) -> int:
+    """Remove Chromium's process-local lock symlinks before its profile starts."""
+    removed = 0
+    browser_dir = home / ".config" / "browser"
+    for name in CHROMIUM_SINGLETON_NAMES:
+        path = check_safe_parent(home, f".config/browser/{name}")
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        # These links point at a container hostname/PID and a local socket.
+        # They cannot describe a live process after this container is recreated.
+        # Leave regular files and all browser profile data untouched.
+        if stat.S_ISLNK(info.st_mode):
+            path.unlink()
+            removed += 1
+    if removed and browser_dir.is_dir() and not browser_dir.is_symlink():
+        fsync_dir(browser_dir)
+    return removed
+
+
 def check_safe_parent(home: Path, relative: str) -> Path:
     """Resolve a fixed managed path while rejecting symlinked path components."""
     if home.is_symlink() or not home.is_dir():
@@ -377,6 +427,10 @@ def save_pending(state: Path, name: str, target: Path, relative: str, kind: str)
 
 def prepare(home: Path) -> None:
     state = ensure_state_dir(home)
+    # The profile volume survives Host recreation, but Chromium's singleton
+    # links refer to the old container's hostname and PID. Run before gem.sh
+    # starts Chromium so stale links cannot leave the desktop permanently blank.
+    prune_stale_browser_singletons(home)
     for name, relative, kind in MANAGED_PATHS:
         target = check_safe_parent(home, relative)
         current = fingerprint(target, kind)
@@ -459,7 +513,7 @@ def restore(home: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("prepare", "restore", "workspace-defaults"))
+    parser.add_argument("command", choices=("prepare", "restore", "workspace-defaults", "prune-browser-metrics"))
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME, help=argparse.SUPPRESS)
     args = parser.parse_args()
     home = args.home
@@ -470,6 +524,8 @@ def main() -> int:
             prepare(home)
         elif args.command == "workspace-defaults":
             workspace_defaults(home)
+        elif args.command == "prune-browser-metrics":
+            print(prune_browser_metrics(home))
         else:
             restore(home)
         return 0

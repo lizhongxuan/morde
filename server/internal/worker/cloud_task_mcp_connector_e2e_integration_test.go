@@ -3,11 +3,11 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -47,11 +47,87 @@ type f02MCPWorkspaceFixture struct {
 	sessionID   string
 	connectorID string
 	claimed     task.Task
+	tasks       *app.TaskService
 	sync        *app.WorkspaceSyncService
 	broker      *app.CloudDSHToolBroker
 	provider    *f01LocalMCPProvider
 	commit      *f02MCPCommitObserver
 	call        app.ModelToolCall
+	agent       f01MCPTestAgent
+}
+
+type f01MCPTestAgent struct {
+	service *app.AgentInstanceService
+	fence   app.AgentInstanceFence
+	nonce   []byte
+	key     []byte
+}
+
+func startF01MCPTestAgent(t *testing.T, ctx context.Context, store *storepostgres.Store, claimed task.Task, tag string) (task.Task, f01MCPTestAgent) {
+	t.Helper()
+	key := bytes.Repeat([]byte{0x63}, 32)
+	authenticator, err := app.NewAgentStopAuthenticator("mcp-test-supervisor", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := app.NewAgentInstanceService(store, authenticator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := sha256.Sum256([]byte("mcp-test-agent-" + tag))
+	sessionID := claimed.AgentSessionID
+	if sessionID == "" {
+		sessionID = "mcp-session-" + tag
+	}
+	fence := app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+		AgentInstanceID: "mcp-agent-" + tag, AgentSessionID: sessionID, SupervisorID: "mcp-test-supervisor",
+		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AuthorizationVersion: claimed.Authorization.Version,
+		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	lease, replayed, err := service.Start(ctx, app.AgentInstanceStart{Fence: fence, SupervisorNonce: nonce[:], LeaseDuration: 20 * time.Second})
+	if err != nil || replayed {
+		t.Fatalf("start MCP test Agent: replay=%t err=%v", replayed, err)
+	}
+	fence = lease.Fence
+	claimed.AgentInstanceID, claimed.AgentGeneration, claimed.AgentSessionID = fence.AgentInstanceID, fence.AgentGeneration, fence.AgentSessionID
+	claimed.AgentEngineVersion, claimed.AgentProfileVersion = fence.EngineVersion, fence.ProfileVersion
+	return claimed, f01MCPTestAgent{service: service, fence: fence, nonce: nonce[:], key: key}
+}
+
+func (a f01MCPTestAgent) stop(t *testing.T, ctx context.Context) {
+	t.Helper()
+	receipt := app.AgentStopReceipt{Fence: a.fence, SupervisorNonce: a.nonce, TreeStopped: true}
+	payload, err := app.AgentStopReceiptSigningPayload(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := hmac.New(sha256.New, a.key)
+	_, _ = mac.Write(payload)
+	receipt.Signature = mac.Sum(nil)
+	if _, err := a.service.ConfirmStopped(ctx, receipt); err != nil {
+		t.Fatalf("confirm MCP test Agent stop: %v", err)
+	}
+}
+
+func discoverF01MCPTool(t *testing.T, ctx context.Context, broker *app.CloudDSHToolBroker, claimed task.Task, connectorID string) {
+	t.Helper()
+	arguments, err := json.Marshal(map[string]string{"connector_id": connectorID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := broker.Execute(ctx, claimed, app.ModelToolCall{CallID: "mcp-discovery-" + connectorID,
+		Name: "mcp_discover", Arguments: string(arguments)})
+	if err != nil || result.Status != app.AgentToolSucceeded {
+		t.Fatalf("discover selected MCP tool: result=%+v err=%v", result, err)
+	}
+}
+
+func f01SelectedMCPCall(t *testing.T, callID, connectorID, query string) app.ModelToolCall {
+	t.Helper()
+	arguments, err := json.Marshal(map[string]any{"connector_id": connectorID, "tool_name": "lookup", "arguments": map[string]string{"query": query}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return app.ModelToolCall{CallID: callID, Name: "mcp_call", Arguments: string(arguments)}
 }
 
 func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspaceFixture {
@@ -116,6 +192,7 @@ func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspac
 	if err != nil || !found || claimed.ID != submitted.Task.ID {
 		t.Fatalf("claim Task = %#v, found=%t err=%v", claimed, found, err)
 	}
+	claimed, agent := startF01MCPTestAgent(t, ctx, store, claimed, "f02-before")
 	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "blocks"))
 	if err != nil {
 		t.Fatal(err)
@@ -159,12 +236,35 @@ func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspac
 	if written, err := syncService.PutSyncBlock(ctx, principal, value.ID, session.ID, fileHash, bytes.NewReader(content)); err != nil || written != int64(len(content)) {
 		t.Fatalf("upload synthetic block: written=%d err=%v", written, err)
 	}
-	toolDigest := sha256.Sum256([]byte("lookup"))
+	discoverF01MCPTool(t, ctx, broker, claimed, connector.ID)
 	return f02MCPWorkspaceFixture{
 		store: store, principal: principal, workspaceID: value.ID, sessionID: session.ID, connectorID: connector.ID,
-		claimed: claimed, sync: syncService, broker: broker, provider: provider, commit: commit,
-		call: app.ModelToolCall{CallID: "f02-mcp-workspace-call", Name: fmt.Sprintf("mcp_%s_%x", connector.ID, toolDigest[:6]), Arguments: `{"query":"synthetic"}`},
+		claimed: claimed, tasks: tasks, sync: syncService, broker: broker, provider: provider, commit: commit, agent: agent,
+		call: f01SelectedMCPCall(t, "f02-mcp-workspace-call", connector.ID, "synthetic"),
 	}
+}
+
+func approveF02MCPCall(t *testing.T, ctx context.Context, fixture *f02MCPWorkspaceFixture) {
+	t.Helper()
+	first, err := fixture.broker.Execute(ctx, fixture.claimed, fixture.call)
+	if err != nil || first.Status != app.AgentToolNeedsUser {
+		t.Fatalf("MCP call before explicit approval = %#v, %v", first, err)
+	}
+	fixture.agent.stop(t, ctx)
+	details, err := fixture.store.GetTask(ctx, fixture.claimed.ID, fixture.claimed.OwnerID)
+	if err != nil || details.PendingRequest == nil {
+		t.Fatalf("read pending MCP approval = %#v, %v", details.PendingRequest, err)
+	}
+	if err := fixture.tasks.RespondToPendingRequest(ctx, fixture.principal, fixture.claimed.ID,
+		details.PendingRequest.ID, details.PendingRequest.Version, task.PendingDecisionApprove,
+		"mcp-approval-"+fixture.claimed.ID); err != nil {
+		t.Fatalf("approve exact MCP call: %v", err)
+	}
+	claimed, found, err := fixture.store.ClaimNextTask(ctx, "f02-mcp-approved-worker", time.Minute)
+	if err != nil || !found || claimed.ID != fixture.claimed.ID {
+		t.Fatalf("reclaim approved MCP task = %#v, found=%t, err=%v", claimed, found, err)
+	}
+	fixture.claimed, fixture.agent = startF01MCPTestAgent(t, ctx, fixture.store, claimed, "f02-after")
 }
 
 func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
@@ -172,6 +272,7 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		f := newF02MCPWorkspaceFixture(t, ctx)
+		approveF02MCPCall(t, ctx, &f)
 		result, err := f.broker.Execute(ctx, f.claimed, f.call)
 		if err != nil || result.Status != app.AgentToolSucceeded || f.provider.remoteCalls.Load() != 1 {
 			t.Fatalf("unchanged Workspace MCP = %#v err=%v calls=%d", result, err, f.provider.remoteCalls.Load())
@@ -182,6 +283,7 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		f := newF02MCPWorkspaceFixture(t, ctx)
+		approveF02MCPCall(t, ctx, &f)
 		committed, err := f.sync.CommitSyncSession(ctx, f.principal, f.workspaceID, f.sessionID, "f02-mcp-workspace-commit")
 		if err != nil || committed.State != workspace.SyncCompleted || committed.TargetRevision != 1 {
 			t.Fatalf("commit external Workspace change = %#v err=%v", committed, err)
@@ -208,6 +310,7 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		f := newF02MCPWorkspaceFixture(t, ctx)
+		approveF02MCPCall(t, ctx, &f)
 		f.provider.started = make(chan struct{}, 1)
 		release := make(chan struct{})
 		f.provider.release = release
@@ -306,6 +409,79 @@ func TestCloudTaskMCPWorkspaceFence(t *testing.T) {
 	})
 }
 
+func TestCloudTaskMCPGrantRevocationBeforeAndAfterDispatch(t *testing.T) {
+	for _, inFlight := range []bool{false, true} {
+		name := "before_dispatch"
+		if inFlight {
+			name = "after_dispatch"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			f := newF02MCPWorkspaceFixture(t, ctx)
+			approveF02MCPCall(t, ctx, &f)
+			grants, err := f.store.ListTaskMCPConnectorGrants(ctx, f.claimed.OwnerID, f.claimed.ID)
+			if err != nil || len(grants) != 1 || grants[0].ConnectorID != f.connectorID {
+				t.Fatalf("read MCP grant: %+v err=%v", grants, err)
+			}
+			revoke := func() {
+				t.Helper()
+				if _, err := f.store.RevokeTaskMCPConnectorGrant(ctx, f.claimed.OwnerID, f.claimed.ID, f.connectorID, grants[0].GrantVersion); err != nil {
+					t.Fatalf("revoke MCP grant: %v", err)
+				}
+			}
+			if !inFlight {
+				revoke()
+				result, err := f.broker.Execute(ctx, f.claimed, f.call)
+				if err != nil || result.Status != app.AgentToolFailed || f.provider.remoteCalls.Load() != 0 {
+					t.Fatalf("revoked MCP connector reached provider: result=%+v err=%v calls=%d", result, err, f.provider.remoteCalls.Load())
+				}
+				return
+			}
+			f.provider.started = make(chan struct{}, 1)
+			release := make(chan struct{})
+			f.provider.release = release
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+			type callResult struct {
+				result app.AgentToolResult
+				err    error
+			}
+			done := make(chan callResult, 1)
+			go func() {
+				result, err := f.broker.Execute(ctx, f.claimed, f.call)
+				done <- callResult{result: result, err: err}
+			}()
+			select {
+			case <-f.provider.started:
+			case result := <-done:
+				t.Fatalf("MCP call did not reach synthetic provider: result=%+v err=%v", result.result, result.err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			operationKey := f01OperationKey(f.call.CallID)
+			operation, err := f.store.GetMCPConnectorOperation(ctx, f.claimed.OwnerID, f.claimed.ID, f.connectorID, operationKey)
+			if err != nil || operation.Status != task.OperationDispatched {
+				t.Fatalf("in-flight MCP ledger: %+v err=%v", operation, err)
+			}
+			revoke()
+			operation, err = f.store.GetMCPConnectorOperation(ctx, f.claimed.OwnerID, f.claimed.ID, f.connectorID, operationKey)
+			if err != nil || !operation.CancelRequested || operation.Status != task.OperationDispatched {
+				t.Fatalf("in-flight revocation did not request cancellation: %+v err=%v", operation, err)
+			}
+			releaseOnce.Do(func() { close(release) })
+			result := <-done
+			if result.err != nil || result.result.Status != app.AgentToolNeedsUser {
+				t.Fatalf("revoked in-flight result was delivered: result=%+v err=%v", result.result, result.err)
+			}
+			operation, err = f.store.GetMCPConnectorOperation(ctx, f.claimed.OwnerID, f.claimed.ID, f.connectorID, operationKey)
+			if err != nil || operation.Status != task.OperationUnknown || f.provider.remoteCalls.Load() != 1 {
+				t.Fatalf("revoked in-flight result was not preserved as unknown: %+v err=%v calls=%d", operation, err, f.provider.remoteCalls.Load())
+			}
+		})
+	}
+}
+
 func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -362,6 +538,7 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 	if err != nil || !found || claimed.ID != submitted.Task.ID {
 		t.Fatalf("claim MCP task = id %s found=%t err=%v", claimed.ID, found, err)
 	}
+	claimed, approvalAgent := startF01MCPTestAgent(t, ctx, store, claimed, "f01-before")
 
 	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "blocks"))
 	if err != nil {
@@ -389,6 +566,39 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	definitions, err := broker.Definitions(ctx, claimed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mcpToolName string
+	for _, definition := range definitions {
+		if definition.Name == "mcp_call" {
+			mcpToolName = definition.Name
+			break
+		}
+	}
+	if mcpToolName == "" {
+		t.Fatal("the test MCP connector did not expose a tool")
+	}
+	discoverF01MCPTool(t, ctx, broker, claimed, connector.ID)
+	approvalCall := f01SelectedMCPCall(t, "f01-mcp-call-001", connector.ID, "test record")
+	approval, err := broker.Execute(ctx, claimed, approvalCall)
+	if err != nil || approval.Status != app.AgentToolNeedsUser {
+		t.Fatalf("MCP restart test approval request = %#v, %v", approval, err)
+	}
+	approvalAgent.stop(t, ctx)
+	approvalDetails, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || approvalDetails.PendingRequest == nil {
+		t.Fatalf("read MCP restart test approval = %#v, %v", approvalDetails.PendingRequest, err)
+	}
+	if err := tasks.RespondToPendingRequest(ctx, principal, claimed.ID, approvalDetails.PendingRequest.ID,
+		approvalDetails.PendingRequest.Version, task.PendingDecisionApprove, "f01-mcp-approved-call-001"); err != nil {
+		t.Fatalf("approve exact MCP restart test call: %v", err)
+	}
+	claimed, found, err = store.ClaimNextTask(ctx, "f01-mcp-node-approved-worker", 30*time.Second)
+	if err != nil || !found || claimed.ID != submitted.Task.ID {
+		t.Fatalf("reclaim approved MCP task = %#v, found=%t, err=%v", claimed, found, err)
+	}
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("local Node is unavailable; the real dsh subprocess cannot run")
@@ -408,23 +618,15 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 		t.Fatalf("locate real morde-cloud-runtime entrypoint: %v", err)
 	}
 	stopKey := bytes.Repeat([]byte{0x41}, 32)
-	stopAuthenticator, err := app.NewAgentStopAuthenticator("f01-mcp-restart-supervisor", stopKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	instances, err := app.NewAgentInstanceService(store, stopAuthenticator)
-	if err != nil {
-		t.Fatal(err)
-	}
+	instances, conversationRuntimeManager, supervisor := newF01ConversationRuntime(t, store, node, script, "f01-mcp-restart-supervisor", stopKey)
 	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	model := &f01MCPRestartModel{}
-	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
+	model := &f01MCPRestartModel{connectorID: connector.ID}
 	interruptingTools := &f01InterruptAfterMCPDispatch{inner: broker, supervisor: supervisor}
 	firstRun, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-mcp-restart-supervisor", Supervisor: supervisor,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-mcp-restart-supervisor", AccountRuntimes: conversationRuntimeManager,
 		Instances: instances, Checkpoints: checkpoints, Models: model, Tools: interruptingTools,
 	})
 	if err != nil {
@@ -452,6 +654,10 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 		t.Fatalf("persisted dsh recovery point after interruption = %#v, %v", afterInterruption.Task, err)
 	}
 
+	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
+		WHERE conversation_id=$1`, submitted.Conversation.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, submitted.Task.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +667,7 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 		t.Fatalf("claim recoverable MCP task = %#v found=%t err=%v", recovered, found, err)
 	}
 	secondRun, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-mcp-restart-supervisor", Supervisor: supervisor,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-mcp-restart-supervisor", AccountRuntimes: conversationRuntimeManager,
 		Instances: instances, Checkpoints: checkpoints, Models: model, Tools: broker,
 	})
 	if err != nil {
@@ -493,7 +699,7 @@ func (tools *f01InterruptAfterMCPDispatch) Definitions(ctx context.Context, valu
 
 func (tools *f01InterruptAfterMCPDispatch) Execute(ctx context.Context, value task.Task, call app.ModelToolCall) (app.AgentToolResult, error) {
 	result, err := tools.inner.Execute(ctx, value, call)
-	if err == nil && strings.HasPrefix(call.Name, "mcp_") && tools.interrupted.CompareAndSwap(false, true) {
+	if err == nil && call.Name == "mcp_call" && tools.interrupted.CompareAndSwap(false, true) {
 		tools.supervisor.child.mu.Lock()
 		cmd := tools.supervisor.child.cmd
 		tools.supervisor.child.mu.Unlock()
@@ -622,8 +828,9 @@ func (provider *f01LocalMCPProvider) CallTool(ctx context.Context, _ string, _ h
 }
 
 type f01MCPRestartModel struct {
-	mu    sync.Mutex
-	calls int
+	mu          sync.Mutex
+	calls       int
+	connectorID string
 }
 
 func (model *f01MCPRestartModel) callCount() int {
@@ -647,9 +854,13 @@ func (model *f01MCPRestartModel) Complete(_ context.Context, call app.ModelCall)
 			return app.ModelResponse{}, err
 		}
 		for _, tool := range request.Tools {
-			if strings.HasPrefix(tool.Name, "mcp_") {
+			if tool.Name == "mcp_call" {
+				arguments, err := json.Marshal(map[string]any{"connector_id": model.connectorID, "tool_name": "lookup", "arguments": map[string]string{"query": "test record"}})
+				if err != nil {
+					return app.ModelResponse{}, err
+				}
 				return app.ModelResponse{StopReason: "tool_calls", Usage: usage, ToolCalls: []app.ModelToolCall{{
-					CallID: "f01-mcp-call-001", Name: tool.Name, Arguments: `{"query":"test record"}`,
+					CallID: "f01-mcp-call-001", Name: tool.Name, Arguments: string(arguments),
 				}}}, nil
 			}
 		}

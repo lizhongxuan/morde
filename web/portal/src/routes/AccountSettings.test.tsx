@@ -52,7 +52,6 @@ describe('AccountSettings', () => {
   ) {
     vi.spyOn(portalApi, 'personalDataQuota').mockResolvedValue({ owner_id: 'u1', used_bytes: 10, reserved_bytes: 2,
       quota_bytes: 1000, max_attachment_bytes: 500, remaining_bytes: 988, version: 1 });
-    vi.spyOn(portalApi, 'myInviteCode').mockResolvedValue({ code: '0123456789abcdef0123456789abcdef' });
     vi.spyOn(portalApi, 'myRecords').mockResolvedValue(records);
     const captureStatuses = vi.spyOn(portalApi, 'myRecordCaptureStatuses');
     const results = captureResults.length ? captureResults : [{ page: emptyCapturePage }];
@@ -80,8 +79,7 @@ describe('AccountSettings', () => {
     expect(screen.getByText('普通用户')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '修改密码' })).toHaveAttribute('href', '/settings/password');
     expect(screen.getByRole('link', { name: '管理客户端' })).toHaveAttribute('href', '/clients');
-    expect(await screen.findByText('0123456789abcdef0123456789abcdef')).toBeInTheDocument();
-    expect(screen.getByText(/不会自动获得额度或奖励/)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '我的邀请码' })).not.toBeInTheDocument();
     expect(await screen.findByRole('checkbox', { name: '允许保存完整会话记录' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: '允许保存训练样本贡献' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: '同步个人数据到当前账号' })).toBeChecked();

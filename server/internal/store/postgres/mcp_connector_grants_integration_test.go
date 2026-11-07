@@ -11,7 +11,7 @@ import (
 	"morde/server/internal/domain"
 )
 
-func TestTaskMCPConnectorGrantAtomicCreationAndAppendSelection(t *testing.T) {
+func TestTaskMCPConnectorGrantAtomicCreationAndRevisionSelection(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
@@ -38,32 +38,29 @@ func TestTaskMCPConnectorGrantAtomicCreationAndAppendSelection(t *testing.T) {
 		t.Fatalf("foreign owner saw task grants: %#v, %v", foreignGrants, err)
 	}
 
-	// An active Task may repeat its existing selection, or omit it to retain it,
-	// but cannot silently widen or replace its grants.
-	wrongSelection := newTestTaskSubmission(t, owner.ID, "", "grant-append-widen", "try another connector")
-	wrongSelection.Task.ConversationID = created.Conversation.ID
-	wrongSelection.Message.ConversationID = created.Conversation.ID
-	wrongSelection.MCPConnectorIDs = []string{connectors[1].ID}
-	if _, err := store.AppendMessage(ctx, wrongSelection); domain.CodeOf(err) != domain.CodeConflict {
-		t.Fatalf("append with changed grant set error = %v, want conflict", err)
+	// An omitted selection is inherited; an explicit revision replaces it only
+	// after the old Agent has stopped and the new revision is applied.
+	var selectedID, replacementID string
+	routed := newSelectedMCPAgentFixture(t, nil, func(route routeActionsTestFixture) []string {
+		selected := createEnabledMCPGrantConnectors(t, route.store, route.ownerID, route.ownerID)
+		selectedID, replacementID = selected[0].ID, selected[1].ID
+		return []string{selectedID}
+	})
+	if _, err := routed.route.store.GrantSelectedTaskMCPConnector(ctx, routed.task, selectedID); err != nil {
+		t.Fatal(err)
 	}
-
-	exactSelection := newTestTaskSubmission(t, owner.ID, "", "grant-append-exact", "continue with same connector")
-	exactSelection.Task.ConversationID = created.Conversation.ID
-	exactSelection.Message.ConversationID = created.Conversation.ID
-	exactSelection.MCPConnectorIDs = []string{connectors[0].ID}
-	if _, err := store.AppendMessage(ctx, exactSelection); err != nil {
-		t.Fatalf("append with exact grant set: %v", err)
+	routed.revise(t, 1, nil)
+	ids, err := routed.route.store.ListSelectedTaskMCPConnectors(ctx, routed.task)
+	if err != nil || len(ids) != 1 || ids[0] != selectedID {
+		t.Fatalf("omitted revision did not retain selected connector: %v err=%v", ids, err)
 	}
-	emptySelection := newTestTaskSubmission(t, owner.ID, "", "grant-append-retain", "continue without grant list")
-	emptySelection.Task.ConversationID = created.Conversation.ID
-	emptySelection.Message.ConversationID = created.Conversation.ID
-	if _, err := store.AppendMessage(ctx, emptySelection); err != nil {
-		t.Fatalf("append with omitted grant list: %v", err)
+	routed.revise(t, 2, []string{replacementID})
+	ids, err = routed.route.store.ListSelectedTaskMCPConnectors(ctx, routed.task)
+	if err != nil || len(ids) != 1 || ids[0] != replacementID {
+		t.Fatalf("explicit revision did not replace selected connector: %v err=%v", ids, err)
 	}
-	grants, err = store.ListTaskMCPConnectorGrants(ctx, owner.ID, created.Task.ID)
-	if err != nil || len(grants) != 1 || grants[0].ConnectorID != connectors[0].ID {
-		t.Fatalf("append changed persisted grants: %#v, %v", grants, err)
+	if _, err := routed.route.store.GrantSelectedTaskMCPConnector(ctx, routed.task, selectedID); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("replaced connector remained authorized: %v", err)
 	}
 
 	// A foreign-owned ID is reported the same as an unknown ID, and the failed

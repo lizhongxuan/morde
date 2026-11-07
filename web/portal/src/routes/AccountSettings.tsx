@@ -61,16 +61,6 @@ function RecordConsentSettings() {
   </section>;
 }
 
-function MyInviteCode() {
-  const query = useQuery({ queryKey: ['me', 'invite-code'], queryFn: portalApi.myInviteCode, retry: false });
-  return <section className="connection-section" aria-labelledby="invite-code-title">
-    <div className="connection-section-heading"><div><h2 id="invite-code-title">我的邀请码</h2><p className="muted">分享给新用户可记录邀请关系；受邀账号仍需管理员审核，且不会自动获得额度或奖励。</p></div></div>
-    {query.isPending ? <div className="loading-card" role="status">正在读取邀请码…</div>
-      : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></div>
-        : <p className="notice notice-info"><code>{query.data.code}</code></p>}
-  </section>;
-}
-
 function MyRecordCaptureStatuses() {
   const query = useInfiniteQuery({
     queryKey: ['me', 'record-capture-statuses'],
@@ -216,7 +206,6 @@ export function AccountSettings() {
       <div className="connection-section-heading account-clients-link"><div><h2>已登录设备</h2><p className="muted">查看或撤销已登录的电脑和手机。</p></div><Link className="button button-secondary" to="/clients">管理客户端</Link></div>
     </section>
     <RecordConsentSettings />
-    <MyInviteCode />
     <PersonalSyncSettings />
     <MyRecordCaptureStatuses />
     <MyRecordSettings />

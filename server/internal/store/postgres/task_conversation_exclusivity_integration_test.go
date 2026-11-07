@@ -132,23 +132,21 @@ BEFORE INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION wait_for_conversation_task_
 	close(start)
 	workers.Wait()
 	close(results)
-	successes, conflicts := 0, 0
+	successes := 0
 	for result := range results {
 		if result.err == nil {
 			successes++
-		} else if domain.CodeOf(result.err) == domain.CodeInvalidState {
-			conflicts++
 		} else {
 			t.Fatalf("same conversation submission error = %v", result.err)
 		}
 	}
-	if successes != 1 || conflicts != 1 {
-		t.Fatalf("same conversation submissions: success=%d conflict=%d, want 1/1", successes, conflicts)
+	if successes != 2 {
+		t.Fatalf("same conversation submissions: success=%d, want 2", successes)
 	}
 	var active int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1 AND owner_id=$2
-AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')`, conversationC.ID, owner.ID).Scan(&active); err != nil || active != 1 {
-		t.Fatalf("active tasks in same conversation=%d err=%v, want exactly one", active, err)
+AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')`, conversationC.ID, owner.ID).Scan(&active); err != nil || active != 2 {
+		t.Fatalf("active tasks in same conversation=%d err=%v, want two", active, err)
 	}
 }
 
@@ -214,18 +212,18 @@ func TestPostgresPausedTaskResumeRacesWithSameConversationSubmission(t *testing.
 	close(start)
 	workers.Wait()
 	close(results)
-	resumeCount, submitConflict := 0, 0
+	resumeCount, submitCount := 0, 0
 	for result := range results {
 		if result.resumed {
 			resumeCount++
-		} else if domain.CodeOf(result.err) == domain.CodeInvalidState {
-			submitConflict++
+		} else if result.err == nil {
+			submitCount++
 		} else {
 			t.Fatalf("resume/submit race returned unexpected error: %v", result.err)
 		}
 	}
-	if resumeCount != 1 || submitConflict != 1 {
-		t.Fatalf("resume/submit race: resumed=%d submit conflicts=%d, want 1/1", resumeCount, submitConflict)
+	if resumeCount != 1 || submitCount != 1 {
+		t.Fatalf("resume/submit race: resumed=%d submitted=%d, want 1/1", resumeCount, submitCount)
 	}
 	var status string
 	var active int
@@ -233,8 +231,8 @@ func TestPostgresPausedTaskResumeRacesWithSameConversationSubmission(t *testing.
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1 AND owner_id=$2
-AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')`, conversationValue.ID, owner.ID).Scan(&active); err != nil || active != 1 {
-		t.Fatalf("active tasks after resume/submit race=%d err=%v, want exactly one", active, err)
+AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')`, conversationValue.ID, owner.ID).Scan(&active); err != nil || active != 2 {
+		t.Fatalf("active tasks after resume/submit race=%d err=%v, want two", active, err)
 	}
 	if status != string(task.StatusQueued) {
 		t.Fatalf("resumed Task status=%q, want queued", status)

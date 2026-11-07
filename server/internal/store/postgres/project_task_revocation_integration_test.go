@@ -46,9 +46,8 @@ func TestPostgresProjectTaskRevocationRequiresAgentStopEvidence(t *testing.T) {
 	if err != nil || replay {
 		t.Fatalf("create project conversation = %#v replay=%t err=%v", conversationValue, replay, err)
 	}
-	submission, err := conversations.AppendMessage(ctx, principal(member.ID), projectValue.ID, conversationValue.ID, app.AppendMessageCommand{
-		ModelID: "project-test-model", Content: "summarize the project plan", IdempotencyKey: "project-revoked-task-message",
-	})
+	submission, err := submitIndependentProjectTaskForTest(t, ctx, store, owner.ID, member.ID, projectValue.ID, conversationValue.ID,
+		"project-test-model", "summarize the project plan", "project-revoked-task-message", nil)
 	if err != nil || submission.Task.OwnerID != owner.ID || submission.Task.InitiatorID != member.ID ||
 		submission.Task.ProjectID != projectValue.ID || submission.Message.ActorID != member.ID {
 		t.Fatalf("append member project Task = %#v err=%v", submission, err)

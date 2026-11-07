@@ -109,18 +109,14 @@ export function AdminUsage() {
   const stats = useQuery({ queryKey: ['admin', 'stats'], queryFn: portalApi.adminStats });
 
   return <section className="admin-content">
-    <div className="page-heading"><div><p className="eyebrow">平台统计</p><h1>用量与统计</h1><p className="muted">按账本展示模型调用用量，以及用户、平台安装和注册周统计。</p></div></div>
-    <div className="device-manager-actions">
+    <section className="admin-detail-section" aria-labelledby="admin-model-usage-heading">
+    <div className="design-panel-header"><div><h2 id="admin-model-usage-heading">平台模型用量</h2><p>调用数与 Token 来源于 model_call_ledger；活跃账户为所选区间至少有一笔调用的去重账号。</p></div><div className="device-manager-actions">
       <label htmlFor="admin-usage-days">用量区间</label>
       <select id="admin-usage-days" value={days} onChange={(event) => setDays(Number(event.target.value) as UsageDays)}>
         <option value={7}>近 7 天</option><option value={30}>近 30 天</option><option value={90}>近 90 天</option>
       </select>
-    </div>
-    <section className="admin-detail-section" aria-labelledby="admin-model-usage-heading">
-      <div className="page-heading"><div><h2 id="admin-model-usage-heading">平台模型用量</h2>
-        <p className="muted">调用数与 token 来源于 model_call_ledger；活跃账户为所选区间至少有一笔调用的去重账号。</p>
-        {usage.data && <p className="muted">统计区间：{usage.data.from} 至 {usage.data.to}</p>}
-      </div></div>
+    </div></div>
+      {usage.data && <p className="muted">统计区间：{usage.data.from} 至 {usage.data.to}</p>}
       {usage.isPending ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
         : usage.isError ? <UsageError error={usage.error} retry={() => void usage.refetch()} />
           : <>

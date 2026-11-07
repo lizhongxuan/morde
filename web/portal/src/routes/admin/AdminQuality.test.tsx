@@ -22,7 +22,7 @@ describe('admin quality and risk', () => {
     });
     renderPage();
 
-    expect(await screen.findByRole('heading', { name: '质量与风险' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '质量与风险统计' })).toBeInTheDocument();
     expect(await screen.findByText('当前没有经同意的质量样本。')).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('当前不可用');
     expect(screen.getByText(/普通会话正文不会作为替代数据/)).toBeInTheDocument();

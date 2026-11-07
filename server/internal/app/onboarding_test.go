@@ -123,7 +123,7 @@ func TestOnboardingModelSelectionRequiresConfiguredUsableModel(t *testing.T) {
 	}
 }
 
-func TestOnboardingInstantChatAcceptsCheckedTextOnlyModel(t *testing.T) {
+func TestOnboardingAcceptsCheckedTextOnlyModel(t *testing.T) {
 	service, _, preferences, models := newOnboardingTestService(t)
 	models.items = append(models.items, ModelConnectionView{
 		ID: "p7654321", Name: "text only", CheckedAt: timePointer(time.Now()),

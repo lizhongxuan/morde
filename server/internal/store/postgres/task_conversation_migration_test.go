@@ -219,6 +219,9 @@ JOIN instant_chat_exchanges i ON i.user_message_id=m.id WHERE m.id=$1`, messageI
 
 func markWorkspaceVolumesLegacyForMigrationRollback(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
+	if _, err := pool.Exec(ctx, `DELETE FROM workspace_revision_directories WHERE directory_path='.' AND valid_from_revision=0`); err != nil {
+		t.Fatalf("prepare legacy Workspace directory fixture: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE workspace_volumes AS volume
 SET state='legacy', volume_name=NULL, ready_at=NULL,
     legacy_host_id=(

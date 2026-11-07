@@ -10,6 +10,7 @@ export function RouteGuard({ loginPath = '/login' }: { loginPath?: string }) {
   if (loading) return <main className="loading-page" aria-live="polite">正在检查登录状态…</main>;
   if (error) return <main className="loading-page"><div className="error-card" role="alert">{error}<button className="button button-secondary" type="button" onClick={() => { void refresh(); }}>重试</button></div></main>;
   if (!user) return <Navigate to={loginPath} replace state={{ from: `${location.pathname}${location.search}${location.hash}` }} />;
+  if (user.must_change_password && loginPath === '/login') return <Navigate to="/settings/password" replace />;
   return <Outlet />;
 }
 

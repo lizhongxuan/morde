@@ -122,7 +122,11 @@ func (w *WorkerApp) Reconcile(ctx context.Context) (map[string]int, error) {
 			if value.RuntimeGeneration > 1 && value.StateReason == "restore_unknown" {
 				continue
 			}
-			if value.CreatedAt.IsZero() || time.Since(value.CreatedAt) < w.service.readyTimeout {
+			createStartedAt := value.CreatedAt
+			if value.RuntimeGeneration > 1 {
+				createStartedAt = value.UpdatedAt
+			}
+			if createStartedAt.IsZero() || time.Since(createStartedAt) < w.service.readyTimeout {
 				continue
 			}
 			failed, changed, err := w.service.hosts.FailUnattemptedCreate(ctx, value.ID, "ready_timeout")
@@ -274,7 +278,11 @@ func (w *WorkerApp) reconcileIdleAndExpiry(ctx context.Context, value host.Host,
 
 func (w *WorkerApp) reconcileFailedHost(ctx context.Context, value host.Host) error {
 	if value.RuntimeGeneration > 1 {
-		return fmt.Errorf("refuse failed-host cleanup for restored Host generation %d; data must be preserved", value.RuntimeGeneration)
+		// Restored generations keep their profile and Workspace volumes attached
+		// until an administrator has inspected the sandbox and explicitly
+		// requested recovery. Repeating cleanup errors here only obscures the
+		// actionable failed state.
+		return nil
 	}
 	bindings, err := w.service.workspaces.GetWorkspaceBindingsByHost(ctx, value.ID)
 	if err != nil {

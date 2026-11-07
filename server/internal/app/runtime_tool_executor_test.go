@@ -145,7 +145,7 @@ func TestWorkspaceTaskDisablesAIDesktopInput(t *testing.T) {
 		t.Fatalf("Workspace Task tools include desktop input or omit safe tools: %v", seen)
 	}
 
-	request := fixture.request(runtimeToolDesktopClick, `{"window_id":"0x1","x":1,"y":1}`, identity.ScopeComputerOperate)
+	request := fixture.request(runtimeToolDesktopClick, `{"window_id":"0x1","x":1,"y":1,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`, identity.ScopeComputerOperate)
 	if _, err := fixture.executor.Prepare(context.Background(), request); domain.CodeOf(err) != domain.CodeUnsupported {
 		t.Fatalf("Prepare(Workspace desktop input) error = %v; want unsupported", err)
 	}
@@ -183,10 +183,12 @@ func TestRuntimeDesktopToolArgumentsAreBounded(t *testing.T) {
 		{tool: runtimeToolWindowList, input: `{}`, valid: true},
 		{tool: runtimeToolWindowActivate, input: `{"window_id":"0x1"}`, valid: true},
 		{tool: runtimeToolWindowActivate, input: `{"window_id":"0x01"}`},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":0,"y":0}`, valid: true},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":65536,"y":0}`},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"button":"right"}`, valid: true},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"button":"4"}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":0,"y":0,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50}`, valid: true},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":65536,"y":0,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50,"button":"right"}`, valid: true},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50,"button":"4"}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":100,"y":2,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50}`},
 		{tool: runtimeToolDesktopClick, input: `{"x":0,"y":0}`},
 		{tool: runtimeToolDesktopType, input: `{"window_id":"0x1","text":"你好"}`, valid: true},
 		{tool: runtimeToolDesktopType, input: `{"window_id":"0x1","text":"x","shell":"echo bad"}`},
@@ -300,11 +302,13 @@ func TestRuntimeDesktopScreenshotMapsValidatedJPEGWithoutBase64InOutput(t *testi
 	}
 	imageBytes := imageBuffer.Bytes()
 	encoded, err := json.Marshal(struct {
-		MIMEType   string `json:"mime_type"`
-		Width      int    `json:"width"`
-		Height     int    `json:"height"`
-		DataBase64 string `json:"data_base64"`
-	}{MIMEType: "image/jpeg", Width: 2, Height: 3, DataBase64: base64.StdEncoding.EncodeToString(imageBytes)})
+		MIMEType     string `json:"mime_type"`
+		Width        int    `json:"width"`
+		Height       int    `json:"height"`
+		ScreenWidth  int    `json:"screen_width"`
+		ScreenHeight int    `json:"screen_height"`
+		DataBase64   string `json:"data_base64"`
+	}{MIMEType: "image/jpeg", Width: 2, Height: 3, ScreenWidth: 2000, ScreenHeight: 3000, DataBase64: base64.StdEncoding.EncodeToString(imageBytes)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,6 +327,9 @@ func TestRuntimeDesktopScreenshotMapsValidatedJPEGWithoutBase64InOutput(t *testi
 	}
 	if strings.Contains(result.Output, base64.StdEncoding.EncodeToString(imageBytes)) {
 		t.Fatal("desktop screenshot base64 leaked into tool output")
+	}
+	if !strings.Contains(result.Output, `"screen_width":2000`) || !strings.Contains(result.Output, `"screen_height":3000`) {
+		t.Fatalf("desktop screenshot did not preserve screen geometry: %s", result.Output)
 	}
 
 	badDimensions := bytes.Replace(encoded, []byte(`"width":2`), []byte(`"width":3`), 1)
@@ -353,12 +360,12 @@ func TestRuntimeDesktopResultsMustMatchBoundWindowAndArguments(t *testing.T) {
 			result: `{"window_id":"0x1","activated":true}`, want: `{"window_id":"0x1","activated":true}`, valid: true,
 		},
 		{
-			name: "click defaults to left", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34}`,
+			name: "click defaults to left", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`,
 			result: `{"window_id":"0x1","x":12,"y":34,"button":"left","clicked":true}`,
 			want:   `{"window_id":"0x1","x":12,"y":34,"button":"left","clicked":true}`, valid: true,
 		},
 		{
-			name: "click cannot change target", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34}`,
+			name: "click cannot change target", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`,
 			result: `{"window_id":"0x2","x":12,"y":34,"button":"left","clicked":true}`,
 		},
 		{
@@ -888,7 +895,11 @@ func TestRuntimeBrowserToolArgumentsAreBoundedAndDoNotAcceptRawSelectors(t *test
 }
 
 func TestRuntimeBrowserScreenshotMapsImageWithoutPersistingBase64AsToolOutput(t *testing.T) {
-	imageBytes := []byte{0xff, 0xd8, 0xff, 0xd9}
+	var imageBuffer bytes.Buffer
+	if err := jpeg.Encode(&imageBuffer, image.NewRGBA(image.Rect(0, 0, 2, 3)), nil); err != nil {
+		t.Fatal(err)
+	}
+	imageBytes := imageBuffer.Bytes()
 	encoded, err := json.Marshal(struct {
 		TargetID   string `json:"target_id"`
 		MIMEType   string `json:"mime_type"`

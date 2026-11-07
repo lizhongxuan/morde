@@ -105,7 +105,7 @@ type MCPConnectorService struct {
 
 func NewMCPConnectorService(store MCPConnectorStore, sealer *Sealer, redirectURI string) (*MCPConnectorService, error) {
 	oauthStore, ok := store.(MCPConnectorOAuthStore)
-	if store == nil || sealer == nil || !ok || !validMCPConnectorOAuthRedirect(redirectURI) {
+	if store == nil || sealer == nil || !ok || (redirectURI != "" && !validMCPConnectorOAuthRedirect(redirectURI)) {
 		return nil, domain.NewError(domain.CodeInvalidArgument, "MCP connector dependencies are required")
 	}
 	return &MCPConnectorService{
@@ -353,6 +353,9 @@ func validateMCPConnectorCredential(value []byte, optional bool) error {
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(value, &object); err != nil || object == nil {
 		return domain.InvalidArgument("credential", "connector credential must be a JSON object within the size limit")
+	}
+	if !validMCPConnectorCredentialHeadersJSON(value) {
+		return domain.InvalidArgument("credential", "connector credential headers are invalid")
 	}
 	return nil
 }

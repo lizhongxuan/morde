@@ -68,13 +68,13 @@ func TestPostgresAdminModelBudgetDefaultUsesCASAndAudit(t *testing.T) {
 	}
 }
 
-func TestPostgresLoadModelBudgetDefaultForApprovalRequiresConfiguration(t *testing.T) {
+func TestPostgresLoadModelBudgetDefaultForApprovalAllowsMissingConfiguration(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	err := store.WithTx(context.Background(), func(tx pgx.Tx) error {
 		_, err := loadModelBudgetDefaultInTx(context.Background(), tx)
 		return err
 	})
-	if domain.CodeOf(err) != domain.CodeInvalidState {
+	if err != nil {
 		t.Fatalf("missing default budget error = %v", err)
 	}
 }

@@ -73,6 +73,7 @@ it('allows the local development Host only from the local Portal', () => {
   const local = 'http://h1234567.hosts.localhost';
   expect(resolveHostEntryURL(`${local}/__ch/auth?t=x`, local, 'portal.localhost')).toBe(`${local}/__ch/auth?t=x`);
   expect(resolveHostEntryURL(`${local}/__ch/auth?t=x`, local, 'localhost')).toBe(`${local}/__ch/auth?t=x`);
+  expect(resolveHostEntryURL(`${local}/__ch/auth?t=x`, local, '127.0.0.1')).toBe(`${local}/__ch/auth?t=x`);
   expect(() => resolveHostEntryURL(`${local}/__ch/auth?t=x`, local, 'portal.example.com')).toThrow('服务器返回了无效的云端电脑入口');
   expect(() => resolveHostEntryURL('http://host.test/__ch/auth?t=x', 'http://host.test', 'portal.localhost')).toThrow('服务器返回了无效的云端电脑入口');
 });

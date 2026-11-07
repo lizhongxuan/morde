@@ -15,7 +15,7 @@ type Authorization = Awaited<ReturnType<typeof portalApi.adminUserAuthorizations
 type ModelCall = Awaited<ReturnType<typeof portalApi.adminUserModelCalls>>['items'][number];
 
 const modelUsageSourceLabel: Record<UnknownModelCall['source'], string> = {
-  client: '客户端', chat: '对话', task: '云端任务', probe: '连接检查',
+  client: '客户端', chat: '对话', task: '云端任务', route: '消息分流', probe: '连接检查',
 };
 
 function UserResourceEditor({ user }: { user: AdminUser }) {
@@ -123,7 +123,7 @@ function ModelAccountBudgetEditor({ ownerID }: { ownerID: string }) {
     retry: false,
   });
   return <section className="admin-detail-section">
-    <div className="dashboard-section-heading"><div><h2>平台模型预算</h2><p>设置此账号的平台模型调用额度和并发数。</p></div>
+    <div className="dashboard-section-heading"><div><h2>平台模型预算</h2><p>设置此账号的平台模型调用额度和并发数。个人模型使用自己的 API 密钥，不占用此额度。</p></div>
       {!query.isPending && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
     {query.isPending && <div className="loading-card" role="status">正在读取模型预算…</div>}
@@ -309,8 +309,8 @@ export function AdminUserDetail() {
   const ownedWorkspaces = workspaces.data.pages.flatMap((page) => page.items).filter((workspace) => workspace.owner_id === user.id);
 
   return <section>
-    <Link className="back-link" to="/admin/users">‹ 返回用户列表</Link>
-    <div className="page-heading detail-heading"><div><p className="eyebrow">用户详情</p><h2>{user.name}</h2><p className="muted mono">{user.id}</p></div><div className="inline-actions"><Link className="button button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}/records`}>记录与样本</Link><span className={`status status-${user.status === 'approved' ? 'ready' : 'disabled'}`}>{user.status === 'approved' ? '登录正常' : user.status === 'disabled' ? '已禁用登录' : user.status === 'pending' ? '等待审核' : '审核未通过'}</span></div></div>
+    <section className="design-panel">
+    <div className="design-panel-header"><div><h2>{user.name}</h2><p className="mono">{user.id}</p></div><div className="inline-actions"><span className={`status status-${user.status === 'approved' ? 'ready' : 'disabled'}`}>{user.status === 'approved' ? '登录正常' : user.status === 'disabled' ? '已禁用登录' : user.status === 'pending' ? '等待审核' : '审核未通过'}</span><Link className="button button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}/records`}>记录与样本</Link><Link className="button button-secondary" to="/admin/users">← 返回用户列表</Link></div></div>
     <div className="admin-detail-facts">
       <article><span>角色</span><strong>{user.role === 'super_admin' ? '超级管理员' : user.role === 'admin' ? '管理员' : '普通用户'}</strong></article>
       <article><span>云端电脑 / 上限</span><strong>{ownedHosts.length} / {user.quota.hosts} 台</strong></article>
@@ -318,6 +318,7 @@ export function AdminUserDetail() {
       <article><span>内存使用 / 配额</span><strong>{user.usage && user.quota ? `${formatMemory(user.usage.mem_mib)} / ${formatMemory(user.quota.mem_mib)}` : '未提供'}</strong></article>
       <article><span>创建时间</span><strong>{formatDate(user.created_at)}</strong></article>
     </div>
+    </section>
     <UserResourceEditor key={`${user.id}:${user.quota.hosts}:${user.default_host_resources.cpu_milli}:${user.default_host_resources.mem_mib}`} user={user} />
     <PersonalDataQuotaEditor ownerID={user.id} />
     <ModelAccountBudgetEditor ownerID={user.id} />

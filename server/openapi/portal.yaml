@@ -59,7 +59,7 @@ paths:
       tags: [Portal]
       operationId: getCapabilities
       summary: Discover this Morde service before login
-      description: The persisted service identifier partitions client data across installations. A null protocol or minimum version means it is not declared, not that an unfinished capability is available. Only assembled capabilities are listed. The default request size has route-specific exceptions.
+      description: The persisted service identifier partitions client data across installations. A null protocol or minimum version means it is not declared, not that an unfinished capability is available. Only assembled capabilities are listed. The default request size has route-specific exceptions. task_media_generation is present only when server-managed image/video/speech generation, token reservation and settlement, durable idempotent provider-operation recovery, owner-authorized preview, save confirmation, and verified Workspace artifact publication are all assembled. Task media inputs and cloud speech recognition are not included.
       security: []
       responses:
         '200':
@@ -80,7 +80,7 @@ paths:
                   minimum_client_version: { type: [string, 'null'] }
                   supported_features:
                     type: array
-                    description: An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, both project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
+                    description: An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
                     items: { type: string }
                   default_max_request_bytes: { type: integer, format: int64, minimum: 1 }
         '503': { $ref: '#/components/responses/Error' }
@@ -107,8 +107,8 @@ paths:
     post:
       tags: [Models]
       operationId: createPlatformChatCompletion
-      summary: Run one metered platform-model inference
-      description: Requires a user Session or installation-bound Client, an explicitly configured model budget, and an Idempotency-Key. This endpoint returns tool calls without executing them. It supports text, inline base64 images, function tools, temperature and text streaming; unsupported options such as stop sequences, remote image URLs and forced tool choice are rejected. A repeated call is not dispatched again; if its result was not saved by the caller, reconcile instead of retrying with a new key. No complete request or response is retained by the model ledger.
+      summary: Run one model inference
+      description: Requires a user Session or installation-bound Client and an Idempotency-Key. Shared platform models require a configured account model budget; caller-owned personal models do not consume it. This endpoint returns tool calls without executing them. It supports text, inline base64 images, function tools, temperature and text streaming; unsupported options such as stop sequences, remote image URLs and forced tool choice are rejected. A repeated call is not dispatched again; if its result was not saved by the caller, reconcile instead of retrying with a new key. No complete request or response is retained by the model ledger.
       security: [{ portalSession: [] }, { bearerToken: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -250,7 +250,7 @@ paths:
       tags: [Auth]
       operationId: register
       summary: Register a standard user account
-      description: Creates a pending user account with role=user. Registration is rate limited and does not create a login session. The name admin is reserved case-insensitively.
+      description: Requires only a username and password; an optional invite_code is attribution-only and no SMS step is used. Creates a pending user account with role=user, is rate limited, and does not create a login session. The name admin is reserved case-insensitively.
       security: []
       requestBody:
         required: true
@@ -1841,6 +1841,87 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/RequestTooLarge' }
         default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/{id}/shares:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: createWorkspaceShareLink
+      summary: Create a single-recipient Workspace copy link
+      description: Portal owner sessions only. The link expires after seven days if unclaimed. The response contains the random token once; only its SHA-256 hash is stored. A successful claim creates an independent Workspace owned by the recipient. View permission is enforced by the server and prevents Workspace writes and Host attachment.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkspaceShareRequest' }
+      responses:
+        '201':
+          description: Link created; do not cache this response because it contains the one-time raw token.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceShareCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspace-shares/preview:
+    post:
+      tags: [Workspaces]
+      operationId: previewWorkspaceShareLink
+      summary: Preview a Workspace copy link
+      description: Portal session only. The token is sent in the request body and responses are not cacheable. Preview does not claim or consume the link.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceShareTokenRequest' }
+      responses:
+        '200':
+          description: Workspace name, permission, and link expiry.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceSharePreview' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspace-shares/accept:
+    post:
+      tags: [Workspaces]
+      operationId: acceptWorkspaceShareLink
+      summary: Claim a Workspace copy link
+      description: Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkspaceShareTokenRequest' }
+      responses:
+        '201':
+          description: Independent Workspace copy claimed.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspaceShareAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/workspaces/{id}/restore:
     parameters:
       - $ref: '#/components/parameters/WorkspaceId'
@@ -2791,74 +2872,6 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
-  /api/instant-chat/conversations:
-    get:
-      tags: [Instant Chat compatibility]
-      operationId: listInstantChatConversations
-      summary: List conversations through the legacy instant chat route
-      description: Returns the same durable Task-backed conversations as the canonical conversation API.
-      security: [{ portalSession: [] }]
-      responses:
-        '200':
-          description: Conversations
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items: { type: array, items: { $ref: '#/components/schemas/InstantChatConversation' } }
-        default: { $ref: '#/components/responses/Error' }
-  /api/instant-chat/conversations/{id}/messages:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema: { $ref: '#/components/schemas/ConversationId' }
-    get:
-      tags: [Instant Chat compatibility]
-      operationId: listInstantChatMessages
-      summary: List conversation messages through the legacy instant chat route
-      description: Returns the same persisted messages as the canonical conversation API.
-      security: [{ portalSession: [] }]
-      responses:
-        '200':
-          description: Messages
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items: { type: array, items: { $ref: '#/components/schemas/InstantChatMessage' } }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
-  /api/instant-chat/messages:
-    post:
-      tags: [Instant Chat compatibility]
-      operationId: sendInstantChatMessage
-      summary: Submit a durable Task through the legacy reply shape
-      description: Submits to the canonical Task and Conversation services, then waits for the Task's terminal result to preserve the legacy response shape. Disconnecting while waiting does not cancel the durable Task. Reuse the Idempotency-Key only with the same conversation_id (including an omitted value for a new conversation), model_id, and content after trimming surrounding whitespace. A different request with the same key returns a conflict.
-      security: [{ portalSession: [] }]
-      parameters:
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema: { type: string, minLength: 8, maxLength: 128 }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/InstantChatSendRequest' }
-      responses:
-        '200':
-          description: Saved exchange
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/InstantChatSendResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        default: { $ref: '#/components/responses/Error' }
   /api/execution:
     get:
       tags: [Tasks]
@@ -3383,6 +3396,8 @@ paths:
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
       requestBody:
         required: true
         content:
@@ -3448,6 +3463,28 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/tasks:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+    get:
+      tags: [Projects]
+      operationId: listProjectConversationActiveTasks
+      summary: List visible active tasks in a shared conversation
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Active task page and task event cursors
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationActiveTaskPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/projects/{id}/conversations/{conversation_id}/messages:
     parameters:
       - { $ref: '#/components/parameters/ProjectId' }
@@ -3461,6 +3498,12 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
+        - name: client_message_id
+          in: query
+          description: Reconcile a message submitted by the authenticated member in this conversation.
+          schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
       responses:
         '200':
           description: Messages in chronological order
@@ -3473,9 +3516,45 @@ paths:
         default: { $ref: '#/components/responses/Error' }
     post:
       tags: [Projects]
-      operationId: appendProjectConversationMessage
-      summary: Append a message and queue a Task in the shared conversation
-      description: Accepted project members may append messages. The conversation owner remains the creator while the Task initiator is the caller; current membership and the caller's independent Host, Workspace, model, and token access are rechecked by the write transaction.
+      operationId: acceptProjectConversationMessage
+      summary: Accept a message in a shared project conversation
+      description: Persists the member's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The conversation owner remains the creator, while the caller is the message actor. The Idempotency-Key must equal client_message_id.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/ServiceInstanceID' }
+        - { $ref: '#/components/parameters/MessageActor' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptConversationMessageRequest' }
+      responses:
+        '202':
+          description: The shared message and routing receipt were durably accepted. A Task may be created later.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedProjectConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/message-uploads/{client_message_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: client_message_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    put:
+      tags: [Projects]
+      operationId: initializeProjectConversationMessageUpload
+      summary: Initialize or resume a long message
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -3483,18 +3562,318 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/AppendProjectConversationMessageRequest' }
+            schema: { $ref: '#/components/schemas/ConversationMessageUploadInit' }
       responses:
-        '202':
-          description: Shared message and queued project Task
+        '200':
+          description: Upload state and received chunks; committed state contains the receipt
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/AppendProjectConversationMessageResponse' }
+              schema: { $ref: '#/components/schemas/ConversationMessageUpload' }
         '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationMessageUpload
+      summary: Read upload progress
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Upload state and received chunks; committed state contains the receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageUpload' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/message-uploads/{client_message_id}/chunks/{sequence}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: client_message_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - name: sequence
+        in: path
+        required: true
+        schema: { type: integer, minimum: 0, maximum: 511 }
+    put:
+      tags: [Projects]
+      operationId: putChunkProjectConversationMessageUpload
+      summary: Idempotently store one 16 KiB byte chunk
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationMessageChunk' }
+      responses:
+        '204': { description: Chunk stored or exact retry accepted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/message-uploads/{client_message_id}/commit:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: client_message_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    post:
+      tags: [Projects]
+      operationId: commitProjectConversationMessageUpload
+      summary: Atomically accept the verified message
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '202':
+          description: Message durably accepted for routing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationMessageEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - { $ref: '#/components/parameters/IdempotencyKey' }
+    post:
+      tags: [Projects]
+      operationId: retryProjectConversationMessageProcessing
+      summary: Retry processing of an accepted failed message
+      description: Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '202': { description: Retry accepted or exact replay }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: client_attachment_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    put:
+      tags: [Projects]
+      operationId: initializeProjectConversationAttachment
+      summary: Initialize or resume an attachment declared by a project message
+      description: The original sender and current project member can initialize the declared slot. Exact retries reuse its ID; changed metadata conflicts. Expired incomplete uploads can restart with the same metadata. This slot is its idempotency identity.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectConversationAttachmentInit' }
+      responses:
+        '200':
+          description: Current upload state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationAttachmentStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationAttachmentUpload
+      summary: Read received chunks for an upload by the original sender
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current upload state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationAttachmentStatus' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/chunks/{sequence}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: client_attachment_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
+      - { name: sequence, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 74 } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - { name: Content-Length, in: header, required: true, schema: { type: integer, minimum: 1, maximum: 4194304 } }
+      - { name: X-Chunk-SHA256, in: header, required: true, schema: { type: string, pattern: '^[a-f0-9]{64}$' } }
+    put:
+      tags: [Projects]
+      operationId: putProjectConversationAttachmentChunk
+      summary: Upload or replay one project attachment chunk
+      description: Send raw 4 MiB chunks in any order; the last chunk has the exact remaining length. Identical retries succeed and changed bytes conflict.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Durable chunk receipt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sequence, replay]
+                properties:
+                  sequence: { type: integer, minimum: 0, maximum: 74 }
+                  replay: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/commit:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: client_attachment_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    post:
+      tags: [Projects]
+      operationId: commitProjectConversationAttachment
+      summary: Verify all chunks and associate the project attachment
+      description: Empty request body. Size and full SHA-256 are verified before this slot becomes available to the Task; an exact retry is safe.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Committed attachment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationAttachmentStatus' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/derivatives:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: client_attachment_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    put:
+      tags: [Projects]
+      operationId: putProjectConversationAttachmentDerivatives
+      summary: Atomically commit or skip a project's attachment representations
+      description: The original sender submits a complete ordered set after the original attachment is committed. The original slot must have been initialized with pdf or image mode. The JSON request is limited to 8 MiB. Identical retries succeed, changed content or a different outcome conflicts. Only this message's routing waits for the set; other messages remain eligible.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectConversationDerivatives' }
+      responses:
+        '200':
+          description: Current original attachment and derivative state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationAttachmentStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}/content:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: client_attachment_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationAttachmentContent
+      summary: Read a committed project attachment as a current project member
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Committed attachment bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments-by-id/{attachment_id}:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: attachment_id, in: path, required: true, schema: { $ref: '#/components/schemas/ProjectConversationAttachmentId' } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationAttachmentMetadata
+      summary: Read committed attachment metadata by its project attachment ID
+      description: Requires current project viewer access. The attachment must belong to the specified message and service instance.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Project attachment metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConversationAttachmentMetadata' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments-by-id/{attachment_id}/content:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - { name: message_id, in: path, required: true, schema: { $ref: '#/components/schemas/MessageId' } }
+      - { name: attachment_id, in: path, required: true, schema: { $ref: '#/components/schemas/ProjectConversationAttachmentId' } }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationAttachmentContentByID
+      summary: Read a committed project attachment by its ID
+      description: Requires current project viewer access. The attachment must belong to the specified message and service instance.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Project attachment bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
         default: { $ref: '#/components/responses/Error' }
   /api/project-content/search:
     get:
@@ -3847,7 +4226,7 @@ paths:
       tags: [Projects]
       operationId: listProjectBudgetLedger
       summary: List project model usage attribution
-      description: Available to accepted project members. Task model calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
+      description: Available to accepted project members. Platform-model Task calls reserve both this budget and the initiating account budget before dispatch using configured models.project_rates. Caller-owned personal model calls do not consume either platform budget. Unknown usage remains held for reconciliation. The ledger returns attribution, model/rate metadata, usage and integer micro amounts only; prompts, model responses, credentials and provider payloads are never included.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/PageLimit' }
@@ -3874,12 +4253,18 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
+        - name: include_unassigned
+          in: query
+          required: false
+          description: Defaults to false for compatibility with older clients. true includes items whose assignee_id is null; the cursor is bound to this filter.
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: Stable project-scoped page ordered by creation time and ID
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProjectWorkItemPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -3888,7 +4273,7 @@ paths:
       tags: [Projects]
       operationId: createProjectWorkItem
       summary: Create a project work item
-      description: Owner/member only. The default assignee is the caller; any supplied assignee must be an accepted member. Task and Workspace fields are added only through separately authorized operations.
+      description: Owner/member only. Omitted category defaults to unclassified. By default, the caller is the assignee unless assignee_id is supplied. Set unassigned=true with assignee_id omitted to create an unassigned item. Task and Workspace fields are added only through separately authorized operations.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -3923,12 +4308,19 @@ paths:
       operationId: getProjectWorkItem
       summary: Read one project work item
       security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - name: include_unassigned
+          in: query
+          required: false
+          description: Defaults to false for compatibility with older clients. Set true to read an unassigned item; otherwise it is returned as not found.
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: Project work item
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -3948,6 +4340,35 @@ paths:
       responses:
         '200':
           description: Updated work item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectWorkItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/work-items/{work_item_id}/claim:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectWorkItemId' }
+    post:
+      tags: [Projects]
+      operationId: claimProjectWorkItem
+      summary: Claim an unassigned work item for the current member
+      description: Owner/member only. Claims only an unassigned item for the authenticated member. It cannot replace an existing assignee; expected_version and Idempotency-Key make concurrent claims compare-and-set and exact retries idempotent.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClaimProjectWorkItemRequest' }
+      responses:
+        '200':
+          description: Work item claimed by the current member
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProjectWorkItem' }
@@ -4097,6 +4518,8 @@ paths:
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
       requestBody:
         required: true
         content:
@@ -4134,6 +4557,29 @@ paths:
               schema: { $ref: '#/components/schemas/Conversation' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/tasks:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+    get:
+      tags: [Tasks]
+      operationId: listConversationActiveTasks
+      summary: List visible active tasks in this conversation
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PageLimit' }
+        - { $ref: '#/components/parameters/PageCursor' }
+      responses:
+        '200':
+          description: Active task page and task event cursors
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationActiveTaskPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/conversations/{id}/messages:
     parameters:
       - name: id
@@ -4148,6 +4594,12 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/PageLimit' }
         - { $ref: '#/components/parameters/PageCursor' }
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
+        - name: client_message_id
+          in: query
+          description: Reconcile a message submitted by the authenticated account in this conversation.
+          schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
       responses:
         '200':
           description: Message page in chronological order
@@ -4158,9 +4610,112 @@ paths:
         default: { $ref: '#/components/responses/Error' }
     post:
       tags: [Tasks]
-      operationId: appendConversationMessage
-      summary: Append a message to a conversation or its active cloud task
-      description: When expected_task_id is supplied, the message is appended only if that Task is still active; a changed or finished Task returns a conflict instead of creating a new Task. Without it, a new Task may be queued. The server-side dsh Agent can continue after the client disconnects.
+      operationId: acceptConversationMessage
+      summary: Accept a message in a personal conversation
+      description: Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. The Idempotency-Key must equal client_message_id.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { $ref: '#/components/parameters/ServiceInstanceID' }
+        - { $ref: '#/components/parameters/MessageActor' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptConversationMessageRequest' }
+      responses:
+        '202':
+          description: The message and routing receipt were durably accepted. A Task may be created later.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/retry-processing:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - { $ref: '#/components/parameters/IdempotencyKey' }
+    post:
+      tags: [Tasks]
+      operationId: retryConversationMessageProcessing
+      summary: Retry processing of an accepted failed message
+      description: Only the original actor may retry a failed message without a Task. Exact retries use the same key; unknown dispatched model calls are not blindly repeated.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '202': { description: Retry accepted or exact replay }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/attachments/{client_attachment_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - name: client_attachment_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    put:
+      tags: [Tasks]
+      operationId: associateConversationMessageAttachment
+      summary: Associate a committed personal attachment with its stable message slot
+      description: Exact retries succeed; changing the attachment for a slot conflicts. The authenticated owner, message, declared slot, and committed attachment must belong to the same service instance.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [attachment_id]
+              properties:
+                attachment_id: { $ref: '#/components/schemas/PersonalAttachmentId' }
+      responses:
+        '204': { description: Attachment associated or exact retry accepted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/message-uploads/{client_message_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: client_message_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    put:
+      tags: [Tasks]
+      operationId: initializeConversationMessageUpload
+      summary: Initialize or resume a long message
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -4168,15 +4723,96 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/AppendConversationMessageRequest' }
+            schema: { $ref: '#/components/schemas/ConversationMessageUploadInit' }
       responses:
-        '202':
-          description: Message and queued task
+        '200':
+          description: Upload state and received chunks; committed state contains the receipt
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/AppendConversationMessageResponse' }
+              schema: { $ref: '#/components/schemas/ConversationMessageUpload' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Tasks]
+      operationId: getConversationMessageUpload
+      summary: Read upload progress
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Upload state and received chunks; committed state contains the receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageUpload' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/message-uploads/{client_message_id}/chunks/{sequence}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: client_message_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+      - name: sequence
+        in: path
+        required: true
+        schema: { type: integer, minimum: 0, maximum: 511 }
+    put:
+      tags: [Tasks]
+      operationId: putChunkConversationMessageUpload
+      summary: Idempotently store one 16 KiB byte chunk
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationMessageChunk' }
+      responses:
+        '204': { description: Chunk stored or exact retry accepted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/message-uploads/{client_message_id}/commit:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: client_message_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    post:
+      tags: [Tasks]
+      operationId: commitConversationMessageUpload
+      summary: Atomically accept the verified message
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '202':
+          description: Message durably accepted for routing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks:
     get:
@@ -4236,6 +4872,42 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/media/{operation_id}/preview:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: operation_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/OperationId' }
+    get:
+      tags: [Tasks]
+      operationId: getTaskMediaPreview
+      summary: Read a pending generated-media preview
+      description: Requires the Task owner's session or client credential. Returns only server-staged generated media tied to the exact Task operation while its save confirmation is pending. Provider URLs and credentials are never returned. The response is private and non-cacheable; the staged bytes are deleted after approval, rejection, cancellation, or expiry. The service advertises task_media_generation only when this route and the complete generation, metering, recovery, and Workspace publication flow are assembled.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Generated preview bytes; this response does not create a Workspace artifact.
+          headers:
+            Cache-Control: { schema: { type: string, const: 'private, no-store' } }
+            X-Content-Type-Options: { schema: { type: string, const: nosniff } }
+          content:
+            image/png: { schema: { type: string, format: binary } }
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+            video/mp4: { schema: { type: string, format: binary } }
+            audio/mpeg: { schema: { type: string, format: binary } }
+            audio/ogg: { schema: { type: string, format: binary } }
+            audio/opus: { schema: { type: string, format: binary } }
+            audio/wav: { schema: { type: string, format: binary } }
+            audio/aac: { schema: { type: string, format: binary } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/workbench-observation-ticket:
@@ -4839,6 +5511,8 @@ paths:
       description: Requires an approved portal session or active Client credential. The write is an optimistic compare-and-set using base_revision. On a revision conflict, details contain only base_revision, current_revision and deleted; the server never returns the object body in the conflict.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
@@ -4863,6 +5537,8 @@ paths:
       description: Requires an approved portal session or active Client credential. Deletion records a versioned tombstone; the same profile ID cannot be recreated. The body-free receipt is idempotent through Idempotency-Key.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
@@ -4888,6 +5564,8 @@ paths:
       description: Requires an approved portal session or active Client credential. The request is limited to 16 KiB and requires an Idempotency-Key. It reserves personal-data quota before accepting chunks; retries with the same key and request return the original upload.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
@@ -4923,6 +5601,8 @@ paths:
       description: Requires an approved portal session or active Client credential. Send one raw chunk no larger than 4 MiB, an exact Content-Length, and exactly one X-Chunk-SHA256 header. Repeating the same sequence and bytes is idempotent; different bytes conflict.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
         - name: Content-Length
           in: header
           required: true
@@ -4962,6 +5642,8 @@ paths:
       description: Requires an approved portal session or active Client credential, an empty request body, and an Idempotency-Key. Commit verifies the target object's current revision, all chunk hashes and the final SHA-256, then publishes an owner-scoped attachment. An exact retry returns the original receipt without publishing twice.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200':
@@ -4987,6 +5669,9 @@ paths:
       summary: Cancel a pending personal attachment upload
       description: Requires an approved portal session or active Client credential and an empty request body. Repeated cancellation is safe; reserved quota is released through an idempotent bounded cleanup path.
       security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/OptionalServiceInstanceID' }
+        - { $ref: '#/components/parameters/OptionalMessageActor' }
       responses:
         '204': { description: Upload cancelled or already inactive }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -5162,8 +5847,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [items, configuration_status, default_model_configured, default_model_id]
                 properties:
+                  configuration_status:
+                    $ref: '#/components/schemas/ModelConfigurationStatus'
                   items:
                     type: array
                     items:
@@ -5180,15 +5867,22 @@ paths:
                             text: { type: boolean }
                             tools: { type: boolean }
                             vision: { type: boolean }
+                  default_model_configured:
+                    type: boolean
+                    description: True while the configured global shared model is checked and supports text. Tool use still requires verified tool capability; shared platform models require an account budget.
+                  default_model_id:
+                    oneOf:
+                      - { $ref: '#/components/schemas/ModelConnectionId' }
+                      - { type: 'null' }
+                    description: Configured global model ID only when it is currently usable; null otherwise.
         default: { $ref: '#/components/responses/Error' }
   /api/model-connections:
     get:
       tags: [Models]
       operationId: listModelConnections
       summary: List model connections available to the current user
-      description: Portal sessions only. Lists shared connections and the current user's personal connections. API keys are not accepted.
-      security:
-        - portalSession: []
+      description: Approved Portal sessions or an installation-bound Morde Client credential may list shared and caller-owned personal connections. Ordinary API-key credentials are not accepted; client credentials can only access the caller's personal connections and shared models.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       responses:
         '200':
           description: Model connections without secret values
@@ -5203,9 +5897,8 @@ paths:
       tags: [Models]
       operationId: createModelConnection
       summary: Create a personal or shared model connection
-      description: Portal sessions only. A personal connection is owned by the caller. Setting shared=true creates a shared connection and requires an administrator; ownership and authorization are enforced by the server. The API key is encrypted at rest and never returned.
-      security:
-        - portalSession: []
+      description: Approved Portal sessions or an installation-bound Morde Client credential may create a personal connection owned by the caller. Only an administrator Portal session may set shared=true. Ordinary API-key credentials are not accepted. Ownership and authorization are enforced by the server. The API key is encrypted at rest and never returned.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       requestBody:
         required: true
         content:
@@ -5231,9 +5924,8 @@ paths:
       tags: [Models]
       operationId: getModelConnection
       summary: Get a model connection
-      description: Portal sessions only. The response includes has_api_key but never the secret. Shared and personal access is checked by the server; inaccessible connections return not found.
-      security:
-        - portalSession: []
+      description: Approved Portal sessions or an installation-bound Morde Client credential may read shared and caller-owned personal connection metadata. Ordinary API-key credentials are not accepted. The response includes has_api_key but never the secret; inaccessible connections return not found.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       responses:
         '200':
           description: Model connection without its API key
@@ -5250,9 +5942,8 @@ paths:
       tags: [Models]
       operationId: updateModelConnection
       summary: Update a model connection
-      description: Portal sessions only. Only the owner may update a personal connection; only an administrator may update a shared connection. shared is immutable here. Omit api_key or send an empty string to retain the existing secret; any supplied secret replaces it. The server never returns the secret.
-      security:
-        - portalSession: []
+      description: Approved Portal sessions or an installation-bound Morde Client credential may update caller-owned personal connections; only an administrator Portal session may update shared connections. shared is immutable here. Ordinary API-key credentials are not accepted. Omit api_key or send an empty string to retain the existing secret; any supplied secret replaces it. The server never returns the secret.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       requestBody:
         required: true
         content:
@@ -5276,9 +5967,8 @@ paths:
       tags: [Models]
       operationId: deleteModelConnection
       summary: Delete a model connection
-      description: Portal sessions only. Only the owner may delete a personal connection; only an administrator may delete a shared connection. Authorization is enforced by the server.
-      security:
-        - portalSession: []
+      description: Approved Portal sessions or an installation-bound Morde Client credential may delete caller-owned personal connections; only an administrator Portal session may delete shared connections. Ordinary API-key credentials are not accepted. Authorization is enforced by the server.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       responses:
         '204': { description: Model connection deleted }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -5295,9 +5985,8 @@ paths:
       tags: [Models]
       operationId: checkModelConnection
       summary: Check a model connection and discover capabilities
-      description: Portal sessions only. Requires a configured account model budget and an Idempotency-Key. The selected probe is reserved and settled in the same ledger as model requests. An omitted capability means all; text, tools and vision can also be checked independently, using a new key for each. False means not yet verified or unsupported. Verified capabilities are combined only while the connection version is unchanged. Unknown usage remains pending for reconciliation and cannot be silently retried; the API key is never returned.
-      security:
-        - portalSession: []
+      description: Approved Portal sessions or an installation-bound Morde Client credential may check shared or caller-owned personal connections; shared connection checks require an administrator Portal session. Ordinary API-key credentials are not accepted. Requires an Idempotency-Key. Shared platform model checks require a configured account model budget; caller-owned personal checks do not consume it. The selected probe is recorded and settled in the same ledger as model requests. An omitted capability or all checks text, tools and vision; media generation probes are explicit because they may incur provider charges and require a new key. False means not yet verified or unsupported. Verified capabilities are combined only while the connection version is unchanged. Media generation is verified only when the provider reports actual input/output Token usage that can be reserved and settled exactly; seconds, images, characters or cost are never converted to Tokens. Unknown usage remains pending for reconciliation and cannot be silently retried; the API key is never returned.
+      security: [{ portalSession: [] }, { bearerToken: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -5308,7 +5997,7 @@ paths:
               type: object
               additionalProperties: false
               properties:
-                capability: { type: string, enum: [all, text, tools, vision], default: all }
+                capability: { type: string, enum: [all, text, text_stream, tools, vision, image_generation, video_generation, speech_generation], default: all, description: text_stream is an explicit metered inference that verifies SSE and can incur usage; all does not trigger it. }
       responses:
         '200':
           description: Verified model capabilities
@@ -5507,7 +6196,7 @@ paths:
       tags: [MCP]
       operationId: beginMCPConnectorOAuth
       summary: Begin server-side OAuth authorization for a connector
-      description: Portal sessions only. Discovers the MCP protected resource and authorization server, reuses or dynamically registers an OAuth client, and returns a PKCE authorization URL. If dynamic registration is unavailable, returns the issuer and callback URI so the user can provide an OAuth client ID and optional secret. Client secrets are accepted only in this request and are never returned.
+      description: Portal sessions only. OAuth authorization is unavailable when the Portal uses HTTP. Discovers the MCP protected resource and authorization server, reuses or dynamically registers an OAuth client, and returns a PKCE authorization URL. If dynamic registration is unavailable, returns the issuer and callback URI so the user can provide an OAuth client ID and optional secret. Client secrets are accepted only in this request and are never returned.
       security:
         - portalSession: []
       requestBody:
@@ -5549,12 +6238,12 @@ paths:
     get:
       tags: [Admin]
       operationId: getAdminSettings
-      summary: Read account, model budget, reward, and quota policy
-      description: Requires an approved administrator's unbound Portal session. Newly registered accounts receive the configured default model budget only on their first approval; administrators must configure a positive default before approving any new account. Invitation and contribution rewards remain disabled.
+      summary: Read account, model budget, model selection, reward, and quota policy
+      description: Requires an approved administrator's unbound Portal session. A configured default platform-model budget is granted only on first approval; approval is also allowed when no default is configured, and personal models do not require one. Cloud Agent execution requires a checked text-and-tools model available to the user. Invitation and contribution rewards remain disabled.
       security: [{ portalSession: [] }]
       responses:
         '200':
-          description: Current policy, default model budget configuration, and personal-data quota defaults
+          description: Current policy, default model budget and model selection, and personal-data quota defaults
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AdminSettings' }
@@ -5583,6 +6272,35 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/settings/model-default:
+    put:
+      tags: [Admin]
+      operationId: updateAdminModelDefault
+      summary: Select or clear the global Cloud Agent model
+      description: Requires an approved administrator's unbound Portal session. The selected connection must be shared, checked, and support text plus tools; setting an empty model_id clears the default. Updates use expected_version compare-and-set. Users may select another checked model they are authorized to use. The model ID may remain visible in admin settings when its connection is temporarily unchecked, while configured is false.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAdminModelDefaultRequest' }
+      responses:
+        '200':
+          description: Saved default model selection and version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminModelDefault' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Connection is not checked or does not support text and tools
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/invites:
     get:
@@ -5723,6 +6441,31 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/admin/hosts/{id}/recovery:
+    parameters:
+      - $ref: '#/components/parameters/HostId'
+    post:
+      tags: [Admin]
+      operationId: recoverAdminHost
+      summary: Safely recover an uncertain Host restore
+      description: Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminHostRecoveryRequest' }
+      responses:
+        '202':
+          description: Host recovery queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminHostRecoveryResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/admin/workspaces:
     get:
       tags: [Admin]
@@ -5818,7 +6561,7 @@ paths:
       tags: [Admin]
       operationId: updateUser
       summary: Review a user's status, change their role, or update quota
-      description: Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, the configured default model budget is created in the same transaction as the status change and audit. If no valid default is configured, approval fails and the account remains unchanged. Disabling and restoring an account does not grant or reset a budget.
+      description: Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, a configured default platform model budget is created in the same transaction as the status change and audit. If no default is configured, approval succeeds without granting a platform model budget. Disabling and restoring an account does not grant or reset a budget.
       security:
         - portalSession: []
       requestBody:
@@ -6428,7 +7171,7 @@ paths:
                       required: [owner_id, source, call_id, model_id, provider_model, reserved_tokens, created_at, unknown_at]
                       properties:
                         owner_id: { $ref: '#/components/schemas/UserId' }
-                        source: { type: string, enum: [client, chat, task, probe] }
+                        source: { type: string, enum: [client, chat, task, route, probe] }
                         call_id: { type: string }
                         model_id: { type: string }
                         provider_model: { type: string }
@@ -6457,7 +7200,7 @@ paths:
               required: [owner_id, source, call_id, input_tokens, output_tokens, evidence]
               properties:
                 owner_id: { $ref: '#/components/schemas/UserId' }
-                source: { type: string, enum: [client, chat, task, probe] }
+                source: { type: string, enum: [client, chat, task, route, probe] }
                 call_id: { type: string, minLength: 8, maxLength: 128 }
                 input_tokens: { type: integer, format: int64, minimum: 0 }
                 output_tokens: { type: integer, format: int64, minimum: 0 }
@@ -6757,6 +7500,30 @@ components:
       required: true
       description: Reuse only for an exact retry of the same operation and normalized request.
       schema: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
+    ServiceInstanceID:
+      name: X-Morde-Service-Instance-ID
+      in: header
+      required: true
+      description: Current service instance UUID; a mismatch fails without writing.
+      schema: { type: string, format: uuid }
+    OptionalServiceInstanceID:
+      name: X-Morde-Service-Instance-ID
+      in: header
+      required: false
+      description: Required for outbox reconciliation, scoped conversation creation, and outbox personal-data writes; must be paired with X-Morde-Actor-ID.
+      schema: { type: string, format: uuid }
+    MessageActor:
+      name: X-Morde-Actor-ID
+      in: header
+      required: true
+      description: Original outbox account ID, which must match the authenticated account.
+      schema: { $ref: '#/components/schemas/UserId' }
+    OptionalMessageActor:
+      name: X-Morde-Actor-ID
+      in: header
+      required: false
+      description: Required for outbox reconciliation, scoped creation, and outbox personal-data writes; must match the authenticated account and be paired with the service instance header.
+      schema: { $ref: '#/components/schemas/UserId' }
     PageLimit:
       name: limit
       in: query
@@ -6949,6 +7716,7 @@ components:
     ScheduleId: { type: string, pattern: '^j[a-z0-9]{7}$' }
     PersonalAttachmentUploadId: { type: string, pattern: '^pu_[a-f0-9]{32}$' }
     PersonalAttachmentId: { type: string, pattern: '^pa_[a-f0-9]{32}$' }
+    ProjectConversationAttachmentId: { type: string, pattern: '^pca_[a-f0-9]{32}$' }
     ConversationId: { type: string, pattern: '^c[a-z0-9]{7}$' }
     TaskId: { type: string, pattern: '^q[a-z0-9]{7}$' }
     TaskWorkspaceViewDeletionId: { type: string, pattern: '^z[a-z0-9]{7}$' }
@@ -6998,11 +7766,21 @@ components:
       additionalProperties: false
     ModelConnectionCapabilities:
       type: object
-      required: [text, tools, vision]
+      required: [text, text_stream, tools, vision]
       properties:
         text: { type: boolean }
+        text_stream: { type: boolean, description: True only after an explicit successful SSE probe for the current connection version. False includes unknown or unsupported. }
         tools: { type: boolean }
         vision: { type: boolean }
+        media_generation:
+          type: object
+          description: Optional verified server-managed output capabilities. A provider may advertise a modality only when it supplies a precise Token reservation upper bound, settleable actual Token usage, durable idempotent operation recovery, and confirmed cancellation; providers missing any of these remain disabled. Omitted or false means unavailable or unverified. Voice here means speech synthesis only; it does not enable audio input or cloud ASR.
+          required: [image_generation, video_generation, speech_generation]
+          properties:
+            image_generation: { type: boolean }
+            video_generation: { type: boolean }
+            speech_generation: { type: boolean }
+          additionalProperties: false
       additionalProperties: false
     ModelConnection:
       type: object
@@ -7020,10 +7798,15 @@ components:
         updated_at: { type: string, format: date-time }
       description: API keys and other secret material are never present in this response.
       additionalProperties: false
+    ModelConfigurationStatus:
+      type: string
+      enum: [configured, not_configured, unknown]
+      description: Configuration availability for the authenticated account, independent of health, budget and tool capability. Failed requests and stale cache must be treated as unknown.
     ModelConnectionList:
       type: object
-      required: [items]
+      required: [items, configuration_status]
       properties:
+        configuration_status: { $ref: '#/components/schemas/ModelConfigurationStatus' }
         items:
           type: array
           items: { $ref: '#/components/schemas/ModelConnection' }
@@ -7147,8 +7930,8 @@ components:
       required: [name, password]
       additionalProperties: false
       properties:
-        name: { type: string, minLength: 3, maxLength: 64 }
-        password: { type: string, minLength: 8, maxLength: 72, writeOnly: true }
+        name: { type: string, minLength: 1, maxLength: 64, description: 'Username is trimmed and limited to 3–64 UTF-8 bytes.' }
+        password: { type: string, minLength: 1, maxLength: 72, writeOnly: true, description: 'Password is limited to 8–72 UTF-8 bytes.' }
         invite_code: { type: string, pattern: '^[a-f0-9]{32}$', description: Optional Morde invitation attribution. The account remains pending review and receives no reward. }
     InviteCode:
       type: object
@@ -7158,7 +7941,7 @@ components:
       additionalProperties: false
     AdminSettings:
       type: object
-      required: [registration_review_required, automatic_new_user_model_budget, automatic_invitation_reward, automatic_contribution_reward, default_personal_data_quota_bytes, default_personal_attachment_bytes, default_model_budget]
+      required: [registration_review_required, automatic_new_user_model_budget, automatic_invitation_reward, automatic_contribution_reward, default_personal_data_quota_bytes, default_personal_attachment_bytes, default_model_budget, default_model]
       properties:
         registration_review_required: { type: boolean }
         automatic_new_user_model_budget: { type: boolean, const: true }
@@ -7167,6 +7950,7 @@ components:
         default_personal_data_quota_bytes: { type: integer, format: int64, minimum: 1 }
         default_personal_attachment_bytes: { type: integer, format: int64, minimum: 1 }
         default_model_budget: { $ref: '#/components/schemas/AdminModelBudgetDefault' }
+        default_model: { $ref: '#/components/schemas/AdminModelDefault' }
       additionalProperties: false
     AdminModelBudgetDefault:
       type: object
@@ -7184,6 +7968,27 @@ components:
         expected_version: { type: integer, format: int64, minimum: 0 }
         token_limit: { type: integer, format: int64, minimum: 1 }
         max_concurrent: { type: integer, minimum: 1, maximum: 100 }
+      additionalProperties: false
+    AdminModelDefault:
+      type: object
+      required: [configured, model_id, version]
+      properties:
+        configured: { type: boolean }
+        model_id:
+          oneOf:
+            - { $ref: '#/components/schemas/ModelConnectionId' }
+            - { type: 'null' }
+        version: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    UpdateAdminModelDefaultRequest:
+      type: object
+      required: [expected_version, model_id]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 0 }
+        model_id:
+          oneOf:
+            - { $ref: '#/components/schemas/ModelConnectionId' }
+            - { type: string, maxLength: 0, description: Send an empty string to clear the global default. }
       additionalProperties: false
     AdminInvite:
       type: object
@@ -7704,16 +8509,55 @@ components:
         updated_at: { type: string, format: date-time }
     Workspace:
       type: object
-      required: [id, name, revision, used_bytes, quota_bytes, state, created_at, updated_at]
+      required: [id, name, revision, used_bytes, quota_bytes, is_read_only, state, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/WorkspaceId' }
         name: { type: string }
         revision: { type: integer, format: int64, minimum: 0 }
         used_bytes: { type: integer, format: int64, minimum: 0 }
         quota_bytes: { type: integer, format: int64, minimum: 1 }
+        is_read_only: { type: boolean, description: True for a copy accepted with view permission. Server-side file mutations and Host attachment are denied. }
         state: { type: string, enum: [ready, deleting, deleted] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+    CreateWorkspaceShareRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_current_revision, permission]
+      properties:
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+        permission: { type: string, enum: [view, edit] }
+    WorkspaceShareCreated:
+      type: object
+      additionalProperties: false
+      required: [workspace_name, permission, token, expires_at]
+      properties:
+        workspace_name: { type: string }
+        permission: { type: string, enum: [view, edit] }
+        token: { type: string, pattern: '^[A-Za-z0-9_-]{43}$', description: High-entropy token returned only once. Store only a hash on the server. }
+        expires_at: { type: string, format: date-time }
+    WorkspaceShareTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+    WorkspaceSharePreview:
+      type: object
+      additionalProperties: false
+      required: [workspace_name, permission, expires_at]
+      properties:
+        workspace_name: { type: string }
+        permission: { type: string, enum: [view, edit] }
+        expires_at: { type: string, format: date-time }
+    WorkspaceShareAccepted:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, workspace_name, permission]
+      properties:
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        workspace_name: { type: string }
+        permission: { type: string, enum: [view, edit] }
     CreateSiteRequest:
       type: object
       required: [host_id, workspace_id]
@@ -8412,6 +9256,16 @@ components:
       properties:
         kind: { type: string, enum: [every_n_hours] }
         interval_hours: { type: integer, minimum: 1, maximum: 168, description: Elapsed hours between occurrences. }
+        anchor_at:
+          type: string
+          format: date-time
+          description: >-
+            Optional RFC3339 instant with an explicit UTC offset and at most six fractional-second
+            digits (the existing PostgreSQL timestamp precision), used as the cadence phase.
+            For every_n_hours, each slot is anchor_at + k * interval_hours for integer k >= 0.
+            Creation or re-enabling selects the earliest slot strictly after now; anchor_at is
+            used when still in the future and elapsed slots are skipped. Omission preserves
+            creation/re-enabling-relative cadence.
         time_zone: { type: string, minLength: 1, description: Must be a valid IANA time-zone identifier; the server rejects unknown identifiers. }
     ScheduleTiming:
       oneOf:
@@ -8423,7 +9277,7 @@ components:
     ScheduleSyncDefinition:
       type: object
       additionalProperties: false
-      required: [status, host_id, model_id, objective, timing, budget, misfire_policy, notification_events]
+      required: [status, host_id, model_id, title, objective, timing, budget, misfire_policy, notification_events]
       allOf:
         - if:
             required: [observation]
@@ -8436,7 +9290,8 @@ components:
         status: { $ref: '#/components/schemas/ScheduleStatus' }
         host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string, minLength: 1, maxLength: 200 }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
+        title: { type: string, minLength: 1, maxLength: 32768, description: 'Display title must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; independent of the model objective.' }
+        objective: { type: string, minLength: 1, maxLength: 32768, description: 'Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes.' }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -8489,7 +9344,8 @@ components:
       properties:
         host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string, minLength: 1, maxLength: 200 }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
+        title: { type: string, minLength: 1, maxLength: 32768, description: 'Optional display title; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; when omitted the server derives it from the trimmed objective.' }
+        objective: { type: string, minLength: 1, maxLength: 32768, description: 'Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes.' }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -8506,7 +9362,8 @@ components:
         expected_version: { type: integer, format: int64, minimum: 1 }
         host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string, minLength: 1, maxLength: 200 }
-        objective: { type: string, minLength: 1, maxLength: 32768 }
+        title: { type: string, minLength: 1, maxLength: 32768, description: 'Optional independent display-title update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; omission preserves the current title.' }
+        objective: { type: string, minLength: 1, maxLength: 32768, description: 'Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes.' }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -8550,7 +9407,7 @@ components:
     Schedule:
       type: object
       additionalProperties: false
-      required: [id, version, status, host_id, model_id, objective, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
+      required: [id, version, status, host_id, model_id, title, objective, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
       allOf:
         - if:
             required: [observation]
@@ -8565,7 +9422,8 @@ components:
         status: { $ref: '#/components/schemas/ScheduleStatus' }
         host_id: { $ref: '#/components/schemas/ScheduleHostId' }
         model_id: { type: string }
-        objective: { type: string }
+        title: { type: string, minLength: 1, maxLength: 32768, description: 'Display title, non-empty after trimming and limited to 1–32768 UTF-8 bytes; independent of the model objective.' }
+        objective: { type: string, minLength: 1, maxLength: 32768, description: 'Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes.' }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -8974,39 +9832,6 @@ components:
         id: { $ref: '#/components/schemas/TokenId' }
         key: { type: string, pattern: '^chk_' }
         expires_at: { type: string, format: date-time }
-    InstantChatConversation:
-      type: object
-      required: [id, title, model_id, created_at, updated_at]
-      properties:
-        id: { $ref: '#/components/schemas/ConversationId' }
-        title: { type: string }
-        model_id: { type: string }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-    InstantChatMessage:
-      type: object
-      required: [id, conversation_id, role, content, created_at]
-      properties:
-        id: { type: string }
-        conversation_id: { $ref: '#/components/schemas/ConversationId' }
-        role: { type: string, enum: [user, assistant] }
-        content: { type: string }
-        created_at: { type: string, format: date-time }
-    InstantChatSendRequest:
-      type: object
-      additionalProperties: false
-      required: [model_id, content]
-      properties:
-        conversation_id: { $ref: '#/components/schemas/ConversationId' }
-        model_id: { type: string }
-        content: { type: string, minLength: 1, maxLength: 32768 }
-    InstantChatSendResponse:
-      type: object
-      required: [conversation, message, reply]
-      properties:
-        conversation: { $ref: '#/components/schemas/InstantChatConversation' }
-        message: { $ref: '#/components/schemas/InstantChatMessage' }
-        reply: { $ref: '#/components/schemas/InstantChatMessage' }
     Conversation:
       type: object
       required: [id, scope, is_main, title, created_at, updated_at]
@@ -9064,35 +9889,30 @@ components:
         next_cursor: { type: [string, 'null'] }
     ProjectConversationMessage:
       allOf:
-        - { $ref: '#/components/schemas/ConversationMessage' }
+        - { $ref: '#/components/schemas/ConversationMessageBase' }
         - type: object
           required: [owner_id, actor_id]
           properties:
             owner_id: { $ref: '#/components/schemas/UserId' }
             actor_id: { $ref: '#/components/schemas/UserId' }
+            attachment_ids: { type: array, items: { $ref: '#/components/schemas/ProjectConversationAttachmentId' } }
     ProjectConversationMessagePage:
       type: object
       required: [items, next_cursor]
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/ProjectConversationMessage' } }
         next_cursor: { type: [string, 'null'] }
-    AppendProjectConversationMessageRequest:
-      allOf:
-        - { $ref: '#/components/schemas/AppendConversationMessageRequest' }
-    AppendProjectConversationMessageResponse:
+    ProjectConversationMessageEnvelope:
       type: object
-      required: [message, task]
+      required: [message]
       properties:
         message: { $ref: '#/components/schemas/ProjectConversationMessage' }
-        task: { $ref: '#/components/schemas/ProjectConversationTask' }
-    ProjectConversationTask:
-      allOf:
-        - { $ref: '#/components/schemas/Task' }
-        - type: object
-          required: [project_id, initiator_id]
-          properties:
-            project_id: { $ref: '#/components/schemas/ProjectId' }
-            initiator_id: { $ref: '#/components/schemas/UserId' }
+    AcceptedProjectConversationMessageResponse:
+      type: object
+      required: [message, replayed]
+      properties:
+        message: { $ref: '#/components/schemas/ProjectConversationMessage' }
+        replayed: { type: boolean, description: True when an identical accepted receipt was returned. }
     CreateProjectRequest:
       type: object
       required: [name]
@@ -9440,7 +10260,7 @@ components:
         call_id: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
         actor_id: { $ref: '#/components/schemas/UserId' }
         task_id: { $ref: '#/components/schemas/TaskId', description: Present only for source=task. }
-        source: { type: string, enum: [client, chat, task] }
+        source: { type: string, enum: [client, chat, task, route] }
         model_id: { $ref: '#/components/schemas/ModelConnectionId' }
         rate_version: { type: integer, format: int64, minimum: 1 }
         currency: { type: string, pattern: '^[A-Z]{3}$' }
@@ -9456,7 +10276,8 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/ProjectBudgetLedgerEntry' } }
         next_cursor: { type: [string, 'null'] }
-    ProjectWorkItemState: { type: string, enum: [open, blocked, delivered] }
+    ProjectWorkItemCategory: { type: string, enum: [bug, request, unclassified] }
+    ProjectWorkItemState: { type: string, enum: [open, blocked, delivered], description: Execution lifecycle independent from whether the item is claimed. delivered is terminal saved delivery evidence; no acceptance/review state is currently supported. }
     ProjectWorkItemDelivery:
       type: object
       required: [task_id, workspace_id, revision]
@@ -9466,7 +10287,7 @@ components:
         revision: { type: integer, format: int64, minimum: 1 }
     ProjectWorkItem:
       type: object
-      required: [id, project_id, title, description, acceptance_criteria, assignee_id, state, blocked_reason, task_ids, version]
+      required: [id, project_id, title, description, acceptance_criteria, category, assignee_id, state, blocked_reason, task_ids, version]
       properties:
         id: { $ref: '#/components/schemas/ProjectWorkItemId' }
         project_id: { $ref: '#/components/schemas/ProjectId' }
@@ -9476,7 +10297,11 @@ components:
           type: array
           maxItems: 100
           items: { type: string, minLength: 1, maxLength: 1000 }
-        assignee_id: { $ref: '#/components/schemas/UserId' }
+        category: { $ref: '#/components/schemas/ProjectWorkItemCategory' }
+        assignee_id:
+          anyOf:
+            - { $ref: '#/components/schemas/UserId' }
+            - { type: 'null' }
         state: { $ref: '#/components/schemas/ProjectWorkItemState' }
         blocked_reason: { type: string, maxLength: 2000 }
         task_ids:
@@ -9506,12 +10331,20 @@ components:
           maxItems: 100
           items: { type: string, minLength: 1, maxLength: 1000 }
         assignee_id: { $ref: '#/components/schemas/UserId', description: Defaults to the caller. }
+        category: { $ref: '#/components/schemas/ProjectWorkItemCategory', description: Defaults to unclassified. }
+        unassigned: { type: boolean, description: Omission defaults to false; set true to create without an assignee and omit assignee_id. }
       additionalProperties: false
     AssignProjectWorkItemRequest:
       type: object
       required: [assignee_id, expected_version]
       properties:
         assignee_id: { $ref: '#/components/schemas/UserId' }
+        expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      additionalProperties: false
+    ClaimProjectWorkItemRequest:
+      type: object
+      required: [expected_version]
+      properties:
         expected_version: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
       additionalProperties: false
     BlockProjectWorkItemRequest:
@@ -9549,57 +10382,195 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/Conversation' } }
         next_cursor: { type: [string, 'null'] }
-    ConversationMessage:
+    ConversationMessageBase:
       type: object
-      required: [id, conversation_id, role, content, delivery_status, created_at]
+      required: [id, conversation_id, sequence, role, content, delivery_status, created_at]
       properties:
         id: { $ref: '#/components/schemas/MessageId' }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        sequence: { type: integer, format: int64, minimum: 1, description: Monotonic sequence within the conversation; clients sort messages in ascending order for display. }
         role: { type: string, enum: [user, assistant] }
         content: { type: string }
         task_id: { $ref: '#/components/schemas/TaskId' }
-        attachment_ids: { type: array, items: { $ref: '#/components/schemas/PersonalAttachmentId' } }
+        client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+        routing_status: { type: string, enum: [pending, processing, routed, waiting_user, waiting_adjustment, failed] }
+        routing_failure_reason: { type: string, enum: [model_unavailable, routing_context_unavailable, routing_action_unavailable, message_too_long] }
+        output_status: { type: string, enum: [streaming, interrupted, completed], description: Status of a persisted streamed assistant message. }
+        output_task_revision: { type: integer, format: int64, minimum: 0, description: Task revision that produced this streamed message. }
+        output_result_event_sequence: { type: integer, format: int64, minimum: 1, description: Present only after completion and identifies the corresponding Task result event. }
+        sources:
+          type: array
+          description: Confirmed task results combined into this assistant message, in display order.
+          items: { $ref: '#/components/schemas/ConversationMessageSource' }
         delivery_status: { type: string, enum: [pending, applied, unknown] }
         created_at: { type: string, format: date-time }
+    ConversationMessage:
+      allOf:
+        - { $ref: '#/components/schemas/ConversationMessageBase' }
+        - type: object
+          properties:
+            attachment_ids: { type: array, items: { $ref: '#/components/schemas/PersonalAttachmentId' } }
+    ConversationMessageSource:
+      type: object
+      required: [user_message_id, task_id, task_revision, event_sequence, content]
+      properties:
+        user_message_id: { $ref: '#/components/schemas/MessageId' }
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        event_sequence: { type: integer, format: int64, minimum: 1 }
+        content: { type: string }
     ConversationMessagePage:
       type: object
       required: [items, next_cursor]
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/ConversationMessage' } }
         next_cursor: { type: [string, 'null'] }
+    ConversationMessageEnvelope:
+      type: object
+      required: [message]
+      properties:
+        message: { $ref: '#/components/schemas/ConversationMessage' }
     CreateConversationRequest:
       type: object
       additionalProperties: false
       properties:
         host_id: { $ref: '#/components/schemas/HostId' }
         title: { type: string, maxLength: 120 }
-    AppendConversationMessageRequest:
+    AcceptConversationMessageRequest:
       type: object
       additionalProperties: false
-      required: [model_id, content]
+      required: [client_message_id, content]
       properties:
-        expected_task_id: { $ref: '#/components/schemas/TaskId', description: Active Task that must receive this message; if it is no longer active, the request conflicts rather than creating another Task. }
+        client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$', description: Must equal the Idempotency-Key header. }
+        previous_client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+        reference_task_id: { $ref: '#/components/schemas/TaskId' }
         host_id: { $ref: '#/components/schemas/HostId' }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
-        input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision used by this task. Required with workspace_id. }
         application_id: { type: string, maxLength: 64 }
-        model_id: { type: string, minLength: 1, maxLength: 256 }
-        content: { type: string, minLength: 1, maxLength: 32768 }
+        model_id: { type: string, maxLength: 256, description: Optional routing hint; a server default may be selected asynchronously. }
+        content: { type: string, maxLength: 32768 }
         mcp_connector_ids:
           type: array
           maxItems: 16
           uniqueItems: true
           items: { $ref: '#/components/schemas/MCPConnectorId' }
+        client_attachment_ids:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
         budget:
           oneOf:
             - { $ref: '#/components/schemas/TaskBudgetRequest' }
             - { type: 'null' }
-    AppendConversationMessageResponse:
+    AcceptedConversationMessageResponse:
       type: object
-      required: [message, task]
+      required: [message, replayed]
       properties:
         message: { $ref: '#/components/schemas/ConversationMessage' }
-        task: { $ref: '#/components/schemas/Task' }
+        replayed: { type: boolean, description: True when an identical message receipt was returned. }
+    ProjectConversationAttachmentInit:
+      type: object
+      additionalProperties: false
+      required: [name, media_type, size_bytes, sha256]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        media_type: { type: string, minLength: 1, maxLength: 128 }
+        size_bytes: { type: integer, format: int64, minimum: 0, maximum: 314572800 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        derivative_mode:
+          type: string
+          enum: [none, pdf, image]
+          default: none
+          description: Fixed when the original slot is initialized; pdf requires a PDF original, image requires an image original.
+    ProjectConversationDerivatives:
+      type: object
+      additionalProperties: false
+      required: [outcome, files]
+      description: A completed PDF has one extracted text (page 0) and up to ten JPEG page previews (pages 1–10). An image conversion has one JPEG (page 0). A skipped set has no files. All bytes and SHA-256 values are verified.
+      properties:
+        outcome: { type: string, enum: [completed, skipped] }
+        files:
+          type: array
+          maxItems: 11
+          items:
+            type: object
+            additionalProperties: false
+            required: [kind, page, name, media_type, sha256, content_base64]
+            properties:
+              kind: { type: string, enum: [extracted_text, page_preview, image_conversion] }
+              page: { type: integer, minimum: 0, maximum: 10 }
+              name: { type: string, minLength: 1, maxLength: 255 }
+              media_type: { type: string, enum: [text/plain, image/jpeg] }
+              sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+              content_base64: { type: string, format: byte }
+    ProjectConversationAttachmentMetadata:
+      type: object
+      required: [attachment_id, name, media_type, size_bytes, sha256]
+      properties:
+        attachment_id: { $ref: '#/components/schemas/ProjectConversationAttachmentId' }
+        name: { type: string }
+        media_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        derivative_mode: { type: string, enum: [none, pdf, image] }
+    ProjectConversationAttachmentStatus:
+      type: object
+      required: [attachment_id, name, media_type, size_bytes, sha256, state, total_chunks, received_sequences, replay]
+      properties:
+        attachment_id: { $ref: '#/components/schemas/ProjectConversationAttachmentId' }
+        name: { type: string }
+        media_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        state: { type: string, enum: [uploading, committed, expired] }
+        total_chunks: { type: integer, minimum: 0, maximum: 75 }
+        received_sequences: { type: array, items: { type: integer, minimum: 0, maximum: 74 } }
+        replay: { type: boolean }
+        derivative_mode: { type: string, enum: [none, pdf, image] }
+        derivative_state: { type: string, enum: [none, awaiting, completed, skipped] }
+    ConversationMessageUploadInit:
+      type: object
+      additionalProperties: false
+      required: [total_bytes, total_chunks, sha256]
+      description: Idempotency-Key equals the client_message_id path value. Chunks are zero-based 16384-byte slices; the last slice may be shorter.
+      properties:
+        total_bytes: { type: integer, minimum: 1, maximum: 8388608 }
+        total_chunks: { type: integer, minimum: 1, maximum: 512 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        previous_client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
+        reference_task_id: { $ref: '#/components/schemas/TaskId' }
+        host_id: { $ref: '#/components/schemas/HostId' }
+        workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
+        application_id: { type: string, maxLength: 64 }
+        model_id: { type: string, minLength: 1, maxLength: 256 }
+        mcp_connector_ids: { type: array, maxItems: 16, uniqueItems: true, items: { $ref: '#/components/schemas/MCPConnectorId' } }
+        client_attachment_ids: { type: array, maxItems: 16, uniqueItems: true, items: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' } }
+        budget:
+          oneOf:
+            - { $ref: '#/components/schemas/TaskBudgetRequest' }
+            - { type: 'null' }
+    ConversationMessageChunk:
+      type: object
+      additionalProperties: false
+      required: [content_base64, sha256]
+      properties:
+        content_base64: { type: string, contentEncoding: base64, maxLength: 21848 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+    ConversationMessageUpload:
+      type: object
+      required: [client_message_id, state, total_bytes, total_chunks, received_sequences]
+      properties:
+        client_message_id: { type: string }
+        state: { type: string, enum: [uploading, committed] }
+        total_bytes: { type: integer, minimum: 1, maximum: 8388608 }
+        total_chunks: { type: integer, minimum: 1, maximum: 512 }
+        received_sequences: { type: array, uniqueItems: true, items: { type: integer, minimum: 0, maximum: 511 } }
+        message:
+          description: Present when committed.
+          anyOf:
+            - { $ref: '#/components/schemas/ConversationMessage' }
+            - { $ref: '#/components/schemas/ProjectConversationMessage' }
     TaskStatus:
       type: string
       enum: [queued, running, waiting_user, pausing, paused, cancelling, completed, failed, cancelled]
@@ -9636,6 +10607,8 @@ components:
         execution_location: { type: string, enum: [server, legacy] }
         workspace_id: { $ref: '#/components/schemas/WorkspaceId' }
         input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision this task started from. }
+        current_revision: { type: integer, format: int64, minimum: 0, description: Task execution revision, distinct from Workspace input_revision. }
+        desired_revision: { type: integer, format: int64, minimum: 0, description: Latest requested Task execution revision. }
         workspace_checkpoint_revision: { type: integer, minimum: 0, description: Current confirmed Workspace revision available to this task; advances only after a durable task-owned publish. }
         application_id: { type: string }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
@@ -9643,6 +10616,8 @@ components:
         objective: { type: string }
         status: { $ref: '#/components/schemas/TaskStatus' }
         current_step: { type: [string, 'null'] }
+        step_count: { type: integer, format: int64, minimum: 0, description: Count of Task steps excluding budget steps. }
+        completed_step_count: { type: integer, format: int64, minimum: 0, description: Count of succeeded Task steps excluding budget steps; never greater than step_count. }
         budget: { $ref: '#/components/schemas/TaskBudget' }
         usage: { $ref: '#/components/schemas/TaskUsage' }
         created_at: { type: string, format: date-time }
@@ -9653,7 +10628,7 @@ components:
       properties:
         id: { $ref: '#/components/schemas/StepId' }
         sequence: { type: integer, minimum: 1 }
-        kind: { type: string, enum: [plan, model, tool, wait, clarification, budget, verification, verify, batch_item, batch_result, subagent, result] }
+        kind: { type: string, enum: [plan, model, tool, wait, clarification, budget, verification, verify, batch_item, batch_result, subagent, progress, result] }
         status: { type: string, enum: [queued, running, waiting_user, succeeded, failed, unknown] }
         title: { type: string }
         summary: { type: string }
@@ -9670,6 +10645,7 @@ components:
         error: { type: [string, 'null'] }
     TaskArtifact:
       type: object
+      description: A saved Task output. Generated media becomes an artifact only after the Task owner confirms saving and the Workspace revision, relative path, size and digest are verified.
       required: [id, step_id, label, path, media_type, workspace_id, workspace_revision, size_bytes, sha256, verified, batch_item_id, batch_attempt, created_at]
       properties:
         id: { $ref: '#/components/schemas/ArtifactId' }
@@ -9696,6 +10672,7 @@ components:
         object: { type: string }
         content: { type: string }
         impact: { type: string }
+        media_preview_operation_id: { $ref: '#/components/schemas/OperationId', description: Present only while an image, video or speech output awaits the Task owner's save decision; use it with the Task media preview route. }
     TaskClarificationRequest:
       type: object
       required: [id, version, question]
@@ -9715,11 +10692,14 @@ components:
     TaskAssistantMessage:
       type: object
       description: The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text.
-      required: [id, conversation_id, task_id, role, content, status, created_at]
+      required: [id, conversation_id, sequence, task_id, role, content, status, created_at]
       properties:
         id: { $ref: '#/components/schemas/MessageId' }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
+        sequence: { type: integer, format: int64, minimum: 1, description: Monotonic sequence within the conversation, matching the durable conversation message. }
         task_id: { $ref: '#/components/schemas/TaskId' }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        result_event_sequence: { type: integer, format: int64, minimum: 1, description: Exact event identifying this completed result. }
         role: { type: string, const: assistant }
         content: { type: string, maxLength: 32768 }
         status: { type: string, enum: [streaming, completed, interrupted] }
@@ -9769,7 +10749,10 @@ components:
           properties:
             event_sequence: { type: integer, format: int64, minimum: 0, description: Event cursor from the same database snapshot as this Task; resume task events after this sequence. }
             result: { type: [string, 'null'] }
-            waiting_reason: { type: [string, 'null'] }
+            current_revision_started: { type: boolean, description: True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. }
+            result_message_pending: { type: boolean, description: A completed result is being held for a conversation reply; do not display it as a separate final message until published. }
+            result_message_published: { type: boolean, description: The final result is published as a conversation message with sources; use that message rather than displaying a separate Task result. }
+            waiting_reason: { type: [string, 'null'], description: 'Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available.' }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
             batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
             artifacts: { type: array, items: { $ref: '#/components/schemas/TaskArtifact' } }
@@ -9784,8 +10767,22 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/TaskSummary' } }
         next_cursor: { type: [string, 'null'] }
+    ConversationActiveTask:
+      allOf:
+        - { $ref: '#/components/schemas/TaskSummary' }
+        - type: object
+          required: [event_sequence]
+          properties:
+            event_sequence: { type: integer, format: int64, minimum: 0 }
+    ConversationActiveTaskPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ConversationActiveTask' } }
+        next_cursor: { type: [string, 'null'] }
     SubmitTaskRequest:
       type: object
+      description: Text-only Task input. No image, video or audio attachment field is accepted. If task_media_generation is advertised, the server may generate image, video or speech outputs through verified media-capable connections; uploaded media and cloud speech recognition remain unavailable.
       additionalProperties: false
       required: [model_id, objective]
       properties:
@@ -9861,6 +10858,7 @@ components:
         unsettled_operation_ids: { type: array, items: { $ref: '#/components/schemas/OperationId' } }
     TaskEvent:
       type: object
+      description: Media-generation progress uses the existing task.operation and task.waiting_user events. Raw media bytes, provider URLs, credentials and unverified file paths are never sent in SSE. task.artifact appears only after explicit save approval and verified Workspace publication.
       required: [task_id, sequence, type, created_at, payload]
       properties:
         task_id: { $ref: '#/components/schemas/TaskId' }
@@ -9916,6 +10914,21 @@ components:
         cpu_milli: { type: integer, minimum: 1 }
         mem_mib: { type: integer, minimum: 1 }
         expected_version: { type: integer, format: int64, minimum: 1 }
+    AdminHostRecoveryRequest:
+      type: object
+      required: [runtime_generation, confirm_retry]
+      additionalProperties: false
+      properties:
+        runtime_generation: { type: integer, format: int64, minimum: 1 }
+        confirm_retry: { type: boolean, description: Confirm that the external issue is fixed before creating a replacement sandbox. }
+    AdminHostRecoveryResult:
+      type: object
+      required: [host_id, runtime_generation, action, sandbox_count]
+      properties:
+        host_id: { $ref: '#/components/schemas/HostId' }
+        runtime_generation: { type: integer, format: int64, minimum: 1 }
+        action: { type: string, enum: [adopt_existing, retry_create] }
+        sandbox_count: { type: integer, minimum: 0 }
     AdminUser:
       type: object
       required: [id, name, role, status, quota, usage, default_host_resources, created_at]
@@ -9978,7 +10991,7 @@ components:
       type: object
       required: [source, call_id, model_id, provider_model, reserved_tokens, state, input_tokens, output_tokens, created_at, settled_at]
       properties:
-        source: { type: string, enum: [client, chat, task, probe] }
+        source: { type: string, enum: [client, chat, task, route, probe] }
         call_id: { type: string }
         model_id: { type: string }
         provider_model: { type: string }

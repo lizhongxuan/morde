@@ -45,6 +45,7 @@ type workspaceResponse struct {
 	Revision   int64           `json:"revision"`
 	UsedBytes  int64           `json:"used_bytes"`
 	QuotaBytes int64           `json:"quota_bytes"`
+	ReadOnly   bool            `json:"is_read_only"`
 	State      workspace.State `json:"state"`
 	CreatedAt  time.Time       `json:"created_at"`
 	UpdatedAt  time.Time       `json:"updated_at"`
@@ -242,7 +243,7 @@ func toWorkspaceResponse(item workspace.Workspace) (workspaceResponse, error) {
 	}
 	return workspaceResponse{
 		ID: item.ID, Name: item.Name, Revision: item.Revision, UsedBytes: item.UsedBytes, QuotaBytes: item.QuotaBytes,
-		State: item.State, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+		ReadOnly: item.ReadOnly, State: item.State, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}, nil
 }
 

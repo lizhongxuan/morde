@@ -85,6 +85,22 @@ func agentInstanceTestFence() AgentInstanceFence {
 		AuthorizationVersion: 1, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"}
 }
 
+func TestAgentStartSeparatesConversationOwnerAndTaskInitiator(t *testing.T) {
+	fence := agentInstanceTestFence()
+	fence.InitiatorID = "u7654321"
+	runtime := AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000",
+		ConversationID: "c1234567", OwnerID: fence.OwnerID, RuntimeID: "runtime-1", RuntimeGeneration: 1,
+		LeaseOwner: "runtime-worker", LeaseVersion: 1, ExecutionEpoch: 1}
+	request := AgentInstanceStart{Fence: fence, RuntimeFence: &runtime, SupervisorNonce: bytes.Repeat([]byte{1}, 32), LeaseDuration: time.Second}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("shared conversation rejected its authorized task initiator: %v", err)
+	}
+	runtime.OwnerID = fence.InitiatorID
+	if err := request.Validate(); err == nil {
+		t.Fatal("accepted a Runtime owned by the task initiator instead of the conversation owner")
+	}
+}
+
 func signedAgentTestReceipt(t *testing.T, key []byte, fence AgentInstanceFence, nonce []byte) AgentStopReceipt {
 	t.Helper()
 	receipt := AgentStopReceipt{Fence: fence, SupervisorNonce: nonce, TreeStopped: true}
@@ -118,7 +134,7 @@ func signedAccountAgentTaskStopTestAttestation(t *testing.T, key ed25519.Private
 	t.Helper()
 	now := time.Now().UTC()
 	attestation := AccountAgentTaskStopAttestation{
-		RuntimeFence: AccountAgentRuntimeFence{ServiceInstanceID: "12345678-1234-1234-1234-123456789abc", OwnerID: "u1234567",
+		RuntimeFence: AccountAgentRuntimeFence{ServiceInstanceID: "12345678-1234-1234-1234-123456789abc", ConversationID: "c1234567", OwnerID: "u1234567",
 			RuntimeID: "runtime-1", RuntimeGeneration: 1, LeaseOwner: "runtime-worker", LeaseVersion: 1, ExecutionEpoch: 1},
 		TaskFence: AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-1", AgentGeneration: 1,
 			AgentSessionID: "session-1", SupervisorID: "supervisor-1", LeaseOwner: "worker-1", LeaseVersion: 1,

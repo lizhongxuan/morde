@@ -11,7 +11,7 @@ import { Workspaces } from './Workspaces';
 
 vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'u1234567' } }) }));
 
-const workspace: components['schemas']['Workspace'] = { id: 'w1234567', name: '项目工作区', revision: 2, used_bytes: 4096, quota_bytes: 1024 * 1024, state: 'ready', created_at: '', updated_at: '' };
+const workspace: components['schemas']['Workspace'] = { id: 'w1234567', name: '项目工作区', revision: 2, used_bytes: 4096, quota_bytes: 1024 * 1024, is_read_only: false, state: 'ready', created_at: '', updated_at: '' };
 const host: components['schemas']['Host'] = {
   id: 'h1234567', name: '开发电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', workspace_runtime_online: true, url: '',
   workspaces: [], resources: { cpu_milli: 500, mem_mib: 1024, cpu_limit_milli: 1000, mem_limit_mib: 2048 }, expires_at: null, last_active_at: null, created_at: '',
@@ -45,11 +45,27 @@ describe('Workspaces', () => {
   });
   afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('opens and closes the workspace form without creating anything', async () => {
+    const create = vi.spyOn(portalApi, 'createWorkspace');
+    const user = userEvent.setup();
+    renderWorkspaces();
+
+    const open = screen.getByRole('button', { name: '＋ 创建工作区' });
+    expect(open).toHaveAttribute('aria-expanded', 'false');
+    await user.click(open);
+    expect(screen.getByRole('form', { name: '创建独立工作区' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '收起' })).toHaveAttribute('aria-expanded', 'true');
+    await user.click(screen.getByRole('button', { name: '收起' }));
+    expect(screen.queryByLabelText('工作区名称')).not.toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it('creates a standalone workspace through the API', async () => {
     const create = vi.spyOn(portalApi, 'createWorkspace').mockResolvedValue(workspace);
     const user = userEvent.setup();
     renderWorkspaces();
 
+    await user.click(screen.getByRole('button', { name: '＋ 创建工作区' }));
     await user.type(await screen.findByLabelText('工作区名称'), '  客户项目  ');
     await user.click(screen.getByRole('button', { name: '创建工作区' }));
 
@@ -65,6 +81,49 @@ describe('Workspaces', () => {
 
     expect(await screen.findByText('暂无未绑定工作区的运行中主机')).toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: `工作区 ${workspace.name} 的绑定主机` })).not.toBeInTheDocument();
+  });
+
+  it('explains an initial workspace is waiting for its creating host, not a file transfer', async () => {
+    const initial = { ...workspace, revision: 0, used_bytes: 0 };
+    const initialBinding = { ...binding, workspace: { ...binding.workspace, revision: 0, used_bytes: 0 },
+      state: 'preparing' as const, desired_revision: 0, applied_revision: 0 };
+    const creatingHost = { ...host, state: 'creating' as const, workspace_runtime_online: false, workspaces: [initialBinding] };
+    renderWorkspaces([initial], [creatingHost]);
+
+    expect(screen.getByText('初始版本，暂无历史版本')).toBeInTheDocument();
+    expect(screen.getByText('电脑创建中，工作区等待挂载。')).toBeInTheDocument();
+    expect(screen.queryByText(/Host Runtime 未在线确认/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '比较工作区版本 项目工作区' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '打开主机 开发电脑' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '查看设备同步进度 项目工作区' })).toBeEnabled();
+  });
+
+  it('does not treat a later zero-byte revision as an initial workspace', () => {
+    renderWorkspaces([{ ...workspace, used_bytes: 0 }]);
+
+    expect(screen.queryByText('初始版本，暂无历史版本')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '比较工作区版本 项目工作区' })).toBeEnabled();
+  });
+
+  it('does not claim a host is still being created when its recovery is uncertain', () => {
+    const initial = { ...workspace, revision: 0, used_bytes: 0 };
+    const initialBinding = { ...binding, workspace: { ...binding.workspace, revision: 0, used_bytes: 0 },
+      state: 'preparing' as const, desired_revision: 0, applied_revision: 0 };
+    renderWorkspaces([initial], [{ ...host, state: 'creating', state_reason: 'restore_unknown',
+      workspace_runtime_online: false, workspaces: [initialBinding] }]);
+
+    expect(screen.getByText('电脑恢复状态待核实，工作区尚未挂载。')).toBeInTheDocument();
+  });
+
+  it('still shows a sync conflict while the host is creating', () => {
+    const initial = { ...workspace, revision: 0, used_bytes: 0 };
+    const conflictBinding = { ...binding, workspace: { ...binding.workspace, revision: 0, used_bytes: 0 },
+      state: 'preparing' as const, desired_revision: 0, applied_revision: 0,
+      sync_state: 'conflict' as const, sync_conflicts: ['notes.txt'] };
+    renderWorkspaces([initial], [{ ...host, state: 'creating', workspace_runtime_online: false, workspaces: [conflictBinding] }]);
+
+    expect(screen.getByText('Host 工作区同步冲突')).toBeInTheDocument();
+    expect(screen.getByText('notes.txt')).toBeInTheDocument();
   });
 
   it('renders the server diff, metadata, and expandable text safely', async () => {
@@ -336,6 +395,7 @@ describe('Workspaces', () => {
     const user = userEvent.setup();
     const firstRender = renderWorkspaces();
 
+    await user.click(screen.getByRole('button', { name: '＋ 创建工作区' }));
     await user.type(await screen.findByLabelText('工作区名称'), '项目工作区');
     await user.click(screen.getByRole('button', { name: '创建工作区' }));
     expect(await screen.findByText('创建失败：服务器已创建工作区，但响应丢失')).toBeInTheDocument();
@@ -399,7 +459,6 @@ describe('Workspaces', () => {
     expect(open).toHaveBeenCalledWith(`${window.location.origin}/host-entry/${host.id}`, '_blank');
     expect(tab.opener).toBeNull();
     expect(enter).not.toHaveBeenCalled();
-    expect(screen.getByText(/Host 应用与设备传输进度分别显示/)).toBeInTheDocument();
   });
 
   it('preserves a newer host selection when an earlier bind request completes', async () => {
@@ -660,7 +719,7 @@ describe('Workspaces', () => {
 
     await user.click(await screen.findByRole('button', { name: '查看设备同步进度 项目工作区' }));
 
-    expect(await screen.findByText('当前没有活动的设备同步会话；这不代表两端没有待同步差异。')).toBeInTheDocument();
+    expect(await screen.findByText('当前没有设备正在同步。设备连接后，仍可能有待同步的文件。')).toBeInTheDocument();
     await waitFor(() => expect(progress).toHaveBeenCalledTimes(2), { timeout: 4000 });
     expect(await screen.findByText('设备 t7654321 · 下载 · 应用中')).toBeInTheDocument();
   }, 10000);
@@ -672,11 +731,11 @@ describe('Workspaces', () => {
     renderWorkspaces();
 
     await user.click(await screen.findByRole('button', { name: '查看设备同步进度 项目工作区' }));
-    expect(await screen.findByText('当前没有活动的设备同步会话；这不代表两端没有待同步差异。')).toBeInTheDocument();
+    expect(await screen.findByText('当前没有设备正在同步。设备连接后，仍可能有待同步的文件。')).toBeInTheDocument();
     await waitFor(() => expect(progress).toHaveBeenCalledTimes(1));
 
     await user.click(screen.getByRole('button', { name: '关闭设备同步进度' }));
-    expect(screen.queryByText('当前没有活动的设备同步会话；这不代表两端没有待同步差异。')).not.toBeInTheDocument();
+    expect(screen.queryByText('当前没有设备正在同步。设备连接后，仍可能有待同步的文件。')).not.toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 3200));
     expect(progress).toHaveBeenCalledTimes(1);
 

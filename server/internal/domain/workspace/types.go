@@ -16,6 +16,7 @@ type Workspace struct {
 	OwnerID    string
 	Name       string
 	State      State
+	ReadOnly   bool
 	Revision   int64
 	UsedBytes  int64
 	QuotaBytes int64

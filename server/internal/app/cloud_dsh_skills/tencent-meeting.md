@@ -3,7 +3,7 @@ name: tencent-meeting
 description: The user's 腾讯会议 via the official tmeet CLI: upcoming meetings, creating, changing or cancelling one, inviting people, then the recording, minutes, transcript and attendance. Use when the user mentions 腾讯会议, a 会议号, a 会议链接, 纪要 or 录制, or wants a meeting set up or looked up.
 channel: cli
 metadata:
-  author: nanoMuse
+  author: Morde
   version: "1"
 ---
 

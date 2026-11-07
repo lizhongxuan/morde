@@ -40,16 +40,19 @@ type TaskListRequest struct {
 }
 
 type TaskDetails struct {
-	Task                  task.Task
-	AssistantMessage      *AssistantMessageSnapshot
-	ScheduleObservation   *schedule.ObservationSpec
-	Steps                 []task.Step
-	BatchItems            []task.BatchItem
-	Artifacts             []task.Artifact
-	PendingRequest        *task.PendingRequest
-	ClarificationRequests []task.ClarificationRequest
-	StopRequest           *task.StopRequest
-	StopOperationIDs      []string
+	Task                   task.Task
+	AssistantMessage       *AssistantMessageSnapshot
+	CurrentRevisionStarted *bool
+	ResultMessagePending   bool
+	ResultMessagePublished bool
+	ScheduleObservation    *schedule.ObservationSpec
+	Steps                  []task.Step
+	BatchItems             []task.BatchItem
+	Artifacts              []task.Artifact
+	PendingRequest         *task.PendingRequest
+	ClarificationRequests  []task.ClarificationRequest
+	StopRequest            *task.StopRequest
+	StopOperationIDs       []string
 }
 
 type AssistantMessageStatus string
@@ -64,8 +67,10 @@ const (
 // Streaming text survives event-cursor expiry; the final conversation message
 // replaces the streamed text under the same message ID.
 type AssistantMessageSnapshot struct {
-	Message conversation.Message   `json:"message"`
-	Status  AssistantMessageStatus `json:"status"`
+	Message             conversation.Message   `json:"message"`
+	Status              AssistantMessageStatus `json:"status"`
+	TaskRevision        *int64                 `json:"task_revision,omitempty"`
+	ResultEventSequence *int64                 `json:"result_event_sequence,omitempty"`
 }
 
 type TaskActionResult struct {
@@ -90,7 +95,6 @@ type IdempotencyRecord struct {
 }
 
 type TaskSubmission struct {
-	ExpectedTaskID              string
 	Conversation                *conversation.Conversation
 	Task                        task.Task
 	Message                     conversation.Message
@@ -123,8 +127,10 @@ type TaskProgress struct {
 	Artifacts                []task.Artifact
 	Event                    task.Event
 	PendingRequest           *task.PendingRequest
+	TaskMediaApproval        *TaskMediaApprovalCommit
 	ClarificationRequest     *task.ClarificationRequest
 	AssistantMessage         *conversation.Message
+	PublishResultMessage     bool
 	CloudDSHSkillRead        *CloudDSHSkillReadCommit
 	CloudDSHPersonalMutation *CloudDSHPersonalMutationCommit
 }
@@ -156,6 +162,11 @@ type CloudDSHPersonalMutationCommit struct {
 	CallID               string
 	Mutation             personal.Mutation
 	FingerprintSHA256    string
+	// Goal writes bind the original call as well as the resulting object.
+	// Empty values retain the original personal-object receipt format.
+	GoalToolName        string
+	GoalArgumentsSHA256 string
+	GoalStatus          string
 }
 
 type AssistantTextDelta struct {
@@ -217,9 +228,9 @@ type TaskStore interface {
 	ListProjectConversations(context.Context, string, string, PageRequest) (ConversationPage, error)
 	ListProjectConversationMessages(context.Context, string, string, string, PageRequest) (MessagePage, error)
 	SubmitTask(context.Context, TaskSubmission) (TaskSubmissionResult, error)
-	AppendMessage(context.Context, TaskSubmission) (TaskSubmissionResult, error)
 	GetTask(context.Context, string, string) (TaskDetails, error)
 	ListTasks(context.Context, string, TaskListRequest) (TaskPage, error)
+	ListConversationActiveTasks(context.Context, string, string, string, []string, PageRequest) (TaskPage, error)
 	ListTaskEvents(context.Context, string, string, int64, int32) ([]task.Event, error)
 	GetTaskEventPage(context.Context, string, string, int64, int32) (TaskEventPage, error)
 	ClaimNextTask(context.Context, string, time.Duration) (task.Task, bool, error)

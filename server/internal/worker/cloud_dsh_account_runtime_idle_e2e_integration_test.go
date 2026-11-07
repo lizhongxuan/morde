@@ -11,15 +11,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain/execution"
 )
+
+func createF01RuntimeConversation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, ownerID string) string {
+	t.Helper()
+	const conversationID = "c1234567"
+	if _, err := pool.Exec(ctx, `INSERT INTO conversations(id,owner_id,title) VALUES ($1,$2,'runtime test')`, conversationID, ownerID); err != nil {
+		t.Fatal(err)
+	}
+	return conversationID
+}
 
 func TestAccountAgentRuntimeIdleRenewalPersistsBeyondOriginalExpiry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
 	owner := createF01User(t, ctx, store)
+	conversationID := createF01RuntimeConversation(t, ctx, pool, owner.ID)
 	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +48,7 @@ func TestAccountAgentRuntimeIdleRenewalPersistsBeyondOriginalExpiry(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := manager.Acquire(ctx, owner.ID)
+	session, err := manager.Acquire(ctx, owner.ID, conversationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +64,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
 	if err := manager.renewIdleSessions(ctx); err != nil {
 		t.Fatal(err)
 	}
-	persisted, found, err := control.Get(ctx, owner.ID)
+	persisted, found, err := control.Get(ctx, conversationID)
 	if err != nil || !found || persisted.State != app.AccountAgentRuntimeRunning ||
 		persisted.LeaseExpiresAt.Before(time.Now().Add(20*time.Second)) || persisted.Fence != session.runtime.Fence {
 		t.Fatalf("idle Runtime was not kept alive in PostgreSQL: runtime=%+v found=%t err=%v", persisted, found, err)
@@ -74,6 +86,7 @@ func TestAccountRuntimeRecoversFailedStartAcrossManagerRestart(t *testing.T) {
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
 	owner := createF01User(t, ctx, store)
+	conversationID := createF01RuntimeConversation(t, ctx, pool, owner.ID)
 	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -102,10 +115,10 @@ func TestAccountRuntimeRecoversFailedStartAcrossManagerRestart(t *testing.T) {
 		return manager
 	}
 	first := newManager(&accountRuntimeSupervisorStub{incomplete: true})
-	if _, err := first.Acquire(ctx, owner.ID); err == nil {
+	if _, err := first.Acquire(ctx, owner.ID, conversationID); err == nil {
 		t.Fatal("incomplete first startup unexpectedly succeeded")
 	}
-	old, found, err := control.Get(ctx, owner.ID)
+	old, found, err := control.Get(ctx, conversationID)
 	if err != nil || !found || old.State != app.AccountAgentRuntimeFailed || old.FailureReason != execution.RuntimeFailureStartup ||
 		!old.LeaseExpiresAt.After(time.Now()) {
 		t.Fatalf("failed startup state=%+v found=%t err=%v", old, found, err)
@@ -113,7 +126,7 @@ func TestAccountRuntimeRecoversFailedStartAcrossManagerRestart(t *testing.T) {
 	// An incomplete supervisor response is persisted as failed, so recovery must
 	// require a full Guardian stop attestation before replacing the Runtime.
 	restarted := newManager(&signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: privateKey})
-	if _, err := restarted.Acquire(ctx, owner.ID); err == nil || err.Error() != "account Agent Runtime lease is active in another worker" {
+	if _, err := restarted.Acquire(ctx, owner.ID, conversationID); err == nil || err.Error() != "account Agent Runtime lease is active in another worker" {
 		t.Fatalf("failed Runtime replacement while the lease is active: err=%v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
@@ -121,12 +134,12 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
 		old.Fence.ServiceInstanceID, owner.ID, old.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
-	session, err := restarted.Acquire(ctx, owner.ID)
+	session, err := restarted.Acquire(ctx, owner.ID, conversationID)
 	if err != nil {
 		t.Fatalf("restart Manager failed to replace aborted Runtime: %v", err)
 	}
 	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
-	current, found, err := control.Get(ctx, owner.ID)
+	current, found, err := control.Get(ctx, conversationID)
 	if err != nil || !found || current.State != app.AccountAgentRuntimeRunning ||
 		current.Fence.RuntimeGeneration != old.Fence.RuntimeGeneration+1 || current.Fence.RuntimeID == old.Fence.RuntimeID {
 		t.Fatalf("replacement Runtime state=%+v found=%t err=%v", current, found, err)
@@ -145,6 +158,7 @@ func TestAccountRuntimeReplacesStoppedOldProcessAcrossManagerRestart(t *testing.
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
 	owner := createF01User(t, ctx, store)
+	conversationID := createF01RuntimeConversation(t, ctx, pool, owner.ID)
 	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +182,7 @@ func TestAccountRuntimeReplacesStoppedOldProcessAcrossManagerRestart(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldSession, err := first.Acquire(ctx, owner.ID)
+	oldSession, err := first.Acquire(ctx, owner.ID, conversationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +203,7 @@ func TestAccountRuntimeReplacesStoppedOldProcessAcrossManagerRestart(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := restarted.Acquire(ctx, owner.ID); err == nil {
+	if _, err := restarted.Acquire(ctx, owner.ID, conversationID); err == nil {
 		t.Fatal("replacement Runtime started before the old lease expired")
 	}
 	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
@@ -197,12 +211,12 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`,
 		oldFence.ServiceInstanceID, owner.ID, oldFence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
-	session, err := restarted.Acquire(ctx, owner.ID)
+	session, err := restarted.Acquire(ctx, owner.ID, conversationID)
 	if err != nil {
 		t.Fatalf("restart Manager failed to replace old Runtime: %v", err)
 	}
 	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
-	current, found, err := control.Get(ctx, owner.ID)
+	current, found, err := control.Get(ctx, conversationID)
 	if err != nil || !found || current.State != app.AccountAgentRuntimeRunning ||
 		current.Fence.RuntimeGeneration != oldFence.RuntimeGeneration+1 || current.Fence.RuntimeID == oldFence.RuntimeID {
 		t.Fatalf("replacement Runtime state=%+v found=%t err=%v", current, found, err)

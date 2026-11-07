@@ -4,11 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +16,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"morde/server/internal/app"
@@ -28,12 +23,10 @@ import (
 )
 
 const (
-	dockerDSHUser       = "65532:65532"
-	dockerDSHMemory     = int64(512 << 20)
-	dockerDSHNanoCPUs   = int64(1_000_000_000)
-	dockerDSHPIDs       = int64(64)
-	dockerDSHFenceLabel = "morde.dsh.fence"
-	dockerDSHNonceLabel = "morde.dsh.nonce-sha256"
+	dockerDSHUser     = "65532:65532"
+	dockerDSHMemory   = int64(512 << 20)
+	dockerDSHNanoCPUs = int64(1_000_000_000)
+	dockerDSHPIDs     = int64(64)
 )
 
 var dockerDSHImageDigest = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
@@ -63,13 +56,11 @@ type DockerCloudDSHGuardian interface {
 }
 
 type DockerCloudDSHSupervisorOptions struct {
-	DockerHost   string
-	Image        string
-	NodePath     string
-	ScriptPath   string
-	SupervisorID string
-	SigningKey   []byte
-	Guardian     DockerCloudDSHGuardian
+	DockerHost string
+	Image      string
+	NodePath   string
+	ScriptPath string
+	Guardian   DockerCloudDSHGuardian
 }
 
 type DockerCloudDSHSupervisor struct {
@@ -77,15 +68,6 @@ type DockerCloudDSHSupervisor struct {
 	socket  string
 	client  *http.Client
 	api     *dockerapi.EndpointResolver
-	mu      sync.Mutex
-	active  map[app.AgentInstanceFence]*dockerDSHState
-}
-
-type dockerDSHState struct {
-	mu             sync.Mutex
-	guard          DockerCloudDSHGuard
-	startRequested bool
-	removed        bool
 }
 
 // NewDockerCloudDSHSupervisor is intentionally unavailable without a separately
@@ -94,276 +76,19 @@ func NewDockerCloudDSHSupervisor(options DockerCloudDSHSupervisorOptions) (*Dock
 	endpoint, err := url.Parse(options.DockerHost)
 	if err != nil || endpoint.Scheme != "unix" || endpoint.Host != "" || endpoint.User != nil || endpoint.Opaque != "" || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" ||
 		!filepath.IsAbs(endpoint.Path) || filepath.Clean(endpoint.Path) != endpoint.Path || endpoint.Path == "/" ||
-		!dockerDSHImageDigest.MatchString(options.Image) || !cleanDockerDSHPath(options.NodePath) || !cleanDockerDSHPath(options.ScriptPath) ||
-		!cloudDSHID.MatchString(options.SupervisorID) || len(options.SigningKey) < 32 || bytes.Equal(options.SigningKey, make([]byte, len(options.SigningKey))) || options.Guardian == nil {
-		return nil, errors.New("docker dsh supervisor requires a Unix socket, pinned image, fixed command, signing key and independent guardian")
+		!dockerDSHImageDigest.MatchString(options.Image) || !cleanDockerDSHPath(options.NodePath) || !cleanDockerDSHPath(options.ScriptPath) || options.Guardian == nil {
+		return nil, errors.New("docker dsh supervisor requires a Unix socket, pinned image, fixed command and independent guardian")
 	}
-	options.SigningKey = append([]byte(nil), options.SigningKey...)
 	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", endpoint.Path)
 	}, DisableCompression: true}
 	client := &http.Client{Transport: transport}
 	return &DockerCloudDSHSupervisor{options: options, socket: endpoint.Path, client: client,
-		api: dockerapi.NewEndpointResolver(client), active: make(map[app.AgentInstanceFence]*dockerDSHState)}, nil
+		api: dockerapi.NewEndpointResolver(client)}, nil
 }
 
 func cleanDockerDSHPath(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != "/" && !strings.ContainsAny(path, "\x00\r\n")
-}
-
-func (s *DockerCloudDSHSupervisor) Start(ctx context.Context, launch CloudDSHLaunch) (io.WriteCloser, io.ReadCloser, error) {
-	if ctx == nil || launch.Fence.Validate() != nil || launch.Fence.SupervisorID != s.options.SupervisorID ||
-		launch.NodePath != s.options.NodePath || launch.ScriptPath != s.options.ScriptPath ||
-		len(launch.Nonce) != 32 || bytes.Equal(launch.Nonce, make([]byte, 32)) || !validCloudDSHLease(launch.ExpiresAt) ||
-		!slices.Equal(launch.Environment, []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}) {
-		return nil, nil, errors.New("invalid docker dsh launch")
-	}
-	guard, labels, err := dockerDSHIdentity(launch.Fence, launch.Nonce)
-	if err != nil {
-		return nil, nil, err
-	}
-	guard.ExpiresAt = launch.ExpiresAt
-	state := &dockerDSHState{guard: guard}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	s.mu.Lock()
-	if _, exists := s.active[launch.Fence]; exists {
-		s.mu.Unlock()
-		return nil, nil, errors.New("dsh fence already has a supervised container")
-	}
-	s.active[launch.Fence] = state
-	s.mu.Unlock()
-	if err := s.validateImage(ctx); err != nil {
-		return nil, nil, err
-	}
-	create := s.containerCreate(labels)
-	var created struct {
-		ID string `json:"Id"`
-	}
-	if err := s.requestJSON(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(guard.ContainerName), create, http.StatusCreated, &created); err != nil {
-		return nil, nil, err
-	}
-	if !dockerDSHContainerID.MatchString(created.ID) {
-		return nil, nil, errors.New("docker returned an invalid container identity")
-	}
-	state.guard.ContainerID = created.ID
-	inspected, err := s.inspect(ctx, created.ID)
-	if err != nil || s.validateContainer(inspected, state.guard, false) != nil || *inspected.State.Running || *inspected.State.PID != 0 {
-		return nil, nil, errors.New("created docker dsh container did not match its isolation contract")
-	}
-	if err := s.options.Guardian.Arm(ctx, state.guard); err != nil {
-		return nil, nil, errors.New("independent dsh expiry guard is unavailable")
-	}
-	input, output, err := s.attach(ctx, created.ID)
-	if err != nil {
-		return nil, nil, err
-	}
-	succeeded := false
-	defer func() {
-		if !succeeded {
-			_ = input.Close()
-			_ = output.Close()
-		}
-	}()
-	if !state.guard.ExpiresAt.After(time.Now()) {
-		return nil, nil, errors.New("dsh lease expired before container start")
-	}
-	state.startRequested = true
-	if err := s.requestJSON(ctx, http.MethodPost, "/containers/"+created.ID+"/start", nil, http.StatusNoContent, nil); err != nil {
-		return nil, nil, err
-	}
-	inspected, err = s.inspect(ctx, created.ID)
-	if err != nil || s.validateContainer(inspected, state.guard, true) != nil || !*inspected.State.Running || *inspected.State.PID < 1 {
-		return nil, nil, errors.New("started docker dsh container did not match its isolation contract")
-	}
-	if err := s.options.Guardian.Started(ctx, state.guard, *inspected.State.PID); err != nil {
-		return nil, nil, errors.New("independent dsh process-tree observation failed")
-	}
-	if ctx.Err() != nil || !state.guard.ExpiresAt.After(time.Now()) {
-		return nil, nil, errors.New("dsh lease expired during startup")
-	}
-	succeeded = true
-	return input, output, nil
-}
-
-func (s *DockerCloudDSHSupervisor) Renew(ctx context.Context, fence app.AgentInstanceFence, expires time.Time) error {
-	if ctx == nil || fence.Validate() != nil || fence.SupervisorID != s.options.SupervisorID || !validCloudDSHLease(expires) {
-		return errors.New("invalid docker dsh renewal")
-	}
-	s.mu.Lock()
-	state := s.active[fence]
-	s.mu.Unlock()
-	if state == nil {
-		return errors.New("docker dsh guard is not known")
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.removed || state.guard.ContainerID == "" || !state.guard.ExpiresAt.After(time.Now()) || expires.Before(state.guard.ExpiresAt) {
-		return errors.New("docker dsh lease cannot be renewed")
-	}
-	updated := state.guard
-	updated.ExpiresAt = expires
-	if err := s.options.Guardian.Renew(ctx, updated); err != nil {
-		return errors.New("independent dsh expiry renewal failed")
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	state.guard = updated
-	return nil
-}
-
-func (s *DockerCloudDSHSupervisor) Stop(ctx context.Context, fence app.AgentInstanceFence, nonce []byte) (app.AgentStopReceipt, error) {
-	if ctx == nil || fence.Validate() != nil || fence.SupervisorID != s.options.SupervisorID || len(nonce) != 32 || bytes.Equal(nonce, make([]byte, 32)) {
-		return app.AgentStopReceipt{}, errors.New("invalid docker dsh stop identity")
-	}
-	guard, _, err := dockerDSHIdentity(fence, nonce)
-	if err != nil {
-		return app.AgentStopReceipt{}, err
-	}
-	s.mu.Lock()
-	state := s.active[fence]
-	s.mu.Unlock()
-	if state == nil {
-		state = &dockerDSHState{guard: guard, startRequested: true}
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.guard.ContainerName != guard.ContainerName || subtle.ConstantTimeCompare([]byte(state.guard.NonceSHA256), []byte(guard.NonceSHA256)) != 1 {
-		return app.AgentStopReceipt{}, errors.New("docker dsh stop identity does not match")
-	}
-	if !state.startRequested {
-		if !state.removed {
-			var inspected dockerDSHInspect
-			var err error
-			if state.guard.ContainerID == "" {
-				inspected, err = s.inspect(ctx, guard.ContainerName)
-				if errors.Is(err, errDockerObjectNotFound) {
-					state.removed = true
-				} else if err != nil || !dockerDSHContainerID.MatchString(inspected.ID) {
-					return app.AgentStopReceipt{}, errors.New("docker dsh container identity is unconfirmed")
-				} else {
-					state.guard.ContainerID = inspected.ID
-				}
-			} else {
-				inspected, err = s.inspect(ctx, state.guard.ContainerID)
-			}
-			if !state.removed {
-				if err != nil || s.validateContainer(inspected, state.guard, false) != nil || *inspected.State.Running || *inspected.State.PID != 0 {
-					return app.AgentStopReceipt{}, errors.New("dsh container was started without a recorded start request")
-				}
-				if err := s.requestJSON(ctx, http.MethodDelete, "/containers/"+state.guard.ContainerID+"?force=0&v=0", nil, http.StatusNoContent, nil); err != nil {
-					return app.AgentStopReceipt{}, err
-				}
-				state.removed = true
-			}
-		}
-		absentID := state.guard.ContainerID
-		if absentID == "" {
-			absentID = state.guard.ContainerName
-		}
-		if err := s.requireAbsent(ctx, absentID); err != nil {
-			return app.AgentStopReceipt{}, err
-		}
-		return s.signStopReceipt(fence, nonce)
-	}
-	if state.guard.ContainerID == "" {
-		inspected, err := s.inspect(ctx, guard.ContainerName)
-		if err != nil || !dockerDSHContainerID.MatchString(inspected.ID) {
-			return app.AgentStopReceipt{}, errors.New("docker dsh container identity is unconfirmed")
-		}
-		state.guard.ContainerID = inspected.ID
-	}
-	if !state.removed {
-		inspected, err := s.inspect(ctx, state.guard.ContainerID)
-		if err != nil || s.validateContainer(inspected, state.guard, false) != nil {
-			return app.AgentStopReceipt{}, errors.New("docker dsh container identity or isolation changed")
-		}
-		if *inspected.State.Running {
-			if err := s.requestJSON(ctx, http.MethodPost, "/containers/"+state.guard.ContainerID+"/kill?signal=SIGKILL", nil, http.StatusNoContent, nil); err != nil {
-				return app.AgentStopReceipt{}, err
-			}
-		}
-		var waited struct {
-			StatusCode *int `json:"StatusCode"`
-			Error      *struct {
-				Message string `json:"Message"`
-			} `json:"Error"`
-		}
-		if err := s.requestJSON(ctx, http.MethodPost, "/containers/"+state.guard.ContainerID+"/wait?condition=not-running", nil, http.StatusOK, &waited); err != nil {
-			return app.AgentStopReceipt{}, err
-		}
-		if waited.StatusCode == nil || waited.Error != nil && waited.Error.Message != "" {
-			return app.AgentStopReceipt{}, errors.New("docker reported a container wait failure")
-		}
-		inspected, err = s.inspect(ctx, state.guard.ContainerID)
-		if err != nil || s.validateContainer(inspected, state.guard, false) != nil || *inspected.State.Running || *inspected.State.PID != 0 {
-			return app.AgentStopReceipt{}, errors.New("docker dsh container stop is unconfirmed")
-		}
-		if err := s.requestJSON(ctx, http.MethodDelete, "/containers/"+state.guard.ContainerID+"?force=0&v=0", nil, http.StatusNoContent, nil); err != nil {
-			return app.AgentStopReceipt{}, err
-		}
-		state.removed = true
-	}
-	if err := s.requireAbsent(ctx, state.guard.ContainerID); err != nil {
-		return app.AgentStopReceipt{}, err
-	}
-	destroyed, err := s.options.Guardian.ConfirmDestroyed(ctx, state.guard)
-	if err != nil || !destroyed {
-		return app.AgentStopReceipt{}, errors.New("dsh process tree or PID namespace destruction is unconfirmed")
-	}
-	if ctx.Err() != nil {
-		return app.AgentStopReceipt{}, ctx.Err()
-	}
-	return s.signStopReceipt(fence, nonce)
-}
-
-func (s *DockerCloudDSHSupervisor) signStopReceipt(fence app.AgentInstanceFence, nonce []byte) (app.AgentStopReceipt, error) {
-	receipt := app.AgentStopReceipt{Fence: fence, SupervisorNonce: append([]byte(nil), nonce...), TreeStopped: true}
-	payload, err := app.AgentStopReceiptSigningPayload(receipt)
-	if err != nil {
-		return app.AgentStopReceipt{}, err
-	}
-	mac := hmac.New(sha256.New, s.options.SigningKey)
-	_, _ = mac.Write(payload)
-	receipt.Signature = mac.Sum(nil)
-	return receipt, nil
-}
-
-func (s *DockerCloudDSHSupervisor) AgentStopConfirmed(fence app.AgentInstanceFence, nonce []byte) {
-	if fence.Validate() != nil || fence.SupervisorID != s.options.SupervisorID || len(nonce) != 32 {
-		return
-	}
-	nonceSum := sha256.Sum256(nonce)
-	s.mu.Lock()
-	state := s.active[fence]
-	s.mu.Unlock()
-	if state == nil {
-		return
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if !state.removed || state.guard.Fence != fence || subtle.ConstantTimeCompare([]byte(state.guard.NonceSHA256), []byte(hex.EncodeToString(nonceSum[:]))) != 1 {
-		return
-	}
-	s.mu.Lock()
-	if s.active[fence] == state {
-		delete(s.active, fence)
-	}
-	s.mu.Unlock()
-}
-
-func dockerDSHIdentity(fence app.AgentInstanceFence, nonce []byte) (DockerCloudDSHGuard, map[string]string, error) {
-	encoded, err := json.Marshal(fence)
-	if err != nil {
-		return DockerCloudDSHGuard{}, nil, errors.New("cannot encode dsh fence")
-	}
-	nonceSum := sha256.Sum256(nonce)
-	nonceHash := hex.EncodeToString(nonceSum[:])
-	identity := sha256.Sum256(append(append(encoded, 0), nonceSum[:]...))
-	name := "morde-dsh-" + hex.EncodeToString(identity[:])
-	return DockerCloudDSHGuard{ContainerName: name, Fence: fence, NonceSHA256: nonceHash},
-		map[string]string{dockerDSHFenceLabel: string(encoded), dockerDSHNonceLabel: nonceHash}, nil
 }
 
 func (s *DockerCloudDSHSupervisor) validateImage(ctx context.Context) error {
@@ -382,15 +107,13 @@ func (s *DockerCloudDSHSupervisor) validateImage(ctx context.Context) error {
 	}
 	for _, value := range image.Config.Env {
 		key, _, ok := strings.Cut(value, "=")
-		if !ok || (key != "PATH" && key != "LANG" && key != "NODE_ENV") {
+		// Debian's official slim image can declare PATH without a value. The
+		// container launch always replaces it with the fixed runtime PATH below.
+		if (!ok && value != "PATH") || (ok && key != "PATH" && key != "LANG" && key != "NODE_ENV") {
 			return errors.New("dsh image contains an unapproved environment variable")
 		}
 	}
 	return nil
-}
-
-func (s *DockerCloudDSHSupervisor) containerCreate(labels map[string]string) any {
-	return s.containerCreateForScript(labels, s.options.ScriptPath)
 }
 
 func (s *DockerCloudDSHSupervisor) containerCreateForScript(labels map[string]string, scriptPath string) any {
@@ -478,19 +201,6 @@ func (s *DockerCloudDSHSupervisor) inspect(ctx context.Context, id string) (dock
 	var inspected dockerDSHInspect
 	err := s.requestJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/json", nil, http.StatusOK, &inspected)
 	return inspected, err
-}
-
-func (s *DockerCloudDSHSupervisor) validateContainer(value dockerDSHInspect, guard DockerCloudDSHGuard, running bool) error {
-	encoded, err := json.Marshal(guard.Fence)
-	if err != nil {
-		return err
-	}
-	if !s.validContainerIsolation(value, s.options.ScriptPath, running) ||
-		value.ID != guard.ContainerID || value.Name != "/"+guard.ContainerName ||
-		value.Config.Labels[dockerDSHFenceLabel] != string(encoded) || value.Config.Labels[dockerDSHNonceLabel] != guard.NonceSHA256 {
-		return errors.New("docker dsh isolation contract mismatch")
-	}
-	return nil
 }
 
 func (s *DockerCloudDSHSupervisor) validContainerIsolation(value dockerDSHInspect, scriptPath string, running bool) bool {
@@ -683,5 +393,3 @@ func (p *dockerDSHOutput) Read(data []byte) (int, error) {
 }
 
 func (p *dockerDSHOutput) Close() error { return p.conn.Close() }
-
-var _ CloudDSHSupervisor = (*DockerCloudDSHSupervisor)(nil)

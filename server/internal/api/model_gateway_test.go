@@ -13,12 +13,13 @@ import (
 )
 
 type modelGatewayHTTPTest struct {
-	call            app.ModelCall
-	response        app.ModelResponse
-	err             error
-	checkErr        error
-	checkKey        string
-	checkCapability string
+	call              app.ModelCall
+	response          app.ModelResponse
+	err               error
+	checkErr          error
+	checkKey          string
+	checkCapability   string
+	checkCapabilities app.ModelCapabilities
 }
 
 func (s *modelGatewayHTTPTest) CheckModelCapability(_ context.Context, _ identity.Principal, _ string, key, capability string) (app.ModelCapabilities, error) {
@@ -26,11 +27,14 @@ func (s *modelGatewayHTTPTest) CheckModelCapability(_ context.Context, _ identit
 	if key == "" {
 		return app.ModelCapabilities{}, domain.InvalidArgument("idempotency_key", "idempotency key is invalid")
 	}
-	return app.ModelCapabilities{}, s.checkErr
+	return s.checkCapabilities, s.checkErr
 }
 
 func TestModelProbeSelectsCapabilityAndRequiresIdempotency(t *testing.T) {
-	service := &modelGatewayHTTPTest{}
+	service := &modelGatewayHTTPTest{checkCapabilities: app.ModelCapabilities{
+		Text: true, Tools: true, Vision: true,
+		MediaGeneration: app.ModelMediaGenerationCapabilities{ImageGeneration: true},
+	}}
 	deps := newServices().deps()
 	deps.ModelGateway = service
 	router, err := New(deps, validOptions())
@@ -42,9 +46,15 @@ func TestModelProbeSelectsCapabilityAndRequiresIdempotency(t *testing.T) {
 	if withoutKey.Code != http.StatusBadRequest {
 		t.Fatalf("probe without key = %d %s", withoutKey.Code, withoutKey.Body)
 	}
-	response := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/model-connections/p1234567/check", `{"capability":"tools"}`, cookie,
+	toolsResponse := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/model-connections/p1234567/check", `{"capability":"tools"}`, cookie,
+		"https://portal.example.test", "Idempotency-Key", "probe-tools-0001")
+	if toolsResponse.Code != http.StatusOK || service.checkCapability != "tools" {
+		t.Fatalf("tools probe = %d %s, capability=%q", toolsResponse.Code, toolsResponse.Body, service.checkCapability)
+	}
+	response := requestWithCookieBodyAndHeader(router, http.MethodPost, "/api/model-connections/p1234567/check", `{"capability":"image_generation"}`, cookie,
 		"https://portal.example.test", "Idempotency-Key", "probe-key-0001")
-	if response.Code != http.StatusOK || service.checkKey != "probe-key-0001" || service.checkCapability != "tools" {
+	if response.Code != http.StatusOK || service.checkKey != "probe-key-0001" || service.checkCapability != "image_generation" ||
+		!strings.Contains(response.Body.String(), `"media_generation":{"image_generation":true,"video_generation":false,"speech_generation":false}`) {
 		t.Fatalf("probe = %d %s, key=%q, capability=%q", response.Code, response.Body, service.checkKey, service.checkCapability)
 	}
 }

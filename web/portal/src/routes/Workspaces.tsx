@@ -112,6 +112,7 @@ export function Workspaces() {
   const [selectedBinding, setSelectedBinding] = useState<{ host: Host; binding: Binding } | null>(null);
   const [restored] = useState(() => readPendingWorkspaceCreate(user?.id));
   const [name, setName] = useState(restored.pending?.name ?? '');
+  const [showCreate, setShowCreate] = useState(false);
   const [validationError, setValidationError] = useState('');
   const pendingWorkspaceCreate = useRef<PendingWorkspaceCreate | null>(restored.pending);
   const [recoveryPending, setRecoveryPending] = useState(!!restored.pending);
@@ -204,6 +205,7 @@ export function Workspaces() {
       if (pendingWorkspaceCreate.current?.idempotencyKey === request.idempotencyKey) pendingWorkspaceCreate.current = null;
       setRecoveryPending(false);
       setRecoveryError(false);
+      setShowCreate(false);
       setName('');
       setValidationError('');
       await client.invalidateQueries({ queryKey: ['workspaces'] });
@@ -429,6 +431,7 @@ export function Workspaces() {
       pendingWorkspaceCreate.current = null;
       setRecoveryPending(false);
       setRecoveryError(false);
+      setShowCreate(true);
       setName('');
       create.reset();
     } catch {
@@ -441,7 +444,6 @@ export function Workspaces() {
   };
 
   return <section>
-    <div className="page-heading"><div><p className="eyebrow">资源管理</p><h1>我的工作区</h1><p className="muted">工作区独立保存在服务端。删除主机只会解绑工作区，不会删除其中的数据。</p></div></div>
     {import.meta.env.VITE_MOCK_API === '1' && <p className="notice notice-info" role="status">当前使用本机 MSW；“本地差异演示工作区”的差异内容与恢复结果均为合成数据，不会写入真实 Workspace。</p>}
     {restoreRecovery.invalid && <div className="notice notice-warning" role="alert">
       <p>本机 Workspace 恢复记录无法读取。请先在 Host 和 Workspace 列表核对服务端状态，不能直接开始另一项恢复。</p>
@@ -455,7 +457,9 @@ export function Workspaces() {
         setRestoreConfirmationOpen(true);
       }}>{restoreWorkflowBusy ? '正在核对并恢复…' : '核对状态并继续恢复'}</button>
     </div>}
-    <form className="form-card form-stack workspace-create-form" aria-label="创建独立工作区" onSubmit={createWorkspace}>
+    <section className="design-panel" aria-labelledby="workspace-list-title">
+    <div className="design-panel-header"><div><h2 id="workspace-list-title">我的工作区</h2><p>工作区独立保存，删除电脑不会删除工作区数据。</p></div><button type="button" className="button button-primary" aria-expanded={showCreate || recoveryPending || recoveryError} disabled={recoveryPending || recoveryError || create.isPending} onClick={() => setShowCreate((open) => !open)}>{showCreate || recoveryPending || recoveryError ? '收起' : '＋ 创建工作区'}</button></div>
+    {(showCreate || recoveryPending || recoveryError) && <form className="form-card form-stack workspace-create-form" aria-label="创建独立工作区" onSubmit={createWorkspace}>
       <h2>创建工作区</h2>
       {create.isError && <p className="form-error" role="alert">创建失败：{errorDetails(create.error).message}</p>}
       {validationError && <p className="form-error" role="alert">{validationError}</p>}
@@ -464,8 +468,8 @@ export function Workspaces() {
       <label htmlFor="workspace-name">工作区名称</label>
       <input id="workspace-name" required maxLength={100} value={name} disabled={create.isPending || recoveryPending || recoveryError} onChange={(event) => { setName(event.target.value); create.reset(); setValidationError(''); }} placeholder="例如：产品项目" />
       <div className="form-actions"><button type="submit" className="button button-primary" disabled={create.isPending || recoveryError}>{create.isPending ? '正在创建…' : recoveryPending ? '继续上次创建' : '创建工作区'}</button></div>
-    </form>
-    {query.isPending ? <div className="loading-card">正在加载工作区…</div> : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div> : !query.data?.items.length ? <div className="empty-card"><h2>还没有工作区</h2><p>也可以在创建主机时新建工作区，或选择已有工作区。</p></div> : <div className="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>已用 / 配额</th><th>版本</th><th>绑定主机</th><th>Host 应用 / 同步状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
+    </form>}
+    {query.isPending ? <div className="loading-card">正在加载工作区…</div> : query.isError ? <div className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div> : !query.data?.items.length ? <div className="empty-card"><h2>还没有工作区</h2><p>也可以在创建主机时新建工作区，或选择已有工作区。</p></div> : <div className="table-wrap"><table className="workspace-table"><thead><tr><th>名称</th><th>状态</th><th>已用 / 配额</th><th>版本</th><th>绑定主机</th><th>电脑状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
       {query.data.items.map((item) => {
         const bindings = hosts.data?.items.flatMap((host) => host.workspaces
           .filter((binding) => binding.workspace.id === item.id && binding.state !== 'detached')
@@ -475,14 +479,16 @@ export function Workspaces() {
         const selectedHost = availableHosts.find((host) => host.id === selectedHostID);
         const canDelete = !hosts.isPending && !hosts.isFetching && !hosts.isError && item.state === 'ready' && bindings.length === 0;
         return <tr key={item.id}>
-          <td><strong>{item.name || item.id}</strong><small className="table-sub mono">{item.id}</small></td>
-          <td><span className={`status status-${item.state}`}>{workspaceStateLabel[item.state]}</span></td>
-          <td>{formatBytes(item.used_bytes)} / {formatBytes(item.quota_bytes)}</td>
-          <td>v{item.revision}</td>
-          <td>{bindings.length ? bindings.map(({ host, binding }) => <small className="table-sub" key={`${host.id}-${binding.workspace.id}`}>{host.name || host.id}{host.owner_id === user?.id ? ` · ${hostStateLabel[host.state] || host.state}` : ' · 无权打开'}</small>) : hosts.isError ? '主机绑定状态暂不可用' : hosts.isPending ? '正在读取…' : '未绑定'}</td>
-          <td>{bindings.length ? bindings.map(({ host, binding }) => {
+          <td><span className="workspace-cell-label">名称</span><strong>{item.name || item.id}</strong><small className="table-sub mono">{item.id}</small></td>
+          <td><span className="workspace-cell-label">状态</span><span className={`status status-${item.state}`}>{workspaceStateLabel[item.state]}</span></td>
+          <td><span className="workspace-cell-label">已用 / 配额</span>{formatBytes(item.used_bytes)} / {formatBytes(item.quota_bytes)}</td>
+          <td><span className="workspace-cell-label">版本</span>v{item.revision}{item.revision === 0 && <small className="table-sub">初始版本，暂无历史版本</small>}</td>
+          <td><span className="workspace-cell-label">绑定主机</span>{bindings.length ? bindings.map(({ host, binding }) => <small className="table-sub" key={`${host.id}-${binding.workspace.id}`}>{host.name || host.id}{host.owner_id === user?.id ? ` · ${hostStateLabel[host.state] || host.state}` : ' · 无权打开'}</small>) : hosts.isError ? '主机绑定状态暂不可用' : hosts.isPending ? '正在读取…' : '未绑定'}</td>
+          <td><span className="workspace-cell-label">电脑状态</span>{bindings.length ? bindings.map(({ host, binding }) => {
             const conflicts = binding.sync_conflicts;
+            const waitingForHost = host.owner_id === user?.id && host.state === 'creating' && binding.state === 'preparing' && binding.sync_state !== 'conflict';
             return <div className="workspace-host-status" key={`${host.id}-${binding.workspace.id}`}>
+              {waitingForHost ? <small>{host.state_reason === 'restore_unknown' ? '电脑恢复状态待核实，工作区尚未挂载。' : '电脑创建中，工作区等待挂载。'}</small> : <>
               <small>{host.owner_id !== user?.id ? '主机应用状态不可见' : `应用：${bindingStateLabel[binding.state] || binding.state}`}</small>
               <small>同步：{workspaceSyncLabel(item, host, binding)}</small>
               {binding.sync_state === 'conflict' && <div className="workspace-host-sync-conflict notice notice-warning" role="status">
@@ -492,15 +498,16 @@ export function Workspaces() {
                 {host.owner_id === user?.id && <button type="button" className="button button-secondary button-small" aria-label={`重试 Host 同步 ${item.name || item.id} 到 ${host.name || host.id}`} disabled={retryHostSync.isPending} onClick={() => retryHostSync.mutate({ host, binding })}>{retryHostSync.isPending ? '正在重试…' : '重试同步'}</button>}
               </div>}
               <small>{host.owner_id !== user?.id ? '项目：状态不可见' : `项目：${workspaceProjectLabel(item, host, binding)}`}</small>
+              </>}
             </div>;
           }) : '—'}</td>
-          <td>{formatDate(item.updated_at)}</td>
-          <td><div className="workspace-actions">
+          <td><span className="workspace-cell-label">更新时间</span>{formatDate(item.updated_at)}</td>
+          <td><span className="workspace-cell-label">操作</span><div className="workspace-actions">
             <button type="button" className="button button-secondary button-small" aria-label={`查看设备同步进度 ${item.name || item.id}`} onClick={() => {
               if (progressWorkspaceID === item.id) void deviceProgress.refetch();
               else setProgressWorkspaceID(item.id);
             }}>设备进度</button>
-            {item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`比较工作区版本 ${item.name || item.id}`} disabled={revisionCompareLoading} onClick={() => openRevisionDiff(item)}>版本差异</button>}
+            {item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`比较工作区版本 ${item.name || item.id}`} disabled={revisionCompareLoading || item.revision === 0} title={item.revision === 0 ? '当前只有初始版本，暂无可比较的历史版本' : undefined} onClick={() => openRevisionDiff(item)}>版本差异</button>}
             {item.state === 'ready' && <button type="button" className="button button-secondary button-small" aria-label={`预演复制与移交 ${item.name || item.id}`} onClick={() => setTransferWorkspaceID(item.id)}>复制/移交演示</button>}
             {bindings.filter(({ host }) => host.owner_id === user?.id).map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={host.id} aria-label={`打开主机 ${host.name || host.id}`} disabled={!canOpenWorkspaceHost(item, host, binding)} title={!canOpenWorkspaceHost(item, host, binding) ? 'Host Runtime 在线且工作区当前版本已应用后才能打开' : undefined} onClick={() => void openHost(host)}>打开主机</button>)}
             {bindings.filter(({ host, binding }) => host.owner_id === user?.id && host.state === 'running' && binding.state !== 'unbinding').map(({ host, binding }) => <button type="button" className="button button-secondary button-small" key={`unbind-${host.id}`} aria-label={`解绑工作区 ${item.name || item.id} 与主机 ${host.name || host.id}`} disabled={unbind.isPending} onClick={() => setSelectedBinding({ host, binding })}>解绑</button>)}
@@ -518,6 +525,7 @@ export function Workspaces() {
         </tr>;
       })}
     </tbody></table></div>}
+    </section>
     {revisionWorkspace && <section className="form-card form-stack" aria-label="历史 revision 差异">
       <div className="host-card-heading"><h2>历史 revision 差异 · {revisionWorkspace.name || revisionWorkspace.id}</h2><button type="button" className="button button-secondary button-small" aria-label="关闭历史 revision 差异" onClick={closeRevisionDiff}>关闭</button></div>
       <p className="muted">差异由服务端按已提交版本计算。小型文本可展开查看；二进制或过大的文件只显示元数据。恢复会创建新 revision，不改写历史。</p>
@@ -617,7 +625,7 @@ export function Workspaces() {
     </section>}
     {progressWorkspaceID && <section className="notice notice-info" aria-live="polite">
       <div className="host-card-heading"><h2>设备同步进度 · {query.data?.items.find((item) => item.id === progressWorkspaceID)?.name || progressWorkspaceID}</h2><button type="button" className="button button-secondary button-small" aria-label="关闭设备同步进度" onClick={() => setProgressWorkspaceID('')}>关闭</button></div>
-      {deviceProgress.isPending ? <p>正在读取同步状态…</p> : deviceProgress.isError ? <p role="alert">读取失败：{errorDetails(deviceProgress.error).message} <button type="button" className="button button-secondary button-small" onClick={() => void deviceProgress.refetch()}>重试</button></p> : !deviceProgress.data.items.length ? <p>当前没有活动的设备同步会话；这不代表两端没有待同步差异。</p> : deviceProgress.data.items.map((item) => <div className="workspace-host-status" key={item.session_id}>
+      {deviceProgress.isPending ? <p>正在读取同步状态…</p> : deviceProgress.isError ? <p role="alert">读取失败：{errorDetails(deviceProgress.error).message} <button type="button" className="button button-secondary button-small" onClick={() => void deviceProgress.refetch()}>重试</button></p> : !deviceProgress.data.items.length ? <p>当前没有设备正在同步。设备连接后，仍可能有待同步的文件。</p> : deviceProgress.data.items.map((item) => <div className="workspace-host-status" key={item.session_id}>
         <strong>设备 {item.device_id} · {syncDirectionLabel[item.direction]} · {syncStateLabel[item.state]}</strong>
         <small>阶段：{syncStageLabel[item.stage]}</small>
         <small>已确认传输：{formatBytes(item.confirmed_bytes)} / {formatBytes(item.planned_bytes)}</small>
@@ -626,7 +634,6 @@ export function Workspaces() {
       </div>)}
     </section>}
     {hosts.isError && <p className="notice notice-info" role="status">无法读取主机绑定状态，工作区删除和绑定操作已停用。{errorDetails(hosts.error).message}</p>}
-    <p className="muted">Host 应用与设备传输进度分别显示。设备进度仅包含活动会话；无活动会话不代表两端完全一致。</p>
     {selectedBinding && <ConfirmDialog title={`解绑工作区与主机 ${selectedBinding.host.name || selectedBinding.host.id}`} description="Morde 无法自动检测外部写入者。解绑前请先关闭会写入该工作区的 AI、IDE、终端任务和其他应用；继续即表示确认这些写入者均已停止。服务端会等待进行中的操作结束并校验稳定快照。解绑不会删除服务端工作区或主机磁盘副本。" confirmLabel="已停止写入者，确认解绑" danger busy={unbind.isPending} onClose={() => setSelectedBinding(null)} onConfirm={() => unbind.mutate(selectedBinding)} />}
     {selected && <ConfirmDialog title="删除工作区" description={`确定删除“${selected.name || selected.id}”吗？这会永久删除 Morde 云端工作区及其已同步数据。本地文件夹和未同步的文件会保留。`} confirmLabel="删除工作区" danger busy={remove.isPending} onClose={() => setSelected(null)} onConfirm={() => remove.mutate(selected.id)} />}
   </section>;

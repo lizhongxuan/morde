@@ -38,7 +38,7 @@ describe('admin usage and platform statistics', () => {
     vi.spyOn(portalApi, 'adminStats').mockResolvedValue(statsData);
     renderPage();
 
-    expect(await screen.findByRole('heading', { name: '用量与统计' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '平台模型用量' })).toBeInTheDocument();
     expect(screen.getByText('model_call_ledger', { exact: false })).toBeInTheDocument();
     expect(await screen.findByText('统计区间：2026-10-27 至 2026-11-02')).toBeInTheDocument();
     expect(usage).toHaveBeenCalledWith(7);

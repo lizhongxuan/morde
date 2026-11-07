@@ -18,17 +18,17 @@ import {
   type PersonalObjectBody,
   type PersonalObjectType,
 } from './personal-data-store';
-import { batchLegacyHistory, legacyHistorySource, readLegacyHistorySelection, type LegacyHistorySelection } from './personal-history-import';
 
-type Section = 'profile' | 'memory' | 'feed' | 'ideas' | 'library';
+type Section = 'profile' | 'soul' | 'memory' | 'feed' | 'ideas' | 'library' | 'preferences';
 type ProfileBody = { name: string; avatar: 'dragon' | 'emoji'; emoji?: string; color?: string; description?: string; style?: string };
+type SoulBody = { name: string; emoji?: string; style?: string; lang?: string; content: string };
 type MemoryBody = { content: string; category?: string };
 type FeedPostBody = { title: string; type: string; emoji?: string; created_at?: string; liked?: boolean; body: string };
 type LibraryBody = { name: string; kind: 'artifact' | 'media'; mime?: string; size_bytes?: number; attachment_id?: string };
 
 const sections: Array<{ id: Section; title: string }> = [
-  { id: 'profile', title: '个人资料' }, { id: 'memory', title: '记忆' }, { id: 'feed', title: '动态' },
-  { id: 'ideas', title: '灵感' }, { id: 'library', title: '资源库' },
+  { id: 'profile', title: '个人资料' }, { id: 'soul', title: 'AI 个性' }, { id: 'memory', title: '记忆' }, { id: 'feed', title: '动态' },
+  { id: 'ideas', title: '灵感' }, { id: 'library', title: '资源库' }, { id: 'preferences', title: '偏好' },
 ];
 
 const profileStyles = [
@@ -113,10 +113,6 @@ export function PersonalData() {
   const [feedTitle, setFeedTitle] = useState('');
   const [feedBody, setFeedBody] = useState('');
   const [libraryKind, setLibraryKind] = useState<'artifact' | 'media'>('artifact');
-  const [historySelection, setHistorySelection] = useState<LegacyHistorySelection | null>(null);
-  const [historyImporting, setHistoryImporting] = useState(false);
-  const [historyImportError, setHistoryImportError] = useState<string | null>(null);
-  const [historyImportStatus, setHistoryImportStatus] = useState<string | null>(null);
   const syncingRef = useRef(false);
 
   const refreshLocal = useCallback(async () => {
@@ -180,7 +176,12 @@ export function PersonalData() {
 
   const allObjects = useMemo(() => state ? objectsWithDrafts(state) : [], [state]);
   const profileObject = objectOf<ProfileBody>(allObjects, 'profile', 'default');
+  const soulObject = objectOf<SoulBody>(allObjects, 'soul', 'default');
   const memoryObjects = allObjects.filter((item) => item.object_type === 'memory');
+  // Show the confirmed server value, not an offline draft, for this consent.
+  const memorySetting = state?.objects[personalObjectKey('skill_setting', 'builtin_memory')];
+  const memoryEnabled = memorySetting?.body.enabled === true;
+  const memorySettingPending = state?.outbox.some((item) => item.objectType === 'skill_setting' && item.objectID === 'builtin_memory' && !item.resolutionQueued) ?? false;
   const feedObjects = allObjects.filter((item) => item.object_type === 'feed_post').sort((a, b) => asString(b.body.created_at).localeCompare(asString(a.body.created_at)));
   const ideaMarks = new Map(allObjects.filter((item) => item.object_type === 'idea_mark').map((item) => [item.object_id, asString(item.body.state)]));
   const libraryObjects = allObjects.filter((item) => item.object_type === 'library_item');
@@ -213,53 +214,6 @@ export function PersonalData() {
       setActionError(error instanceof Error ? error.message : '无法删除个人数据。');
     }
   }, [store, syncEnabled, sync]);
-
-  const selectLegacyHistory = async (files: File[]) => {
-    setHistoryImportError(null);
-    setHistoryImportStatus(null);
-    if (!files.length) {
-      setHistorySelection(null);
-      return;
-    }
-    try {
-      setHistorySelection(await readLegacyHistorySelection(files));
-    } catch (error) {
-      setHistorySelection(null);
-      setHistoryImportError(error instanceof Error ? error.message : '无法读取所选会话文件。');
-    }
-  };
-
-  const importLegacyHistory = async () => {
-    if (!historySelection || historyImporting) return;
-    setHistoryImportError(null);
-    setHistoryImporting(true);
-    let completedMessages = 0;
-    let completedConversations = 0;
-    const totalConversations = historySelection.conversations.length;
-    try {
-      for (const conversation of historySelection.conversations) {
-        let targetConversationID: string | undefined;
-        for (const messages of batchLegacyHistory(conversation.messages)) {
-          const receipt = await portalApi.importPersonalHistory({
-            ...legacyHistorySource,
-            source_conversation_id: conversation.source_conversation_id,
-            title: conversation.title,
-            ...(targetConversationID ? { target_conversation_id: targetConversationID } : {}),
-            messages,
-          });
-          targetConversationID = receipt.conversation_id;
-          completedMessages += messages.length;
-          setHistoryImportStatus(`正在导入会话 ${completedConversations + 1}/${totalConversations}，已提交 ${completedMessages} 条文本消息…`);
-        }
-        completedConversations++;
-      }
-      setHistoryImportStatus(`已导入 ${completedConversations} 个会话、${completedMessages} 条文本消息。重复导入会按来源消息去重。`);
-    } catch (error) {
-      setHistoryImportError(`导入已中断；已提交 ${completedMessages} 条文本消息。${error instanceof Error ? error.message : '请稍后重试。'} 同一文件可安全重试。`);
-    } finally {
-      setHistoryImporting(false);
-    }
-  };
 
   const addMemory = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -373,37 +327,21 @@ export function PersonalData() {
 
   if (!user) return <section><div className="loading-card" role="status">正在读取账号…</div></section>;
 
-  return <section className="personal-data-page">
-    <div className="page-heading">
-      <div><p className="eyebrow">我的数据</p><h1>个人资料</h1><p className="muted">管理个人资料、记忆、动态、灵感标记和资源库附件。</p></div>
+  return <section className="personal-data-page design-panel">
+    <div className="design-panel-header">
+      <div><h2>我的数据</h2><p>管理个人资料、AI 个性、记忆、动态、灵感和资源库。</p></div>
+      <div className="inline-actions">
       <label className="checkbox-row personal-sync-toggle"><input type="checkbox" checked={syncEnabled} onChange={(event) => {
         const enabled = event.target.checked;
         setPersonalDataSyncEnabled(user.id, enabled, store?.serviceOrigin);
         setSyncEnabled(enabled);
         if (enabled) void sync();
       }} />同步到 Morde</label>
+      <button type="button" className="button button-secondary" disabled={!syncEnabled || syncing} onClick={() => void sync()}>{syncing ? '同步中…' : '立即同步'}</button>
+      </div>
     </div>
-    <p className="notice notice-info" role="note">其他旧版本机资料不会自动导入或删除；只有你明确选择并提交的会话文本才会导入当前账号。未选中的资料、工具输出和附件继续留在原导出文件中。</p>
-
-    <section className="connection-section" aria-labelledby="legacy-history-import-title">
-      <div className="connection-section-heading"><div><h2 id="legacy-history-import-title">导入 nanoMuse 会话历史</h2><p className="muted">从旧版下载的数据 ZIP 解压后，可在 threads 文件夹选择一个或多个会话 JSON；index.json 可一并选择以使用原会话标题。</p></div></div>
-      <label htmlFor="legacy-history-files">选择要导入的会话 JSON 文件</label>
-      <input id="legacy-history-files" type="file" accept=".json,application/json" multiple disabled={historyImporting}
-        onChange={(event) => void selectLegacyHistory(Array.from(event.currentTarget.files ?? []))} />
-      <p className="muted">导入前会显示会话与消息数量。只发送可见的用户和助手文本；推理、工具事件、后台消息和旧附件不会导入，也不会创建任务。</p>
-      {historySelection && <div className="empty-card" role="status">
-        <p>可导入 {historySelection.conversations.length} 个会话、{historySelection.conversations.reduce((total, item) => total + item.messages.length, 0)} 条文本消息；跳过 {historySelection.skipped_files} 个文件、{historySelection.ignored_events} 个不支持事件、{historySelection.skipped_attachments} 个附件引用。</p>
-        {!!historySelection.conversations.length && <ul>{historySelection.conversations.map((item) => <li key={item.source_conversation_id}>{item.title} · {item.messages.length} 条消息</li>)}</ul>}
-      </div>}
-      {historyImportError && <p className="error-card" role="alert">{historyImportError}</p>}
-      {historyImportStatus && <p className="notice notice-info" role="status">{historyImportStatus}</p>}
-      <button type="button" className="button button-secondary" disabled={!historySelection?.conversations.length || historyImporting}
-        onClick={() => void importLegacyHistory()}>{historyImporting ? '正在导入…' : `明确导入所选历史（${historySelection?.conversations.reduce((total, item) => total + item.messages.length, 0) ?? 0} 条）`}</button>
-    </section>
-
     <div className="connection-section-heading personal-sync-status" aria-live="polite">
       <p className="muted">{syncing ? '正在同步个人数据…' : syncEnabled ? '同步已开启' : '同步已关闭；本地数据会继续保留'} · {pendingCount} 项待同步 · {conflicts.length} 条冲突草稿</p>
-      <button type="button" className="button button-secondary" disabled={!syncEnabled || syncing} onClick={() => void sync()}>{syncing ? '同步中…' : '立即同步'}</button>
     </div>
 
     {localError && <div className="error-card" role="alert">{localError}<button type="button" className="button button-secondary" onClick={() => void refreshLocal()}>重试</button></div>}
@@ -445,8 +383,20 @@ export function PersonalData() {
         onSave={(body) => void saveObject('profile', 'default', body as unknown as PersonalObjectBody)} onInvalid={setActionError} />
     </section>}
 
+    {state && !remoteLoading && activeSection === 'soul' && <section className="connection-section" aria-labelledby="personal-soul-title">
+      <div className="connection-section-heading"><div><h2 id="personal-soul-title">AI 个性</h2><p className="muted">Morde 默认人格由系统提供。这里可以为个人对话设置专属偏好；项目对话不会读取个人 SOUL。删除个人版本会恢复系统默认人格。</p></div></div>
+      <SoulEditor key={`${soulObject?.revision ?? 0}:${JSON.stringify(soulObject?.body ?? null)}`} value={soulObject}
+        hasConflict={conflicts.some((item) => item.objectType === 'soul' && item.objectID === 'default')}
+        onSave={(body) => void saveObject('soul', 'default', body as unknown as PersonalObjectBody)}
+        onDelete={() => void deleteObject('soul', 'default')} onInvalid={setActionError} />
+    </section>}
+
     {state && !remoteLoading && activeSection === 'memory' && <section className="connection-section" aria-labelledby="personal-memory-title">
-      <div className="connection-section-heading"><div><h2 id="personal-memory-title">记忆</h2><p className="muted">记忆以独立版本保存，可离线新增、修改和删除。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-memory-title">记忆</h2><p className="muted">允许后，AI 可以在个人对话中使用已保存的记忆。项目对话不会读取个人记忆。</p></div></div>
+      <label className="checkbox-row"><input type="checkbox" checked={memoryEnabled}
+        disabled={!syncEnabled || !state.snapshotComplete || syncing || memorySettingPending}
+        onChange={(event) => void saveObject('skill_setting', 'builtin_memory', { enabled: event.target.checked })} />允许 AI 使用个人记忆</label>
+      <p className="muted">{memorySettingPending ? '设置正在同步，服务端确认后生效。' : '默认关闭；修改或删除记忆在服务端同步成功后生效。'}</p>
       <form className="form-card form-stack" onSubmit={addMemory}>
         <label>新增记忆<textarea value={memoryContent} maxLength={65536} required onChange={(event) => setMemoryContent(event.target.value)} /></label>
         <label>分类（可选）<input value={memoryCategory} maxLength={64} onChange={(event) => setMemoryCategory(event.target.value)} /></label>
@@ -457,7 +407,6 @@ export function PersonalData() {
 
     {state && !remoteLoading && activeSection === 'feed' && <section className="connection-section" aria-labelledby="personal-feed-title">
       <div className="connection-section-heading"><div><h2 id="personal-feed-title">动态</h2><p className="muted">个人动态保存在 feed_post 对象中；偏好设置与动态分开保存。</p></div></div>
-      <FeedPreferencesEditor key={feedPreference?.body.content ?? 'empty'} initialContent={feedPreference?.body.content ?? ''} onSave={saveFeedPreferences} />
       <form className="form-card form-stack" onSubmit={addFeedPost}>
         <label>新增动态标题<input value={feedTitle} maxLength={200} required onChange={(event) => setFeedTitle(event.target.value)} /></label>
         <label>内容<textarea value={feedBody} maxLength={65536} required onChange={(event) => setFeedBody(event.target.value)} /></label>
@@ -472,8 +421,13 @@ export function PersonalData() {
       })}</ul>}
     </section>}
 
+    {state && !remoteLoading && activeSection === 'preferences' && <section className="connection-section" aria-labelledby="personal-preferences-title">
+      <div className="connection-section-heading"><div><h2 id="personal-preferences-title">偏好</h2><p className="muted">设置你希望关注的动态内容。</p></div></div>
+      <FeedPreferencesEditor key={feedPreference?.body.content ?? 'empty'} initialContent={feedPreference?.body.content ?? ''} onSave={saveFeedPreferences} />
+    </section>}
+
     {state && !remoteLoading && activeSection === 'ideas' && <section className="connection-section" aria-labelledby="personal-ideas-title">
-      <div className="connection-section-heading"><div><h2 id="personal-ideas-title">灵感</h2><p className="muted">灵感来自本地 nanoMuse 静态目录；服务端只保存你的收藏或忽略标记。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-ideas-title">灵感</h2><p className="muted">灵感来自 Morde 内置目录；服务端只保存你的收藏或忽略标记。</p></div></div>
       {catalogue('zh-CN').sections.map((group) => <section key={group.id} aria-label={group.title}>
         <h3>{group.title}</h3><ul className="personal-object-list">{group.ideas.map((idea) => {
           const mark = ideaMarks.get(idea.id);
@@ -556,6 +510,36 @@ function FeedPreferencesEditor({ initialContent, onSave }: { initialContent: str
     <label>动态偏好<textarea value={content} maxLength={8192} onChange={(event) => setContent(event.target.value)} placeholder="写下你想看到的动态内容" /></label>
     <button type="submit" className="button button-secondary">{content.trim() ? '保存动态偏好' : '清除动态偏好'}</button>
   </form>;
+}
+
+function SoulEditor({ value, hasConflict, onSave, onDelete, onInvalid }: {
+  value: PersonalObject | undefined;
+  hasConflict: boolean;
+  onSave: (body: SoulBody) => void;
+  onDelete: () => void;
+  onInvalid: (message: string) => void;
+}) {
+  const [name, setName] = useState(asString(value?.body.name) || 'Morde');
+  const [content, setContent] = useState(asString(value?.body.content));
+  const save = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const normalizedName = name.trim();
+    const normalizedContent = content.trim();
+    if (!normalizedName) { onInvalid('人格名称不能为空。'); return; }
+    if (!normalizedContent) { onInvalid('人格内容不能为空。'); return; }
+    onSave({ name: normalizedName, lang: 'zh-CN', content: normalizedContent });
+  };
+  return <>
+    {!value && <p className="empty-card">当前使用系统默认的 Morde 人格。保存后会为你的个人对话创建覆盖版本。</p>}
+    <form className="form-card form-stack" onSubmit={save}>
+      <label>人格名称<input value={name} maxLength={80} required onChange={(event) => setName(event.target.value)} /></label>
+      <label>SOUL 内容<textarea value={content} maxLength={65536} required onChange={(event) => setContent(event.target.value)} placeholder="写下希望 Morde 长期遵循的交流风格和做事原则" /></label>
+      <div className="inline-actions">
+        <button type="submit" className="button button-primary">{hasConflict ? '基于远端版本保存' : value ? '保存 AI 个性' : '保存个人人格'}</button>
+        {value && <button type="button" className="button button-secondary" onClick={onDelete}>删除个人人格</button>}
+      </div>
+    </form>
+  </>;
 }
 
 function MemoryRow({ item, onSave, onDelete }: { item: PersonalObject; onSave: (body: MemoryBody) => void; onDelete: () => void }) {

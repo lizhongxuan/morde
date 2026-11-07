@@ -16,6 +16,8 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/control"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 )
@@ -211,7 +213,7 @@ func TestPostgresAccountRuntimeTaskStopProofIsBoundToBothFences(t *testing.T) {
 	}
 	runtimeNonce := make([]byte, 32)
 	runtimeNonce[0] = 91
-	runtimeRequest := app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, RuntimeID: "runtime-task-proof",
+	runtimeRequest := app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, ConversationID: runtimeTaskConversation(t, f.store, f.request.Fence.TaskID), RuntimeID: "runtime-task-proof",
 		LeaseOwner: "portal-runtime-task-proof", SupervisorNonce: runtimeNonce, MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second}
 	runtime, _, err := runtimeService.Start(ctx, runtimeRequest)
 	if err != nil {
@@ -334,7 +336,7 @@ func TestPostgresAccountRuntimeProofStopsUnconfirmedTaskAgents(t *testing.T) {
 	}
 	runtimeNonce := make([]byte, 32)
 	runtimeNonce[0] = 92
-	runtime, _, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID,
+	runtime, _, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: f.request.Fence.OwnerID, ConversationID: runtimeTaskConversation(t, f.store, f.request.Fence.TaskID),
 		RuntimeID: "runtime-parent-stop-proof", LeaseOwner: "portal-parent-stop-proof", SupervisorNonce: runtimeNonce,
 		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
 	if err != nil {
@@ -357,7 +359,7 @@ func TestPostgresAccountRuntimeProofStopsUnconfirmedTaskAgents(t *testing.T) {
 		"execution.stop_all", "runtime-parent-stop-proof"), control.Epoch); err != nil {
 		t.Fatalf("request account Runtime stop: %v", err)
 	}
-	identity, err := runtimeService.StopIdentity(ctx, f.request.Fence.OwnerID)
+	identity, err := runtimeService.StopIdentity(ctx, runtime.Fence.ConversationID)
 	if err != nil {
 		t.Fatalf("read account Runtime stop identity: %v", err)
 	}
@@ -472,6 +474,426 @@ func TestPostgresAgentConcurrentStartsAllowOnlyOneInstance(t *testing.T) {
 	if err := f.store.pool.QueryRow(context.Background(), `SELECT count(*) FROM task_agent_instances WHERE task_id=$1`, f.request.Fence.TaskID).
 		Scan(&count); err != nil || successes != 1 || rejected != 1 || count != 1 {
 		t.Fatalf("concurrent starts: success=%d rejected=%d instances=%d err=%v", successes, rejected, count, err)
+	}
+}
+
+func TestPostgresAgentHostFenceAllowsTextAndStopsOperationsAfterControlRevocation(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+
+	firstHost := createRunningControlHost(t, ctx, f.store, f.principal.UserID, host.ControlAI, 0)
+	firstHost = setAgentTestHostRuntime(t, f.store, firstHost, "ri_agent_host_first")
+	clientAuthExpiresAt := time.Now().UTC().Add(time.Hour)
+	firstRequest := submitHostBoundAgentStart(t, f.store, f.principal.UserID, firstHost.ID,
+		task.Authorization{Kind: string(identity.KindClient), TokenID: f.principal.TokenID,
+			ClientInstallationID: f.principal.ClientInstallationID, Version: 1, ExpiresAt: &clientAuthExpiresAt},
+		"agent-host-first")
+	first, replayed, err := f.service.Start(ctx, firstRequest)
+	if err != nil || replayed {
+		t.Fatalf("start first Host-bound Agent: lease=%+v replayed=%t err=%v", first, replayed, err)
+	}
+	var storedHostID, storedHostOwner, storedHostActor, storedPermission, storedAuthorizationKind, storedRuntimeInstance, storedGrantFingerprint string
+	var storedRuntimeGeneration, storedControlVersion int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT host_id,host_owner_id,host_actor_id,host_permission,host_authorization_kind,
+host_runtime_generation,host_runtime_instance_id,host_control_version,COALESCE(host_grant_fingerprint,'')
+FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`, first.Fence.TaskID, first.Fence.AgentGeneration).
+		Scan(&storedHostID, &storedHostOwner, &storedHostActor, &storedPermission, &storedAuthorizationKind,
+			&storedRuntimeGeneration, &storedRuntimeInstance, &storedControlVersion, &storedGrantFingerprint); err != nil {
+		t.Fatalf("read persisted Host Agent fence: %v", err)
+	}
+	if storedHostID != firstHost.ID || storedHostOwner != f.principal.UserID || storedHostActor != f.principal.UserID ||
+		storedPermission != string(host.PermissionDesktopControl) || storedAuthorizationKind != "owner" ||
+		storedRuntimeGeneration != firstHost.RuntimeGeneration || storedRuntimeInstance != "ri_agent_host_first" ||
+		storedControlVersion != firstHost.ControlVersion || storedGrantFingerprint != "" {
+		t.Fatalf("persisted Host Agent fence does not match startup authorization: host=%q owner=%q actor=%q permission=%q kind=%q generation=%d runtime=%q control=%d grantFingerprint=%q",
+			storedHostID, storedHostOwner, storedHostActor, storedPermission, storedAuthorizationKind,
+			storedRuntimeGeneration, storedRuntimeInstance, storedControlVersion, storedGrantFingerprint)
+	}
+
+	beforeRevocation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: first.Fence.TaskID,
+		Key: "before-host-control-revocation", RequestHash: hashBytes("before host control revocation"), HostID: firstHost.ID,
+		RuntimeGeneration: firstHost.RuntimeGeneration, RuntimeInstanceID: "ri_agent_host_first", ControlVersion: firstHost.ControlVersion,
+		LeaseVersion: first.Fence.LeaseVersion, RuntimeLeaseVersion: first.Fence.LeaseVersion, Status: task.OperationPrepared}
+	if operation, replay, err := f.store.CreateOperation(ctx, beforeRevocation, first.Fence.LeaseOwner); err != nil || replay || operation.Status != task.OperationPrepared {
+		t.Fatalf("admit Host operation before control revocation: operation=%+v replay=%t err=%v", operation, replay, err)
+	}
+
+	otherOwner := createPreRetirementTestUser(t, f.store, 4, 8_000, 16_000)
+	otherHost := createRunningControlHost(t, ctx, f.store, otherOwner.ID, host.ControlAI, 0)
+	otherHost = setAgentTestHostRuntime(t, f.store, otherHost, "ri_agent_host_other")
+	otherRequest := submitHostBoundAgentStart(t, f.store, otherOwner.ID, otherHost.ID, task.Authorization{}, "agent-host-other")
+	otherLease, replayed, err := f.service.Start(ctx, otherRequest)
+	if err != nil || replayed {
+		t.Fatalf("start another account Host-bound Agent: lease=%+v replayed=%t err=%v", otherLease, replayed, err)
+	}
+
+	currentHost, err := f.store.GetHost(ctx, firstHost.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeControlTransitionForTest(t, f.store, firstHost.ID, f.principal.UserID, f.principal.UserID,
+		control.ActionTakeOver, currentHost.ControlVersion, "agent-host-first-takeover")
+
+	if _, err := f.service.Renew(ctx, first.Fence, 30*time.Second); err != nil {
+		t.Fatalf("Host control handoff stopped unrelated Agent text: %v", err)
+	}
+
+	afterRevocation := beforeRevocation
+	afterRevocation.ID = mustID(t, domain.NewOperationID)
+	afterRevocation.Key = "after-host-control-revocation"
+	afterRevocation.RequestHash = hashBytes("after host control revocation")
+	if _, _, err := f.store.CreateOperation(ctx, afterRevocation, first.Fence.LeaseOwner); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host operation was admitted after control revocation: %v", err)
+	}
+	if _, err := f.store.GetOperation(ctx, f.principal.UserID, first.Fence.TaskID, afterRevocation.Key); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("Host operation was persisted after control revocation: %v", err)
+	}
+
+	// Reopening AI control does not restore the old Agent's authority. The
+	// current Host permission is usable again, but its control version has
+	// advanced, so the startup snapshot remains stale.
+	afterTakeover, err := f.store.GetHost(ctx, firstHost.ID)
+	if err != nil || afterTakeover.ControlState != host.ControlUser {
+		t.Fatalf("Host after takeover = %#v, err=%v", afterTakeover, err)
+	}
+	completeControlTransitionForTest(t, f.store, firstHost.ID, f.principal.UserID, f.principal.UserID,
+		control.ActionRelease, afterTakeover.ControlVersion, "agent-host-first-release")
+	reopenedHost, err := f.store.GetHost(ctx, firstHost.ID)
+	if err != nil || reopenedHost.ControlState != host.ControlAI || reopenedHost.ControlVersion == storedControlVersion {
+		t.Fatalf("Host after returning control to AI = %#v, err=%v", reopenedHost, err)
+	}
+	if _, err := f.service.Renew(ctx, first.Fence, 30*time.Second); err != nil {
+		t.Fatalf("stale Host control version stopped unrelated Agent text: %v", err)
+	}
+	staleVersionOperation := afterRevocation
+	staleVersionOperation.ID = mustID(t, domain.NewOperationID)
+	staleVersionOperation.Key = "after-host-control-returned-to-ai"
+	staleVersionOperation.RequestHash = hashBytes("after host control returned to AI")
+	if _, _, err := f.store.CreateOperation(ctx, staleVersionOperation, first.Fence.LeaseOwner); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host operation accepted the old control version after AI control returned: %v", err)
+	}
+	if _, err := f.store.GetOperation(ctx, f.principal.UserID, first.Fence.TaskID, staleVersionOperation.Key); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("stale-version Host operation was persisted after AI control returned: %v", err)
+	}
+	var operationCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_operations WHERE task_id=$1`, first.Fence.TaskID).
+		Scan(&operationCount); err != nil || operationCount != 1 {
+		t.Fatalf("operation count after Host control revocation = %d, err=%v; want only the pre-revocation operation", operationCount, err)
+	}
+
+	if _, err := f.service.Renew(ctx, otherLease.Fence, 30*time.Second); err != nil {
+		t.Fatalf("Host control revocation for first account affected another account's Agent: %v", err)
+	}
+}
+
+func TestPostgresAgentHostMemberGrantRevocationAndRegrantFence(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	actorID := f.principal.UserID
+	hostOwner := createPreRetirementTestUser(t, f.store, 4, 8_000, 16_000)
+	hostValue := createRunningControlHost(t, ctx, f.store, hostOwner.ID, host.ControlAI, 0)
+	hostValue = setAgentTestHostRuntime(t, f.store, hostValue, "ri_agent_shared_host_member")
+	grant, err := f.store.UpsertHostMember(ctx, host.Member{HostID: hostValue.ID, OwnerID: hostOwner.ID, UserID: actorID,
+		Permissions: []host.Permission{host.PermissionDesktopControl}})
+	if err != nil {
+		t.Fatalf("grant Agent actor desktop:control: %v", err)
+	}
+	var initialGrantVersion string
+	if err := f.store.pool.QueryRow(ctx, `SELECT grant_version::text FROM host_members
+WHERE host_id=$1 AND owner_id=$2 AND user_id=$3 AND revoked_at IS NULL`, hostValue.ID, hostOwner.ID, actorID).
+		Scan(&initialGrantVersion); err != nil {
+		t.Fatalf("read initial Host member grant version: %v", err)
+	}
+
+	clientAuthExpiresAt := time.Now().UTC().Add(time.Hour)
+	request := submitHostBoundAgentStart(t, f.store, actorID, hostValue.ID,
+		task.Authorization{Kind: string(identity.KindClient), TokenID: f.principal.TokenID,
+			ClientInstallationID: f.principal.ClientInstallationID, Version: 1, ExpiresAt: &clientAuthExpiresAt},
+		"agent-shared-host-member")
+	lease, replayed, err := f.service.Start(ctx, request)
+	if err != nil || replayed {
+		t.Fatalf("start shared Host-bound Agent: lease=%+v replayed=%t err=%v", lease, replayed, err)
+	}
+	if lease.Fence.OwnerID != actorID || lease.Fence.InitiatorID != actorID {
+		t.Fatalf("shared Host task identity was not actor-owned: owner=%q initiator=%q actor=%q", lease.Fence.OwnerID, lease.Fence.InitiatorID, actorID)
+	}
+	var storedHostOwner, storedHostActor, storedAuthorizationKind, storedGrantFingerprint string
+	if err := f.store.pool.QueryRow(ctx, `SELECT host_owner_id,host_actor_id,host_authorization_kind,host_grant_fingerprint
+FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`, lease.Fence.TaskID, lease.Fence.AgentGeneration).
+		Scan(&storedHostOwner, &storedHostActor, &storedAuthorizationKind, &storedGrantFingerprint); err != nil {
+		t.Fatalf("read persisted member Agent fence: %v", err)
+	}
+	if storedHostOwner != hostOwner.ID || storedHostActor != actorID || storedAuthorizationKind != "member" ||
+		len(storedGrantFingerprint) != 64 || grant.CreatedAt.IsZero() {
+		t.Fatalf("persisted member Agent fence does not capture Host grant: owner=%q actor=%q kind=%q grantFingerprint=%q createdAt=%v",
+			storedHostOwner, storedHostActor, storedAuthorizationKind, storedGrantFingerprint, grant.CreatedAt)
+	}
+
+	beforeRevoke := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: lease.Fence.TaskID,
+		Key: "shared-host-before-member-revoke", RequestHash: hashBytes("shared Host before member revoke"), HostID: hostValue.ID,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_agent_shared_host_member", ControlVersion: hostValue.ControlVersion,
+		LeaseVersion: lease.Fence.LeaseVersion, RuntimeLeaseVersion: lease.Fence.LeaseVersion, Status: task.OperationPrepared}
+	if operation, replay, err := f.store.CreateOperation(ctx, beforeRevoke, lease.Fence.LeaseOwner); err != nil || replay || operation.Status != task.OperationPrepared {
+		t.Fatalf("admit operation under active Host member grant: operation=%+v replay=%t err=%v", operation, replay, err)
+	}
+	if _, err := f.store.UpdateOperation(ctx, app.OperationUpdate{TaskID: beforeRevoke.TaskID, OperationKey: beforeRevoke.Key,
+		LeaseOwner: lease.Fence.LeaseOwner, LeaseVersion: lease.Fence.LeaseVersion,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_agent_shared_host_member",
+		ControlVersion: hostValue.ControlVersion, RuntimeLeaseVersion: lease.Fence.LeaseVersion, Status: task.OperationDispatched}); err != nil {
+		t.Fatalf("dispatch operation before member grant revocation: %v", err)
+	}
+	if _, err := f.store.UpdateOperation(ctx, app.OperationUpdate{TaskID: beforeRevoke.TaskID, OperationKey: beforeRevoke.Key,
+		LeaseOwner: lease.Fence.LeaseOwner, LeaseVersion: lease.Fence.LeaseVersion,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_agent_shared_host_member",
+		ControlVersion: hostValue.ControlVersion, RuntimeLeaseVersion: lease.Fence.LeaseVersion,
+		Status: task.OperationUnknown, ExternalID: "uncertain-before-revoke"}); err != nil {
+		t.Fatalf("record uncertain operation before member grant revocation: %v", err)
+	}
+	preparedBeforeRevoke := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: lease.Fence.TaskID,
+		Key: "shared-host-prepared-before-member-revoke", RequestHash: hashBytes("shared Host prepared before member revoke"), HostID: hostValue.ID,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: "ri_agent_shared_host_member", ControlVersion: hostValue.ControlVersion,
+		LeaseVersion: lease.Fence.LeaseVersion, RuntimeLeaseVersion: lease.Fence.LeaseVersion, Status: task.OperationPrepared}
+	if operation, replay, err := f.store.CreateOperation(ctx, preparedBeforeRevoke, lease.Fence.LeaseOwner); err != nil || replay || operation.Status != task.OperationPrepared {
+		t.Fatalf("admit second operation under active Host member grant: operation=%+v replay=%t err=%v", operation, replay, err)
+	}
+	pendingSubmission := newTestTaskSubmission(t, actorID, hostValue.ID, "shared-host-queued-before-revoke", "queued before Host grant revocation")
+	pendingTask, err := f.store.SubmitTask(ctx, pendingSubmission)
+	if err != nil {
+		t.Fatalf("submit second Task under active Host member grant: %v", err)
+	}
+
+	if err := f.store.RevokeHostMember(ctx, hostValue.ID, hostOwner.ID, actorID); err != nil {
+		t.Fatalf("revoke Agent actor Host grant: %v", err)
+	}
+	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host-bound Agent renewed after member grant revocation: %v", err)
+	}
+	assertSharedHostOperationRejected(t, f.store, beforeRevoke, lease.Fence.OwnerID, lease.Fence.LeaseOwner, "shared-host-after-member-revoke")
+	assertSharedHostOperationRearmRejected(t, f.store, beforeRevoke, lease.Fence, hostValue, "after member revoke")
+	assertSharedHostOperationDispatchRejected(t, f.store, preparedBeforeRevoke, lease.Fence, hostValue, "after member revoke")
+	if claimed, found, err := f.store.ClaimNextTask(ctx, "agent-shared-host-after-revoke", 30*time.Second); err != nil || found || claimed.ID == pendingTask.Task.ID {
+		t.Fatalf("Host member revocation did not fence queued Task claim: found=%t claimed=%+v err=%v", found, claimed, err)
+	}
+
+	// UpsertHostMember starts a new grant by replacing created_at. The old
+	// Agent must remain fenced even though the same permission is granted again.
+	time.Sleep(2 * time.Millisecond)
+	regrant, err := f.store.UpsertHostMember(ctx, host.Member{HostID: hostValue.ID, OwnerID: hostOwner.ID, UserID: actorID,
+		Permissions: []host.Permission{host.PermissionDesktopControl}})
+	if err != nil {
+		t.Fatalf("regrant Agent actor desktop:control: %v", err)
+	}
+	if !regrant.CreatedAt.After(grant.CreatedAt) {
+		t.Fatalf("regrant did not create a new grant version: first=%v regrant=%v", grant.CreatedAt, regrant.CreatedAt)
+	}
+	var regrantVersion string
+	if err := f.store.pool.QueryRow(ctx, `SELECT grant_version::text FROM host_members
+WHERE host_id=$1 AND owner_id=$2 AND user_id=$3 AND revoked_at IS NULL`, hostValue.ID, hostOwner.ID, actorID).
+		Scan(&regrantVersion); err != nil {
+		t.Fatalf("read replacement Host member grant version: %v", err)
+	}
+	if regrantVersion == initialGrantVersion {
+		t.Fatalf("Host member regrant reused grant version %q", regrantVersion)
+	}
+	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("old Host-bound Agent renewed after member grant was replaced: %v", err)
+	}
+	assertSharedHostOperationRejected(t, f.store, beforeRevoke, lease.Fence.OwnerID, lease.Fence.LeaseOwner, "shared-host-after-member-regrant")
+	assertSharedHostOperationRearmRejected(t, f.store, beforeRevoke, lease.Fence, hostValue, "after member regrant")
+	assertSharedHostOperationDispatchRejected(t, f.store, preparedBeforeRevoke, lease.Fence, hostValue, "after member regrant")
+	var operationCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_operations WHERE task_id=$1`, lease.Fence.TaskID).
+		Scan(&operationCount); err != nil || operationCount != 2 {
+		t.Fatalf("operation count after member grant revoke/regrant = %d, err=%v; want only the two pre-revocation operations", operationCount, err)
+	}
+}
+
+func TestPostgresAgentHostOfflineAllowsTextButRejectsOperations(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	computer := createRunningControlHost(t, ctx, f.store, f.principal.UserID, host.ControlAI, 0)
+	computer = setAgentTestHostRuntime(t, f.store, computer, "ri_offline_task_host")
+	expires := time.Now().UTC().Add(time.Hour)
+	request := submitHostBoundAgentStart(t, f.store, f.principal.UserID, computer.ID,
+		task.Authorization{Kind: string(identity.KindClient), TokenID: f.principal.TokenID,
+			ClientInstallationID: f.principal.ClientInstallationID, Version: 1, ExpiresAt: &expires}, "agent-host-offline")
+	lease, _, err := f.service.Start(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE hosts SET state='stopped' WHERE id=$1`, computer.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); err != nil {
+		t.Fatalf("offline Host interrupted the Agent's text execution: %v", err)
+	}
+	operation := task.Operation{ID: mustID(t, domain.NewOperationID), TaskID: lease.Fence.TaskID,
+		Key: "offline-host-operation", RequestHash: hashBytes("offline host operation"), HostID: computer.ID,
+		RuntimeGeneration: computer.RuntimeGeneration, RuntimeInstanceID: "ri_offline_task_host", ControlVersion: computer.ControlVersion,
+		LeaseVersion: lease.Fence.LeaseVersion, RuntimeLeaseVersion: lease.Fence.LeaseVersion, Status: task.OperationPrepared}
+	if _, _, err := f.store.CreateOperation(ctx, operation, lease.Fence.LeaseOwner); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("offline Host admitted a computer operation: %v", err)
+	}
+	replacement := request
+	replacement.Fence.AgentInstanceID = "agent-host-offline-replacement"
+	replacement.SupervisorNonce = bytes.Repeat([]byte{8}, 32)
+	if _, _, err := f.service.Start(ctx, replacement); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unconfirmed Agent was replaced while Host offline: %v", err)
+	}
+	receipt := signAgentLifecycleReceipt(t, f.key, lease.Fence, request.SupervisorNonce)
+	if _, err := f.service.ConfirmStopped(ctx, receipt); err != nil {
+		t.Fatalf("confirm old Agent stop: %v", err)
+	}
+	restarted, _, err := f.service.Start(ctx, replacement)
+	if err != nil || restarted.Fence.AgentGeneration != lease.Fence.AgentGeneration+1 {
+		t.Fatalf("offline Host prevented verified Agent recovery: lease=%+v err=%v", restarted, err)
+	}
+	if _, err := f.service.Renew(ctx, restarted.Fence, 30*time.Second); err != nil {
+		t.Fatalf("recovered Agent could not continue text while Host offline: %v", err)
+	}
+}
+
+func TestPostgresAgentRecoveryRejectsRegrantedHostPermission(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, f.store, 2, 2000, 4096)
+	computer := createRunningControlHost(t, ctx, f.store, owner.ID, host.ControlAI, 0)
+	computer = setAgentTestHostRuntime(t, f.store, computer, "ri_regrant_recovery")
+	grant := host.Member{HostID: computer.ID, OwnerID: owner.ID, UserID: f.principal.UserID,
+		Permissions: []host.Permission{host.PermissionDesktopControl}}
+	if _, err := f.store.UpsertHostMember(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Hour)
+	request := submitHostBoundAgentStart(t, f.store, f.principal.UserID, computer.ID,
+		task.Authorization{Kind: string(identity.KindClient), TokenID: f.principal.TokenID,
+			ClientInstallationID: f.principal.ClientInstallationID, Version: 1, ExpiresAt: &expires}, "agent-regrant-recovery")
+	lease, _, err := f.service.Start(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.ConfirmStopped(ctx, signAgentLifecycleReceipt(t, f.key, lease.Fence, request.SupervisorNonce)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RevokeHostMember(ctx, computer.ID, owner.ID, f.principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.UpsertHostMember(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
+	replacement := request
+	replacement.Fence.AgentInstanceID = "agent-regrant-replacement"
+	replacement.SupervisorNonce = bytes.Repeat([]byte{7}, 32)
+	if _, _, err := f.service.Start(ctx, replacement); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("regranted Host permission revived an old Agent: %v", err)
+	}
+}
+
+func assertSharedHostOperationDispatchRejected(t *testing.T, store *Store, operation task.Operation, fence app.AgentInstanceFence,
+	hostValue host.Host, phase string) {
+	t.Helper()
+	_, err := store.UpdateOperation(context.Background(), app.OperationUpdate{
+		TaskID: operation.TaskID, OperationKey: operation.Key, LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: hostValue.RuntimeInstanceID,
+		ControlVersion: hostValue.ControlVersion, RuntimeLeaseVersion: fence.LeaseVersion, Status: task.OperationDispatched,
+	})
+	if domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host operation dispatched %s after member grant changed: %v", phase, err)
+	}
+	stored, err := store.GetOperation(context.Background(), fence.OwnerID, operation.TaskID, operation.Key)
+	if err != nil || stored.Status != task.OperationPrepared {
+		t.Fatalf("Host operation state after rejected dispatch %s = %q, err=%v; want prepared", phase, stored.Status, err)
+	}
+}
+
+func assertSharedHostOperationRejected(t *testing.T, store *Store, original task.Operation, ownerID, leaseOwner, key string) {
+	t.Helper()
+	value := original
+	value.ID = mustID(t, domain.NewOperationID)
+	value.Key = key
+	value.RequestHash = hashBytes(key)
+	if _, _, err := store.CreateOperation(context.Background(), value, leaseOwner); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host operation %q was admitted after member grant changed: %v", key, err)
+	}
+	if _, err := store.GetOperation(context.Background(), ownerID, original.TaskID, key); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("Host operation %q was persisted after member grant changed: %v", key, err)
+	}
+}
+
+func assertSharedHostOperationRearmRejected(t *testing.T, store *Store, operation task.Operation, fence app.AgentInstanceFence,
+	hostValue host.Host, phase string) {
+	t.Helper()
+	_, err := store.UpdateOperation(context.Background(), app.OperationUpdate{
+		TaskID: operation.TaskID, OperationKey: operation.Key, LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion,
+		RuntimeGeneration: hostValue.RuntimeGeneration, RuntimeInstanceID: hostValue.RuntimeInstanceID,
+		ControlVersion: hostValue.ControlVersion, RuntimeLeaseVersion: fence.LeaseVersion,
+		Status: task.OperationPrepared, RearmAfterNotFound: true,
+	})
+	if domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("Host operation rearmed %s after member grant changed: %v", phase, err)
+	}
+	stored, err := store.GetOperation(context.Background(), fence.OwnerID, operation.TaskID, operation.Key)
+	if err != nil || stored.Status != task.OperationUnknown {
+		t.Fatalf("Host operation state after rejected rearm %s = %q, err=%v; want unknown", phase, stored.Status, err)
+	}
+}
+
+func TestPostgresAgentHostlessLeaseRenewalDoesNotRequireHostFence(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	lease, replayed, err := f.service.Start(context.Background(), f.request)
+	if err != nil || replayed {
+		t.Fatalf("start Hostless Agent: lease=%+v replayed=%t err=%v", lease, replayed, err)
+	}
+	if _, err := f.service.Renew(context.Background(), lease.Fence, 30*time.Second); err != nil {
+		t.Fatalf("Hostless Agent renewal unexpectedly required a Host fence: %v", err)
+	}
+}
+
+func setAgentTestHostRuntime(t *testing.T, store *Store, value host.Host, runtimeInstanceID string) host.Host {
+	t.Helper()
+	ctx := context.Background()
+	current, err := store.GetHost(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRuntimeInstanceID(ctx, current.ID, current.RuntimeGeneration, current.ControlVersion, "", runtimeInstanceID); err != nil {
+		t.Fatalf("set Host runtime identity: %v", err)
+	}
+	current, err = store.GetHost(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return current
+}
+
+func submitHostBoundAgentStart(t *testing.T, store *Store, ownerID, hostID string, authorization task.Authorization,
+	idempotencyKey string) app.AgentInstanceStart {
+	t.Helper()
+	ctx := context.Background()
+	submission := newTestTaskSubmission(t, ownerID, hostID, idempotencyKey, "run Host-bound Agent")
+	if authorization.Kind != "" {
+		submission.Task.Authorization = authorization
+	}
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Host-bound Agent task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "agent-host-"+idempotencyKey, time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		var status, hostID, executionLocation string
+		var executionEpoch int64
+		_ = store.pool.QueryRow(ctx, `SELECT status,COALESCE(host_id,''),execution_location,execution_epoch
+FROM tasks WHERE id=$1`, created.Task.ID).Scan(&status, &hostID, &executionLocation, &executionEpoch)
+		t.Fatalf("claim Host-bound Agent task: claimed=%t task=%+v status=%q host=%q execution_location=%q execution_epoch=%d err=%v",
+			found, claimed, status, hostID, executionLocation, executionEpoch, err)
+	}
+	nonce := sha256.Sum256([]byte("agent-host-nonce:" + idempotencyKey))
+	return app.AgentInstanceStart{
+		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+			AgentInstanceID: "agent-" + idempotencyKey, AgentSessionID: "session-" + idempotencyKey,
+			SupervisorID: "supervisor-1", LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			AuthorizationVersion: claimed.Authorization.Version, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
+		SupervisorNonce: nonce[:], LeaseDuration: 30 * time.Second,
 	}
 }
 

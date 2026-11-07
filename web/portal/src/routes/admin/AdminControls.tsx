@@ -201,10 +201,6 @@ export function AdminControls() {
   const changeDisabled = versionConflict || !data?.notify_configured || create.isPending || update.isPending || remove.isPending;
 
   return <section className="admin-content">
-    <div className="page-heading"><div><p className="eyebrow">治理与审计</p><h1>通知规则</h1><p className="muted">只管理账号数阈值通知规则。所有通知只写入 Morde 本地接收箱，不会发送到外部服务。</p></div>
-      <button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>{query.isFetching ? '正在刷新…' : '刷新数据'}</button>
-    </div>
-
     {versionConflict && <div className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></div>}
     {notice && <p className="notice notice-info" role="status">{notice}</p>}
 
@@ -212,7 +208,7 @@ export function AdminControls() {
       : query.isError ? <ErrorCard error={query.error} retry={() => void query.refetch()} />
         : data && <>
           <section className="admin-detail-section" aria-labelledby="admin-controls-summary-heading">
-            <h2 id="admin-controls-summary-heading">阈值通知概览</h2>
+            <div className="design-panel-header"><div><h2 id="admin-controls-summary-heading">阈值通知概览</h2><p>所有通知只写入 Morde 本地接收箱，不会发送到外部服务。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>{query.isFetching ? '正在刷新…' : '刷新数据'}</button></div>
             <div className="admin-detail-facts">
               <article><span>账号总数</span><strong>{formatNumber(data.accounts_total)}</strong></article>
               <article><span>下一触发阈值</span><strong>{data.next_threshold === null ? '暂无' : formatNumber(data.next_threshold)}</strong></article>

@@ -35,6 +35,7 @@ func taskDomain(row sqlcgen.Task) task.Task {
 		ID: row.ID, OwnerID: row.OwnerID, ProjectID: row.ProjectID.String, InitiatorID: row.InitiatorID,
 		ConversationID: row.ConversationID, HostID: row.HostID.String,
 		ExecutionLocation: row.ExecutionLocation, WorkspaceID: row.WorkspaceID.String,
+		WorkspaceOwnerID: row.WorkspaceOwnerID.String, WorkspaceProjectResourceVersion: int64Pointer(row.WorkspaceProjectResourceVersion),
 		InputRevision: int64Pointer(row.InputRevision), WorkspaceCheckpointRevision: int64Pointer(row.WorkspaceCheckpointRevision),
 		ContextDigest:   append([]byte(nil), row.ContextDigest...),
 		AgentInstanceID: row.AgentInstanceID, AgentGeneration: row.AgentGeneration, AgentSessionID: row.AgentSessionID,

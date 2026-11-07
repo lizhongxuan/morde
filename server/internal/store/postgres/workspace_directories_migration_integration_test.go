@@ -34,6 +34,7 @@ func TestWorkspaceDirectoryMigrationDownUpAndPreservesRows(t *testing.T) {
 		ctx := context.Background()
 		owner := createTestUser(t, store, 3, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "directory-down-revision")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		if _, err := pool.Exec(ctx, `INSERT INTO workspace_revision_directories
 (workspace_id,valid_from_revision,directory_path,folded_path,mode,mod_time_ns)
 VALUES ($1,0,'src','src',493,123)`, value.ID); err != nil {
@@ -51,6 +52,7 @@ VALUES ($1,0,'src','src',493,123)`, value.ID); err != nil {
 		ctx := context.Background()
 		owner := createTestUser(t, store, 4, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "directory-down-session")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		if _, err := pool.Exec(ctx, `INSERT INTO workspace_sync_sessions
 (id,workspace_id,owner_id,replica_id,direction,policy,state,stage,base_revision,target_revision,pinned_revision,planned_bytes,files,upload_files,download_files)
 VALUES ('pabc1234',$1,$2,'replica-directory-test','bidirectional','live','planned','scan',0,0,0,0,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb)`, value.ID, owner.ID); err != nil {
@@ -74,6 +76,7 @@ VALUES ($1,'pabc1234','[{"path":"src","mode":493,"mod_time_ns":123}]'::jsonb,
 		ctx := context.Background()
 		owner := createTestUser(t, store, 5, 10_000, 20_000)
 		value := createTestWorkspace(t, ctx, store, owner.ID, "directory-legacy-unknown")
+		removeInitialWorkspaceRootForLegacyTest(t, ctx, pool, value.ID)
 		if _, err := pool.Exec(ctx, `INSERT INTO workspace_revision_files
 (workspace_id,valid_from_revision,file_path,folded_path,size_bytes,sha256,mode,chunks)
 VALUES ($1,0,'src/main.go','src/main.go',0,$2,420,'[]'::jsonb)`, value.ID, strings.Repeat("0", 64)); err != nil {
@@ -97,6 +100,13 @@ VALUES ($1,0,'src','src',488,123)`, value.ID); err != nil {
 			t.Fatalf("known manifest directory metadata = %#v, err=%v", page.Directories, err)
 		}
 	})
+}
+
+func removeInitialWorkspaceRootForLegacyTest(t *testing.T, ctx context.Context, pool *pgxpool.Pool, workspaceID string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `DELETE FROM workspace_revision_directories WHERE workspace_id=$1 AND directory_path='.'`, workspaceID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertWorkspaceDirectoryMigrationDownRejected(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {

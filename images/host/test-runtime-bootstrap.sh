@@ -4,7 +4,7 @@ set -euo pipefail
 image="${IMAGE_TAG:-registry.local/cloudhost/host:1.0.0}"
 platform="${IMAGE_PLATFORM:-linux/amd64}"
 credential=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-replica_credential=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+replica_credential=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
 codex_auth_fixture='{"morde_test_fixture":"SYNTHETIC_NOT_A_CREDENTIAL"}'
 smoke_id="${$}-${RANDOM}-${RANDOM}"
 runtime_volume="morde-runtime-smoke-${smoke_id}"

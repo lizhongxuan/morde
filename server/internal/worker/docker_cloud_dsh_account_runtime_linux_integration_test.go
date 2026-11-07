@@ -71,11 +71,15 @@ func TestRealDockerGuardianProcess(t *testing.T) {
 	if os.Getenv("MORDE_REAL_DOCKER_GUARDIAN_HELPER") != "1" {
 		t.Skip("Guardian subprocess helper")
 	}
+	dockerSocket := os.Getenv("MORDE_REAL_DOCKER_SOCKET")
+	if dockerSocket == "" {
+		dockerSocket = "/var/run/docker.sock"
+	}
 	key, err := dshguardian.LoadAttestationPrivateKey(os.Getenv("MORDE_REAL_DOCKER_GUARDIAN_KEY"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := dshguardian.Open(os.Getenv("MORDE_REAL_DOCKER_GUARDIAN_STATE"), "/var/run/docker.sock", key)
+	service, err := dshguardian.Open(os.Getenv("MORDE_REAL_DOCKER_GUARDIAN_STATE"), dockerSocket, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +125,10 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 	if image == "" {
 		t.Skip("set MORDE_REAL_DOCKER_RUNTIME_IMAGE to a local pinned Runtime image")
 	}
+	dockerHost := os.Getenv("MORDE_REAL_DOCKER_HOST")
+	if dockerHost == "" {
+		dockerHost = "/var/run/docker.sock"
+	}
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -146,15 +154,14 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 	}
 	guardian := guardianInterface.(*unixSocketDockerCloudDSHGuardian)
 	docker, err := NewDockerCloudDSHSupervisor(DockerCloudDSHSupervisorOptions{
-		DockerHost: "unix:///var/run/docker.sock", Image: image, NodePath: "/usr/local/bin/node",
-		ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", SupervisorID: "supervisor-test",
-		SigningKey: bytes.Repeat([]byte{5}, 32), Guardian: guardian,
+		DockerHost: dockerHost, Image: image, NodePath: "/usr/local/bin/node",
+		ScriptPath: "/opt/morde-cloud-runtime/bin.mjs", Guardian: guardian,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	fence := app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000",
-		OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
+		ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime-1", RuntimeGeneration: 1,
 		LeaseOwner: "worker-runtime", LeaseVersion: 1, ExecutionEpoch: 1}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
@@ -322,6 +329,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 	t.Run("postgres-manager", func(t *testing.T) {
 		store, pool := newF01TemporaryStore(t)
 		owner := createF01User(t, ctx, store)
+		conversationID := createF01RuntimeConversation(t, ctx, pool, owner.ID)
 		if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 			t.Fatal(err)
 		}
@@ -379,7 +387,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 			t.Fatal(err)
 		}
 		firstCtx, cancelFirst := context.WithTimeout(ctx, 20*time.Second)
-		session, err := manager.Acquire(firstCtx, owner.ID)
+		session, err := manager.Acquire(firstCtx, owner.ID, conversationID)
 		if err != nil {
 			cancelFirst()
 			t.Fatal(err)
@@ -397,7 +405,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 		prepareTask := func(taskCtx context.Context, sequence int64) (app.AgentInstanceLease, []byte) {
 			t.Helper()
 			submitted, err := taskService.Submit(taskCtx, principal, app.SubmitTaskCommand{
-				ModelID: "p1234567", Objective: "Answer with one sentence.",
+				ConversationID: conversationID, ModelID: "p1234567", Objective: "Answer with one sentence.",
 				Budget:         task.Budget{ActiveSeconds: 60, ToolCalls: 5, ModelTokens: 1000},
 				IdempotencyKey: fmt.Sprintf("f01-real-account-task-%d", sequence),
 			})
@@ -425,7 +433,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 		leaseA, nonceA := prepareTask(firstCtx, 1)
 		secondCtx, cancelSecond := context.WithTimeout(ctx, 20*time.Second)
 		defer cancelSecond()
-		reused, err := manager.Acquire(secondCtx, owner.ID)
+		reused, err := manager.Acquire(secondCtx, owner.ID, conversationID)
 		if err != nil || reused != session {
 			t.Fatalf("second Docker Task did not reuse the PostgreSQL account Runtime: reused=%t err=%v", reused == session, err)
 		}
@@ -484,7 +492,7 @@ func TestRealDockerAccountRuntimeTaskIsolationAndGuardianCrashRestart(t *testing
 		case <-ctx.Done():
 			t.Fatalf("Task B did not continue after Task A stopped: %v", ctx.Err())
 		}
-		current, found, err := control.Get(ctx, owner.ID)
+		current, found, err := control.Get(ctx, conversationID)
 		var provedTasks int
 		if queryErr := pool.QueryRow(ctx, `SELECT count(*) FROM task_agent_instances
 WHERE owner_id=$1 AND state='stopped' AND guardian_stop_attestation IS NOT NULL
@@ -502,7 +510,7 @@ WHERE owner_id=$1 AND state='stopped' AND guardian_stop_attestation IS NOT NULL
 		if err := manager.reapStopCandidates(ctx); err != nil {
 			t.Fatal(err)
 		}
-		stopped, found, err := control.Get(ctx, owner.ID)
+		stopped, found, err := control.Get(ctx, conversationID)
 		var runtimeProofAcknowledged bool
 		if queryErr := pool.QueryRow(ctx, `SELECT guardian_stop_attestation IS NOT NULL AND guardian_stop_acknowledged_at IS NOT NULL
 FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
@@ -583,7 +591,32 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 		if err != nil {
 			t.Fatal(err)
 		}
-		toolBroker, err := app.NewCloudDSHToolBroker(store, runtimeTools, nil, nil)
+		personalData, err := app.NewPersonalMutationService(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		personalSync, err := app.NewPersonalSyncService(store, bytes.Repeat([]byte{8}, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		goals, err := app.NewGoalService(personalData, store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		quota, err := app.NewPersonalDataQuotaService(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		personalFiles, err := app.NewPersonalAttachmentService(store, quota)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordCapture, err := app.NewRecordCaptureService(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		toolBroker, err := app.NewCloudDSHToolBrokerWithPersonalData(store, runtimeTools, nil, nil,
+			recordCapture, personalData, personalSync, goals, personalFiles, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -601,7 +634,10 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 			defer done()
 			if session == nil {
 				manager.mu.Lock()
-				session = manager.sessions[owner.ID]
+				for _, active := range manager.sessions {
+					session = active
+					break
+				}
 				manager.mu.Unlock()
 			}
 			if session == nil {
@@ -624,8 +660,7 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 			t.Fatal(err)
 		}
 		executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-			NodePath: "/usr/local/bin/node", ScriptPath: "/opt/morde-cloud-runtime/bin.mjs",
-			SupervisorID: "supervisor-test", Supervisor: docker, AccountRuntimes: manager,
+			ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "supervisor-test", AccountRuntimes: manager,
 			Instances: instances, Checkpoints: checkpoints, Models: f01ImmediateCloudDSHModel{},
 			Tools: toolBroker, Children: children, Completion: toolBroker,
 		})
@@ -734,6 +769,10 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 			completed.FileDeliveryIntent != task.FileDeliveryNone || completed.AgentInstanceID == "" {
 			t.Fatalf("Portal-submitted Task did not complete through the persistent Runtime after disconnect: task=%+v last_get_error=%v", completed, lastGetErr)
 		}
+		messages, err := store.ListMessages(ctx, owner.ID, completed.ConversationID, app.PageRequest{Limit: 20})
+		if err != nil || len(messages.Items) != 2 || messages.Items[0].Role != "assistant" || messages.Items[0].Content != completed.Result {
+			t.Fatalf("completed Runtime reply was not saved to conversation: messages=%+v err=%v", messages.Items, err)
+		}
 		cancelWorker()
 		select {
 		case runErr := <-workerDone:
@@ -744,7 +783,7 @@ FROM account_agent_runtimes WHERE service_instance_id=$1::uuid AND owner_id=$2`,
 		case <-time.After(10 * time.Second):
 			t.Fatal("TaskWorker did not stop after completing the Task")
 		}
-		current, found, err := control.Get(ctx, owner.ID)
+		current, found, err := control.Get(ctx, completed.ConversationID)
 		if err != nil || !found || current.State != app.AccountAgentRuntimeRunning {
 			t.Fatalf("Portal Task closed the account Runtime: runtime=%+v found=%t err=%v", current, found, err)
 		}
@@ -757,7 +796,7 @@ WHERE task_id=$1 AND owner_id=$2 AND state='stopped' AND guardian_stop_attestati
 		if taskProofs != 1 {
 			t.Fatalf("Portal Task Guardian stop proof acknowledgements = %d, want 1", taskProofs)
 		}
-		if session, err = manager.Acquire(ctx, owner.ID); err != nil {
+		if session, err = manager.Acquire(ctx, owner.ID, completed.ConversationID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := control.RequestStop(ctx, session.runtime.Fence); err != nil {
@@ -766,7 +805,7 @@ WHERE task_id=$1 AND owner_id=$2 AND state='stopped' AND guardian_stop_attestati
 		if err := manager.reapStopCandidates(ctx); err != nil {
 			t.Fatal(err)
 		}
-		stopped, found, err := control.Get(ctx, owner.ID)
+		stopped, found, err := control.Get(ctx, completed.ConversationID)
 		if err != nil || !found || stopped.State != app.AccountAgentRuntimeStopped {
 			t.Fatalf("Portal account Runtime did not stop with Guardian proof: runtime=%+v found=%t err=%v", stopped, found, err)
 		}

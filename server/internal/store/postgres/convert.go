@@ -36,6 +36,7 @@ func hostDomain(row sqlcgen.Host) host.Host {
 func workspaceDomain(row sqlcgen.Workspace) workspace.Workspace {
 	return workspace.Workspace{
 		ID: row.ID, OwnerID: row.OwnerID, Name: row.Name, State: workspace.State(row.State),
+		ReadOnly: row.IsReadOnly,
 		Revision: row.Revision, UsedBytes: row.UsedBytes, QuotaBytes: row.QuotaBytes, LastError: row.LastError,
 		CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time, DeletedAt: timePointer(row.DeletedAt),
 	}

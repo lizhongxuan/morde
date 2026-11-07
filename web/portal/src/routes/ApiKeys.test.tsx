@@ -21,7 +21,11 @@ describe('ApiKeys', () => {
     const user = userEvent.setup();
     renderPage();
 
-    const submit = await screen.findByRole('button', { name: '创建 API Key' });
+    const open = await screen.findByRole('button', { name: '＋ 创建 API Key' });
+    expect(open).toHaveAttribute('aria-expanded', 'false');
+    await user.click(open);
+    expect(screen.getByRole('button', { name: '收起' })).toHaveAttribute('aria-expanded', 'true');
+    const submit = screen.getByRole('button', { name: '创建 API Key' });
     expect(submit).toBeDisabled();
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
     await user.type(screen.getByLabelText('名称'), '我的 MCP');

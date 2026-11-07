@@ -114,10 +114,16 @@ func NewTaskStopWorker(options TaskStopWorkerOptions) (*TaskStopWorker, error) {
 
 // Run continuously claims and settles one task stop request at a time. It must
 // receive the service lifecycle context, not an HTTP request context.
-func (w *TaskStopWorker) Run(ctx context.Context) error {
+func (w *TaskStopWorker) Run(ctx context.Context) (runErr error) {
 	if ctx == nil {
 		return errors.New("task stop worker context is required")
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("task stop worker panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+			runErr = errors.New("task stop worker panicked")
+		}
+	}()
 	w.runMu.Lock()
 	if w.started {
 		w.runMu.Unlock()
@@ -125,69 +131,86 @@ func (w *TaskStopWorker) Run(ctx context.Context) error {
 	}
 	w.started = true
 	w.runMu.Unlock()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if reconciler, ok := w.store.(WorkspaceInputRevisionReconciler); ok {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			w.reconcileWorkspaceInputChanges(ctx, reconciler)
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("reconcile workspace task inputs panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+				}
+			}()
+			w.reconcileWorkspaceInputChanges(runCtx, reconciler)
 		}()
-		defer func() { <-done }()
+		defer func() {
+			cancel()
+			<-done
+		}()
 	}
 
-	for ctx.Err() == nil {
-		if err := w.reconcileExecutionStops(ctx); err != nil {
+	for runCtx.Err() == nil {
+		if err := w.reconcileExecutionStops(runCtx); err != nil {
 			w.logger.Error("reconcile owner execution stop failed", zap.String("error_type", fmt.Sprintf("%T", err)))
-			if !waitStopWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(runCtx, w.pollInterval) {
 				break
 			}
 			continue
 		}
-		claim, ok, err := w.claim(ctx)
-		if ctx.Err() != nil {
+		claim, ok, err := w.claim(runCtx)
+		if runCtx.Err() != nil {
 			break
 		}
 		if err != nil {
 			w.logger.Error("claim task stop failed", zap.String("error_type", fmt.Sprintf("%T", err)))
-			if !waitStopWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(runCtx, w.pollInterval) {
 				break
 			}
 			continue
 		}
 		if !ok {
-			if !waitStopWorker(ctx, w.pollInterval) {
+			if !waitStopWorker(runCtx, w.pollInterval) {
 				break
 			}
 			continue
 		}
 		if err := w.validateClaim(claim); err != nil {
 			w.logger.Error("task stop claim is invalid", zap.String("error_type", fmt.Sprintf("%T", err)))
-			w.release(claim, ctx)
-			if !waitStopWorker(ctx, w.pollInterval) {
+			w.release(claim, runCtx)
+			if !waitStopWorker(runCtx, w.pollInterval) {
 				break
 			}
 			continue
 		}
-		if err := w.processClaim(ctx, claim); err != nil {
-			if ctx.Err() == nil {
+		if err := w.processClaim(runCtx, claim); err != nil {
+			if runCtx.Err() == nil {
 				w.logger.Error("task stop recovery deferred", zap.String("task_id", claim.Task.ID), zap.String("request_id", claim.Request.ID), zap.String("error_type", fmt.Sprintf("%T", err)))
 			}
-			w.release(claim, ctx)
-			if !waitStopWorker(ctx, w.pollInterval) {
+			w.release(claim, runCtx)
+			if !waitStopWorker(runCtx, w.pollInterval) {
 				break
 			}
 		}
 	}
-	return ctx.Err()
+	return runCtx.Err()
 }
 
 func (w *TaskStopWorker) reconcileWorkspaceInputChanges(ctx context.Context, reconciler WorkspaceInputRevisionReconciler) {
 	for ctx.Err() == nil {
-		callCtx, cancel := context.WithTimeout(ctx, w.operationTimeout)
-		err := reconciler.ReconcileStaleWorkspaceTasks(callCtx)
-		cancel()
-		if err != nil && ctx.Err() == nil {
-			w.logger.Warn("reconcile tasks with stale Workspace inputs failed", zap.String("error_type", fmt.Sprintf("%T", err)))
-		}
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("reconcile tasks with stale Workspace inputs panicked", zap.String("worker_id", w.workerID), zap.ByteString("stack", debug.Stack()))
+				}
+			}()
+			callCtx, cancel := context.WithTimeout(ctx, w.operationTimeout)
+			err := reconciler.ReconcileStaleWorkspaceTasks(callCtx)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				w.logger.Warn("reconcile tasks with stale Workspace inputs failed", zap.String("error_type", fmt.Sprintf("%T", err)))
+			}
+		}()
 		if !waitStopWorker(ctx, w.pollInterval) {
 			return
 		}

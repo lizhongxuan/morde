@@ -70,10 +70,8 @@ func TestPostgresProjectMCPConnectorOwnerInitiatorAndRevocationFences(t *testing
 
 	appendTask := func(actorID, key string) app.TaskSubmissionResult {
 		t.Helper()
-		command := app.AppendMessageCommand{ModelID: "project-test-model", Content: "Use the granted MCP connector", IdempotencyKey: key,
-			MCPConnectorIDs: []string{connector.ID}}
-		result, err := conversations.AppendMessage(ctx, principal(actorID), projectValue.ID, conversationValue.ID,
-			command)
+		result, err := submitIndependentProjectTaskForTest(t, ctx, store, projectOwner.ID, actorID, projectValue.ID, conversationValue.ID,
+			"project-test-model", "Use the granted MCP connector", key, []string{connector.ID})
 		if err != nil {
 			t.Fatalf("append project Task as %s: %v", actorID, err)
 		}

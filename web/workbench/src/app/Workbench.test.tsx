@@ -60,12 +60,12 @@ describe('Workbench MVP navigation', () => {
     ];
     render(<Workbench />);
 
-    expect(await screen.findByRole('button', { name: '桌面' })).toBeVisible();
+    expect(await screen.findByRole('button', { name: '浏览器' })).toBeVisible();
     expect(screen.getByRole('button', { name: '终端' })).toBeVisible();
     expect(screen.getByRole('button', { name: 'Workspace' })).toBeVisible();
-    expect(screen.getByRole('button', { name: '主机文件' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '文件' })).toBeVisible();
     expect(screen.getByRole('button', { name: 'VS Code' })).toBeDisabled();
-    fireEvent.click(screen.getByRole('button', { name: '主机文件' }));
+    fireEvent.click(screen.getByRole('button', { name: '文件' }));
     expect(screen.getByText('请先接管电脑后使用文件。')).toBeVisible();
     expect(screen.queryByLabelText('当前路径')).not.toBeInTheDocument();
     expect(screen.queryByText(/Codex|微信|QQ|飞书/)).not.toBeInTheDocument();
@@ -80,7 +80,7 @@ describe('Workbench MVP navigation', () => {
     render(<Workbench />);
 
     expect(await screen.findByRole('button', { name: 'Workspace' })).toBeVisible();
-    expect(screen.queryByRole('button', { name: '桌面' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '浏览器' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '终端' })).not.toBeInTheDocument();
     expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
     expect(gatewayApi.host).not.toHaveBeenCalled();
@@ -114,6 +114,56 @@ describe('Workbench MVP navigation', () => {
     expect(gatewayApi.workspaces).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: /暂停|继续|停止任务|接管电脑/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /下载|打开/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('Workbench mobile menus', () => {
+  beforeEach(mockWorkbenchApi);
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('keeps browser, terminal, and files as main entries and opens secondary tools from long-press menus', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }));
+    render(<Workbench />);
+
+    expect(await screen.findByRole('button', { name: '浏览器' })).toBeVisible();
+    const terminal = screen.getByRole('button', { name: '终端' });
+    expect(terminal).toBeVisible();
+    const files = screen.getByRole('button', { name: '文件' });
+
+    fireEvent.contextMenu(terminal);
+    expect(screen.getByRole('menu', { name: '终端操作' })).toBeVisible();
+    expect(screen.getByRole('menuitem', { name: '新建终端' })).toBeDisabled();
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: '浏览器' }));
+    expect(screen.getByRole('menu', { name: '窗口操作' })).toBeVisible();
+    expect(screen.getByRole('menuitem', { name: '适应窗口' })).toBeVisible();
+
+    fireEvent.contextMenu(files);
+    expect(screen.getByRole('menu', { name: '更多功能' })).toBeVisible();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Workspace' }));
+    expect(files).toHaveAttribute('aria-current', 'page');
+    expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();
+  });
+
+  it('opens the file menu after a touch long press and suppresses the tab click', async () => {
+    render(<Workbench />);
+    await screen.findByRole('button', { name: '浏览器' });
+    const files = screen.getByRole('button', { name: '文件' });
+    vi.useFakeTimers();
+
+    fireEvent.pointerDown(files, { pointerType: 'touch' });
+    act(() => { vi.advanceTimersByTime(450); });
+    fireEvent.pointerUp(files, { pointerType: 'touch' });
+    fireEvent.click(files);
+
+    expect(screen.getByRole('menu', { name: '更多功能' })).toBeVisible();
+    expect(files).not.toHaveAttribute('aria-current', 'page');
   });
 });
 
@@ -158,14 +208,14 @@ describe('Workbench control conflicts', () => {
     expect(screen.queryByRole('button', { name: '交回 AI' })).not.toBeInTheDocument();
     expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=true');
 
-    fireEvent.click(screen.getByRole('button', { name: '主机文件' }));
+    fireEvent.click(screen.getByRole('button', { name: '文件' }));
     expect(screen.getByRole('alert')).toHaveTextContent('控制状态暂不可用：connection lost');
     expect(screen.queryByLabelText('当前路径')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '重试读取' }));
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect(screen.getByText('你持有电脑操作权')).toBeVisible();
-    expect(screen.getByRole('button', { name: '交回 AI' })).toBeVisible();
+    expect(screen.getAllByRole('button', { name: '交回 AI' }).at(-1)).toBeVisible();
     expect(screen.getByTitle('远程桌面').getAttribute('src')).toContain('view_only=false');
   });
 

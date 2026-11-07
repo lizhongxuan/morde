@@ -501,7 +501,18 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 		if current.State == host.StateRunning && current.RuntimeGeneration > 1 {
 			return nil
 		}
-		if current.State != host.StateStopped || current.DeletedAt != nil || current.ControlState != host.ControlAI {
+		if current.DeletedAt != nil || current.ControlState != host.ControlAI {
+			return hostStateConflict(current)
+		}
+		expectedState := host.StateStopped
+		if params.RecoveryFromFailed {
+			if params.ExpectedGeneration <= 1 || current.State != host.StateFailed || current.RuntimeGeneration != params.ExpectedGeneration ||
+				current.StateReason != params.ExpectedReason || current.SandboxID != params.ExpectedSandboxID ||
+				(current.StateReason != "orchestrator_error" && current.StateReason != "ready_timeout") {
+				return hostStateConflict(current)
+			}
+			expectedState = host.StateFailed
+		} else if current.State != host.StateStopped {
 			return hostStateConflict(current)
 		}
 		if current.RuntimeGeneration <= 0 || current.RuntimeGeneration == math.MaxInt64 {
@@ -512,7 +523,7 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 			return storeError("get host owner for restore", "user", err)
 		}
 		var ownerCPU, ownerMemory int64
-		if err := tx.QueryRow(ctx, allocatedResourceUsageSQL, current.OwnerID).Scan(&ownerCPU, &ownerMemory); err != nil {
+		if err := tx.QueryRow(ctx, allocatedResourceUsageExcludingHostSQL, current.OwnerID, current.ID).Scan(&ownerCPU, &ownerMemory); err != nil {
 			return fmt.Errorf("read owner host allocation for restore: %w", err)
 		}
 		if err := validateAllocation("cpu_milli", ownerCPU, int64(current.CPUMilli), int64(user.QuotaCpuMilli), domain.CodeQuotaExceeded); err != nil {
@@ -522,7 +533,7 @@ func (s *Store) BeginHostRestore(ctx context.Context, params app.RestoreHostPara
 			return err
 		}
 		var totalCPU, totalMemory int64
-		if err := tx.QueryRow(ctx, allocatedResourceUsageSQL, nil).Scan(&totalCPU, &totalMemory); err != nil {
+		if err := tx.QueryRow(ctx, allocatedResourceUsageExcludingHostSQL, nil, current.ID).Scan(&totalCPU, &totalMemory); err != nil {
 			return fmt.Errorf("read cluster host allocation for restore: %w", err)
 		}
 		if err := validateAllocation("cpu_milli", totalCPU, int64(current.CPUMilli), params.Capacity.CPUMilli, domain.CodeCapacityExceeded); err != nil {
@@ -538,8 +549,10 @@ SET state='creating', state_reason='restore_pending', runtime_generation=runtime
     runtime_instance_id=NULL, sandbox_id=NULL,
     create_attempted_at=NULL, runtime_credential_enc=$2, expires_at=$3,
     last_active_at=now(), updated_at=now()
-WHERE id=$1 AND state='stopped' AND runtime_generation=$4 AND deleted_at IS NULL`,
-			params.HostID, params.RuntimeCredentialEnc, params.ExpiresAt, current.RuntimeGeneration)
+WHERE id=$1 AND state=$5 AND runtime_generation=$4 AND state_reason=$6
+  AND sandbox_id IS NOT DISTINCT FROM NULLIF($7,'') AND deleted_at IS NULL`,
+			params.HostID, params.RuntimeCredentialEnc, params.ExpiresAt, current.RuntimeGeneration,
+			expectedState, current.StateReason, current.SandboxID)
 		if err != nil {
 			return fmt.Errorf("begin host restore: %w", err)
 		}
@@ -629,6 +642,59 @@ WHERE id=$1 AND state=$2 AND runtime_generation=$3 AND create_attempted_at IS NO
 	}
 	if err != nil {
 		return fmt.Errorf("check host state reason: %w", err)
+	}
+	return hostStateConflict(current)
+}
+
+func (s *Store) RequeueUnknownHostRestore(ctx context.Context, hostID string, generation int64, sandboxID string, attemptedBefore time.Time) error {
+	if !domain.ValidHostID(hostID) || generation <= 1 || len(sandboxID) > 128 || attemptedBefore.IsZero() {
+		return domain.InvalidArgument("host.recovery", "host recovery request is invalid")
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE hosts
+SET state_reason='restore_pending', sandbox_id=NULL, create_attempted_at=NULL, updated_at=now()
+WHERE id=$1 AND state='creating' AND runtime_generation=$2 AND state_reason='restore_unknown'
+  AND create_attempted_at IS NOT NULL AND create_attempted_at <= $4
+  AND sandbox_id IS NOT DISTINCT FROM NULLIF($3,'')`, hostID, generation, sandboxID, attemptedBefore)
+	if err != nil {
+		return fmt.Errorf("requeue unknown Host restore: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	current, err := s.GetHost(ctx, hostID)
+	if errors.Is(err, pgx.ErrNoRows) || domain.CodeOf(err) == domain.CodeNotFound {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if err != nil {
+		return fmt.Errorf("check Host after restore recovery: %w", err)
+	}
+	return hostStateConflict(current)
+}
+
+func (s *Store) AdoptFailedHostRestore(ctx context.Context, hostID string, generation int64, reason, sandboxID string) error {
+	if !domain.ValidHostID(hostID) || generation <= 1 || len(reason) > 64 || len(sandboxID) == 0 || len(sandboxID) > 128 {
+		return domain.InvalidArgument("host.recovery", "host recovery request is invalid")
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE hosts
+SET state='creating', state_reason='restore_pending', runtime_instance_id=NULL,
+    create_attempted_at=now(), updated_at=now()
+WHERE id=$1 AND state='failed' AND runtime_generation=$2 AND state_reason=$3
+  AND state_reason IN ('orchestrator_error','ready_timeout') AND sandbox_id=$4 AND deleted_at IS NULL`,
+		hostID, generation, reason, sandboxID)
+	if err != nil {
+		return fmt.Errorf("adopt failed Host restore sandbox: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	current, err := s.GetHost(ctx, hostID)
+	if errors.Is(err, pgx.ErrNoRows) || domain.CodeOf(err) == domain.CodeNotFound {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if err != nil {
+		return fmt.Errorf("check Host after failed restore adoption: %w", err)
 	}
 	return hostStateConflict(current)
 }

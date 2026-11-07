@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -56,14 +58,22 @@ type mainConversationResponse struct {
 }
 
 type messageResponse struct {
-	ID             string                      `json:"id"`
-	ConversationID string                      `json:"conversation_id"`
-	Role           conversation.Role           `json:"role"`
-	Content        string                      `json:"content"`
-	TaskID         string                      `json:"task_id,omitempty"`
-	AttachmentIDs  []string                    `json:"attachment_ids,omitempty"`
-	DeliveryStatus conversation.DeliveryStatus `json:"delivery_status"`
-	CreatedAt      time.Time                   `json:"created_at"`
+	ID                        string                            `json:"id"`
+	ConversationID            string                            `json:"conversation_id"`
+	Sequence                  int64                             `json:"sequence"`
+	Role                      conversation.Role                 `json:"role"`
+	Content                   string                            `json:"content"`
+	TaskID                    string                            `json:"task_id,omitempty"`
+	AttachmentIDs             []string                          `json:"attachment_ids,omitempty"`
+	ClientMessageID           string                            `json:"client_message_id,omitempty"`
+	RoutingStatus             conversation.RoutingStatus        `json:"routing_status,omitempty"`
+	RoutingFailureReason      conversation.RoutingFailureReason `json:"routing_failure_reason,omitempty"`
+	Sources                   []conversation.MessageSource      `json:"sources,omitempty"`
+	DeliveryStatus            conversation.DeliveryStatus       `json:"delivery_status"`
+	OutputStatus              conversation.OutputStatus         `json:"output_status,omitempty"`
+	OutputTaskRevision        *int64                            `json:"output_task_revision,omitempty"`
+	OutputResultEventSequence *int64                            `json:"output_result_event_sequence,omitempty"`
+	CreatedAt                 time.Time                         `json:"created_at"`
 }
 
 type messagePageResponse struct {
@@ -71,8 +81,9 @@ type messagePageResponse struct {
 	NextCursor *string           `json:"next_cursor"`
 }
 
-type appendMessageRequest struct {
-	ExpectedTaskID  string             `json:"expected_task_id"`
+type appendConversationTaskRequest struct {
+	ClientMessageID string             `json:"client_message_id"`
+	Mode            string             `json:"mode"`
 	HostID          string             `json:"host_id"`
 	WorkspaceID     string             `json:"workspace_id"`
 	InputRevision   *int64             `json:"input_revision"`
@@ -80,12 +91,97 @@ type appendMessageRequest struct {
 	ApplicationID   string             `json:"application_id"`
 	ModelID         string             `json:"model_id"`
 	Content         string             `json:"content"`
+	AttachmentIDs   []string           `json:"attachment_ids"`
 	Budget          *taskBudgetRequest `json:"budget"`
 }
 
-type appendMessageResponse struct {
+type appendConversationTaskResponse struct {
+	Message  messageResponse `json:"message"`
+	Task     taskResponse    `json:"task"`
+	Replayed bool            `json:"replayed"`
+}
+
+type conversationMessageRequest struct {
+	ClientMessageID         string             `json:"client_message_id"`
+	PreviousClientMessageID string             `json:"previous_client_message_id,omitempty"`
+	ReferenceTaskID         string             `json:"reference_task_id,omitempty"`
+	HostID                  string             `json:"host_id,omitempty"`
+	WorkspaceID             string             `json:"workspace_id,omitempty"`
+	MCPConnectorIDs         []string           `json:"mcp_connector_ids,omitempty"`
+	ClientAttachmentIDs     []string           `json:"client_attachment_ids,omitempty"`
+	ApplicationID           string             `json:"application_id,omitempty"`
+	ModelID                 string             `json:"model_id,omitempty"`
+	Content                 string             `json:"content"`
+	Budget                  *taskBudgetRequest `json:"budget,omitempty"`
+}
+
+type conversationMessageResponseEnvelope struct {
 	Message messageResponse `json:"message"`
-	Task    taskResponse    `json:"task"`
+}
+
+type acceptedConversationMessageResponse struct {
+	Message  messageResponse `json:"message"`
+	Replayed bool            `json:"replayed"`
+}
+
+func requiredMessageServiceInstance(c *gin.Context) (string, bool) {
+	values := c.Request.Header.Values("X-Morde-Service-Instance-ID")
+	if len(values) != 1 || !domain.ValidServiceInstanceID(values[0]) {
+		writeError(c, domain.InvalidArgument("service_instance_id", "a valid service instance header is required"))
+		return "", false
+	}
+	return values[0], true
+}
+
+// A persisted outbox must only be submitted under the account that created it.
+// The authenticated principal is resolved for this request, so a cookie change
+// in another tab cannot redirect a pending message into a different account.
+func requiredMessageActor(c *gin.Context, principal identity.Principal) bool {
+	values := c.Request.Header.Values("X-Morde-Actor-ID")
+	if len(values) != 1 || !domain.ValidUserID(values[0]) {
+		writeError(c, domain.InvalidArgument("actor_id", "a valid actor header is required"))
+		return false
+	}
+	if values[0] != principal.UserID {
+		writeError(c, domain.NewError(domain.CodeForbidden, "pending message belongs to a different account"))
+		return false
+	}
+	return true
+}
+
+func optionalMessageActor(c *gin.Context, principal identity.Principal) bool {
+	if len(c.Request.Header.Values("X-Morde-Actor-ID")) == 0 && len(c.Request.Header.Values("X-Morde-Service-Instance-ID")) == 0 {
+		return true
+	}
+	if !requiredMessageActor(c, principal) {
+		return false
+	}
+	instanceID, ok := requiredMessageServiceInstance(c)
+	if !ok {
+		return false
+	}
+	c.Request = c.Request.WithContext(app.WithExpectedServiceInstance(c.Request.Context(), instanceID))
+	return true
+}
+
+func optionalOutboxCreationScope(c *gin.Context, principal identity.Principal) (string, bool) {
+	if len(c.Request.Header.Values("X-Morde-Actor-ID")) == 0 && len(c.Request.Header.Values("X-Morde-Service-Instance-ID")) == 0 {
+		return "", true
+	}
+	if !requiredMessageActor(c, principal) {
+		return "", false
+	}
+	return requiredMessageServiceInstance(c)
+}
+
+type conversationActiveTaskResponse struct {
+	taskSummaryResponse
+	EventSequence int64 `json:"event_sequence"`
+}
+
+type conversationActiveTaskPageResponse struct {
+	Items      []conversationActiveTaskResponse `json:"items"`
+	NextCursor *string                          `json:"next_cursor"`
 }
 
 func (h *api) registerConversations(group *gin.RouterGroup, conversations ConversationService, tasks TaskService) {
@@ -99,7 +195,12 @@ func (h *api) registerConversations(group *gin.RouterGroup, conversations Conver
 		group.PUT("/me/main-conversation", h.setMainConversation(conversations))
 	}
 	if tasks != nil {
-		group.POST("/conversations/:id/messages", h.appendConversationMessage(tasks))
+		group.POST("/conversations/:id/messages", h.acceptConversationMessage(tasks))
+		group.PUT("/conversations/:id/messages/:message_id/attachments/:client_attachment_id", h.associateConversationMessageAttachment(tasks))
+		group.POST("/conversations/:id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
+		group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
+		group.GET("/conversations/:id/tasks", h.listConversationActiveTasks(tasks))
+		registerConversationMessageUploads(group, tasks)
 	}
 }
 
@@ -197,12 +298,16 @@ func (h *api) createConversation(service ConversationService) gin.HandlerFunc {
 			unauthenticated(c)
 			return
 		}
+		instanceID, ok := optionalOutboxCreationScope(c, principal)
+		if !ok {
+			return
+		}
 		var request createConversationRequest
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
 		value, replayed, err := service.Create(c.Request.Context(), principal, app.CreateConversationCommand{
-			HostID: request.HostID, Title: request.Title, IdempotencyKey: c.GetHeader("Idempotency-Key"),
+			HostID: request.HostID, Title: request.Title, IdempotencyKey: c.GetHeader("Idempotency-Key"), ServiceInstanceID: instanceID,
 		})
 		if err != nil {
 			writeError(c, err)
@@ -305,7 +410,27 @@ func (h *api) listConversationMessages(service ConversationService) gin.HandlerF
 		if !ok {
 			return
 		}
-		result, err := service.ListMessages(c.Request.Context(), principal, id, page)
+		var result app.MessagePage
+		var err error
+		if clientID := c.Query("client_message_id"); clientID != "" {
+			if !requiredMessageActor(c, principal) {
+				return
+			}
+			instanceID, ok := requiredMessageServiceInstance(c)
+			if !ok {
+				return
+			}
+			lookup, ok := service.(interface {
+				FindMessageByClientID(context.Context, identity.Principal, string, string, string) (app.MessagePage, error)
+			})
+			if !ok {
+				serviceUnavailable(c)
+				return
+			}
+			result, err = lookup.FindMessageByClientID(c.Request.Context(), principal, id, clientID, instanceID)
+		} else {
+			result, err = service.ListMessages(c.Request.Context(), principal, id, page)
+		}
 		if err != nil {
 			writeError(c, err)
 			return
@@ -323,7 +448,7 @@ func (h *api) listConversationMessages(service ConversationService) gin.HandlerF
 	}
 }
 
-func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
+func (h *api) listConversationActiveTasks(service TaskService) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		principal, ok := principalFrom(c)
 		if !ok {
@@ -334,23 +459,85 @@ func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		var request appendMessageRequest
+		page, ok := requestPage(c)
+		if !ok {
+			return
+		}
+		result, err := service.ListConversationActiveTasks(c.Request.Context(), principal, "", id, page)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		writeConversationActiveTasks(c, result)
+	}
+}
+
+func writeConversationActiveTasks(c *gin.Context, page app.TaskPage) {
+	response := conversationActiveTaskPageResponse{Items: make([]conversationActiveTaskResponse, 0, len(page.Items)), NextCursor: cursorPointer(page.NextCursor)}
+	for _, value := range page.Items {
+		summary, err := toTaskSummaryResponse(value)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response.Items = append(response.Items, conversationActiveTaskResponse{taskSummaryResponse: summary, EventSequence: value.EventSequence})
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		if !requiredMessageActor(c, principal) {
+			return
+		}
+		conversationID, ok := safeID(c, "id", domain.ValidConversationID)
+		if !ok {
+			return
+		}
+		var request appendConversationTaskRequest
 		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		instanceID, ok := requiredMessageServiceInstance(c)
+		if !ok {
+			return
+		}
+		key, ok := requiredIdempotencyKey(c)
+		if !ok {
+			return
+		}
+		if request.Mode != "new" || request.ClientMessageID == "" || request.ClientMessageID != key || request.ModelID == "" || len(request.ModelID) > 256 || !validTaskText(request.Content, 32768) {
+			writeError(c, domain.InvalidArgument("message", "a new task requires a message id, model, and content"))
+			return
+		}
+		if (request.WorkspaceID == "") != (request.InputRevision == nil) {
+			writeError(c, domain.InvalidArgument("input_revision", "workspace and input revision must be provided together"))
 			return
 		}
 		budget, ok := requestBudget(c, request.Budget)
 		if !ok {
 			return
 		}
-		result, err := service.AppendMessage(c.Request.Context(), principal, id, app.AppendMessageCommand{
-			ExpectedTaskID: request.ExpectedTaskID,
-			HostID:         request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
-			MCPConnectorIDs: request.MCPConnectorIDs,
-			ApplicationID:   request.ApplicationID, ModelID: request.ModelID, Content: request.Content,
-			Budget: budget, IdempotencyKey: c.GetHeader("Idempotency-Key"),
+		c.Request = c.Request.WithContext(app.WithExpectedServiceInstance(c.Request.Context(), instanceID))
+		result, err := service.Submit(c.Request.Context(), principal, app.SubmitTaskCommand{
+			ClientMessageID: request.ClientMessageID, AttachmentIDs: request.AttachmentIDs,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
+			MCPConnectorIDs: request.MCPConnectorIDs, ApplicationID: request.ApplicationID, ModelID: request.ModelID,
+			ConversationID: conversationID, Objective: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)
+			return
+		}
+		if result.Message.ConversationID != conversationID || result.Task.ConversationID != conversationID ||
+			result.Message.TaskID != result.Task.ID || result.Message.ClientMessageID != request.ClientMessageID ||
+			result.Task.ModelID != request.ModelID || result.Task.Objective != request.Content {
+			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
 			return
 		}
 		message, err := toMessageResponse(result.Message)
@@ -358,12 +545,12 @@ func (h *api) appendConversationMessage(service TaskService) gin.HandlerFunc {
 			writeError(c, err)
 			return
 		}
-		taskValue, err := toTaskResponse(app.TaskDetails{Task: result.Task})
+		taskView, err := toTaskResponse(app.TaskDetails{Task: result.Task})
 		if err != nil {
 			writeError(c, err)
 			return
 		}
-		c.JSON(http.StatusAccepted, appendMessageResponse{Message: message, Task: taskValue})
+		c.JSON(http.StatusAccepted, appendConversationTaskResponse{Message: message, Task: taskView, Replayed: result.Replayed})
 	}
 }
 
@@ -386,24 +573,53 @@ func toMainConversationResponse(value conversation.MainConversation) (mainConver
 }
 
 func toMessageResponse(value conversation.Message) (messageResponse, error) {
+	return toScopedMessageResponse(value, false)
+}
+
+func toScopedMessageResponse(value conversation.Message, projectScope bool) (messageResponse, error) {
 	deliveryStatus := value.DeliveryStatus
 	if deliveryStatus == "" {
 		deliveryStatus = conversation.DeliveryApplied
 	}
 	if !domain.ValidMessageID(value.ID) || !domain.ValidConversationID(value.ConversationID) ||
 		(value.TaskID != "" && !domain.ValidTaskID(value.TaskID)) ||
-		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.CreatedAt.IsZero() ||
-		!deliveryStatus.Valid() {
+		(value.Role != conversation.RoleUser && value.Role != conversation.RoleAssistant) || value.Sequence < 1 || value.CreatedAt.IsZero() ||
+		!deliveryStatus.Valid() || (value.RoutingStatus != "" && !value.RoutingStatus.Valid()) ||
+		(value.RoutingFailureReason != "" && !value.RoutingFailureReason.Valid()) {
+		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	if value.OutputStatus != "" {
+		if !value.OutputStatus.Valid() || value.Role != conversation.RoleAssistant || value.TaskID == "" ||
+			value.OutputTaskRevision == nil || *value.OutputTaskRevision < 0 ||
+			(value.OutputStatus == conversation.OutputCompleted) != (value.OutputResultEventSequence != nil) ||
+			(value.OutputResultEventSequence != nil && *value.OutputResultEventSequence < 1) {
+			return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+	} else if value.OutputTaskRevision != nil || value.OutputResultEventSequence != nil {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	for _, attachmentID := range value.AttachmentIDs {
-		if !personal.ValidPersonalAttachmentID(attachmentID) {
+		if (!projectScope && !personal.ValidPersonalAttachmentID(attachmentID)) ||
+			(projectScope && !app.ValidProjectConversationAttachmentID(attachmentID)) {
+			return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+	}
+	if len(value.Sources) > 64 || (len(value.Sources) > 0 && value.Role != conversation.RoleAssistant) {
+		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
+	for _, source := range value.Sources {
+		if !domain.ValidMessageID(source.UserMessageID) || !domain.ValidTaskID(source.TaskID) ||
+			source.TaskRevision < 0 || source.EventSequence < 1 || strings.TrimSpace(source.Content) == "" ||
+			len(source.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(source.Content) || strings.ContainsRune(source.Content, '\x00') {
 			return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 	}
 	return messageResponse{
-		ID: value.ID, ConversationID: value.ConversationID, Role: value.Role, Content: value.Content,
+		ID: value.ID, ConversationID: value.ConversationID, Sequence: value.Sequence, Role: value.Role, Content: value.Content,
 		TaskID: value.TaskID, AttachmentIDs: append([]string(nil), value.AttachmentIDs...),
-		DeliveryStatus: deliveryStatus, CreatedAt: value.CreatedAt,
+		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
+		Sources:        append([]conversation.MessageSource(nil), value.Sources...),
+		DeliveryStatus: deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,
+		OutputResultEventSequence: value.OutputResultEventSequence, CreatedAt: value.CreatedAt,
 	}, nil
 }

@@ -68,6 +68,9 @@ func registerPersonalDataRoutes(group *gin.RouterGroup, service personalDataServ
 			unauthenticated(c)
 			return
 		}
+		if !optionalMessageActor(c, principal) {
+			return
+		}
 		var request personalMutationRequest
 		if !decodeStrictJSON(c, &request) {
 			return
@@ -101,6 +104,9 @@ func registerPersonalDataRoutes(group *gin.RouterGroup, service personalDataServ
 		principal, ok := principalFrom(c)
 		if !ok {
 			unauthenticated(c)
+			return
+		}
+		if !optionalMessageActor(c, principal) {
 			return
 		}
 		var request personalMutationRequest

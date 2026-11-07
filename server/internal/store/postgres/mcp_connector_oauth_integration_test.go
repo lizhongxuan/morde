@@ -26,7 +26,8 @@ func TestMCPConnectorOAuthFlowIsSingleUseAndRefreshCredentialUsesCAS(t *testing.
 	}
 	principal := identity.Principal{UserID: owner.ID, Role: owner.Role, Kind: identity.KindSession, TokenID: "oauth-test"}
 	connector, err := service.Create(ctx, principal, app.CreateMCPConnectorCommand{
-		Name: "OAuth connector", EndpointURL: "https://mcp.example.test/mcp", CredentialJSON: []byte(`{"token":"old-token"}`),
+		Name: "OAuth connector", EndpointURL: "https://mcp.example.test/mcp",
+		CredentialJSON: []byte(`{"kind":"oauth","oauth":{"access_token":"old-token"}}`),
 	})
 	if err != nil {
 		t.Fatal(err)

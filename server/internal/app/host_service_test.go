@@ -692,6 +692,48 @@ func TestHostServiceRestorePreservesIdentityAndVolumes(t *testing.T) {
 	}
 }
 
+func TestAdminRecoveryRestartsFailedRestoreWithoutDeletingVolumes(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateFailed)
+	value.RuntimeGeneration = 9
+	value.StateReason = "orchestrator_error"
+	value.SandboxID = "sandbox-failed"
+	sealHostServiceTestKey(t, deps.sealer, &value)
+	deps.hosts.addHost(value)
+	workspaceValue := workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady}
+	deps.workspaces.add(workspaceValue)
+	hostServiceTestAddBinding(deps, value)
+	metadata := hostServiceMetadata(value.ID)
+	metadata["ch-generation"] = "9"
+	deps.sandbox.add(Sandbox{ID: value.SandboxID, State: SandboxFailed, Metadata: metadata})
+	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+	if _, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, false); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("recovery without confirmation error = %v, want conflict", err)
+	}
+	if len(deps.sandbox.deleteCalls) != 0 {
+		t.Fatalf("failed sandbox was deleted without confirmation: %v", deps.sandbox.deleteCalls)
+	}
+
+	recovered, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, true)
+	if err != nil || recovered.Action != "retry_create" || recovered.RuntimeGeneration != 10 || len(deps.sandbox.deleteCalls) != 1 {
+		t.Fatalf("RecoverUnknownRestore() = %#v, deletes=%v, err=%v", recovered, deps.sandbox.deleteCalls, err)
+	}
+	if err := service.AdvanceCreate(context.Background(), value.ID); err != nil {
+		t.Fatalf("AdvanceCreate(recovered Host) = %v", err)
+	}
+	if deps.sandbox.createRequest.Metadata["ch-generation"] != "10" || len(deps.sandbox.createRequest.Volumes) != 3 ||
+		deps.sandbox.createRequest.Volumes[0].ClaimName != domain.ProfileVolumeName(value.ID) ||
+		deps.sandbox.createRequest.Volumes[1].ClaimName != WorkspaceNamedVolumeName(testHostWorkspaceID(value)) ||
+		deps.sandbox.createRequest.Volumes[2].ClaimName != domain.RuntimeVolumeName(value.ID) {
+		t.Fatalf("recovery did not retain the Host data volumes: %#v", deps.sandbox.createRequest.Volumes)
+	}
+	stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	if stored.State != host.StateRunning || stored.RuntimeGeneration != 10 || testHostWorkspaceID(stored) != testHostWorkspaceID(value) {
+		t.Fatalf("Host after recovery = %#v", stored)
+	}
+}
+
 func TestHostServiceRestoreRejectsMultipleBindingsAndUnscopedAPIKey(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateStopped)
@@ -1675,7 +1717,12 @@ func (s *hostServiceTestHostStore) BeginHostRestore(_ context.Context, params Re
 	if value.State == host.StateRunning && value.RuntimeGeneration > 1 {
 		return cloneHostServiceHost(value), false, nil
 	}
-	if value.State != host.StateStopped {
+	if params.RecoveryFromFailed {
+		if value.State != host.StateFailed || value.RuntimeGeneration != params.ExpectedGeneration ||
+			value.StateReason != params.ExpectedReason || value.SandboxID != params.ExpectedSandboxID {
+			return host.Host{}, false, invalidHostState(value.State)
+		}
+	} else if value.State != host.StateStopped {
 		return host.Host{}, false, invalidHostState(value.State)
 	}
 	value.State, value.StateReason = host.StateCreating, "restore_pending"
@@ -1686,6 +1733,41 @@ func (s *hostServiceTestHostStore) BeginHostRestore(_ context.Context, params Re
 	value.SandboxID, value.RuntimeInstanceID = "", ""
 	s.values[params.HostID] = value
 	return cloneHostServiceHost(value), true, nil
+}
+
+func (s *hostServiceTestHostStore) AdoptFailedHostRestore(_ context.Context, id string, generation int64, reason, sandboxID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[id]
+	if !ok {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if value.State != host.StateFailed || value.RuntimeGeneration != generation || value.StateReason != reason || value.SandboxID != sandboxID {
+		return invalidHostState(value.State)
+	}
+	value.State, value.StateReason = host.StateCreating, "restore_pending"
+	value.RuntimeInstanceID = ""
+	value.CreateAttemptedAt = ptrTime(time.Now())
+	s.values[id] = value
+	return nil
+}
+
+func (s *hostServiceTestHostStore) RequeueUnknownHostRestore(_ context.Context, id string, generation int64, sandboxID string, attemptedBefore time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[id]
+	if !ok {
+		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	if value.State != host.StateCreating || value.StateReason != "restore_unknown" || value.RuntimeGeneration != generation ||
+		value.SandboxID != sandboxID || value.CreateAttemptedAt == nil || value.CreateAttemptedAt.After(attemptedBefore) {
+		return invalidHostState(value.State)
+	}
+	value.StateReason = "restore_pending"
+	value.SandboxID = ""
+	value.CreateAttemptedAt = nil
+	s.values[id] = value
+	return nil
 }
 
 func (s *hostServiceTestHostStore) SetHostStateReason(_ context.Context, id string, expected host.State, generation int64, reason string) error {

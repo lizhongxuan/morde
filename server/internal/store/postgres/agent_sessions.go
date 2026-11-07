@@ -302,6 +302,79 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND cancel_requested_at IS NU
 	return result, replayed, err
 }
 
+// requestActiveTaskAgentChildCancellations records cancellation intent for all
+// active background descendants of the Task's currently fenced root session.
+// Synchronous child Agents are stopped with the root process tree and do not
+// have a separate background-cancellation flag. The caller holds the Task row
+// lock while changing the Task to cancelling, so no new child can be created.
+func requestActiveTaskAgentChildCancellations(ctx context.Context, tx pgx.Tx, taskID, ownerID string) error {
+	var rootSessionID string
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(agent_session_id,'') FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).
+		Scan(&rootSessionID); err != nil {
+		return fmt.Errorf("read root Agent Session for Task cancellation: %w", err)
+	}
+	if rootSessionID == "" {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `WITH RECURSIVE descendants(session_id) AS (
+  SELECT session_id FROM task_agent_sessions
+  WHERE task_id=$1 AND owner_id=$2 AND parent_session_id=$3
+  UNION
+  SELECT child.session_id FROM task_agent_sessions child
+  JOIN descendants parent ON child.parent_session_id=parent.session_id
+  WHERE child.task_id=$1 AND child.owner_id=$2
+)
+SELECT s.session_id,s.parent_session_id,s.step_id
+FROM descendants d
+JOIN task_agent_sessions s ON s.task_id=$1 AND s.owner_id=$2 AND s.session_id=d.session_id
+JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
+WHERE s.cancel_requested_at IS NULL AND st.status IN ('queued','running','waiting_user')
+  AND s.is_background
+ORDER BY st.sequence
+FOR UPDATE OF s,st`, taskID, ownerID, rootSessionID)
+	if err != nil {
+		return fmt.Errorf("lock active child Agent Sessions for Task cancellation: %w", err)
+	}
+	type child struct{ sessionID, parentSessionID, stepID string }
+	children := make([]child, 0)
+	for rows.Next() {
+		var value child
+		if err := rows.Scan(&value.sessionID, &value.parentSessionID, &value.stepID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read active child Agent Session for Task cancellation: %w", err)
+		}
+		children = append(children, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate active child Agent Sessions for Task cancellation: %w", err)
+	}
+	rows.Close()
+	for _, child := range children {
+		updated, err := tx.Exec(ctx, `UPDATE task_agent_sessions SET cancel_requested_at=clock_timestamp()
+WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND cancel_requested_at IS NULL`, taskID, ownerID, child.sessionID)
+		if err != nil {
+			return fmt.Errorf("persist child Agent cancellation intent: %w", err)
+		}
+		if updated.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "child Agent Session changed during Task cancellation")
+		}
+		sequence, err := incrementTaskEventSequence(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		payload, err := json.Marshal(map[string]string{"phase": "subagent_cancel_requested", "session_id": child.sessionID,
+			"parent_session_id": child.parentSessionID, "step_id": child.stepID})
+		if err != nil {
+			return fmt.Errorf("encode child Agent cancellation event: %w", err)
+		}
+		if err := insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.step", Payload: payload}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func validStoredAgentToolNames(names []string) bool {
 	if len(names) > 64 {
 		return false

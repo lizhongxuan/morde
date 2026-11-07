@@ -25,6 +25,10 @@ func TestHostSharingPersistenceAndTicketActor(t *testing.T) {
 	if value, err := store.UpsertHostMember(ctx, grant); err != nil || value.UserID != member.ID || value.RevokedAt != nil {
 		t.Fatalf("upsert host member = %#v, %v", value, err)
 	}
+	listed, err := store.ListHostMembers(ctx, created.ID, owner.ID)
+	if err != nil || len(listed) != 1 || listed[0].UserID != member.ID {
+		t.Fatalf("list Host members after upsert = %#v, %v", listed, err)
+	}
 	access, err := store.GetHostActorAccess(ctx, created.ID, member.ID)
 	if err != nil || access.OwnerID != owner.ID || access.Disabled || len(access.Permissions) != 1 || access.Permissions[0] != host.PermissionWorkspaceFileRead {
 		t.Fatalf("member access = %#v, %v", access, err)

@@ -106,6 +106,7 @@ type Templates struct {
 type Hosts struct {
 	ReadyTimeout      time.Duration `yaml:"ready_timeout"`
 	ReadyPollInterval time.Duration `yaml:"ready_poll_interval"`
+	RuntimePortalURL  string        `yaml:"runtime_portal_url"`
 }
 
 type Capacity struct {
@@ -158,6 +159,7 @@ type SiteStorage struct {
 
 type Models struct {
 	AllowedHosts []string           `yaml:"allowed_hosts"`
+	ProxyURL     string             `yaml:"proxy_url"`
 	ProjectRates []ProjectModelRate `yaml:"project_rates"`
 }
 
@@ -177,17 +179,26 @@ func (r ProjectModelRate) Snapshot() project.RateSnapshot {
 }
 
 type CloudDSH struct {
-	Enabled               bool   `yaml:"enabled"`
-	MaxConcurrentTasks    int    `yaml:"max_concurrent_tasks"`
-	MaxConcurrentPerOwner int    `yaml:"max_concurrent_tasks_per_owner"`
-	DockerHost            string `yaml:"docker_host"`
-	Image                 string `yaml:"image"`
-	NodePath              string `yaml:"node_path"`
-	ScriptPath            string `yaml:"script_path"`
-	SupervisorID          string `yaml:"supervisor_id"`
-	SupervisorKeyFile     string `yaml:"supervisor_key_file"`
-	GuardianSocket        string `yaml:"guardian_socket"`
-	GuardianPublicKeyFile string `yaml:"guardian_public_key_file"`
+	Enabled               bool          `yaml:"enabled"`
+	MaxConcurrentTasks    int           `yaml:"max_concurrent_tasks"`
+	MaxConcurrentPerOwner int           `yaml:"max_concurrent_tasks_per_owner"`
+	DockerHost            string        `yaml:"docker_host"`
+	Image                 string        `yaml:"image"`
+	NodePath              string        `yaml:"node_path"`
+	ScriptPath            string        `yaml:"script_path"`
+	SupervisorID          string        `yaml:"supervisor_id"`
+	SupervisorKeyFile     string        `yaml:"supervisor_key_file"`
+	GuardianSocket        string        `yaml:"guardian_socket"`
+	GuardianPublicKeyFile string        `yaml:"guardian_public_key_file"`
+	BuiltinSearch         BuiltinSearch `yaml:"builtin_search"`
+}
+
+type BuiltinSearch struct {
+	Enabled       bool   `yaml:"enabled"`
+	NodePath      string `yaml:"node_path"`
+	ScriptPath    string `yaml:"script_path"`
+	SearxngURL    string `yaml:"searxng_url"`
+	MaxConcurrent int    `yaml:"max_concurrent"`
 }
 
 type PortalWeb struct {
@@ -288,6 +299,22 @@ var cloudDSHImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha
 var cloudDSHSupervisorIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func (c Config) validate() error {
+	if c.CloudDSH.BuiltinSearch.Enabled {
+		search := c.CloudDSH.BuiltinSearch
+		parsed, err := url.Parse(search.SearxngURL)
+		validEndpoint := false
+		if err == nil {
+			port, portErr := strconv.Atoi(parsed.Port())
+			validEndpoint = portErr == nil && port > 0 && port <= 65535 && parsed.Scheme == "http" &&
+				parsed.Hostname() == "127.0.0.1" && parsed.Host == net.JoinHostPort("127.0.0.1", parsed.Port()) && parsed.User == nil &&
+				parsed.Path == "" && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == ""
+		}
+		if !c.CloudDSH.Enabled || !filepath.IsAbs(search.NodePath) || filepath.Clean(search.NodePath) != search.NodePath ||
+			!filepath.IsAbs(search.ScriptPath) || filepath.Clean(search.ScriptPath) != search.ScriptPath || search.MaxConcurrent < 1 || search.MaxConcurrent > 16 ||
+			!validEndpoint {
+			return fmt.Errorf("config.cloud_dsh.builtin_search requires an enabled runtime, fixed executable paths, a loopback SearXNG URL and valid concurrency")
+		}
+	}
 	if strings.TrimSpace(c.Instance) == "" {
 		return fmt.Errorf("config.instance is required")
 	}

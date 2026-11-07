@@ -32,6 +32,29 @@ const (
 	testTokenID     = "t1234567"
 )
 
+func TestInstantChatCompatibilityRoutesAreRemoved(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hosts := &hostServiceStub{}
+	router, err := New(Deps{Hosts: hosts, TLSAuthorizer: hosts, Verifier: verifierStub{}, Auth: &authServiceStub{}}, Options{
+		Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 1 << 20, MCPMaxBodyBytes: 1 << 20,
+		SessionTTL: time.Hour, HostScheme: "http", PortalDomain: "morde.test", HostSuffix: "hosts.invalid", PreviewPortMin: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []struct{ method, path string }{
+		{http.MethodGet, "/api/instant-chat/conversations"},
+		{http.MethodGet, "/api/instant-chat/conversations/c1234567/messages"},
+		{http.MethodPost, "/api/instant-chat/messages"},
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(request.method, request.path, strings.NewReader(`{}`)))
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("%s %s returned %d, want 404", request.method, request.path, recorder.Code)
+		}
+	}
+}
+
 type hostServiceStub struct {
 	item             host.Host
 	err              error
@@ -955,6 +978,12 @@ func TestHealthMCPAndPortalStaticRoutes(t *testing.T) {
 	if admin.Code != http.StatusOK || !strings.Contains(admin.Body.String(), "<title>admin</title>") || admin.Header().Get("Content-Security-Policy") != portalCSP || admin.Header().Get("X-Content-Type-Options") != "nosniff" || admin.Header().Get("Cache-Control") != "no-cache" {
 		t.Fatalf("admin SPA response = %d headers=%v body=%q", admin.Code, admin.Header(), admin.Body)
 	}
+	if login := requestHTML(router, "/admin/login"); login.Code != http.StatusOK || !strings.Contains(login.Body.String(), "<title>admin</title>") {
+		t.Fatalf("admin login SPA response = %d headers=%v body=%q", login.Code, login.Header(), login.Body)
+	}
+	if noHTML := request(router, http.MethodGet, "/admin/login", "", "", ""); noHTML.Code != http.StatusNotFound {
+		t.Fatalf("non-HTML admin login response = %d headers=%v body=%q", noHTML.Code, noHTML.Header(), noHTML.Body)
+	}
 	if root := requestHTML(router, "/admin/"); root.Code != http.StatusOK || !strings.Contains(root.Body.String(), "<title>admin</title>") {
 		t.Fatalf("admin root = %d %s", root.Code, root.Body)
 	}
@@ -1759,7 +1788,17 @@ func TestWorkspaceSyncDeviceHTTPContractUsesClientProofAndPortalRevocation(t *te
 func TestClientCredentialRouteFence(t *testing.T) {
 	services := newServices()
 	services.verifier = verifierStub{role: identity.RoleAdmin}
-	router := newRouter(t, services, Options{})
+	now := time.Now().UTC()
+	modelConnections := &modelConnectionManagerStub{items: []app.ModelConnectionView{{
+		ID: "p1234567", Name: "Personal", BaseURL: "https://provider.example/v1", ModelName: "model-a", HasAPIKey: true,
+		CreatedAt: now, UpdatedAt: now,
+	}}}
+	deps := services.deps()
+	deps.ModelConnections = modelConnections
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
 	client, _, err := identity.NewCredential(identity.KindClient, testTokenID)
 	if err != nil {
 		t.Fatal(err)
@@ -1769,10 +1808,15 @@ func TestClientCredentialRouteFence(t *testing.T) {
 	if allowed.Code != http.StatusOK || services.hosts.principal.Kind != identity.KindClient || services.hosts.principal.Role != identity.RoleUser {
 		t.Fatalf("client host list = %d %s, principal = %#v", allowed.Code, allowed.Body, services.hosts.principal)
 	}
+	modelList := request(router, http.MethodGet, "/api/model-connections", "", auth, "")
+	if modelList.Code != http.StatusOK || modelConnections.principal.Kind != identity.KindClient ||
+		modelConnections.principal.Role != identity.RoleUser || !strings.Contains(modelList.Body.String(), `"id":"p1234567"`) ||
+		!strings.Contains(modelList.Body.String(), `"has_api_key":true`) || strings.Contains(modelList.Body.String(), `"api_key"`) {
+		t.Fatalf("client model connection list = %d %s, principal = %#v", modelList.Code, modelList.Body, modelConnections.principal)
+	}
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodGet, "/api/admin/users", ""},
 		{http.MethodGet, "/api/apikeys", ""},
-		{http.MethodGet, "/api/model-connections", ""},
 		{http.MethodGet, "/api/device/workspaces", ""},
 		{http.MethodPost, "/api/workspaces", `{}`},
 		{http.MethodDelete, "/api/workspaces/" + testWorkspaceID + "/sync-devices/d1234567", ""},

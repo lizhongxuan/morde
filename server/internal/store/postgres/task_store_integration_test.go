@@ -26,7 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
+func TestPostgresTaskSubmissionAndMessageReceiptReplay(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
@@ -44,92 +44,152 @@ func TestPostgresTaskSubmissionAppendAndReplay(t *testing.T) {
 		created.Message.TaskID != created.Task.ID || created.Message.ConversationID != created.Conversation.ID {
 		t.Fatalf("created associations = %#v", created)
 	}
-
 	replayed, err := store.SubmitTask(ctx, submission)
 	if err != nil || !replayed.Replayed || replayed.Task.ID != created.Task.ID || replayed.Message.ID != created.Message.ID || replayed.Conversation.ID != created.Conversation.ID {
-		t.Fatalf("idempotent replay = %#v, err=%v", replayed, err)
+		t.Fatalf("idempotent task replay = %#v, err=%v", replayed, err)
 	}
-
 	different := submission
 	different.Idempotency.RequestHash = hashBytes("different request")
 	if _, err := store.SubmitTask(ctx, different); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
-		t.Fatalf("different request under same key error = %v", err)
+		t.Fatalf("different task request under same key error = %v", err)
 	}
 
-	appendRequest := app.TaskSubmission{
-		Task:        task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: "model-test"},
-		Message:     conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID, OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue"},
-		Idempotency: testIdempotency(owner.ID, "append-message", "append-task-message"),
-	}
-	appended, err := store.AppendMessage(ctx, appendRequest)
-	if err != nil || appended.Task.ID != created.Task.ID || appended.Message.TaskID != created.Task.ID || appended.Task.Status != task.StatusQueued {
-		t.Fatalf("append to active task = %#v, err=%v", appended, err)
+	receipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "continue-task", "continue")
+	message, replay, err := store.AcceptConversationMessage(ctx, receipt)
+	if err != nil || replay || message.TaskID != "" || message.DeliveryStatus != conversation.DeliveryPending {
+		t.Fatalf("message receipt = %#v replay=%t err=%v", message, replay, err)
 	}
 	assertAccountChangeLog(t, ctx, store, owner.ID,
 		expectedAccountChange{objectType: "conversation", objectID: created.Conversation.ID, revision: 1},
 		expectedAccountChange{objectType: "message", objectID: created.Message.ID, revision: 1},
 		expectedAccountChange{objectType: "conversation", objectID: created.Conversation.ID, revision: 2},
-		expectedAccountChange{objectType: "message", objectID: appended.Message.ID, revision: 1},
+		expectedAccountChange{objectType: "message", objectID: message.ID, revision: 1},
 	)
-	events, err := store.ListTaskEvents(ctx, owner.ID, created.Task.ID, 1, 10)
-	if err != nil || len(events) != 1 || events[0].Sequence != 2 || events[0].Type != "task.message" {
-		t.Fatalf("append event = %#v, err=%v", events, err)
-	}
 	eventPage, err := store.GetTaskEventPage(ctx, owner.ID, created.Task.ID, 1, 10)
-	if err != nil || eventPage.HostID != hostValue.ID || eventPage.Status != task.StatusQueued || eventPage.CurrentSequence != 2 ||
-		len(eventPage.Items) != 1 || eventPage.Items[0].Sequence != 2 {
-		t.Fatalf("event page = %#v, err=%v", eventPage, err)
+	if err != nil || eventPage.HostID != hostValue.ID || eventPage.Status != task.StatusQueued || eventPage.CurrentSequence != 1 || len(eventPage.Items) != 0 {
+		t.Fatalf("unrouted message changed task events = %#v, err=%v", eventPage, err)
 	}
-
-	mismatch := appendRequest
-	mismatch.Task.ModelID = "different-model"
-	mismatch.Message.ID = mustID(t, domain.NewMessageID)
-	mismatch.Message.Content = "must not be persisted"
-	mismatch.Idempotency = testIdempotency(owner.ID, "append-message", "append-mismatch")
-	if _, err := store.AppendMessage(ctx, mismatch); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("mismatched model error = %v", err)
+	replayMessage, replay, err := store.AcceptConversationMessage(ctx, receipt)
+	if err != nil || !replay || replayMessage.ID != message.ID {
+		t.Fatalf("idempotent message replay = %#v replay=%t err=%v", replayMessage, replay, err)
+	}
+	changedReceipt := receipt
+	changedReceipt.RequestHash = hashBytes("different message")
+	if _, _, err := store.AcceptConversationMessage(ctx, changedReceipt); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("different message under same client ID error = %v", err)
 	}
 
 	otherHost := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, nil)
-	mismatchHost := appendRequest
-	mismatchHost.Task.HostID = otherHost.ID
-	mismatchHost.Message.ID = mustID(t, domain.NewMessageID)
-	mismatchHost.Message.Content = "must not cross hosts"
-	mismatchHost.Idempotency = testIdempotency(owner.ID, "append-message", "append-host-mismatch")
-	if _, err := store.AppendMessage(ctx, mismatchHost); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("mismatched Host error = %v", err)
-	}
-	messages, err := store.ListMessages(ctx, owner.ID, created.Conversation.ID, app.PageRequest{Limit: 20})
-	if err != nil || len(messages.Items) != 2 {
-		t.Fatalf("messages after rejected append = %d, err=%v", len(messages.Items), err)
+	next := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "continue-changed-target", "continue with a different tool")
+	next.Input.HostID, next.Input.ModelID = otherHost.ID, "p1234567"
+	if _, replay, err := store.AcceptConversationMessage(ctx, next); err != nil || replay {
+		t.Fatalf("message with a different target was blocked: replay=%t err=%v", replay, err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status='pausing' WHERE id=$1`, created.Task.ID); err != nil {
 		t.Fatal(err)
 	}
-	pausingMessage := appendRequest
-	pausingMessage.Message.ID = mustID(t, domain.NewMessageID)
-	pausingMessage.Idempotency = testIdempotency(owner.ID, "append-message", "append-during-pause")
-	if _, err := store.AppendMessage(ctx, pausingMessage); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("append during pause error = %v", err)
+	pausing := receivePendingRouteMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "continue-during-pause", "continue while pausing")
+	if pausing.TaskID != "" || pausing.DeliveryStatus != conversation.DeliveryPending {
+		t.Fatalf("message during pause was not safely received: %#v", pausing)
 	}
-	messages, err = store.ListMessages(ctx, owner.ID, created.Conversation.ID, app.PageRequest{Limit: 20})
-	if err != nil || len(messages.Items) != 2 {
-		t.Fatalf("messages after rejected append during pause = %d, err=%v", len(messages.Items), err)
+	messages, err := store.ListMessages(ctx, owner.ID, created.Conversation.ID, app.PageRequest{Limit: 20})
+	if err != nil || len(messages.Items) != 4 {
+		t.Fatalf("messages after independent receipts = %d, err=%v", len(messages.Items), err)
 	}
-
 	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status='completed', finished_at=clock_timestamp() WHERE id=$1`, created.Task.ID); err != nil {
 		t.Fatal(err)
 	}
-	newTask := newTestTaskSubmission(t, owner.ID, hostValue.ID, "append-after-complete", "new task after completion")
-	newTask.Task.ConversationID = created.Conversation.ID
-	newTask.Message.ConversationID = created.Conversation.ID
-	newTask.Conversation = nil
-	newTask.Idempotency.RequestHash = hashBytes("completed conversation new request")
-	newTask.Idempotency.Key = "append-after-complete"
-	newTask.Idempotency.Operation = "append-message"
-	result, err := store.AppendMessage(ctx, newTask)
+	newTask := newTestTaskSubmission(t, owner.ID, hostValue.ID, "task-after-complete", "new task after completion")
+	newTask.Task.ConversationID, newTask.Message.ConversationID = created.Conversation.ID, created.Conversation.ID
+	result, err := store.SubmitTask(ctx, newTask)
 	if err != nil || result.Task.ID != newTask.Task.ID || result.Task.ID == created.Task.ID {
-		t.Fatalf("append after completion should create a new task: %#v, err=%v", result, err)
+		t.Fatalf("independent task after completion = %#v, err=%v", result, err)
+	}
+}
+
+func TestPostgresConcurrentMessageReceiptReplaySurvivesTaskStateChange(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	monitorConfig := pool.Config().Copy()
+	monitorConfig.MaxConns = 8
+	monitorPool, err := pgxpool.NewWithConfig(ctx, monitorConfig)
+	if err != nil {
+		t.Fatalf("open PostgreSQL lock monitor pool: %v", err)
+	}
+	defer monitorPool.Close()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	created, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "receipt-replay-base", "initial work"))
+	if err != nil {
+		t.Fatalf("submit initial task: %v", err)
+	}
+	receipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "receipt-state-change-race", "continue")
+
+	const advisoryLockKey int64 = 824726200
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION wait_for_receipt_state_change_test_release() RETURNS trigger AS $$
+BEGIN
+  IF NEW.client_message_id = 'receipt-state-change-race' THEN
+    PERFORM pg_advisory_xact_lock(824726200);
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create receipt barrier: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TRIGGER wait_for_receipt_state_change_test_release
+BEFORE INSERT ON conversation_message_routes FOR EACH ROW EXECUTE FUNCTION wait_for_receipt_state_change_test_release()`); err != nil {
+		t.Fatalf("install receipt barrier: %v", err)
+	}
+	advisoryConn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire PostgreSQL advisory lock connection: %v", err)
+	}
+	defer func() {
+		_, _ = advisoryConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, advisoryLockKey)
+		advisoryConn.Release()
+	}()
+	if _, err := advisoryConn.Exec(ctx, `SELECT pg_advisory_lock($1)`, advisoryLockKey); err != nil {
+		t.Fatalf("hold receipt barrier: %v", err)
+	}
+	type receiptResult struct {
+		value    conversation.Message
+		replayed bool
+		err      error
+	}
+	firstResult, secondResult := make(chan receiptResult, 1), make(chan receiptResult, 1)
+	go func() {
+		value, replayed, err := store.AcceptConversationMessage(ctx, receipt)
+		firstResult <- receiptResult{value: value, replayed: replayed, err: err}
+	}()
+	waitForPostgresLockWait(t, ctx, monitorPool, "%INSERT INTO conversation_message_routes%", 1)
+	go func() {
+		value, replayed, err := store.AcceptConversationMessage(ctx, receipt)
+		secondResult <- receiptResult{value: value, replayed: replayed, err: err}
+	}()
+	waitForPostgresLockWait(t, ctx, monitorPool, "%FROM conversations%FOR UPDATE%", 1)
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='pausing' WHERE id=$1`, created.Task.ID); err != nil {
+		t.Fatalf("advance task state while receipt waits: %v", err)
+	}
+	var unlocked bool
+	if err := advisoryConn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, advisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+		t.Fatalf("release receipt barrier: unlocked=%t err=%v", unlocked, err)
+	}
+	select {
+	case first := <-firstResult:
+		if first.err != nil || first.replayed || first.value.ID != receipt.Message.ID || first.value.TaskID != "" {
+			t.Fatalf("first receipt = %#v replay=%t err=%v", first.value, first.replayed, first.err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("first receipt did not finish: %v", ctx.Err())
+	}
+	select {
+	case replayed := <-secondResult:
+		if replayed.err != nil || !replayed.replayed || replayed.value.ID != receipt.Message.ID || replayed.value.TaskID != "" {
+			t.Fatalf("concurrent receipt replay = %#v replay=%t err=%v", replayed.value, replayed.replayed, replayed.err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("concurrent receipt replay did not finish: %v", ctx.Err())
 	}
 }
 
@@ -168,10 +228,10 @@ func TestProjectTaskUsesInitiatorResourcesAndRechecksMembership(t *testing.T) {
 	submission.Task.Authorization.TokenID = testSessionTokenID(initiator.ID)
 	submission.Message.ConversationID = sharedConversation.ID
 	submission.Message.ActorID = initiator.ID
-	submission.Idempotency = testIdempotency(initiator.ID, "conversation.append_message", "project-task-message-01")
-	created, err := store.AppendMessage(ctx, submission)
+	submission.Idempotency = testIdempotency(initiator.ID, "task.submit", "project-task-message-01")
+	created, err := store.SubmitTask(ctx, submission)
 	if err != nil {
-		t.Fatalf("append project task message as member: %v", err)
+		t.Fatalf("submit project task as member: %v", err)
 	}
 	if created.Task.OwnerID != conversationOwner.ID || created.Task.InitiatorID != initiator.ID || created.Task.ProjectID != projectValue.ID ||
 		created.Task.HostID != initiatorHost.ID || created.Message.OwnerID != conversationOwner.ID || created.Message.ActorID != initiator.ID {
@@ -205,8 +265,8 @@ func TestProjectTaskUsesInitiatorResourcesAndRechecksMembership(t *testing.T) {
 	queuedAfterRevocation.Message.ID = mustID(t, domain.NewMessageID)
 	queuedAfterRevocation.Message.ConversationID = secondConversation.ID
 	queuedAfterRevocation.Message.Content = queuedAfterRevocation.Task.Objective
-	queuedAfterRevocation.Idempotency = testIdempotency(initiator.ID, "conversation.append_message", "project-task-message-queued")
-	if _, err := store.AppendMessage(ctx, queuedAfterRevocation); err != nil {
+	queuedAfterRevocation.Idempotency = testIdempotency(initiator.ID, "task.submit", "project-task-message-queued")
+	if _, err := store.SubmitTask(ctx, queuedAfterRevocation); err != nil {
 		t.Fatalf("queue second project task before revocation: %v", err)
 	}
 
@@ -229,12 +289,11 @@ func TestProjectTaskUsesInitiatorResourcesAndRechecksMembership(t *testing.T) {
 	if _, err := store.ListProjectConversationMessages(ctx, conversationOwner.ID, projectValue.ID, sharedConversation.ID, app.PageRequest{Limit: 20}); err != nil {
 		t.Fatalf("remaining project member cannot read shared history: %v", err)
 	}
-	appendAfterRevocation := submission
-	appendAfterRevocation.Message.ID = mustID(t, domain.NewMessageID)
-	appendAfterRevocation.Message.Content = "must not be accepted after revocation"
-	appendAfterRevocation.Idempotency = testIdempotency(initiator.ID, "conversation.append_message", "project-task-message-revoked")
-	if _, err := store.AppendMessage(ctx, appendAfterRevocation); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("revoked initiator append = %v, want not found", err)
+	receipt := newConversationReceiptForTest(t, ctx, store, initiator.ID, sharedConversation.ID, created.Task.ID,
+		"project-task-message-revoked", "must not be accepted after revocation")
+	receipt.Message.OwnerID, receipt.Input.ProjectID = conversationOwner.ID, projectValue.ID
+	if _, _, err := store.AcceptConversationMessage(ctx, receipt); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked initiator receipt = %v, want not found", err)
 	}
 }
 
@@ -266,42 +325,53 @@ func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 	}
 }
 
-func TestPostgresTaskAppendOnlyRaisesFileDeliveryIntent(t *testing.T) {
-	store, _ := newTemporaryStore(t)
+func TestPostgresTaskRevisionPreservesFileDeliveryIntent(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
-	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
-	submission := newTestTaskSubmission(t, owner.ID, "", "append-intent-start", "Explain what caused the error.")
-	created, err := store.SubmitTask(ctx, submission)
+	initial := f.receive(t, "file-intent-start", "Explain what caused the error.", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, initial)
 	if err != nil {
-		t.Fatalf("submit task: %v", err)
+		t.Fatal(err)
 	}
-
-	appendMessage := func(key, content string, intent task.FileDeliveryIntent) app.TaskSubmissionResult {
-		t.Helper()
-		result, appendErr := store.AppendMessage(ctx, app.TaskSubmission{
-			Task: task.Task{
-				OwnerID: owner.ID, ConversationID: created.Conversation.ID, ModelID: created.Task.ModelID,
-				FileDeliveryIntent: intent,
-			},
-			Message: conversation.Message{
-				ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
-				OwnerID: owner.ID, Role: conversation.RoleUser, Content: content,
-			},
-			Idempotency: testIdempotency(owner.ID, "append-intent", key),
-		})
-		if appendErr != nil {
-			t.Fatalf("append %q: %v", key, appendErr)
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, initial, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initial.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	for index, content := range []string{"Generate and save a PDF report.", "Continue the explanation."} {
+		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
+		updated, err := f.store.LoadConversationRouteSnapshot(ctx, message)
+		if err != nil || len(updated.Context.Candidates) != 1 {
+			t.Fatalf("file intent revision candidates=%+v err=%v", updated.Context.Candidates, err)
 		}
-		return result
+		if err := f.store.ApplyConversationRoute(ctx, message, updated, app.ConversationRouteDecision{Action: app.ConversationRouteUpdate,
+			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision}); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	required := appendMessage("append-intent-required", "Generate and save a PDF report.", task.FileDeliveryRequired)
-	if required.Task.FileDeliveryIntent != task.FileDeliveryRequired {
-		t.Fatalf("appended required intent = %q", required.Task.FileDeliveryIntent)
+	var before string
+	if err := f.store.pool.QueryRow(ctx, `SELECT file_delivery_intent FROM tasks WHERE id=$1`, taskID).Scan(&before); err != nil || before != string(task.FileDeliveryNone) {
+		t.Fatalf("unapplied revision prematurely changed file intent: %q err=%v", before, err)
 	}
-	stillRequired := appendMessage("append-intent-neutral", "Continue the explanation.", task.FileDeliveryNone)
-	if stillRequired.Task.FileDeliveryIntent != task.FileDeliveryRequired {
-		t.Fatalf("later neutral message downgraded intent to %q", stillRequired.Task.FileDeliveryIntent)
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE task_id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	stop, found, err := f.store.ClaimNextTaskStop(ctx, "file-intent-revision-stop", time.Minute)
+	if err != nil || !found || stop.Task.ID != taskID {
+		t.Fatalf("claim revision stop: found=%t err=%v", found, err)
+	}
+	if _, err := f.store.CompleteTaskStop(ctx, taskID, stop.Request.ID, stop.Request.LeaseOwner, stop.Request.LeaseVersion); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := f.store.ApplyNextConversationTaskRevision(ctx); err != nil || !applied {
+		t.Fatalf("apply file intent revisions: applied=%t err=%v", applied, err)
+	}
+	var intent string
+	if err := f.store.pool.QueryRow(ctx, `SELECT file_delivery_intent FROM tasks WHERE id=$1`, taskID).Scan(&intent); err != nil || intent != string(task.FileDeliveryRequired) {
+		t.Fatalf("neutral revision lost the required file intent: intent=%q err=%v", intent, err)
 	}
 }
 
@@ -340,28 +410,12 @@ func TestPostgresTaskSubmissionFencesWorkspaceRevisionAndHostBinding(t *testing.
 	if err != nil || accepted.Task.WorkspaceID != workspaceValue.ID || accepted.Task.InputRevision == nil || *accepted.Task.InputRevision != revision {
 		t.Fatalf("task with current active Workspace binding = %#v, err=%v", accepted, err)
 	}
-	appendValue := app.TaskSubmission{
-		Task: task.Task{OwnerID: owner.ID, ConversationID: accepted.Conversation.ID, HostID: hostValue.ID, ModelID: accepted.Task.ModelID},
-		Message: conversation.Message{
-			ID: mustID(t, domain.NewMessageID), ConversationID: accepted.Conversation.ID,
-			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue this task",
-		},
-		Idempotency: testIdempotency(owner.ID, "conversation.append_message", "task-workspace-context-append"),
-	}
-	appended, err := store.AppendMessage(ctx, appendValue)
-	if err != nil || appended.Task.WorkspaceID != workspaceValue.ID || appended.Task.InputRevision == nil || *appended.Task.InputRevision != revision {
-		t.Fatalf("append did not preserve active task Workspace input: %#v, err=%v", appended, err)
-	}
-	mismatchedAppend := appendValue
-	mismatchedAppend.Task.WorkspaceID = workspaceValue.ID
-	wrongRevision := revision + 1
-	mismatchedAppend.Task.InputRevision = &wrongRevision
-	mismatchedAppend.Task.ContextDigest = hashBytes("workspace input manifest")
-	mismatchedAppend.Message.ID = mustID(t, domain.NewMessageID)
-	mismatchedAppend.Message.Content = "must not change the pinned input"
-	mismatchedAppend.Idempotency = testIdempotency(owner.ID, "conversation.append_message", "task-workspace-context-mismatch")
-	if _, err := store.AppendMessage(ctx, mismatchedAppend); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("append with a different Workspace snapshot error = %v", err)
+	message := receivePendingRouteMessageForTest(t, ctx, store, owner.ID, accepted.Conversation.ID, accepted.Task.ID,
+		"task-workspace-context-message", "continue this task")
+	loaded, err := store.GetTask(ctx, accepted.Task.ID, owner.ID)
+	if err != nil || message.TaskID != "" || loaded.Task.WorkspaceID != workspaceValue.ID ||
+		loaded.Task.InputRevision == nil || *loaded.Task.InputRevision != revision {
+		t.Fatalf("unrouted receipt changed the pinned Workspace input: task=%#v message=%#v err=%v", loaded.Task, message, err)
 	}
 	if _, err := store.SubmitTask(ctx, newWorkspaceTask("task-stale-input", revision+1)); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("task with uncommitted Workspace revision error = %v", err)
@@ -372,6 +426,12 @@ func TestPostgresTaskSubmissionFencesWorkspaceRevisionAndHostBinding(t *testing.
 	}
 	if _, err := store.SubmitTask(ctx, newWorkspaceTask("task-conflicted-binding", revision)); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("task with conflicted Host replica error = %v", err)
+	}
+	receipt := newConversationReceiptForTest(t, ctx, store, owner.ID, accepted.Conversation.ID, accepted.Task.ID,
+		"task-conflicted-workspace-message", "continue despite a Workspace conflict")
+	receipt.Input.WorkspaceID, receipt.Input.HostID = workspaceValue.ID, hostValue.ID
+	if _, replay, err := store.AcceptConversationMessage(ctx, receipt); err != nil || replay {
+		t.Fatalf("Workspace conflict blocked message receipt: replay=%t err=%v", replay, err)
 	}
 }
 
@@ -418,15 +478,11 @@ VALUES ($1,$2,$3,$4,'pending',$5)`, transferID, workspaceValue.ID, owner.ID, tar
 		t.Fatalf("new Workspace Task during transfer error = %v, want workspace busy", err)
 	}
 
-	appendTask := app.TaskSubmission{
-		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID,
-			WorkspaceID: workspaceValue.ID, InputRevision: &revision, ContextDigest: created.Task.ContextDigest, ModelID: created.Task.ModelID},
-		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
-			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue Workspace work"},
-		Idempotency: testIdempotency(owner.ID, "conversation.append_message", "transfer-freeze-append"),
-	}
-	if _, err := store.AppendMessage(ctx, appendTask); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
-		t.Fatalf("continue Workspace Task during transfer error = %v, want workspace busy", err)
+	receipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID,
+		"transfer-freeze-message", "continue Workspace work")
+	receipt.Input.WorkspaceID, receipt.Input.HostID = workspaceValue.ID, hostValue.ID
+	if message, replay, err := store.AcceptConversationMessage(ctx, receipt); err != nil || replay || message.TaskID != "" {
+		t.Fatalf("Workspace transfer blocked conversation receipt: message=%#v replay=%t err=%v", message, replay, err)
 	}
 	var taskCount, messageCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE workspace_id=$1`, workspaceValue.ID).Scan(&taskCount); err != nil || taskCount != 1 {
@@ -1160,8 +1216,7 @@ func TestPostgresConversationChangesTargetAndRejectsOperationAfterHostUnready(t 
 	secondInput.Task.ConversationID = first.Conversation.ID
 	secondInput.Task.ModelID = "another-model"
 	secondInput.Message.ConversationID = first.Conversation.ID
-	secondInput.Idempotency.Operation = "append-message"
-	second, err := store.AppendMessage(ctx, secondInput)
+	second, err := store.SubmitTask(ctx, secondInput)
 	if err != nil || second.Task.ID == first.Task.ID || second.Task.HostID != secondHost.ID || second.Task.ModelID != "another-model" {
 		t.Fatalf("new turn with changed target: result=%+v err=%v", second, err)
 	}
@@ -1203,6 +1258,44 @@ finished_at=clock_timestamp() WHERE id=$1`, second.Task.ID); err != nil {
 		LeaseVersion: claimed.Lease.Version, RuntimeLeaseVersion: claimed.Lease.Version, Status: task.OperationPrepared}
 	if _, _, err := store.CreateOperation(ctx, operation, "model-only-worker"); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("model-only task obtained a Host operation: %v", err)
+	}
+}
+
+func TestPostgresTaskTargetRequiresCurrentHostMemberControlGrant(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	actor := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	target := createRunningControlHost(t, ctx, store, hostOwner.ID, host.ControlAI, 0)
+
+	denied := newTestTaskSubmission(t, actor.ID, target.ID, "shared-host-without-grant", "must not use an unshared Host")
+	if _, err := store.SubmitTask(ctx, denied); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("submit without Host grant = %v; want not found", err)
+	}
+	if _, err := store.UpsertHostMember(ctx, host.Member{
+		HostID: target.ID, OwnerID: hostOwner.ID, UserID: actor.ID,
+		Permissions: []host.Permission{host.PermissionDesktopControl},
+	}); err != nil {
+		t.Fatalf("grant member desktop control: %v", err)
+	}
+
+	submission := newTestTaskSubmission(t, actor.ID, target.ID, "shared-host-with-grant", "run on shared Host")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil || created.Task.HostID != target.ID || created.Task.InitiatorID != actor.ID || created.Conversation.HostID != target.ID {
+		t.Fatalf("submit with Host member grant = %#v, err=%v", created, err)
+	}
+
+	if err := store.RevokeHostMember(ctx, target.ID, hostOwner.ID, actor.ID); err != nil {
+		t.Fatalf("revoke member desktop control: %v", err)
+	}
+	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, actor.ID, target.ID, "shared-host-after-revoke", "use revoked Host")); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("new task after Host grant revocation = %v; want not found", err)
+	}
+	message := receivePendingRouteMessageForTest(t, ctx, store, actor.ID, created.Conversation.ID, created.Task.ID,
+		"shared-host-message-after-revoke", "continue the conversation")
+	messages, err := store.ListMessages(ctx, actor.ID, created.Conversation.ID, app.PageRequest{Limit: 20})
+	if err != nil || len(messages.Items) != 2 || message.TaskID != "" {
+		t.Fatalf("messages after Host grant revocation = %#v, err=%v; want both messages", messages.Items, err)
 	}
 }
 
@@ -1272,17 +1365,16 @@ func TestPostgresClientTaskAuthorizationSnapshotSurvivesReloadAndRevocation(t *t
 		t.Fatalf("reloaded task authorization = %#v, err=%v", loaded.Task.Authorization, err)
 	}
 
-	appendRequest := app.TaskSubmission{
-		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: submission.Task.ModelID},
-		Message: conversation.Message{
-			ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID, OwnerID: owner.ID,
-			Role: conversation.RoleUser, Content: "continue from the same client",
-		},
-		Idempotency: testIdempotency(owner.ID, "append-message", "client-task-append"),
+	receipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID,
+		"client-task-message", "continue from the same client")
+	receipt.Authorization = loaded.Task.Authorization
+	message, replay, err := store.AcceptConversationMessage(ctx, receipt)
+	if err != nil || replay || message.TaskID != "" {
+		t.Fatalf("client message receipt = %#v replay=%t err=%v", message, replay, err)
 	}
-	appended, err := store.AppendMessage(ctx, appendRequest)
-	if err != nil || appended.Task.ID != created.Task.ID || appended.Task.Authorization.ClientInstallationID != installationID {
-		t.Fatalf("append preserved client authorization = %#v, err=%v", appended.Task.Authorization, err)
+	var storedInstallation string
+	if err := store.pool.QueryRow(ctx, `SELECT authorization_snapshot->>'ClientInstallationID' FROM conversation_message_routes WHERE message_id=$1`, message.ID).Scan(&storedInstallation); err != nil || storedInstallation != installationID {
+		t.Fatalf("client message lost its original installation: installation=%q err=%v", storedInstallation, err)
 	}
 
 	claimed, found, err := store.ClaimNextTask(ctx, "client-task-worker", time.Minute)
@@ -1375,21 +1467,11 @@ func TestPostgresTaskApplicationTargetRequiresCurrentLaunchAndSurvivesClaim(t *t
 	if _, _, err := store.CreateOperation(ctx, operation, "application-worker"); err != nil {
 		t.Fatalf("operation with current application = %v", err)
 	}
-	appendRequest := app.TaskSubmission{
-		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID,
-			ModelID: submission.Task.ModelID},
-		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
-			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue"},
-		Idempotency: testIdempotency(owner.ID, "append-message", "app-target-mismatch"),
-	}
-	if _, err := store.AppendMessage(ctx, appendRequest); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("append without active task application target error = %v", err)
-	}
-	appendRequest.Task.ApplicationID = app.WechatApplicationID
-	appendRequest.Idempotency = testIdempotency(owner.ID, "append-message", "app-target-match")
-	appended, err := store.AppendMessage(ctx, appendRequest)
-	if err != nil || appended.Task.ID != created.Task.ID || appended.Task.ApplicationID != app.WechatApplicationID {
-		t.Fatalf("append to application task = %#v, err=%v", appended, err)
+	message := receivePendingRouteMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID,
+		"app-target-message", "continue")
+	loaded, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || message.TaskID != "" || loaded.Task.ApplicationID != app.WechatApplicationID {
+		t.Fatalf("message receipt altered the application target: task=%#v message=%#v err=%v", loaded.Task, message, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE host_application_launches SET status='stopped' WHERE host_id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
@@ -1942,7 +2024,7 @@ func TestPostgresConcurrentApprovalByTwoAuthorizedClientsIsAppliedOnce(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	tasks, err := app.NewTaskService(store, credentials, taskChatConfiguredModelCatalog{})
+	tasks, err := app.NewTaskService(store, credentials, testConfiguredModelCatalog{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2114,12 +2196,12 @@ func TestPostgresInitialFileDeliveryClarificationIsDurableAndAtomic(t *testing.T
 		t.Fatalf("submitted file clarification = %#v, err=%v", details, err)
 	}
 
-	append := newTestTaskSubmission(t, owner.ID, hostValue.ID, "append-before-file-answer", "continue")
-	append.Task.ConversationID = created.Task.ConversationID
-	append.Message.ConversationID = created.Task.ConversationID
-	append.Idempotency.Operation = "conversation.append_message"
-	if _, err := store.AppendMessage(ctx, append); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("append bypassed pending file clarification: %v", err)
+	message := receivePendingRouteMessageForTest(t, ctx, store, owner.ID, created.Task.ConversationID, created.Task.ID,
+		"message-before-file-answer", "continue")
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || message.TaskID != "" || details.Task.Status != task.StatusWaitingUser ||
+		details.ClarificationRequests[0].Status != task.ClarificationPending {
+		t.Fatalf("message receipt changed pending file clarification: task=%#v message=%#v err=%v", details.Task, message, err)
 	}
 
 	answer := "不需要文件，只要聊天答复"
@@ -2219,17 +2301,10 @@ func TestPostgresTaskWritesDuringUserTakeoverAndPreserveReplays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("submit while Host is AI-controlled: %v", err)
 	}
-	appendRequest := app.TaskSubmission{
-		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: "model-test"},
-		Message: conversation.Message{
-			ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID, OwnerID: owner.ID,
-			Role: conversation.RoleUser, Content: "continue",
-		},
-		Idempotency: testIdempotency(owner.ID, "append-message", "fenced-append"),
-	}
-	appended, err := store.AppendMessage(ctx, appendRequest)
-	if err != nil || appended.Task.ID != created.Task.ID {
-		t.Fatalf("append while Host is AI-controlled = %#v, err=%v", appended, err)
+	receipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "fenced-message", "continue")
+	message, replay, err := store.AcceptConversationMessage(ctx, receipt)
+	if err != nil || replay || message.TaskID != "" {
+		t.Fatalf("message receipt while Host is AI-controlled = %#v replay=%t err=%v", message, replay, err)
 	}
 
 	transition, err := store.BeginControlTransition(ctx, control.BeginRequest{
@@ -2246,21 +2321,19 @@ func TestPostgresTaskWritesDuringUserTakeoverAndPreserveReplays(t *testing.T) {
 	if err != nil || !replayedSubmit.Replayed || replayedSubmit.Task.ID != created.Task.ID {
 		t.Fatalf("submit replay after takeover = %#v, err=%v", replayedSubmit, err)
 	}
-	replayedAppend, err := store.AppendMessage(ctx, appendRequest)
-	if err != nil || !replayedAppend.Replayed || replayedAppend.Message.ID != appendRequest.Message.ID {
-		t.Fatalf("append replay after takeover = %#v, err=%v", replayedAppend, err)
+	replayedMessage, replay, err := store.AcceptConversationMessage(ctx, receipt)
+	if err != nil || !replay || replayedMessage.ID != message.ID {
+		t.Fatalf("message replay after takeover = %#v replay=%t err=%v", replayedMessage, replay, err)
 	}
 
 	newSubmit := newTestTaskSubmission(t, owner.ID, hostValue.ID, "takeover-submit", "server work")
 	if _, err := store.SubmitTask(ctx, newSubmit); err != nil {
 		t.Fatalf("new task submission during takeover error = %v", err)
 	}
-	newAppend := appendRequest
-	newAppend.Message.ID = mustID(t, domain.NewMessageID)
-	newAppend.Message.Content = "continue server work"
-	newAppend.Idempotency = testIdempotency(owner.ID, "append-message", "takeover-append")
-	if _, err := store.AppendMessage(ctx, newAppend); err != nil {
-		t.Fatalf("new message append during takeover error = %v", err)
+	newMessage := receivePendingRouteMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID,
+		"takeover-message", "continue server work")
+	if newMessage.TaskID != "" {
+		t.Fatalf("new message during takeover was prematurely assigned to a task: %#v", newMessage)
 	}
 	claimedTask, claimed, err := store.ClaimNextTask(ctx, "worker-fenced", time.Minute)
 	if err != nil || !claimed || claimedTask.ID != created.Task.ID {
@@ -2293,14 +2366,10 @@ func TestPostgresTaskProgressWithoutRunningHost(t *testing.T) {
 			if err != nil {
 				t.Fatalf("submit task with Host %s: %v", state, err)
 			}
-			appendRequest := app.TaskSubmission{
-				Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: "model-test"},
-				Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
-					OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue"},
-				Idempotency: testIdempotency(owner.ID, "append-message", "non-running-host-append"),
-			}
-			if _, err := store.AppendMessage(ctx, appendRequest); err != nil {
-				t.Fatalf("append with Host %s: %v", state, err)
+			message := receivePendingRouteMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID,
+				"non-running-host-message", "continue")
+			if message.TaskID != "" {
+				t.Fatalf("message with Host %s was prematurely assigned: %#v", state, message)
 			}
 			claimed, found, err := store.ClaimNextTask(ctx, "worker-non-running", time.Minute)
 			if err != nil || !found || claimed.ID != created.Task.ID {
@@ -2342,20 +2411,17 @@ func TestPostgresTaskTargetRejectsDeletedAndOtherOwnerHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	appendRequest := app.TaskSubmission{
-		Task: task.Task{OwnerID: owner.ID, ConversationID: created.Conversation.ID, HostID: hostValue.ID, ModelID: "model-test"},
-		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID,
-			OwnerID: owner.ID, Role: conversation.RoleUser, Content: "continue"},
-		Idempotency: testIdempotency(owner.ID, "append-message", "deleted-host-append"),
-	}
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='deleted', deleted_at=clock_timestamp() WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "deleted-host-submit", "must be rejected")); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("submit against deleted Host error = %v", err)
 	}
-	if _, err := store.AppendMessage(ctx, appendRequest); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("append against deleted Host error = %v", err)
+	deletedReceipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID,
+		"deleted-host-message", "continue the conversation")
+	deletedReceipt.Input.HostID = hostValue.ID
+	if message, replay, err := store.AcceptConversationMessage(ctx, deletedReceipt); err != nil || replay || message.TaskID != "" {
+		t.Fatalf("deleted Host blocked message receipt: message=%#v replay=%t err=%v", message, replay, err)
 	}
 	if _, found, err := store.ClaimNextTask(ctx, "deleted-host-worker", time.Minute); err != nil || found {
 		t.Fatalf("claim against deleted Host: found=%t, err=%v", found, err)
@@ -2374,12 +2440,11 @@ func TestPostgresTaskTargetRejectsDeletedAndOtherOwnerHost(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='completed', finished_at=clock_timestamp() WHERE id=$1`, created.Task.ID); err != nil {
 		t.Fatal(err)
 	}
-	newTurn := newTestTaskSubmission(t, owner.ID, otherHost.ID, "other-owner-host-append", "must be rejected")
-	newTurn.Task.ConversationID = created.Conversation.ID
-	newTurn.Message.ConversationID = created.Conversation.ID
-	newTurn.Idempotency.Operation = "append-message"
-	if _, err := store.AppendMessage(ctx, newTurn); domain.CodeOf(err) != domain.CodeNotFound {
-		t.Fatalf("append against another owner's Host error = %v", err)
+	foreignReceipt := newConversationReceiptForTest(t, ctx, store, owner.ID, created.Conversation.ID, "",
+		"other-owner-host-message", "answer without using that Host")
+	foreignReceipt.Input.HostID = otherHost.ID
+	if message, replay, err := store.AcceptConversationMessage(ctx, foreignReceipt); err != nil || replay || message.TaskID != "" {
+		t.Fatalf("unavailable Host blocked message receipt: message=%#v replay=%t err=%v", message, replay, err)
 	}
 }
 
@@ -2429,7 +2494,7 @@ func TestPostgresTaskTargetDeletionSerializesConcurrentSubmissionAndClaim(t *tes
 	}()
 	<-started
 	<-started
-	waitForPostgresLockWait(t, ctx, pool, "%FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE%", 2)
+	waitForPostgresLockWait(t, ctx, pool, "%FROM hosts WHERE id=$1 FOR SHARE%", 2)
 
 	if _, err := fenceTx.Exec(ctx, `UPDATE hosts SET state='deleted', deleted_at=clock_timestamp() WHERE id=$1`, hostValue.ID); err != nil {
 		t.Fatal(err)

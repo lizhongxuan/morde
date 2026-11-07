@@ -139,7 +139,7 @@ func TestAdminConsoleAPIsUseRealViewsAndProtectSensitiveFields(t *testing.T) {
 	}
 
 	connections := request(router, http.MethodGet, "/api/admin/model-connections", "", key, "")
-	if connections.Code != http.StatusOK || !strings.Contains(connections.Body.String(), "Shared") || strings.Contains(connections.Body.String(), "Private") || strings.Contains(connections.Body.String(), `"api_key":`) {
+	if connections.Code != http.StatusOK || !strings.Contains(connections.Body.String(), "Shared") || !strings.Contains(connections.Body.String(), `"configuration_status":"configured"`) || strings.Contains(connections.Body.String(), "Private") || strings.Contains(connections.Body.String(), `"api_key":`) {
 		t.Fatalf("admin model connections = %d %s", connections.Code, connections.Body)
 	}
 

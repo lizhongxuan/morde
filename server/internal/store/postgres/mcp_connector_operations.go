@@ -9,8 +9,10 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/store/postgres/sqlcgen"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -36,6 +38,11 @@ func (s *Store) PrepareMCPConnectorOperation(ctx context.Context, value app.MCPC
 			if err := requireMCPConnectorTaskWorkspaceSnapshot(ctx, tx, value); err != nil {
 				return err
 			}
+			if value.ConnectorID == app.BuiltinSearchMCPConnectorID {
+				if err := lockCurrentTaskMCPConnectorGrant(ctx, tx, value); err != nil {
+					return err
+				}
+			}
 			if stored.Status == task.OperationPrepared && stored.LeaseVersion != value.LeaseVersion {
 				if err := lockCurrentTaskMCPConnectorGrant(ctx, tx, value); err != nil {
 					return err
@@ -50,6 +57,14 @@ func (s *Store) PrepareMCPConnectorOperation(ctx context.Context, value app.MCPC
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read MCP connector operation before prepare: %w", err)
 		}
+		var unknown bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_mcp_connector_operations
+WHERE task_id=$1 AND status='unknown')`, value.TaskID).Scan(&unknown); err != nil {
+			return fmt.Errorf("check unresolved MCP operation: %w", err)
+		}
+		if unknown {
+			return domain.NewError(domain.CodeConflict, "previous MCP operation requires reconciliation")
+		}
 		if err := requireMCPConnectorTaskWorkspaceSnapshot(ctx, tx, value); err != nil {
 			return err
 		}
@@ -62,13 +77,14 @@ func (s *Store) PrepareMCPConnectorOperation(ctx context.Context, value app.MCPC
 		if err := lockMCPConnectorWorkspaceFence(ctx, tx, value); err != nil {
 			return err
 		}
+		connectorID, builtinService := mcpOperationSourceColumns(value.ConnectorID)
 		command, err := tx.Exec(ctx, `INSERT INTO task_mcp_connector_operations (
-id, task_id, owner_id, connector_id, connector_revision, credential_version, grant_version, lease_version,
+id, task_id, owner_id, connector_id, builtin_service, connector_revision, credential_version, grant_version, lease_version,
 host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision,
 operation_key, tool_name, request_hash, status
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'prepared')
-ON CONFLICT (task_id, connector_id, operation_key) DO NOTHING`,
-			value.ID, value.TaskID, value.OwnerID, value.ConnectorID, value.ConnectorRevision, value.CredentialVersion,
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'prepared')
+ON CONFLICT (task_id, connector_id, builtin_service, operation_key) DO NOTHING`,
+			value.ID, value.TaskID, value.OwnerID, connectorID, builtinService, value.ConnectorRevision, value.CredentialVersion,
 			value.GrantVersion, value.LeaseVersion, value.HostID, value.WorkspaceID, value.BindingVersion,
 			taskUsageTokens(value.InputRevision), taskUsageTokens(value.WorkspaceCheckpointRevision), value.Key, value.ToolName, value.RequestHash)
 		if err != nil {
@@ -144,7 +160,7 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 			return domain.NewError(domain.CodeConflict, "MCP connector operation is no longer prepared")
 		}
 		if err := tx.QueryRow(ctx, `UPDATE task_mcp_connector_operations SET status='dispatched', updated_at=clock_timestamp()
-WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND connector_id=$4 AND operation_key=$5 AND status='prepared' RETURNING updated_at`,
+WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND COALESCE(connector_id, 'builtin:' || builtin_service)=$4 AND operation_key=$5 AND status='prepared' RETURNING updated_at`,
 			stored.ID, stored.TaskID, stored.OwnerID, stored.ConnectorID, stored.Key).Scan(&stored.UpdatedAt); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.NewError(domain.CodeConflict, "MCP connector operation changed before dispatch")
@@ -272,6 +288,9 @@ func (s *Store) CompleteMCPConnectorOperation(ctx context.Context, value app.MCP
 			return idempotencyConflict()
 		}
 		if grantErr != nil {
+			if value.ConnectorID == app.BuiltinSearchMCPConnectorID {
+				return grantErr
+			}
 			if stored.CancelRequested {
 				return domain.NewError(domain.CodeConflict, "MCP connector operation was revoked before result commit")
 			}
@@ -341,15 +360,15 @@ WHERE id=$1 AND status='dispatched'`, stored.ID, resultText)
 }
 
 func (s *Store) GetMCPConnectorOperation(ctx context.Context, ownerID, taskID, connectorID, key string) (app.MCPConnectorOperation, error) {
-	if !domain.ValidUserID(ownerID) || !domain.ValidTaskID(taskID) || !domain.ValidMCPConnectorID(connectorID) || !validMCPConnectorOperationKey(key) {
+	if !domain.ValidUserID(ownerID) || !domain.ValidTaskID(taskID) || !validMCPConnectorOperationSource(connectorID) || !validMCPConnectorOperationKey(key) {
 		return app.MCPConnectorOperation{}, domain.InvalidArgument("operation", "MCP connector operation identity is invalid")
 	}
 	var result app.MCPConnectorOperation
 	var inputRevision, workspaceCheckpointRevision pgtype.Int8
-	err := s.pool.QueryRow(ctx, `SELECT id, task_id, owner_id, connector_id, connector_revision, credential_version,
+	err := s.pool.QueryRow(ctx, `SELECT id, task_id, owner_id, COALESCE(connector_id, 'builtin:' || builtin_service), connector_revision, credential_version,
 grant_version, lease_version, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision,
 operation_key, tool_name, request_hash, status, cancel_requested, result, created_at, updated_at
-FROM task_mcp_connector_operations WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 AND operation_key=$4`,
+FROM task_mcp_connector_operations WHERE owner_id=$1 AND task_id=$2 AND COALESCE(connector_id, 'builtin:' || builtin_service)=$3 AND operation_key=$4`,
 		ownerID, taskID, connectorID, key).Scan(
 		&result.ID, &result.TaskID, &result.OwnerID, &result.ConnectorID, &result.ConnectorRevision, &result.CredentialVersion,
 		&result.GrantVersion, &result.LeaseVersion, &result.HostID, &result.WorkspaceID, &result.BindingVersion, &inputRevision,
@@ -364,11 +383,26 @@ FROM task_mcp_connector_operations WHERE owner_id=$1 AND task_id=$2 AND connecto
 }
 
 func lockMCPConnectorTaskLease(ctx context.Context, tx pgx.Tx, value app.MCPConnectorOperation, leaseOwner string) error {
+	var initiatorID string
+	if err := tx.QueryRow(ctx, `SELECT initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, value.TaskID, value.OwnerID).Scan(&initiatorID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return missingTaskError()
+		}
+		return fmt.Errorf("read MCP connector Task initiator: %w", err)
+	}
+	if _, err := lockTaskInitiatorInTx(ctx, tx, value.TaskID, value.OwnerID, initiatorID); err != nil {
+		return err
+	}
+	gate, err := requireOwnerExecutionEnabled(ctx, tx, initiatorID, nil)
+	if err != nil {
+		return err
+	}
 	var status, storedOwner string
 	var leaseVersion int64
 	var leaseValid bool
-	err := tx.QueryRow(ctx, `SELECT status, lease_owner, lease_version, COALESCE(lease_expires_at > clock_timestamp(), false)
-FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, value.TaskID, value.OwnerID).Scan(&status, &storedOwner, &leaseVersion, &leaseValid)
+	err = tx.QueryRow(ctx, `SELECT status, lease_owner, lease_version,
+ COALESCE(lease_expires_at > clock_timestamp(), false) AND current_revision=desired_revision AND execution_epoch=$3
+FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, value.TaskID, value.OwnerID, gate.epoch).Scan(&status, &storedOwner, &leaseVersion, &leaseValid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return missingTaskError()
 	}
@@ -377,6 +411,15 @@ FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, value.TaskID, value.OwnerID)
 	}
 	if status != string(task.StatusRunning) || storedOwner != leaseOwner || leaseVersion != value.LeaseVersion || !leaseValid {
 		return domain.NewError(domain.CodeInvalidState, "task lease is not current for MCP connector operation")
+	}
+	if value.ConnectorID != app.BuiltinSearchMCPConnectorID {
+		stored, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: value.TaskID, OwnerID: value.OwnerID})
+		if err != nil {
+			return fmt.Errorf("read MCP connector Task authorization: %w", err)
+		}
+		if err := checkCurrentTaskMCPAuthorization(ctx, tx, stored, nil); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -394,12 +437,73 @@ func lockMCPConnectorTask(ctx context.Context, tx pgx.Tx, taskID, ownerID string
 }
 
 func lockCurrentTaskMCPConnectorGrant(ctx context.Context, tx pgx.Tx, value app.MCPConnectorOperation) error {
+	if value.ConnectorID == app.BuiltinSearchMCPConnectorID {
+		current, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: value.TaskID, OwnerID: value.OwnerID})
+		if err != nil {
+			return fmt.Errorf("load built-in MCP task authorization: %w", err)
+		}
+		principal := identity.Principal{Kind: identity.Kind(current.AuthKind), Scopes: scheduleTaskScopes(current.AuthScopes)}
+		if current.ExecutionLocation != "server" || current.AuthVersion != value.GrantVersion || value.ConnectorRevision != 1 ||
+			value.CredentialVersion != 0 || !principal.HasScope(identity.ScopeTaskRead) || !principal.HasScope(identity.ScopeTaskSubmit) {
+			return domain.NewError(domain.CodeForbidden, "built-in MCP task authorization is unavailable")
+		}
+		var enabled bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM owner_execution_controls ec JOIN tasks t ON t.initiator_id=ec.owner_id
+WHERE t.id=$1 AND t.owner_id=$2 AND ec.state='enabled' AND ec.epoch=t.execution_epoch
+)`, value.TaskID, value.OwnerID).Scan(&enabled); err != nil {
+			return fmt.Errorf("check built-in MCP task execution gate: %w", err)
+		}
+		if !enabled {
+			return domain.NewError(domain.CodeForbidden, "built-in MCP task execution is disabled")
+		}
+		authorized, err := requireCurrentTaskAuthorization(ctx, tx, current)
+		if err != nil {
+			return err
+		}
+		if !authorized {
+			return domain.NewError(domain.CodeForbidden, "built-in MCP task authorization changed")
+		}
+		return nil
+	}
+	stored, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: value.TaskID, OwnerID: value.OwnerID})
+	if err != nil {
+		return fmt.Errorf("read Task MCP selection: %w", err)
+	}
+	taskValue := taskDomain(stored)
+	var currentRevision int64
+	if err := tx.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1 AND owner_id=$2
+ AND current_revision=desired_revision`, value.TaskID, value.OwnerID).Scan(&currentRevision); err != nil {
+		return domain.NewError(domain.CodeConflict, "task revision is being adjusted")
+	}
+	selection, err := loadTaskMCPSelection(ctx, tx, taskValue, currentRevision)
+	if err != nil {
+		return err
+	}
+	selected := false
+	for _, id := range selection.IDs {
+		selected = selected || id == value.ConnectorID
+	}
+	if !selected {
+		return domain.NewError(domain.CodeForbidden, "MCP connector was not selected for this task")
+	}
+	if selection.MessageID != "" {
+		var matching bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_mcp_selection_sources
+WHERE task_id=$1 AND owner_id=$2 AND connector_id=$3 AND message_id=$4 AND task_revision=$5 AND grant_version=$6)`,
+			value.TaskID, value.OwnerID, value.ConnectorID, selection.MessageID, selection.Revision, value.GrantVersion).Scan(&matching); err != nil {
+			return fmt.Errorf("check Task MCP selection provenance: %w", err)
+		}
+		if !matching {
+			return domain.NewError(domain.CodeForbidden, "MCP grant does not match the current selection")
+		}
+	}
 	var grantConnectorRevision, grantCredentialVersion, grantVersion int64
 	var connectorRevision, credentialVersion int64
 	var enabled bool
 	var projectID, taskProjectID, taskInitiatorID, connectorOwnerID string
 	var projectGrantVersion *int64
-	err := tx.QueryRow(ctx, `SELECT COALESCE(g.project_id,''),COALESCE(t.project_id,''),COALESCE(NULLIF(t.initiator_id,''),t.owner_id),
+	err = tx.QueryRow(ctx, `SELECT COALESCE(g.project_id,''),COALESCE(t.project_id,''),COALESCE(NULLIF(t.initiator_id,''),t.owner_id),
        g.connector_owner_id,g.project_grant_version
 FROM task_mcp_connector_grants g
 JOIN tasks t ON t.id=g.task_id AND t.owner_id=g.owner_id
@@ -469,11 +573,11 @@ FOR SHARE OF g,actor_member,actor_user,connector_owner_member,connector_owner_us
 func getMCPConnectorOperationForUpdate(ctx context.Context, tx pgx.Tx, ownerID, taskID, connectorID, key string) (app.MCPConnectorOperation, error) {
 	var result app.MCPConnectorOperation
 	var inputRevision, workspaceCheckpointRevision pgtype.Int8
-	err := tx.QueryRow(ctx, `SELECT id, task_id, owner_id, connector_id, connector_revision, credential_version,
+	err := tx.QueryRow(ctx, `SELECT id, task_id, owner_id, COALESCE(connector_id, 'builtin:' || builtin_service), connector_revision, credential_version,
 grant_version, lease_version, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision,
 operation_key, tool_name, request_hash, status, cancel_requested, result, created_at, updated_at
 FROM task_mcp_connector_operations
-WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 AND operation_key=$4 FOR UPDATE`,
+WHERE owner_id=$1 AND task_id=$2 AND COALESCE(connector_id, 'builtin:' || builtin_service)=$3 AND operation_key=$4 FOR UPDATE`,
 		ownerID, taskID, connectorID, key).Scan(
 		&result.ID, &result.TaskID, &result.OwnerID, &result.ConnectorID, &result.ConnectorRevision, &result.CredentialVersion,
 		&result.GrantVersion, &result.LeaseVersion, &result.HostID, &result.WorkspaceID, &result.BindingVersion, &inputRevision,
@@ -486,10 +590,21 @@ WHERE owner_id=$1 AND task_id=$2 AND connector_id=$3 AND operation_key=$4 FOR UP
 
 func validMCPConnectorOperation(value app.MCPConnectorOperation) bool {
 	return domain.ValidOperationID(value.ID) && domain.ValidTaskID(value.TaskID) && domain.ValidUserID(value.OwnerID) &&
-		domain.ValidMCPConnectorID(value.ConnectorID) && validMCPConnectorOperationKey(value.Key) &&
+		validMCPConnectorOperationSource(value.ConnectorID) && validMCPConnectorOperationKey(value.Key) &&
 		value.ToolName != "" && len(value.ToolName) <= 128 && value.ConnectorRevision > 0 && value.CredentialVersion >= 0 &&
 		value.GrantVersion > 0 && value.LeaseVersion > 0 && (value.HostID == "" || domain.ValidHostID(value.HostID)) &&
 		validMCPConnectorWorkspaceFence(value) && len(value.RequestHash) == 32 && len(value.Result) <= maxMCPConnectorOperationResultBytes
+}
+
+func validMCPConnectorOperationSource(value string) bool {
+	return domain.ValidMCPConnectorID(value) || value == app.BuiltinSearchMCPConnectorID
+}
+
+func mcpOperationSourceColumns(value string) (any, any) {
+	if value == app.BuiltinSearchMCPConnectorID {
+		return nil, strings.TrimPrefix(value, "builtin:")
+	}
+	return value, nil
 }
 
 func validMCPConnectorWorkspaceFence(value app.MCPConnectorOperation) bool {

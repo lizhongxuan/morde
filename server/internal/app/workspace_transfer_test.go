@@ -55,8 +55,8 @@ func (s *workspaceTransferStoreStub) StartWorkspaceOwnershipTransferAcceptance(_
 	return value, false, nil
 }
 
-func (s *workspaceTransferStoreStub) FinishWorkspaceOwnershipTransferAcceptance(_ context.Context, actorID, workspaceID, transferID, operationID string,
-	_ int64) (workspace.OwnershipTransfer, error) {
+func (s *workspaceTransferStoreStub) FinishWorkspaceOwnershipTransferAcceptanceWithReadOnly(_ context.Context, actorID, workspaceID, transferID, operationID string,
+	_ int64, _ bool) (workspace.OwnershipTransfer, error) {
 	value := s.started
 	value.ID, value.WorkspaceID, value.ToOwnerID = transferID, workspaceID, actorID
 	value.State, value.OperationID = workspace.OwnershipTransferAccepted, operationID

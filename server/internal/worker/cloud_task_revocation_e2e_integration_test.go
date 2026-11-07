@@ -234,14 +234,7 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 		t.Fatalf("locate real morde-cloud-runtime entrypoint: %v", err)
 	}
 	stopKey := bytes.Repeat([]byte{0x6b}, 32)
-	stopAuthenticator, err := app.NewAgentStopAuthenticator("f01-revoke-supervisor", stopKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	instances, err := app.NewAgentInstanceService(store, stopAuthenticator)
-	if err != nil {
-		t.Fatal(err)
-	}
+	instances, conversationRuntimeManager, _ := newF01ConversationRuntime(t, store, node, script, "f01-revoke-supervisor", stopKey)
 	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
 	if err != nil {
 		t.Fatal(err)
@@ -250,9 +243,8 @@ func runCloudTaskAuthorizationRevocationE2E(t *testing.T, disableOwnerAccount bo
 		workspaceID:   workspaceValue.ID,
 		secondStarted: make(chan struct{}), content: "this file must not be written after authorization revocation\n",
 	}
-	supervisor := &f01CapturingSupervisor{child: &cloudDSHTestSupervisor{key: stopKey}}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
-		NodePath: node, ScriptPath: script, SupervisorID: "f01-revoke-supervisor", Supervisor: supervisor,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-revoke-supervisor", AccountRuntimes: conversationRuntimeManager,
 		Instances: instances, Checkpoints: checkpoints, Models: model, Tools: toolBroker, Completion: toolBroker,
 	})
 	if err != nil {

@@ -29,6 +29,10 @@ type RestoreHostParams struct {
 	RuntimeCredentialEnc []byte
 	ExpiresAt            time.Time
 	Capacity             Capacity
+	RecoveryFromFailed   bool
+	ExpectedGeneration   int64
+	ExpectedReason       string
+	ExpectedSandboxID    string
 }
 
 // LeaderLock is held until Release is called. The PostgreSQL implementation

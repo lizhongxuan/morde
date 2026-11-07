@@ -12,6 +12,7 @@ import (
 	"morde/server/internal/domain/task"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // RespondToPendingRequest consumes one exact active approval and queues its
@@ -70,15 +71,34 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).Scan(&status, &lea
 			return domain.NewError(domain.CodeInvalidState, "task lease version is exhausted")
 		}
 		var storedVersion int64
-		var requestStatus string
-		if err := tx.QueryRow(ctx, `SELECT version, status FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, taskID).
-			Scan(&storedVersion, &requestStatus); errors.Is(err, pgx.ErrNoRows) {
+		var requestStatus, mediaPreviewOperationID string
+		if err := tx.QueryRow(ctx, `SELECT version, status, COALESCE(media_preview_operation_id,'') FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, taskID).
+			Scan(&storedVersion, &requestStatus, &mediaPreviewOperationID); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "pending request is no longer active")
 		} else if err != nil {
 			return fmt.Errorf("lock pending request: %w", err)
 		}
 		if storedVersion != version || requestStatus != string(task.PendingRequestPending) {
 			return domain.NewError(domain.CodeConflict, "pending request version is stale or already resolved")
+		}
+		if mediaPreviewOperationID != "" {
+			if !domain.ValidOperationID(mediaPreviewOperationID) {
+				return domain.NewError(domain.CodeInternal, "pending media preview identity is invalid")
+			}
+			nextState := "discarded"
+			if decision == task.PendingDecisionApprove {
+				nextState = "saving"
+			}
+			updated, err := tx.Exec(ctx, `UPDATE task_media_staged_objects
+SET state=$3, updated_at=clock_timestamp()
+WHERE task_id=$1 AND operation_id=$2 AND state='preview' AND cleanup_state='pending'
+  AND ($3='discarded' OR expires_at > clock_timestamp())`, taskID, mediaPreviewOperationID, nextState)
+			if err != nil {
+				return fmt.Errorf("transition pending media preview: %w", err)
+			}
+			if decision == task.PendingDecisionApprove && updated.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "task media preview is expired or no longer available")
+			}
 		}
 		requestStatus = string(task.PendingRequestApproved)
 		if decision == task.PendingDecisionReject {
@@ -221,6 +241,99 @@ RETURNING event_seq`, taskID, taskOwnerID, objective, string(fileIntent)).Scan(&
 // transaction that changes its task to cancelling, so a late user response
 // cannot requeue work after cancellation began.
 func cancelPendingTaskRequest(ctx context.Context, tx pgx.Tx, taskID string) error {
+	var workspaceID string
+	var checkpointRevision int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(workspace_id,''), COALESCE(workspace_checkpoint_revision,-1) FROM tasks WHERE id=$1`, taskID).
+		Scan(&workspaceID, &checkpointRevision); err != nil {
+		return fmt.Errorf("read task Workspace for media cancellation: %w", err)
+	}
+	rows, err := tx.Query(ctx, `SELECT status, COALESCE(media_preview_operation_id,'')
+FROM task_pending_requests WHERE task_id=$1 AND status IN ('pending','approved') ORDER BY version FOR UPDATE`, taskID)
+	if err != nil {
+		return fmt.Errorf("lock pending media decisions for task cancellation: %w", err)
+	}
+	type mediaDecision struct{ status, operationID string }
+	var decisions []mediaDecision
+	for rows.Next() {
+		var decision mediaDecision
+		if err := rows.Scan(&decision.status, &decision.operationID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan pending media decision for task cancellation: %w", err)
+		}
+		if decision.operationID != "" {
+			if !domain.ValidOperationID(decision.operationID) {
+				rows.Close()
+				return domain.NewError(domain.CodeInternal, "pending media preview identity is invalid")
+			}
+			decisions = append(decisions, decision)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read pending media decisions for task cancellation: %w", err)
+	}
+	rows.Close()
+	for _, decision := range decisions {
+		if decision.status == string(task.PendingRequestApproved) {
+			var receiptState string
+			var publishedRevision pgtype.Int8
+			operationKey := ""
+			stepID := "s" + decision.operationID[1:]
+			if domain.ValidWorkspaceID(workspaceID) {
+				operationKey = "task-workspace-publish:" + stepID + ":" + workspaceID
+				err := tx.QueryRow(ctx, `SELECT state, published_revision FROM task_workspace_publish_receipts
+WHERE task_id=$1 AND operation_key=$2 FOR UPDATE`, taskID, operationKey).Scan(&receiptState, &publishedRevision)
+				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					return fmt.Errorf("read Task media publish receipt during cancellation: %w", err)
+				}
+			}
+			if receiptState == string(app.TaskWorkspacePublishSucceeded) {
+				if !publishedRevision.Valid || publishedRevision.Int64 != checkpointRevision {
+					return domain.NewError(domain.CodeConflict, "published Task media checkpoint changed before cancellation")
+				}
+				var mediaType string
+				var sizeBytes int64
+				var sha256Bytes []byte
+				if err := tx.QueryRow(ctx, `SELECT media_type, size_bytes, sha256 FROM task_media_staged_objects
+WHERE task_id=$1 AND operation_id=$2`, taskID, decision.operationID).Scan(&mediaType, &sizeBytes, &sha256Bytes); err != nil {
+					return fmt.Errorf("read published Task media metadata during cancellation: %w", err)
+				}
+				var artifactRecorded bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM task_artifacts
+  WHERE task_id=$1 AND step_id=$2 AND workspace_id=$3 AND workspace_revision=$4
+    AND size_bytes=$5 AND sha256=encode($6::bytea,'hex') AND media_type=$7
+    AND path LIKE $8
+)`, taskID, stepID, workspaceID, publishedRevision.Int64, sizeBytes, sha256Bytes, mediaType,
+					"morde-media-"+decision.operationID+".%").Scan(&artifactRecorded); err != nil {
+					return fmt.Errorf("check published Task media Artifact during cancellation: %w", err)
+				}
+				if !artifactRecorded {
+					return domain.NewError(domain.CodeConflict, "Task media was published but its Artifact is still being recorded; retry cancellation")
+				}
+				if _, err := tx.Exec(ctx, `UPDATE task_media_staged_objects SET state='published', updated_at=clock_timestamp()
+WHERE task_id=$1 AND operation_id=$2 AND state='saving' AND cleanup_state='pending'`, taskID, decision.operationID); err != nil {
+					return fmt.Errorf("settle published Task media during cancellation: %w", err)
+				}
+				continue
+			}
+			if operationKey != "" && receiptState == string(app.TaskWorkspacePublishPending) {
+				if _, err := tx.Exec(ctx, `UPDATE task_workspace_publish_receipts SET state='conflict', updated_at=clock_timestamp()
+WHERE task_id=$1 AND operation_key=$2 AND state='pending'`, taskID, operationKey); err != nil {
+					return fmt.Errorf("reject pending Task media publish during cancellation: %w", err)
+				}
+			}
+			if _, err := tx.Exec(ctx, `UPDATE task_media_staged_objects SET state='discarded', updated_at=clock_timestamp()
+WHERE task_id=$1 AND operation_id=$2 AND state='saving' AND cleanup_state='pending'`, taskID, decision.operationID); err != nil {
+				return fmt.Errorf("discard approved Task media during cancellation: %w", err)
+			}
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_media_staged_objects SET state='discarded', updated_at=clock_timestamp()
+WHERE task_id=$1 AND operation_id=$2 AND state='preview' AND cleanup_state='pending'`, taskID, decision.operationID); err != nil {
+			return fmt.Errorf("discard pending media preview during task cancellation: %w", err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `UPDATE task_pending_requests SET status='cancelled', decision='', responded_at=clock_timestamp()
 WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
 		return fmt.Errorf("cancel pending task approval: %w", err)
@@ -230,4 +343,94 @@ WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
 		return fmt.Errorf("cancel pending task clarification: %w", err)
 	}
 	return nil
+}
+
+// ExpireTaskMediaPreviewApproval rejects an approval whose preview bytes have
+// expired, then requeues the exact waiting Task so its broker can settle the
+// declined tool call without replaying generation.
+func (s *Store) ExpireTaskMediaPreviewApproval(ctx context.Context, taskID, operationID string) error {
+	if !domain.ValidTaskID(taskID) || !domain.ValidOperationID(operationID) {
+		return domain.InvalidArgument("task_media_preview", "expired Task media identity is invalid")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		var taskStatus, waitingReason string
+		var leaseVersion int64
+		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version FROM tasks WHERE id=$1 FOR UPDATE`, taskID).
+			Scan(&taskStatus, &waitingReason, &leaseVersion); errors.Is(err, pgx.ErrNoRows) {
+			return missingTaskError()
+		} else if err != nil {
+			return fmt.Errorf("lock Task for expired media approval: %w", err)
+		}
+		var pendingID string
+		var pendingVersion int64
+		var pendingStatus string
+		if err := tx.QueryRow(ctx, `SELECT id, version, status FROM task_pending_requests
+WHERE task_id=$1 AND media_preview_operation_id=$2 FOR UPDATE`, taskID, operationID).
+			Scan(&pendingID, &pendingVersion, &pendingStatus); errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("lock approval for expired Task media: %w", err)
+		}
+		if pendingStatus != string(task.PendingRequestPending) {
+			return nil
+		}
+		if taskStatus != string(task.StatusWaitingUser) || waitingReason != "approval_required" || leaseVersion == int64(^uint64(0)>>1) {
+			return domain.NewError(domain.CodeConflict, "expired media approval is not attached to a waiting Task")
+		}
+		var mediaState string
+		if err := tx.QueryRow(ctx, `SELECT state FROM task_media_staged_objects
+WHERE task_id=$1 AND operation_id=$2 FOR UPDATE`, taskID, operationID).Scan(&mediaState); err != nil {
+			return fmt.Errorf("lock expired Task media preview: %w", err)
+		}
+		if mediaState != string(app.TaskMediaPreviewExpired) {
+			return domain.NewError(domain.CodeConflict, "Task media preview has not expired")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_pending_requests
+SET status='rejected', decision='reject', responded_at=clock_timestamp()
+WHERE id=$1 AND task_id=$2 AND version=$3 AND status='pending'`, pendingID, taskID, pendingVersion); err != nil {
+			return fmt.Errorf("reject expired Task media approval: %w", err)
+		}
+		var sequence int64
+		err := tx.QueryRow(ctx, `UPDATE tasks SET status='queued', lease_version=lease_version+1,
+waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
+WHERE id=$1 AND status='waiting_user' AND lease_owner='' AND lease_expires_at IS NULL RETURNING event_seq`, taskID).Scan(&sequence)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "Task changed while expiring its media approval")
+		}
+		if err != nil {
+			return fmt.Errorf("requeue Task after media preview expiry: %w", err)
+		}
+		payload, err := json.Marshal(map[string]any{
+			"pending_id": pendingID, "pending_version": pendingVersion, "decision": string(task.PendingDecisionReject),
+			"reason": "media_preview_expired", "idempotency_replayed": false,
+			"status": string(task.StatusQueued), "lease_version": leaseVersion + 1,
+		})
+		if err != nil {
+			return fmt.Errorf("encode expired media approval event: %w", err)
+		}
+		return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.response", Payload: payload})
+	})
+}
+
+func (s *Store) CanCleanupTaskMediaStagedObject(ctx context.Context, taskID, operationID string) (bool, error) {
+	if !domain.ValidTaskID(taskID) || !domain.ValidOperationID(operationID) {
+		return false, domain.InvalidArgument("task_media_cleanup", "Task media cleanup identity is invalid")
+	}
+	stepID := "s" + operationID[1:]
+	var taskStatus, stepStatus, pendingStatus string
+	err := s.pool.QueryRow(ctx, `SELECT t.status, COALESCE(step.status,''), COALESCE(pending.status,'')
+FROM tasks t
+LEFT JOIN task_steps step ON step.task_id=t.id AND step.id=$3
+LEFT JOIN task_pending_requests pending ON pending.task_id=t.id AND pending.media_preview_operation_id=$2
+WHERE t.id=$1`, taskID, operationID, stepID).Scan(&taskStatus, &stepStatus, &pendingStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, missingTaskError()
+	}
+	if err != nil {
+		return false, fmt.Errorf("check Task media cleanup readiness: %w", err)
+	}
+	return taskStatus == string(task.StatusCancelling) || taskStatus == string(task.StatusCancelled) ||
+		taskStatus == string(task.StatusFailed) || taskStatus == string(task.StatusCompleted) ||
+		stepStatus == string(task.StepFailed) || stepStatus == string(task.StepSucceeded) ||
+		(stepStatus == "" && (pendingStatus == string(task.PendingRequestRejected) || pendingStatus == string(task.PendingRequestCancelled))), nil
 }

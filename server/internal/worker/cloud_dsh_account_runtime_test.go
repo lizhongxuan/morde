@@ -19,6 +19,18 @@ import (
 	"morde/server/internal/dshguardian"
 )
 
+func TestCloudDSHRuntimeStartupErrorKeepsSafeStage(t *testing.T) {
+	wrapped := errors.Join(fmt.Errorf("startup failed: %w", cloudDSHStartupFailure(
+		"guardian_arm", "guardian could not arm the account Agent Runtime", errors.New("private provider detail"))), errors.New("cleanup pending"))
+	var staged interface{ RuntimeStartupStage() string }
+	if !errors.As(wrapped, &staged) || staged.RuntimeStartupStage() != "guardian_arm" {
+		t.Fatalf("startup stage was not preserved through wrapping: %v", wrapped)
+	}
+	if strings.Contains(wrapped.Error(), "private provider detail") {
+		t.Fatal("safe startup error exposed its underlying detail")
+	}
+}
+
 type accountRuntimeControlStub struct {
 	runtime                app.AccountAgentRuntime
 	candidates             []app.AccountAgentRuntimeStopIdentity
@@ -33,7 +45,7 @@ type accountRuntimeControlStub struct {
 func (s *accountRuntimeControlStub) Start(_ context.Context, request app.AccountAgentRuntimeStart) (app.AccountAgentRuntime, bool, error) {
 	digest := sha256.Sum256(request.SupervisorNonce)
 	s.runtime = app.AccountAgentRuntime{
-		Fence: app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", OwnerID: request.OwnerID,
+		Fence: app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: request.ConversationID, OwnerID: request.OwnerID,
 			RuntimeID: request.RuntimeID, RuntimeGeneration: 1, LeaseOwner: request.LeaseOwner, LeaseVersion: 1, ExecutionEpoch: 1},
 		State: app.AccountAgentRuntimeStarting, LeaseExpiresAt: time.Now().Add(request.LeaseDuration),
 		MaxConcurrentTasks: request.MaxConcurrentTasks, NonceSHA256: hex.EncodeToString(digest[:]),
@@ -129,7 +141,7 @@ func (s *ownerScopedAccountRuntimeControlStub) Start(ctx context.Context, reques
 	defer s.mu.Unlock()
 	runtime, replayed, err := s.accountRuntimeControlStub.Start(ctx, request)
 	if err == nil {
-		s.runtimes[request.OwnerID] = runtime
+		s.runtimes[request.ConversationID] = runtime
 	}
 	return runtime, replayed, err
 }
@@ -137,10 +149,10 @@ func (s *ownerScopedAccountRuntimeControlStub) Start(ctx context.Context, reques
 func (s *ownerScopedAccountRuntimeControlStub) Ready(ctx context.Context, fence app.AccountAgentRuntimeFence) (app.AccountAgentRuntime, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.runtime = s.runtimes[fence.OwnerID]
+	s.runtime = s.runtimes[fence.ConversationID]
 	runtime, err := s.accountRuntimeControlStub.Ready(ctx, fence)
 	if err == nil {
-		s.runtimes[fence.OwnerID] = runtime
+		s.runtimes[fence.ConversationID] = runtime
 	}
 	return runtime, err
 }
@@ -148,29 +160,29 @@ func (s *ownerScopedAccountRuntimeControlStub) Ready(ctx context.Context, fence 
 func (s *ownerScopedAccountRuntimeControlStub) Fail(ctx context.Context, fence app.AccountAgentRuntimeFence, reason execution.RuntimeFailureReason) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.runtime = s.runtimes[fence.OwnerID]
+	s.runtime = s.runtimes[fence.ConversationID]
 	if err := s.accountRuntimeControlStub.Fail(ctx, fence, reason); err != nil {
 		return err
 	}
-	s.runtimes[fence.OwnerID] = s.runtime
+	s.runtimes[fence.ConversationID] = s.runtime
 	return nil
 }
 
 func (s *ownerScopedAccountRuntimeControlStub) Renew(ctx context.Context, fence app.AccountAgentRuntimeFence, duration time.Duration) (app.AccountAgentRuntime, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.runtime = s.runtimes[fence.OwnerID]
+	s.runtime = s.runtimes[fence.ConversationID]
 	runtime, err := s.accountRuntimeControlStub.Renew(ctx, fence, duration)
 	if err == nil {
-		s.runtimes[fence.OwnerID] = runtime
+		s.runtimes[fence.ConversationID] = runtime
 	}
 	return runtime, err
 }
 
-func (s *ownerScopedAccountRuntimeControlStub) Get(_ context.Context, ownerID string) (app.AccountAgentRuntime, bool, error) {
+func (s *ownerScopedAccountRuntimeControlStub) Get(_ context.Context, conversationID string) (app.AccountAgentRuntime, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	runtime, found := s.runtimes[ownerID]
+	runtime, found := s.runtimes[conversationID]
 	return runtime, found, nil
 }
 
@@ -275,7 +287,7 @@ func TestAccountAgentRuntimeRejectsIncompleteSupervisorProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Acquire(context.Background(), "u1234567"); err == nil || !strings.Contains(err.Error(), "incomplete pipes") {
+	if _, err := manager.Acquire(context.Background(), "u1234567", "c1234567"); err == nil || !strings.Contains(err.Error(), "incomplete pipes") {
 		t.Fatalf("incomplete supervisor process error = %v", err)
 	}
 	if control.runtime.State != app.AccountAgentRuntimeFailed || control.failureMarks != 1 {
@@ -283,7 +295,7 @@ func TestAccountAgentRuntimeRejectsIncompleteSupervisorProcess(t *testing.T) {
 	}
 }
 
-func TestAccountAgentRuntimeSessionsAreIsolatedByOwner(t *testing.T) {
+func TestAccountAgentRuntimeSessionsAreIsolatedByConversation(t *testing.T) {
 	control := &ownerScopedAccountRuntimeControlStub{
 		accountRuntimeControlStub: &accountRuntimeControlStub{}, runtimes: make(map[string]app.AccountAgentRuntime),
 	}
@@ -295,28 +307,37 @@ func TestAccountAgentRuntimeSessionsAreIsolatedByOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := manager.Acquire(context.Background(), "u1234567")
+	first, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := manager.Acquire(context.Background(), "u7654321")
+	second, err := manager.Acquire(context.Background(), "u7654321", "c7654321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := manager.Acquire(context.Background(), "u1234567", "c1111111")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first == second || first.runtime.Fence.OwnerID == second.runtime.Fence.OwnerID ||
-		manager.sessions[first.runtime.Fence.OwnerID] != first || manager.sessions[second.runtime.Fence.OwnerID] != second {
+		first == third || first.runtime.Fence.ConversationID == third.runtime.Fence.ConversationID ||
+		manager.sessions[first.runtime.Fence.ConversationID] != first || manager.sessions[second.runtime.Fence.ConversationID] != second ||
+		manager.sessions[third.runtime.Fence.ConversationID] != third {
 		t.Fatalf("account Runtime sessions were shared: first=%p/%+v second=%p/%+v sessions=%v",
 			first, first.runtime.Fence, second, second.runtime.Fence, manager.sessions)
 	}
-	reused, err := manager.Acquire(context.Background(), first.runtime.Fence.OwnerID)
+	reused, err := manager.Acquire(context.Background(), first.runtime.Fence.OwnerID, first.runtime.Fence.ConversationID)
 	if err != nil || reused != first {
 		t.Fatalf("acquire for first account did not reuse its own Runtime: reused=%t err=%v", reused == first, err)
 	}
-	firstState, firstFound, err := control.Get(context.Background(), first.runtime.Fence.OwnerID)
+	if _, err := manager.Acquire(context.Background(), "u7654321", first.runtime.Fence.ConversationID); err == nil {
+		t.Fatal("conversation Runtime was reused for a different owner")
+	}
+	firstState, firstFound, err := control.Get(context.Background(), first.runtime.Fence.ConversationID)
 	if err != nil || !firstFound || firstState.Fence != first.runtime.Fence {
 		t.Fatalf("first account Runtime state crossed accounts: runtime=%+v found=%t err=%v", firstState, firstFound, err)
 	}
-	secondState, secondFound, err := control.Get(context.Background(), second.runtime.Fence.OwnerID)
+	secondState, secondFound, err := control.Get(context.Background(), second.runtime.Fence.ConversationID)
 	if err != nil || !secondFound || secondState.Fence != second.runtime.Fence {
 		t.Fatalf("second account Runtime state crossed accounts: runtime=%+v found=%t err=%v", secondState, secondFound, err)
 	}
@@ -324,6 +345,8 @@ func TestAccountAgentRuntimeSessionsAreIsolatedByOwner(t *testing.T) {
 	_ = first.process.Output.Close()
 	_ = second.process.Input.Close()
 	_ = second.process.Output.Close()
+	_ = third.process.Input.Close()
+	_ = third.process.Output.Close()
 }
 
 func (s *accountRuntimeSupervisorStub) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
@@ -344,7 +367,7 @@ func TestAccountAgentRuntimeRenewsIdleSessionBeforeExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := manager.Acquire(context.Background(), "u1234567")
+	session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +494,7 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	}
 	acquireCtx, cancelAcquire := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelAcquire()
-	session, err := manager.Acquire(acquireCtx, "u1234567")
+	session, err := manager.Acquire(acquireCtx, "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +641,7 @@ func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	session, err := manager.Acquire(ctx, "u1234567")
+	session, err := manager.Acquire(ctx, "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,9 +706,102 @@ func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
 	if err := manager.StopTask(ctx, session, unarmed); err != nil {
 		t.Fatalf("retire last unarmed Task after sibling stopped: %v", err)
 	}
-	if control.runtime.State != app.AccountAgentRuntimeStopped || control.requestStops != 1 || supervisor.stopCalls != 1 || len(taskStopper.confirmed) != 2 {
+	if control.runtime.State != app.AccountAgentRuntimeStopped || control.requestStops != 0 || supervisor.stopCalls != 1 || len(taskStopper.confirmed) != 2 {
 		t.Fatalf("final Runtime state=%q requests=%d Runtime stops=%d Task proofs=%d",
 			control.runtime.State, control.requestStops, supervisor.stopCalls, len(taskStopper.confirmed))
+	}
+}
+
+func TestFailedAccountAgentRuntimeCanBeGuardianStoppedBeforeLeaseExpiry(t *testing.T) {
+	control := &accountRuntimeControlStub{}
+	supervisor := &accountRuntimeSupervisorStub{}
+	manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: control, Supervisor: supervisor, Guardian: &accountRuntimeGuardianStub{},
+		StopVerifier: accountRuntimeStopVerifierStub{}, TaskStopper: &accountRuntimeTaskStopperStub{},
+		LeaseOwner: "worker-runtime", MaxTasks: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.process.Input.Close(); _ = session.process.Output.Close() }()
+	session.fail(errors.New("account Agent Runtime protocol failed"))
+	if !control.runtime.LeaseExpiresAt.After(time.Now()) {
+		t.Fatal("test requires an active account Runtime lease")
+	}
+	if err := manager.stopUnattachedRuntime(context.Background(), session.runtime.Fence); err != nil {
+		t.Fatalf("Guardian recovery could not stop a failed Runtime: %v", err)
+	}
+	if control.runtime.State != app.AccountAgentRuntimeStopped || control.requestStops != 0 || control.stopProofs != 1 {
+		t.Fatalf("failed Runtime cleanup changed owner execution: state=%s owner_stop_requests=%d guardian_proofs=%d",
+			control.runtime.State, control.requestStops, control.stopProofs)
+	}
+}
+
+func TestAccountAgentRuntimeBackpressureDoesNotBlockSibling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime := app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{
+		ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567",
+		RuntimeID: "runtime_1", RuntimeGeneration: 1,
+	}}
+	session := &cloudDSHAccountRuntimeSession{runtime: runtime, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask)}
+	startTask := func(taskID, agentID, sessionID string, sequence int64) (app.AgentInstanceFence, io.ReadCloser) {
+		t.Helper()
+		fence := app.AgentInstanceFence{TaskID: taskID, OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: agentID,
+			AgentGeneration: 1, AgentSessionID: sessionID, SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
+			AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+		lease := app.AgentInstanceLease{Fence: fence, RuntimeFence: &runtime.Fence, RuntimeSequence: sequence, ExpiresAt: time.Now().Add(app.MaxAgentLease)}
+		_, output, err := session.StartTask(ctx, fence, []byte(strings.Repeat("n", 32)), lease)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fence, output
+	}
+	stalled, stalledOutput := startTask("q1234567", "agent-1", "session-1", 1)
+	sibling, siblingOutput := startTask("q2345678", "agent-2", "session-2", 2)
+	stalledTask := session.tasks[stalled]
+	for len(stalledTask.events) < cap(stalledTask.events) {
+		stalledTask.events <- cloudDSHRead{frame: []byte(`{}`)}
+	}
+	frame := func(fence app.AgentInstanceFence) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{"type": "checkpoint", "server_instance_id": runtime.Fence.ServiceInstanceID,
+			"runtime_id": runtime.Fence.RuntimeID, "runtime_generation": runtime.Fence.RuntimeGeneration,
+			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
+			"session_id": fence.AgentSessionID, "generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	done := make(chan error, 1)
+	stalledFrame := frame(stalled)
+	go func() { done <- session.routeFrame(stalledFrame) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stalled Task stopped the shared Runtime: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a full Task event queue blocked routing for the shared Runtime")
+	}
+	if _, err := stalledOutput.Read(make([]byte, 64)); err == nil {
+		t.Fatal("the stalled Task did not report its event-queue failure")
+	}
+	if err := session.routeFrame(frame(sibling)); err != nil || session.closed() {
+		t.Fatalf("sibling Task could not receive its event: err=%v closed=%t", err, session.closed())
+	}
+	reader := bufio.NewReader(siblingOutput)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+	got, err := reader.ReadBytes('\n')
+	if err != nil || !strings.Contains(string(got), `"task_id":"q2345678"`) {
+		t.Fatalf("sibling received wrong event: %s, %v", got, err)
 	}
 }
 
@@ -699,7 +815,7 @@ func TestAccountAgentRuntimeLifecycleReapsIdleStoppingRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := manager.Acquire(context.Background(), "u1234567")
+	session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +832,7 @@ func TestAccountAgentRuntimeLifecycleReapsIdleStoppingRuntime(t *testing.T) {
 		t.Fatalf("Runtime proof acknowledgements DB=%d Guardian=%d pending=%d, want 1/1/0",
 			len(control.acknowledgedStopProofs), len(guardian.runtimeProofAcks), len(control.pendingStopProofs))
 	}
-	if manager.sessions[session.runtime.Fence.OwnerID] != nil {
+	if manager.sessions[session.runtime.Fence.ConversationID] != nil {
 		t.Fatal("reaped Runtime session remains cached")
 	}
 }
@@ -731,7 +847,7 @@ func TestAbortedAccountRuntimeStartDoesNotAcknowledgeMissingGuardianLease(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = control.Start(context.Background(), app.AccountAgentRuntimeStart{OwnerID: "u1234567",
+	_, _, err = control.Start(context.Background(), app.AccountAgentRuntimeStart{OwnerID: "u1234567", ConversationID: "c1234567",
 		RuntimeID: "aborted-runtime", LeaseOwner: "worker-runtime", SupervisorNonce: []byte(strings.Repeat("n", 32)),
 		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
 	if err != nil {
@@ -750,7 +866,7 @@ func TestAbortedAccountRuntimeStartDoesNotAcknowledgeMissingGuardianLease(t *tes
 
 func TestAccountAgentRuntimeLifecycleReplaysPersistedStopProofAcknowledgements(t *testing.T) {
 	runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000",
-		OwnerID: "u1234567", RuntimeID: "runtime_1", RuntimeGeneration: 1, LeaseOwner: "worker-runtime", LeaseVersion: 1, ExecutionEpoch: 1}
+		ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime_1", RuntimeGeneration: 1, LeaseOwner: "worker-runtime", LeaseVersion: 1, ExecutionEpoch: 1}
 	runtimeProof := app.AccountAgentRuntimeStopAttestation{Fence: runtimeFence, NonceSHA256: strings.Repeat("a", 64),
 		ProofSHA256: strings.Repeat("b", 64), Destroyed: true, DestroyedAt: time.Now()}
 	control := &accountRuntimeControlStub{pendingStopProofs: []app.AccountAgentRuntimeStopAttestation{runtimeProof}}
@@ -788,7 +904,7 @@ func TestAccountAgentRuntimeLifecycleKeepsRuntimeWithActiveTasks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := manager.Acquire(context.Background(), "u1234567")
+	session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -816,7 +932,7 @@ func TestAccountAgentRuntimeLifecyclePersistsStopBeforeReapingExpiredRuntime(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := manager.Acquire(context.Background(), "u1234567")
+	session, err := manager.Acquire(context.Background(), "u1234567", "c1234567")
 	if err != nil {
 		t.Fatal(err)
 	}

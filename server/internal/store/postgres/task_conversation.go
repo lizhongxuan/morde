@@ -1,10 +1,8 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -14,6 +12,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
@@ -25,6 +24,17 @@ import (
 )
 
 func (s *Store) CreateConversation(ctx context.Context, value conversation.Conversation, key app.IdempotencyRecord) (conversation.Conversation, bool, error) {
+	return s.createConversation(ctx, value, key, "")
+}
+
+func (s *Store) CreateConversationForServiceInstance(ctx context.Context, value conversation.Conversation, key app.IdempotencyRecord, instanceID string) (conversation.Conversation, bool, error) {
+	if !domain.ValidServiceInstanceID(instanceID) {
+		return conversation.Conversation{}, false, domain.InvalidArgument("service_instance_id", "service instance id is invalid")
+	}
+	return s.createConversation(ctx, value, key, instanceID)
+}
+
+func (s *Store) createConversation(ctx context.Context, value conversation.Conversation, key app.IdempotencyRecord, instanceID string) (conversation.Conversation, bool, error) {
 	if err := validateConversation(value); err != nil {
 		return conversation.Conversation{}, false, err
 	}
@@ -34,6 +44,11 @@ func (s *Store) CreateConversation(ctx context.Context, value conversation.Conve
 	var result conversation.Conversation
 	var replayed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if instanceID != "" {
+			if err := requireConversationServiceInstance(ctx, tx, instanceID); err != nil {
+				return err
+			}
+		}
 		stored, replay, err := reserveIdempotency(ctx, tx, key, value.ID, "")
 		if err != nil {
 			return err
@@ -67,65 +82,6 @@ VALUES ($1, $2, $3, $4, $5)`, value.ID, value.OwnerID, nullableText(value.HostID
 	return result, replayed, err
 }
 
-// GetLegacyInstantChatReplay returns the canonical conversation and message
-// pair copied by the instant-chat migration. It fails closed if the key exists
-// but its canonical history is missing or inconsistent.
-func (s *Store) GetLegacyInstantChatReplay(ctx context.Context, ownerID, key string, requestHash []byte) (app.LegacyInstantChatReplay, bool, error) {
-	var storedHash []byte
-	var userMessageID, assistantMessageID string
-	err := s.pool.QueryRow(ctx, `SELECT request_hash, resource_id, related_id
-FROM idempotency_keys WHERE owner_id=$1 AND operation='instant_chat.send' AND key=$2`, ownerID, key).
-		Scan(&storedHash, &userMessageID, &assistantMessageID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return app.LegacyInstantChatReplay{}, false, nil
-	}
-	if err != nil {
-		return app.LegacyInstantChatReplay{}, false, fmt.Errorf("load legacy instant-chat idempotency record: %w", err)
-	}
-	if !bytes.Equal(storedHash, requestHash) {
-		return app.LegacyInstantChatReplay{}, false, domain.NewError(domain.CodeIdempotencyConflict, "idempotency key reused with different request")
-	}
-
-	var result app.LegacyInstantChatReplay
-	var userRole, assistantRole string
-	err = s.pool.QueryRow(ctx, `SELECT
-  c.id, c.owner_id, c.model_id, c.title, c.created_at, c.updated_at,
-  u.id, u.conversation_id, u.owner_id, u.role, u.content, u.model_id, u.sequence,
-  u.source_kind, u.source_exchange_id, u.requested_conversation_id, u.created_at,
-  a.id, a.conversation_id, a.owner_id, a.role, a.content, a.model_id, a.sequence,
-  a.source_kind, a.source_exchange_id, a.requested_conversation_id, a.created_at
-FROM idempotency_keys k
-JOIN conversation_messages u ON u.id=k.resource_id AND u.owner_id=k.owner_id
-JOIN conversation_messages a ON a.id=k.related_id AND a.owner_id=k.owner_id
-JOIN conversations c ON c.id=u.conversation_id AND c.owner_id=u.owner_id
-WHERE k.owner_id=$1 AND k.operation='instant_chat.send' AND k.key=$2
-  AND u.id=$3 AND a.id=$4 AND u.conversation_id=a.conversation_id AND c.host_id IS NULL
-  AND c.source_kind='legacy_instant' AND u.task_id IS NULL AND a.task_id IS NULL
-  AND u.role='user' AND a.role='assistant'
-  AND u.source_kind='legacy_instant' AND a.source_kind='legacy_instant'
-  AND u.source_exchange_id<>'' AND u.source_exchange_id=a.source_exchange_id
-  AND u.requested_conversation_id=a.requested_conversation_id
-  AND u.model_id=c.model_id AND a.model_id=c.model_id`, ownerID, key, userMessageID, assistantMessageID).Scan(
-		&result.Conversation.ID, &result.Conversation.OwnerID, &result.Conversation.ModelID, &result.Conversation.Title,
-		&result.Conversation.CreatedAt, &result.Conversation.UpdatedAt,
-		&result.UserMessage.ID, &result.UserMessage.ConversationID, &result.UserMessage.OwnerID, &userRole,
-		&result.UserMessage.Content, &result.UserMessage.ModelID, &result.UserMessage.Sequence,
-		&result.UserMessage.SourceKind, &result.UserMessage.SourceExchangeID, &result.UserMessage.RequestedConversationID, &result.UserMessage.CreatedAt,
-		&result.AssistantMessage.ID, &result.AssistantMessage.ConversationID, &result.AssistantMessage.OwnerID, &assistantRole,
-		&result.AssistantMessage.Content, &result.AssistantMessage.ModelID, &result.AssistantMessage.Sequence,
-		&result.AssistantMessage.SourceKind, &result.AssistantMessage.SourceExchangeID, &result.AssistantMessage.RequestedConversationID, &result.AssistantMessage.CreatedAt,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return app.LegacyInstantChatReplay{}, false, domain.NewError(domain.CodeInternal, "legacy instant-chat history is unavailable")
-	}
-	if err != nil {
-		return app.LegacyInstantChatReplay{}, false, fmt.Errorf("load legacy instant-chat history: %w", err)
-	}
-	result.UserMessage.Role = conversation.Role(userRole)
-	result.AssistantMessage.Role = conversation.Role(assistantRole)
-	return result, true, nil
-}
-
 func (s *Store) GetConversation(ctx context.Context, id, ownerID string) (conversation.Conversation, error) {
 	row, err := s.q.GetConversation(ctx, sqlcgen.GetConversationParams{ID: id, OwnerID: ownerID})
 	if err != nil {
@@ -138,6 +94,17 @@ func (s *Store) GetConversation(ctx context.Context, id, ownerID string) (conver
 }
 
 func (s *Store) CreateProjectConversation(ctx context.Context, actorID string, value conversation.Conversation, key app.IdempotencyRecord) (conversation.Conversation, bool, error) {
+	return s.createProjectConversation(ctx, actorID, value, key, "")
+}
+
+func (s *Store) CreateProjectConversationForServiceInstance(ctx context.Context, actorID string, value conversation.Conversation, key app.IdempotencyRecord, instanceID string) (conversation.Conversation, bool, error) {
+	if !domain.ValidServiceInstanceID(instanceID) {
+		return conversation.Conversation{}, false, domain.InvalidArgument("service_instance_id", "service instance id is invalid")
+	}
+	return s.createProjectConversation(ctx, actorID, value, key, instanceID)
+}
+
+func (s *Store) createProjectConversation(ctx context.Context, actorID string, value conversation.Conversation, key app.IdempotencyRecord, instanceID string) (conversation.Conversation, bool, error) {
 	if err := validateConversation(value); err != nil {
 		return conversation.Conversation{}, false, err
 	}
@@ -148,6 +115,11 @@ func (s *Store) CreateProjectConversation(ctx context.Context, actorID string, v
 	var result conversation.Conversation
 	var replayed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if instanceID != "" {
+			if err := requireConversationServiceInstance(ctx, tx, instanceID); err != nil {
+				return err
+			}
+		}
 		if _, _, err := lockProjectForActorInTx(ctx, tx, actorID, value.ProjectID, project.RoleMember, true); err != nil {
 			return err
 		}
@@ -273,10 +245,10 @@ func (s *Store) GetMainConversation(ctx context.Context, ownerID string) (conver
 	var archivedAt pgtype.Timestamptz
 	var candidateCount int64
 	err := s.pool.QueryRow(ctx, `SELECT p.conversation_id,p.version,c.id,c.archived_at,
-  (SELECT count(*) FROM conversations candidate WHERE candidate.owner_id=$1 AND candidate.archived_at IS NULL)
+  (SELECT count(*) FROM conversations candidate WHERE candidate.owner_id=$1 AND candidate.project_id IS NULL AND candidate.archived_at IS NULL)
 FROM service_identity i
 LEFT JOIN account_main_conversations p ON p.service_instance_id=i.instance_id AND p.owner_id=$1
-LEFT JOIN conversations c ON c.id=p.conversation_id AND c.owner_id=p.owner_id
+LEFT JOIN conversations c ON c.id=p.conversation_id AND c.owner_id=p.owner_id AND c.project_id IS NULL
 WHERE i.singleton=true`, ownerID).Scan(&id, &version, &storedConversationID, &archivedAt, &candidateCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return conversation.MainConversation{}, domain.NewError(domain.CodeInternal, "service instance identity is unavailable")
@@ -319,7 +291,7 @@ func (s *Store) EnsureMainConversation(ctx context.Context, value conversation.C
 			return err
 		}
 		if replay {
-			result, err = replayMainConversation(stored)
+			result, err = replayAvailableMainConversation(ctx, tx, value.OwnerID, stored)
 			replayed = err == nil
 			return err
 		}
@@ -331,7 +303,7 @@ func (s *Store) EnsureMainConversation(ctx context.Context, value conversation.C
 			return err
 		}
 		if replay {
-			result, err = replayMainConversation(stored)
+			result, err = replayAvailableMainConversation(ctx, tx, value.OwnerID, stored)
 			replayed = err == nil
 			return err
 		}
@@ -345,7 +317,7 @@ func (s *Store) EnsureMainConversation(ctx context.Context, value conversation.C
 			return reserveMainConversationResult(ctx, tx, record, result)
 		}
 
-		rows, err := tx.Query(ctx, `SELECT id FROM conversations WHERE owner_id=$1 AND archived_at IS NULL ORDER BY created_at,id LIMIT 2 FOR SHARE`, value.OwnerID)
+		rows, err := tx.Query(ctx, `SELECT id FROM conversations WHERE owner_id=$1 AND project_id IS NULL AND archived_at IS NULL ORDER BY created_at,id LIMIT 2 FOR SHARE`, value.OwnerID)
 		if err != nil {
 			return fmt.Errorf("list main conversation candidates: %w", err)
 		}
@@ -410,7 +382,7 @@ func (s *Store) SetMainConversation(ctx context.Context, ownerID, conversationID
 			return err
 		}
 		if replay {
-			result, err = replayMainConversation(stored)
+			result, err = replayAvailableMainConversation(ctx, tx, ownerID, stored)
 			replayed = err == nil
 			return err
 		}
@@ -422,7 +394,7 @@ func (s *Store) SetMainConversation(ctx context.Context, ownerID, conversationID
 			return err
 		}
 		if replay {
-			result, err = replayMainConversation(stored)
+			result, err = replayAvailableMainConversation(ctx, tx, ownerID, stored)
 			replayed = err == nil
 			return err
 		}
@@ -508,6 +480,17 @@ func replayMainConversation(stored sqlcgen.IdempotencyKey) (conversation.MainCon
 	return conversation.MainConversation{Status: conversation.MainConversationReady, ConversationID: stored.ResourceID, Version: version}, nil
 }
 
+func replayAvailableMainConversation(ctx context.Context, tx pgx.Tx, ownerID string, stored sqlcgen.IdempotencyKey) (conversation.MainConversation, error) {
+	result, err := replayMainConversation(stored)
+	if err != nil {
+		return conversation.MainConversation{}, err
+	}
+	if err := lockAvailableConversationInTx(ctx, tx, ownerID, result.ConversationID); err != nil {
+		return conversation.MainConversation{}, err
+	}
+	return result, nil
+}
+
 func mainConversationVersionConflict(expected, current int64) error {
 	conflict := domain.NewError(domain.CodeConflict, "main conversation version changed")
 	conflict.Details["expected_version"] = expected
@@ -578,26 +561,38 @@ func (s *Store) ListMessages(ctx context.Context, ownerID, conversationID string
 			return app.MessagePage{}, domain.InvalidArgument("cursor", "message cursor is invalid")
 		}
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id,conversation_id,owner_id,role,content,task_id,created_at,model_id,source_kind,
-source_exchange_id,requested_conversation_id,sequence,delivery_status,actor_id
-FROM conversation_messages
-WHERE owner_id=$1 AND conversation_id=$2 AND ($3::bigint=0 OR sequence<$3::bigint)
-ORDER BY sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
+	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,m.task_id,m.created_at,m.model_id,m.source_kind,
+m.source_exchange_id,m.requested_conversation_id,m.sequence,m.delivery_status,m.actor_id,
+COALESCE(r.client_message_id,''),COALESCE(r.state,''),COALESCE(r.failure_reason,''),
+CASE WHEN m.output_status='streaming' AND NOT EXISTS (
+ SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
+  AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
+) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence
+FROM conversation_messages m LEFT JOIN conversation_message_routes r ON r.message_id=m.id
+WHERE m.owner_id=$1 AND m.conversation_id=$2 AND ($3::bigint=0 OR m.sequence<$3::bigint)
+ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	if err != nil {
 		return app.MessagePage{}, fmt.Errorf("list conversation messages: %w", err)
 	}
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var deliveryStatus string
+		var deliveryStatus, clientID, routingStatus, routingFailure string
+		var outputStatus string
+		var outputRevision, outputEvent pgtype.Int8
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &deliveryStatus, &row.ActorID); err != nil {
+			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &routingStatus, &routingFailure,
+			&outputStatus, &outputRevision, &outputEvent); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan conversation message: %w", err)
 		}
 		message := messageDomain(row)
 		message.DeliveryStatus = conversation.DeliveryStatus(deliveryStatus)
+		message.ClientMessageID = clientID
+		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
+		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
 		items = append(items, message)
 	}
 	if err := rows.Err(); err != nil {
@@ -606,6 +601,9 @@ ORDER BY sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	}
 	rows.Close()
 	if err := s.attachConversationMessageAttachmentIDs(ctx, ownerID, conversationID, items); err != nil {
+		return app.MessagePage{}, err
+	}
+	if err := s.attachConversationResultSources(ctx, ownerID, conversationID, items); err != nil {
 		return app.MessagePage{}, err
 	}
 	pageResult := app.MessagePage{Items: items}
@@ -636,11 +634,17 @@ func (s *Store) ListProjectConversationMessages(ctx context.Context, actorID, pr
 		}
 	}
 	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,m.task_id,m.created_at,m.model_id,m.source_kind,
-m.source_exchange_id,m.requested_conversation_id,m.sequence,m.delivery_status,m.actor_id
+m.source_exchange_id,m.requested_conversation_id,m.sequence,m.delivery_status,m.actor_id,
+CASE WHEN r.actor_id=$2 THEN COALESCE(r.client_message_id,'') ELSE '' END,COALESCE(r.state,''),COALESCE(r.failure_reason,''),
+CASE WHEN m.output_status='streaming' AND NOT EXISTS (
+ SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
+  AND live.current_revision=live.desired_revision AND live.current_revision=m.output_task_revision
+) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence
 FROM conversation_messages m
 JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.project_id=$1
 JOIN project_members pm ON pm.project_id=c.project_id AND pm.user_id=$2
 JOIN users u ON u.id=pm.user_id AND u.status='approved'
+LEFT JOIN conversation_message_routes r ON r.message_id=m.id
 WHERE m.conversation_id=$3 AND ($4::bigint=0 OR m.sequence<$4::bigint)
 ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, limit+1)
 	if err != nil {
@@ -649,14 +653,22 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
+		var clientID, routingStatus, routingFailure string
+		var outputStatus string
+		var outputRevision, outputEvent pgtype.Int8
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &row.DeliveryStatus, &row.ActorID); err != nil {
+			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &routingStatus, &routingFailure,
+			&outputStatus, &outputRevision, &outputEvent); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan project conversation message: %w", err)
 		}
 		message := messageDomain(row)
 		message.DeliveryStatus = conversation.DeliveryStatus(row.DeliveryStatus)
+		message.ClientMessageID = clientID
+		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
+		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
 		items = append(items, message)
 	}
 	if err := rows.Err(); err != nil {
@@ -664,9 +676,105 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		return app.MessagePage{}, fmt.Errorf("iterate project conversation messages: %w", err)
 	}
 	rows.Close()
+	if err := s.attachProjectConversationMessageAttachmentIDs(ctx, actorID, projectID, conversationID, items); err != nil {
+		return app.MessagePage{}, err
+	}
+	if err := s.attachConversationResultSources(ctx, actorID, conversationID, items); err != nil {
+		return app.MessagePage{}, err
+	}
 	result := app.MessagePage{Items: items}
 	if int32(len(items)) > limit {
 		result.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(items[limit-1].Sequence, 10)))
+		result.Items = items[:limit]
+	}
+	return result, nil
+}
+
+func applyConversationOutputProjection(message *conversation.Message, status string, revision, event pgtype.Int8) {
+	message.OutputStatus = conversation.OutputStatus(status)
+	if revision.Valid {
+		message.OutputTaskRevision = &revision.Int64
+	}
+	if event.Valid {
+		message.OutputResultEventSequence = &event.Int64
+	}
+}
+
+func (s *Store) attachConversationResultSources(ctx context.Context, actorID, conversationID string, items []conversation.Message) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Role == conversation.RoleAssistant {
+			ids = append(ids, item.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	sources, err := s.ListConversationResultSources(ctx, actorID, conversationID, ids)
+	if err != nil {
+		return err
+	}
+	for index := range items {
+		for _, source := range sources[items[index].ID] {
+			items[index].Sources = append(items[index].Sources, conversation.MessageSource{UserMessageID: source.UserMessageID,
+				TaskID: source.TaskID, TaskRevision: source.TaskRevision, EventSequence: source.EventSequence, Content: source.Content})
+		}
+	}
+	return nil
+}
+
+func (s *Store) ListConversationActiveTasks(ctx context.Context, actorID, projectID, conversationID string, hostIDs []string, page app.PageRequest) (app.TaskPage, error) {
+	if !domain.ValidUserID(actorID) || !domain.ValidConversationID(conversationID) || (projectID != "" && !project.ValidID(projectID)) {
+		return app.TaskPage{}, domain.NewError(domain.CodeNotFound, "conversation not found")
+	}
+	for _, hostID := range hostIDs {
+		if !domain.ValidHostID(hostID) {
+			return app.TaskPage{}, domain.InvalidArgument("host_ids", "host id is invalid")
+		}
+	}
+	limit, cursorAt, cursorID, err := pagination(page.Limit, page.Cursor)
+	if err != nil {
+		return app.TaskPage{}, err
+	}
+	var rows []sqlcgen.Task
+	var items []task.Task
+	err = s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
+		if projectID != "" {
+			if _, err := loadProjectConversationForActorInTx(ctx, tx, actorID, projectID, conversationID, false); err != nil {
+				return err
+			}
+		} else {
+			value, err := sqlcgen.New(tx).GetConversation(ctx, sqlcgen.GetConversationParams{ID: conversationID, OwnerID: actorID})
+			if err != nil {
+				return storeError("get conversation", "conversation", err)
+			}
+			if value.ProjectID.Valid {
+				return domain.NewError(domain.CodeNotFound, "conversation not found")
+			}
+		}
+		var err error
+		rows, err = sqlcgen.New(tx).ListConversationActiveTasks(ctx, sqlcgen.ListConversationActiveTasksParams{
+			ConversationID: conversationID, ProjectID: nullableText(projectID), ActorID: actorID,
+			HostIds: hostIDs, CursorAt: cursorAt, CursorID: cursorID, PageLimit: limit + 1,
+		})
+		if err != nil {
+			return err
+		}
+		items = mapRows(rows, rowTaskDomain)
+		if err := populateTaskStepCounts(ctx, tx, items); err != nil {
+			return err
+		}
+		return populateTaskRevisionProjection(ctx, tx, items)
+	})
+	if err != nil {
+		return app.TaskPage{}, fmt.Errorf("list active conversation tasks: %w", err)
+	}
+	result := app.TaskPage{Items: items}
+	result.NextCursor = nextPageCursor(items, limit, func(value task.Task) (string, time.Time) { return value.ID, value.CreatedAt })
+	if int32(len(items)) > limit {
 		result.Items = items[:limit]
 	}
 	return result, nil
@@ -798,6 +906,13 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 
 	var result app.TaskSubmissionResult
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
+		serviceInstanceID := ""
+		if app.ExpectedServiceInstance(ctx) != "" || len(message.AttachmentIDs) != 0 {
+			serviceInstanceID, err = personalServiceInstanceIDInTx(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
 		if submission.Task.ProjectID != "" {
 			if _, _, err := lockProjectForActorInTx(ctx, tx, submission.Task.InitiatorID, submission.Task.ProjectID, project.RoleMember, true); err != nil {
 				return err
@@ -813,6 +928,24 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 				result.Replayed = true
 			}
 			return err
+		}
+		if submission.Task.ProjectID != "" && submission.Task.WorkspaceID != "" {
+			ownerID, _, err := lockProjectTaskWorkspaceAccess(ctx, tx, submission.Task.ProjectID,
+				submission.Task.InitiatorID, submission.Task.WorkspaceID, false)
+			if err != nil {
+				return err
+			}
+			if ownerID != submission.Task.InitiatorID && submission.Task.HostID != "" {
+				grant, err := lockProjectWorkspaceGrant(ctx, tx, submission.Task.InitiatorID, ownerID, submission.Task.WorkspaceID)
+				if err != nil || grant.hostID != submission.Task.HostID {
+					return domain.NewError(domain.CodeForbidden, "project Workspace is not bound to the selected Host")
+				}
+			}
+			if submission.Task.HostID != "" {
+				if err := lockProjectWorkspaceHost(ctx, tx, submission.Task.HostID, ownerID); err != nil {
+					return err
+				}
+			}
 		}
 		gate, err := requireOwnerExecutionEnabled(ctx, tx, submission.Task.InitiatorID, nil)
 		if err != nil {
@@ -844,15 +977,6 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 				return fmt.Errorf("lock task conversation: %w", err)
 			}
 		}
-		var activeTaskID string
-		err = tx.QueryRow(ctx, `SELECT id FROM tasks WHERE conversation_id=$1 AND status IN ('queued','running','waiting_user','pausing','paused','cancelling') FOR UPDATE`,
-			submission.Task.ConversationID).Scan(&activeTaskID)
-		if err == nil {
-			return domain.NewError(domain.CodeInvalidState, "conversation already has an active task")
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("check active conversation task: %w", err)
-		}
 		_, contextManifest, err := captureTaskConversationContextForTask(ctx, tx, submission.Task)
 		if err != nil {
 			return err
@@ -872,6 +996,15 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		}
 		if err := insertMessage(ctx, tx, message); err != nil {
 			return err
+		}
+		if len(message.AttachmentIDs) != 0 {
+			uploadIDs, err := lockAndValidateHistoryAttachments(ctx, tx, serviceInstanceID, message.OwnerID, message.AttachmentIDs)
+			if err != nil {
+				return err
+			}
+			if err := insertHistoryMessageAttachments(ctx, tx, serviceInstanceID, message.OwnerID, message.ConversationID, message.ID, message.AttachmentIDs, uploadIDs); err != nil {
+				return err
+			}
 		}
 		if err := insertTaskEvent(ctx, tx, task.Event{
 			TaskID: submission.Task.ID, Sequence: 1, Type: submission.InitialEvent.Type, Payload: eventPayload,
@@ -897,295 +1030,6 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 			return err
 		}
 		result, err = loadSubmissionResult(ctx, tx, submission.Task.OwnerID, submission.Task.ID, message.ID)
-		return err
-	})
-	return result, err
-}
-
-func (s *Store) AppendMessage(ctx context.Context, submission app.TaskSubmission) (app.TaskSubmissionResult, error) {
-	submission.Task = normalizeNewTask(submission.Task)
-	if submission.Task.InitiatorID == "" {
-		submission.Task.InitiatorID = submission.Task.OwnerID
-	}
-	message := submission.Message
-	if message.ActorID == "" && submission.Task.ProjectID == "" {
-		message.ActorID = message.OwnerID
-	}
-	if !domain.ValidConversationID(message.ConversationID) || !domain.ValidUserID(message.OwnerID) ||
-		message.Role != conversation.RoleUser || message.Content == "" || !domain.ValidMessageID(message.ID) {
-		return app.TaskSubmissionResult{}, domain.InvalidArgument("message", "message fields are invalid")
-	}
-	if submission.Task.OwnerID != message.OwnerID || submission.Task.ConversationID != message.ConversationID ||
-		(submission.Task.HostID != "" && !domain.ValidHostID(submission.Task.HostID)) || submission.Task.ModelID == "" {
-		return app.TaskSubmissionResult{}, domain.InvalidArgument("task", "task routing fields do not match message")
-	}
-	if err := validateTaskConversationScope(submission.Task, submission.Task.ProjectID); err != nil {
-		return app.TaskSubmissionResult{}, err
-	}
-	if err := validateMessageConversationScope(message, submission.Task.ProjectID); err != nil {
-		return app.TaskSubmissionResult{}, err
-	}
-	if submission.Idempotency.OwnerID != message.ActorID {
-		return app.TaskSubmissionResult{}, domain.InvalidArgument("actor_id", "message actor does not match idempotency owner")
-	}
-	var result app.TaskSubmissionResult
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		if submission.Task.ProjectID != "" {
-			if _, _, err := lockProjectForActorInTx(ctx, tx, message.ActorID, submission.Task.ProjectID, project.RoleMember, true); err != nil {
-				return err
-			}
-		} else if submission.Task.InitiatorID != message.OwnerID {
-			return domain.InvalidArgument("actor_id", "personal task initiator must own the conversation")
-		}
-		stored, replay, err := findIdempotency(ctx, tx, submission.Idempotency)
-		if err != nil {
-			return err
-		}
-		if replay {
-			result, err = loadSubmissionResult(ctx, tx, message.OwnerID, stored.ResourceID, stored.RelatedID)
-			if err == nil {
-				result.Replayed = true
-			}
-			return err
-		}
-		var conversationRow sqlcgen.Conversation
-		if submission.Task.ProjectID != "" {
-			loaded, err := loadProjectConversationForActorInTx(ctx, tx, message.ActorID, submission.Task.ProjectID, message.ConversationID, true)
-			if err != nil {
-				return err
-			}
-			conversationRow.ID, conversationRow.OwnerID, conversationRow.Title, conversationRow.CreatedAt, conversationRow.UpdatedAt =
-				loaded.ID, loaded.OwnerID, loaded.Title, pgtype.Timestamptz{Time: loaded.CreatedAt, Valid: true}, pgtype.Timestamptz{Time: loaded.UpdatedAt, Valid: true}
-			conversationRow.HostID = nullableText(loaded.HostID)
-			conversationRow.ProjectID = nullableText(loaded.ProjectID)
-		} else {
-			err := tx.QueryRow(ctx, `SELECT id, owner_id, host_id, title, created_at, updated_at, project_id FROM conversations
-WHERE id=$1 AND owner_id=$2 AND project_id IS NULL FOR UPDATE`, message.ConversationID, message.OwnerID).
-				Scan(&conversationRow.ID, &conversationRow.OwnerID, &conversationRow.HostID, &conversationRow.Title,
-					&conversationRow.CreatedAt, &conversationRow.UpdatedAt, &conversationRow.ProjectID)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.NewError(domain.CodeNotFound, "conversation not found")
-			}
-			if err != nil {
-				return fmt.Errorf("lock message conversation: %w", err)
-			}
-		}
-		var active sqlcgen.Task
-		err = tx.QueryRow(ctx, `SELECT id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
-budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens,
-lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, application_id,
-workspace_id, input_revision, context_digest, file_delivery_intent,
-workspace_checkpoint_revision, project_id, initiator_id
-FROM tasks WHERE conversation_id=$1 AND owner_id=$2 AND project_id IS NOT DISTINCT FROM $3::text
-  AND status IN ('queued','running','waiting_user','pausing','paused','cancelling') FOR UPDATE`,
-			message.ConversationID, message.OwnerID, nullableText(submission.Task.ProjectID)).Scan(
-			&active.ID, &active.OwnerID, &active.ConversationID, &active.HostID, &active.ModelID, &active.Objective, &active.Status,
-			&active.AuthKind, &active.AuthTokenID, &active.AuthScopes, &active.AuthClientInstallationID, &active.BudgetActiveSeconds, &active.BudgetToolCalls,
-			&active.BudgetModelTokens, &active.UsageActiveSeconds, &active.UsageToolCalls, &active.UsageModelTokens,
-			&active.LeaseOwner, &active.LeaseVersion, &active.LeaseExpiresAt, &active.EventSeq, &active.CurrentStep,
-			&active.Result, &active.WaitingReason, &active.CreatedAt, &active.UpdatedAt, &active.FinishedAt, &active.ApplicationID,
-			&active.WorkspaceID, &active.InputRevision, &active.ContextDigest, &active.FileDeliveryIntent,
-			&active.WorkspaceCheckpointRevision, &active.ProjectID, &active.InitiatorID)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("find active conversation task: %w", err)
-		}
-		var targetTask task.Task
-		newTask := errors.Is(err, pgx.ErrNoRows)
-		if submission.ExpectedTaskID != "" && (newTask || active.ID != submission.ExpectedTaskID) {
-			return domain.NewError(domain.CodeConflict, "active conversation task changed before the message was appended")
-		}
-		if newTask {
-			candidate := submission.Task
-			if candidate.OwnerID != message.OwnerID || candidate.ConversationID != message.ConversationID || candidate.ProjectID != conversationRow.ProjectID.String {
-				return domain.InvalidArgument("task", "task scope does not match conversation")
-			}
-			if err := validateTask(candidate); err != nil {
-				return err
-			}
-			if err := validateNormalizedTaskMCPConnectorIDs(submission.MCPConnectorIDs); err != nil {
-				return err
-			}
-			targetTask = candidate
-		} else {
-			targetTask = taskDomain(active)
-			if targetTask.ProjectID != submission.Task.ProjectID {
-				return domain.NewError(domain.CodeInternal, "active task conversation scope is inconsistent")
-			}
-			if targetTask.Status == task.StatusPausing || targetTask.Status == task.StatusCancelling {
-				return domain.NewError(domain.CodeInvalidState, "task is stopping and cannot accept another message")
-			}
-			var pendingApproval, pendingClarification bool
-			if err := tx.QueryRow(ctx, `SELECT
-EXISTS (SELECT 1 FROM task_pending_requests WHERE task_id=$1 AND status='pending'),
-EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1 AND status='pending')`, targetTask.ID).
-				Scan(&pendingApproval, &pendingClarification); err != nil {
-				return fmt.Errorf("check unresolved task requests before appending message: %w", err)
-			}
-			if pendingApproval || pendingClarification {
-				return domain.NewError(domain.CodeInvalidState, "task has an unresolved approval or clarification")
-			}
-			if targetTask.ProjectID != "" {
-				if _, _, err := lockProjectForActorInTx(ctx, tx, targetTask.InitiatorID, targetTask.ProjectID, project.RoleMember, true); err != nil {
-					return err
-				}
-			}
-			if err := validateNormalizedTaskMCPConnectorIDs(submission.MCPConnectorIDs); err != nil {
-				return err
-			}
-			if len(submission.MCPConnectorIDs) > 0 {
-				if err := requireTaskMCPConnectorGrantSet(ctx, tx, targetTask.OwnerID, targetTask.ID, submission.MCPConnectorIDs); err != nil {
-					return err
-				}
-			}
-			var taskEpoch int64
-			if err := tx.QueryRow(ctx, `SELECT execution_epoch FROM tasks WHERE id=$1 AND owner_id=$2`, targetTask.ID, targetTask.OwnerID).Scan(&taskEpoch); err != nil {
-				return fmt.Errorf("read active task execution epoch: %w", err)
-			}
-			gate, err := requireOwnerExecutionEnabled(ctx, tx, targetTask.InitiatorID, nil)
-			if err != nil {
-				return err
-			}
-			if taskEpoch != gate.epoch {
-				return ownerExecutionDisabledError(gate)
-			}
-			if targetTask.HostID != submission.Task.HostID || targetTask.ModelID != submission.Task.ModelID ||
-				targetTask.ApplicationID != submission.Task.ApplicationID {
-				return domain.NewError(domain.CodeInvalidState, "message host, model and application must match the active task")
-			}
-			if submission.Task.WorkspaceID != "" && (targetTask.WorkspaceID != submission.Task.WorkspaceID ||
-				!sameTaskInputRevision(targetTask.InputRevision, submission.Task.InputRevision) ||
-				!bytes.Equal(targetTask.ContextDigest, submission.Task.ContextDigest)) {
-				return domain.NewError(domain.CodeInvalidState, "message workspace input must match the active task")
-			}
-		}
-		var gate executionGate
-		if newTask {
-			gate, err = requireOwnerExecutionEnabled(ctx, tx, targetTask.InitiatorID, nil)
-			if err != nil {
-				return err
-			}
-		}
-		if targetTask.HostID != "" {
-			if err := lockTaskTargetHost(ctx, tx, targetTask.HostID, targetTask.InitiatorID); err != nil {
-				return err
-			}
-		}
-		if newTask {
-			if err := lockTaskWorkspaceInput(ctx, tx, targetTask); err != nil {
-				return err
-			}
-		} else if err := lockTaskWorkspaceForExecution(ctx, tx, targetTask.WorkspaceID, targetTask.InitiatorID); err != nil {
-			return err
-		}
-		message.TaskID = targetTask.ID
-		message.DeliveryStatus = conversation.DeliveryApplied
-		if !newTask {
-			switch targetTask.Status {
-			case task.StatusPausing, task.StatusCancelling:
-				message.DeliveryStatus = conversation.DeliveryUnknown
-			default:
-				message.DeliveryStatus = conversation.DeliveryPending
-			}
-		}
-		if err := validateMessage(message); err != nil {
-			return err
-		}
-		if err := validateMessageConversationScope(message, targetTask.ProjectID); err != nil {
-			return err
-		}
-		stored, replay, err = reserveIdempotency(ctx, tx, submission.Idempotency, targetTask.ID, message.ID)
-		if err != nil {
-			return err
-		}
-		if replay {
-			result, err = loadSubmissionResult(ctx, tx, message.OwnerID, stored.ResourceID, stored.RelatedID)
-			if err == nil {
-				result.Replayed = true
-			}
-			return err
-		}
-		if newTask {
-			if err := validateInitialFileDeliveryClarification(submission); err != nil {
-				return err
-			}
-			payload, err := validateInitialTaskEvent(submission.InitialEvent.Type, submission.InitialEvent.Payload)
-			if err != nil {
-				return err
-			}
-			_, contextManifest, err := captureTaskConversationContextForTask(ctx, tx, targetTask)
-			if err != nil {
-				return err
-			}
-			payload, err = attachTaskConversationContextManifest(payload, contextManifest)
-			if err != nil {
-				return err
-			}
-			if err := validateBatchItems(targetTask.ID, submission.BatchItems); err != nil {
-				return err
-			}
-			if err := insertTask(ctx, tx, targetTask, 1, gate.epoch); err != nil {
-				return err
-			}
-			if err := insertInitialFileDeliveryClarification(ctx, tx, submission); err != nil {
-				return err
-			}
-			if err := insertTaskMCPConnectorGrants(ctx, tx, targetTask, submission.MCPConnectorIDs); err != nil {
-				return err
-			}
-			if err := insertMessage(ctx, tx, message); err != nil {
-				return err
-			}
-			if err := insertTaskEvent(ctx, tx, task.Event{TaskID: targetTask.ID, Sequence: 1, Type: submission.InitialEvent.Type, Payload: payload}); err != nil {
-				return err
-			}
-			if err := insertBatchItems(ctx, tx, targetTask.ID, submission.BatchItems); err != nil {
-				return err
-			}
-		} else if message.DeliveryStatus == conversation.DeliveryUnknown || targetTask.Status == task.StatusPaused {
-			if err := insertMessage(ctx, tx, message); err != nil {
-				return err
-			}
-		} else {
-			payload, err := json.Marshal(map[string]string{"message_id": message.ID, "role": string(message.Role), "content": message.Content})
-			if err != nil {
-				return fmt.Errorf("encode task message event: %w", err)
-			}
-			if err := insertMessage(ctx, tx, message); err != nil {
-				return err
-			}
-			status := string(targetTask.Status)
-			var sequence int64
-			err = tx.QueryRow(ctx, `UPDATE tasks SET status=$2,
-file_delivery_intent=CASE
-  WHEN file_delivery_intent='required' OR $3='required' THEN 'required'
-  WHEN file_delivery_intent='unclear' OR $3='unclear' THEN 'unclear'
-  ELSE 'none'
-END,
-event_seq=event_seq+1, updated_at=clock_timestamp()
-WHERE id=$1 RETURNING event_seq`, targetTask.ID, status, string(submission.Task.FileDeliveryIntent)).Scan(&sequence)
-			if err != nil {
-				return fmt.Errorf("advance task after message: %w", err)
-			}
-			if err := insertTaskEvent(ctx, tx, task.Event{TaskID: targetTask.ID, Sequence: sequence, Type: "task.message", Payload: payload}); err != nil {
-				return err
-			}
-		}
-		conversationHostID := nullableText(targetTask.HostID)
-		if targetTask.ProjectID != "" {
-			conversationHostID = pgtype.Text{}
-		}
-		_, err = tx.Exec(ctx, `UPDATE conversations SET updated_at=clock_timestamp(), model_id=$3, host_id=$4 WHERE id=$1 AND owner_id=$2`,
-			message.ConversationID, message.OwnerID, targetTask.ModelID, conversationHostID)
-		if err != nil {
-			return fmt.Errorf("touch conversation after message: %w", err)
-		}
-		if err := recordAccountObjectChanges(ctx, tx,
-			accountObjectChange{OwnerID: message.OwnerID, ObjectType: "conversation", ObjectID: message.ConversationID, Operation: "upsert", MutationID: submission.Idempotency.Key},
-			accountObjectChange{OwnerID: message.OwnerID, ObjectType: "message", ObjectID: message.ID, Operation: "upsert", MutationID: submission.Idempotency.Key},
-		); err != nil {
-			return err
-		}
-		result, err = loadSubmissionResult(ctx, tx, message.OwnerID, targetTask.ID, message.ID)
 		return err
 	})
 	return result, err
@@ -1266,17 +1110,26 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending')`, request.ID, request.TaskID, request.Versi
 	return nil
 }
 
-// Hold the Host lock so deletion cannot race a task target check.
-func lockTaskTargetHost(ctx context.Context, tx pgx.Tx, hostID, ownerID string) error {
-	var exists bool
+// Hold the Host lock so deletion and member revocation cannot race a task
+// target check. The actor may be the owner or an approved member with control.
+func lockTaskTargetHost(ctx context.Context, tx pgx.Tx, hostID, actorID string) error {
+	var ownerID string
+	var available bool
 	err := tx.QueryRow(ctx, `
-SELECT state<>'deleted' AND deleted_at IS NULL
-FROM hosts WHERE id=$1 AND owner_id=$2 FOR SHARE`, hostID, ownerID).Scan(&exists)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !exists) {
+SELECT owner_id,state<>'deleted' AND deleted_at IS NULL
+FROM hosts WHERE id=$1 FOR SHARE`, hostID).Scan(&ownerID, &available)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !available) {
 		return domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	if err != nil {
 		return fmt.Errorf("lock task target Host: %w", err)
+	}
+	allowed, err := hasControlPermission(ctx, tx, hostID, ownerID, actorID, string(host.PermissionDesktopControl))
+	if err != nil {
+		return fmt.Errorf("authorize task target Host: %w", err)
+	}
+	if !allowed {
+		return domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	return nil
 }
@@ -1285,14 +1138,51 @@ func lockTaskWorkspaceInput(ctx context.Context, tx pgx.Tx, value task.Task) err
 	if value.WorkspaceID == "" {
 		return nil
 	}
-	if value.HostID == "" || value.InputRevision == nil || len(value.ContextDigest) != 32 {
+	if value.InputRevision == nil || len(value.ContextDigest) != 32 {
 		return domain.InvalidArgument("workspace_id", "workspace input snapshot is incomplete")
+	}
+	workspaceOwnerID := value.InitiatorID
+	if value.ProjectID != "" {
+		ownerID, version, err := lockProjectTaskWorkspaceAccess(ctx, tx, value.ProjectID, value.InitiatorID, value.WorkspaceID, false)
+		if err != nil {
+			return err
+		}
+		if value.WorkspaceOwnerID != "" && value.WorkspaceOwnerID != ownerID ||
+			value.WorkspaceProjectResourceVersion != nil && *value.WorkspaceProjectResourceVersion != version {
+			return domain.NewError(domain.CodeConflict, "project Workspace resource changed")
+		}
+		workspaceOwnerID = ownerID
+	}
+	if value.HostID == "" {
+		var ownerID, state string
+		var revision int64
+		err := tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, value.WorkspaceID).
+			Scan(&ownerID, &state, &revision)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != workspaceOwnerID || state != string(workspace.StateReady))) {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err != nil {
+			return fmt.Errorf("lock Hostless task input Workspace: %w", err)
+		}
+		if err := requireWorkspaceOwnershipTransferNotFrozen(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
+		if err := requireNoPendingWorkspaceLegacyImport(ctx, tx, value.WorkspaceID); err != nil {
+			return err
+		}
+		if err := ensureNoWorkspaceSyncReceive(ctx, tx, value.WorkspaceID, ""); err != nil {
+			return err
+		}
+		if revision != *value.InputRevision {
+			return domain.NewError(domain.CodeWorkspaceConflict, "workspace changed before task submission")
+		}
+		return nil
 	}
 	var ownerID, state string
 	var revision int64
 	err := tx.QueryRow(ctx, `SELECT owner_id, state, revision FROM workspaces WHERE id=$1 FOR UPDATE`, value.WorkspaceID).
 		Scan(&ownerID, &state, &revision)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != value.InitiatorID || state != string(workspace.StateReady))) {
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (ownerID != workspaceOwnerID || state != string(workspace.StateReady))) {
 		return domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	if err != nil {
@@ -1315,7 +1205,7 @@ FROM workspace_bindings WHERE host_id=$1 AND workspace_id=$2 FOR UPDATE`, value.
 	if err != nil {
 		return fmt.Errorf("lock task input workspace binding: %w", err)
 	}
-	if bindingOwner != value.InitiatorID || bindingState != string(workspace.BindingActive) {
+	if bindingOwner != workspaceOwnerID || bindingState != string(workspace.BindingActive) {
 		return domain.NewError(domain.CodeNotFound, "workspace binding not found")
 	}
 	if syncState != string(workspace.BindingSyncHealthy) || desiredRevision != revision || appliedRevision != revision {
@@ -1382,6 +1272,14 @@ func loadSubmissionResult(ctx context.Context, tx pgx.Tx, ownerID, taskID, messa
 	}
 	message := messageDomain(messageRow)
 	message.DeliveryStatus = conversation.DeliveryStatus(deliveryStatus)
+	instanceID, err := serviceInstanceIDInTx(ctx, tx)
+	if err != nil {
+		return app.TaskSubmissionResult{}, err
+	}
+	message.AttachmentIDs, err = loadHistoryMessageAttachmentIDs(ctx, tx, instanceID, ownerID, message.ConversationID, message.ID)
+	if err != nil {
+		return app.TaskSubmissionResult{}, err
+	}
 	return app.TaskSubmissionResult{
 		Task: taskDomain(taskRow), Message: message, Conversation: conversationDomain(conversationRow),
 	}, nil
@@ -1392,15 +1290,26 @@ func insertTask(ctx context.Context, tx pgx.Tx, value task.Task, eventSequence i
 	if executionEpoch < 1 {
 		return missingExecutionGateError()
 	}
+	if value.WorkspaceID != "" {
+		if value.ProjectID == "" {
+			value.WorkspaceOwnerID = value.InitiatorID
+		} else {
+			ownerID, version, err := lockProjectTaskWorkspaceAccess(ctx, tx, value.ProjectID, value.InitiatorID, value.WorkspaceID, false)
+			if err != nil {
+				return err
+			}
+			value.WorkspaceOwnerID, value.WorkspaceProjectResourceVersion = ownerID, &version
+		}
+	}
 	_, err := tx.Exec(ctx, `
 INSERT INTO tasks (
   id, owner_id, conversation_id, host_id, model_id, objective, status, auth_kind, auth_token_id, auth_scopes,
   budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls,
   usage_model_tokens, lease_owner, lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, finished_at, execution_epoch, application_id,
   auth_client_installation_id, execution_location, workspace_id, input_revision, workspace_checkpoint_revision, context_digest, auth_version, auth_expires_at,
-  file_delivery_intent, project_id, initiator_id
+  file_delivery_intent, project_id, initiator_id, workspace_owner_id, workspace_project_resource_version
 ) VALUES (
-  $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::text[], '{}'::text[]),$11,$12,$13,$14,$15,$16,'',0,NULL,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34
+  $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::text[], '{}'::text[]),$11,$12,$13,$14,$15,$16,'',0,NULL,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36
 )`, value.ID, value.OwnerID, value.ConversationID, nullableText(value.HostID), value.ModelID, value.Objective,
 		string(value.Status), value.Authorization.Kind, value.Authorization.TokenID, value.Authorization.Scopes,
 		value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
@@ -1408,9 +1317,16 @@ INSERT INTO tasks (
 		eventSequence, value.CurrentStep, value.Result, value.WaitingReason, nullableTimestamp(value.FinishedAt), executionEpoch, value.ApplicationID,
 		nullableText(value.Authorization.ClientInstallationID), value.ExecutionLocation, nullableText(value.WorkspaceID),
 		value.InputRevision, value.WorkspaceCheckpointRevision, value.ContextDigest, value.Authorization.Version, value.Authorization.ExpiresAt,
-		string(value.FileDeliveryIntent), nullableText(value.ProjectID), value.InitiatorID)
+		string(value.FileDeliveryIntent), nullableText(value.ProjectID), value.InitiatorID,
+		nullableText(value.WorkspaceOwnerID), value.WorkspaceProjectResourceVersion)
 	if err != nil {
 		return fmt.Errorf("insert task: %w", err)
+	}
+	if value.ProjectID != "" && value.WorkspaceID != "" {
+		if err := pinProjectTaskWorkspaceGrant(ctx, tx, value.ID, value.ProjectID, value.InitiatorID,
+			value.WorkspaceOwnerID, value.WorkspaceID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

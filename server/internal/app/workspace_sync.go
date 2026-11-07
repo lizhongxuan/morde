@@ -598,6 +598,9 @@ func (s *WorkspaceSyncService) CreateSyncSession(ctx context.Context, principal 
 	if value.State != workspace.StateReady {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceBusy, "workspace is not available for synchronization")
 	}
+	if value.ReadOnly && command.Direction != workspace.SyncDownload {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
+	}
 	if principal.Kind == identity.KindHostReplica {
 		binding, err := s.store.GetWorkspaceBinding(ctx, principal.HostScope, workspaceID)
 		if err != nil {
@@ -829,6 +832,9 @@ func (s *WorkspaceSyncService) CommitSyncSession(ctx context.Context, principal 
 	}
 	if session.OwnerID != value.OwnerID || session.ReplicaID != syncReplicaID(principal) {
 		return workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
+	}
+	if value.ReadOnly && session.Direction != workspace.SyncDownload {
+		return workspace.SyncSession{}, domain.NewError(domain.CodeForbidden, "workspace is shared as read-only")
 	}
 	record, err := idempotencyRecord(value.OwnerID, "workspace.sync.commit", idempotencyKey, struct {
 		WorkspaceID string `json:"workspace_id"`

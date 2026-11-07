@@ -22,8 +22,8 @@ export function AdminAudit() {
     if (since) next.set('since', new Date(since).toISOString());
     setFilters(next);
   };
-  return <section className="admin-content">
-    <div className="page-heading"><div><p className="eyebrow">管理员操作记录</p><h1>审计</h1><p className="muted">筛选已记录的操作及其结果。</p></div></div>
+  return <section className="admin-content design-panel">
+    <div className="design-panel-header"><div><h2>操作与发行记录</h2><p>筛选已记录的操作及其结果。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching || releases.isFetching} onClick={() => { void query.refetch(); void releases.refetch(); }}>刷新数据</button></div>
     <form className="audit-filters form-card" onSubmit={(event) => void submit(event)}>
       <div><label htmlFor="audit-actor">操作人</label><input id="audit-actor" value={actor} onChange={(event) => setActor(event.target.value)} /></div>
       <div><label htmlFor="audit-action">操作类型</label><input id="audit-action" value={action} onChange={(event) => setAction(event.target.value)} placeholder="如 host.create" /></div>

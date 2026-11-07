@@ -195,7 +195,7 @@ func (s *ProjectBudgetService) ListLedger(ctx context.Context, principal identit
 
 // ReserveModelCall is an internal model-gateway use case; no client endpoint accepts rate or reservation amounts.
 func (s *ProjectBudgetService) ReserveModelCall(ctx context.Context, principal identity.Principal, command ReserveProjectModelCallCommand) (ProjectModelReservation, bool, error) {
-	if ctx == nil || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
+	if ctx == nil || command.Source == ModelCallRoute || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
 		!idempotencyKeyPattern.MatchString(command.CallID) || !domain.ValidModelConnectionID(command.ModelID) ||
 		(command.Source == ModelCallTask && !domain.ValidTaskID(command.TaskID)) ||
 		(command.Source != ModelCallTask && command.TaskID != "") || !validProjectTokenUsage(command.Usage) {
@@ -310,7 +310,7 @@ func projectAccountCallMatchesCommand(call ModelCallReservation, principal ident
 }
 
 func sameProjectAccountCall(value, expected ModelCallReservation) bool {
-	if value.Source != expected.Source || value.ProjectID != expected.ProjectID || value.OwnerID != expected.OwnerID ||
+	if value.Source != expected.Source || value.ProjectID != expected.ProjectID || value.PersonalModel != expected.PersonalModel || value.OwnerID != expected.OwnerID ||
 		value.ModelID != expected.ModelID || value.ProviderModel != expected.ProviderModel ||
 		!value.ConnectionVersion.Equal(expected.ConnectionVersion) || value.NeedsTools != expected.NeedsTools ||
 		value.NeedsVision != expected.NeedsVision || value.CallID != expected.CallID ||
@@ -338,7 +338,7 @@ func sameProjectAccountPrincipal(value, expected identity.Principal) bool {
 
 // SettleModelCall is an internal model-gateway use case. Unknown charges stay reserved until reconciliation.
 func (s *ProjectBudgetService) SettleModelCall(ctx context.Context, command SettleProjectModelCallCommand) error {
-	if ctx == nil || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
+	if ctx == nil || command.Source == ModelCallRoute || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
 		!idempotencyKeyPattern.MatchString(command.CallID) || (!command.Unknown && !validProjectTokenUsage(command.Usage)) {
 		return domain.InvalidArgument("project_model_settlement", "project model call settlement is invalid")
 	}
@@ -384,7 +384,7 @@ func validateProjectLedgerEntry(value ProjectLedgerEntry) error {
 }
 
 func validProjectBudgetSource(source ModelCallSource) bool {
-	return source == ModelCallClient || source == ModelCallChat || source == ModelCallTask
+	return source == ModelCallClient || source == ModelCallChat || source == ModelCallTask || source == ModelCallRoute
 }
 
 func validProjectTokenUsage(value project.Usage) bool {

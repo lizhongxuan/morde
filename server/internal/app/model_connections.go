@@ -35,6 +35,10 @@ type ModelConnectionStore interface {
 	DeleteModelConnection(context.Context, string) error
 }
 
+type ModelDefaultReader interface {
+	GetAdminModelDefault(context.Context) (AdminModelDefaultRecord, error)
+}
+
 type ModelConnectionView struct {
 	ID           string
 	Name         string
@@ -48,6 +52,27 @@ type ModelConnectionView struct {
 	UpdatedAt    time.Time
 }
 
+type ModelConfigurationStatus string
+
+const (
+	ModelConfigurationConfigured    ModelConfigurationStatus = "configured"
+	ModelConfigurationNotConfigured ModelConfigurationStatus = "not_configured"
+	ModelConfigurationUnknown       ModelConfigurationStatus = "unknown"
+)
+
+// ModelConnectionsConfigurationStatus reports saved configuration, independently of capability probes.
+func ModelConnectionsConfigurationStatus(items []ModelConnectionView) ModelConfigurationStatus {
+	if len(items) == 0 {
+		return ModelConfigurationNotConfigured
+	}
+	for _, item := range items {
+		if item.HasAPIKey {
+			return ModelConfigurationConfigured
+		}
+	}
+	return ModelConfigurationUnknown
+}
+
 type ModelConnectionCommand struct {
 	Name      string
 	BaseURL   string
@@ -58,6 +83,7 @@ type ModelConnectionCommand struct {
 
 type ModelConnectionService struct {
 	store       ModelConnectionStore
+	defaults    ModelDefaultReader
 	sealer      *Sealer
 	client      ModelClient
 	allowedHost map[string]struct{}
@@ -67,6 +93,10 @@ func NewModelConnectionService(store ModelConnectionStore, sealer *Sealer, clien
 	if store == nil || sealer == nil || client == nil || len(allowedHosts) == 0 {
 		return nil, fmt.Errorf("model connection dependencies and allowed hosts are required")
 	}
+	defaults, ok := store.(ModelDefaultReader)
+	if !ok {
+		return nil, fmt.Errorf("admin default model storage is required")
+	}
 	allowed := make(map[string]struct{}, len(allowedHosts))
 	for _, host := range allowedHosts {
 		host = strings.ToLower(strings.TrimSpace(host))
@@ -75,7 +105,7 @@ func NewModelConnectionService(store ModelConnectionStore, sealer *Sealer, clien
 		}
 		allowed[host] = struct{}{}
 	}
-	return &ModelConnectionService{store: store, sealer: sealer, client: client, allowedHost: allowed}, nil
+	return &ModelConnectionService{store: store, defaults: defaults, sealer: sealer, client: client, allowedHost: allowed}, nil
 }
 
 func (s *ModelConnectionService) List(ctx context.Context, principal identity.Principal) ([]ModelConnectionView, error) {
@@ -88,7 +118,7 @@ func (s *ModelConnectionService) List(ctx context.Context, principal identity.Pr
 	}
 	views := make([]ModelConnectionView, 0, len(records))
 	for _, record := range records {
-		if record.OwnerID != "" {
+		if record.OwnerID != "" && record.OwnerID != principal.UserID {
 			continue
 		}
 		views = append(views, modelConnectionView(record))
@@ -103,16 +133,11 @@ func (s *ModelConnectionService) List(ctx context.Context, principal identity.Pr
 }
 
 func validateModelListPrincipal(principal identity.Principal) error {
-	if principal.Kind == identity.KindClient && domain.ValidUserID(principal.UserID) &&
-		principal.Role == identity.RoleUser && domain.ValidClientInstallationID(principal.ClientInstallationID) &&
-		principal.HostScope == "" && len(principal.HostIDs) == 0 && len(principal.Scopes) == 0 {
-		return nil
-	}
-	return validateModelPrincipal(principal)
+	return validateModelAccountPrincipal(principal)
 }
 
 func (s *ModelConnectionService) Get(ctx context.Context, principal identity.Principal, id string) (ModelConnectionView, error) {
-	if err := validateModelPrincipal(principal); err != nil {
+	if err := validateModelAccountPrincipal(principal); err != nil {
 		return ModelConnectionView{}, err
 	}
 	if !domain.ValidModelConnectionID(id) {
@@ -122,18 +147,18 @@ func (s *ModelConnectionService) Get(ctx context.Context, principal identity.Pri
 	if err != nil {
 		return ModelConnectionView{}, err
 	}
-	if !canUseModelConnection(record) {
+	if !canUseModelConnection(principal, record) {
 		return ModelConnectionView{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
 	return modelConnectionView(record), nil
 }
 
 func (s *ModelConnectionService) Create(ctx context.Context, principal identity.Principal, command ModelConnectionCommand) (ModelConnectionView, error) {
-	if err := validateModelPrincipal(principal); err != nil {
+	if err := validateModelAccountPrincipal(principal); err != nil {
 		return ModelConnectionView{}, err
 	}
-	if !principal.Role.IsAdmin() || !command.Shared {
-		return ModelConnectionView{}, domain.NewError(domain.CodeForbidden, "administrator role and shared model connection required")
+	if command.Shared && !principal.Role.IsAdmin() {
+		return ModelConnectionView{}, domain.NewError(domain.CodeForbidden, "administrator role required for shared model connections")
 	}
 	if err := validateModelConnectionCommand(command, s.allowedHost, true); err != nil {
 		return ModelConnectionView{}, err
@@ -146,8 +171,12 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if err != nil {
 		return ModelConnectionView{}, fmt.Errorf("encrypt model API key: %w", err)
 	}
+	ownerID := principal.UserID
+	if command.Shared {
+		ownerID = ""
+	}
 	record, err := s.store.CreateModelConnection(ctx, ModelConnectionRecord{
-		ID: id, OwnerID: "", Name: strings.TrimSpace(command.Name), BaseURL: strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"),
+		ID: id, OwnerID: ownerID, Name: strings.TrimSpace(command.Name), BaseURL: strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"),
 		ModelName: strings.TrimSpace(command.ModelName), APIKeyCipher: ciphertext,
 	})
 	if err != nil {
@@ -157,7 +186,7 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 }
 
 func (s *ModelConnectionService) Update(ctx context.Context, principal identity.Principal, id string, command ModelConnectionCommand) (ModelConnectionView, error) {
-	if err := validateModelPrincipal(principal); err != nil {
+	if err := validateModelAccountPrincipal(principal); err != nil {
 		return ModelConnectionView{}, err
 	}
 	if !domain.ValidModelConnectionID(id) {
@@ -200,7 +229,7 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 }
 
 func (s *ModelConnectionService) Delete(ctx context.Context, principal identity.Principal, id string) error {
-	if err := validateModelPrincipal(principal); err != nil {
+	if err := validateModelAccountPrincipal(principal); err != nil {
 		return err
 	}
 	if !domain.ValidModelConnectionID(id) {
@@ -217,7 +246,7 @@ func (s *ModelConnectionService) Delete(ctx context.Context, principal identity.
 }
 
 func (s *ModelConnectionService) Check(ctx context.Context, principal identity.Principal, id string) (ModelCapabilities, error) {
-	if err := validateModelPrincipal(principal); err != nil {
+	if err := validateModelAccountPrincipal(principal); err != nil {
 		return ModelCapabilities{}, err
 	}
 	if !domain.ValidModelConnectionID(id) {
@@ -240,6 +269,15 @@ func modelConnectionCheckError(err error) error {
 	}
 	result := domain.NewError(code, "model connection check failed")
 	result.Details["reason"] = string(clientErr.Kind)
+	switch clientErr.Stage {
+	case "client_validation", "provider_status":
+		result.Details["stage"] = clientErr.Stage
+	}
+	switch clientErr.ProviderCode {
+	case "insufficient_quota", "billing_hard_limit_reached", "invalid_api_key", "rate_limit_exceeded", "model_not_found",
+		"invalid_request_error", "unsupported_parameter", "context_length_exceeded", "permission_denied", "server_error":
+		result.Details["provider_code"] = clientErr.ProviderCode
+	}
 	return result
 }
 
@@ -254,10 +292,10 @@ func (s *ModelConnectionService) IsConfiguredModel(ctx context.Context, ownerID,
 	if err != nil {
 		return false, err
 	}
-	if record.OwnerID != "" {
+	if record.OwnerID != "" && record.OwnerID != ownerID {
 		return false, nil
 	}
-	return record.CheckedAt != nil && record.Capabilities.Text && record.Capabilities.Tools, nil
+	return len(record.APIKeyCipher) > 0, nil
 }
 
 func (s *ModelConnectionService) ResolveEndpoint(ctx context.Context, ownerID, modelID string) (ModelEndpoint, error) {
@@ -268,7 +306,7 @@ func (s *ModelConnectionService) ResolveEndpoint(ctx context.Context, ownerID, m
 	if err != nil {
 		return ModelEndpoint{}, err
 	}
-	if record.OwnerID != "" || record.CheckedAt == nil || !record.Capabilities.Text || !record.Capabilities.Tools {
+	if (record.OwnerID != "" && record.OwnerID != ownerID) || record.CheckedAt == nil || !record.Capabilities.Text {
 		return ModelEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
 	key, err := s.sealer.Open(record.APIKeyCipher)
@@ -286,22 +324,24 @@ func (s *ModelConnectionService) ResolveGatewayEndpoint(ctx context.Context, own
 	if err != nil {
 		return ModelGatewayEndpoint{}, err
 	}
-	if record.OwnerID != "" || record.CheckedAt == nil || !record.Capabilities.Text ||
-		(needsTools && !record.Capabilities.Tools) || (needsVision && !record.Capabilities.Vision) {
+	if (record.OwnerID != "" && record.OwnerID != ownerID) || record.CheckedAt == nil || !record.Capabilities.Text {
 		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	if needsTools && !record.Capabilities.Tools {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeUnsupported, "selected model does not support tool calls")
+	}
+	if needsVision && !record.Capabilities.Vision {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeUnsupported, "selected model does not support image input")
 	}
 	key, err := s.sealer.Open(record.APIKeyCipher)
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
-	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt}, nil
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt, Personal: record.OwnerID != ""}, nil
 }
 
 func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, principal identity.Principal, id string) (ModelGatewayEndpoint, error) {
 	if err := validateClientAccountPrincipal(principal); err != nil {
-		return ModelGatewayEndpoint{}, err
-	}
-	if err := validateModelPrincipal(principal); err != nil {
 		return ModelGatewayEndpoint{}, err
 	}
 	if principal.ClientInstallationID != "" && principal.Role.IsAdmin() {
@@ -321,14 +361,11 @@ func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, princ
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
-	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt}, nil
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt, Personal: record.OwnerID != ""}, nil
 }
 
 func (s *ModelConnectionService) SaveProbeCapabilities(ctx context.Context, principal identity.Principal, id string, expected time.Time, capabilities ModelCapabilities) (ModelCapabilities, error) {
 	if err := validateClientAccountPrincipal(principal); err != nil {
-		return ModelCapabilities{}, err
-	}
-	if err := validateModelPrincipal(principal); err != nil {
 		return ModelCapabilities{}, err
 	}
 	record, err := s.store.GetModelConnection(ctx, id)
@@ -345,32 +382,85 @@ func (s *ModelConnectionService) SaveProbeCapabilities(ctx context.Context, prin
 		capabilities.Text = capabilities.Text || record.Capabilities.Text
 		capabilities.Tools = capabilities.Tools || record.Capabilities.Tools
 		capabilities.Vision = capabilities.Vision || record.Capabilities.Vision
+		capabilities.MediaGeneration.ImageGeneration = capabilities.MediaGeneration.ImageGeneration || record.Capabilities.MediaGeneration.ImageGeneration
+		capabilities.MediaGeneration.VideoGeneration = capabilities.MediaGeneration.VideoGeneration || record.Capabilities.MediaGeneration.VideoGeneration
+		capabilities.MediaGeneration.SpeechGeneration = capabilities.MediaGeneration.SpeechGeneration || record.Capabilities.MediaGeneration.SpeechGeneration
 	}
 	checkedAt := time.Now().UTC()
 	capabilities.ModelID = id
 	record.Capabilities, record.CheckedAt = capabilities, &checkedAt
-	_, err = s.store.UpdateModelConnection(ctx, record)
+	updated, err := s.store.UpdateModelConnection(ctx, record)
 	if err != nil {
 		return ModelCapabilities{}, err
+	}
+	if !modelCapabilitiesInclude(updated.Capabilities, capabilities) {
+		return ModelCapabilities{}, domain.NewError(domain.CodeUnsupported, "model capability storage is unavailable")
 	}
 	return capabilities, nil
 }
 
-func validateModelPrincipal(principal identity.Principal) error {
-	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) ||
-		(principal.Role != identity.RoleUser && !principal.Role.IsAdmin()) || principal.HostScope != "" ||
-		len(principal.HostIDs) != 0 || len(principal.Scopes) != 0 {
-		return domain.NewError(domain.CodeForbidden, "portal session required")
+func modelCapabilitiesInclude(actual, expected ModelCapabilities) bool {
+	return (!expected.Text || actual.Text) && (!expected.Tools || actual.Tools) && (!expected.Vision || actual.Vision) &&
+		(!expected.MediaGeneration.ImageGeneration || actual.MediaGeneration.ImageGeneration) &&
+		(!expected.MediaGeneration.VideoGeneration || actual.MediaGeneration.VideoGeneration) &&
+		(!expected.MediaGeneration.SpeechGeneration || actual.MediaGeneration.SpeechGeneration)
+}
+
+func (s *ModelConnectionService) ResolveMediaGenerationEndpoint(ctx context.Context, ownerID, modelID, capability string) (ModelGatewayEndpoint, error) {
+	if !domain.ValidUserID(ownerID) || !domain.ValidModelConnectionID(modelID) || !isModelMediaGenerationCapability(capability) {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	defaultAvailable, err := s.defaultModelAvailable(ctx)
+	if err != nil {
+		return ModelGatewayEndpoint{}, err
+	}
+	if !defaultAvailable {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeUnsupported, "default model is not configured")
+	}
+	record, err := s.store.GetModelConnection(ctx, modelID)
+	if err != nil {
+		return ModelGatewayEndpoint{}, err
+	}
+	available := record.Capabilities.MediaGeneration.ImageGeneration && capability == "image_generation" ||
+		record.Capabilities.MediaGeneration.VideoGeneration && capability == "video_generation" ||
+		record.Capabilities.MediaGeneration.SpeechGeneration && capability == "speech_generation"
+	if record.OwnerID != "" || record.CheckedAt == nil || !available {
+		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
+	}
+	key, err := s.sealer.Open(record.APIKeyCipher)
+	if err != nil {
+		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
+	}
+	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt}, nil
+}
+
+func (s *ModelConnectionService) defaultModelAvailable(ctx context.Context) (bool, error) {
+	value, err := s.defaults.GetAdminModelDefault(ctx)
+	if err != nil {
+		return false, err
+	}
+	return adminDefaultModelAvailable(ctx, s.store, value.ModelID)
+}
+
+func validateModelAccountPrincipal(principal identity.Principal) error {
+	if err := validateClientAccountPrincipal(principal); err != nil {
+		return err
+	}
+	if principal.ClientInstallationID != "" && principal.Role.IsAdmin() {
+		return domain.NewError(domain.CodeForbidden, "administrator portal session required")
 	}
 	return nil
 }
 
-func canUseModelConnection(record ModelConnectionRecord) bool {
-	return record.OwnerID == ""
+func canUseModelConnection(principal identity.Principal, record ModelConnectionRecord) bool {
+	return record.OwnerID == "" || record.OwnerID == principal.UserID
 }
 
 func canManageModelConnection(principal identity.Principal, record ModelConnectionRecord) bool {
-	return record.OwnerID == "" && principal.Role.IsAdmin()
+	if record.OwnerID == "" {
+		return principal.Kind == identity.KindSession && principal.Role.IsAdmin()
+	}
+	return record.OwnerID == principal.UserID
 }
 
 func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {

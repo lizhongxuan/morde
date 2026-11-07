@@ -16,7 +16,7 @@ it('lists an installation and revokes its linked access', async () => {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   render(<QueryClientProvider client={queryClient}><ToastProvider><MemoryRouter><Clients /></MemoryRouter></ToastProvider></QueryClientProvider>);
   expect(await screen.findByText('Morde 笔记本')).toBeInTheDocument();
-  expect(screen.queryByRole('link')).not.toBeInTheDocument();
+  expect(screen.getByRole('link', { name: '下载客户端' })).toHaveAttribute('href', '/download');
   await userEvent.setup().click(screen.getByRole('button', { name: '撤销客户端' }));
   expect(within(screen.getByRole('dialog')).getByText(/本机文件不会删除/)).toBeInTheDocument();
   await userEvent.setup().click(within(screen.getByRole('dialog')).getByRole('button', { name: '撤销客户端' }));

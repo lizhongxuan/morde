@@ -7,6 +7,8 @@ package sqlcgen
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const getHostActorAccess = `-- name: GetHostActorAccess :one
@@ -35,7 +37,8 @@ func (q *Queries) GetHostActorAccess(ctx context.Context, arg GetHostActorAccess
 }
 
 const listHostMembers = `-- name: ListHostMembers :many
-SELECT host_id, owner_id, user_id, permissions, created_at, updated_at, revoked_at FROM host_members WHERE host_id = $1 AND owner_id = $2 AND revoked_at IS NULL
+SELECT host_id, owner_id, user_id, permissions, created_at, updated_at, revoked_at
+FROM host_members WHERE host_id = $1 AND owner_id = $2 AND revoked_at IS NULL
 ORDER BY created_at, user_id
 `
 
@@ -44,15 +47,25 @@ type ListHostMembersParams struct {
 	OwnerID string `json:"owner_id"`
 }
 
-func (q *Queries) ListHostMembers(ctx context.Context, arg ListHostMembersParams) ([]HostMember, error) {
+type ListHostMembersRow struct {
+	HostID      string             `json:"host_id"`
+	OwnerID     string             `json:"owner_id"`
+	UserID      string             `json:"user_id"`
+	Permissions []string           `json:"permissions"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+}
+
+func (q *Queries) ListHostMembers(ctx context.Context, arg ListHostMembersParams) ([]ListHostMembersRow, error) {
 	rows, err := q.db.Query(ctx, listHostMembers, arg.HostID, arg.OwnerID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []HostMember
+	var items []ListHostMembersRow
 	for rows.Next() {
-		var i HostMember
+		var i ListHostMembersRow
 		if err := rows.Scan(
 			&i.HostID,
 			&i.OwnerID,
@@ -134,7 +147,8 @@ const upsertHostMember = `-- name: UpsertHostMember :one
 INSERT INTO host_members (host_id, owner_id, user_id, permissions)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (host_id, user_id) DO UPDATE SET owner_id = EXCLUDED.owner_id,
-  permissions = EXCLUDED.permissions, created_at = now(), updated_at = now(), revoked_at = NULL
+  permissions = EXCLUDED.permissions, created_at = now(), updated_at = now(), revoked_at = NULL,
+  grant_version = gen_random_uuid()
 RETURNING host_id, owner_id, user_id, permissions, created_at, updated_at, revoked_at
 `
 
@@ -145,14 +159,24 @@ type UpsertHostMemberParams struct {
 	Permissions []string `json:"permissions"`
 }
 
-func (q *Queries) UpsertHostMember(ctx context.Context, arg UpsertHostMemberParams) (HostMember, error) {
+type UpsertHostMemberRow struct {
+	HostID      string             `json:"host_id"`
+	OwnerID     string             `json:"owner_id"`
+	UserID      string             `json:"user_id"`
+	Permissions []string           `json:"permissions"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+}
+
+func (q *Queries) UpsertHostMember(ctx context.Context, arg UpsertHostMemberParams) (UpsertHostMemberRow, error) {
 	row := q.db.QueryRow(ctx, upsertHostMember,
 		arg.HostID,
 		arg.OwnerID,
 		arg.UserID,
 		arg.Permissions,
 	)
-	var i HostMember
+	var i UpsertHostMemberRow
 	err := row.Scan(
 		&i.HostID,
 		&i.OwnerID,

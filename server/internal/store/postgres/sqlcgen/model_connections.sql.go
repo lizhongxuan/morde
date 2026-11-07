@@ -19,7 +19,7 @@ INSERT INTO model_connections (
   $1, $2, $3, $4, $5, $6,
   false, false, false, NULL
 )
-RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at
+RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation
 `
 
 type CreateModelConnectionParams struct {
@@ -54,6 +54,9 @@ func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConn
 		&i.CheckedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.CapabilityMediaImageGeneration,
+		&i.CapabilityMediaVideoGeneration,
+		&i.CapabilityMediaSpeechGeneration,
 	)
 	return i, err
 }
@@ -70,7 +73,7 @@ func (q *Queries) DeleteModelConnection(ctx context.Context, id string) (string,
 }
 
 const getModelConnection = `-- name: GetModelConnection :one
-SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at FROM model_connections WHERE id = $1
+SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation FROM model_connections WHERE id = $1
 `
 
 func (q *Queries) GetModelConnection(ctx context.Context, id string) (ModelConnection, error) {
@@ -89,12 +92,15 @@ func (q *Queries) GetModelConnection(ctx context.Context, id string) (ModelConne
 		&i.CheckedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.CapabilityMediaImageGeneration,
+		&i.CapabilityMediaVideoGeneration,
+		&i.CapabilityMediaSpeechGeneration,
 	)
 	return i, err
 }
 
 const listModelConnections = `-- name: ListModelConnections :many
-SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at FROM model_connections
+SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation FROM model_connections
 WHERE owner_id IS NULL OR owner_id = $1
 ORDER BY owner_id NULLS FIRST, lower(name), id
 `
@@ -121,6 +127,9 @@ func (q *Queries) ListModelConnections(ctx context.Context, ownerID pgtype.Text)
 			&i.CheckedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.CapabilityMediaImageGeneration,
+			&i.CapabilityMediaVideoGeneration,
+			&i.CapabilityMediaSpeechGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -137,22 +146,28 @@ UPDATE model_connections SET
   name = $1, base_url = $2, model_name = $3,
   api_key_cipher = $4, capability_text = $5,
   capability_tools = $6, capability_vision = $7,
-  checked_at = $8, updated_at = clock_timestamp()
-WHERE id = $9 AND updated_at = $10
-RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at
+  capability_media_image_generation = COALESCE($8, capability_media_image_generation),
+  capability_media_video_generation = COALESCE($9, capability_media_video_generation),
+  capability_media_speech_generation = COALESCE($10, capability_media_speech_generation),
+  checked_at = $11, updated_at = clock_timestamp()
+WHERE id = $12 AND updated_at = $13
+RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation
 `
 
 type UpdateModelConnectionParams struct {
-	Name              string             `json:"name"`
-	BaseUrl           string             `json:"base_url"`
-	ModelName         string             `json:"model_name"`
-	ApiKeyCipher      []byte             `json:"api_key_cipher"`
-	CapabilityText    bool               `json:"capability_text"`
-	CapabilityTools   bool               `json:"capability_tools"`
-	CapabilityVision  bool               `json:"capability_vision"`
-	CheckedAt         pgtype.Timestamptz `json:"checked_at"`
-	ID                string             `json:"id"`
-	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
+	Name                            string             `json:"name"`
+	BaseUrl                         string             `json:"base_url"`
+	ModelName                       string             `json:"model_name"`
+	ApiKeyCipher                    []byte             `json:"api_key_cipher"`
+	CapabilityText                  bool               `json:"capability_text"`
+	CapabilityTools                 bool               `json:"capability_tools"`
+	CapabilityVision                bool               `json:"capability_vision"`
+	CapabilityMediaImageGeneration  pgtype.Bool        `json:"capability_media_image_generation"`
+	CapabilityMediaVideoGeneration  pgtype.Bool        `json:"capability_media_video_generation"`
+	CapabilityMediaSpeechGeneration pgtype.Bool        `json:"capability_media_speech_generation"`
+	CheckedAt                       pgtype.Timestamptz `json:"checked_at"`
+	ID                              string             `json:"id"`
+	ExpectedUpdatedAt               pgtype.Timestamptz `json:"expected_updated_at"`
 }
 
 func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConnectionParams) (ModelConnection, error) {
@@ -164,6 +179,9 @@ func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConn
 		arg.CapabilityText,
 		arg.CapabilityTools,
 		arg.CapabilityVision,
+		arg.CapabilityMediaImageGeneration,
+		arg.CapabilityMediaVideoGeneration,
+		arg.CapabilityMediaSpeechGeneration,
 		arg.CheckedAt,
 		arg.ID,
 		arg.ExpectedUpdatedAt,
@@ -182,6 +200,9 @@ func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConn
 		&i.CheckedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.CapabilityMediaImageGeneration,
+		&i.CapabilityMediaVideoGeneration,
+		&i.CapabilityMediaSpeechGeneration,
 	)
 	return i, err
 }

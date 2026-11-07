@@ -41,6 +41,7 @@ type scheduleBudgetRequest struct {
 type scheduleCreateRequest struct {
 	HostID             string                       `json:"host_id"`
 	ModelID            string                       `json:"model_id"`
+	Title              json.RawMessage              `json:"title"`
 	Objective          string                       `json:"objective"`
 	Timing             schedule.Timing              `json:"timing"`
 	Budget             *scheduleBudgetRequest       `json:"budget"`
@@ -53,6 +54,7 @@ type scheduleUpdateRequest struct {
 	ExpectedVersion    *int64                        `json:"expected_version"`
 	HostID             json.RawMessage               `json:"host_id"`
 	ModelID            *string                       `json:"model_id"`
+	Title              json.RawMessage               `json:"title"`
 	Objective          *string                       `json:"objective"`
 	Timing             *schedule.Timing              `json:"timing"`
 	Budget             *scheduleBudgetRequest        `json:"budget"`
@@ -99,6 +101,7 @@ type scheduleResponse struct {
 	Status             schedule.Status              `json:"status"`
 	HostID             *string                      `json:"host_id"`
 	ModelID            string                       `json:"model_id"`
+	Title              string                       `json:"title"`
 	Objective          string                       `json:"objective"`
 	Timing             schedule.Timing              `json:"timing"`
 	Budget             scheduleBudgetResponse       `json:"budget"`
@@ -177,12 +180,17 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 		if !decodeStrictJSON(c, &request) {
 			return
 		}
+		title, err := parseOptionalScheduleTitle(request.Title)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
 		key, ok := scheduleIdempotencyKey(c)
 		if !ok {
 			return
 		}
 		command := app.CreateScheduleCommand{
-			HostID: request.HostID, ModelID: request.ModelID, Objective: request.Objective,
+			HostID: request.HostID, ModelID: request.ModelID, Title: title, Objective: request.Objective,
 			Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
 			NotificationEvents: request.NotificationEvents, Observation: request.Observation,
 		}
@@ -254,8 +262,13 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 			writeError(c, invalidScheduleBody())
 			return
 		}
+		title, err := parseOptionalScheduleTitle(request.Title)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
 		command := app.UpdateScheduleCommand{
-			ExpectedVersion: *request.ExpectedVersion, HostID: hostID, ModelID: request.ModelID,
+			ExpectedVersion: *request.ExpectedVersion, HostID: hostID, ModelID: request.ModelID, Title: title,
 			Objective: request.Objective, Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
 			NotificationEvents: request.NotificationEvents,
 		}
@@ -406,7 +419,7 @@ func toScheduleResponse(value schedule.Schedule) scheduleResponse {
 		hostID = &value.HostID
 	}
 	result := scheduleResponse{
-		ID: value.ID, Version: value.Version, Status: value.Status, HostID: hostID, ModelID: value.ModelID,
+		ID: value.ID, Version: value.Version, Status: value.Status, HostID: hostID, ModelID: value.ModelID, Title: value.Title,
 		Objective: value.Objective, Timing: value.Timing,
 		Budget: scheduleBudgetResponse{
 			ActiveSeconds: value.Budget.ActiveSeconds,
@@ -429,6 +442,20 @@ func toScheduleResponse(value schedule.Schedule) scheduleResponse {
 		result.CurrentRun = &currentRun
 	}
 	return result
+}
+
+func parseOptionalScheduleTitle(raw json.RawMessage) (*string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var title *string
+	if err := json.Unmarshal(raw, &title); err != nil {
+		return nil, err
+	}
+	if title == nil {
+		return nil, errors.New("schedule title cannot be null")
+	}
+	return title, nil
 }
 
 func parseScheduleHostID(raw json.RawMessage) (*string, error) {

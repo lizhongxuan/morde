@@ -163,6 +163,9 @@ func TestPostgresMCPConnectorOperationDispatchedCompletionAndUnknownAreTerminal(
 	if _, err := store.MarkMCPConnectorOperationDispatched(ctx, unknownDispatched, fixture.leaseOwner); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("unknown operation was dispatchable again: %v", err)
 	}
+	if _, _, err := store.PrepareMCPConnectorOperation(ctx, fixture.operation("unknown-new-key", "update"), fixture.leaseOwner); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("new MCP operation bypassed an unknown result: %v", err)
+	}
 	if err := store.MarkMCPConnectorOperationUnknown(ctx, unknownDispatched, fixture.leaseOwner, "different summary"); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("unknown result was overwritten: %v", err)
 	}

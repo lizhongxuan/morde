@@ -51,76 +51,76 @@ func NewDockerCloudDSHAccountRuntimeSupervisor(docker *DockerCloudDSHSupervisor)
 func (s *dockerCloudDSHAccountRuntimeSupervisor) StartAccountRuntime(ctx context.Context, fence app.AccountAgentRuntimeFence,
 	nonce []byte, expires time.Time) (CloudDSHAccountRuntimeProcess, error) {
 	if ctx == nil || fence.Validate() != nil || len(nonce) != 32 || bytes.Equal(nonce, make([]byte, 32)) || !validCloudDSHLease(expires) {
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime launch identity is invalid")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("launch_identity", "account Agent Runtime launch identity is invalid", nil)
 	}
 	scriptPath := filepath.Join(filepath.Dir(s.docker.options.ScriptPath), "bin-account.mjs")
 	if !cleanDockerDSHPath(scriptPath) {
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime script path is invalid")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("script_path", "account Agent Runtime script path is invalid", nil)
 	}
 	nonceDigest := sha256.Sum256(nonce)
 	nonceHash := hex.EncodeToString(nonceDigest[:])
 	encodedFence, err := json.Marshal(fence)
 	if err != nil {
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime fence cannot be encoded")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("launch_identity", "account Agent Runtime fence cannot be encoded", err)
 	}
 	identity := sha256.Sum256(append(append(encodedFence, 0), nonceDigest[:]...))
 	name := "morde-account-runtime-" + hex.EncodeToString(identity[:])
 	labels := map[string]string{dockerAccountRuntimeFenceLabel: string(encodedFence), dockerAccountRuntimeNonceLabel: nonceHash}
 	guard := dshguardian.AccountRuntimeGuard{ContainerName: name, Fence: fence, NonceSHA256: nonceHash, ExpiresAt: expires}
 	if err := s.docker.validateImage(ctx); err != nil {
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime image is unavailable")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("image_validation", "account Agent Runtime image is unavailable", err)
 	}
 	create := s.docker.containerCreateForScript(labels, scriptPath)
 	var created struct {
 		ID string `json:"Id"`
 	}
 	if err := s.docker.requestJSON(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(name), create, http.StatusCreated, &created); err != nil || !dockerDSHContainerID.MatchString(created.ID) {
-		return CloudDSHAccountRuntimeProcess{}, errors.New("docker could not create the account Agent Runtime container")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_create", "docker could not create the account Agent Runtime container", err)
 	}
 	guard.ContainerID = created.ID
 	preflight, err := s.docker.inspect(ctx, created.ID)
 	if err != nil || s.validateAccountRuntime(preflight, guard, false) != nil || *preflight.State.Running || *preflight.State.PID != 0 {
 		if s.cleanupUnstartedContainer(ctx, created.ID, name) != nil {
-			return CloudDSHAccountRuntimeProcess{}, errors.New("unverified account Agent Runtime container cleanup is unconfirmed")
+			return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_preflight_cleanup", "unverified account Agent Runtime container cleanup is unconfirmed", err)
 		}
-		return CloudDSHAccountRuntimeProcess{}, errors.New("created account Agent Runtime container does not match its identity")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_preflight", "created account Agent Runtime container does not match its identity", err)
 	}
 	if err := s.guardian.ArmAccountRuntime(ctx, guard); err != nil {
 		if s.cleanupUnstartedContainer(ctx, created.ID, name) != nil {
-			return CloudDSHAccountRuntimeProcess{}, errors.New("unguarded account Agent Runtime container cleanup is unconfirmed")
+			return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("guardian_arm_cleanup", "unguarded account Agent Runtime container cleanup is unconfirmed", err)
 		}
-		return CloudDSHAccountRuntimeProcess{}, errors.New("guardian could not arm the account Agent Runtime")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("guardian_arm", "guardian could not arm the account Agent Runtime", err)
 	}
 	// The attach stream belongs to the account Runtime, not the Task that started it.
 	input, output, err := s.docker.attach(context.WithoutCancel(ctx), created.ID)
 	if err != nil {
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime pipes could not be attached")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_attach", "account Agent Runtime pipes could not be attached", err)
 	}
 	if err := s.docker.requestJSON(ctx, http.MethodPost, "/containers/"+created.ID+"/start", nil, http.StatusNoContent, nil); err != nil {
 		_ = input.Close()
 		_ = output.Close()
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime container could not be started")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_start", "account Agent Runtime container could not be started", err)
 	}
 	started, err := s.docker.inspect(ctx, created.ID)
 	if err != nil || s.validateAccountRuntime(started, guard, true) != nil || !*started.State.Running || *started.State.PID < 2 {
 		_ = input.Close()
 		_ = output.Close()
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
-		return CloudDSHAccountRuntimeProcess{}, errors.New("started account Agent Runtime container does not match its identity")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("container_started_inspect", "started account Agent Runtime container does not match its identity", err)
 	}
 	if err := s.guardian.StartedAccountRuntime(ctx, guard); err != nil {
 		_ = input.Close()
 		_ = output.Close()
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
-		return CloudDSHAccountRuntimeProcess{}, errors.New("guardian could not verify the account Agent Runtime process")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("guardian_started", "guardian could not verify the account Agent Runtime process", err)
 	}
 	if ctx.Err() != nil || !expires.After(time.Now()) {
 		_ = input.Close()
 		_ = output.Close()
 		_, _ = s.guardian.StopAccountRuntime(context.WithoutCancel(ctx), fence, nonceHash)
-		return CloudDSHAccountRuntimeProcess{}, errors.New("account Agent Runtime expired during startup")
+		return CloudDSHAccountRuntimeProcess{}, cloudDSHStartupFailure("startup_expired", "account Agent Runtime expired during startup", ctx.Err())
 	}
 	return CloudDSHAccountRuntimeProcess{ContainerID: created.ID, ContainerName: name, Input: input, Output: output}, nil
 }

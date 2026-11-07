@@ -23,15 +23,44 @@ func (s *ModelGatewayService) CheckModelCapability(ctx context.Context, principa
 	if !idempotencyKeyPattern.MatchString(key) {
 		return ModelCapabilities{}, domain.InvalidArgument("idempotency_key", "idempotency key is invalid")
 	}
-	if capability != "all" && capability != "text" && capability != "tools" && capability != "vision" {
+	if capability != "all" && capability != "text" && capability != "text_stream" && capability != "tools" && capability != "vision" && !isModelMediaGenerationCapability(capability) {
 		return ModelCapabilities{}, domain.InvalidArgument("capability", "invalid model capability")
 	}
 	endpoint, err := s.models.ResolveProbeEndpoint(ctx, principal, modelID)
 	if err != nil {
 		return ModelCapabilities{}, err
 	}
+	if capability == "text_stream" {
+		return s.checkModelTextStreaming(ctx, principal, modelID, key, endpoint)
+	}
+	if isModelMediaGenerationCapability(capability) {
+		checker, ok := s.client.(ModelMediaGenerationCapabilityClient)
+		if !ok {
+			return ModelCapabilities{}, domain.NewError(domain.CodeUnsupported, "model provider cannot verify metered media generation")
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, ModelCallTimeout)
+		defer cancel()
+		report, err := checker.CheckMediaGenerationCapability(checkCtx, endpoint.Endpoint, capability)
+		if err != nil {
+			return ModelCapabilities{}, modelConnectionCheckError(err)
+		}
+		if !report.Supported || !report.ExactTokenReservation || !report.ActualTokenUsage ||
+			!report.IdempotentOperation || !report.DurableOperationRecovery || !report.ConfirmedCancellation {
+			return ModelCapabilities{}, domain.NewError(domain.CodeUnsupported, "model provider does not meet media usage and recovery requirements")
+		}
+		capabilities := ModelCapabilities{ModelID: modelID}
+		switch capability {
+		case "image_generation":
+			capabilities.MediaGeneration.ImageGeneration = true
+		case "video_generation":
+			capabilities.MediaGeneration.VideoGeneration = true
+		case "speech_generation":
+			capabilities.MediaGeneration.SpeechGeneration = true
+		}
+		return s.models.SaveProbeCapabilities(ctx, principal, modelID, endpoint.Version, capabilities)
+	}
 	const probeTool = "morde_capability_probe"
-	request := ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "Reply exactly OK."}}, MaxOutputTokens: 64}
+	request := ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "Reply exactly OK."}}, MaxOutputTokens: 64, DisableThinking: true}
 	if capability == "tools" || capability == "all" {
 		request.Instructions = "Call the provided function with color set to red."
 		request.Tools = []ModelTool{{Name: probeTool, Description: "Report the requested color.",
@@ -90,4 +119,8 @@ func (s *ModelGatewayService) CheckModelCapability(ctx context.Context, principa
 	}
 	capabilities := ModelCapabilities{Text: capability != "tools", Tools: capability == "tools" || capability == "all", Vision: capability == "vision" || capability == "all", ModelID: modelID}
 	return s.models.SaveProbeCapabilities(ctx, principal, modelID, endpoint.Version, capabilities)
+}
+
+func isModelMediaGenerationCapability(value string) bool {
+	return value == "image_generation" || value == "video_generation" || value == "speech_generation"
 }

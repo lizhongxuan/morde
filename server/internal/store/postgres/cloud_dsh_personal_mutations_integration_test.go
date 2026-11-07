@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -37,6 +38,12 @@ func TestPostgresCloudDSHPersonalMutationIsAtomicFencedAndRedacted(t *testing.T)
 	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
 	mutationService, err := app.NewPersonalMutationService(store)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutationService.ApplyPersonalMutation(ctx, principal, app.PersonalMutationCommand{
+		MutationID: "enable-memory-1", ObjectType: personal.ObjectTypeSkillSetting, ObjectID: "builtin_memory",
+		Body: json.RawMessage(`{"enabled":true}`),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	body := json.RawMessage(`{"content":"private-personal-body-7f9c","category":"preference"}`)
@@ -77,6 +84,20 @@ func TestPostgresCloudDSHPersonalMutationIsAtomicFencedAndRedacted(t *testing.T)
 	if err != nil || stored.Revision != 1 || !strings.Contains(string(stored.Body), "private-personal-body-7f9c") {
 		t.Fatalf("stale write changed the personal object: %+v, err=%v", stored, err)
 	}
+	if _, err := mutationService.ApplyPersonalMutation(ctx, principal, app.PersonalMutationCommand{
+		MutationID: "disable-memory-1", ObjectType: personal.ObjectTypeSkillSetting, ObjectID: "builtin_memory",
+		BaseRevision: 1, Body: json.RawMessage(`{"enabled":false}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if replayed, err := store.CommitTaskProgress(ctx, progress); err != nil || replayed.Sequence != first.Sequence {
+		t.Fatalf("committed mutation did not replay after withdrawal: %+v, %v", replayed, err)
+	}
+	disabled := cloudDSHPersonalMutationProgress(t, claimed, principal, mutationService, "call_personal_write_disabled", 1,
+		json.RawMessage(`{"content":"must-not-write-disabled"}`))
+	if _, err := store.CommitTaskProgress(ctx, disabled); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("disabled memory mutation error = %v, want forbidden", err)
+	}
 
 	if _, err := store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=clock_timestamp() WHERE id=$1`, principal.TokenID); err != nil {
 		t.Fatal(err)
@@ -88,6 +109,84 @@ func TestPostgresCloudDSHPersonalMutationIsAtomicFencedAndRedacted(t *testing.T)
 	}
 	if _, err := store.GetPersonalObject(ctx, principal, personal.ObjectTypeMemory, "global"); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("revoked session still reads personal data: %v", err)
+	}
+}
+
+func TestPostgresCloudDSHMemoryWriteCannotRaceConsentWithdrawal(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	submission := newTestTaskSubmission(t, owner.ID, "", "memory-concurrent-task", "remember preference")
+	submission.Task.ExecutionLocation = "server"
+	submission.Task.Authorization.Scopes = []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)}
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, "memory-concurrent-worker", 20*time.Second)
+	if err != nil || !ok || claimed.ID != created.Task.ID {
+		t.Fatalf("claim: %v, %v", ok, err)
+	}
+	claimed.AgentSessionID = "session_memory_race"
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET agent_session_id=$2 WHERE id=$1`, claimed.ID, claimed.AgentSessionID); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
+	service, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplyPersonalMutation(ctx, principal, app.PersonalMutationCommand{MutationID: "memory-race-enable", ObjectType: personal.ObjectTypeSkillSetting,
+		ObjectID: "builtin_memory", Body: json.RawMessage(`{"enabled":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	disable, err := service.PreparePersonalMutation(principal, app.PersonalMutationCommand{MutationID: "memory-race-disable", ObjectType: personal.ObjectTypeSkillSetting,
+		ObjectID: "builtin_memory", BaseRevision: 1, Body: json.RawMessage(`{"enabled":false}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := applyPersonalMutationInTx(ctx, tx, principal, disable, ""); err != nil {
+		t.Fatal(err)
+	}
+	progress := cloudDSHPersonalMutationProgress(t, claimed, principal, service, "memory_racing_write", 0, json.RawMessage(`{"content":"should not be written"}`))
+	done := make(chan error, 1)
+	go func() { _, err := store.CommitTaskProgress(ctx, progress); done <- err }()
+	select {
+	case err := <-done:
+		t.Fatalf("write was not serialized behind withdrawal: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("write after withdrawal = %v", err)
+	}
+	if _, err := store.GetPersonalObject(ctx, principal, personal.ObjectTypeMemory, "global"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("memory appeared after withdrawal: %v", err)
+	}
+	broker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := broker.PausePersonalMemoryRecovery(ctx, claimed); err != nil {
+			t.Fatalf("pause %d: %v", i, err)
+		}
+	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || details.Task.Status != task.StatusWaitingUser || details.Task.WaitingReason != "dsh_recovery_unresolved" ||
+		len(details.Steps) != 1 || !strings.Contains(details.Steps[0].Summary, "请重新发送消息") {
+		t.Fatalf("memory pause was not durable or duplicated: %+v, %v", details, err)
+	}
+	if next, found, err := store.ClaimNextTask(ctx, "other-memory-worker", 20*time.Second); err != nil || found {
+		t.Fatalf("paused memory task was reclaimed: %+v found=%t err=%v", next, found, err)
 	}
 }
 
