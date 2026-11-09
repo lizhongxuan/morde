@@ -1,0 +1,27 @@
+@import "tailwindcss" source(none);
+@source "./morde";
+
+@theme {
+  --color-bg: #f7f9fa;
+  --color-surface-2: #eef6fb;
+  --color-border: #e3e9ed;
+  --color-muted: #637784;
+  --color-accent: #2e74a6;
+  --color-ink: #2e74a6;
+  --color-ink-fg: #ffffff;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+html, body, #root { height: 100%; }
+body { margin: 0; background: #f7f9fa; color: #1b2932; font-family: var(--font-sans); }
+.safe-top { padding-top: env(safe-area-inset-top); }
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+
+.morde-mobile > header, .morde-mobile > nav { background: #fff; }
+.morde-mobile > header h1 { display: flex; align-items: center; gap: 9px; color: #1b2932; }
+.morde-mobile > header h1::before { content: 'M'; display: grid; place-items: center; width: 33px; height: 33px; border-radius: 11px; background: linear-gradient(145deg, #a6d5f4, #6aa8d0); color: #fff; font-size: 18px; box-shadow: 0 5px 12px rgb(133 191 231 / 32%); }
+.morde-mobile main .rounded-2xl.border { border-radius: 16px; background: #fff; box-shadow: 0 7px 22px rgb(36 66 84 / 4%); }
+.morde-mobile button.rounded-full, .morde-mobile a.rounded-full { min-height: 40px; border-radius: 10px; font-weight: 650; }
+.morde-mobile button.bg-ink, .morde-mobile a.bg-ink { background: #2e74a6; }
+.morde-mobile > nav button[aria-current="page"] { color: #286a9c; background: #eef7fd; }
+.morde-mobile button:focus-visible, .morde-mobile a:focus-visible, .morde-mobile textarea:focus-visible, .morde-mobile select:focus-visible { outline: 2px solid #347fb9; outline-offset: 2px; }

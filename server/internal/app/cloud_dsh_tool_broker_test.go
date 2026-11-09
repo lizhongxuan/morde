@@ -359,7 +359,7 @@ func TestCloudDSHToolBrokerReadsFixedNanoMuseSkillAndReplaysWithoutRecharging(t 
 	var output cloudDSHSkillReadOutput
 	if err := json.Unmarshal([]byte(first.Output), &output); err != nil || output.SkillID != "compare-options" ||
 		output.Version != "1" || output.BundleVersion != cloudDSHSkillBundleVersion ||
-		output.SourceRef != "project/nanoMuse/nanomuse/skills/builtin/compare-options/SKILL.md" ||
+		output.SourceRef != "clients/nanoMuse/nanomuse/skills/builtin/compare-options/SKILL.md" ||
 		output.ExecutionNotes == "" || output.Content != string(mustReadEmbeddedSkill(t)) || len(first.Output) > maxAgentToolOutputBytes {
 		t.Fatalf("skill result metadata/content/size is invalid: %#v, err=%v", output, err)
 	}
@@ -486,7 +486,7 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	for _, skill := range cloudDSHSkillCatalog {
 		metadata, ok := CloudDSHSkillMetadataForID(skill.id)
 		if !ok || metadata.ID != skill.id || metadata.Version != skill.version ||
-			metadata.SourceRef != "project/nanoMuse/nanomuse/skills/builtin/"+skill.id+"/SKILL.md" {
+			metadata.SourceRef != "clients/nanoMuse/nanomuse/skills/builtin/"+skill.id+"/SKILL.md" {
 			t.Fatalf("skill metadata is not fixed for %q: %#v", skill.id, metadata)
 		}
 		content, err := cloudDSHSkillBundle.ReadFile("cloud_dsh_skills/" + skill.id + ".md")

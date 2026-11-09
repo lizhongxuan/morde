@@ -1,0 +1,134 @@
+diff --git a/cmd/syncthing/generate/generate.go b/cmd/syncthing/generate/generate.go
+index 9434b43..5758b41 100644
+--- a/cmd/syncthing/generate/generate.go
++++ b/cmd/syncthing/generate/generate.go
+@@ -27,6 +27,7 @@ type CLI struct {
+ 	GUIUser       string `placeholder:"STRING" help:"Specify new GUI authentication user name"`
+ 	GUIPassword   string `placeholder:"STRING" help:"Specify new GUI authentication password (use - to read from standard input)"`
+ 	NoPortProbing bool   `help:"Don't try to find free ports for GUI and listen addresses on first startup" env:"STNOPORTPROBING"`
++	MordeDesktop  bool   `help:"Apply Morde's private-node network defaults before the first serve"`
+ }
+ 
+ func (c *CLI) Run() error {
+@@ -40,13 +41,30 @@ func (c *CLI) Run() error {
+ 		c.GUIPassword = string(password)
+ 	}
+ 
+-	if err := Generate(locations.GetBaseDir(locations.ConfigBaseDir), c.GUIUser, c.GUIPassword, c.NoPortProbing); err != nil {
++	if c.MordeDesktop && (c.GUIUser != "" || c.GUIPassword != "") {
++		return fmt.Errorf("Morde desktop mode does not accept GUI credentials on the command line")
++	}
++	var err error
++	if c.MordeDesktop {
++		err = GenerateMordeDesktop(locations.GetBaseDir(locations.ConfigBaseDir), c.NoPortProbing)
++	} else {
++		err = Generate(locations.GetBaseDir(locations.ConfigBaseDir), c.GUIUser, c.GUIPassword, c.NoPortProbing)
++	}
++	if err != nil {
+ 		return fmt.Errorf("failed to generate config and keys: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+ func Generate(confDir, guiUser, guiPassword string, skipPortProbing bool) error {
++	return generate(confDir, guiUser, guiPassword, skipPortProbing, false)
++}
++
++func GenerateMordeDesktop(confDir string, skipPortProbing bool) error {
++	return generate(confDir, "", "", skipPortProbing, true)
++}
++
++func generate(confDir, guiUser, guiPassword string, skipPortProbing, mordeDesktop bool) error {
+ 	dir, err := fs.ExpandTilde(confDir)
+ 	if err != nil {
+ 		return err
+@@ -89,6 +107,9 @@ func Generate(confDir, guiUser, guiPassword string, skipPortProbing bool) error
+ 	var updateErr error
+ 	waiter, err := cfg.Modify(func(cfg *config.Configuration) {
+ 		updateErr = updateGUIAuthentication(&cfg.GUI, guiUser, guiPassword)
++		if mordeDesktop && updateErr == nil {
++			applyMordeDesktopDefaults(cfg)
++		}
+ 	})
+ 	if err != nil {
+ 		return fmt.Errorf("modify config: %w", err)
+@@ -104,6 +125,22 @@ func Generate(confDir, guiUser, guiPassword string, skipPortProbing bool) error
+ 	return nil
+ }
+ 
++func applyMordeDesktopDefaults(cfg *config.Configuration) {
++	cfg.GUI.RawAddress = "127.0.0.1:8384"
++	cfg.Options.RawListenAddresses = []string{""}
++	cfg.Options.RawGlobalAnnServers = []string{}
++	cfg.Options.RawStunServers = []string{}
++	cfg.Options.GlobalAnnEnabled = false
++	cfg.Options.LocalAnnEnabled = false
++	cfg.Options.RelaysEnabled = false
++	cfg.Options.NATEnabled = false
++	cfg.Options.AnnounceLANAddresses = false
++	cfg.Options.CREnabled = false
++	cfg.Options.AutoUpgradeIntervalH = 0
++	cfg.Options.StartBrowser = false
++	cfg.Options.DeprecatedDefaultFolderPath = ""
++}
++
+ func updateGUIAuthentication(guiCfg *config.GUIConfiguration, guiUser, guiPassword string) error {
+ 	if guiUser != "" && guiCfg.User != guiUser {
+ 		guiCfg.User = guiUser
+diff --git a/cmd/syncthing/generate/morde_desktop_test.go b/cmd/syncthing/generate/morde_desktop_test.go
+new file mode 100644
+index 0000000..97a827d
+--- /dev/null
++++ b/cmd/syncthing/generate/morde_desktop_test.go
+@@ -0,0 +1,51 @@
++// Copyright (C) 2026 nanoMuse contributors and Morde contributors.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++package generate
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/syncthing/syncthing/lib/config"
++)
++
++func TestMordeDesktopDefaultsDisablePublicNetworkingAndPreserveManagedEntries(t *testing.T) {
++	folders := []config.FolderConfiguration{{ID: "morde-0123456789abcdef0123456789abcdef"}}
++	devices := []config.DeviceConfiguration{{Name: "registered owner"}}
++	cfg := config.Configuration{
++		Folders: folders,
++		Devices: devices,
++		GUI: config.GUIConfiguration{RawAddress: "0.0.0.0:8384"},
++		Options: config.OptionsConfiguration{
++			RawListenAddresses: []string{"default"},
++			RawGlobalAnnServers: []string{"default"},
++			RawStunServers: []string{"default"},
++			GlobalAnnEnabled: true,
++			LocalAnnEnabled: true,
++			RelaysEnabled: true,
++			NATEnabled: true,
++			AnnounceLANAddresses: true,
++			CREnabled: true,
++			AutoUpgradeIntervalH: 12,
++			StartBrowser: true,
++			DeprecatedDefaultFolderPath: "/tmp/Sync",
++		},
++	}
++
++	applyMordeDesktopDefaults(&cfg)
++
++	if !reflect.DeepEqual(cfg.Folders, folders) || !reflect.DeepEqual(cfg.Devices, devices) {
++		t.Fatal("safe defaults must preserve registered folders and devices")
++	}
++	if cfg.GUI.RawAddress != "127.0.0.1:8384" || !reflect.DeepEqual(cfg.Options.RawListenAddresses, []string{""}) ||
++		len(cfg.Options.RawGlobalAnnServers) != 0 || len(cfg.Options.RawStunServers) != 0 ||
++		cfg.Options.GlobalAnnEnabled || cfg.Options.LocalAnnEnabled || cfg.Options.RelaysEnabled || cfg.Options.NATEnabled ||
++		cfg.Options.AnnounceLANAddresses || cfg.Options.CREnabled || cfg.Options.AutoUpgradeIntervalH != 0 ||
++		cfg.Options.StartBrowser || cfg.Options.DeprecatedDefaultFolderPath != "" {
++		t.Fatalf("Morde desktop networking defaults are unsafe: %+v %+v", cfg.GUI, cfg.Options)
++	}
++}

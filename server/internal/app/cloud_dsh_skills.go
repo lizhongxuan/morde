@@ -68,7 +68,7 @@ func CloudDSHSkillMetadataForID(id string) (CloudDSHSkillMetadata, bool) {
 func cloudDSHSkillForID(id string) (cloudDSHSkill, bool) {
 	for _, skill := range cloudDSHSkillCatalog {
 		if skill.id == id {
-			skill.sourceRef = "project/nanoMuse/nanomuse/skills/builtin/" + skill.id + "/SKILL.md"
+			skill.sourceRef = "clients/nanoMuse/nanomuse/skills/builtin/" + skill.id + "/SKILL.md"
 			skill.resource = "cloud_dsh_skills/" + skill.id + ".md"
 			return skill, true
 		}

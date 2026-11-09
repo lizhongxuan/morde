@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --strictPort",
     "predev": "msw init public --save",
-    "build": "tsc -b && vite build && npm --prefix ../../project/nanoMuse/web run build && node scripts/copy-morde-mobile.mjs",
+    "build": "tsc -b && vite build && npm --prefix ../../web/mobile run build && node scripts/copy-morde-mobile.mjs",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint src vite.config.ts --max-warnings=0",
     "test": "vitest run && node --test scripts/copy-morde-mobile.node-test.mjs",

@@ -1,0 +1,7 @@
+/* Siri invocation phrases (Simplified Chinese). Keys = English code phrases. */
+
+"Get ${applicationName} session status" = "获取${applicationName}会话状态";
+"Check ${applicationName} task" = "查看${applicationName}任务";
+"List ${applicationName} sessions" = "列出${applicationName}会话";
+"Show ${applicationName} chats" = "显示${applicationName}聊天";
+"Open a ${applicationName} session" = "打开${applicationName}会话";

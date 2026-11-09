@@ -1,0 +1,221 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'">
+<title>Morde hands</title>
+<style>
+  /* A transparent, click-through, always-on-top window over the whole display while the hands
+     work — the phone's HandsStage, drawn for a desktop screen: a glow breathing along the four
+     edges (blue while the hands work, amber while they wait for the person; 2.4 s in, 2.4 s out),
+     a hairline at the rim, and at the point the hands act the phone's marker — a halo, a ring in
+     Muse's action blue with a cyan arc turning round it, a dot at the centre, the action's name in
+     a dark pill beside it — that locks on in 220 ms and ripples twice as the click lands. A drag
+     draws its path as a dashed line and sends the ring along it to an arrowhead; typing, keys and
+     waits write their name where the last ring was. Nothing runs round the rim or sweeps across
+     the screen; under prefers-reduced-motion the glow is steady, the arc still, the ring in place.
+     Thinner than the phone's in proportion: the band is 7 % of the shorter side, the ring 12 px.
+     Nothing here is ever in a screenshot: the window has content protection on (macOS, Windows)
+     or steps aside for the capture (Linux). The idea of a frame breathing round the screen is
+     UI-TARS-desktop's ScreenMarker; nothing of it is copied. */
+  :root { --accent: #0a66e4; --violet: #7c5cff; --cyan: #06b6d4; --glow: rgba(10,102,228,0.34); --edge: rgba(10,102,228,0.45); --band: min(7vmin, 110px); }
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; pointer-events: none; }
+  .held { --glow: rgba(255,176,0,0.38); --edge: rgba(255,176,0,0.5); }
+  /* the four bands, the colour at the edge gone at half the band; the whole breathes about the centre */
+  .glow { position: fixed; inset: 0; opacity: 0; transition: opacity 240ms ease; }
+  .on .glow { opacity: 1; animation: breathe 4.8s ease-in-out infinite; }
+  .band { position: absolute; }
+  .band.t { left: 0; right: 0; top: 0; height: var(--band); background: linear-gradient(to bottom, var(--glow), transparent 50%); }
+  .band.b { left: 0; right: 0; bottom: 0; height: var(--band); background: linear-gradient(to top, var(--glow), transparent 50%); }
+  .band.l { top: 0; bottom: 0; left: 0; width: var(--band); background: linear-gradient(to right, var(--glow), transparent 50%); }
+  .band.r { top: 0; bottom: 0; right: 0; width: var(--band); background: linear-gradient(to left, var(--glow), transparent 50%); }
+  .hair { position: fixed; inset: 0; box-shadow: inset 0 0 0 1.5px var(--edge); opacity: 0; transition: opacity 240ms ease; }
+  .on .hair { opacity: 1; animation: hair 4.8s ease-in-out infinite; }
+  @keyframes breathe { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.05); opacity: 0.92; } }
+  @keyframes hair { 0%, 100% { opacity: 0.65; } 50% { opacity: 1; } }
+  /* the marker */
+  .mark { position: fixed; left: 0; top: 0; width: 0; height: 0; opacity: 0; transition: opacity 180ms ease; }
+  .mark.shown { opacity: 1; }
+  .mark.fade { opacity: 0; transition: opacity 600ms ease; }
+  .mark .halo { position: absolute; left: -32px; top: -32px; width: 64px; height: 64px; border-radius: 50%; background: radial-gradient(closest-side, rgba(10,102,228,0.22), rgba(10,102,228,0)); }
+  .mark .ring { position: absolute; left: -12px; top: -12px; width: 24px; height: 24px; border-radius: 50%; box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px rgba(10,102,228,0.22); }
+  .mark .arc { position: absolute; left: -17px; top: -17px; width: 34px; height: 34px; animation: turn 520ms linear infinite; }
+  .mark .arc circle { fill: none; stroke: var(--cyan); stroke-width: 2; stroke-dasharray: 37.7 62.8; stroke-linecap: round; }
+  @keyframes turn { to { transform: rotate(360deg); } }
+  .mark .dot { position: absolute; left: -3px; top: -3px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: inset 0 0 0 1.5px var(--accent); }
+  .mark .dot::after { content: ''; position: absolute; left: 1.8px; top: 1.8px; width: 2.4px; height: 2.4px; border-radius: 50%; background: #fff; }
+  .mark.lock { animation: lock 220ms ease-out; }
+  @keyframes lock { from { transform: scale(1.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  /* the action's name: the phone's label pill, a cyan→blue bar at its start, to the right of the ring (left near the edge) */
+  .chip { position: absolute; left: 26px; top: 0; transform: translateY(-50%); display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px 5px 9px; border-radius: 999px; background: rgba(17,18,24,0.88); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1), 0 2px 8px rgba(0,0,0,0.12); color: #fff; font: 500 12.5px/1.3 -apple-system, "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; white-space: nowrap; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; animation: pop 120ms ease-out; }
+  .chip::before { content: ''; flex: none; width: 3px; height: 12px; border-radius: 2px; background: linear-gradient(var(--cyan), var(--accent)); }
+  .mark.left .chip { left: auto; right: 26px; }
+  @keyframes pop { from { transform: translateY(-50%) scale(0.92); } to { transform: translateY(-50%) scale(1); } }
+  /* a word with no place (typing, keys, a wait): the same pill where the last ring was */
+  .say { position: fixed; left: 0; top: 0; width: 0; height: 0; opacity: 0; transition: opacity 180ms ease; }
+  .say.shown { opacity: 1; }
+  .say.fade { opacity: 0; transition: opacity 250ms ease; }
+  /* the pair of ripples as the click lands */
+  .ripple { position: fixed; width: 24px; height: 24px; margin: -12px 0 0 -12px; border-radius: 50%; border: 2px solid var(--accent); opacity: 0; pointer-events: none; }
+  .ripple.go { animation: ripple 520ms ease-out forwards; }
+  .ripple.go.second { animation-delay: 110ms; }
+  @keyframes ripple { from { transform: scale(1); opacity: 0.8; } to { transform: scale(3.2); opacity: 0; } }
+  /* a drag: the dashed path, blue to cyan, and the arrowhead and landing ring at its end */
+  .trail { position: fixed; inset: 0; width: 100%; height: 100%; opacity: 0; transition: opacity 180ms ease; }
+  .trail.shown { opacity: 1; }
+  .trail.fade { opacity: 0; transition: opacity 600ms ease; }
+  .trail line { stroke: url(#trailGradient); stroke-width: 2.5; stroke-dasharray: 8 6; stroke-linecap: round; opacity: 0.7; }
+  .trail circle { fill: none; stroke: var(--cyan); stroke-width: 2; }
+  .trail polygon { fill: var(--cyan); }
+  @media (prefers-reduced-motion: reduce) {
+    .on .glow, .on .hair, .mark .arc, .mark.lock, .chip { animation: none; }
+    .ripple.go { animation: none; opacity: 0; }
+  }
+  /* Linux (X11) only: the one element that takes pointer events. A click-through window never
+     gets any, so one arriving here means the window's X11 input shape is gone and the shell
+     must set it again (src/glow.ts). Invisible, under everything else. */
+  .witness { position: fixed; inset: 0; pointer-events: none; background: transparent; z-index: -1; }
+  .x11 .witness { pointer-events: auto; }
+</style>
+</head>
+<body>
+  <div class="witness" id="witness"></div>
+  <div class="glow"><div class="band t"></div><div class="band b"></div><div class="band l"></div><div class="band r"></div></div>
+  <div class="hair"></div>
+  <svg class="trail" id="trail">
+    <defs><linearGradient id="trailGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="0"><stop offset="0" stop-color="#0a66e4" /><stop offset="1" stop-color="#06b6d4" /></linearGradient></defs>
+    <line id="trailLine" x1="0" y1="0" x2="0" y2="0" /><circle id="trailEnd" r="16" cx="0" cy="0" /><polygon id="trailHead" points="0,0 0,0 0,0" />
+  </svg>
+  <div class="ripple" id="ripple1"></div>
+  <div class="ripple second" id="ripple2"></div>
+  <div class="mark" id="mark">
+    <span class="halo"></span>
+    <svg class="arc" viewBox="0 0 34 34"><circle cx="17" cy="17" r="16" /></svg>
+    <span class="ring"></span>
+    <span class="dot"></span>
+    <span class="chip" id="markChip"></span>
+  </div>
+  <div class="say" id="say"><span class="chip" id="sayChip"></span></div>
+  <script>
+    const root = document.body
+    const mark = document.getElementById('mark')
+    const markChip = document.getElementById('markChip')
+    const say = document.getElementById('say')
+    const sayChip = document.getElementById('sayChip')
+    const trail = document.getElementById('trail')
+    const trailLine = document.getElementById('trailLine')
+    const trailEnd = document.getElementById('trailEnd')
+    const trailHead = document.getElementById('trailHead')
+    const trailGradient = document.getElementById('trailGradient')
+    const ripples = [document.getElementById('ripple1'), document.getElementById('ripple2')]
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const MARKER_MS = 1600
+    const SAY_MS = 2200
+    const SWEEP_MS = 420
+    const CLICKS = new Set(['click', 'double_click', 'right_click', 'middle_click', 'double click', 'right click', 'middle click', 'tap'])
+    let markerAt = 0
+    let markerTimer = 0
+    let sayTimer = 0
+    let sweep = null
+    // where the last ring was, as fractions: a word with no place goes there
+    let lastX = -1
+    let lastY = -1
+    const fraction = (v) => typeof v === 'number' && v >= 0 && v <= 1
+    const place = (el, fx, fy) => { el.style.left = `${fx * 100}%`; el.style.top = `${fy * 100}%` }
+    const restart = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls) }
+    const ripple = (fx, fy) => {
+      for (const r of ripples) { place(r, fx, fy); restart(r, 'go') }
+    }
+    const hideMarks = () => {
+      mark.classList.remove('shown', 'lock'); trail.classList.remove('shown'); say.classList.remove('shown')
+      if (sweep) { sweep.cancel(); sweep = null }
+    }
+    /** The ring locks on to a point with the action's name beside it. */
+    const aim = (fx, fy, text, click) => {
+      place(mark, fx, fy)
+      mark.classList.toggle('left', fx > 0.8)
+      markChip.textContent = text || ''
+      markChip.style.display = text ? '' : 'none'
+      mark.classList.remove('fade'); say.classList.remove('shown')
+      restart(mark, 'lock'); mark.classList.add('shown')
+      lastX = fx; lastY = fy
+      // the ripples as the click lands, a beat after the lock-on
+      if (click) setTimeout(() => ripple(fx, fy), reduced.matches ? 0 : 220)
+    }
+    /** A drag: the path, then the ring travels it and lands with the arrowhead. */
+    const drag = (fx, fy, fx2, fy2, text) => {
+      const w = window.innerWidth, h = window.innerHeight
+      const x1 = fx * w, y1 = fy * h, x2 = fx2 * w, y2 = fy2 * h
+      trailLine.setAttribute('x1', x1); trailLine.setAttribute('y1', y1); trailLine.setAttribute('x2', x2); trailLine.setAttribute('y2', y2)
+      trailGradient.setAttribute('x1', x1); trailGradient.setAttribute('y1', y1); trailGradient.setAttribute('x2', x2); trailGradient.setAttribute('y2', y2)
+      trailEnd.setAttribute('cx', x2); trailEnd.setAttribute('cy', y2)
+      const a = Math.atan2(y2 - y1, x2 - x1), s = 11, spread = 0.45
+      trailHead.setAttribute('points', `${x2},${y2} ${x2 - s * Math.cos(a - spread)},${y2 - s * Math.sin(a - spread)} ${x2 - s * Math.cos(a + spread)},${y2 - s * Math.sin(a + spread)}`)
+      trail.classList.remove('fade'); trail.classList.add('shown')
+      aim(fx, fy, text, false)
+      if (sweep) sweep.cancel()
+      if (reduced.matches) { place(mark, fx2, fy2); lastX = fx2; lastY = fy2; return }
+      sweep = mark.animate([{ left: `${fx * 100}%`, top: `${fy * 100}%` }, { left: `${fx2 * 100}%`, top: `${fy2 * 100}%` }], { duration: SWEEP_MS, delay: 220, easing: 'ease-in-out', fill: 'forwards' })
+      sweep.onfinish = () => { place(mark, fx2, fy2); lastX = fx2; lastY = fy2; ripple(fx2, fy2); sweep = null }
+    }
+    /** An action with no place on the screen: its name where the last ring was. */
+    const sayWord = (text) => {
+      if (!text) return
+      const fx = lastX >= 0 ? lastX : 0.5, fy = lastY >= 0 ? lastY : 0.42
+      place(say, fx, fy)
+      say.classList.toggle('left', fx > 0.8)
+      sayChip.textContent = text
+      mark.classList.add('fade'); trail.classList.add('fade')
+      say.classList.remove('fade'); restart(say, 'shown')
+      clearTimeout(sayTimer)
+      sayTimer = setTimeout(() => say.classList.add('fade'), SAY_MS)
+    }
+    // The shell sends {active, held, x, y, kind, text, marker} — x,y fractions of the frame from the
+    // web client (the hands' own point when the shell's operator is not the one acting), and marker
+    // {x, y, x2, y2, kind, text, at} from the operator itself: the exact point it acted on, in
+    // fractions of the display; x2,y2 the far end of a drag, else -1.
+    const showMarker = (m) => {
+      if (!m || m.at === markerAt) return
+      markerAt = m.at
+      const kind = String(m.kind || '')
+      const text = m.text || kind
+      if (fraction(m.x) && fraction(m.y)) {
+        if (kind === 'drag' && fraction(m.x2) && fraction(m.y2)) drag(m.x, m.y, m.x2, m.y2, text)
+        else { trail.classList.remove('shown'); aim(m.x, m.y, text, CLICKS.has(kind)) }
+      } else sayWord(text)
+      clearTimeout(markerTimer)
+      markerTimer = setTimeout(() => { mark.classList.add('fade'); trail.classList.add('fade') }, MARKER_MS + (kind === 'drag' ? SWEEP_MS + 220 : 0))
+    }
+    // the web client's point, when the operator has no marker of its own (another backend acted)
+    let clientAt = ''
+    const showClient = (s) => {
+      const key = `${s.kind}:${s.x}:${s.y}`
+      if (!fraction(s.x) || !fraction(s.y) || key === clientAt) return
+      clientAt = key
+      trail.classList.remove('shown')
+      aim(s.x, s.y, '', CLICKS.has(String(s.kind)))
+      clearTimeout(markerTimer)
+      markerTimer = setTimeout(() => mark.classList.add('fade'), MARKER_MS)
+    }
+    if (window.nanomuseGlow?.platform === 'linux') {
+      root.classList.add('x11')
+      let lastLeak = 0
+      const leak = (e) => {
+        // moves are thinned to one per 100 ms; a press or a wheel always goes through (never made up by Chromium)
+        const now = Date.now()
+        if (e.type !== 'pointerdown' && e.type !== 'wheel' && now - lastLeak < 100) return
+        lastLeak = now
+        window.nanomuseGlow.leak(e.clientX, e.clientY, e.type)
+      }
+      for (const type of ['pointerenter', 'pointermove', 'pointerdown', 'wheel']) document.getElementById('witness').addEventListener(type, leak, { passive: true })
+    }
+    window.nanomuseGlow?.onState((s) => {
+      root.classList.toggle('on', Boolean(s.active))
+      root.classList.toggle('held', Boolean(s.held))
+      if (!s.active) { hideMarks(); return }
+      if (s.marker) showMarker(s.marker)
+      else if (!markerAt || Date.now() - markerAt > MARKER_MS) showClient(s)
+    })
+  </script>
+</body>
+</html>

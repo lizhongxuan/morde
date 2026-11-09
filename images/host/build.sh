@@ -13,7 +13,7 @@ case "$image_platform" in
 esac
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd "$script_dir/../.." && pwd)"
-runtime_context="$project_dir/project/morde-runtime"
+runtime_context="$project_dir/runtime/morde-runtime"
 if [[ ! -f "$runtime_context/go.mod" || ! -f "$runtime_context/cmd/morde-runtime/main.go" ]]; then
     printf 'morde-runtime source is incomplete: %s\n' "$runtime_context" >&2
     exit 1

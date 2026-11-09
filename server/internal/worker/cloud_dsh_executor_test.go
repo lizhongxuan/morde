@@ -701,7 +701,7 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	script, err := filepath.Abs(filepath.Join("..", "..", "..", "project", "nanoMuse", "harness", "morde-cloud-runtime", "bin.mjs"))
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}

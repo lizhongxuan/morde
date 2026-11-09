@@ -68,6 +68,6 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace morde-runtime => ../project/morde-runtime
+replace morde-runtime => ../runtime/morde-runtime
 
-replace morde-sync => ../project/morde-sync
+replace morde-sync => ../runtime/morde-sync

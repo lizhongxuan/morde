@@ -4,7 +4,7 @@
 
 ## 构建与本地检查
 
-在 `project/nanoMuse/harness/morde-cloud-runtime/` 执行：
+在 `runtime/morde-cloud-runtime/` 执行：
 
 ```sh
 ./build.sh

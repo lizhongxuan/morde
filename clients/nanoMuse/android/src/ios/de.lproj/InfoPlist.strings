@@ -1,0 +1,26 @@
+/* Info.plist permission strings — Deutsch */
+
+"NSLocationWhenInUseUsageDescription" = "Morde verwendet Ihren Standort, um den Startort von Agent-Sitzungen in Ihrem Sitzungsverlauf aufzuzeichnen.";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Morde verwendet den Hintergrund-Standort, um Agent-Aufgaben im Hintergrund weiterlaufen zu lassen. Standortdaten werden nur zur Aufzeichnung des Sitzungsverlaufs verwendet.";
+"NSCalendarsUsageDescription" = "Morde greift auf den Kalender zu, damit der KI-Agent Ihren Terminplan einsehen, Verfügbarkeiten prüfen und Termine in Ihrem Namen erstellen kann.";
+"NSCalendarsFullAccessUsageDescription" = "Morde greift auf den Kalender zu, damit der KI-Agent Ihren Terminplan einsehen, Verfügbarkeiten prüfen und Termine in Ihrem Namen erstellen kann.";
+"NSRemindersUsageDescription" = "Morde greift auf Erinnerungen zu, damit der KI-Agent Erinnerungen in Ihrem Namen suchen und erstellen kann.";
+"NSRemindersFullAccessUsageDescription" = "Morde greift auf Erinnerungen zu, damit der KI-Agent Erinnerungen in Ihrem Namen suchen und erstellen kann.";
+"NSCameraUsageDescription" = "Morde benötigt Kamerazugriff, um Fotos für KI-Unterhaltungen aufzunehmen.";
+"NSPhotoLibraryUsageDescription" = "Morde benötigt Zugriff auf die Fotomediathek, um Bilder an KI-Unterhaltungen anzuhängen.";
+"NSPhotoLibraryAddUsageDescription" = "Morde benötigt die Berechtigung, Videos und Bilder in Ihrer Fotomediathek zu speichern.";
+"NSHealthShareUsageDescription" = "Morde greift auf HealthKit zu, damit der KI-Agent Gesundheitsdaten wie Schritte, Herzfrequenz, Schlaf und Workouts in Ihrem Namen lesen kann.";
+"NSHealthUpdateUsageDescription" = "Morde greift schreibend auf HealthKit zu, damit der KI-Agent Gesundheitsdaten wie Schritte, Gewicht und Wasseraufnahme in Ihrem Namen aufzeichnen kann.";
+"NSContactsUsageDescription" = "Morde greift auf Kontakte zu, damit der KI-Agent Ihre Kontakte in Ihrem Namen suchen, anzeigen und verwalten kann.";
+"NSAppleMusicUsageDescription" = "Morde greift auf die Mediathek zu, damit der KI-Agent Ihre Musikbibliothek durchsuchen und die Wiedergabe steuern kann.";
+"NSMicrophoneUsageDescription" = "Morde benötigt Mikrofonzugriff für die Spracheingabe im Chat.";
+"NSSpeechRecognitionUsageDescription" = "Morde verwendet Spracherkennung, um Ihre Stimme in Textnachrichten umzuwandeln.";
+"NSHomeKitUsageDescription" = "Morde greift auf HomeKit zu, damit der KI-Agent Ihre Smart-Home-Geräte in Ihrem Namen abfragen und steuern kann.";
+"NSAlarmKitUsageDescription" = "Morde verwendet AlarmKit, damit der KI-Agent Wecker und Timer in Ihrem Namen stellen kann.";
+"NSLocalNetworkUsageDescription" = "Morde nutzt das lokale Netzwerk für den Debug-Server und damit der KI-Agent Dienste in deinem eigenen Netzwerk erreichen kann."; /* Morde: the app has no VM; the sentence matches Info.plist */
+
+/* Morde: the keys Info.plist declares but this file lacked, so the prompt is in the person's language */
+"NFCReaderUsageDescription" = "Morde nutzt NFC, damit der KI-Agent in deinem Auftrag NFC-Tags lesen und beschreiben kann.";
+"NSBluetoothAlwaysUsageDescription" = "Morde nutzt Bluetooth, damit der KI-Agent in deinem Auftrag BLE-Geräte in der Nähe suchen, verbinden und mit ihnen kommunizieren kann.";
+"NSBluetoothPeripheralUsageDescription" = "Morde nutzt Bluetooth, damit der KI-Agent in deinem Auftrag BLE-Geräte in der Nähe suchen, verbinden und mit ihnen kommunizieren kann.";
+"NSFaceIDUsageDescription" = "Morde nutzt Face ID, um gesperrte Chat-Sitzungen zu schützen, damit nur du ihren Inhalt sehen kannst.";

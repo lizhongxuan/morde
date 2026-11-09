@@ -24,9 +24,9 @@ export function copyMordeMobileWeb(webDist, outputDir, legalDir) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
   copyMordeMobileWeb(
-    join(repoRoot, 'project/nanoMuse/web/dist'),
+    join(repoRoot, 'web/mobile/dist'),
     join(repoRoot, 'web/portal/dist/app'),
-    join(repoRoot, 'project/nanoMuse'),
+    join(repoRoot, 'clients/nanoMuse'),
   );
   process.stdout.write('Copied Morde mobile Web and legal notices to web/portal/dist/app\n');
 }

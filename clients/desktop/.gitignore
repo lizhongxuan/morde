@@ -1,0 +1,50 @@
+# Local configuration and credentials
+config/config.toml
+config/*.local.toml
+.env
+.env.*
+*.env
+!.env.example
+
+# Runtime data
+workspace/
+*.db
+*.enc
+*.key
+audit.jsonl
+sessions/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Desktop and DSH build output
+node_modules/
+*.tsbuildinfo
+harness/desktop/node_modules/
+harness/desktop/dist/
+harness/desktop/runtime/
+harness/desktop/bin/
+harness/dsh-nanomuse/node_modules/
+harness/dsh-nanomuse/lib/
+harness/dsh-nanomuse/.pnpm-store/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.jks
+*.keystore

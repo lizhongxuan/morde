@@ -1,0 +1,26 @@
+/* Info.plist permission strings — Russian */
+
+"NSLocationWhenInUseUsageDescription" = "Morde использует вашу геопозицию, чтобы записывать в истории сессий, где были начаты сессии агента.";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Morde использует геопозицию в фоновом режиме, чтобы задачи агента продолжали выполняться, когда приложение свёрнуто. Данные о местоположении используются только для записи истории подключений сессий.";
+"NSCalendarsUsageDescription" = "Morde использует доступ к календарю, чтобы ИИ-агент мог просматривать ваше расписание, проверять свободное время и создавать события от вашего имени.";
+"NSCalendarsFullAccessUsageDescription" = "Morde использует доступ к календарю, чтобы ИИ-агент мог просматривать ваше расписание, проверять свободное время и создавать события от вашего имени.";
+"NSRemindersUsageDescription" = "Morde использует доступ к напоминаниям, чтобы ИИ-агент мог просматривать и создавать их от вашего имени.";
+"NSRemindersFullAccessUsageDescription" = "Morde использует доступ к напоминаниям, чтобы ИИ-агент мог просматривать и создавать их от вашего имени.";
+"NSCameraUsageDescription" = "Morde требуется доступ к камере, чтобы делать снимки для диалогов с ИИ.";
+"NSPhotoLibraryUsageDescription" = "Morde требуется доступ к медиатеке, чтобы прикреплять изображения к диалогам с ИИ.";
+"NSPhotoLibraryAddUsageDescription" = "Morde требуется разрешение, чтобы сохранять видео и изображения в вашу медиатеку.";
+"NSHealthShareUsageDescription" = "Morde использует доступ к HealthKit, чтобы ИИ-агент мог читать ваши данные о здоровье — шаги, пульс, сон и тренировки — от вашего имени.";
+"NSHealthUpdateUsageDescription" = "Morde использует доступ к записи в HealthKit, чтобы ИИ-агент мог сохранять данные о здоровье — шаги, вес и потребление воды — от вашего имени.";
+"NSContactsUsageDescription" = "Morde использует доступ к контактам, чтобы ИИ-агент мог искать, просматривать и управлять ими от вашего имени.";
+"NSAppleMusicUsageDescription" = "Morde использует доступ к медиатеке, чтобы ИИ-агент мог искать музыку и управлять воспроизведением от вашего имени.";
+"NSMicrophoneUsageDescription" = "Morde требуется доступ к микрофону для голосового ввода текста в чате.";
+"NSSpeechRecognitionUsageDescription" = "Morde использует распознавание речи, чтобы преобразовывать вашу речь в текстовые сообщения.";
+"NSHomeKitUsageDescription" = "Morde использует доступ к HomeKit, чтобы ИИ-агент мог просматривать и управлять аксессуарами вашего умного дома от вашего имени.";
+"NSAlarmKitUsageDescription" = "Morde использует AlarmKit, чтобы ИИ-агент мог устанавливать будильники и таймеры от вашего имени.";
+"NSLocalNetworkUsageDescription" = "Morde использует локальную сеть для отладочного сервера и чтобы ИИ-агент мог обращаться к сервисам в вашей собственной сети."; /* Morde: the app has no VM; the sentence matches Info.plist */
+
+/* Morde: the keys Info.plist declares but this file lacked, so the prompt is in the person's language */
+"NFCReaderUsageDescription" = "Morde использует NFC, чтобы ИИ-агент мог читать и записывать NFC-метки от вашего имени.";
+"NSBluetoothAlwaysUsageDescription" = "Morde использует Bluetooth, чтобы ИИ-агент мог искать ближайшие BLE-устройства, подключаться к ним и обмениваться данными от вашего имени.";
+"NSBluetoothPeripheralUsageDescription" = "Morde использует Bluetooth, чтобы ИИ-агент мог искать ближайшие BLE-устройства, подключаться к ним и обмениваться данными от вашего имени.";
+"NSFaceIDUsageDescription" = "Morde использует Face ID для защиты заблокированных чатов, чтобы только вы могли видеть их содержимое.";

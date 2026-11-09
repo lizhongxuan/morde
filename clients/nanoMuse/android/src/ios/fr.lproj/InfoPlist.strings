@@ -1,0 +1,26 @@
+/* Info.plist permission strings — Français */
+
+"NSLocationWhenInUseUsageDescription" = "Morde utilise votre position pour enregistrer le lieu de démarrage des sessions de l'agent dans votre historique.";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Morde utilise la localisation en arrière-plan pour maintenir les tâches de l'agent en cours d'exécution. Les données de localisation servent uniquement à enregistrer l'historique des connexions.";
+"NSCalendarsUsageDescription" = "Morde accède au calendrier pour que l'agent AI puisse consulter votre emploi du temps, vérifier vos disponibilités et créer des événements en votre nom.";
+"NSCalendarsFullAccessUsageDescription" = "Morde accède au calendrier pour que l'agent AI puisse consulter votre emploi du temps, vérifier vos disponibilités et créer des événements en votre nom.";
+"NSRemindersUsageDescription" = "Morde accède aux rappels pour que l'agent AI puisse consulter et créer des rappels en votre nom.";
+"NSRemindersFullAccessUsageDescription" = "Morde accède aux rappels pour que l'agent AI puisse consulter et créer des rappels en votre nom.";
+"NSCameraUsageDescription" = "Morde a besoin de l'accès à l'appareil photo pour prendre des photos destinées aux conversations AI.";
+"NSPhotoLibraryUsageDescription" = "Morde a besoin de l'accès à la photothèque pour joindre des images aux conversations AI.";
+"NSPhotoLibraryAddUsageDescription" = "Morde a besoin de l'autorisation d'enregistrer des vidéos et images dans votre photothèque.";
+"NSHealthShareUsageDescription" = "Morde accède à HealthKit pour que l'agent AI puisse lire vos données de santé telles que les pas, la fréquence cardiaque, le sommeil et les entraînements.";
+"NSHealthUpdateUsageDescription" = "Morde accède en écriture à HealthKit pour que l'agent AI puisse enregistrer des données de santé telles que les pas, le poids et l'hydratation.";
+"NSContactsUsageDescription" = "Morde accède aux contacts pour que l'agent AI puisse rechercher, consulter et gérer vos contacts en votre nom.";
+"NSAppleMusicUsageDescription" = "Morde accède à la bibliothèque multimédia pour que l'agent AI puisse rechercher votre musique et contrôler la lecture.";
+"NSMicrophoneUsageDescription" = "Morde a besoin de l'accès au microphone pour la saisie vocale dans le chat.";
+"NSSpeechRecognitionUsageDescription" = "Morde utilise la reconnaissance vocale pour convertir votre voix en messages texte.";
+"NSHomeKitUsageDescription" = "Morde accède à HomeKit pour que l'agent AI puisse interroger et contrôler vos accessoires domotiques.";
+"NSAlarmKitUsageDescription" = "Morde utilise AlarmKit pour que l'agent AI puisse régler des alarmes et des minuteries en votre nom.";
+"NSLocalNetworkUsageDescription" = "Morde utilise le réseau local pour le serveur de débogage et pour que l'agent IA puisse joindre les services de votre propre réseau."; /* Morde: the app has no VM; the sentence matches Info.plist */
+
+/* Morde: the keys Info.plist declares but this file lacked, so the prompt is in the person's language */
+"NFCReaderUsageDescription" = "Morde utilise le NFC pour que l'agent IA puisse lire et écrire des tags NFC en votre nom.";
+"NSBluetoothAlwaysUsageDescription" = "Morde utilise le Bluetooth pour que l'agent IA puisse rechercher, connecter et communiquer avec des appareils BLE à proximité en votre nom.";
+"NSBluetoothPeripheralUsageDescription" = "Morde utilise le Bluetooth pour que l'agent IA puisse rechercher, connecter et communiquer avec des appareils BLE à proximité en votre nom.";
+"NSFaceIDUsageDescription" = "Morde utilise Face ID pour protéger les sessions de discussion verrouillées afin que vous seul puissiez en voir le contenu.";

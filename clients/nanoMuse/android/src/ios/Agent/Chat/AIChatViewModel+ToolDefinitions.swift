@@ -1,0 +1,145 @@
+import Foundation
+
+// MARK: - Tool Definitions (Canonical)
+
+extension AIChatViewModel {
+
+    /// [T-ios-vision-branch-mismatch #182] THE single source of truth for
+    /// "can the model that will actually receive this turn see images itself".
+    ///
+    /// Both the `read_image` registration (which picks the tool DESCRIPTION) and
+    /// its handler (which picks pixels-vs-Vision-Group) must agree, or the model
+    /// is told one thing and handed another. They previously each wrote
+    /// `selectedModel.capabilities.supportedModalities.contains(.imageInput)` —
+    /// textually identical, yet wrong: `selectedModel` is the @Published UI
+    /// property, while the REQUEST is built from `resolveCurrentEntry()` (see
+    /// `activeModel` in runAgentLoop). With group routing or a session binding
+    /// those are different models, so a text-only model could be registered with
+    /// the Vision Group tool description and then served by the native pixel
+    /// branch — returning metadata and no description at all.
+    ///
+    /// Resolve from the same entry the request uses, and fall back to
+    /// `selectedModel` only when that resolution fails.
+    var activeModelHasNativeVision: Bool {
+        let model = resolveCurrentEntry()?.model ?? selectedModel
+        return model.capabilities.supportedModalities.contains(.imageInput)
+    }
+
+    // MARK: - Tool Definitions (Canonical)
+
+    func makeAgentTools() -> [AgentToolDefinition] {
+        // [T-memory-toggle-gates-injection-and-tools-ios] memory_get and
+        // memory_write are conditionally registered. When the per-session
+        // toggle is off, drop both tool definitions so the LLM never sees
+        // them. The system prompt also switches to a "memory disabled"
+        // wording (see baseSystemPrompt below) so the model can correctly
+        // tell the user to re-enable memory via /memory or Settings.
+        let includeMemoryTools = memoryEnabled
+        var tools: [AgentToolDefinition] = [
+            AgentToolDefinition(
+                name: "browser_use",
+                description: "Control a web browser with up to 3 tabs. Do NOT use this tool for minis:// action URLs (open_terminal, views, settings) — those are app deep links, use Markdown links in chat instead. The browser supports both web URLs and minis:// resource URLs. Use minis:// URLs to preview session files (e.g. navigate to minis://workspace/index.html). Sub-resources (JS, CSS, images, fonts) referenced via minis:// absolute paths or relative paths within HTML pages resolve correctly. Use navigate to open URLs, screenshot to see the page (returns an image), click/type to interact with elements, get_text/get_readable to extract content, scroll to navigate long pages, scroll_and_collect to scroll through infinite-scroll/virtual-rendered pages (like Twitter/X timelines) and accumulate unique content items across scroll positions in a single call, find_elements to discover interactive elements, get_page_info for page metadata, get_backbone to get a structural overview of the page DOM as a simplified tree, fetch to download files/resources using the page's session (returns metadata and a minis:// URL), new_tab to open an additional tab, close_tab to close a tab, and list_tabs to see all open tabs. Use set_viewport with viewport_width + viewport_height to override the viewport for the current session (e.g. before screenshotting a 1920×1080 HTML composition that would otherwise be cropped to the phone viewport); pass reset=true to drop the session override and fall back to the global browser setting. Use get_cookies to retrieve cookies for the current page URL / current site root domain only (including HttpOnly cookies). get_cookies supports optional 'keyword' (filter by cookie name) and 'fuzzy' (true=contains match, false=exact match, default true). It returns only a summary and an app-local file path — raw cookie values are NOT included in the tool response. Use set_cookies to write cookies into the current page's cookie store via the native cookie store (so even HttpOnly cookies, which JS cannot set, land). Pass a 'cookies' array of objects, each with name + value (required) and optional domain (defaults to the current page host), path (defaults to '/'), secure, http_only, and expires (Unix timestamp in seconds; omit for a session cookie). Use wait_for_dom_stable to wait until the page DOM stops changing (useful after navigation or interactions that trigger async data loading — polls every 0.5s, resolves when mutation rate gradient is stable for 3+ intervals, default timeout 10s). Use tab_id to target a specific tab (defaults to the most recently used tab).",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Open Wikipedia homepage', 'Take screenshot of current page'). Use the same language as the user."),
+                    "action": AgentToolParam(type: .string, description: "The browser action to perform", enumValues: BrowserAction.allCases.map(\.rawValue)),
+                    "url": AgentToolParam(type: .string, description: "URL to navigate to (for navigate action) or resource to download (for fetch action)"),
+                    "selector": AgentToolParam(type: .string, description: "CSS selector for targeting elements (click, type, get_text, scroll, hover, find_elements). For scroll: specify a scrollable container to scroll (e.g. 'div.timeline'); if omitted, auto-detects the best scrollable element."),
+                    "text": AgentToolParam(type: .string, description: "Text to type (for type action)"),
+                    "coordinate_x": AgentToolParam(type: .integer, description: "X coordinate for click (alternative to selector)"),
+                    "coordinate_y": AgentToolParam(type: .integer, description: "Y coordinate for click (alternative to selector)"),
+                    "direction": AgentToolParam(type: .string, description: "Scroll direction", enumValues: ["up", "down"]),
+                    "amount": AgentToolParam(type: .integer, description: "Scroll amount in pixels (default: 500)"),
+                    "script": AgentToolParam(type: .string, description: "JavaScript code to execute (for execute_js action). The script runs inside an async function wrapper — `await` and top-level `return` are both supported (e.g. `var r = await fetch(url); return await r.json()`). DOM values may be returned directly — a DOMRect, Date, Error, element or NodeList is converted to plain JSON before it reaches you."),
+                    "user_agent": AgentToolParam(type: .string, description: "User agent profile to switch to", enumValues: ["desktop_safari", "mobile_safari"]),
+                    "max_depth": AgentToolParam(type: .integer, description: "Maximum tree depth for get_backbone (default: 5)"),
+                    "scroll_count": AgentToolParam(type: .integer, description: "Number of scroll steps for scroll_and_collect (default: 10, max: 20). Each step scrolls by 'amount' pixels and waits for new content."),
+                    "item_selector": AgentToolParam(type: .string, description: "CSS selector for individual content items in scroll_and_collect (e.g. 'article', '[data-testid=\"tweet\"]'). If omitted, auto-detects repeated elements."),
+                    "tab_id": AgentToolParam(type: .integer, description: "Target tab ID (optional, defaults to most recently used tab). Use list_tabs to see available tabs."),
+                    "keywords": AgentToolParam(type: .string, description: "Filter cookies by name (for get_cookies). A space-separated string or array of strings. With fuzzy=true (default), ALL keywords must appear in the cookie name (case-insensitive). With fuzzy=false, cookie name must exactly equal any one of the provided keywords (case-insensitive). Omit to return all cookies for the current site."),
+                    "fuzzy": AgentToolParam(type: .boolean, description: "Whether keyword matching is fuzzy (contains-all) or exact-any (for get_cookies, default: true)."),
+                    "cookies": AgentToolParam(type: .string, description: "For set_cookies: a JSON array of cookie objects to write. Pass it as a JSON array (a JSON-encoded string of the array is also accepted). Each object: {\"name\": str (required), \"value\": str (required), \"domain\": str (optional, defaults to current page host), \"path\": str (optional, defaults to \"/\"), \"secure\": bool (optional), \"http_only\": bool (optional — sets an HttpOnly cookie that JS cannot read/set), \"expires\": int (optional, Unix timestamp in seconds; omit for a session cookie)}. Field-name variants from common cookie exports are accepted: httpOnly (=http_only), expirationDate (=expires), sameSite, and case/camel variants — so you can paste cookies verbatim from browser extensions (EditThisCookie / Cookie-Editor) or Playwright/Puppeteer storage."),
+                    "timeout": AgentToolParam(type: .integer, description: "Timeout in seconds for wait_for_dom_stable (default: 10). The action polls every 0.5s and resolves when DOM mutation rate stabilizes."),
+                    "viewport_width": AgentToolParam(type: .integer, description: "Viewport width in CSS pixels for set_viewport (e.g. 1920). Required together with viewport_height unless reset=true."),
+                    "viewport_height": AgentToolParam(type: .integer, description: "Viewport height in CSS pixels for set_viewport (e.g. 1080). Required together with viewport_width unless reset=true."),
+                    "reset": AgentToolParam(type: .boolean, description: "For set_viewport: when true, clear the session-level viewport override and fall back to the global browser setting."),
+                    "full_page": AgentToolParam(type: .boolean, description: "For screenshot: capture the entire scrollable page by temporarily resizing the WebView to document.documentElement.scrollHeight. Default false captures viewport only. Capped at 32768px tall; when capped, result text includes 'Truncated: true' and the original height."),
+                ],
+                required: ["tool_title", "action"],
+                propertyOrdering: ["tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "full_page"]
+            ),
+        ]
+
+        if includeMemoryTools {
+            tools.append(AgentToolDefinition(
+                name: "memory_write",
+                description: "Write a memory entry to today's daily log (YYYY-MM-DD.md). Memories persist across all sessions. Each entry is prepended with a timestamp. Save: user preferences, recurring patterns, key facts, project conventions, reusable knowledge. Avoid saving passwords, API keys, tokens, or secrets unless the user explicitly confirms after being warned. Keep entries concise and general-purpose. GLOBAL.md is read-only (user-maintained via Settings).",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Save user preference for Python', 'Note today's project context'). Use the same language as the user."),
+                    "content": AgentToolParam(type: .string, description: "The memory content to write. Use concise Markdown with a short heading (## Topic) and context about what was done/learned."),
+                ],
+                required: ["tool_title", "content"],
+                propertyOrdering: ["tool_title", "content"]
+            ))
+            tools.append(AgentToolDefinition(
+                name: "memory_get",
+                description: "Retrieve memories from persistent storage. Supports keyword-based fuzzy search across memory files. Returns matching lines with surrounding context. Use this to recall previous knowledge, user preferences, or past notes.",
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'Recall user preferences', 'Search past notes'). Use the same language as the user."),
+                    "scope": AgentToolParam(type: .string, description: "Memory scope to search: 'daily' for daily logs only, 'all' for daily logs + GLOBAL.md.", enumValues: ["daily", "all"]),
+                    "keywords": AgentToolParam(type: .string, description: "Space-separated keywords for fuzzy matching (e.g. 'python preference' or 'API key setup'). All keywords must appear in a line or its surrounding context for a match. Leave empty to return full memory files."),
+                ],
+                required: ["tool_title"],
+                propertyOrdering: ["tool_title", "scope", "keywords"]
+            ))
+        }
+
+        // [T-ios-vision-group #182] Expose read_image when the model can see
+        // images ITSELF, or when a Vision Group is configured to see them on its
+        // behalf. Previously a text-only model simply never got this tool, so an
+        // image on disk was invisible to it with no recourse. The handler picks
+        // the matching branch: native models get pixels, others get the Vision
+        // Group's description as text.
+        //
+        // `isConfigured` is strict (group must resolve AND hold a usable
+        // image-capable member), so we never advertise a tool whose non-native
+        // path has nothing behind it.
+        let nativeVision = activeModelHasNativeVision
+        // Evaluate FIRST, not inside the `||` below: short-circuiting on
+        // `nativeVision` would skip the call, and this read is also what keeps
+        // `isConfiguredCached` — which the off-main T264 placeholder builder
+        // relies on — up to date.
+        let visionGroupConfigured = VisionGroupResolver.isConfigured
+        if nativeVision || visionGroupConfigured {
+            // Describe what this model will ACTUALLY receive. Promising "the
+            // image is returned directly" to a text-only model would set up a
+            // false expectation and invite it to re-call the tool when no pixels
+            // arrive; the non-native branch returns a written description instead.
+            let readImageDescription = nativeVision
+                ? "Read an image file from the Linux filesystem and return it for visual analysis. Supports PNG, JPEG, GIF, WEBP, and other common image formats. Use this to inspect generated charts, downloaded images, screenshots, or any visual output. The image is returned directly for your analysis along with metadata (dimensions, file size)."
+                : "Read an image file from the Linux filesystem and return a written description of it. Supports PNG, JPEG, GIF, WEBP, and other common image formats. Use this to inspect generated charts, downloaded images, screenshots, user-attached photos, or any visual output. You cannot see images directly, so the image is analyzed by a separate vision model and you receive its detailed description plus a transcription of any visible text, along with metadata (dimensions, file size). Because you cannot look again yourself, use the optional 'prompt' argument to ask for exactly what you need from the image — that is your only way to follow up on specific details."
+            // [T-ios-vision-group-t264 #182] The `prompt` argument is what makes
+            // the non-native branch usable for anything but a generic caption:
+            // the host model can't look at the image, so this is its only lever
+            // for directing the describing model. On the native branch the model
+            // sees the pixels itself, so the argument is documented as optional
+            // context rather than a question.
+            let promptDescription = nativeVision
+                ? "Optional. A note about what you are looking for in the image. Recorded alongside the result; the image itself is returned to you in full either way."
+                : "Optional. A specific question or instruction about the image, e.g. 'transcribe the table', 'what error message is shown in this screenshot', 'describe the people and their expressions'. This is passed to the vision model that reads the image for you, so ask for exactly the detail you need. If omitted, a generic detailed description with full text transcription is returned."
+            tools.append(AgentToolDefinition(
+                name: "read_image",
+                description: readImageDescription,
+                parameters: [
+                    "tool_title": AgentToolParam(type: .string, description: "A concise 5-10 word summary of what this tool call does, shown to the user (e.g. 'View generated bar chart', 'Inspect downloaded screenshot'). Use the same language as the user."),
+                    "path": AgentToolParam(type: .string, description: "Linux path (e.g. /var/minis/attachments/chart.png) or minis:// URL (e.g. minis://attachments/chart.png)"),
+                    "prompt": AgentToolParam(type: .string, description: promptDescription),
+                ],
+                required: ["tool_title", "path"],
+                propertyOrdering: ["tool_title", "path", "prompt"]
+            ))
+        }
+
+        return tools
+    }
+
+}

@@ -1,0 +1,113 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { intlLocale, setLocaleSetting } from "./i18n";
+import { cx, fileKind, relativeSeconds, relativeTime, safeDecodeURIComponent, timeShort, truncate } from "./util";
+
+describe("relativeTime", () => {
+  beforeEach(() => {
+    // the words are the app language's; a developer's machine set to Chinese must not change them
+    setLocaleSetting("en");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-22T12:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("reads the past", () => {
+    expect(relativeTime("2026-09-22T11:59:50Z")).toBe("just now");
+    expect(relativeTime("2026-09-22T11:57:00Z")).toBe("3 min ago");
+    expect(relativeTime("2026-09-22T09:00:00Z")).toBe("3 h ago");
+    expect(relativeTime("2026-09-13T12:00:00Z")).toBe("9 d ago");
+  });
+
+  it("reads the future", () => {
+    expect(relativeTime("2026-09-22T12:00:20Z")).toBe("any moment");
+    expect(relativeTime("2026-09-22T14:00:00Z")).toBe("in 2 h");
+    expect(relativeTime("2026-10-01T12:00:00Z")).toBe("in 9 d");
+  });
+
+  it("speaks the app language", () => {
+    setLocaleSetting("zh-CN");
+    try {
+      expect(relativeTime("2026-09-22T11:57:00Z")).toBe("3 分钟前");
+      expect(relativeTime("2026-09-22T14:00:00Z")).toBe("2 小时后");
+    } finally {
+      setLocaleSetting("en");
+    }
+  });
+
+  it("is empty for nothing and for garbage", () => {
+    expect(relativeTime(null)).toBe("");
+    expect(relativeTime(undefined)).toBe("");
+    expect(relativeTime("not a date")).toBe("");
+  });
+});
+
+describe("timeShort", () => {
+  it("shows only the time for today and adds the day otherwise", () => {
+    const today = new Date();
+    today.setHours(9, 5, 0, 0);
+    // the clock follows the app language, not the machine's locale
+    const clock = today.toLocaleTimeString(intlLocale(), { hour: "2-digit", minute: "2-digit" });
+    expect(timeShort(today.toISOString())).toBe(clock);
+    // locale-agnostic: an older date carries a day part in front of the clock
+    const old = timeShort("2020-01-15T09:05:00Z");
+    expect(old.length).toBeGreaterThan(clock.length);
+    expect(old).toMatch(/15|14/);
+    expect(timeShort(undefined)).toBe("");
+    expect(timeShort("nope")).toBe("");
+  });
+});
+
+describe("cx and truncate", () => {
+  it("joins the truthy classes", () => {
+    expect(cx("a", false, null, undefined, "b")).toBe("a b");
+  });
+  it("truncates with an ellipsis inside the budget", () => {
+    expect(truncate("hello", 10)).toBe("hello");
+    expect(truncate("hello world", 6)).toBe("hello…");
+    expect(truncate("hello world", 6)).toHaveLength(6);
+  });
+});
+
+describe("fileKind", () => {
+  it("classifies by extension, case-insensitively", () => {
+    expect(fileKind("notes.md")).toBe("text");
+    expect(fileKind("script.PY")).toBe("code");
+    expect(fileKind("itinerary.html")).toBe("html");
+    expect(fileKind("photo.JPEG")).toBe("image");
+    expect(fileKind("report.pdf")).toBe("pdf");
+    expect(fileKind("budget.csv")).toBe("data");
+    expect(fileKind("2026-09-24-1-1.ics")).toBe("event");
+    expect(fileKind("archive.zip")).toBe("other");
+    expect(fileKind("Makefile")).toBe("other");
+  });
+});
+
+describe("safeDecodeURIComponent", () => {
+  it("decodes a well-formed link and leaves a malformed one alone", () => {
+    expect(safeDecodeURIComponent("notes/%E4%BA%AC%E9%83%BD.md")).toBe("notes/京都.md");
+    expect(safeDecodeURIComponent("100%25")).toBe("100%");
+    // a stray "%" from a model's reply must not throw and take the bubble down with it
+    expect(safeDecodeURIComponent("save 100% of it")).toBe("save 100% of it");
+    expect(safeDecodeURIComponent("%E4%BA")).toBe("%E4%BA");
+  });
+});
+
+describe("relativeSeconds", () => {
+  beforeEach(() => {
+    setLocaleSetting("en");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-22T12:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("reads a Unix timestamp, the past only", () => {
+    const now = Math.floor(Date.UTC(2026, 8, 22, 12) / 1000);
+    expect(relativeSeconds(now - 10)).toBe("just now");
+    expect(relativeSeconds(now + 100)).toBe("just now");
+    expect(relativeSeconds(now - 3 * 60)).toBe("3 min ago");
+    expect(relativeSeconds(now - 5 * 3600)).toBe("5 h ago");
+    expect(relativeSeconds(now - 2 * 86400)).toBe("2 d ago");
+    // a week or more is the date itself
+    expect(relativeSeconds(now - 9 * 86400)).toMatch(/2026/);
+  });
+});

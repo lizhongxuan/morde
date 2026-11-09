@@ -1,0 +1,41 @@
+{
+  "configurations": [
+    {
+      "id": "64E81043-01FE-4B36-9AC7-07E25A03821D",
+      "name": "Local Portal long message recovery",
+      "options": {
+        "environmentVariableEntries": [
+          {
+            "key": "MORDE_IOS_LOCAL_PORTAL_SERVER",
+            "value": "http://127.0.0.1:63842",
+            "isEnabled": true
+          },
+          {
+            "key": "MORDE_IOS_LOCAL_PORTAL_USER",
+            "value": "user-uud8teur",
+            "isEnabled": true
+          },
+          {
+            "key": "MORDE_IOS_LOCAL_PORTAL_PASSWORD",
+            "value": "client-password-123",
+            "isEnabled": true
+          }
+        ]
+      }
+    }
+  ],
+  "defaultOptions": {
+    "codeCoverage": false
+  },
+  "testTargets": [
+    {
+      "parallelizable": false,
+      "target": {
+        "containerPath": "container:Minis.xcodeproj",
+        "identifier": "AA8A568A2F6FBB7A00A3E54E",
+        "name": "MinisUITests"
+      }
+    }
+  ],
+  "version": 1
+}

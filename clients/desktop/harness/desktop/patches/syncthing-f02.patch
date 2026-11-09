@@ -1,0 +1,2079 @@
+diff --git a/lib/api/api.go b/lib/api/api.go
+index f48427741..0353b6bf8 100644
+--- a/lib/api/api.go
++++ b/lib/api/api.go
+@@ -954,11 +954,22 @@ func (s *service) getDBFile(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	sendJSON(w, map[string]any{
++	result := map[string]any{
+ 		"global":       jsonFileInfo(gf),
+ 		"local":        jsonFileInfo(lf),
+ 		"availability": av,
+-	})
++	}
++	if policy, ok := s.model.(interface {
++		MordeFileTooLarge(folder, name string) (bool, error)
++	}); ok {
++		blocked, err := policy.MordeFileTooLarge(folder, file)
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusInternalServerError)
++			return
++		}
++		result["mordeFileTooLarge"] = blocked
++	}
++	sendJSON(w, result)
+ }
+ 
+ func (s *service) getDebugFile(w http.ResponseWriter, r *http.Request) {
+diff --git a/lib/config/folderconfiguration.go b/lib/config/folderconfiguration.go
+index a08a7ea48..1928398f0 100644
+--- a/lib/config/folderconfiguration.go
++++ b/lib/config/folderconfiguration.go
+@@ -87,6 +87,9 @@ type FolderConfiguration struct {
+ 	SyncXattrs              bool                        `json:"syncXattrs" xml:"syncXattrs"`
+ 	SendXattrs              bool                        `json:"sendXattrs" xml:"sendXattrs"`
+ 	BlockIndexing           bool                        `json:"blockIndexing" xml:"blockIndexing" default:"true"`
++	MordeMaxSingleFileBytes int64                       `json:"mordeMaxSingleFileBytes" xml:"mordeMaxSingleFileBytes"`
++	MordeQuotaSocket        string                      `json:"mordeQuotaSocket" xml:"mordeQuotaSocket,omitempty" restart:"true"`
++	MordeWorkspaceID        string                      `json:"mordeWorkspaceId" xml:"mordeWorkspaceId,omitempty" restart:"true"`
+ 	XattrFilter             XattrFilter                 `json:"xattrFilter" xml:"xattrFilter"`
+ 	// Legacy deprecated
+ 	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.
+@@ -211,9 +214,18 @@ func (f *FolderConfiguration) markerContents() []byte {
+ 
+ // CheckPath returns nil if the folder root exists and contains the marker file
+ func (f *FolderConfiguration) CheckPath() error {
++	if (f.MordeQuotaSocket == "") != (f.MordeWorkspaceID == "") || f.MordeQuotaSocket != "" &&
++		(!filepath.IsAbs(f.MordeQuotaSocket) || filepath.Clean(f.MordeQuotaSocket) != f.MordeQuotaSocket || strings.ContainsAny(f.MordeQuotaSocket, "\x00\r\n") ||
++			strings.TrimSpace(f.MordeWorkspaceID) != f.MordeWorkspaceID || strings.ContainsAny(f.MordeWorkspaceID, "/\\\x00\r\n") || !validMordeQuotaFolderID(f.ID)) {
++		return errors.New("Morde quota socket and Workspace ID must be set together with an absolute socket path")
++	}
+ 	return f.checkFilesystemPath(f.Filesystem(), ".")
+ }
+ 
++func validMordeQuotaFolderID(value string) bool {
++	return len(value) == 38 && strings.HasPrefix(value, "morde-") && strings.Trim(value[6:], "0123456789abcdef") == ""
++}
++
+ func (f *FolderConfiguration) checkFilesystemPath(ffs fs.Filesystem, path string) error {
+ 	fi, err := ffs.Stat(path)
+ 	if err != nil {
+diff --git a/lib/model/folder.go b/lib/model/folder.go
+index b3ce1321c..906755674 100644
+--- a/lib/model/folder.go
++++ b/lib/model/folder.go
+@@ -681,23 +681,24 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
+ 	defer scanCancel()
+ 
+ 	scanConfig := scanner.Config{
+-		Folder:                f.ID,
+-		Subs:                  subDirs,
+-		Matcher:               f.ignores,
+-		TempLifetime:          time.Duration(f.model.cfg.Options().KeepTemporariesH) * time.Hour,
+-		CurrentFiler:          cFiler{db: f.db, folder: f.folderID},
+-		Filesystem:            f.mtimefs,
+-		IgnorePerms:           f.IgnorePerms,
+-		AutoNormalize:         f.AutoNormalize,
+-		Hashers:               f.model.numHashers(f.ID),
+-		ShortID:               f.shortID,
+-		ProgressTickIntervalS: f.ScanProgressIntervalS,
+-		LocalFlags:            f.localFlags,
+-		ModTimeWindow:         f.modTimeWindow,
+-		EventLogger:           f.evLogger,
+-		ScanOwnership:         f.SendOwnership || f.SyncOwnership,
+-		ScanXattrs:            f.SendXattrs || f.SyncXattrs,
+-		XattrFilter:           f.XattrFilter,
++		Folder:                  f.ID,
++		Subs:                    subDirs,
++		Matcher:                 f.ignores,
++		TempLifetime:            time.Duration(f.model.cfg.Options().KeepTemporariesH) * time.Hour,
++		CurrentFiler:            cFiler{db: f.db, folder: f.folderID},
++		Filesystem:              f.mtimefs,
++		IgnorePerms:             f.IgnorePerms,
++		AutoNormalize:           f.AutoNormalize,
++		Hashers:                 f.model.numHashers(f.ID),
++		ShortID:                 f.shortID,
++		ProgressTickIntervalS:   f.ScanProgressIntervalS,
++		LocalFlags:              f.localFlags,
++		ModTimeWindow:           f.modTimeWindow,
++		EventLogger:             f.evLogger,
++		ScanOwnership:           f.SendOwnership || f.SyncOwnership,
++		ScanXattrs:              f.SendXattrs || f.SyncXattrs,
++		XattrFilter:             f.XattrFilter,
++		MordeMaxSingleFileBytes: f.MordeMaxSingleFileBytes,
+ 	}
+ 	var fchan chan scanner.ScanResult
+ 	if f.Type == config.FolderTypeReceiveEncrypted {
+diff --git a/lib/model/folder_sendrecv.go b/lib/model/folder_sendrecv.go
+index 9902dc572..53b8e8d7c 100644
+--- a/lib/model/folder_sendrecv.go
++++ b/lib/model/folder_sendrecv.go
+@@ -130,6 +130,8 @@ type sendReceiveFolder struct {
+ 	queue              *jobQueue
+ 	blockPullReorderer blockPullReorderer
+ 	writeLimiter       *semaphore.Semaphore
++	mordeQuotaClient   *mordeQuotaClient
++	mordeQuotaSerial   mordeQuotaSerial
+ 
+ 	tempPullErrors map[string]string // pull errors that might be just transient
+ }
+@@ -140,6 +142,7 @@ func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.Fold
+ 		queue:              newJobQueue(),
+ 		blockPullReorderer: newBlockPullReorderer(cfg.BlockPullOrder, model.id, cfg.DeviceIDs()),
+ 		writeLimiter:       semaphore.New(cfg.MaxConcurrentWrites),
++		mordeQuotaClient:   newMordeQuotaClient(cfg.MordeQuotaSocket, cfg.MordeWorkspaceID, cfg.ID),
+ 	}
+ 	f.puller = f
+ 
+@@ -332,6 +335,10 @@ loop:
+ 			break loop
+ 		default:
+ 		}
++		if f.MordeMaxSingleFileBytes > 0 && !file.IsDeleted() && file.Type == protocol.FileInfoTypeFile && file.Size > f.MordeMaxSingleFileBytes {
++			f.newPullError(file.Name, errMordeFileTooLarge)
++			continue
++		}
+ 
+ 		if f.IgnoreDelete && file.IsDeleted() {
+ 			f.sl.DebugContext(ctx, "Ignoring file deletion per config", slogutil.FilePath(file.FileName()))
+@@ -399,6 +406,11 @@ loop:
+ 				f.queue.Push(file.Name, file.Size, file.ModTime())
+ 			}
+ 
++		case f.mordeManaged() && file.IsSymlink():
++			file.SetUnsupported()
++			f.newPullError(file.Name, errMordeSymlinkExcluded)
++			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
++
+ 		case (build.IsWindows || build.IsAndroid) && file.IsSymlink():
+ 			if err := f.handleSymlinkCheckExisting(file, scanChan); err != nil {
+ 				f.newPullError(file.Name, fmt.Errorf("handling unsupported symlink: %w", err))
+@@ -508,6 +520,7 @@ nextFile:
+ 
+ 		if err := f.handleFile(ctx, fi, copyChan); err != nil {
+ 			f.newPullError(fileName, err)
++			f.queue.Done(fileName)
+ 		}
+ 	}
+ 
+@@ -554,6 +567,9 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 	// Used in the defer closure below, updated by the function body. Take
+ 	// care not declare another err.
+ 	var err error
++	var quotaRelease func(mordeQuotaOutcome)
++	var quotaReservationID string
++	quotaSettled := false
+ 
+ 	f.evLogger.Log(events.ItemStarted, map[string]string{
+ 		"folder": f.folderID,
+@@ -572,6 +588,30 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 			"action": "update",
+ 		})
+ 	}()
++	defer func() {
++		if quotaRelease == nil {
++			return
++		}
++		switch {
++		case quotaSettled:
++			quotaRelease(mordeQuotaComplete)
++		case errors.Is(err, errMordeQuotaResultUnknown):
++			quotaRelease(mordeQuotaUnknown)
++		case errors.Is(err, errMordeQuotaAborted):
++			quotaRelease(mordeQuotaAbortedOutcome)
++		default:
++			quotaCtx, cancel := mordeQuotaContext()
++			outcome, abortErr := f.mordeQuotaClient.abort(quotaCtx, quotaReservationID)
++			cancel()
++			if abortErr != nil {
++				err = errors.Join(err, fmt.Errorf("Morde quota reservation remains active: %w", abortErr))
++				quotaRelease(mordeQuotaUnknown)
++				f.newPullError(file.Name, err)
++			} else {
++				quotaRelease(outcome)
++			}
++		}
++	}()
+ 
+ 	mode := fs.FileMode(file.Permissions & 0o777)
+ 	if f.IgnorePerms || file.NoPermissions {
+@@ -594,13 +634,23 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 			f.newPullError(file.Name, fmt.Errorf("handling dir: %w", err))
+ 			return
+ 		}
+-		if err := f.scanIfItemChanged(file.Name, info, curFile, hasCurFile, false, scanChan); err != nil {
+-			f.newPullError(file.Name, fmt.Errorf("handling dir: %w", err))
+-			return
++		if !(f.MordeMaxSingleFileBytes > 0 && info.IsRegular() && info.Size() > f.MordeMaxSingleFileBytes) {
++			if err := f.scanIfItemChanged(file.Name, info, curFile, hasCurFile, false, scanChan); err != nil {
++				f.newPullError(file.Name, fmt.Errorf("handling dir: %w", err))
++				return
++			}
+ 		}
+ 
+-		// Remove it to replace with the dir.
+-		if !curFile.IsSymlink() && file.InConflictWith(curFile) {
++		if f.mordeManaged() {
++			if f.mordeQuotaClient != nil {
++				quotaRelease, quotaReservationID, err = f.reserveMordeFile(context.Background(), curFile, "delete", 0)
++				if err != nil {
++					f.newPullError(file.Name, fmt.Errorf("reserve Workspace deletion: %w", err))
++					return
++				}
++			}
++			_, err = f.mordePreserveFile(file.Name)
++		} else if !curFile.IsSymlink() && file.InConflictWith(curFile) {
+ 			// The new file has been changed in conflict with the existing one. We
+ 			// should file it away as a conflict instead of just removing or
+ 			// archiving.
+@@ -613,13 +663,28 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 			err = f.deleteItemOnDisk(curFile, scanChan)
+ 		}
+ 		if err != nil {
+-			f.newPullError(file.Name, err)
++			f.newPullError(file.Name, fmt.Errorf("handling dir: %w", err))
+ 			return
+ 		}
+ 		fallthrough
+ 	// The directory doesn't exist, so we create it with the right
+ 	// mode bits from the start.
+ 	case err != nil && fs.IsNotExist(err):
++		if f.mordeQuotaClient != nil && quotaRelease == nil {
++			curFile, hasCurFile, getErr := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
++			if getErr != nil {
++				err = getErr
++				f.newPullError(file.Name, fmt.Errorf("handling dir: %w", err))
++				return
++			}
++			if hasCurFile && !curFile.IsDeleted() && !curFile.IsDirectory() {
++				quotaRelease, quotaReservationID, err = f.reserveMordeFile(context.Background(), curFile, "delete", 0)
++				if err != nil {
++					f.newPullError(file.Name, fmt.Errorf("reserve Workspace deletion: %w", err))
++					return
++				}
++			}
++		}
+ 		// We declare a function that acts on only the path name, so
+ 		// we can pass it to InWritableDir. We use a regular Mkdir and
+ 		// not MkdirAll because the parent should already exist.
+@@ -650,11 +715,34 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 		}
+ 
+ 		if err = f.inWritableDir(mkdir, file.Name); err == nil {
++			if quotaRelease != nil {
++				if err = f.settleMordeQuota(quotaReservationID); err != nil {
++					f.newPullError(file.Name, fmt.Errorf("settle Workspace deletion: %w", err))
++					return
++				}
++				quotaSettled = true
++			}
+ 			dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleDir}
+ 		} else {
+ 			f.newPullError(file.Name, fmt.Errorf("creating directory: %w", err))
+ 		}
+ 		return
++	case err == nil && info.IsDir():
++		if f.mordeQuotaClient != nil {
++			curFile, hasCurFile, getErr := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
++			if getErr != nil {
++				err = getErr
++				f.newPullError(file.Name, fmt.Errorf("handling dir: %w", err))
++				return
++			}
++			if hasCurFile && !curFile.IsDeleted() && !curFile.IsDirectory() {
++				quotaRelease, quotaReservationID, err = f.reserveMordeFile(context.Background(), curFile, "delete", 0)
++				if err != nil {
++					f.newPullError(file.Name, fmt.Errorf("reserve Workspace deletion: %w", err))
++					return
++				}
++			}
++		}
+ 	// Weird error when stat()'ing the dir. Probably won't work to do
+ 	// anything else with it if we can't even stat() it.
+ 	case err != nil:
+@@ -666,15 +754,22 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 	// don't handle modification times on directories, because that sucks...)
+ 	// It's OK to change mode bits on stuff within non-writable directories.
+ 	if !f.IgnorePerms && !file.NoPermissions {
+-		if err := f.mtimefs.Chmod(file.Name, mode|(info.Mode()&retainBits)); err != nil {
++		if err = f.mtimefs.Chmod(file.Name, mode|(info.Mode()&retainBits)); err != nil {
+ 			f.newPullError(file.Name, fmt.Errorf("handling dir (setting permissions): %w", err))
+ 			return
+ 		}
+ 	}
+-	if err := f.setPlatformData(&file, file.Name); err != nil {
++	if err = f.setPlatformData(&file, file.Name); err != nil {
+ 		f.newPullError(file.Name, fmt.Errorf("handling dir (setting metadata): %w", err))
+ 		return
+ 	}
++	if quotaRelease != nil {
++		if err = f.settleMordeQuota(quotaReservationID); err != nil {
++			f.newPullError(file.Name, fmt.Errorf("settle Workspace deletion: %w", err))
++			return
++		}
++		quotaSettled = true
++	}
+ 	dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleDir}
+ }
+ 
+@@ -903,6 +998,9 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
+ 	// Used in the defer closure below, updated by the function body. Take
+ 	// care not declare another err.
+ 	var err error
++	var quotaRelease func(mordeQuotaOutcome)
++	var quotaReservationID string
++	quotaSettled := false
+ 
+ 	f.sl.Debug("Deleting file or symlink", slogutil.FilePath(file.Name))
+ 
+@@ -932,23 +1030,108 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
+ 			"action": "delete",
+ 		})
+ 	}()
++	if f.mordeQuotaClient != nil && !file.IsDirectory() {
++		quotaCtx, cancel := mordeQuotaContext()
++		quotaRelease, quotaReservationID, err = f.reserveMordeFile(quotaCtx, file, "delete", 0)
++		cancel()
++		if err != nil {
++			f.newPullError(file.Name, fmt.Errorf("reserve Workspace deletion: %w", err))
++			return
++		}
++	}
++	if quotaRelease != nil {
++		defer func() {
++			switch {
++			case quotaSettled:
++				quotaRelease(mordeQuotaComplete)
++			case errors.Is(err, errMordeQuotaResultUnknown):
++				quotaRelease(mordeQuotaUnknown)
++			case errors.Is(err, errMordeQuotaAborted):
++				quotaRelease(mordeQuotaAbortedOutcome)
++			default:
++				quotaCtx, cancel := mordeQuotaContext()
++				outcome, abortErr := f.mordeQuotaClient.abort(quotaCtx, quotaReservationID)
++				cancel()
++				if abortErr != nil {
++					err = errors.Join(err, fmt.Errorf("Morde quota reservation remains active: %w", abortErr))
++					quotaRelease(mordeQuotaUnknown)
++				} else {
++					quotaRelease(outcome)
++				}
++			}
++		}()
++	}
+ 
+ 	if err = f.checkToBeDeleted(file, cur, hasCur, scanChan); err != nil {
+ 		if fs.IsNotExist(err) || fs.IsErrCaseConflict(err) {
++			if quotaRelease != nil {
++				if fs.IsNotExist(err) {
++					if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(file.Name)); err != nil {
++						return
++					}
++					if _, statErr := f.mtimefs.Lstat(file.Name); !fs.IsNotExist(statErr) {
++						if statErr == nil || fs.IsErrCaseConflict(statErr) {
++							err = errModified
++						} else {
++							err = statErr
++						}
++						return
++					}
++				}
++				err = f.settleMordeQuota(quotaReservationID)
++				if err != nil {
++					return
++				}
++				quotaSettled = true
++			}
+ 			err = nil
+ 			dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+ 		}
+ 		return
+ 	}
+ 
+-	// We are asked to delete a file, but what we have on disk and in db
+-	// is a directory. Something is wrong here, should probably not happen.
++	// A file path may now be a directory. Morde removes only this file entry
++	// from the Workspace manifest; child paths have their own delete operations.
++	if info, statErr := f.mtimefs.Lstat(file.Name); statErr == nil && info.IsDir() {
++		if !f.mordeManaged() {
++			err = errUnexpectedDirOnFileDel
++			return
++		}
++		if quotaRelease != nil {
++			err = f.settleMordeQuota(quotaReservationID)
++			if err != nil {
++				return
++			}
++			quotaSettled = true
++		}
++		dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
++		return
++	} else if statErr != nil && !fs.IsNotExist(statErr) {
++		err = statErr
++		return
++	}
+ 	if cur.IsDirectory() {
+-		err = errUnexpectedDirOnFileDel
++		if !f.mordeManaged() {
++			err = errUnexpectedDirOnFileDel
++			return
++		}
++		if quotaRelease != nil {
++			err = f.settleMordeQuota(quotaReservationID)
++			if err != nil {
++				return
++			}
++			quotaSettled = true
++		}
++		dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+ 		return
+ 	}
+ 
++	preserveFailed := false
+ 	switch {
++	case f.mordeManaged():
++		_, err = f.mordePreserveFile(file.Name)
++		preserveFailed = err != nil
++
+ 	case file.InConflictWith(cur) && !cur.IsSymlink():
+ 		// If the delete constitutes winning a conflict, we move the file to
+ 		// a conflict copy instead of doing the delete
+@@ -965,17 +1148,37 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
+ 		err = f.inWritableDir(f.mtimefs.Remove, file.Name)
+ 	}
+ 
++	if preserveFailed {
++		return
++	}
+ 	if err == nil || fs.IsNotExist(err) {
++		if quotaRelease != nil {
++			err = f.settleMordeQuota(quotaReservationID)
++			if err != nil {
++				return
++			}
++			quotaSettled = true
++		}
+ 		// It was removed or it doesn't exist to start with
+ 		dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+ 		return
+ 	}
+-
+ 	if _, serr := f.mtimefs.Lstat(file.Name); serr != nil && !fs.IsPermission(serr) {
+ 		// We get an error just looking at the file, and it's not a permission
+ 		// problem. Lets assume the error is in fact some variant of "file
+ 		// does not exist" (possibly expressed as some parent being a file and
+ 		// not a directory etc) and that the delete is handled.
++		if quotaRelease != nil {
++			if !fs.IsNotExist(serr) {
++				err = fmt.Errorf("confirm file removal: %w", serr)
++				return
++			}
++			err = f.settleMordeQuota(quotaReservationID)
++			if err != nil {
++				return
++			}
++			quotaSettled = true
++		}
+ 		err = nil
+ 		dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
+ 	}
+@@ -986,6 +1189,9 @@ func (f *sendReceiveFolder) deleteFileWithCurrent(file, cur protocol.FileInfo, h
+ // renameFile attempts to rename an existing file to a destination
+ // and set the right attributes on it.
+ func (f *sendReceiveFolder) renameFile(cur, source, target protocol.FileInfo, dbUpdateChan chan<- dbUpdateJob, scanChan chan<- string) error {
++	if f.mordeManaged() {
++		return errors.New("Morde managed folders do not use the rename shortcut")
++	}
+ 	// Used in the defer closure below, updated by the function body. Take
+ 	// care not declare another err.
+ 	var err error
+@@ -1155,10 +1361,17 @@ func (f *sendReceiveFolder) renameFile(cur, source, target protocol.FileInfo, db
+ // handleFile queues the copies and pulls as necessary for a single new or
+ // changed file.
+ func (f *sendReceiveFolder) handleFile(ctx context.Context, file protocol.FileInfo, copyChan chan<- copyBlocksState) error {
++	if f.MordeMaxSingleFileBytes > 0 && file.Size > f.MordeMaxSingleFileBytes {
++		return errMordeFileTooLarge
++	}
+ 	curFile, hasCurFile, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
+ 	if err != nil {
+ 		return err
+ 	}
++	quotaRelease, quotaReservationID, err := f.reserveMordeFile(ctx, file, "upsert", file.Size)
++	if err != nil {
++		return err
++	}
+ 
+ 	have, _ := blockDiff(curFile.Blocks, file.Blocks)
+ 
+@@ -1193,6 +1406,8 @@ func (f *sendReceiveFolder) handleFile(ctx context.Context, file protocol.FileIn
+ 	})
+ 
+ 	s := newSharedPullerState(file, f.mtimefs, f.folderID, tempName, blocks, reused, f.IgnorePerms || file.NoPermissions, hasCurFile, curFile, !f.DisableSparseFiles, !f.DisableFsync)
++	s.mordeQuotaReservationID = quotaReservationID
++	s.mordeQuotaRelease = quotaRelease
+ 
+ 	f.sl.DebugContext(ctx, "Handling file", slogutil.FilePath(file.Name), "blocksToCopy", len(blocks), "reused", len(reused))
+ 
+@@ -1297,6 +1512,9 @@ func (f *sendReceiveFolder) shortcutFile(file, curFile protocol.FileInfo, dbUpda
+ 	})
+ 
+ 	var err error
++	var quotaRelease func(mordeQuotaOutcome)
++	var quotaReservationID string
++	quotaSettled := false
+ 	defer func() {
+ 		if err != nil {
+ 			slog.Info("Failed to update file metadata", f.LogAttr(), file.LogAttr(), slogutil.Error(err))
+@@ -1311,8 +1529,39 @@ func (f *sendReceiveFolder) shortcutFile(file, curFile protocol.FileInfo, dbUpda
+ 			"action": "metadata",
+ 		})
+ 	}()
++	defer func() {
++		if quotaRelease == nil {
++			return
++		}
++		switch {
++		case quotaSettled:
++			quotaRelease(mordeQuotaComplete)
++		case errors.Is(err, errMordeQuotaResultUnknown):
++			quotaRelease(mordeQuotaUnknown)
++		case errors.Is(err, errMordeQuotaAborted):
++			quotaRelease(mordeQuotaAbortedOutcome)
++		default:
++			quotaCtx, cancel := mordeQuotaContext()
++			outcome, abortErr := f.mordeQuotaClient.abort(quotaCtx, quotaReservationID)
++			cancel()
++			if abortErr != nil {
++				err = errors.Join(err, fmt.Errorf("Morde quota reservation remains active: %w", abortErr))
++				quotaRelease(mordeQuotaUnknown)
++				f.newPullError(file.Name, err)
++			} else {
++				quotaRelease(outcome)
++			}
++		}
++	}()
+ 
+ 	f.queue.Done(file.Name)
++	if f.mordeQuotaClient != nil {
++		quotaRelease, quotaReservationID, err = f.reserveMordeFile(context.Background(), file, "upsert", file.Size)
++		if err != nil {
++			f.newPullError(file.Name, fmt.Errorf("reserve Workspace metadata update: %w", err))
++			return
++		}
++	}
+ 
+ 	info, err := f.mtimefs.Lstat(file.Name)
+ 	if fs.IsNotExist(err) {
+@@ -1325,7 +1574,6 @@ func (f *sendReceiveFolder) shortcutFile(file, curFile protocol.FileInfo, dbUpda
+ 		f.newPullError(file.Name, fmt.Errorf("shortcut file (checking existing file): %w", err))
+ 		return
+ 	}
+-
+ 	if !f.IgnorePerms && !file.NoPermissions {
+ 		if err = f.mtimefs.Chmod(file.Name, fs.FileMode(file.Permissions&0o777)); err != nil {
+ 			f.newPullError(file.Name, fmt.Errorf("shortcut file (setting permissions): %w", err))
+@@ -1333,7 +1581,7 @@ func (f *sendReceiveFolder) shortcutFile(file, curFile protocol.FileInfo, dbUpda
+ 		}
+ 	}
+ 
+-	if err := f.setPlatformData(&file, file.Name); err != nil {
++	if err = f.setPlatformData(&file, file.Name); err != nil {
+ 		f.newPullError(file.Name, fmt.Errorf("shortcut file (setting metadata): %w", err))
+ 		return
+ 	}
+@@ -1361,6 +1609,13 @@ func (f *sendReceiveFolder) shortcutFile(file, curFile protocol.FileInfo, dbUpda
+ 	}
+ 
+ 	f.mtimefs.Chtimes(file.Name, file.ModTime(), file.ModTime()) // never fails
++	if quotaRelease != nil {
++		if err = f.settleMordeQuota(quotaReservationID); err != nil {
++			f.newPullError(file.Name, fmt.Errorf("settle Workspace metadata update: %w", err))
++			return
++		}
++		quotaSettled = true
++	}
+ 
+ 	dbUpdateChan <- dbUpdateJob{file, dbUpdateShortcutFile}
+ }
+@@ -1703,6 +1958,16 @@ loop:
+ }
+ 
+ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCurFile bool, tempName string, dbUpdateChan chan<- dbUpdateJob, scanChan chan<- string) error {
++	return f.performFinishReserved(context.Background(), file, curFile, hasCurFile, tempName, "", dbUpdateChan, scanChan)
++}
++
++func (f *sendReceiveFolder) performFinishReserved(ctx context.Context, file, curFile protocol.FileInfo, hasCurFile bool, tempName, reservationID string, dbUpdateChan chan<- dbUpdateJob, scanChan chan<- string) error {
++	if f.MordeMaxSingleFileBytes > 0 && file.Size > f.MordeMaxSingleFileBytes {
++		return errMordeFileTooLarge
++	}
++	if f.mordeQuotaClient != nil && reservationID == "" {
++		return errors.New("Morde quota reservation is missing for received file")
++	}
+ 	// Set the correct permission bits on the new file
+ 	if !f.IgnorePerms && !file.NoPermissions {
+ 		if err := f.mtimefs.Chmod(tempName, fs.FileMode(file.Permissions&0o777)); err != nil {
+@@ -1719,8 +1984,30 @@ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCu
+ 		// There is an old file or directory already in place. We need to
+ 		// handle that.
+ 
+-		if err := f.scanIfItemChanged(file.Name, stat, curFile, hasCurFile, false, scanChan); err != nil {
+-			return fmt.Errorf("checking existing file: %w", err)
++		if f.MordeMaxSingleFileBytes <= 0 || !stat.IsRegular() || stat.Size() <= f.MordeMaxSingleFileBytes {
++			if err := f.scanIfItemChanged(file.Name, stat, curFile, hasCurFile, false, scanChan); err != nil {
++				return fmt.Errorf("checking existing file: %w", err)
++			}
++		}
++		if f.mordeManaged() {
++			if stat.IsDir() {
++				names, err := f.mtimefs.DirNames(file.Name)
++				if err != nil {
++					return fmt.Errorf("checking directory before file replacement: %w", err)
++				}
++				if len(names) > 0 {
++					return errDirNotEmpty
++				}
++			}
++			if err := f.mordePreserveAndInstall(file.Name, tempName); err != nil {
++				return fmt.Errorf("preserving existing file: %w", err)
++			}
++			f.mtimefs.Chtimes(file.Name, file.ModTime(), file.ModTime())
++			if err := f.settleMordeQuota(reservationID); err != nil {
++				return err
++			}
++			dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleFile}
++			return nil
+ 		}
+ 
+ 		if !curFile.IsDirectory() && !curFile.IsSymlink() && file.InConflictWith(curFile) {
+@@ -1744,12 +2031,21 @@ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCu
+ 
+ 	// Replace the original content with the new one. If it didn't work,
+ 	// leave the temp file in place for reuse.
+-	if err := osutil.RenameOrCopy(f.CopyRangeMethod.ToFS(), f.mtimefs, f.mtimefs, tempName, file.Name); err != nil {
++	var err error
++	if f.mordeManaged() {
++		err = f.mordeInstallWithoutReplace(file.Name, tempName)
++	} else {
++		err = osutil.RenameOrCopy(f.CopyRangeMethod.ToFS(), f.mtimefs, f.mtimefs, tempName, file.Name)
++	}
++	if err != nil {
+ 		return fmt.Errorf("replacing file: %w", err)
+ 	}
+ 
+ 	// Set the correct timestamp on the new file
+ 	f.mtimefs.Chtimes(file.Name, file.ModTime(), file.ModTime()) // never fails
++	if err := f.settleMordeQuota(reservationID); err != nil {
++		return err
++	}
+ 
+ 	// Record the updated file in the index
+ 	dbUpdateChan <- dbUpdateJob{file, dbUpdateHandleFile}
+@@ -1764,7 +2060,26 @@ func (f *sendReceiveFolder) finisherRoutine(ctx context.Context, in <-chan *shar
+ 			f.queue.Done(state.file.Name)
+ 
+ 			if err == nil {
+-				err = f.performFinish(state.file, state.curFile, state.hasCurFile, state.tempName, dbUpdateChan, scanChan)
++				err = f.performFinishReserved(ctx, state.file, state.curFile, state.hasCurFile, state.tempName, state.mordeQuotaReservationID, dbUpdateChan, scanChan)
++			}
++			if state.mordeQuotaRelease != nil {
++				if errors.Is(err, errMordeQuotaResultUnknown) {
++					state.mordeQuotaRelease(mordeQuotaUnknown)
++				} else if errors.Is(err, errMordeQuotaAborted) {
++					state.mordeQuotaRelease(mordeQuotaAbortedOutcome)
++				} else if err != nil {
++					abortCtx, cancel := mordeQuotaContext()
++					outcome, abortErr := f.mordeQuotaClient.abort(abortCtx, state.mordeQuotaReservationID)
++					cancel()
++					if abortErr != nil {
++						err = errors.Join(err, fmt.Errorf("Morde quota reservation remains active: %w", abortErr))
++						state.mordeQuotaRelease(mordeQuotaUnknown)
++					} else {
++						state.mordeQuotaRelease(outcome)
++					}
++				} else {
++					state.mordeQuotaRelease(mordeQuotaComplete)
++				}
+ 			}
+ 
+ 			if err != nil {
+@@ -1994,6 +2309,10 @@ func (f *sendReceiveFolder) deleteItemOnDisk(item protocol.FileInfo, scanChan ch
+ 			err = fmt.Errorf("%s: %w", contextRemovingOldItem, err)
+ 		}
+ 	}()
++	if f.mordeManaged() {
++		_, err = f.mordePreserveFile(item.Name)
++		return err
++	}
+ 
+ 	switch {
+ 	case item.IsDirectory():
+@@ -2016,6 +2335,26 @@ func (f *sendReceiveFolder) deleteItemOnDisk(item protocol.FileInfo, scanChan ch
+ // deleteDirOnDisk attempts to delete a directory. It checks for files/dirs inside
+ // the directory and removes them if possible or returns an error if it fails
+ func (f *sendReceiveFolder) deleteDirOnDisk(dir string, scanChan chan<- string) error {
++	if f.mordeManaged() {
++		if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(dir)); err != nil {
++			return err
++		}
++		names, err := f.mtimefs.DirNames(dir)
++		if fs.IsNotExist(err) {
++			return nil
++		}
++		if err != nil {
++			return err
++		}
++		if len(names) > 0 {
++			return errDirNotEmpty
++		}
++		err = f.inWritableDir(f.mtimefs.Remove, dir)
++		if fs.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
+ 	if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(dir)); err != nil {
+ 		return err
+ 	}
+@@ -2151,6 +2490,9 @@ func (f *sendReceiveFolder) scanIfItemChanged(name string, stat fs.FileInfo, ite
+ 			scanChan <- name
+ 		}
+ 	}()
++	if f.MordeMaxSingleFileBytes > 0 && stat.IsRegular() && stat.Size() > f.MordeMaxSingleFileBytes {
++		return errModified
++	}
+ 
+ 	if !hasItem || item.Deleted {
+ 		// The item appeared from nowhere
+@@ -2201,6 +2543,14 @@ func (f *sendReceiveFolder) checkToBeDeleted(file, cur protocol.FileInfo, hasCur
+ 		f.sl.Debug("Not deleting item we don't have, but updating database", slogutil.FilePath(file.Name))
+ 		return err
+ 	}
++	if f.mordeManaged() && file.IsDeleted() {
++		if stat.IsDir() {
++			return nil
++		}
++		if stat.IsRegular() && f.MordeMaxSingleFileBytes > 0 && stat.Size() > f.MordeMaxSingleFileBytes {
++			return nil
++		}
++	}
+ 
+ 	return f.scanIfItemChanged(file.Name, stat, cur, hasCur, true, scanChan)
+ }
+diff --git a/lib/model/folder_summary.go b/lib/model/folder_summary.go
+index 98fe521c7..23dffe6ff 100644
+--- a/lib/model/folder_summary.go
++++ b/lib/model/folder_summary.go
+@@ -114,8 +114,9 @@ type FolderSummary struct {
+ 	Sequence       int64                       `json:"sequence"`
+ 	RemoteSequence map[protocol.DeviceID]int64 `json:"remoteSequence"`
+ 
+-	IgnorePatterns bool   `json:"ignorePatterns"`
+-	WatchError     string `json:"watchError"`
++	IgnorePatterns         bool   `json:"ignorePatterns"`
++	WatchError             string `json:"watchError"`
++	MordeFileLimitExcluded int    `json:"mordeFileLimitExcluded"`
+ }
+ 
+ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
+@@ -199,6 +200,15 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
+ 		res.WatchError = err.Error()
+ 	}
+ 
++	if policy, ok := c.model.(interface {
++		MordeFileLimitExcluded(folder string) (int, error)
++	}); ok {
++		res.MordeFileLimitExcluded, err = policy.MordeFileLimitExcluded(folder)
++		if err != nil {
++			return nil, err
++		}
++	}
++
+ 	return res, nil
+ }
+ 
+diff --git a/lib/model/indexhandler.go b/lib/model/indexhandler.go
+index db9a78123..5b2bbde6f 100644
+--- a/lib/model/indexhandler.go
++++ b/lib/model/indexhandler.go
+@@ -28,6 +28,7 @@ type indexHandler struct {
+ 	downloads                *deviceDownloadState
+ 	folder                   string
+ 	folderIsReceiveEncrypted bool
++	mordeMaxSingleFileBytes  int64
+ 	evLogger                 events.Logger
+ 
+ 	// We track the latest / highest sequence number in two ways for two
+@@ -133,6 +134,7 @@ func newIndexHandler(conn protocol.Connection, downloads *deviceDownloadState, f
+ 		downloads:                downloads,
+ 		folder:                   folder.ID,
+ 		folderIsReceiveEncrypted: folder.Type == config.FolderTypeReceiveEncrypted,
++		mordeMaxSingleFileBytes:  folder.MordeMaxSingleFileBytes,
+ 		localPrevSequence:        startSequence,
+ 		sentPrevSequence:         startSequence,
+ 		evLogger:                 evLogger,
+@@ -394,6 +396,11 @@ func (s *indexHandler) receive(fs []protocol.FileInfo, update bool, op string, p
+ 	}
+ 
+ 	for i := range fs {
++		if s.mordeMaxSingleFileBytes > 0 && !fs[i].IsDeleted() && fs[i].Type == protocol.FileInfoTypeFile && fs[i].Size > s.mordeMaxSingleFileBytes {
++			fs[i].LocalFlags |= protocol.FlagLocalMordeTooLarge
++			fs[i].Blocks = nil
++			fs[i].BlocksHash = nil
++		}
+ 		// Verify index in relation to the claimed sequence boundaries
+ 		if fs[i].Sequence < prevSequence {
+ 			s.logSequenceAnomaly("file with sequence before prevSequence", map[string]any{
+diff --git a/lib/model/model.go b/lib/model/model.go
+index 19a9029f4..98a6de411 100644
+--- a/lib/model/model.go
++++ b/lib/model/model.go
+@@ -2017,6 +2017,9 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
+ 		l.Debugf("%v REQ(in) for ignored file: %s: %q / %q o=%d s=%d", m, deviceID.Short(), req.Folder, req.Name, req.Offset, req.Size)
+ 		return nil, protocol.ErrInvalid
+ 	}
++	if blocked, checkErr := m.mordeFileTooLarge(req.Folder, req.Name, folderCfg.MordeMaxSingleFileBytes); checkErr != nil || blocked {
++		return nil, protocol.ErrInvalid
++	}
+ 
+ 	// Restrict parallel requests by connection/device
+ 
+@@ -2050,7 +2053,7 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
+ 	if req.FromTemporary {
+ 		tempFn := fs.TempName(req.Name)
+ 
+-		if info, err := folderFs.Lstat(tempFn); err != nil || !info.IsRegular() {
++		if info, err := folderFs.Lstat(tempFn); err != nil || !info.IsRegular() || folderCfg.MordeMaxSingleFileBytes > 0 && info.Size() > folderCfg.MordeMaxSingleFileBytes {
+ 			// Reject reads for anything that doesn't exist or is something
+ 			// other than a regular file.
+ 			l.Debugf("%v REQ(in) failed stating temp file (%v): %s: %q / %q o=%d s=%d", m, err, deviceID.Short(), req.Folder, req.Name, req.Offset, req.Size)
+@@ -2064,7 +2067,7 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
+ 		// file has finished downloading.
+ 	}
+ 
+-	if info, err := folderFs.Lstat(req.Name); err != nil || !info.IsRegular() {
++	if info, err := folderFs.Lstat(req.Name); err != nil || !info.IsRegular() || folderCfg.MordeMaxSingleFileBytes > 0 && info.Size() > folderCfg.MordeMaxSingleFileBytes {
+ 		// Reject reads for anything that doesn't exist or is something
+ 		// other than a regular file.
+ 		l.Debugf("%v REQ(in) failed stating file (%v): %s: %q / %q o=%d s=%d", m, err, deviceID.Short(), req.Folder, req.Name, req.Offset, req.Size)
+diff --git a/lib/model/sharedpullerstate.go b/lib/model/sharedpullerstate.go
+index fcbf5f03a..2b9ca5738 100644
+--- a/lib/model/sharedpullerstate.go
++++ b/lib/model/sharedpullerstate.go
+@@ -25,19 +25,21 @@ import (
+ // updated along the way.
+ type sharedPullerState struct {
+ 	// Immutable, does not require locking
+-	file          protocol.FileInfo // The new file (desired end state)
+-	fs            fs.Filesystem
+-	folder        string
+-	tempName      string
+-	realName      string
+-	reused        int // Number of blocks reused from temporary file
+-	ignorePerms   bool
+-	hasCurFile    bool              // Whether curFile is set
+-	curFile       protocol.FileInfo // The file as it exists now in our database
+-	curFileBlocks map[string]int    // block hash to index in curFile
+-	sparse        bool
+-	created       time.Time
+-	fsync         bool
++	file                    protocol.FileInfo // The new file (desired end state)
++	fs                      fs.Filesystem
++	folder                  string
++	tempName                string
++	realName                string
++	reused                  int // Number of blocks reused from temporary file
++	ignorePerms             bool
++	hasCurFile              bool              // Whether curFile is set
++	curFile                 protocol.FileInfo // The file as it exists now in our database
++	curFileBlocks           map[string]int    // block hash to index in curFile
++	sparse                  bool
++	created                 time.Time
++	fsync                   bool
++	mordeQuotaReservationID string
++	mordeQuotaRelease       func(mordeQuotaOutcome)
+ 
+ 	// Mutable, must be locked for access
+ 	err              error           // The first error we hit
+diff --git a/lib/protocol/bep_fileinfo.go b/lib/protocol/bep_fileinfo.go
+index ad3d17e6c..5147fabbc 100644
+--- a/lib/protocol/bep_fileinfo.go
++++ b/lib/protocol/bep_fileinfo.go
+@@ -31,16 +31,17 @@ const (
+ 	FlagLocalGlobal        FlagLocal = 1 << 4 // 16: This is the global file version
+ 	FlagLocalNeeded        FlagLocal = 1 << 5 // 32: We need this file
+ 	FlagLocalRemoteInvalid FlagLocal = 1 << 6 // 64: The remote marked this as invalid
++	FlagLocalMordeTooLarge FlagLocal = 1 << 7 // 128: Morde file-size policy excludes this version
+ 
+ 	// Flags that should result in the Invalid bit on outgoing updates (or had it on ingoing ones)
+-	LocalInvalidFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalRemoteInvalid
++	LocalInvalidFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalRemoteInvalid | FlagLocalMordeTooLarge
+ 
+ 	// Flags that should result in a file being in conflict with its
+ 	// successor, due to us not having an up to date picture of its state on
+ 	// disk.
+ 	LocalConflictFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalReceiveOnly
+ 
+-	LocalAllFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalGlobal | FlagLocalNeeded | FlagLocalRemoteInvalid
++	LocalAllFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalGlobal | FlagLocalNeeded | FlagLocalRemoteInvalid | FlagLocalMordeTooLarge
+ )
+ 
+ // localFlagBitNames maps flag values to characters which can be used to
+@@ -53,6 +54,7 @@ var localFlagBitNames = map[FlagLocal]string{
+ 	FlagLocalGlobal:        "G",
+ 	FlagLocalNeeded:        "n",
+ 	FlagLocalRemoteInvalid: "v",
++	FlagLocalMordeTooLarge: "s",
+ }
+ 
+ func (f FlagLocal) IsInvalid() bool {
+diff --git a/lib/scanner/walk.go b/lib/scanner/walk.go
+index 105307df2..ed6b4067a 100644
+--- a/lib/scanner/walk.go
++++ b/lib/scanner/walk.go
+@@ -67,6 +67,8 @@ type Config struct {
+ 	ScanXattrs bool
+ 	// Filter for extended attributes
+ 	XattrFilter XattrFilter
++	// MordeMaxSingleFileBytes excludes oversized regular files when positive.
++	MordeMaxSingleFileBytes int64
+ }
+ 
+ type CurrentFiler interface {
+@@ -434,7 +436,7 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo,
+ 		return w.walkDir(ctx, path, info, finishedChan)
+ 
+ 	case info.IsRegular():
+-		return w.walkRegular(ctx, path, info, toHashChan)
++		return w.walkRegular(ctx, path, info, toHashChan, finishedChan)
+ 
+ 	default:
+ 		// A special file, socket, fifo, etc. -- do nothing, just skip and continue scanning.
+@@ -443,7 +445,7 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo,
+ 	}
+ }
+ 
+-func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo) error {
++func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) error {
+ 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
+ 
+ 	blockSize := protocol.BlockSize(info.Size())
+@@ -469,6 +471,10 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
+ 	f = w.updateFileInfo(f, curFile)
+ 	f.NoPermissions = w.IgnorePerms
+ 	f.RawBlockSize = int32(blockSize)
++	tooLarge := w.MordeMaxSingleFileBytes > 0 && f.Size > w.MordeMaxSingleFileBytes
++	if tooLarge {
++		f.LocalFlags |= protocol.FlagLocalMordeTooLarge
++	}
+ 	l.Debugln(w, "checking:", f)
+ 
+ 	f.New = !hasCurFile
+@@ -498,6 +504,16 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
+ 		l.Debugln(w, "rescan:", curFile)
+ 	}
+ 
++	if tooLarge {
++		// Preserve size and version so other managed nodes can revoke stale copies.
++		select {
++		case finishedChan <- ScanResult{File: f}:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++		return nil
++	}
++
+ 	l.Debugln(w, "to hash:", relPath, f)
+ 
+ 	select {
+@@ -572,6 +588,9 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileIn
+ 
+ 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
+ 	f = w.updateFileInfo(f, curFile)
++	if w.MordeMaxSingleFileBytes > 0 {
++		f.SetUnsupported()
++	}
+ 	l.Debugln(w, "checking:", f)
+ 
+ 	f.New = !hasCurFile
+diff --git a/lib/model/morde_file_policy.go b/lib/model/morde_file_policy.go
+new file mode 100644
+index 000000000..04d05eb46
+--- /dev/null
++++ b/lib/model/morde_file_policy.go
+@@ -0,0 +1,433 @@
++// Copyright (C) 2026 The Syncthing Authors.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++package model
++
++import (
++	"crypto/sha256"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"time"
++
++	"github.com/syncthing/syncthing/lib/fs"
++	"github.com/syncthing/syncthing/lib/osutil"
++	"github.com/syncthing/syncthing/lib/protocol"
++	"github.com/syncthing/syncthing/lib/rand"
++	"golang.org/x/text/unicode/norm"
++)
++
++var errMordeFileTooLarge = errors.New("file unavailable: exceeds Morde file size limit")
++var errMordeSymlinkExcluded = errors.New("symlink unavailable: excluded by Morde Workspace policy")
++
++// MordeFileTooLarge reports whether any known device has an excluded version.
++func (m *model) MordeFileTooLarge(folder, name string) (bool, error) {
++	m.mut.RLock()
++	cfg, ok := m.folderCfgs[folder]
++	m.mut.RUnlock()
++	if !ok {
++		cfg, ok = m.cfg.Folder(folder)
++		if !ok {
++			return false, ErrFolderMissing
++		}
++	}
++	if cfg.MordeMaxSingleFileBytes > 0 {
++		canonical, err := fs.Canonicalize(name)
++		if err != nil {
++			return false, err
++		}
++		name = canonical
++		filesystem := cfg.Filesystem()
++		if err := osutil.TraversesSymlink(filesystem, filepath.Dir(name)); err != nil {
++			return false, err
++		}
++		info, err := filesystem.Lstat(name)
++		if err != nil && !fs.IsNotExist(err) {
++			return false, err
++		}
++		if err == nil && info.IsRegular() && info.Size() > cfg.MordeMaxSingleFileBytes {
++			return true, nil
++		}
++	}
++	return m.mordeFileTooLarge(folder, name, cfg.MordeMaxSingleFileBytes)
++}
++
++// MordeFileLimitExcluded reports distinct excluded paths known to this node.
++func (m *model) MordeFileLimitExcluded(folder string) (int, error) {
++	m.mut.RLock()
++	cfg, ok := m.folderCfgs[folder]
++	m.mut.RUnlock()
++	if !ok {
++		cfg, ok = m.cfg.Folder(folder)
++		if !ok {
++			return 0, ErrFolderMissing
++		}
++	}
++	if cfg.MordeMaxSingleFileBytes <= 0 {
++		return 0, nil
++	}
++	devices, err := m.sdb.ListDevicesForFolder(folder)
++	if err != nil {
++		return 0, err
++	}
++	devices = append(devices, protocol.LocalDeviceID)
++	paths := make(map[string]struct{})
++	for _, device := range devices {
++		files, result := m.sdb.AllLocalFiles(folder, device)
++		for file := range files {
++			if !file.IsDeleted() && file.Type == protocol.FileInfoTypeFile && file.Size > cfg.MordeMaxSingleFileBytes {
++				paths[file.Name] = struct{}{}
++			}
++		}
++		if err := result(); err != nil {
++			return 0, err
++		}
++	}
++	return len(paths), nil
++}
++
++func (m *model) mordeFileTooLarge(folder, name string, maxBytes int64) (bool, error) {
++	if maxBytes <= 0 {
++		return false, nil
++	}
++	devices, err := m.sdb.ListDevicesForFolder(folder)
++	if err != nil {
++		return false, err
++	}
++	devices = append(devices, protocol.LocalDeviceID)
++	for _, device := range devices {
++		file, ok, err := m.sdb.GetDeviceFile(folder, device, name)
++		if err != nil {
++			return false, err
++		}
++		if ok && !file.IsDeleted() && file.Type == protocol.FileInfoTypeFile && file.Size > maxBytes {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++func (f *sendReceiveFolder) mordeFileBlocked(name string) (bool, error) {
++	maxBytes := f.MordeMaxSingleFileBytes
++	if maxBytes <= 0 {
++		return false, nil
++	}
++	blocked, err := f.model.mordeFileTooLarge(f.folderID, name, maxBytes)
++	if err != nil || blocked {
++		return blocked, err
++	}
++	info, err := f.mtimefs.Lstat(name)
++	if fs.IsNotExist(err) {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	return info.IsRegular() && info.Size() > maxBytes, nil
++}
++
++func (f *sendReceiveFolder) mordeManaged() bool {
++	return f.MordeMaxSingleFileBytes > 0 || f.mordeQuotaClient != nil
++}
++
++// mordePreserveFile keeps open writers attached to a recoverable inode outside every sync root.
++func (f *sendReceiveFolder) mordePreserveFile(name string) (string, error) {
++	if f.mtimefs.Type() != fs.FilesystemTypeBasic {
++		return "", errors.New("Morde safe replacement requires a basic filesystem")
++	}
++	if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(name)); err != nil {
++		return "", err
++	}
++	info, err := f.mtimefs.Lstat(name)
++	if err != nil {
++		return "", err
++	}
++	if !info.IsRegular() && !info.IsSymlink() && !info.IsDir() {
++		return "", errors.New("Morde safe replacement does not support this local item type")
++	}
++	canonical, err := fs.Canonicalize(name)
++	if err != nil {
++		return "", errors.New("Morde safe replacement path is invalid")
++	}
++	relative := filepath.Clean(filepath.FromSlash(canonical))
++	if filepath.IsAbs(relative) || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
++		return "", errors.New("Morde safe replacement path is invalid")
++	}
++	preserveRoot, err := f.mordePreservationRoot()
++	if err != nil {
++		return "", err
++	}
++	folderKey := fmt.Sprintf("%x", sha256.Sum256([]byte(f.folderID)))
++	folderDir := filepath.Join(preserveRoot, folderKey)
++	if err := mkdirPrivate(folderDir); err != nil {
++		return "", fmt.Errorf("create preservation directory: %w", err)
++	}
++	entryID := rand.String(20)
++	backupDir := filepath.Join(folderDir, entryID)
++	if err := os.Mkdir(backupDir, 0o700); err != nil {
++		return "", fmt.Errorf("create preservation entry: %w", err)
++	}
++	metadataPath := filepath.Join(folderDir, entryID+".morde.json")
++	metadata, err := json.Marshal(struct {
++		Version   int       `json:"version"`
++		EntryID   string    `json:"entry_id"`
++		FolderID  string    `json:"folder_id"`
++		Path      string    `json:"path"`
++		CreatedAt time.Time `json:"created_at"`
++	}{1, entryID, f.folderID, filepath.ToSlash(canonical), time.Now().UTC()})
++	if err != nil {
++		_ = os.RemoveAll(backupDir)
++		return "", fmt.Errorf("encode preservation metadata: %w", err)
++	}
++	metadataFile, err := os.OpenFile(metadataPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
++	if err != nil {
++		_ = os.RemoveAll(backupDir)
++		return "", fmt.Errorf("create preservation metadata: %w", err)
++	}
++	_, err = metadataFile.Write(metadata)
++	if err == nil {
++		err = metadataFile.Sync()
++	}
++	if closeErr := metadataFile.Close(); err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		_ = os.Remove(metadataPath)
++		_ = os.RemoveAll(backupDir)
++		return "", fmt.Errorf("write preservation metadata: %w", err)
++	}
++	backup := filepath.Join(backupDir, relative)
++	if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
++		_ = os.Remove(metadataPath)
++		_ = os.RemoveAll(backupDir)
++		return "", fmt.Errorf("create preserved path: %w", err)
++	}
++	root := f.mtimefs.URI()
++	if err := f.inWritableDir(func(path string) error { return os.Rename(filepath.Join(root, path), backup) }, name); err != nil {
++		_ = os.Remove(metadataPath)
++		_ = os.RemoveAll(backupDir)
++		return "", fmt.Errorf("preserve old file: %w", err)
++	}
++	return backup, nil
++}
++
++func (f *sendReceiveFolder) mordePreservationRoot() (string, error) {
++	root, err := filepath.EvalSymlinks(f.mtimefs.URI())
++	if err != nil {
++		return "", fmt.Errorf("resolve Workspace root before preserving file: %w", err)
++	}
++	root, err = filepath.Abs(root)
++	if err != nil {
++		return "", fmt.Errorf("resolve Workspace path before preserving file: %w", err)
++	}
++	preserveRoot := filepath.Join(filepath.Dir(root), ".morde-preserved")
++	for _, folder := range f.model.cfg.FolderList() {
++		if folder.Filesystem().Type() != fs.FilesystemTypeBasic {
++			continue
++		}
++		otherRoot, err := filepath.Abs(folder.Filesystem().URI())
++		if err != nil {
++			return "", fmt.Errorf("resolve configured sync root: %w", err)
++		}
++		otherRoot, err = resolvePathWithMissingTail(otherRoot)
++		if err != nil {
++			return "", fmt.Errorf("resolve configured sync root: %w", err)
++		}
++		if pathsOverlap(preserveRoot, otherRoot) {
++			return "", errors.New("Morde preservation directory overlaps a configured sync root")
++		}
++	}
++	if err := mkdirPrivate(preserveRoot); err != nil {
++		return "", fmt.Errorf("create Morde preservation root: %w", err)
++	}
++	resolvedPreserveRoot, err := filepath.EvalSymlinks(preserveRoot)
++	if err != nil {
++		return "", fmt.Errorf("resolve Morde preservation root: %w", err)
++	}
++	for _, folder := range f.model.cfg.FolderList() {
++		if folder.Filesystem().Type() != fs.FilesystemTypeBasic {
++			continue
++		}
++		otherRoot, err := filepath.Abs(folder.Filesystem().URI())
++		if err != nil {
++			return "", fmt.Errorf("resolve configured sync root: %w", err)
++		}
++		otherRoot, err = resolvePathWithMissingTail(otherRoot)
++		if err != nil {
++			return "", fmt.Errorf("resolve configured sync root: %w", err)
++		}
++		if pathsOverlap(resolvedPreserveRoot, otherRoot) {
++			return "", errors.New("Morde preservation directory overlaps a configured sync root")
++		}
++	}
++	return resolvedPreserveRoot, nil
++}
++
++func resolvePathWithMissingTail(path string) (string, error) {
++	path, err := filepath.Abs(path)
++	if err != nil {
++		return "", err
++	}
++	current := filepath.Clean(path)
++	var missing []string
++	for {
++		resolved, err := filepath.EvalSymlinks(current)
++		if err == nil {
++			for i := len(missing) - 1; i >= 0; i-- {
++				resolved = filepath.Join(resolved, missing[i])
++			}
++			return filepath.Clean(resolved), nil
++		}
++		if !errors.Is(err, os.ErrNotExist) {
++			return "", err
++		}
++		if _, lstatErr := os.Lstat(current); lstatErr == nil {
++			return "", fmt.Errorf("unresolved symlink in configured sync root: %w", err)
++		} else if !errors.Is(lstatErr, os.ErrNotExist) {
++			return "", lstatErr
++		}
++		parent := filepath.Dir(current)
++		if parent == current {
++			return "", err
++		}
++		missing = append(missing, filepath.Base(current))
++		current = parent
++	}
++}
++
++func mkdirPrivate(path string) error {
++	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
++		return err
++	}
++	info, err := os.Lstat(path)
++	if err != nil {
++		return err
++	}
++	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
++		return errors.New("Morde preservation path is not a private directory")
++	}
++	return nil
++}
++
++func pathsOverlap(a, b string) bool {
++	if pathContains(a, b) || pathContains(b, a) {
++		return true
++	}
++	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
++		return pathContainsFilesystem(a, b) || pathContainsFilesystem(b, a)
++	}
++	return false
++}
++
++func pathContainsFilesystem(root, candidate string) bool {
++	root, candidate = filepath.Clean(root), filepath.Clean(candidate)
++	rootVolume, candidateVolume := filepath.VolumeName(root), filepath.VolumeName(candidate)
++	if !filesystemPathComponentEqual(rootVolume, candidateVolume) {
++		return false
++	}
++	rootParts := filepathComponents(strings.TrimPrefix(root, rootVolume))
++	candidateParts := filepathComponents(strings.TrimPrefix(candidate, candidateVolume))
++	if len(rootParts) > len(candidateParts) {
++		return false
++	}
++	for i := range rootParts {
++		if !filesystemPathComponentEqual(rootParts[i], candidateParts[i]) {
++			return false
++		}
++	}
++	return true
++}
++
++func filepathComponents(path string) []string {
++	var components []string
++	for _, component := range strings.Split(path, string(filepath.Separator)) {
++		if component != "" && component != "." {
++			components = append(components, component)
++		}
++	}
++	return components
++}
++
++func filesystemPathComponentEqual(a, b string) bool {
++	if runtime.GOOS == "darwin" {
++		a, b = norm.NFD.String(a), norm.NFD.String(b)
++	}
++	return strings.EqualFold(a, b)
++}
++
++func pathContains(root, candidate string) bool {
++	rel, err := filepath.Rel(root, candidate)
++	if err != nil {
++		return false
++	}
++	return rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
++}
++
++// mordeInstallWithoutReplace cannot overwrite a file created concurrently.
++func (f *sendReceiveFolder) mordeInstallWithoutReplace(name, temp string) error {
++	if f.mtimefs.Type() != fs.FilesystemTypeBasic {
++		return errors.New("Morde safe replacement requires a basic filesystem")
++	}
++	if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(name)); err != nil {
++		return err
++	}
++	if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(temp)); err != nil {
++		return err
++	}
++	info, err := f.mtimefs.Lstat(temp)
++	if err != nil || !info.IsRegular() {
++		return errors.New("Morde replacement temporary file is not a regular file")
++	}
++	if f.MordeMaxSingleFileBytes > 0 && info.Size() > f.MordeMaxSingleFileBytes {
++		return errMordeFileTooLarge
++	}
++	root := f.mtimefs.URI()
++	if err := f.inWritableDir(func(string) error {
++		return os.Link(filepath.Join(root, temp), filepath.Join(root, name))
++	}, name); err != nil {
++		return err
++	}
++	if err := f.mtimefs.Remove(temp); err != nil {
++		f.sl.Debug("Could not remove linked Morde replacement temporary file", "error", err)
++	}
++	return nil
++}
++
++// mordePreserveAndInstall retains the old inode before replacing a managed file.
++func (f *sendReceiveFolder) mordePreserveAndInstall(name, temp string) error {
++	if f.mtimefs.Type() != fs.FilesystemTypeBasic {
++		return errors.New("Morde safe replacement requires a basic filesystem")
++	}
++	if err := osutil.TraversesSymlink(f.mtimefs, filepath.Dir(temp)); err != nil {
++		return err
++	}
++	info, err := f.mtimefs.Lstat(temp)
++	if err != nil || !info.IsRegular() || f.MordeMaxSingleFileBytes > 0 && info.Size() > f.MordeMaxSingleFileBytes {
++		return errors.New("Morde replacement temporary file is invalid or too large")
++	}
++	root := f.mtimefs.URI()
++	probe := filepath.Join(root, filepath.Dir(name), ".morde-link-probe-"+rand.String(20))
++	if err := os.Link(filepath.Join(root, temp), probe); err != nil {
++		return fmt.Errorf("Morde safe replacement requires same-filesystem hard links: %w", err)
++	}
++	if err := os.Remove(probe); err != nil {
++		return fmt.Errorf("remove hard-link probe: %w", err)
++	}
++	backup, err := f.mordePreserveFile(name)
++	if err != nil {
++		return err
++	}
++	if err := f.mordeInstallWithoutReplace(name, temp); err != nil {
++		// An existing target must win; the preserved file remains recoverable.
++		_ = os.Link(backup, filepath.Join(root, name))
++		return fmt.Errorf("install replacement; previous file retained at %s: %w", backup, err)
++	}
++	return nil
++}
+diff --git a/lib/model/morde_quota_client.go b/lib/model/morde_quota_client.go
+new file mode 100644
+index 000000000..085055ec9
+--- /dev/null
++++ b/lib/model/morde_quota_client.go
+@@ -0,0 +1,356 @@
++// Copyright (C) 2026 The Syncthing Authors.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++package model
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/syncthing/syncthing/lib/protocol"
++)
++
++var errMordeQuotaResultUnknown = errors.New("Morde quota operation result is unknown")
++var errMordeQuotaUnresolvedOperation = errors.New("another Morde quota operation has an unknown result")
++var errMordeQuotaAborted = errors.New("Morde quota reservation was aborted")
++
++const mordeQuotaResponseLimit = 16 << 10
++
++type mordeQuotaOutcome uint8
++
++const (
++	mordeQuotaUnknown mordeQuotaOutcome = iota
++	mordeQuotaComplete
++	mordeQuotaAbortedOutcome
++)
++
++type mordeQuotaClient struct {
++	workspaceID string
++	folderID    string
++	client      *http.Client
++}
++
++type mordeQuotaReservation struct {
++	ReservationID  string          `json:"reservation_id"`
++	State          string          `json:"state"`
++	BaseRevision   json.RawMessage `json:"base_revision"`
++	ResultRevision json.RawMessage `json:"result_revision,omitempty"`
++}
++
++type mordeQuotaRequest struct {
++	WorkspaceID string `json:"workspace_id"`
++	FolderID    string `json:"folder_id"`
++	OperationID string `json:"operation_id"`
++	Path        string `json:"path"`
++	Operation   string `json:"operation"`
++	SizeBytes   int64  `json:"size_bytes"`
++}
++
++type mordeQuotaSerial struct {
++	mut      sync.Mutex
++	active   string
++	activeID string
++	busy     bool
++	changed  chan struct{}
++	attempts map[string]uint64
++}
++
++func (f *sendReceiveFolder) reserveMordeFile(ctx context.Context, file protocol.FileInfo, operation string, size int64) (func(mordeQuotaOutcome), string, error) {
++	if f.mordeQuotaClient == nil {
++		return nil, "", nil
++	}
++	baseID := mordeQuotaOperationID(f.folderID, file, operation)
++	for {
++		release, operationID, err := f.mordeQuotaSerial.acquire(ctx, baseID)
++		if err != nil {
++			return nil, "", err
++		}
++		reserveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
++		reservation, err := f.mordeQuotaClient.reserve(reserveCtx, file, operation, size, operationID)
++		cancel()
++		if err != nil {
++			if errors.Is(err, errMordeQuotaResultUnknown) {
++				release(mordeQuotaUnknown)
++			} else {
++				release(mordeQuotaComplete)
++			}
++			return nil, "", err
++		}
++		switch reservation.State {
++		case "reserved", "settled":
++			return release, reservation.ReservationID, nil
++		case "aborted":
++			release(mordeQuotaAbortedOutcome)
++		case "aborting":
++			release(mordeQuotaUnknown)
++			return nil, "", mordeQuotaUnknownError("reserve", errors.New("reservation abort is still in progress"))
++		default:
++			release(mordeQuotaUnknown)
++			return nil, "", mordeQuotaUnknownError("reserve", fmt.Errorf("unexpected reservation state %q", reservation.State))
++		}
++	}
++}
++
++func newMordeQuotaClient(socketPath, workspaceID, folderID string) *mordeQuotaClient {
++	if socketPath == "" {
++		return nil
++	}
++	transport := &http.Transport{
++		Proxy: nil,
++		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
++			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
++		},
++	}
++	return &mordeQuotaClient{
++		workspaceID: workspaceID, folderID: folderID,
++		client: &http.Client{
++			Transport: transport,
++			CheckRedirect: func(*http.Request, []*http.Request) error {
++				return http.ErrUseLastResponse
++			},
++		},
++	}
++}
++
++// acquire serializes Workspace mutations. Unknown results keep the same attempt
++// ID; a confirmed abort advances the deterministic attempt ID for the next try.
++func (s *mordeQuotaSerial) acquire(ctx context.Context, baseID string) (func(mordeQuotaOutcome), string, error) {
++	for {
++		s.mut.Lock()
++		if s.changed == nil {
++			s.changed = make(chan struct{})
++		}
++		if s.attempts == nil {
++			s.attempts = make(map[string]uint64)
++		}
++		operationID := mordeQuotaAttemptID(baseID, s.attempts[baseID])
++		if s.active == "" {
++			s.active = baseID
++			s.activeID = operationID
++		}
++		if s.active == baseID && s.activeID == operationID && !s.busy {
++			s.busy = true
++			s.mut.Unlock()
++			var once sync.Once
++			return func(outcome mordeQuotaOutcome) {
++				once.Do(func() {
++					s.mut.Lock()
++					s.busy = false
++					if outcome == mordeQuotaAbortedOutcome {
++						s.attempts[baseID]++
++					}
++					if outcome != mordeQuotaUnknown && s.active == baseID && s.activeID == operationID {
++						s.active = ""
++						s.activeID = ""
++					}
++					close(s.changed)
++					s.changed = make(chan struct{})
++					s.mut.Unlock()
++				})
++			}, operationID, nil
++		}
++		if s.active != "" && s.active != baseID && !s.busy {
++			s.mut.Unlock()
++			return nil, "", errMordeQuotaUnresolvedOperation
++		}
++		if s.active == baseID && !s.busy && s.activeID != operationID {
++			s.activeID = operationID
++			s.mut.Unlock()
++			continue
++		}
++		changed := s.changed
++		s.mut.Unlock()
++		select {
++		case <-ctx.Done():
++			return nil, "", ctx.Err()
++		case <-changed:
++		}
++	}
++}
++
++func mordeQuotaAttemptID(baseID string, attempt uint64) string {
++	if attempt == 0 {
++		return baseID
++	}
++	// Later IDs distinguish fresh attempts after the server confirms rollback.
++	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", baseID, attempt)))
++	return hex.EncodeToString(hash[:])
++}
++
++func mordeQuotaOperationID(folderID string, file protocol.FileInfo, operation string) string {
++	type block struct {
++		Hash string `json:"hash"`
++		Size int    `json:"size"`
++	}
++	blocks := make([]block, len(file.Blocks))
++	for i, value := range file.Blocks {
++		blocks[i] = block{Hash: hex.EncodeToString(value.Hash), Size: value.Size}
++	}
++	value := struct {
++		FolderID    string  `json:"folder_id"`
++		Path        string  `json:"path"`
++		Operation   string  `json:"operation"`
++		Type        int32   `json:"type"`
++		Deleted     bool    `json:"deleted"`
++		Size        int64   `json:"size"`
++		ModifiedS   int64   `json:"modified_s"`
++		ModifiedNs  int32   `json:"modified_ns"`
++		ModifiedBy  uint64  `json:"modified_by"`
++		Version     string  `json:"version"`
++		Permissions uint32  `json:"permissions"`
++		NoPerms     bool    `json:"no_permissions"`
++		Blocks      []block `json:"blocks"`
++	}{
++		FolderID: folderID, Path: file.Name, Operation: operation, Type: int32(file.Type), Deleted: file.Deleted,
++		Size: file.Size, ModifiedS: file.ModifiedS, ModifiedNs: file.ModifiedNs,
++		ModifiedBy: uint64(file.ModifiedBy), Version: file.Version.String(),
++		Permissions: file.Permissions, NoPerms: file.NoPermissions, Blocks: blocks,
++	}
++	encoded, _ := json.Marshal(value)
++	hash := sha256.Sum256(encoded)
++	return hex.EncodeToString(hash[:])
++}
++
++func (c *mordeQuotaClient) reserve(ctx context.Context, file protocol.FileInfo, operation string, size int64, operationID string) (mordeQuotaReservation, error) {
++	if c == nil || c.workspaceID == "" || !validMordeQuotaFolderID(c.folderID) || (operation != "upsert" && operation != "delete") || size < 0 || operation == "delete" && size != 0 {
++		return mordeQuotaReservation{}, errors.New("invalid Morde quota reservation")
++	}
++	value := mordeQuotaRequest{
++		WorkspaceID: c.workspaceID, FolderID: c.folderID, OperationID: operationID,
++		Path: file.Name, Operation: operation, SizeBytes: size,
++	}
++	encoded, err := json.Marshal(value)
++	if err != nil {
++		return mordeQuotaReservation{}, fmt.Errorf("encode Morde quota reservation: %w", err)
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://morde/v1/reservations", strings.NewReader(string(encoded)))
++	if err != nil {
++		return mordeQuotaReservation{}, fmt.Errorf("create Morde quota reservation request: %w", err)
++	}
++	request.Header.Set("Content-Type", "application/json")
++	response, err := c.client.Do(request)
++	if err != nil {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError("reserve", err)
++	}
++	defer response.Body.Close()
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		body, _ := io.ReadAll(io.LimitReader(response.Body, mordeQuotaResponseLimit))
++		detail := strings.TrimSpace(string(body))
++		err := fmt.Errorf("Morde quota reservation returned HTTP %d", response.StatusCode)
++		if detail != "" {
++			err = fmt.Errorf("%w: %s", err, detail)
++		}
++		if response.StatusCode >= 500 || response.StatusCode == http.StatusRequestTimeout {
++			return mordeQuotaReservation{}, mordeQuotaUnknownError("reserve", err)
++		}
++		return mordeQuotaReservation{}, err
++	}
++	var result mordeQuotaReservation
++	decoder := json.NewDecoder(io.LimitReader(response.Body, mordeQuotaResponseLimit))
++	if err := decoder.Decode(&result); err != nil {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError("decode reservation", err)
++	}
++	if result.ReservationID == "" || !validQuotaRevision(result.BaseRevision) || result.State == "" {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError("validate reservation", errors.New("invalid reservation receipt"))
++	}
++	return result, nil
++}
++
++func validMordeQuotaFolderID(value string) bool {
++	return len(value) == 38 && strings.HasPrefix(value, "morde-") && strings.Trim(value[6:], "0123456789abcdef") == ""
++}
++
++func (c *mordeQuotaClient) settle(ctx context.Context, reservationID string) error {
++	receipt, err := c.receipt(ctx, reservationID, "settle")
++	if err != nil {
++		return err
++	}
++	switch receipt.State {
++	case "settled":
++		return nil
++	case "aborted":
++		return errMordeQuotaAborted
++	default:
++		return mordeQuotaUnknownError("settle", fmt.Errorf("unexpected reservation state %q", receipt.State))
++	}
++}
++
++func (f *sendReceiveFolder) settleMordeQuota(reservationID string) error {
++	if f.mordeQuotaClient == nil {
++		return nil
++	}
++	ctx, cancel := mordeQuotaContext()
++	defer cancel()
++	return f.mordeQuotaClient.settle(ctx, reservationID)
++}
++
++func (c *mordeQuotaClient) abort(ctx context.Context, reservationID string) (mordeQuotaOutcome, error) {
++	receipt, err := c.receipt(ctx, reservationID, "abort")
++	if err != nil {
++		return mordeQuotaUnknown, err
++	}
++	switch receipt.State {
++	case "aborted":
++		return mordeQuotaAbortedOutcome, nil
++	case "settled":
++		return mordeQuotaComplete, nil
++	default:
++		return mordeQuotaUnknown, mordeQuotaUnknownError("abort", fmt.Errorf("unexpected reservation state %q", receipt.State))
++	}
++}
++
++func (c *mordeQuotaClient) receipt(ctx context.Context, reservationID, action string) (mordeQuotaReservation, error) {
++	if c == nil || reservationID == "" || (action != "settle" && action != "abort") {
++		return mordeQuotaReservation{}, errors.New("invalid Morde quota receipt request")
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
++		"http://morde/v1/reservations/"+url.PathEscape(reservationID)+"/"+action, nil)
++	if err != nil {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError(action, err)
++	}
++	response, err := c.client.Do(request)
++	if err != nil {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError(action, err)
++	}
++	defer response.Body.Close()
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, mordeQuotaResponseLimit))
++		return mordeQuotaReservation{}, mordeQuotaUnknownError(action, fmt.Errorf("Morde quota %s returned HTTP %d", action, response.StatusCode))
++	}
++	var result mordeQuotaReservation
++	decoder := json.NewDecoder(io.LimitReader(response.Body, mordeQuotaResponseLimit))
++	if err := decoder.Decode(&result); err != nil {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError(action, err)
++	}
++	if result.ReservationID != reservationID || result.State == "" || !validQuotaRevision(result.BaseRevision) {
++		return mordeQuotaReservation{}, mordeQuotaUnknownError(action, errors.New("invalid reservation receipt"))
++	}
++	return result, nil
++}
++
++func validQuotaRevision(revision json.RawMessage) bool {
++	value := strings.TrimSpace(string(revision))
++	return value != "" && value != "null"
++}
++
++func mordeQuotaUnknownError(action string, cause error) error {
++	return fmt.Errorf("%w: %s: %v", errMordeQuotaResultUnknown, action, cause)
++}
++
++func mordeQuotaContext() (context.Context, context.CancelFunc) {
++	return context.WithTimeout(context.Background(), 10*time.Minute)
++}
+diff --git a/lib/mordequota/quota.go b/lib/mordequota/quota.go
+new file mode 100644
+index 000000000..2d88abb63
+--- /dev/null
++++ b/lib/mordequota/quota.go
+@@ -0,0 +1,273 @@
++// Package mordequota prototypes admission accounting for one Workspace.
++package mordequota
++
++import (
++	"errors"
++	"io/fs"
++	"strings"
++	"sync"
++)
++
++const (
++	MaxFileBytes      int64 = 300 << 20
++	MaxWorkspaceBytes int64 = 5 << 30
++)
++
++var (
++	ErrInvalidFile         = errors.New("invalid file path or size")
++	ErrFileTooLarge        = errors.New("file exceeds workspace single-file limit")
++	ErrWorkspaceFull       = errors.New("workspace exceeds logical size limit")
++	ErrPathBusy            = errors.New("workspace path already has a reservation")
++	ErrFileNotFound        = errors.New("workspace file does not exist")
++	ErrDestinationExists   = errors.New("workspace rename destination already exists")
++	ErrInvalidRename       = errors.New("workspace rename source and destination must differ")
++	ErrExclusionUnverified = errors.New("workspace exclusion is not verified inaccessible")
++	ErrInvalidReservation  = errors.New("reservation is not active")
++	ErrReservationLimit    = errors.New("reservation ID space exhausted")
++)
++
++// Ledger is a process-local prototype. The caller must supply an authoritative,
++// normalized list of admitted regular files and serialize all writers through
++// one ledger. The ledger does not persist state or protect filesystem writes.
++// shortcut: process-local only; replace with durable shared reservations before production.
++type Ledger struct {
++	mu           sync.Mutex
++	files        map[string]int64
++	byPath       map[string]uint64
++	reservations map[uint64]candidate
++	committed    int64
++	reserved     int64
++	nextID       uint64
++}
++
++type candidate struct {
++	path     string
++	source   string
++	size     int64
++	increase int64
++	remove   bool
++	exclude  bool
++}
++
++// Reservation is valid only for the ledger that issued it and until settled.
++type Reservation struct {
++	ledger *Ledger
++	id     uint64
++}
++
++// Status counts logical file bytes; temporary data and excluded files are not
++// included. ReservedBytes includes pending increases, not pending decreases.
++type Status struct {
++	CommittedBytes int64
++	ReservedBytes  int64
++	Pending        int
++}
++
++// New starts from a verified, complete snapshot of currently admitted files.
++// After restart, reconcile all previously pending filesystem outcomes first.
++func New(files map[string]int64) (*Ledger, error) {
++	l := &Ledger{
++		files:        make(map[string]int64, len(files)),
++		byPath:       make(map[string]uint64),
++		reservations: make(map[uint64]candidate),
++	}
++	for path, size := range files {
++		if err := validateFile(path, size); err != nil {
++			return nil, err
++		}
++		if size > MaxWorkspaceBytes-l.committed {
++			return nil, ErrWorkspaceFull
++		}
++		l.files[path] = size
++		l.committed += size
++	}
++	return l, nil
++}
++
++func validateFile(path string, size int64) error {
++	if !validPath(path) || size < 0 {
++		return ErrInvalidFile
++	}
++	if size > MaxFileBytes {
++		return ErrFileTooLarge
++	}
++	return nil
++}
++
++func validPath(path string) bool {
++	return path != "." && fs.ValidPath(path) && !strings.ContainsAny(path, "\\:\x00")
++}
++
++// ReserveFile reserves a candidate's positive size delta before it is written.
++// Paths must already be normalized and validated by the receiving boundary.
++func (l *Ledger) ReserveFile(path string, size int64) (Reservation, error) {
++	if err := validateFile(path, size); err != nil {
++		return Reservation{}, err
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if _, busy := l.byPath[path]; busy {
++		return Reservation{}, ErrPathBusy
++	}
++	increase := max(int64(0), size-l.files[path])
++	if increase > MaxWorkspaceBytes-l.committed-l.reserved {
++		return Reservation{}, ErrWorkspaceFull
++	}
++	return l.reserve(candidate{path: path, size: size, increase: increase})
++}
++
++// ReserveRemoval blocks competing writes until the caller confirms deletion.
++func (l *Ledger) ReserveRemoval(path string) (Reservation, error) {
++	return l.reserveRetirement(path, false)
++}
++
++// ReserveExclusion keeps the old size charged until CommitExclusion confirms
++// the old copy cannot be read or propagated through the workspace.
++func (l *Ledger) ReserveExclusion(path string) (Reservation, error) {
++	return l.reserveRetirement(path, true)
++}
++
++func (l *Ledger) reserveRetirement(path string, exclude bool) (Reservation, error) {
++	if !validPath(path) {
++		return Reservation{}, ErrInvalidFile
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if _, busy := l.byPath[path]; busy {
++		return Reservation{}, ErrPathBusy
++	}
++	if _, exists := l.files[path]; !exists {
++		return Reservation{}, ErrFileNotFound
++	}
++	return l.reserve(candidate{path: path, remove: true, exclude: exclude})
++}
++
++// ReserveRename reserves both paths without charging for a second copy. The
++// caller must enforce an atomic, non-overwriting rename or equivalent boundary.
++func (l *Ledger) ReserveRename(source, destination string) (Reservation, error) {
++	if !validPath(source) || !validPath(destination) {
++		return Reservation{}, ErrInvalidFile
++	}
++	if source == destination {
++		return Reservation{}, ErrInvalidRename
++	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if _, busy := l.byPath[source]; busy {
++		return Reservation{}, ErrPathBusy
++	}
++	if _, busy := l.byPath[destination]; busy {
++		return Reservation{}, ErrPathBusy
++	}
++	if _, exists := l.files[source]; !exists {
++		return Reservation{}, ErrFileNotFound
++	}
++	if _, exists := l.files[destination]; exists {
++		return Reservation{}, ErrDestinationExists
++	}
++	return l.reserve(candidate{path: destination, source: source})
++}
++
++// reserve is called only with mu held.
++func (l *Ledger) reserve(c candidate) (Reservation, error) {
++	if l.nextID == ^uint64(0) {
++		return Reservation{}, ErrReservationLimit
++	}
++	l.nextID++
++	l.byPath[c.path] = l.nextID
++	if c.source != "" {
++		l.byPath[c.source] = l.nextID
++	}
++	l.reservations[l.nextID] = c
++	l.reserved += c.increase
++	return Reservation{ledger: l, id: l.nextID}, nil
++}
++
++// Commit must be called only after the corresponding filesystem operation has
++// been durably confirmed. A failed write or rename must not call Commit.
++func (l *Ledger) Commit(r Reservation) error {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	c, ok := l.pending(r)
++	if !ok {
++		return ErrInvalidReservation
++	}
++	if c.exclude {
++		return ErrExclusionUnverified
++	}
++	switch {
++	case c.source != "":
++		l.files[c.path] = l.files[c.source]
++		delete(l.files, c.source)
++	case c.remove:
++		l.committed -= l.files[c.path]
++		delete(l.files, c.path)
++	default:
++		l.committed -= l.files[c.path]
++		l.files[c.path] = c.size
++		l.committed += c.size
++	}
++	l.finish(r.id, c)
++	return nil
++}
++
++// CommitExclusion requires a durable barrier to have made the old copy
++// inaccessible and to remain effective afterward. This in-memory prototype
++// cannot itself prove that a real filesystem or node honors the barrier.
++func (l *Ledger) CommitExclusion(r Reservation) error {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	c, ok := l.pending(r)
++	if !ok || !c.exclude {
++		return ErrInvalidReservation
++	}
++	l.committed -= l.files[c.path]
++	delete(l.files, c.path)
++	l.finish(r.id, c)
++	return nil
++}
++
++// Cancel releases a reservation only when no corresponding filesystem change
++// occurred. Unknown outcomes must be reconciled before releasing the quota.
++func (l *Ledger) Cancel(r Reservation) error {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	c, ok := l.pending(r)
++	if !ok {
++		return ErrInvalidReservation
++	}
++	l.finish(r.id, c)
++	return nil
++}
++
++func (l *Ledger) pending(r Reservation) (candidate, bool) {
++	if r.ledger != l || r.id == 0 {
++		return candidate{}, false
++	}
++	c, ok := l.reservations[r.id]
++	return c, ok
++}
++
++func (l *Ledger) finish(id uint64, c candidate) {
++	delete(l.reservations, id)
++	delete(l.byPath, c.path)
++	if c.source != "" {
++		delete(l.byPath, c.source)
++	}
++	l.reserved -= c.increase
++}
++
++// Status returns a consistent accounting snapshot.
++func (l *Ledger) Status() Status {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return Status{CommittedBytes: l.committed, ReservedBytes: l.reserved, Pending: len(l.reservations)}
++}
++
++// FileSize reports the last committed size, not an in-flight candidate.
++func (l *Ledger) FileSize(path string) (int64, bool) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	size, ok := l.files[path]
++	return size, ok
++}

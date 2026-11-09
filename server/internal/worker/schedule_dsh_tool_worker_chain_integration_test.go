@@ -164,7 +164,7 @@ func TestDSHScheduleToolCreatesDurableWorkAfterTheInitiatingRequestEnds(t *testi
 		cancelRequest()
 		t.Fatalf("resolve local Node path: %v", err)
 	}
-	script, err := filepath.Abs(filepath.Join("..", "..", "..", "project", "nanoMuse", "harness", "morde-cloud-runtime", "bin.mjs"))
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
 	if err != nil {
 		cancelRequest()
 		t.Fatalf("resolve local DSH entrypoint: %v", err)
@@ -491,7 +491,7 @@ func TestGoalBlockedOptInRunsOneShotScheduleThroughDSHOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve local Node path: %v", err)
 	}
-	script, err := filepath.Abs(filepath.Join("..", "..", "..", "project", "nanoMuse", "harness", "morde-cloud-runtime", "bin.mjs"))
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
 	if err != nil {
 		t.Fatalf("resolve local DSH entrypoint: %v", err)
 	}

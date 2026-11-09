@@ -137,7 +137,7 @@ func TestAccountRuntimePostgresAndRealNodeContinueAfterFirstTaskContextEnds(t *t
 	if err != nil {
 		t.Skip("local Node is unavailable")
 	}
-	script, err := filepath.Abs(filepath.Join("..", "..", "..", "project", "nanoMuse", "harness", "morde-cloud-runtime", "bin-account.mjs"))
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin-account.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestAccountRuntimePostgresAndRealNodeRecoverAfterManagerRestart(t *testing.
 	if err != nil {
 		t.Skip("local Node is unavailable")
 	}
-	script, err := filepath.Abs(filepath.Join("..", "..", "..", "project", "nanoMuse", "harness", "morde-cloud-runtime", "bin-account.mjs"))
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin-account.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}

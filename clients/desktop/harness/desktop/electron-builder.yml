@@ -1,0 +1,63 @@
+appId: io.morde.client
+productName: Morde
+executableName: morde-client
+copyright: Copyright (C) 2026 nanoMuse contributors and Morde contributors
+directories:
+  output: dist
+  buildResources: resources
+files:
+  - out/morde-*.js
+  - resources/morde.html
+  - resources/morde.css
+  - resources/morde.js
+  - resources/morde-icon.png
+  - package.json
+extraResources:
+  - from: bin
+    to: bin
+    filter: ["morde-sync", "morde-sync.exe", "morde-sync.sha256", "morde-syncthing", "morde-syncthing.exe", "morde-syncthing.sha256"]
+  - from: ../../../nanoMuse/LICENSE
+    to: legal/LICENSE.nanoMuse
+  - from: ../../../nanoMuse/NOTICE
+    to: legal/NOTICE.nanoMuse
+  - from: ../../../nanoMuse/THIRD_PARTY_NOTICES.md
+    to: legal/THIRD_PARTY_NOTICES.nanoMuse.md
+  - from: ../../../../runtime/morde-sync/LICENSE
+    to: legal/LICENSE.morde-sync
+  - from: resources/LICENSE.syncthing.txt
+    to: legal/LICENSE.syncthing.txt
+  - from: resources/THIRD_PARTY_NOTICES.syncthing.md
+    to: legal/THIRD_PARTY_NOTICES.syncthing.md
+  - from: resources/THIRD_PARTY_NOTICES.morde-sync.md
+    to: legal/THIRD_PARTY_NOTICES.morde-sync.md
+  - from: resources/MORDE_NOTICE.txt
+    to: legal/MORDE_NOTICE.txt
+asar: true
+compression: normal
+npmRebuild: false
+nodeGypRebuild: false
+publish: null
+afterPack: scripts/after-pack.cjs
+linux:
+  target: [AppImage]
+  artifactName: morde-desktop-${version}-linux-x64.${ext}
+  syncDesktopName: true
+  icon: resources/morde-icon.png
+  category: Utility
+  synopsis: Morde desktop client
+win:
+  target: [nsis]
+  artifactName: morde-desktop-${version}-windows-${arch}.${ext}
+  icon: resources/morde-icon.png
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: Morde
+mac:
+  target: [dmg]
+  artifactName: morde-desktop-${version}-macos-${arch}.${ext}
+  icon: resources/morde-icon.png
+  category: public.app-category.productivity
+  hardenedRuntime: false
+  identity: null

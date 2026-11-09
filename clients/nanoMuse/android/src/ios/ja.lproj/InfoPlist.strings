@@ -1,0 +1,26 @@
+/* Info.plist permission strings — 日本語 */
+
+"NSLocationWhenInUseUsageDescription" = "Morde はセッション履歴のために、エージェントセッションの開始位置を記録します。";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Morde はバックグラウンドでエージェントタスクを実行し続けるために、バックグラウンド位置情報を使用します。位置データはセッション接続履歴の記録にのみ使用されます。";
+"NSCalendarsUsageDescription" = "Morde はAIエージェントがあなたの予定を確認し、空き状況をチェックし、代わりにイベントを作成できるようにカレンダーへのアクセスを使用します。";
+"NSCalendarsFullAccessUsageDescription" = "Morde はAIエージェントがあなたの予定を確認し、空き状況をチェックし、代わりにイベントを作成できるようにカレンダーへのアクセスを使用します。";
+"NSRemindersUsageDescription" = "Morde はAIエージェントがリマインダーを検索・作成できるようにリマインダーへのアクセスを使用します。";
+"NSRemindersFullAccessUsageDescription" = "Morde はAIエージェントがリマインダーを検索・作成できるようにリマインダーへのアクセスを使用します。";
+"NSCameraUsageDescription" = "Morde はAI会話用の写真を撮影するためにカメラへのアクセスが必要です。";
+"NSPhotoLibraryUsageDescription" = "Morde はAI会話に画像を添付するためにフォトライブラリへのアクセスが必要です。";
+"NSPhotoLibraryAddUsageDescription" = "Morde は動画や画像をフォトライブラリに保存するための許可が必要です。";
+"NSHealthShareUsageDescription" = "Morde はAIエージェントが歩数、心拍数、睡眠、ワークアウトなどの健康データを読み取れるようにヘルスケアへのアクセスを使用します。";
+"NSHealthUpdateUsageDescription" = "Morde はAIエージェントが歩数、体重、水分摂取量などの健康データを記録できるようにヘルスケアの書き込みアクセスを使用します。";
+"NSContactsUsageDescription" = "Morde はAIエージェントが連絡先を検索、閲覧、管理できるように連絡先へのアクセスを使用します。";
+"NSAppleMusicUsageDescription" = "Morde はAIエージェントがミュージックライブラリを検索し、再生を操作できるようにメディアライブラリへのアクセスを使用します。";
+"NSMicrophoneUsageDescription" = "Morde はチャットでの音声テキスト入力のためにマイクへのアクセスが必要です。";
+"NSSpeechRecognitionUsageDescription" = "Morde は音声をテキストメッセージに変換するために音声認識を使用します。";
+"NSHomeKitUsageDescription" = "Morde はAIエージェントがスマートホームアクセサリを操作・制御できるようにHomeKitへのアクセスを使用します。";
+"NSAlarmKitUsageDescription" = "Morde はAIエージェントがアラームやタイマーを設定できるようにAlarmKitを使用します。";
+"NSLocalNetworkUsageDescription" = "Morde はデバッグサーバーのため、また AI エージェントがあなたのネットワーク上のサービスにアクセスできるようにローカルネットワークを使用します。"; /* Morde: the app has no VM; the sentence matches Info.plist */
+
+/* Morde: the keys Info.plist declares but this file lacked, so the prompt is in the person's language */
+"NFCReaderUsageDescription" = "Morde は NFC を使用し、AI エージェントがあなたに代わって NFC タグを読み書きできるようにします。";
+"NSBluetoothAlwaysUsageDescription" = "Morde は Bluetooth を使用し、AI エージェントがあなたに代わって近くの BLE デバイスを検索・接続・通信できるようにします。";
+"NSBluetoothPeripheralUsageDescription" = "Morde は Bluetooth を使用し、AI エージェントがあなたに代わって近くの BLE デバイスを検索・接続・通信できるようにします。";
+"NSFaceIDUsageDescription" = "Morde は Face ID を使用してロックされたチャットセッションを保護し、あなただけが内容を見られるようにします。";

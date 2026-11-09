@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' file: data:">
+<title>Morde</title>
+<style>
+  /* The splash: the nanoMuse logo (logo.png — the N mark on its white tile, docs/brand.md)
+     inside a quiet loading ring, the wordmark, one line of status. No character and no face
+     here — the logo is the app's, whoever the agent looks like. The error state keeps the
+     layout and shows what went wrong. */
+  :root { color-scheme: light dark; --fg: #1b1b1f; --muted: #6b6f76; --bg: #f9f9f9; --err: #b3261e; --ring: #0064d4; --track: rgba(127,127,127,0.18); }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f1f1f4; --muted: #9a9ea6; --bg: #171717; --ring: #5aa2ff; --track: rgba(255,255,255,0.14); } }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; -webkit-app-region: drag; user-select: none; }
+  .card { text-align: center; max-width: 420px; padding: 24px; }
+  .mark { position: relative; width: 96px; height: 96px; margin: 0 auto 18px; }
+  .mark img { position: absolute; left: 16px; top: 16px; width: 64px; height: 64px; display: block; }
+  .ring { position: absolute; inset: 0; border-radius: 50%; border: 3px solid var(--track); border-top-color: var(--ring); animation: spin 1.1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .ring { animation: none; border-top-color: var(--track); } }
+  h1 { font-size: 24px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  p { margin: 0; color: var(--muted); }
+  .error { display: none; color: var(--err); white-space: pre-wrap; text-align: left; font-size: 13px; margin-top: 12px; -webkit-app-region: no-drag; user-select: text; }
+  .failed .ring { animation: none; border-color: var(--track); }
+  .failed .error { display: block; }
+  /* The slow start (src/host-start.ts): one plain sentence and the Host's last lines, so the
+     person sees the start is moving rather than a ring that never ends. */
+  .slow { display: none; font-size: 13px; margin-top: 10px; }
+  .tail { display: none; text-align: left; font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 9em; overflow-y: auto; margin-top: 10px; -webkit-app-region: no-drag; user-select: text; }
+  .waiting .slow { display: block; }
+  .waiting .tail { display: block; }
+  .failed .slow, .failed .tail { display: none; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="mark" aria-hidden="true"><span class="ring"></span><img src="logo.png" alt=""></div>
+    <h1>Morde</h1>
+    <p id="line" role="status"></p>
+    <p id="slow" class="slow"></p>
+    <pre id="tail" class="tail"></pre>
+    <p id="error" class="error"></p>
+  </div>
+  <script>
+    (function () {
+      var params = new URLSearchParams(location.search);
+      var zh = params.get("lang") === "zh" || (!params.get("lang") && /^zh/i.test(navigator.language));
+      var line = document.getElementById("line");
+      var slow = document.getElementById("slow");
+      var tail = document.getElementById("tail");
+      var error = document.getElementById("error");
+      line.textContent = zh ? "正在启动" : "Starting";
+      // after two minutes without the host's address, while its process runs (src/host-start.ts)
+      window.__slow = function (lines) {
+        if (document.body.classList.contains("failed")) return;
+        document.body.classList.add("waiting");
+        line.textContent = zh ? "还在启动" : "Still starting";
+        slow.textContent = zh
+          ? "第一次启动可能要几分钟：系统会把应用的每个文件检查一遍。后台最近的输出："
+          : "The first start can take a few minutes: the system checks each of the app's files once. The last lines from the host:";
+        tail.textContent = Array.isArray(lines) && lines.length ? lines.join("\n") : (zh ? "（还没有输出）" : "(nothing yet)");
+        tail.scrollTop = tail.scrollHeight;
+      };
+      window.__failed = function (message) {
+        document.body.classList.remove("waiting");
+        document.body.classList.add("failed");
+        line.textContent = zh ? "没能启动" : "Could not start";
+        error.textContent = message || "";
+      };
+    })();
+  </script>
+</body>
+</html>

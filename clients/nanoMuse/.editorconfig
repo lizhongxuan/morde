@@ -1,0 +1,49 @@
+# Editor defaults that match what the tree already uses; nothing here reformats a file,
+# it only tells an editor what to do with the lines you touch. Ruff (Python), the
+# Kotlin and Swift conventions and the two-space TypeScript, YAML and Markdown are
+# the ones in use. https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Python: Ruff, line length 100 (pyproject.toml, cloud/pyproject.toml)
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+# Kotlin, Gradle, Swift, Objective-C
+[*.{kt,kts,swift,m,mm,h}]
+indent_size = 4
+
+# Markdown: two trailing spaces are a line break
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows batch files are CRLF by nature
+[*.bat]
+end_of_line = crlf
+
+# Upstream vendored trees keep their own conventions
+[android/deps/**]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+indent_style = unset
+indent_size = unset
+
+[android/src/android/app/src/main/cpp/**]
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = unset
+
+[android/src/ios/Vendor/**]
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = unset

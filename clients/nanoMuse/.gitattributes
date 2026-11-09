@@ -1,0 +1,8 @@
+*.sh text eol=lf
+android/deps/*.sh text eol=lf
+android/src/ios/** text=auto eol=lf
+*.png binary
+*.webp binary
+*.mp4 binary
+*.woff2 binary
+*.icns binary

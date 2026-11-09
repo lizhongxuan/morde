@@ -1,0 +1,3 @@
+[submodule "nanoMuse-android-deps-ish"]
+	path = clients/nanoMuse/android/deps/ish
+	url = https://github.com/OpenMinis/ish-arm64.git

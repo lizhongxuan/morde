@@ -329,7 +329,7 @@ class DeploymentTests(unittest.TestCase):
         gates = (ROOT / "verify/05-automated.sh").read_text()
         package = json.loads((ROOT.parents[1] / "web/portal/package.json").read_text())
         self.assertIn("npm run build", gates)
-        self.assertIn("project/nanoMuse/web run build", package["scripts"]["build"])
+        self.assertIn("web/mobile run build", package["scripts"]["build"])
 
     def test_installer_accepts_only_existing_local_docker_socket(self):
         installer = (ROOT / "install-portal-service.sh").read_text()

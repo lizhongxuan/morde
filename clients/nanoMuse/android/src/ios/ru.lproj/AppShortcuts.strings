@@ -1,0 +1,10 @@
+/* Siri invocation phrases for MinisShortcutsProvider (AppShortcuts), Russian.
+   Keys must match the English phrases exactly, with `\(.applicationName)`
+   spelled `${applicationName}`. Legacy .strings format (not .xcstrings)
+   because the deployment target is iOS 16. */
+
+"Get ${applicationName} session status" = "Статус сессии ${applicationName}";
+"Check ${applicationName} task" = "Проверить задачу ${applicationName}";
+"List ${applicationName} sessions" = "Список сессий ${applicationName}";
+"Show ${applicationName} chats" = "Показать чаты ${applicationName}";
+"Open a ${applicationName} session" = "Открыть сессию ${applicationName}";

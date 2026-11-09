@@ -1,0 +1,12 @@
+Morde Desktop
+Copyright (C) 2026 Morde contributors
+
+This desktop application modifies the nanoMuse Electron desktop shell.
+The nanoMuse source is licensed under GPL-3.0-or-later. Its LICENSE,
+NOTICE and third-party notices accompany this application in legal/.
+
+The application also bundles the separately built morde-sync program.
+Its source is in runtime/morde-sync in the Morde repository.
+Its Go dependency notices accompany the application in legal/.
+The morde-sync source license has not been identified; public distribution
+requires resolving that source license and reviewing all bundled notices.

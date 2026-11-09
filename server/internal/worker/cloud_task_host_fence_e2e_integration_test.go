@@ -197,7 +197,7 @@ func TestCloudTaskActiveHostOperationWaitsForTakeoverStopProof(t *testing.T) {
 	if err != nil {
 		t.Skip("local Node is unavailable; the real dsh subprocess cannot run")
 	}
-	script, err := filepath.Abs(filepath.Join("..", "..", "..", "project", "nanoMuse", "harness", "morde-cloud-runtime", "bin.mjs"))
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}

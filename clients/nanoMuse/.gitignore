@@ -1,0 +1,41 @@
+# macOS and Xcode
+.DS_Store
+**/xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+DerivedData/
+android/src/ios/build/
+android/src/ios/Generated/
+android/src/ios/Configs/ProviderCustomization.xcconfig
+*.ipa
+*.dSYM
+*.dSYM.zip
+Pods/
+.build/
+.swiftpm/
+Package.resolved
+
+# iOS native dependency build outputs
+android/deps/build/
+android/deps/libs/
+android/deps/include/
+android/deps/resources/
+android/deps/frameworks/
+android/deps/lame-build/
+android/deps/ffmpeg-6.1.2/
+android/deps/ish/build-ios/
+android/deps/ish/build-native/
+android/deps/.cache/
+android/deps/alpine/
+
+# Local credentials
+.env
+.env.*
+*.env
+android/src/ios/fastlane/.env
+android/src/ios/fastlane/appstore-keys/

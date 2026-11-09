@@ -1,0 +1,92 @@
+# The dsh-nanomuse bundle layer: nanoMuse on DeepSeek Harness.
+#
+# Applied after @deepseek-ai/dsh-base (and dsh-web-app in the web profile);
+# the profile's own cordis.patch.yml still comes after this, so everything here
+# can be overridden by the person running it. A patch replaces a row's whole
+# `config`, so the rows restated below carry every key they need.
+
+# The agent is nanoMuse, not "an AI agent powered by …". The row id is the one
+# dsh-base and dsh-web-app use, so this replaces their persona text; the stock
+# identity line is switched off and the persona names the base it runs on.
+- id: system-prompt
+  config:
+    includeHarnessIdentity: false
+    personaPrefix: >-
+      You are nanoMuse, an open-source personal agent that lives on this person's
+      own devices, built on DeepSeek Harness. You speak plainly and briefly, in
+      the language the person writes in, and you say what you did rather than
+      what you are about to do. You never pretend a step succeeded. When
+      something needs the person's hand — a password, a payment, a code — you
+      say so and wait.
+    personaSuffix: Your working directory is {{cwd}}.
+
+# Web sessions compose from an agent preset, and a preset's own persona wins
+# over the row above. Ours is declared in presets/nanomuse.patch.yml; new
+# sessions start from it (the person can still pick Standard or PTC).
+- id: agent-preset-registry
+  config:
+    default: nanomuse
+
+# The sidebar's brand seats are ours; the official occupant steps aside (two
+# occupants at the same rank throw). "Built on DeepSeek Harness" stays in the
+# About text — only the product name on screen changes, as the brand guidelines ask.
+- id: ui-brand-official
+  disabled: true
+
+# The left column is ours: an icon rail (Chats, Search, Feed, Ideas, Goals,
+# Library, Devices, the hamburger) beside the harness's own chats browser. The stock
+# sidebar steps aside; our occupant declares the same seven child seats, so the
+# brand mark, panel glyphs, workspace browser, settings shell and footer
+# actions all mount exactly as before.
+- id: ui-sidebar
+  disabled: true
+
+# The settings dialog is ours as well — a grouped nav, the everyday pages
+# first and the harness's other pages under Advanced. Our shell declares the
+# same settings seats, and its General page declares the rows seat, so every
+# plugin's section and row mounts as before.
+- id: ui-settings-general
+  disabled: true
+
+# The stock Windows PowerShell sandbox assumes its host owns a console. Electron's
+# Node-mode Host does not, so the nanoMuse provider below inserts a short-lived
+# console trampoline before the restricted ACL child starts (#526). Both rows
+# remain off on macOS and Linux, where the base profile uses bash.
+- id: pwsh-sandbox
+  disabled: true
+
+- insert:
+    - id: nanomuse-windows-pwsh-sandbox
+      name: dsh-nanomuse/windows-pwsh-sandbox
+      disabled: !!js process.platform !== 'win32'
+
+    # The browser half rides on this row (sidebar mark and name, hero mark,
+    # the Cloud settings section); the host side serves the face's stills.
+    - id: nanomuse
+      name: dsh-nanomuse
+
+    # One account, every device: sign-in, the account's models as the
+    # `nanomuse` provider of llm-pi-ai, the key in the credential store.
+    - id: nanomuse-cloud
+      name: dsh-nanomuse/cloud
+      config:
+        baseURL: !!js process.env.NANOMUSE_CLOUD_URL || 'https://cloud.nanomuse.cn'
+        deviceName: ''
+        statePath: ''
+
+    # The rooms of the Muse desktop — Feed, Ideas, Goals, Library — over the
+    # harness's own sessions, Schedule and `present`: one store in
+    # $DSH_HOME/nanomuse/rooms.json, served under /nanomuse/rooms/*. The tools
+    # the agent uses to write into them are the preset row
+    # `nanomuse-rooms-tools` (presets/nanomuse.patch.yml).
+    - id: nanomuse-rooms
+      name: dsh-nanomuse/rooms
+
+    # Connectors: third-party services over their remote MCP servers (OAuth
+    # where the server speaks the MCP authorization flow, a key where it wants
+    # one), connected from Settings → Connectors. Credentials in
+    # $DSH_HOME/nanomuse/connectors.json; a loopback proxy of this row carries
+    # them, and the preset row `nanomuse-connectors-tools` mounts one MCP
+    # client per connection in every chat.
+    - id: nanomuse-connectors
+      name: dsh-nanomuse/connectors

@@ -1,0 +1,116 @@
+import { intlLocale, t } from "./i18n";
+
+export function timeShort(ts: string | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const time = d.toLocaleTimeString(intlLocale(), { hour: "2-digit", minute: "2-digit" });
+  if (sameDay) return time;
+  return `${d.toLocaleDateString(intlLocale(), { month: "short", day: "numeric" })} ${time}`;
+}
+
+/** The small centred time between groups of messages: "Today 9:02 AM", "Yesterday 4:01 PM", "Sep 12, 4:01 PM". */
+export function timeDivider(ts: string | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  const time = d.toLocaleTimeString(intlLocale(), { hour: "numeric", minute: "2-digit" });
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === now.toDateString()) return `${t("Today")} ${time}`;
+  if (d.toDateString() === yesterday.toDateString()) return `${t("Yesterday")} ${time}`;
+  return `${dateShort(ts)} ${time}`;
+}
+
+/** A date in the UI language: "Sep 12" / "9月12日", with the year when it is not this one. */
+export function dateShort(ts: string | null | undefined, opts: Intl.DateTimeFormatOptions = {}): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  const thisYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleDateString(intlLocale(), {
+    month: "short",
+    day: "numeric",
+    ...(thisYear ? {} : { year: "numeric" }),
+    ...opts,
+  });
+}
+
+/** "3 min ago" for the past, "in 2 h" / "in 9 d" for the future. */
+export function relativeTime(ts: string | null | undefined): string {
+  if (!ts) return "";
+  const diff = Date.now() - new Date(ts).getTime();
+  if (Number.isNaN(diff)) return "";
+  const s = Math.round(Math.abs(diff) / 1000);
+  if (s < 45) return diff >= 0 ? t("just now") : t("any moment");
+  const m = Math.round(s / 60);
+  const h = Math.round(m / 60);
+  const d = Math.round(h / 24);
+  const span = m < 60 ? t("{n} min", { n: m }) : h < 24 ? t("{n} h", { n: h }) : t("{n} d", { n: d });
+  return diff >= 0 ? t("{span} ago", { span }) : t("in {span}", { span });
+}
+
+/** The same for a Unix timestamp in seconds, the past only: "3 min ago", "2 h ago", "5 d ago", then the date. */
+export function relativeSeconds(ts: number): string {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return t("just now");
+  if (s < 3600) return t("{n} min ago", { n: Math.floor(s / 60) });
+  if (s < 86400) return t("{n} h ago", { n: Math.floor(s / 3600) });
+  if (s < 86400 * 7) return t("{n} d ago", { n: Math.floor(s / 86400) });
+  return new Date(ts * 1000).toLocaleDateString(intlLocale());
+}
+
+/**
+ * `localStorage` that never throws: a browser with storage off (private mode on some, a strict
+ * policy) answers `null` and forgets, and the page goes on. For one key read or written in passing;
+ * modules with a few keys of their own keep their own try/catch.
+ */
+export function readStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+export function writeStorage(key: string, value: string | null): void {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    /* storage is off: the value lasts for this page */
+  }
+}
+
+export function cx(...parts: Array<string | false | null | undefined>): string {
+  return parts.filter(Boolean).join(" ");
+}
+
+/** `decodeURIComponent` that gives the text back unchanged when it is not valid percent-encoding (a stray "%" in a link a model wrote). */
+export function safeDecodeURIComponent(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+export function truncate(text: string, n: number): string {
+  return text.length > n ? `${text.slice(0, n - 1)}…` : text;
+}
+
+export function fileKind(name: string): "text" | "code" | "html" | "image" | "pdf" | "data" | "event" | "other" {
+  const ext = name.toLowerCase().split(".").pop() ?? "";
+  if (ext === "ics") return "event";
+  if (["md", "txt", "log", "rtf"].includes(ext)) return "text";
+  if (["py", "js", "ts", "tsx", "jsx", "sh", "toml", "yaml", "yml", "sql", "rs", "go", "java", "c", "cpp"].includes(ext))
+    return "code";
+  if (["html", "htm"].includes(ext)) return "html";
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "image";
+  if (ext === "pdf") return "pdf";
+  if (["csv", "json", "xlsx", "xls", "parquet"].includes(ext)) return "data";
+  return "other";
+}

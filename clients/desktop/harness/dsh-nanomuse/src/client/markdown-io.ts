@@ -1,0 +1,231 @@
+/**
+ * Markdown in and out of the document editor: the text becomes HTML the
+ * editable shows, and the edited HTML becomes Markdown again when it is saved.
+ * The dialect is the one the agent writes and the rooms render (headings,
+ * paragraphs, emphasis, code, lists with task boxes, quotes, rules, links,
+ * tables); an HTML comment at the top (the file's own note about itself)
+ * shows as an italic preface and goes back to a comment.
+ */
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+function inlineHtml(text: string): string {
+  let out = ''
+  const re = /(\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*([^*\n]+)\*|_([^_\n]+)_|<?(https?:\/\/[^\s<>)]+)>?)/g
+  let last = 0
+  let match: RegExpExecArray | null
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) out += escapeHtml(text.slice(last, match.index))
+    if (match[2] !== undefined || match[3] !== undefined) out += `<strong>${escapeHtml(match[2] ?? match[3] ?? '')}</strong>`
+    else if (match[4] !== undefined) out += `<code>${escapeHtml(match[4])}</code>`
+    else if (match[5] !== undefined && match[6] !== undefined) out += `<a href="${escapeHtml(match[6])}">${escapeHtml(match[5])}</a>`
+    else if (match[7] !== undefined || match[8] !== undefined) out += `<em>${escapeHtml(match[7] ?? match[8] ?? '')}</em>`
+    else if (match[9] !== undefined) out += `<a href="${escapeHtml(match[9])}">${escapeHtml(match[9])}</a>`
+    last = match.index + match[0].length
+  }
+  if (last < text.length) out += escapeHtml(text.slice(last))
+  return out
+}
+
+/** Markdown → HTML for the editable. */
+export function mdToHtml(text: string): string {
+  const src = text.replace(/\r\n?/g, '\n')
+  // the file's note about itself: comments become prefaces
+  const lines = src.replace(/<!--([\s\S]*?)-->/g, (_m, body: string) => `\u0000note:${body.trim().replace(/\n/g, ' ')}\u0000`).split('\n')
+  const out: string[] = []
+  const paragraph: string[] = []
+  const flush = () => {
+    if (paragraph.length) out.push(`<p>${inlineHtml(paragraph.join(' '))}</p>`)
+    paragraph.length = 0
+  }
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i] ?? ''
+    const note = /^\u0000note:([\s\S]*)\u0000\s*$/.exec(line)
+    if (note) {
+      flush()
+      out.push(`<p class="nm-doc-note"><em>${escapeHtml(note[1] ?? '')}</em></p>`)
+      i++
+      continue
+    }
+    if (!line.trim()) {
+      flush()
+      i++
+      continue
+    }
+    if (/^```/.test(line)) {
+      flush()
+      const code: string[] = []
+      const lang = line.slice(3).trim()
+      i++
+      while (i < lines.length && !/^```/.test(lines[i] ?? '')) code.push(lines[i++] ?? '')
+      i++
+      out.push(`<pre${lang ? ` data-lang="${escapeHtml(lang)}"` : ''}><code>${escapeHtml(code.join('\n'))}</code></pre>`)
+      continue
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line)
+    if (heading) {
+      flush()
+      out.push(`<h${heading[1]!.length}>${inlineHtml(heading[2] ?? '')}</h${heading[1]!.length}>`)
+      i++
+      continue
+    }
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flush()
+      out.push('<hr>')
+      i++
+      continue
+    }
+    if (/^>\s?/.test(line)) {
+      flush()
+      const quote: string[] = []
+      while (i < lines.length && /^>\s?/.test(lines[i] ?? '')) quote.push((lines[i++] ?? '').replace(/^>\s?/, ''))
+      out.push(`<blockquote>${mdToHtml(quote.join('\n'))}</blockquote>`)
+      continue
+    }
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+      flush()
+      const ordered = /^\s*\d+[.)]\s+/.test(line)
+      const items: string[] = []
+      while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i] ?? '')) {
+        let item = (lines[i++] ?? '').replace(/^\s*([-*+]|\d+[.)])\s+/, '')
+        while (i < lines.length && /^\s{2,}\S/.test(lines[i] ?? '') && !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i] ?? '')) item += ' ' + (lines[i++] ?? '').trim()
+        const task = /^\[([ xX])\]\s+/.exec(item)
+        if (task) item = item.slice(task[0].length)
+        items.push(`<li${task ? ` data-task="${task[1] === ' ' ? 'todo' : 'done'}"` : ''}>${inlineHtml(item)}</li>`)
+      }
+      out.push(`<${ordered ? 'ol' : 'ul'}>${items.join('')}</${ordered ? 'ol' : 'ul'}>`)
+      continue
+    }
+    if (/^\|.*\|\s*$/.test(line) && /^\|?\s*:?-{2,}/.test(lines[i + 1] ?? '')) {
+      flush()
+      const cells = (row: string) => row.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim())
+      const head = cells(line)
+      i += 2
+      const rows: string[][] = []
+      while (i < lines.length && /^\|.*\|\s*$/.test(lines[i] ?? '')) rows.push(cells(lines[i++] ?? ''))
+      out.push(`<table><thead><tr>${head.map((c) => `<th>${inlineHtml(c)}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${inlineHtml(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`)
+      continue
+    }
+    paragraph.push(line.trim())
+    i++
+  }
+  flush()
+  return out.join('\n')
+}
+
+// ---- HTML → Markdown ---------------------------------------------------------------------
+
+function inlineMd(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return (node.textContent ?? '').replace(/\u00a0/g, ' ')
+  if (node.nodeType !== Node.ELEMENT_NODE) return ''
+  const el = node as HTMLElement
+  const tag = el.tagName.toLowerCase()
+  const inner = () => Array.from(el.childNodes).map(inlineMd).join('')
+  switch (tag) {
+    case 'strong':
+    case 'b': {
+      const text = inner()
+      return text.trim() ? `**${text.trim()}**` : text
+    }
+    case 'em':
+    case 'i': {
+      const text = inner()
+      return text.trim() ? `*${text.trim()}*` : text
+    }
+    case 'code':
+      return `\`${el.textContent ?? ''}\``
+    case 'a': {
+      const href = el.getAttribute('href') ?? ''
+      const text = inner().trim() || href
+      return href ? `[${text}](${href})` : text
+    }
+    case 'br':
+      return '\n'
+    case 'span':
+    case 'u':
+    case 's':
+    case 'font':
+      return inner()
+    default:
+      return blockMd(el)
+  }
+}
+
+function listMd(el: HTMLElement, ordered: boolean, depth: number): string {
+  const lines: string[] = []
+  let n = 1
+  for (const child of Array.from(el.children)) {
+    if (child.tagName.toLowerCase() !== 'li') continue
+    const li = child as HTMLElement
+    const nested: string[] = []
+    const own: string[] = []
+    for (const part of Array.from(li.childNodes)) {
+      const tag = part.nodeType === Node.ELEMENT_NODE ? (part as HTMLElement).tagName.toLowerCase() : ''
+      if (tag === 'ul' || tag === 'ol') nested.push(listMd(part as HTMLElement, tag === 'ol', depth + 1))
+      else own.push(inlineMd(part))
+    }
+    const task = li.getAttribute('data-task')
+    const box = task === 'todo' ? '[ ] ' : task === 'done' ? '[x] ' : ''
+    const marker = ordered ? `${n++}. ` : '- '
+    lines.push(`${'  '.repeat(depth)}${marker}${box}${own.join('').replace(/\s+/g, ' ').trim()}`)
+    for (const block of nested) if (block) lines.push(block)
+  }
+  return lines.join('\n')
+}
+
+function blockMd(el: HTMLElement): string {
+  const tag = el.tagName.toLowerCase()
+  const inner = () => Array.from(el.childNodes).map(inlineMd).join('')
+  switch (tag) {
+    case 'h1':
+    case 'h2':
+    case 'h3':
+    case 'h4':
+    case 'h5':
+    case 'h6':
+      return `\n${'#'.repeat(Number(tag[1]))} ${inner().replace(/\s+/g, ' ').trim()}\n`
+    case 'p':
+    case 'div': {
+      if (el.classList.contains('nm-doc-note')) return `\n<!-- ${(el.textContent ?? '').replace(/\s+/g, ' ').trim()} -->\n`
+      const text = inner().replace(/[ \t]+/g, ' ').trim()
+      return text ? `\n${text}\n` : '\n'
+    }
+    case 'pre':
+      return `\n\`\`\`${el.getAttribute('data-lang') ?? ''}\n${(el.textContent ?? '').replace(/\n$/, '')}\n\`\`\`\n`
+    case 'blockquote':
+      return `\n${htmlToMd(el.innerHTML).trim().split('\n').map((l) => `> ${l}`).join('\n')}\n`
+    case 'ul':
+      return `\n${listMd(el, false, 0)}\n`
+    case 'ol':
+      return `\n${listMd(el, true, 0)}\n`
+    case 'hr':
+      return '\n---\n'
+    case 'table': {
+      const rows = Array.from(el.querySelectorAll('tr')).map((tr) => Array.from(tr.children).map((c) => Array.from(c.childNodes).map(inlineMd).join('').replace(/\s+/g, ' ').trim()))
+      if (!rows.length) return ''
+      const width = Math.max(...rows.map((r) => r.length))
+      const line = (cells: string[]) => `| ${Array.from({ length: width }, (_, i) => cells[i] ?? '').join(' | ')} |`
+      return `\n${line(rows[0]!)}\n| ${Array.from({ length: width }, () => '---').join(' | ')} |\n${rows.slice(1).map(line).join('\n')}\n`
+    }
+    case 'thead':
+    case 'tbody':
+    case 'tr':
+    case 'td':
+    case 'th':
+    case 'li':
+      return inner()
+    default:
+      return inner()
+  }
+}
+
+/** The editable's HTML back to Markdown, blank lines between blocks, nothing else invented. */
+export function htmlToMd(html: string): string {
+  const box = document.createElement('div')
+  box.innerHTML = html
+  const text = Array.from(box.childNodes).map(inlineMd).join('')
+  return text.replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/\n+$/, '\n')
+}

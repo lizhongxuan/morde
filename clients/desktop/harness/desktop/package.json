@@ -1,0 +1,35 @@
+{
+  "name": "morde-client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Morde desktop client",
+  "desktopName": "Morde",
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./out/morde-main.js",
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('out', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.tests.json",
+    "build:test": "tsc -p tsconfig.tests.json",
+    "test": "npm run build:test && node --test tests/*.test.mjs",
+    "build:sync": "node scripts/build-morde-sync.mjs",
+    "build:syncthing": "node scripts/build-morde-syncthing.mjs",
+    "stage:portal": "node scripts/portal-downloads.mjs stage",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && npm run build:sync && npm run build:syncthing && electron-builder --config electron-builder.yml --publish never",
+    "dist:dir": "npm run build && npm run build:sync && npm run build:syncthing && electron-builder --config electron-builder.yml --dir",
+    "dist:macos:x64": "npm run build && node scripts/build-morde-sync.mjs macos x64 && node scripts/build-morde-syncthing.mjs macos x64 && electron-builder --config electron-builder.yml --mac dmg --x64 --publish never",
+    "dist:windows:x64": "npm run build && node scripts/build-morde-sync.mjs windows x64 && node scripts/build-morde-syncthing.mjs windows x64 && electron-builder --config electron-builder.yml --win nsis --x64 --publish never",
+    "dist:linux:x64": "npm run build && node scripts/build-morde-sync.mjs linux x64 && node scripts/build-morde-syncthing.mjs linux x64 && electron-builder --config electron-builder.yml --linux AppImage --x64 --publish never"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "electron": "44.7.0",
+    "electron-builder": "^26.18.0",
+    "typescript": "^5.6.0"
+  },
+  "author": "Morde contributors"
+}

@@ -1,0 +1,89 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: http://127.0.0.1:* http://localhost:* https://127.0.0.1:* https://localhost:*; connect-src 'none'">
+<title>Morde</title>
+<style>
+  /* The small always-on-top card at the top of the screen while the hands work — the phone's
+     HandsCapsule, sized for a pointer: the agent's face in a ring of three hues breathing with
+     it, four bars breathing in turn, "Step N" and what the hands are doing, Stop and
+     "I'll take it"; under them the question the agent asked before a step (Allow once / Deny)
+     or the hold ("Your turn — reason — Done"). Shown when the main window is not the one in
+     front, so the person can see and answer from wherever they are; the shell moves it out of
+     the way when the hands are about to act under it. Fed over IPC from the main window, which
+     has the live state; answers go back the same way. Content-protected: never in a screenshot
+     (Linux: hidden for the capture). Nothing runs round or sweeps across it; the only motion is
+     the breathing — 2.4 s in, 2.4 s out — and it is still under prefers-reduced-motion. */
+  :root { --accent: #0a66e4; --violet: #7c5cff; --cyan: #06b6d4; --ink: rgba(17,18,24,0.82); --hair: rgba(255,255,255,0.1); }
+  html, body { margin: 0; background: transparent; overflow: hidden; }
+  body { font: 13px/1.4 -apple-system, "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; color: #fff; }
+  #root { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 6px 8px 10px; }
+  .pill, .card { box-sizing: border-box; width: 100%; max-width: 420px; background: var(--ink); backdrop-filter: blur(14px); box-shadow: inset 0 0 0 1px var(--hair), 0 10px 30px rgba(0,0,0,0.35); -webkit-app-region: drag; animation: slide 320ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .pill { display: flex; align-items: center; gap: 10px; padding: 6px 8px 6px 6px; border-radius: 999px; }
+  /* the face in its ring: the three hues, the ring breathing with the bars */
+  .ring { flex: none; width: 36px; height: 36px; border-radius: 50%; padding: 3px; box-sizing: border-box; background: conic-gradient(var(--accent), var(--violet), var(--cyan), var(--accent)); animation: breathe 4.8s ease-in-out infinite; }
+  .held .ring { background: #ffb000; }
+  .face { width: 100%; height: 100%; border-radius: 50%; background: #1d1f27 center/cover no-repeat; box-shadow: inset 0 0 0 2px rgba(17,18,24,0.9); }
+  .words { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .title { font-size: 12px; font-weight: 600; letter-spacing: 0.01em; color: rgba(255,255,255,0.72); display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .held .title { color: #ffd27a; }
+  .bars { display: inline-flex; align-items: center; gap: 2px; height: 10px; }
+  .bars i { width: 2.5px; height: 10px; border-radius: 2px; background: var(--cyan); animation: bar 4.8s ease-in-out infinite; }
+  .bars i:nth-child(2) { animation-delay: 0.6s; background: var(--accent); }
+  .bars i:nth-child(3) { animation-delay: 1.2s; background: var(--violet); }
+  .bars i:nth-child(4) { animation-delay: 1.8s; }
+  .held .bars { display: none; }
+  .text { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actions { flex: none; display: inline-flex; gap: 6px; -webkit-app-region: no-drag; }
+  button { border: 0; border-radius: 999px; padding: 7px 12px; font: 600 12.5px/1 inherit; font-family: inherit; cursor: pointer; background: rgba(255,255,255,0.12); color: #fff; white-space: nowrap; -webkit-app-region: no-drag; }
+  button:hover { background: rgba(255,255,255,0.2); }
+  button.on { background: var(--accent); }
+  button.on:hover { background: #2b7bef; }
+  button.no { background: rgba(217,48,37,0.85); }
+  button.stop { background: #9b3b3b; }
+  button.stop:hover { background: #b24646; }
+  /* the question or the hold under the pill */
+  .card { padding: 10px 14px 12px; border-radius: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .card .kind { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgba(255,255,255,0.6); display: flex; align-items: center; gap: 6px; }
+  .card .kind::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); }
+  .card.hold .kind::before { background: #ffb000; }
+  .card .body { font-size: 13.5px; word-break: break-word; max-height: 5.6em; overflow: hidden; }
+  .card .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  @keyframes breathe { 0%, 100% { transform: scale(1); filter: brightness(0.9); } 50% { transform: scale(1.06); filter: brightness(1.1); } }
+  @keyframes bar { 0%, 100% { transform: scaleY(0.35); opacity: 0.6; } 50% { transform: scaleY(1); opacity: 1; } }
+  @keyframes slide { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .pill, .card, .ring, .bars i { animation: none; } }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const root = document.getElementById('root')
+    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
+    const safeFace = (s) => (typeof s === 'string' && /^(data:image\/[a-z+]+;base64,|https?:\/\/127\.0\.0\.1|https?:\/\/localhost)/.test(s) ? s : '')
+    let lastKey = ''
+    // {hands: {active, held, step, title, text, face, stop, take} | null,
+    //  cards: [{id, kind: 'approval'|'hold', title, text, actions: [{id, label, tone}]}]}
+    window.nanomuseCapsule?.onState((s) => {
+      const hands = s.hands && (s.hands.active || s.hands.held) ? s.hands : null
+      const cards = Array.isArray(s.cards) ? s.cards : []
+      const parts = []
+      if (hands) {
+        const face = safeFace(hands.face)
+        const buttons = [hands.take ? `<button data-card="hands" data-action="take">${esc(hands.take)}</button>` : '', hands.stop ? `<button class="stop" data-card="hands" data-action="stop">${esc(hands.stop)}</button>` : ''].join('')
+        parts.push(`<div class="pill${hands.held ? ' held' : ''}"><div class="ring"><div class="face"${face ? ` style="background-image:url(&quot;${esc(face)}&quot;)"` : ''}></div></div><div class="words"><div class="title">${esc(hands.title)}<span class="bars"><i></i><i></i><i></i><i></i></span></div><div class="text">${esc(hands.text)}</div></div>${buttons ? `<div class="actions">${buttons}</div>` : ''}</div>`)
+      }
+      for (const c of cards) parts.push(`<div class="card ${esc(c.kind)}"><div class="kind">${esc(c.title)}</div><div class="body">${esc(c.text)}</div><div class="actions">${(c.actions || []).map((a) => `<button data-card="${esc(c.id)}" data-action="${esc(a.id)}" class="${esc(a.tone || '')}">${esc(a.label)}</button>`).join('')}</div></div>`)
+      // the pill is redrawn only when its words change, so the ring's breathing is not restarted every second
+      const key = parts.join('\n')
+      if (key !== lastKey) { lastKey = key; root.innerHTML = key }
+      requestAnimationFrame(() => window.nanomuseCapsule?.resize(document.body.scrollHeight))
+    })
+    root.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-card]')
+      if (b) window.nanomuseCapsule?.act(b.dataset.card, b.dataset.action)
+    })
+  </script>
+</body>
+</html>

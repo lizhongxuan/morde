@@ -118,7 +118,7 @@ func cloudDSHSkillReadProgress(t *testing.T, claimed task.Task, callID, sessionI
 		TaskID: claimed.ID, OwnerID: claimed.OwnerID, AgentSessionID: sessionID,
 		AuthorizationVersion: claimed.Authorization.Version,
 		CallID:               callID, SkillID: "compare-options", SkillVersion: outputVersion, BundleVersion: "nanomuse-builtin-v1",
-		SourceRef:     "project/nanoMuse/nanomuse/skills/builtin/compare-options/SKILL.md",
+		SourceRef:     "clients/nanoMuse/nanomuse/skills/builtin/compare-options/SKILL.md",
 		ContentSHA256: contentHash, OutputSHA256: outputHash,
 	}
 	read.FingerprintSHA256 = postgresCloudDSHSkillReadFingerprint(read)

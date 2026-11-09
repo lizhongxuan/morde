@@ -4,9 +4,9 @@ Morde 是一个让用户和 AI 共用云端电脑与工作区的平台。它在�
 
 ## 客户端与服务端的唯一归属
 
-**目标是一个产品、一套客户端和一套服务端。** PC 端和手机端以 `project/nanoMuse/` 的原有客户端源码为唯一开发与发行基础：保留 nanoMuse 原有能力并在上面做二次开发，在同一应用中加入 Morde 的云端电脑、工作区和用户功能。服务端以本仓库 `server/` 为唯一业务实现与部署入口，把 nanoMuse 所需的 Cloud、Hub 等服务能力合入其中；客户端内运行的本机 Agent 或桥接进程仍属于客户端，不是第二套对外业务服务。
+**目标是一个产品、一套客户端和一套服务端。** Morde 的 iOS 原生工程保留在 `clients/nanoMuse/`；PC 桌面客户端及其本地运行组件位于 `clients/desktop/`，手机 Web 位于 `web/mobile/`。服务端以本仓库 `server/` 为唯一业务实现与部署入口；客户端内运行的本机 Agent 或桥接进程仍属于客户端，不是第二套对外业务服务。
 
-当前仓库尚处于整合前的过渡状态：`project/morde-desktop/`、`project/morde-sync/` 和 nanoMuse 目录内独立的 Morde iOS 工程可作为已有实现来源，但最终不得作为另一套 PC/iOS 产品交付。现有用户 Web 和工作台界面也须随客户端整合收敛，不能与 nanoMuse PC 端长期并行维护两套用户功能；管理后台是服务端的管理界面，不算第二个用户客户端。原 nanoMuse 功能不得因加入 Morde 而被整体关闭。
+当前仓库仍处于整合阶段：nanoMuse 目录内的独立 Morde iOS 工程是当前 iOS 实现，但最终不得作为另一套手机产品交付；Morde 手机端应逐步并入 nanoMuse 应用，同时保留 nanoMuse 原有能力。现有用户 Web 和工作台界面也须随客户端整合收敛，不能与 nanoMuse PC 端长期并行维护两套用户功能；管理后台是服务端的管理界面，不算第二个用户客户端。
 
 具体范围和验收见 [nanoMuse 客户端与 Morde 服务端合并需求文档](docs/nanoMuse客户端与Morde服务端合并需求文档.md)。此前文档中关于“独立 Morde 客户端为最终工程”或“停用 nanoMuse 原有能力”的描述，以这份新需求为准修订；本段描述的是目标，不表示合并已经完成。
 
@@ -44,9 +44,12 @@ Morde 是一个让用户和 AI 共用云端电脑与工作区的平台。它在�
 | 路径 | 内容 |
 |---|---|
 | `server/` | Go 服务、Portal API、Gateway、MCP、后台任务、数据库迁移与 OpenAPI 契约 |
-| `project/nanoMuse/` | 最终唯一的 PC 与手机端客户端源码；当前仍有待合并的过渡工程 |
-| `project/morde-desktop/`、`project/morde-sync/` | 现有客户端与同步实现来源；不作为最终独立产品交付 |
-| `web/portal/` | 当前用户 Web 与管理后台 Web；用户功能需向 nanoMuse 客户端收敛 |
+| `clients/nanoMuse/` | Morde iOS 原生工程及其 iOS 源码、资源和许可文件 |
+| `clients/desktop/` | Morde PC 桌面客户端、桌面 DSH 插件与本地运行组件 |
+| `runtime/morde-cloud-runtime/` | 云端 DSH Runtime 镜像源码与锁定依赖 |
+| `runtime/morde-runtime/`、`runtime/morde-sync/` | Host Runtime 与 Workspace 同步引擎 |
+| `web/mobile/` | 手机 Web 客户端，部署到 Portal 同源 `/app/` |
+| `web/portal/` | 用户 Web 与管理后台 Web |
 | `web/workbench/` | 当前 Host 网页工作台；用户界面需随客户端整合收敛 |
 | `images/`、`deploy/single/` | Host 镜像与单机部署文件 |
 | `examples/agent/` | Codex 平台 MCP 接入示例 |
@@ -54,6 +57,7 @@ Morde 是一个让用户和 AI 共用云端电脑与工作区的平台。它在�
 
 ## 从哪里开始
 
+- **初始化 iOS 原生依赖：** 克隆仓库后运行 `git submodule update --init --recursive`；iOS 所需的 iSH 版本由 `.gitmodules` 固定。
 - **接入 AI：** 按 [Codex MCP 示例](examples/agent/README.md)配置平台地址和本机环境变量中的 API Key。
 - **了解接口与架构：** 阅读 [实施总览与公共约定](docs/实施/00-总览与公共约定.md)；HTTP 接口以 [OpenAPI 契约](server/openapi/portal.yaml) 为准，后端开发规则见 [server/AGENTS.md](server/AGENTS.md)。
 

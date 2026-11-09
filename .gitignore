@@ -1,9 +1,6 @@
 .local/
-project/morde-desktop/release/
 web/portal/public/downloads/
 .idea
-/project/*
-!/project/morde-runtime/
-/project/morde-runtime/.tmp-t21-shell/
-docs
+/runtime/morde-runtime/.tmp-t21-shell/
+/docs/
 node_modules
