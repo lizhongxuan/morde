@@ -603,22 +603,40 @@ func TestPostgresConcurrentConversationMigrationPreservesExistingTaskAndGuardsRo
 		t.Fatal(err)
 	}
 	defer closeProvider()
-	if _, err := provider.DownTo(ctx, 136); err != nil {
-		t.Fatal(err)
-	}
 	owner := createPreRetirementTestUser(t, store, 8, 20000, 40000)
 	old, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "migration-old-task", "preserve old work"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.UpTo(ctx, 137); err != nil {
-		t.Fatalf("upgrade existing conversation: %v", err)
+	if _, err := provider.DownTo(ctx, 136); err != nil {
+		t.Fatalf("prepare legacy schema with an existing task: %v", err)
 	}
-	input := newTestTaskSubmission(t, owner.ID, "", "migration-new-task", "new parallel work")
-	input.Task.ConversationID, input.Message.ConversationID = old.Conversation.ID, old.Conversation.ID
-	newTask, err := store.SubmitTask(ctx, input)
-	if err != nil || newTask.Task.ID == old.Task.ID {
-		t.Fatalf("new task after migration = %s err=%v", newTask.Task.ID, err)
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("upgrade existing conversation to latest schema: %v", err)
+	}
+	newTaskID := mustID(t, domain.NewTaskID)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO tasks
+SELECT (jsonb_populate_record(NULL::tasks, to_jsonb(existing) || jsonb_build_object(
+  'id', $2::text, 'objective', 'new parallel work', 'status', 'queued', 'lease_owner', '',
+  'lease_version', 0, 'lease_expires_at', NULL, 'event_seq', 0, 'current_step', '',
+  'result', '', 'waiting_reason', '', 'created_at', now(), 'updated_at', now(), 'finished_at', NULL
+))).*
+FROM tasks existing WHERE existing.id=$1`, old.Task.ID, newTaskID); err != nil {
+		t.Fatalf("create second active task for rollback guard: %v", err)
+	}
+	var messageSequence int64
+	if err := pool.QueryRow(ctx, `UPDATE conversations SET message_seq=message_seq+1 WHERE id=$1 RETURNING message_seq`, old.Conversation.ID).Scan(&messageSequence); err != nil {
+		t.Fatalf("reserve message sequence: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation_messages
+(id,conversation_id,owner_id,role,content,task_id,model_id,source_kind,source_exchange_id,requested_conversation_id,sequence,delivery_status,actor_id)
+VALUES ($1,$2,$3,'user','new parallel work',$4,'','task','','',$5,'applied',$3)`,
+		mustID(t, domain.NewMessageID), old.Conversation.ID, owner.ID, newTaskID, messageSequence); err != nil {
+		t.Fatalf("insert second task message for rollback guard: %v", err)
+	}
+	if _, err := provider.DownTo(ctx, 137); err != nil {
+		t.Fatalf("roll back newer schema before testing migration 137: %v", err)
 	}
 	if _, err := provider.DownTo(ctx, 136); err == nil {
 		t.Fatal("rollback accepted two active tasks in the same conversation")

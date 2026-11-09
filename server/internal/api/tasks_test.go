@@ -116,9 +116,6 @@ func (s *taskServiceStub) Submit(_ context.Context, _ identity.Principal, comman
 	value.HostID, value.ExecutionLocation, value.ApplicationID = command.HostID, "server", command.ApplicationID
 	value.WorkspaceID, value.InputRevision = command.WorkspaceID, command.InputRevision
 	value.WorkspaceCheckpointRevision = command.InputRevision
-	if command.ConversationID != "" {
-		value.ConversationID = command.ConversationID
-	}
 	if command.ModelID != "" {
 		value.ModelID = command.ModelID
 	}
@@ -497,11 +494,11 @@ func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
 	}
 	var snapshot struct {
 		ID       string `json:"id"`
-		Sequence int64  `json:"sequence"`
+		Sequence *int64 `json:"sequence"`
 		Status   string `json:"status"`
 	}
 	if err := json.Unmarshal(body["assistant_message"], &snapshot); err != nil ||
-		snapshot.ID != message.ID || snapshot.Sequence != message.Sequence || snapshot.Status != "streaming" {
+		snapshot.ID != message.ID || snapshot.Sequence == nil || *snapshot.Sequence != message.Sequence || snapshot.Status != "streaming" {
 		t.Fatalf("assistant_message JSON = %s, err=%v", body["assistant_message"], err)
 	}
 
@@ -516,8 +513,28 @@ func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
 	invalidMessage = message
 	invalidMessage.Sequence = 0
 	invalid.AssistantMessage = &app.AssistantMessageSnapshot{Message: invalidMessage, Status: app.AssistantMessageStreaming}
+	streamingView, err := toTaskResponse(invalid)
+	if err != nil || streamingView.AssistantMessage == nil || streamingView.AssistantMessage.Sequence != nil {
+		t.Fatalf("streaming assistant message without durable sequence = %#v, err=%v", streamingView.AssistantMessage, err)
+	}
+	streamingJSON, err := json.Marshal(streamingView)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streamingBody map[string]json.RawMessage
+	if err := json.Unmarshal(streamingJSON, &streamingBody); err != nil {
+		t.Fatal(err)
+	}
+	var streamingSnapshot map[string]json.RawMessage
+	if err := json.Unmarshal(streamingBody["assistant_message"], &streamingSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := streamingSnapshot["sequence"]; exists {
+		t.Fatalf("streaming assistant_message should omit an unknown sequence: %s", streamingBody["assistant_message"])
+	}
+	invalid.AssistantMessage.Status = app.AssistantMessageCompleted
 	if _, err := toTaskResponse(invalid); domain.CodeOf(err) != domain.CodeInternal {
-		t.Fatalf("invalid assistant message sequence error = %v, want internal", err)
+		t.Fatalf("completed assistant message without durable sequence error = %v, want internal", err)
 	}
 	invalid = value
 	invalid.AssistantMessage = &app.AssistantMessageSnapshot{Message: message, Status: app.AssistantMessageStatus("unknown")}
@@ -793,6 +810,19 @@ func TestTaskListReturnsNullCursorAndEmptyItems(t *testing.T) {
 	}
 }
 
+func TestSubmitTaskCannotAttachDirectlyToConversation(t *testing.T) {
+	service := &taskServiceStub{}
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(
+		`{"model_id":"model-a","objective":"do the next step","conversation_id":"c1234567"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "independent-task-001")
+	response := httptest.NewRecorder()
+	taskAPIRouter(service, nil).ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || service.submitCalls != 0 {
+		t.Fatalf("direct conversation Task submission returned %d with %d service calls: %s", response.Code, service.submitCalls, response.Body.String())
+	}
+}
+
 func TestConversationMessageRequiresMatchingIdempotencyKey(t *testing.T) {
 	service := &taskServiceStub{}
 	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"client_message_id":"message-0001","content":"继续"}`))
@@ -809,7 +839,7 @@ func TestConversationMessageRequiresMatchingIdempotencyKey(t *testing.T) {
 
 func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 	service := &taskServiceStub{acceptReplayed: true}
-	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(`{"client_message_id":"message-0001","previous_client_message_id":"message-0000","reference_task_id":"q1234567","host_id":"h1234567","workspace_id":"w1234567","mcp_connector_ids":["kbbbbbbb"],"client_attachment_ids":["client-file-0001"],"application_id":"wechat","model_id":"model-a","content":"hello"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader("{\"client_message_id\":\"message-0001\",\"previous_client_message_id\":\"message-0000\",\"reference_task_id\":\"q1234567\",\"host_id\":\"h1234567\",\"workspace_id\":\"w1234567\",\"mcp_connector_ids\":[\"kbbbbbbb\"],\"client_attachment_ids\":[\"client-file-0001\"],\"application_id\":\"wechat\",\"model_id\":\"model-a\",\"content\":\"hello\"}"))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "message-0001")
 	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
@@ -825,10 +855,22 @@ func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 		service.acceptCommand.HostID != "h1234567" || service.acceptCommand.WorkspaceID != "w1234567" ||
 		len(service.acceptCommand.MCPConnectorIDs) != 1 || service.acceptCommand.MCPConnectorIDs[0] != "kbbbbbbb" ||
 		len(service.acceptCommand.ClientAttachmentIDs) != 1 || service.acceptCommand.ClientAttachmentIDs[0] != "client-file-0001" ||
-		service.acceptCommand.ApplicationID != "wechat" || service.acceptCommand.ModelID != "model-a" || service.acceptCommand.Content != "hello" ||
-		body.Message.ID != "m1234567" || body.Message.ClientMessageID != "message-0001" || body.Message.TaskID != "" ||
-		body.Message.RoutingStatus != conversation.RoutingPending || body.Message.DeliveryStatus != conversation.DeliveryPending || !body.Replayed {
+		service.acceptCommand.ApplicationID != "wechat" || service.acceptCommand.ModelID != "model-a" ||
+		service.acceptCommand.Content != "hello" || body.Message.ID != "m1234567" ||
+		body.Message.ClientMessageID != "message-0001" || body.Message.TaskID != "" ||
+		body.Message.ConversationID != "c1234567" || body.Message.RoutingStatus != conversation.RoutingPending ||
+		body.Message.DeliveryStatus != conversation.DeliveryPending || !body.Replayed {
 		t.Fatalf("accept conversation message: status=%d body=%s response=%#v service=%#v err=%v", response.Code, response.Body.String(), body, service, err)
+	}
+}
+
+func TestConversationTaskSubmissionRouteIsRemoved(t *testing.T) {
+	service := &taskServiceStub{}
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/tasks", strings.NewReader(`{}`))
+	response := httptest.NewRecorder()
+	taskAPIRouter(service, nil).ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || service.submitCalls != 0 || service.acceptCalls != 0 {
+		t.Fatalf("removed conversation Task route returned %d, submit calls=%d, accept calls=%d", response.Code, service.submitCalls, service.acceptCalls)
 	}
 }
 
@@ -921,7 +963,7 @@ func TestConversationMessageRejectsLegacyFieldsAndInvalidRequest(t *testing.T) {
 		`{"client_message_id":"retry-key-009","mode":"new","content":"hello"}`,
 		`{"client_message_id":"retry-key-009","expected_task_id":"q1234567","content":"hello"}`,
 		`{"client_message_id":"retry-key-009","input_revision":3,"content":"hello"}`,
-		`{"client_message_id":"retry-key-009","attachment_ids":["f1234567"],"content":"hello"}`,
+		`{"client_message_id":"retry-key-009","attachment_ids":["pa_00000000000000000000000000000001"],"content":"hello"}`,
 	} {
 		request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
@@ -930,8 +972,8 @@ func TestConversationMessageRejectsLegacyFieldsAndInvalidRequest(t *testing.T) {
 		request.Header.Set("X-Morde-Actor-ID", "u1234567")
 		response := httptest.NewRecorder()
 		engine.ServeHTTP(response, request)
-		if response.Code != http.StatusBadRequest || service.submitCalls != 0 || service.acceptCalls != 0 {
-			t.Fatalf("invalid message body %s: status=%d submit_calls=%d accept_calls=%d", body, response.Code, service.submitCalls, service.acceptCalls)
+		if response.Code != http.StatusBadRequest || service.acceptCalls != 0 || service.submitCalls != 0 {
+			t.Fatalf("invalid message body %s: status=%d accept_calls=%d submit_calls=%d", body, response.Code, service.acceptCalls, service.submitCalls)
 		}
 	}
 }
@@ -1254,7 +1296,7 @@ func taskAPIRouter(tasks TaskService, conversations ConversationService) *gin.En
 		c.Next()
 	})
 	group := engine.Group("/api")
-	handler := &api{}
+	handler := &api{options: Options{ServiceInstanceID: "11111111-1111-4111-8111-111111111111"}}
 	handler.registerTasks(group, tasks)
 	if ticketService, ok := tasks.(TaskWorkbenchObservationTicketService); ok {
 		handler.registerTaskWorkbenchObservationTickets(group, ticketService)

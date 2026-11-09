@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"morde/server/internal/dockerapi"
@@ -22,9 +23,16 @@ var (
 
 type dockerAPI interface {
 	inspect(context.Context, string) (containerInspect, error)
+	listByLabel(context.Context, string, string) ([]containerSummary, error)
 	kill(context.Context, string) error
 	wait(context.Context, string) error
 	remove(context.Context, string) error
+}
+
+type containerSummary struct {
+	ID     string            `json:"Id"`
+	Names  []string          `json:"Names"`
+	Labels map[string]string `json:"Labels"`
 }
 
 type containerInspect struct {
@@ -70,6 +78,26 @@ func (d *dockerEngine) inspect(ctx context.Context, id string) (containerInspect
 	}
 	if status != http.StatusOK {
 		return result, fmt.Errorf("docker inspect returned status %d", status)
+	}
+	return result, nil
+}
+
+func (d *dockerEngine) listByLabel(ctx context.Context, key, value string) ([]containerSummary, error) {
+	if key == "" || value == "" || strings.ContainsAny(key+value, "\x00\r\n") {
+		return nil, errors.New("docker label filter is invalid")
+	}
+	filters, err := json.Marshal(map[string][]string{"label": {key + "=" + value}})
+	if err != nil {
+		return nil, errors.New("encode Docker label filter")
+	}
+	path := "/containers/json?all=1&filters=" + url.QueryEscape(string(filters))
+	var result []containerSummary
+	status, err := d.request(ctx, http.MethodGet, path, &result)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("docker container list returned status %d", status)
 	}
 	return result, nil
 }

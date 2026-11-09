@@ -306,7 +306,7 @@ func lockAndValidateHistoryAttachments(ctx context.Context, tx pgx.Tx, instanceI
 			return nil, domain.InvalidArgument("attachment_ids", "personal attachment id is invalid")
 		}
 		rows, err := tx.Query(ctx, `SELECT upload_id FROM personal_attachment_uploads
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND attachment_id=$3 AND state='committed'
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND attachment_id=$3 AND state='committed' AND content_deleted_at IS NULL
 ORDER BY upload_id FOR UPDATE`, instanceID, ownerID, attachmentID)
 		if err != nil {
 			return nil, fmt.Errorf("lock imported personal attachment: %w", err)
@@ -345,6 +345,10 @@ ORDER BY upload_id FOR UPDATE`, instanceID, ownerID, attachmentID)
 		}
 		if !readable {
 			return nil, domain.NewError(domain.CodeForbidden, "personal attachment has no readable owner reference")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE personal_attachment_uploads SET orphaned_at=NULL,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3 AND content_deleted_at IS NULL`, instanceID, ownerID, found[0]); err != nil {
+			return nil, fmt.Errorf("restore personal attachment reference retention: %w", err)
 		}
 		uploadIDs[attachmentID] = found[0]
 	}

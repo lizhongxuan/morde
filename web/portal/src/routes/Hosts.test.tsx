@@ -37,6 +37,22 @@ describe('Hosts', () => {
   beforeEach(() => { vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [] }); });
   afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('scrolls to the requested host after loading a browser handoff link', async () => {
+    vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
+    const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView');
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}><ToastProvider><MemoryRouter initialEntries={[`/hosts#host-${ownedHost.id}`]}><Hosts /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByRole('button', { name: `查看主机 ${ownedHost.name}` })).toBeEnabled();
+    expect(document.getElementById(`host-${ownedHost.id}`)).toBeInTheDocument();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center' });
+    view.unmount();
+    if (original) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', original);
+    else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  });
+
   it('deletes a host without consulting templates and retains its independent workspaces', async () => {
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [{
       id: 'h1234567', name: '测试主机', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '', runtime_generation: 1, control_version: 1, control_state: 'ai', url: '',

@@ -435,8 +435,13 @@ func readAssistantMessageSnapshot(ctx context.Context, tx pgx.Tx, taskRow sqlcge
 	var messageID, turnID, content, rawStatus string
 	var sequence, taskRevision, resultEventSequence pgtype.Int8
 	var createdAt time.Time
-	err := tx.QueryRow(ctx, `SELECT message_id, turn_id, content, status, message_sequence, created_at, task_revision, result_event_sequence
-FROM task_assistant_message_snapshots WHERE task_id=$1`, taskRow.ID).
+	err := tx.QueryRow(ctx, `SELECT snapshot.message_id, snapshot.turn_id, snapshot.content, snapshot.status,
+       COALESCE(snapshot.message_sequence, message.sequence), snapshot.created_at,
+       snapshot.task_revision, snapshot.result_event_sequence
+FROM task_assistant_message_snapshots snapshot
+LEFT JOIN conversation_messages message ON message.id=snapshot.message_id AND message.task_id=snapshot.task_id
+  AND message.conversation_id=$2 AND message.owner_id=$3 AND message.role='assistant'
+WHERE snapshot.task_id=$1`, taskRow.ID, taskRow.ConversationID, taskRow.OwnerID).
 		Scan(&messageID, &turnID, &content, &rawStatus, &sequence, &createdAt, &taskRevision, &resultEventSequence)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

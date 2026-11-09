@@ -61,14 +61,11 @@ func (h *t07DesktopClickCaptureHandler) Execute(_ context.Context, request contr
 	h.request = request
 	h.mu.Unlock()
 	var args struct {
-		WindowID         string `json:"window_id"`
-		X                int    `json:"x"`
-		Y                int    `json:"y"`
-		ScreenshotWidth  int    `json:"screenshot_width"`
-		ScreenshotHeight int    `json:"screenshot_height"`
-		ScreenWidth      int    `json:"screen_width"`
-		ScreenHeight     int    `json:"screen_height"`
-		Button           string `json:"button"`
+		WindowID        string `json:"window_id"`
+		X               int    `json:"x"`
+		Y               int    `json:"y"`
+		ScreenshotToken string `json:"screenshot_token"`
+		Button          string `json:"button"`
 	}
 	if err := json.Unmarshal(request.Arguments, &args); err != nil {
 		return nil, err
@@ -77,11 +74,15 @@ func (h *t07DesktopClickCaptureHandler) Execute(_ context.Context, request contr
 		args.Button = "left"
 	}
 	return json.Marshal(map[string]any{
-		"window_id": args.WindowID,
-		"x":         screenshotPointToScreen(args.X, args.ScreenshotWidth, args.ScreenWidth),
-		"y":         screenshotPointToScreen(args.Y, args.ScreenshotHeight, args.ScreenHeight),
-		"button":    args.Button,
-		"clicked":   true,
+		"window_id":         args.WindowID,
+		"x":                 screenshotPointToScreen(args.X, 400, 800),
+		"y":                 screenshotPointToScreen(args.Y, 200, 400),
+		"button":            args.Button,
+		"clicked":           true,
+		"screenshot_width":  400,
+		"screenshot_height": 200,
+		"screen_width":      800,
+		"screen_height":     400,
 	})
 }
 func (*t07DesktopClickCaptureHandler) Stop(context.Context, contract.Operation) (runtimecore.StopResult, error) {
@@ -200,6 +201,7 @@ func TestT07ScreenshotValidationFailsBeforeReportingSuccess(t *testing.T) {
 	}
 	valid := makeJPEG(8, 4)
 	truncated := append(append([]byte(nil), valid[:len(valid)/2]...), 0xff, 0xd9)
+	validToken := strings.Repeat("A", 43)
 	tests := []struct {
 		name       string
 		tool       string
@@ -226,7 +228,8 @@ func TestT07ScreenshotValidationFailsBeforeReportingSuccess(t *testing.T) {
 				value = map[string]any{"target_id": "target_1", "mime_type": "image/jpeg", "data_base64": base64.StdEncoding.EncodeToString(test.imageBytes)}
 			} else {
 				value = map[string]any{"mime_type": "image/jpeg", "width": test.width, "height": test.height,
-					"screen_width": test.screenW, "screen_height": test.screenH, "data_base64": base64.StdEncoding.EncodeToString(test.imageBytes)}
+					"screen_width": test.screenW, "screen_height": test.screenH, "screenshot_token": validToken,
+					"data_base64": base64.StdEncoding.EncodeToString(test.imageBytes)}
 			}
 			raw, err := json.Marshal(value)
 			if err != nil {
@@ -238,6 +241,20 @@ func TestT07ScreenshotValidationFailsBeforeReportingSuccess(t *testing.T) {
 				t.Fatalf("unsafe screenshot result = %#v, %v; want failure without image", result, err)
 			}
 		})
+	}
+	prooflessDesktopResult, err := json.Marshal(map[string]any{
+		"mime_type": "image/jpeg", "width": 8, "height": 4, "screen_width": 1600, "screen_height": 800,
+		"data_base64": base64.StdEncoding.EncodeToString(valid),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desktopMapping, _ := runtimeToolMappingByName(runtimeToolDesktopScreenshot)
+	result, err := mapRuntimeToolResult(desktopMapping, runtimeclient.Operation{
+		OperationID: "o1234567", Status: runtimeclient.OperationSucceeded, Result: prooflessDesktopResult,
+	}, json.RawMessage(`{}`))
+	if err != nil || result.Status != AgentToolFailed || len(result.Images) != 0 {
+		t.Fatalf("desktop screenshot without proof = %#v, %v; want fail-closed result without image", result, err)
 	}
 }
 
@@ -259,7 +276,7 @@ func TestT07BrowserTypingRequiresExactCharacterCount(t *testing.T) {
 	}
 }
 
-func TestT07DesktopClickRequiresSharedScreenSizeAndReportsChanges(t *testing.T) {
+func TestT07DesktopClickRequiresOneTimeScreenshotProofAndReportsChanges(t *testing.T) {
 	var schema struct {
 		Required   []string `json:"required"`
 		Properties map[string]struct {
@@ -275,32 +292,31 @@ func TestT07DesktopClickRequiresSharedScreenSizeAndReportsChanges(t *testing.T) 
 		}
 	}
 	joined := "," + strings.Join(schema.Required, ",") + ","
-	for _, required := range []string{"screen_width", "screen_height", "screenshot_width", "screenshot_height"} {
-		if !strings.Contains(joined, ","+required+",") {
-			t.Errorf("MCP and Agent shared click schema lacks %s: %v", required, schema.Required)
-		}
+	if !strings.Contains(joined, ",screenshot_token,") {
+		t.Fatalf("MCP and Agent shared click schema lacks screenshot token: %v", schema.Required)
 	}
 	if schema.Properties["x"].Maximum != maxDesktopScreenshotWidth-1 || schema.Properties["y"].Maximum != maxDesktopScreenshotHeight-1 {
 		t.Fatalf("click schema does not bound x/y to screenshot pixels: %+v", schema.Properties)
 	}
 	mapping, _ := runtimeToolMappingByName(runtimeToolDesktopClick)
+	validToken := strings.Repeat("A", 43)
 	for _, test := range []struct {
 		arguments string
 		valid     bool
 	}{
 		{arguments: `{"window_id":"0x1","x":5,"y":5}`},
 		{arguments: `{"window_id":"0x1","x":5,"y":5,"screen_width":20,"screen_height":20}`},
-		{arguments: `{"window_id":"0x1","x":5,"y":5,"screenshot_width":10,"screenshot_height":10,"screen_width":0,"screen_height":20}`},
-		{arguments: `{"window_id":"0x1","x":5,"y":5,"screenshot_width":10,"screenshot_height":10,"screen_width":20,"screen_height":40}`},
-		{arguments: `{"window_id":"0x1","x":10,"y":5,"screenshot_width":10,"screenshot_height":10,"screen_width":20,"screen_height":20}`},
-		{arguments: `{"window_id":"0x1","x":5,"y":10,"screenshot_width":10,"screenshot_height":10,"screen_width":20,"screen_height":20}`},
-		{arguments: `{"window_id":"0x1","x":5,"y":5,"screenshot_width":10,"screenshot_height":10,"screen_width":20,"screen_height":20}`, valid: true},
+		{arguments: `{"window_id":"0x1","x":5,"y":5,"screenshot_token":"not-a-token"}`},
+		{arguments: `{"window_id":"0x1","x":1280,"y":5,"screenshot_token":"` + validToken + `"}`},
+		{arguments: `{"window_id":"0x1","x":5,"y":720,"screenshot_token":"` + validToken + `"}`},
+		{arguments: `{"window_id":"0x1","x":5,"y":5,"screenshot_width":10,"screenshot_height":10,"screen_width":20,"screen_height":20,"screenshot_token":"` + validToken + `"}`},
+		{arguments: `{"window_id":"0x1","x":5,"y":5,"screenshot_token":"` + validToken + `"}`, valid: true},
 	} {
 		if valid := validRuntimeToolArguments(mapping, json.RawMessage(test.arguments)); valid != test.valid {
 			t.Errorf("click argument validity = %t, want %t: %s", valid, test.valid, test.arguments)
 		}
 	}
-	arguments := json.RawMessage(`{"window_id":"0x1","x":5,"y":5,"screenshot_width":10,"screenshot_height":10,"screen_width":20,"screen_height":20}`)
+	arguments := json.RawMessage(`{"window_id":"0x1","x":5,"y":5,"screenshot_token":"` + validToken + `"}`)
 	for _, test := range []struct {
 		result string
 		want   string
@@ -322,7 +338,7 @@ func TestT07DesktopClickForwardsScreenshotGeometryAndMapsResult(t *testing.T) {
 	fixture.store.details.Task.InputRevision = nil
 	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
 	request, preparation := fixture.prepared(runtimeToolDesktopClick,
-		`{"window_id":"0x1","x":200,"y":100,"screenshot_width":400,"screenshot_height":200,"screen_width":800,"screen_height":400}`,
+		`{"window_id":"0x1","x":200,"y":100,"screenshot_token":"`+strings.Repeat("A", 43)+`"}`,
 		identity.ScopeComputerOperate)
 	fixture.persistOperation(request)
 
@@ -337,11 +353,15 @@ func TestT07DesktopClickForwardsScreenshotGeometryAndMapsResult(t *testing.T) {
 	if json.Unmarshal(forwarded, &forwardedArgs) != nil {
 		t.Fatalf("runtime arguments are not JSON: %s", forwarded)
 	}
-	for name, want := range map[string]int{"x": 200, "y": 100, "screenshot_width": 400, "screenshot_height": 200, "screen_width": 800, "screen_height": 400} {
+	for name, want := range map[string]int{"x": 200, "y": 100} {
 		var got int
 		if json.Unmarshal(forwardedArgs[name], &got) != nil || got != want {
 			t.Errorf("runtime argument %s = %d, want %d; args=%s", name, got, want, forwarded)
 		}
+	}
+	var forwardedToken string
+	if json.Unmarshal(forwardedArgs["screenshot_token"], &forwardedToken) != nil || forwardedToken != strings.Repeat("A", 43) {
+		t.Fatalf("runtime screenshot proof was not forwarded: %s", forwardedArgs["screenshot_token"])
 	}
 	var output struct {
 		X int `json:"x"`

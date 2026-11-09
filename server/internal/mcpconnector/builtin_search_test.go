@@ -3,6 +3,7 @@ package mcpconnector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,7 @@ func TestBuiltinSearchRejectsUnsafeConfigurationAndArguments(t *testing.T) {
 		{"searxng_web_search", `{"query":"news","time_range":null}`},
 		{"searxng_web_search", `{"query":""}`},
 		{"web_url_read", `{"url":"file:///etc/passwd"}`},
+		{"web_url_read", `{"url":"http://example.com/news"}`},
 		{"web_url_read", `{"url":"https://user:password@example.com"}`},
 	} {
 		if validBuiltinSearchArguments(input.name, json.RawMessage(input.args)) {
@@ -87,7 +89,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 	if _, err := NewBuiltinSearchClient(node, script, "http://127.0.0.1:8189", 1); err == nil || !strings.Contains(err.Error(), "requires the Morde page-date patch") {
 		t.Fatalf("incomplete Morde page-date patch was accepted: %v", err)
 	}
-	if err := os.WriteFile(readerPath, []byte("import { extractPageDateMetadata } from \"../../../patches/page-date.mjs\"; // MORDE_PAGE_DATE_METADATA_PATCH_V1\nextractPageDateMetadata(read.text)\n"), 0o600); err != nil {
+	validReaderPatch := "import { extractPageDateMetadata } from \"../../../patches/page-date.mjs\"; // MORDE_PAGE_DATE_METADATA_PATCH_V1\n" +
+		"extractPageDateMetadata(read.text)\n" +
+		"if (next.protocol !== \"https:\") throw createContentError(\"Insecure URL redirect blocked.\", next.href); // MORDE_HTTPS_REDIRECT_POLICY_V1\n"
+	if err := os.WriteFile(readerPath, []byte(validReaderPatch), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "patches", "page-date.mjs"), []byte("// broken helper\n"), 0o600); err != nil {
@@ -119,17 +124,43 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 			t.Fatalf("unexpected isolated response: %#v", reply)
 		}
 	}
+	canceledCtx, cancelBeforeCall := context.WithCancel(context.Background())
+	cancelBeforeCall()
+	if _, err := client.CallTool(canceledCtx, "searxng_web_search", json.RawMessage(`{"query":"synthetic"}`)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled request returned %v, want context.Canceled", err)
+	}
 	if err := os.WriteFile(script, []byte(`setInterval(() => {}, 1000)`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if _, err := client.CallTool(ctx, "searxng_web_search", json.RawMessage(`{"query":"synthetic"}`)); err == nil || time.Since(started) > 3*time.Second {
+	if _, err := client.CallTool(ctx, "searxng_web_search", json.RawMessage(`{"query":"synthetic"}`)); !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 3*time.Second {
 		t.Fatalf("cancellation did not stop search process promptly: %v", err)
 	}
 	if _, err := NewBuiltinSearchClient(node, script, "http://127.0.0.1:8189", 0); err == nil || !strings.Contains(err.Error(), "configuration") {
 		t.Fatalf("invalid concurrency was not rejected: %v", err)
+	}
+}
+
+func TestBuiltinSearchPreservesCancellationWhileWaitingForCapacity(t *testing.T) {
+	client := &BuiltinSearchClient{concurrency: make(chan struct{}, 1)}
+	client.concurrency <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := client.CallTool(ctx, "searxng_web_search", json.RawMessage(`{"query":"synthetic"}`))
+		finished <- err
+	}()
+	time.AfterFunc(10*time.Millisecond, cancel)
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("capacity wait returned %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capacity wait did not stop after cancellation")
 	}
 }
 
@@ -155,7 +186,7 @@ func TestBuiltinSearchWithLocalSearxng(t *testing.T) {
 		t.Fatalf("public news search failed or returned no source links: err=%v isError=%t unsupported=%t", err, result.IsError, result.UnsupportedContent)
 	}
 	blocked, err := client.CallTool(context.Background(), "web_url_read", json.RawMessage(`{"url":"http://127.0.0.1:8189/"}`))
-	if err != nil || !blocked.IsError {
+	if err == nil && !blocked.IsError {
 		t.Fatalf("private URL was not blocked by the fixed MCP server: err=%v isError=%t", err, blocked.IsError)
 	}
 }

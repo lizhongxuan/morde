@@ -216,3 +216,106 @@ func TestSelectedMCPRevocationDuringDiscoveryDoesNotExposeCatalog(t *testing.T) 
 		t.Fatalf("revoked discovery exposed a catalog: result=%+v calls=%d err=%v", result, client.callCalls, err)
 	}
 }
+
+func TestGitHubMCPReadOnlyProfileRestrictsCatalogAndExecution(t *testing.T) {
+	client := &recordingSelectedMCPClient{cloudDSHMCPClientStub: &cloudDSHMCPClientStub{tools: []MCPConnectorToolDefinition{
+		{Name: "get_me", InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`)},
+		{Name: "search_code", InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)},
+		{Name: "create_issue", InputSchema: json.RawMessage(`{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}`)},
+	}}}
+	broker, store, claimed := selectedMCPTestFixture(t, client)
+	connector := store.values["k1234567"]
+	connector.EndpointURL = "https://api.githubcopilot.com/mcp/"
+	store.values["k1234567"] = connector
+
+	discovery, err := broker.Execute(context.Background(), claimed, ModelToolCall{CallID: "github-discover", Name: cloudDSHMCPDiscoverToolName,
+		Arguments: `{"connector_id":"k1234567"}`})
+	if err != nil || discovery.Status != AgentToolSucceeded || client.listCalls != 1 {
+		t.Fatalf("GitHub read-only discovery = %+v err=%v calls=%d", discovery, err, client.listCalls)
+	}
+	var catalog struct {
+		Tools []MCPConnectorToolDefinition `json:"tools"`
+	}
+	if err := json.Unmarshal([]byte(discovery.Output), &catalog); err != nil || len(catalog.Tools) != 2 ||
+		catalog.Tools[0].Name != "get_me" || catalog.Tools[1].Name != "search_code" {
+		t.Fatalf("GitHub discovered catalog = %+v err=%v", catalog, err)
+	}
+	if client.listHeaders.Get(githubMCPReadonlyHeader) != "true" || client.listHeaders.Get(githubMCPToolsHeader) != githubMCPReadonlyTools {
+		t.Fatalf("GitHub discovery did not request the restricted upstream profile: headers=%v", client.listHeaders)
+	}
+
+	// Simulate an old or corrupted pinned catalog. The execution path must still
+	// reject a write tool before creating an operation or contacting the server.
+	writeSchema, _, err := canonicalMCPToolSchema([]MCPConnectorToolDefinition{{Name: "create_issue",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.grants[0].ToolSchema = writeSchema
+	store.grants[0].ToolSchemaSHA256 = sha256Bytes(writeSchema)
+	write, err := broker.Execute(context.Background(), claimed, selectedMCPCallForTest(t, "github-write", "k1234567", "create_issue", `{"title":"no"}`))
+	if err != nil || write.Status != AgentToolFailed || client.callCalls != 0 || len(store.operations) != 0 {
+		t.Fatalf("stale GitHub write tool was not rejected: result=%+v err=%v remote_calls=%d operations=%d",
+			write, err, client.callCalls, len(store.operations))
+	}
+
+	readSchema, _, err := canonicalMCPToolSchema([]MCPConnectorToolDefinition{{Name: "search_code",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.grants[0].ToolSchema = readSchema
+	store.grants[0].ToolSchemaSHA256 = sha256Bytes(readSchema)
+	readCall := selectedMCPCallForTest(t, "github-read", "k1234567", "search_code", `{"query":"repo:acme/demo bug"}`)
+	pending, err := broker.Execute(context.Background(), claimed, readCall)
+	if err != nil || pending.Status != AgentToolNeedsUser || client.callCalls != 0 {
+		t.Fatalf("GitHub read call bypassed approval: result=%+v err=%v remote_calls=%d", pending, err, client.callCalls)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	called, err := broker.Execute(context.Background(), store.details.Task, readCall)
+	if err != nil || called.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "search_code" {
+		t.Fatalf("approved GitHub read call = %+v err=%v remote_calls=%d tool=%q", called, err, client.callCalls, client.lastTool)
+	}
+	if client.callHeaders.Get(githubMCPReadonlyHeader) != "true" || client.callHeaders.Get(githubMCPToolsHeader) != githubMCPReadonlyTools {
+		t.Fatalf("GitHub tool call did not request the restricted upstream profile: headers=%v", client.callHeaders)
+	}
+}
+
+func TestGitHubMCPReadOnlyProfileRequiresExactEndpoint(t *testing.T) {
+	for _, test := range []struct {
+		endpoint string
+		github   bool
+	}{
+		{endpoint: "https://api.githubcopilot.com/mcp/", github: true},
+		{endpoint: "https://api.githubcopilot.com:443/mcp/", github: true},
+		{endpoint: "https://api.githubcopilot.com./mcp/", github: true},
+		{endpoint: "https://api.githubcopilot.com/mcp/x/all/readonly", github: true},
+		{endpoint: "https://api.githubcopilot.com.evil.invalid/mcp/"},
+		{endpoint: "http://api.githubcopilot.com/mcp/"},
+		{endpoint: "https://api.githubcopilot.com:444/mcp/"},
+		{endpoint: "https://api.githubcopilot.com/mcp/?toolset=all"},
+	} {
+		t.Run(test.endpoint, func(t *testing.T) {
+			if got := isGitHubMCPRemoteEndpoint(test.endpoint); got != test.github {
+				t.Fatalf("isGitHubMCPRemoteEndpoint(%q) = %t, want %t", test.endpoint, got, test.github)
+			}
+		})
+	}
+}
+
+type recordingSelectedMCPClient struct {
+	*cloudDSHMCPClientStub
+	listHeaders http.Header
+	callHeaders http.Header
+}
+
+func (c *recordingSelectedMCPClient) ListTools(ctx context.Context, endpoint string, headers http.Header) ([]MCPConnectorToolDefinition, error) {
+	c.listHeaders = headers.Clone()
+	return c.cloudDSHMCPClientStub.ListTools(ctx, endpoint, headers)
+}
+
+func (c *recordingSelectedMCPClient) CallTool(ctx context.Context, endpoint string, headers http.Header,
+	name string, arguments json.RawMessage) (MCPConnectorToolResult, error) {
+	c.callHeaders = headers.Clone()
+	return c.cloudDSHMCPClientStub.CallTool(ctx, endpoint, headers, name, arguments)
+}

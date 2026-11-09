@@ -83,6 +83,14 @@ func registerHistogram(reg prometheus.Registerer, collector *prometheus.Histogra
 }
 
 func (c *Client) Create(ctx context.Context, input app.SandboxCreateRequest) (result app.Sandbox, err error) {
+	if input.NetworkPolicy != nil {
+		if !c.profile.NetworkPolicyEnabled {
+			return app.Sandbox{}, fmt.Errorf("sandbox network policy is not enabled for this profile: %w", app.ErrSandboxUnsupported)
+		}
+		if input.NetworkPolicy.DefaultAction != "deny" {
+			return app.Sandbox{}, fmt.Errorf("sandbox network policy must deny egress by default: %w", app.ErrSandboxUnsupported)
+		}
+	}
 	err = c.observe("create", func() error {
 		if c.checkNetworkPolicy == nil || c.checkNetworkPolicy(ctx, c.profile.NetworkGuardPath, c.profile.BaseURL) != nil {
 			return fmt.Errorf("check network policy guard: %w", app.ErrSandboxUnavailable)
@@ -93,6 +101,7 @@ func (c *Client) Create(ctx context.Context, input app.SandboxCreateRequest) (re
 			Timeout:          int64(input.Timeout / time.Second),
 			ResourceRequests: resource(input.Requests),
 			ResourceLimits:   resource(input.Limits),
+			NetworkPolicy:    networkPolicy(input.NetworkPolicy),
 			Env:              nonNilMap(input.Env),
 			Metadata:         nonNilMap(input.Metadata),
 			Volumes:          make([]createVolume, 0, len(input.Volumes)),
@@ -408,6 +417,10 @@ type resourceLimits struct {
 	Memory string `json:"memory"`
 }
 
+type networkPolicyRequest struct {
+	DefaultAction string `json:"defaultAction"`
+}
+
 type pvc struct {
 	ClaimName                  string `json:"claimName"`
 	CreateIfNotExists          bool   `json:"createIfNotExists"`
@@ -422,14 +435,15 @@ type createVolume struct {
 }
 
 type createRequest struct {
-	Image            image             `json:"image"`
-	Entrypoint       []string          `json:"entrypoint"`
-	Timeout          int64             `json:"timeout"`
-	ResourceRequests resourceLimits    `json:"resourceRequests"`
-	ResourceLimits   resourceLimits    `json:"resourceLimits"`
-	Env              map[string]string `json:"env"`
-	Metadata         map[string]string `json:"metadata"`
-	Volumes          []createVolume    `json:"volumes"`
+	Image            image                 `json:"image"`
+	Entrypoint       []string              `json:"entrypoint"`
+	Timeout          int64                 `json:"timeout"`
+	ResourceRequests resourceLimits        `json:"resourceRequests"`
+	ResourceLimits   resourceLimits        `json:"resourceLimits"`
+	NetworkPolicy    *networkPolicyRequest `json:"networkPolicy,omitempty"`
+	Env              map[string]string     `json:"env"`
+	Metadata         map[string]string     `json:"metadata"`
+	Volumes          []createVolume        `json:"volumes"`
 }
 
 type sandboxStatus struct {
@@ -490,6 +504,13 @@ func mapState(state string) app.SandboxState {
 
 func resource(value app.SandboxResources) resourceLimits {
 	return resourceLimits{CPU: value.CPU, Memory: value.Memory}
+}
+
+func networkPolicy(value *app.SandboxNetworkPolicy) *networkPolicyRequest {
+	if value == nil {
+		return nil
+	}
+	return &networkPolicyRequest{DefaultAction: value.DefaultAction}
 }
 
 func nonNilMap(value map[string]string) map[string]string {

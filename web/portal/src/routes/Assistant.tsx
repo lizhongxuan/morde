@@ -16,7 +16,11 @@ import { ApiError } from '../api/client';
 import { useAuth } from '../app/auth';
 import { formatDate, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
+import { AssistantReplySpeech } from '../components/AssistantReplySpeech';
+import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
+import { ChatMarkdown } from '../components/ChatMarkdown';
 import { sha256Hex } from './personal-data-store';
+import { extractAssistantPDFText } from './assistant-pdf';
 
 type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items'][number];
 type ConversationMessage = Awaited<ReturnType<typeof portalApi.conversationMessages>>['items'][number];
@@ -26,12 +30,19 @@ type WorkspaceBinding = Host['workspaces'][number];
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
   snapshotStatus?: 'streaming' | 'completed' | 'interrupted';
 };
-type ComposerAttachment = { id: string; file: File; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string };
+type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string };
+type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string } | { status: 'error'; message: string };
 
 const assistantAttachmentTypes = new Set([
   'image/jpeg', 'image/png', 'text/plain',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+]);
+const assistantOfficeAttachmentTypes = new Set([
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]);
 const attachmentChunkBytes = 4 * 1024 * 1024;
 
@@ -40,16 +51,17 @@ function assistantFileMediaType(file: File): string {
   const extension = file.name.toLowerCase().split('.').at(-1);
   return ({ txt: 'text/plain', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } as Record<string, string>)[extension ?? ''] ?? file.type;
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', pdf: 'application/pdf' } as Record<string, string>)[extension ?? ''] ?? file.type;
 }
 
 function assistantFileError(file: File, mediaType: string): string | null {
-  if (!assistantAttachmentTypes.has(mediaType)) return '暂不支持读取此文件类型。可添加 PNG、JPEG、TXT、DOCX 或 XLSX。';
+  if (!assistantAttachmentTypes.has(mediaType)) return '暂不支持读取此文件类型。可添加 PNG、JPEG、TXT、DOCX、XLSX 或 PPTX。';
   if (file.size < 1) return '空文件无法读取。';
   const maxBytes = mediaType === 'image/jpeg' || mediaType === 'image/png' ? 512 * 1024
     : mediaType === 'text/plain' ? 63 * 1024 : 16 * 1024 * 1024;
   if (file.size > maxBytes) return mediaType.startsWith('image/') ? '图片不能超过 512 KiB。'
-    : mediaType === 'text/plain' ? 'TXT 文件不能超过 63 KiB。' : 'DOCX/XLSX 文件不能超过 16 MiB。';
+    : mediaType === 'text/plain' ? 'TXT 文件不能超过 63 KiB。' : 'DOCX/XLSX/PPTX 文件不能超过 16 MiB。';
   return null;
 }
 
@@ -82,7 +94,7 @@ async function uploadAssistantAttachment(item: PendingMessageAttachment, service
 }
 
 function sortAssistantMessages(messages: AssistantDisplayMessage[]): AssistantDisplayMessage[] {
-  return messages.sort((left, right) => left.sequence - right.sequence ||
+  return messages.sort((left, right) => (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER) ||
     left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id));
 }
 
@@ -147,10 +159,17 @@ export function mergeTaskAssistantMessage(items: AssistantDisplayMessage[], task
         existing.output_task_revision === snapshot.task_revision && snapshot.content.startsWith(existing.content)) {
         // A Task event can arrive after the conversation page was read. Keep
         // its sequence, but use the newer verified prefix for the same revision.
-        messages[existingIndex] = { ...existing, content: snapshot.content, snapshotStatus: snapshot.status };
+        messages[existingIndex] = {
+          ...existing,
+          content: snapshot.content,
+          snapshotStatus: resolveTaskSnapshotStatus(task, snapshot.status),
+        };
       } else if (existing) {
         // A persisted completion or interruption cannot be reverted by a stale snapshot.
-        messages[existingIndex] = { ...existing, snapshotStatus: existing.output_status ?? 'completed' };
+        messages[existingIndex] = {
+          ...existing,
+          snapshotStatus: resolveTaskSnapshotStatus(task, existing.output_status ?? 'completed'),
+        };
       }
     } else {
       const coveredByCombinedMessage = snapshot.task_revision !== undefined && snapshot.result_event_sequence !== undefined
@@ -158,10 +177,8 @@ export function mergeTaskAssistantMessage(items: AssistantDisplayMessage[], task
           source.task_id === task?.id && snapshot.task_id === task?.id
           && source.task_revision === snapshot.task_revision && source.event_sequence === snapshot.result_event_sequence));
       if (coveredByCombinedMessage) return sortAssistantMessages(messages);
-      const snapshotStatus = snapshot.status === 'streaming' && task && terminalTaskStatuses.has(task.status)
-        ? task.status === 'completed' ? 'completed' : 'interrupted'
-        : snapshot.status;
-      messages.push({ ...snapshot, snapshotStatus });
+      const sequence = snapshot.sequence ?? messages.reduce((latest, message) => Math.max(latest, message.sequence), 0) + 1;
+      messages.push({ ...snapshot, sequence, snapshotStatus: resolveTaskSnapshotStatus(task, snapshot.status) });
     }
   }
   return sortAssistantMessages(messages);
@@ -174,6 +191,20 @@ function mergeTaskAssistantMessages(items: ConversationMessage[], tasks: Task[])
 }
 
 const terminalTaskStatuses = new Set<Task['status']>(['completed', 'failed', 'cancelled']);
+function resolveTaskSnapshotStatus(task: Task | undefined, status: AssistantDisplayMessage['snapshotStatus']): AssistantDisplayMessage['snapshotStatus'] {
+  if (status === 'streaming' && task && terminalTaskStatuses.has(task.status)) {
+    return task.status === 'completed' ? 'completed' : 'interrupted';
+  }
+  return status;
+}
+
+function latestConversationClientMessageID(messages: ConversationMessage[] | undefined): string | undefined {
+  return messages?.reduce<ConversationMessage | undefined>((latest, current) => {
+    if (current.role !== 'user' || !current.client_message_id) return latest;
+    return !latest || current.sequence > latest.sequence ? current : latest;
+  }, undefined)?.client_message_id;
+}
+
 const controlStateLabels: Record<Host['control_state'], string> = {
   ai: '云端 AI 控制', taking_over: '正在接管', user: '人工控制', returning: '正在交还 AI',
 };
@@ -306,6 +337,22 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
     const source = new EventSource(`/api/tasks/${encodeURIComponent(task.id)}/events?after=${cursor.current}`);
     let disposed = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    const resync = () => {
+      source.close();
+      onState(task.id, 'resyncing');
+      void client.fetchQuery({ queryKey: ['task', task.id], queryFn: () => portalApi.task(task.id), staleTime: 0 }).then((snapshot) => {
+        if (!disposed) {
+          cursor.current = snapshot.event_sequence;
+          void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
+          setGeneration((value) => value + 1);
+        }
+      }).catch(() => {
+        if (!disposed) {
+          onState(task.id, 'disconnected');
+          retry = setTimeout(() => setGeneration((value) => value + 1), 3000);
+        }
+      });
+    };
     source.onopen = () => onState(task.id, 'connected');
     source.onerror = () => onState(task.id, 'disconnected');
     for (const type of taskEventTypes) {
@@ -313,24 +360,15 @@ function TaskStream({ task, conversationID, onState }: { task: Task; conversatio
         let value: unknown;
         try { value = JSON.parse((event as MessageEvent<string>).data); } catch { return; }
         if (type === 'task.snapshot_required') {
-          source.close();
-          onState(task.id, 'resyncing');
-          void client.fetchQuery({ queryKey: ['task', task.id], queryFn: () => portalApi.task(task.id), staleTime: 0 }).then((snapshot) => {
-            if (!disposed) {
-              cursor.current = snapshot.event_sequence;
-              void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
-              setGeneration((value) => value + 1);
-            }
-          }).catch(() => {
-            if (!disposed) {
-              onState(task.id, 'disconnected');
-              retry = setTimeout(() => setGeneration((value) => value + 1), 3000);
-            }
-          });
+          resync();
           return;
         }
         if (!value || typeof value !== 'object' || !('task_id' in value) || !('sequence' in value) ||
           value.task_id !== task.id || typeof value.sequence !== 'number' || !Number.isSafeInteger(value.sequence) || value.sequence <= cursor.current) return;
+        if (value.sequence > cursor.current + 1) {
+          resync();
+          return;
+        }
         cursor.current = value.sequence;
         onState(task.id, 'connected');
         void client.invalidateQueries({ queryKey: ['task', task.id] });
@@ -361,7 +399,10 @@ export function Assistant() {
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
+  const [savingMessage, setSavingMessage] = useState(false);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
+  const [officePreviews, setOfficePreviews] = useState<Record<string, OfficePreviewState>>({});
+  const [preparingAttachmentCount, setPreparingAttachmentCount] = useState(0);
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const [controlTaskID, setControlTaskID] = useState<string | null>(null);
   const [referenceTaskID, setReferenceTaskID] = useState<string | null>(null);
@@ -369,6 +410,10 @@ export function Assistant() {
   const [taskObservationError, setTaskObservationError] = useState<{ taskID: string; message: string } | null>(null);
   const taskObservationRequest = useRef(false);
   const pendingMessageSave = useRef<Promise<void>>(Promise.resolve());
+  const savingMessageRef = useRef(false);
+  const preparingAttachmentCountRef = useRef(0);
+  const composerGeneration = useRef(0);
+  const pdfPreparationControllers = useRef(new Set<AbortController>());
   const sendingMessageIDs = useRef(new Set<string>());
   const receiptOrder = useRef(new MessageReceiptOrder());
   const newConversationKey = useRef<string | null>(null);
@@ -377,6 +422,10 @@ export function Assistant() {
   const ensureAttemptedUserID = useRef<string | null>(null);
   const conversationView = useRef<HTMLDivElement>(null);
   const followConversation = useRef(true);
+  useEffect(() => () => {
+    for (const controller of pdfPreparationControllers.current) controller.abort();
+    pdfPreparationControllers.current.clear();
+  }, []);
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
   const setTaskEventFeed = useCallback((taskID: string, state: TaskFeedState) => {
     setTaskEventFeeds((current) => current[taskID] === state ? current : { ...current, [taskID]: state });
@@ -390,7 +439,7 @@ export function Assistant() {
     queryKey: ['main-conversation', user?.id], queryFn: portalApi.mainConversation,
     enabled: Boolean(user), retry: false,
   });
-  const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections });
+  const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000 });
   const mcpConnectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const availableModels = useQuery({ queryKey: ['available-models'], queryFn: portalApi.availableModels });
   const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences });
@@ -477,6 +526,7 @@ export function Assistant() {
     { failed: conversations.isError, error: conversations.error, retry: () => conversations.refetch() },
     { failed: Boolean(user) && mainConversation.isError, error: mainConversation.error, retry: () => mainConversation.refetch() },
     { failed: models.isError, error: models.error, retry: () => models.refetch() },
+    { failed: mcpConnectors.isError, error: mcpConnectors.error, retry: () => mcpConnectors.refetch() },
     { failed: preferences.isError, error: preferences.error, retry: () => preferences.refetch() },
     { failed: hosts.isError, error: hosts.error, retry: () => hosts.refetch() },
     { failed: execution.isError, error: execution.error, retry: () => execution.refetch() },
@@ -489,6 +539,7 @@ export function Assistant() {
   const retryNetworkReads = () => { void Promise.all(networkReadFailures.map((item) => item.retry())); };
   const selected = conversationsData.find((item) => item.id === conversationID) ?? conversationDetail.data;
   const readyModels = models.data?.items.filter((item) => item.checked_at && item.capabilities.text) ?? [];
+  const modelConfigurationKnown = models.isSuccess && !models.isStale;
   const enabledMCPConnectors = mcpConnectors.data?.items.filter((item) => item.enabled) ?? [];
   const defaultModelID = availableModels.data?.default_model_id;
   const defaultModelReady = Boolean(availableModels.data?.default_model_configured && defaultModelID &&
@@ -500,7 +551,9 @@ export function Assistant() {
   const cloudTasksAvailable = capabilities.isSuccess
     ? capabilities.data.supported_features.includes('cloud_tasks')
     : undefined;
-  const taskAPIAvailable = capabilities.isSuccess && capabilities.data.supported_features.includes('task_api');
+  const conversationAutoRoutingAvailable = capabilities.isSuccess
+    ? capabilities.data.supported_features.includes('conversation_auto_routing_v1')
+    : undefined;
   const preferredHostID = hostSelection ?? '';
   const hostItems = hosts.data?.items ?? [];
   const selectedHost = hostItems.find((host) => host.id === preferredHostID);
@@ -535,7 +588,7 @@ export function Assistant() {
   }
   const displayMessages = mergeTaskAssistantMessages(messages.data?.items ?? [], tasks);
   const latestDisplayMessageContent = displayMessages.at(-1)?.content;
-  const submissionModelID = effectiveModelID;
+  const submissionModelID = readyModels.some((item) => item.id === effectiveModelID) ? effectiveModelID : '';
   const taskActionKey = (scope: string, fingerprint: string) => {
     const previous = pendingTaskActions.current.get(scope);
     if (previous?.fingerprint === fingerprint) return previous.key;
@@ -563,10 +616,10 @@ export function Assistant() {
     sendingMessageIDs.current.add(id);
     const finishReceipt = receiptOrder.current.begin(scope, id);
     let accepted = message.status === 'accepted' && Boolean(message.messageID);
+    if (accepted) finishReceipt(true);
     const checkScope = () => {
       if (!activeOutboxScope.current || scope !== activeOutboxScope.current || scope === outbox.unknownScope || !message.actorID
-        || message.actorID !== user?.id
-        || !message.serviceInstanceID || message.serviceInstanceID !== capabilities.data?.service_instance_id) {
+        || message.actorID !== user?.id || !message.serviceInstanceID || message.serviceInstanceID !== capabilities.data?.service_instance_id) {
         throw new Error('账号或服务尚未确认，消息保留在本机。');
       }
     };
@@ -586,10 +639,6 @@ export function Assistant() {
       if (currentCapabilities.service_instance_id !== message.serviceInstanceID) {
         throw new Error('服务身份已变化，消息保留在原服务的本机队列中。');
       }
-      if (!currentCapabilities.supported_features.includes('conversation_auto_routing_v1')) {
-        await outbox.change(scope, id, (current) => ({ ...current, status: 'pending', error: '服务尚不支持自动分流，请升级后重试。' }));
-        return;
-      }
       let targetID = message.conversationID;
       if (!targetID) {
         if (!message.conversationCreateKey) throw new Error('缺少会话编号，请重新核对。');
@@ -600,22 +649,28 @@ export function Assistant() {
         message = { ...message, conversationID: targetID };
         if (!selectedConversation.current && activeOutboxScope.current === scope) setConversationID(targetID);
       }
-      let receipt: ConversationMessage | undefined;
-      let submittedTask: Task | undefined;
-      if (accepted && message.messageID) {
+
+      if (reconcile || message.status === 'accepted' || message.status === 'unknown') {
         const page = await portalApi.conversationMessages(targetID, undefined, id, message.serviceInstanceID!, message.actorID);
-        receipt = page.items.find((item) => item.id === message.messageID || item.client_message_id === id);
-        if (receipt?.task_id) submittedTask = await portalApi.task(receipt.task_id).catch(() => undefined);
-      } else if (reconcile) {
-        const page = await portalApi.conversationMessages(targetID, undefined, id, message.serviceInstanceID!, message.actorID);
-        receipt = page.items.find((item) => item.client_message_id === id);
-        if (receipt?.task_id) submittedTask = await portalApi.task(receipt.task_id).catch(() => undefined);
+        const receipt = page.items.find((item) => item.id === message.messageID || item.client_message_id === id);
+        if (receipt) {
+          if (receipt.conversation_id !== targetID || receipt.role !== 'user' || receipt.client_message_id !== id ||
+            receipt.content !== message.request.content) throw new Error('恢复的消息回执与当前账号或原文不匹配，消息已保留。');
+          accepted = true;
+          message = { ...message, messageID: receipt.id, status: 'accepted' };
+          finishReceipt(true);
+          await outbox.change(scope, id, (current) => ({ ...current, messageID: receipt.id, status: 'accepted', error: undefined }));
+          client.setQueryData<{ items: ConversationMessage[]; next_cursor: string | null }>(
+            ['conversation-messages', targetID], (previous) => previous?.items.some((item) => item.id === receipt.id)
+              ? previous : { items: [...(previous?.items ?? []), receipt], next_cursor: previous?.next_cursor ?? null },
+          );
+        }
       }
-      if (!receipt && !accepted) {
-        checkScope();
+
+      if (!accepted) {
         const request = outboxReceiptRequest(message);
-        const previousID = request.previous_client_message_id;
-        if (previousID) {
+        if (request.previous_client_message_id) {
+          const previousID = request.previous_client_message_id;
           if (previousID === id) throw new Error('消息前序编号无效，原消息已保留。');
           const pending = receiptOrder.current.previous(scope, previousID);
           const previousAccepted = pending ? await pending : (await portalApi.conversationMessages(
@@ -628,45 +683,25 @@ export function Assistant() {
           }
         }
         await outbox.change(scope, id, (current) => ({ ...current, status: 'sending', error: undefined }));
-        // Freshness is checked when the queued send actually starts.
-        // eslint-disable-next-line react-hooks/purity
-        const statusTime = Date.now();
-        const configStatus = availableModels.isSuccess && statusTime - availableModels.dataUpdatedAt < 60_000
-          ? availableModels.data.configuration_status : models.isSuccess && statusTime - models.dataUpdatedAt < 60_000
-            ? models.data.configuration_status : 'unknown';
-        if (configStatus === 'not_configured') throw new Error('请先配置云端模型，输入内容已保留。');
         checkScope();
-        receipt = needsMessageUpload(request.content)
+        const receipt = needsMessageUpload(request.content)
           ? await uploadMessage<ConversationMessage>({ conversationID: targetID }, request, message.serviceInstanceID!, message.actorID, checkScope)
           : (await portalApi.acceptConversationMessage(targetID, request, id, message.serviceInstanceID!, message.actorID)).message;
-      }
-      checkScope();
-      if (!receipt) throw new Error('已受理消息暂时无法核对，请稍后重试。');
-      if (receipt && (receipt.conversation_id !== targetID || receipt.client_message_id !== id || receipt.role !== 'user'
-        || receipt.content !== message.request.content || (accepted && message.messageID !== receipt.id))) {
-        throw new Error('服务端回执与当前消息不匹配，请刷新后核对。');
-      }
-      const receiptID = receipt.id;
-      if (!receiptID) throw new Error('已受理消息缺少回执编号，请核对后重试。');
-      accepted = true;
-      message = { ...message, messageID: receiptID, ...(receipt?.task_id ? { taskID: receipt.task_id } : {}), status: 'accepted' };
-      await outbox.change(scope, id, (current) => ({ ...current, messageID: receiptID,
-        ...(receipt?.task_id ? { taskID: receipt.task_id } : {}), status: 'accepted', error: undefined }));
-      finishReceipt(true);
-      if (recentConversationKey && activeOutboxScope.current === scope) {
-        writeRecentConversation(recentConversationKey, targetID);
-        client.setQueryData(['assistant-recent-conversation', recentConversationKey], targetID);
-      }
-      if (receipt) {
+        if (receipt.conversation_id !== targetID || receipt.role !== 'user' || receipt.client_message_id !== id ||
+          receipt.content !== request.content) throw new Error('服务端消息回执与当前账号或原文不匹配，请核对后重试。');
+        accepted = true;
+        message = { ...message, messageID: receipt.id, status: 'accepted' };
+        finishReceipt(true);
+        await outbox.change(scope, id, (current) => ({ ...current, messageID: receipt.id, status: 'accepted', error: undefined }));
         client.setQueryData<{ items: ConversationMessage[]; next_cursor: string | null }>(
           ['conversation-messages', targetID], (previous) => previous?.items.some((item) => item.id === receipt.id)
             ? previous : { items: [...(previous?.items ?? []), receipt], next_cursor: previous?.next_cursor ?? null },
         );
       }
-      if (receipt?.task_id && !submittedTask) submittedTask = await portalApi.task(receipt.task_id).catch(() => undefined);
-      if (submittedTask) client.setQueryData(['task', submittedTask.id], submittedTask);
-      void client.invalidateQueries({ queryKey: ['conversations'] });
-      void client.invalidateQueries({ queryKey: ['conversation-tasks', targetID] });
+      if (recentConversationKey && activeOutboxScope.current === scope) {
+        writeRecentConversation(recentConversationKey, targetID);
+        client.setQueryData(['assistant-recent-conversation', recentConversationKey], targetID);
+      }
       for (const attachment of message.attachments) {
         checkScope();
         const attachmentID = await uploadAssistantAttachment(attachment, message.serviceInstanceID!, message.actorID, checkScope);
@@ -674,15 +709,18 @@ export function Assistant() {
         await outbox.change(scope, id, (current) => ({ ...current,
           attachments: current.attachments.map((item) => item.id === attachment.id ? { ...item, attachmentID } : item) }));
         checkScope();
-        await portalApi.associateConversationAttachment(targetID, receiptID, attachment.id, attachmentID, message.serviceInstanceID!, message.actorID);
+        await portalApi.associateConversationAttachment(targetID, message.messageID!, attachment.id, attachmentID, message.serviceInstanceID!, message.actorID);
       }
       await outbox.remove(scope, id);
+      void client.invalidateQueries({ queryKey: ['conversations'] });
       void client.invalidateQueries({ queryKey: ['conversation-messages', targetID] });
+      void client.invalidateQueries({ queryKey: ['conversation-tasks', targetID] });
     } catch (error) {
       const uncertain = !(error instanceof ApiError) || error.status >= 500 || [408, 425, 429].includes(error.status);
       const details = error instanceof ApiError && error.status === 409
         ? '账号、服务或消息状态已变化，消息保留在本机，请核对后重试。' : errorDetails(error).message;
-      await outbox.change(scope, id, (current) => ({ ...current, status: accepted ? 'accepted' : uncertain ? 'unknown' : 'failed', error: details }))
+      await outbox.change(scope, id, (current) => ({ ...current,
+        status: accepted ? 'accepted' : uncertain ? 'unknown' : 'failed', error: details }))
         .catch(() => notify('无法更新本地消息状态，消息将保留等待核对。', 'error'));
     } finally {
       finishReceipt(false);
@@ -748,33 +786,84 @@ export function Assistant() {
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
 
-  const addComposerFiles = (fileList: FileList | null) => {
+  const cancelComposerAttachmentPreparation = () => {
+    composerGeneration.current += 1;
+    for (const controller of pdfPreparationControllers.current) controller.abort();
+    pdfPreparationControllers.current.clear();
+    preparingAttachmentCountRef.current = 0;
+    setPreparingAttachmentCount(0);
+  };
+
+  const addComposerFiles = async (fileList: FileList | null) => {
     if (!fileList) return;
     const incoming = Array.from(fileList);
-    const available = Math.max(0, 16 - composerAttachments.length);
+    const available = Math.max(0, 16 - composerAttachments.length - preparingAttachmentCountRef.current);
+    const selected = incoming.slice(0, available);
+    const generation = composerGeneration.current;
+    const controller = new AbortController();
+    pdfPreparationControllers.current.add(controller);
+    preparingAttachmentCountRef.current += selected.length;
+    setPreparingAttachmentCount(preparingAttachmentCountRef.current);
     const accepted: ComposerAttachment[] = [];
-    for (const file of incoming.slice(0, available)) {
-      const mediaType = assistantFileMediaType(file);
-      const fileError = assistantFileError(file, mediaType);
-      const unsafeName = !file.name || file.name === '.' || file.name === '..' || [...file.name].length > 255 ||
-        file.name.includes('/') || file.name.includes('\\') || [...file.name].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
-      if (unsafeName) {
-        notify('附件文件名无效。', 'error');
-        continue;
+    try {
+      for (const file of selected) {
+        if (controller.signal.aborted || generation !== composerGeneration.current) break;
+        const mediaType = assistantFileMediaType(file);
+        const unsafeName = !file.name || file.name === '.' || file.name === '..' || [...file.name].length > 255 ||
+          file.name.includes('/') || file.name.includes('\\') || [...file.name].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
+        if (unsafeName) {
+          notify('附件文件名无效。', 'error');
+          continue;
+        }
+        let preparedFile = file;
+        let displayName: string | undefined;
+        if (mediaType === 'application/pdf') {
+          try {
+            const extractedText = await extractAssistantPDFText(file, controller.signal);
+            if (generation !== composerGeneration.current) continue;
+            const safeDerivedName = `${Array.from(file.name).slice(0, 250).join('')}.txt`;
+            preparedFile = new File([extractedText], safeDerivedName, { type: 'text/plain', lastModified: file.lastModified });
+            displayName = `${file.name} · 已提取文字`;
+          } catch (error) {
+            if (generation === composerGeneration.current && !(error instanceof Error && error.name === 'AbortError')) {
+              notify(`${file.name}：${error instanceof Error ? error.message : '无法读取 PDF。'}`, 'error');
+            }
+            continue;
+          }
+        }
+        const fileError = assistantFileError(preparedFile, assistantFileMediaType(preparedFile));
+        if (fileError) {
+          notify(`${file.name}：${fileError}`, 'error');
+          continue;
+        }
+        const id = newIdempotencyKey();
+        accepted.push({ id, file: preparedFile, ...(displayName ? { displayName } : {}), objectID: `chat-${id}`,
+          objectKey: newIdempotencyKey(), uploadKey: newIdempotencyKey(), commitKey: newIdempotencyKey() });
       }
-      if (fileError) {
-        notify(`${file.name}：${fileError}`, 'error');
-        continue;
-      }
-      const id = newIdempotencyKey();
-      accepted.push({ id, file, objectID: `chat-${id}`, objectKey: newIdempotencyKey(), uploadKey: newIdempotencyKey(), commitKey: newIdempotencyKey() });
+    } finally {
+      pdfPreparationControllers.current.delete(controller);
+      preparingAttachmentCountRef.current = Math.max(0, preparingAttachmentCountRef.current - selected.length);
+      setPreparingAttachmentCount(preparingAttachmentCountRef.current);
     }
     if (incoming.length > available) notify('每条消息最多添加 16 个附件。', 'error');
-    if (accepted.length) setComposerAttachments((current) => [...current, ...accepted]);
+    if (generation === composerGeneration.current && accepted.length) setComposerAttachments((current) => [...current, ...accepted]);
+  };
+
+  const previewOfficeAttachment = async (item: ComposerAttachment) => {
+    const mediaType = assistantFileMediaType(item.file);
+    if (!assistantOfficeAttachmentTypes.has(mediaType)) return;
+    setOfficePreviews((current) => ({ ...current, [item.id]: { status: 'loading' } }));
+    try {
+      const text = await portalApi.previewPersonalOfficeText(item.file, mediaType);
+      setOfficePreviews((current) => ({ ...current, [item.id]: { status: 'ready', text } }));
+    } catch (error) {
+      setOfficePreviews((current) => ({ ...current, [item.id]: { status: 'error', message: errorDetails(error).message } }));
+    }
   };
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (savingMessageRef.current || preparingAttachmentCountRef.current > 0) return;
     const text = content;
     if (!text.trim() && !composerAttachments.length) return;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
@@ -782,14 +871,7 @@ export function Assistant() {
       notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
       return;
     }
-    // This runs only when the form is submitted, so freshness is checked at the time of the user's action.
-    // eslint-disable-next-line react-hooks/purity
-    const now = Date.now();
-    const configStatus = availableModels.isSuccess && now - availableModels.dataUpdatedAt < 60_000
-      ? availableModels.data.configuration_status : models.isSuccess && now - models.dataUpdatedAt < 60_000
-        ? models.data.configuration_status : 'unknown';
-    if (configStatus === 'not_configured') {
-      notify('请先配置云端模型，输入内容已保留。', 'error');
+    if (models.isSuccess && !models.isStale && models.data.configuration_status === 'not_configured') {
       return;
     }
     const id = newIdempotencyKey();
@@ -800,18 +882,17 @@ export function Assistant() {
       objectID: item.objectID, objectKey: item.objectKey, uploadKey: item.uploadKey, commitKey: item.commitKey,
       ...(item.attachmentID ? { attachmentID: item.attachmentID } : {}),
     }));
-    const precedingServerMessage = [...(messages.data?.items ?? [])]
-      .filter((item) => item.role === 'user' && item.client_message_id)
-      .sort((left, right) => right.sequence - left.sequence)[0]?.client_message_id;
+    savingMessageRef.current = true;
+    setSavingMessage(true);
     const previous = pendingMessageSave.current.then(async () => {
       const message: PendingConversationMessage = {
         actorID: user?.id ?? '',
         request: {
           client_message_id: id, content: effectiveText,
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
-          ...(referenceTaskID ? { reference_task_id: referenceTaskID } : {}),
           ...(hostSelection ? { host_id: hostSelection } : {}),
           ...(workspaceSelection ? { workspace_id: workspaceSelection } : {}),
+          ...(referenceTaskID ? { reference_task_id: referenceTaskID } : {}),
           ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
           ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
         },
@@ -819,14 +900,23 @@ export function Assistant() {
         ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
         attachments, status: 'pending', createdAt: Date.now(),
       };
-      const entry = await outbox.enqueue(message, precedingServerMessage);
+      const serverPredecessor = latestConversationClientMessageID(messages.data?.items);
+      const entry = await outbox.enqueue(message, serverPredecessor);
       if (activeOutboxScope.current === entry.scope) {
         setContent((current) => current === text ? '' : current);
         setComposerAttachments((current) => current.filter((item) => !attachments.some((attachment) => attachment.id === item.id)));
-        setReferenceTaskID((current) => current === referenceTaskID ? null : current);
+        setOfficePreviews((current) => {
+          const next = { ...current };
+          for (const attachment of attachments) delete next[attachment.id];
+          return next;
+        });
+        setReferenceTaskID(null);
         followConversation.current = true;
       }
       void sendMessage(entry, false);
+    }).finally(() => {
+      savingMessageRef.current = false;
+      setSavingMessage(false);
     });
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
@@ -840,6 +930,7 @@ export function Assistant() {
   };
 
   const startNew = () => {
+    cancelComposerAttachmentPreparation();
     newConversationKey.current = null;
     setConversationID(null);
     setMcpConnectorIDs([]);
@@ -847,6 +938,7 @@ export function Assistant() {
     setReferenceTaskID(null);
     setContent('');
     setComposerAttachments([]);
+    setOfficePreviews({});
     if (recentConversationKey) {
       writeRecentConversation(recentConversationKey, null);
       client.setQueryData(['assistant-recent-conversation', recentConversationKey], null);
@@ -854,11 +946,13 @@ export function Assistant() {
   };
 
   const selectConversation = (item: Conversation) => {
+    cancelComposerAttachmentPreparation();
     setConversationID(item.id);
     setControlTaskID(null);
     setReferenceTaskID(null);
     setContent('');
     setComposerAttachments([]);
+    setOfficePreviews({});
     if (recentConversationKey) {
       writeRecentConversation(recentConversationKey, item.id);
       client.setQueryData(['assistant-recent-conversation', recentConversationKey], item.id);
@@ -876,15 +970,12 @@ export function Assistant() {
       answer, actionScope, key: taskActionKey(actionScope, fingerprint) });
   };
 
-  const taskProgressVersion = tasks.map((task) => `${task.id}:${task.event_sequence}:${task.status}`).join(',');
   const finishedTaskIDs = tasks.filter((task) => terminalTaskStatuses.has(task.status)).map((task) => task.id).join(',');
   useEffect(() => { followConversation.current = true; }, [conversationID]);
   useEffect(() => {
     const view = conversationView.current;
     if (view && followConversation.current) view.scrollTop = view.scrollHeight;
-  }, [conversationID, displayMessages.length, latestDisplayMessageContent, taskProgressVersion,
-    outbox.entries.length, hostIsReady, workspaceSelection,
-    models.isError, models.isPending, readyModels.length, execution.isError, execution.data?.state, hosts.isError]);
+  }, [conversationID, displayMessages.length, latestDisplayMessageContent, outbox.entries.length]);
 
   useEffect(() => {
     if (conversationID && finishedTaskIDs) {
@@ -912,7 +1003,7 @@ export function Assistant() {
       <small role="status">{status}{message.error ? `：${message.error}` : ''}</small>
       {message.attachments.length > 0 && <small>附件 · {message.attachments.length}</small>}
       {message.status !== 'sending' && <button type="button" className="button button-small button-secondary"
-        onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' ? '重试附件' : '核对并重试'}</button>}
+        onClick={() => void sendMessage({ scope, message }, true)}>{message.status === 'accepted' && message.attachments.length ? '重试附件' : '核对并重试'}</button>}
     </article>;
   };
   const renderTaskActivity = (task: Task) => {
@@ -925,6 +1016,9 @@ export function Assistant() {
       message.sources?.some((source) => source.task_id === task.id && source.task_revision === task.assistant_message?.task_revision &&
         source.event_sequence === task.assistant_message?.result_event_sequence)));
     const taskHost = task.host_id ? hostItems.find((host) => host.id === task.host_id) : undefined;
+    const browserHandoffRequested = task.waiting_reason === 'clarification' && Boolean(task.clarification_request) && task.steps.some((step) =>
+      step.kind === 'tool' && (step.title === 'Run cloud dsh tool: browser_prepare_user_handoff' ||
+        step.title === 'Run cloud dsh MCP tool: browser_prepare_user_handoff'));
     const answer = clarificationAnswers[task.id] ?? '';
     const hasPanel = busy || task.status === 'failed' || task.status === 'cancelled' || visibleSteps.length > 0 ||
       task.artifacts.length > 0 || task.result_message_pending || (task.result_message_published && !hasReply) ||
@@ -932,6 +1026,7 @@ export function Assistant() {
     return <Fragment key={`activity:${task.id}`}>
       {task.status === 'completed' && task.result && !hasReply && !task.result_message_pending && !task.result_message_published && <article className="chat-message chat-message-assistant">
         <strong className="chat-message-author">AI 助手</strong><p>{task.result}</p>
+        <AssistantReplySpeech text={task.result} sessionKey={`${conversationID}:${task.id}`} />
       </article>}
       {hasPanel && <section className="task-activity" aria-label={`任务 ${task.id} 的工作过程`}>
         {(busy || task.status === 'failed' || task.status === 'cancelled' || task.result_message_pending ||
@@ -942,6 +1037,10 @@ export function Assistant() {
           {busy && taskEventFeeds[task.id] === 'disconnected' && !showConsolidatedNetworkError && <span>连接中断，正在重连…</span>}
         </div>}
         {task.host_id && <p className="assistant-task-target">当前任务使用：{taskTargetText(task, hostItems)}。下面的目标选择只影响下一条新消息。</p>}
+        {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
+          <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
+          <span className="muted">登录完成后交还 AI，再回到这里提交并继续。</span>
+        </div>}
         {busy && <div className="inline-actions">
           <button type="button" className="button button-secondary"
             onClick={() => document.getElementById('assistant-content')?.focus()}>继续对话</button>
@@ -949,7 +1048,10 @@ export function Assistant() {
             onClick={() => { setReferenceTaskID(task.id); document.getElementById('assistant-content')?.focus(); }}>补充任务</button>}
         </div>}
         {visibleSteps.length > 0 && <details><summary>查看工作过程</summary><ol className="task-activity-steps">
-          {visibleSteps.map((step) => <li key={step.id}><span aria-hidden="true">•</span><span><strong>{stepTitle(step)}</strong>{step.kind !== 'progress' && <small>{stepStatus[step.status]}</small>}</span></li>)}
+          {visibleSteps.map((step) => <li key={step.id}><span aria-hidden="true">•</span><span><strong>{stepTitle(step)}</strong>
+            {step.kind !== 'progress' && <small>{stepStatus[step.status]}</small>}
+            {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
+          </span></li>)}
         </ol></details>}
         {task.artifacts.map((artifact) => <p className="task-activity-artifact" key={artifact.id}>成果：{artifact.label}</p>)}
         {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
@@ -992,11 +1094,11 @@ export function Assistant() {
     {mainConversation.data?.status === 'uninitialized' && <p className="notice notice-info" role="status">正在初始化你的主会话…{ensureMainConversation.isError && <button type="button" className="button button-small button-secondary" onClick={ensureMain}>重试</button>}</p>}
     {capabilities.isPending && <p className="notice notice-info" role="status">正在检查服务能力…</p>}
     {capabilities.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取服务能力：{errorDetails(capabilities.error).message}<button type="button" className="button button-small button-secondary" aria-label="重试服务能力" onClick={() => void capabilities.refetch()}>重试</button></div>}
-    {capabilities.isSuccess && !taskAPIAvailable && <div className="notice notice-warning" role="status">
-      当前服务尚未启用云端任务 API；消息可保存在本机，服务升级后再核对。
+    {capabilities.isSuccess && conversationAutoRoutingAvailable === false && <div className="notice notice-warning" role="status">
+      服务端尚未确认支持对话自动处理；仍可发送消息，发送状态会根据服务端回执显示，未确认的消息会保留在本机。
     </div>}
-    {taskAPIAvailable && cloudTasksAvailable === false && <div className="notice notice-warning" role="status">
-      AI 服务尚未启用，消息可先发送或保存在本机等待处理。
+    {capabilities.isSuccess && cloudTasksAvailable === false && <div className="notice notice-warning" role="status">
+      云端任务工具当前不可用；普通消息仍可发送，实际调用该工具时会检查可用状态。
     </div>}
     <div className="assistant-layout">
       <aside className="assistant-sidebar" aria-label="最近对话">
@@ -1036,9 +1138,39 @@ export function Assistant() {
                 {displayMessages.map((message) => {
                   const messageTask = message.task_id ? tasksByID.get(message.task_id) : undefined;
                   const routingStatus = message.role === 'user' ? routingStatusText(message.routing_status) : null;
+                  const sources = message.role === 'assistant' ? message.sources ?? [] : [];
+                  const sourceContentMatches = sources.length > 0 && sources.every((source) => source.content.length > 0) &&
+                    sources.map((source) => source.content).join('\n\n') === message.content;
                   return <Fragment key={message.id}>
-                    <article className={`chat-message chat-message-${message.role}`}>
-                      <strong className="chat-message-author">{message.role === 'user' ? '你' : 'AI 助手'}</strong><p>{message.content}</p>
+                    <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}`}>
+                      <strong className="chat-message-author">{message.role === 'user' ? '你' : 'AI 助手'}</strong>
+                      {sourceContentMatches ? <div className="chat-message-source-list">
+                        {sources.map((source) => {
+                          const sourceMessage = displayMessages.find((candidate) => candidate.id === source.user_message_id);
+                          const prompt = sourceMessage?.content.trim().replace(/\s+/g, ' ');
+                          const excerpt = prompt && [...prompt].length > 72 ? `${[...prompt].slice(0, 72).join('')}…` : prompt;
+                          return <section className="chat-message-source" key={`${source.task_id}:${source.task_revision}:${source.event_sequence}`}>
+                            <div className="chat-message-source-meta">
+                              {sourceMessage ? <a className="chat-message-source-origin"
+                                href={`#conversation-message-${encodeURIComponent(source.user_message_id)}`}
+                                title={prompt} aria-label={`查看关联的用户消息：${prompt}`}>
+                                {excerpt ? `回复消息：${excerpt}` : '查看关联消息'}
+                              </a> : <span className="chat-message-source-origin">关联消息 {source.user_message_id}</span>}
+                              <span className="chat-message-source-task">任务 {source.task_id} · 修订 {source.task_revision} · 结果事件 {source.event_sequence}</span>
+                            </div>
+                            <ChatMarkdown content={source.content} />
+                          </section>;
+                        })}
+                      </div> : <>
+                        {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
+                        {sources.length > 0 && <div className="chat-message-source-meta" aria-label="回复来源">
+                          {sources.map((source) => <span className="chat-message-source-task" key={`${source.task_id}:${source.task_revision}:${source.event_sequence}`}>
+                            关联消息 {source.user_message_id} · 任务 {source.task_id} · 修订 {source.task_revision} · 结果事件 {source.event_sequence}
+                          </span>)}
+                        </div>}
+                      </>}
+                      {message.role === 'assistant' && message.snapshotStatus !== 'streaming' && message.snapshotStatus !== 'interrupted' &&
+                        <AssistantReplySpeech text={message.content} sessionKey={conversationID ?? message.conversation_id} />}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
                         {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
                           href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {index + 1}</a></span>)}
@@ -1069,8 +1201,8 @@ export function Assistant() {
           {pendingMessages.map(renderPendingMessage)}
           </>}
           {models.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取模型：{errorDetails(models.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void models.refetch()}>重试</button></div>}
-          {models.data?.configuration_status === 'not_configured' && <div className="notice notice-warning assistant-setup-notice" role="status">还没有配置云端模型。<Link to="/connections">配置模型</Link></div>}
-          {models.data?.configuration_status === 'configured' && !readyModels.length && <div className="notice notice-warning assistant-setup-notice" role="status">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></div>}
+          {modelConfigurationKnown && models.data?.configuration_status === 'not_configured' && <div className="notice notice-warning assistant-setup-notice" role="status">还没有配置云端模型。<Link to="/connections">配置模型</Link></div>}
+          {modelConfigurationKnown && models.data?.configuration_status === 'configured' && !readyModels.length && <div className="notice notice-warning assistant-setup-notice" role="status">模型已配置，当前没有通过检查的文字模型；消息仍可先发送。<Link to="/connections">检查模型设置</Link></div>}
           {outbox.storageError && <div className="error-inline" role="alert">本地消息存储不可用：{outbox.storageError}</div>}
           {execution.isError && !showConsolidatedNetworkError && <div className="error-inline" role="alert">无法读取 AI 服务状态：{errorDetails(execution.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void execution.refetch()}>重试</button></div>}
           {execution.data?.state === 'stopping' && <p className="notice notice-warning" role="status">AI 服务正在停止；消息仍可先发送。</p>}
@@ -1079,21 +1211,41 @@ export function Assistant() {
           {selectedHost && !hostIsReady && <p className="notice notice-warning" role="status">目标电脑暂不可用：{hostStateLabel[selectedHost.state] || selectedHost.state} · {controlStateLabels[selectedHost.control_state]}。</p>}
           {workspaceSelection && !selectedBinding && <p className="notice notice-warning" role="status">所选 Workspace 状态待核对；消息仍可发送，使用时会再次核验。</p>}
         </div>
-        <section className="assistant-composer" aria-label="发送云端任务消息">
+        <section className="assistant-composer" aria-label="发送对话消息">
           <form onSubmit={submit}>
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
             <textarea id="assistant-content" value={content} onChange={(event) => setContent(event.target.value)}
               placeholder="输入你想问的问题…" />
             {composerAttachments.length > 0 && <div className="assistant-attachment-list" aria-label="待发送附件">
-              {composerAttachments.map((item) => <span className="assistant-attachment-chip" key={item.id}>
-                <span title={item.file.name}>{item.file.name}{item.attachmentID ? ' · 已准备' : ''}</span>
-                <button type="button" aria-label={`移除附件 ${item.file.name}`}
-                  onClick={() => setComposerAttachments((current) => current.filter((candidate) => candidate.id !== item.id))}>×</button>
-              </span>)}
+              {composerAttachments.map((item) => {
+                const mediaType = assistantFileMediaType(item.file);
+                const preview = officePreviews[item.id];
+                return <Fragment key={item.id}>
+                  <span className="assistant-attachment-chip">
+                    <span title={item.displayName ?? item.file.name}>{item.displayName ?? item.file.name}{item.attachmentID ? ' · 已准备' : ''}</span>
+                    {assistantOfficeAttachmentTypes.has(mediaType) && <button type="button" aria-label={`预览附件 ${item.file.name}`}
+                      disabled={preview?.status === 'loading'} style={{ width: 'auto', padding: '0 5px', whiteSpace: 'nowrap' }}
+                      onClick={() => void previewOfficeAttachment(item)}>{preview?.status === 'loading' ? '预览中…' : '预览文本'}</button>}
+                    <button type="button" aria-label={`移除附件 ${item.file.name}`} onClick={() => {
+                      setComposerAttachments((current) => current.filter((candidate) => candidate.id !== item.id));
+                      setOfficePreviews((current) => {
+                        const next = { ...current };
+                        delete next[item.id];
+                        return next;
+                      });
+                    }}>×</button>
+                  </span>
+                  {preview?.status === 'loading' && <span role="status" style={{ flexBasis: '100%' }}>正在提取 {item.file.name} 的文字…</span>}
+                  {preview?.status === 'error' && <span role="alert" style={{ flexBasis: '100%' }}>{item.file.name} 预览失败：{preview.message}</span>}
+                  {preview?.status === 'ready' && <pre role="region" aria-label={`文本预览 ${item.file.name}`}
+                    style={{ flexBasis: '100%', maxHeight: '12rem', overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0', padding: '8px', border: '1px solid #dce5f4', borderRadius: '6px' }}>
+                    {preview.text}</pre>}
+                </Fragment>;
+              })}
             </div>}
             <div className="assistant-composer-footer"><div className="assistant-selectors"><label><span>AI 模型</span><select aria-label="选择 AI 模型"
-              value={submissionModelID} onChange={(event) => setModelID(event.target.value)} disabled={models.isPending}>
-              <option value="">自动选择模型</option>{submissionModelID && !readyModels.some((item) => item.id === submissionModelID) && <option value={submissionModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
+              value={effectiveModelID} onChange={(event) => setModelID(event.target.value)} disabled={models.isPending}>
+              <option value="">自动选择模型</option>{effectiveModelID && !readyModels.some((item) => item.id === effectiveModelID) && <option value={effectiveModelID}>已选择模型，状态待核对</option>}{readyModels.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model_name}</option>)}
             </select></label>
           {enabledMCPConnectors.length > 0 && <fieldset className="assistant-tool-connectors">
             <legend>工具连接</legend>
@@ -1103,7 +1255,7 @@ export function Assistant() {
               <span>{connector.name}</span>
             </label>)}</div>
           </fieldset>}
-          {mcpConnectors.isError && <div className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></div>}
+          {mcpConnectors.isError && !showConsolidatedNetworkError && <div className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></div>}
           <div className="assistant-target-row">
             <label><span>目标电脑</span><select aria-label="选择目标电脑" value={selectedHost?.id ?? hostSelection ?? ''}
               disabled={hosts.isPending}
@@ -1126,17 +1278,24 @@ export function Assistant() {
                 {referenceTaskID && <span role="status">正在补充任务 {referenceTaskID} <button type="button" onClick={() => setReferenceTaskID(null)}>取消</button></span>}
                 <label className="assistant-attach-control">
                   <span>＋ 附件</span>
-                  <input type="file" aria-label="添加附件" accept=".txt,.jpg,.jpeg,.png,.docx,.xlsx,text/plain,image/jpeg,image/png,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  <input type="file" aria-label="添加附件" accept=".txt,.jpg,.jpeg,.png,.docx,.xlsx,.pptx,.pdf,text/plain,image/jpeg,image/png,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     multiple
-                    onChange={(event) => { addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
+                    onChange={(event) => { void addComposerFiles(event.currentTarget.files); event.currentTarget.value = ''; }} />
                 </label>
-                {activeTasks.length > 1 && <select aria-label="选择要停止的任务" value={activeTaskID ?? ''} disabled={taskControl.isPending}
-                  onChange={(event) => setControlTaskID(event.target.value || null)}>
-                  <option value="">选择要停止的任务</option>{activeTasks.map((task) => <option key={task.id} value={task.id}>{task.objective.slice(0, 24)} · {task.id}</option>)}
-                </select>}
-                {activeTask?.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending} onClick={() => submitTaskControl('resume')}>继续任务</button>}
-                {activeTask && ['queued', 'running', 'waiting_user', 'paused'].includes(activeTask.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending} onClick={() => submitTaskControl('cancel')}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
-                <button className="button button-primary assistant-send" type="submit" disabled={!content.trim() && !composerAttachments.length}>发送 <span aria-hidden="true">↑</span></button>
+                <AssistantVoiceInput onTranscript={(transcript) => setContent((current) => current.trim()
+                  ? `${current.trimEnd()} ${transcript}` : transcript)} />
+                <div className="assistant-task-actions" role="group" aria-label="任务控制与发送">
+                  {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
+                  {activeTasks.length > 1 && <select aria-label="选择要停止的任务" value={activeTaskID ?? ''} disabled={taskControl.isPending}
+                    onChange={(event) => setControlTaskID(event.target.value || null)}>
+                    <option value="">选择要停止的任务</option>{activeTasks.map((task) => <option key={task.id} value={task.id}>{task.objective.slice(0, 24)} · {task.id}</option>)}
+                  </select>}
+                  {activeTask?.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending} onClick={() => submitTaskControl('resume')}>继续任务</button>}
+                  {activeTask && ['queued', 'running', 'waiting_user', 'paused'].includes(activeTask.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending} onClick={() => submitTaskControl('cancel')}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
+                  <button className="button button-primary assistant-send" type="submit" disabled={savingMessage || preparingAttachmentCount > 0 || (!content.trim() && !composerAttachments.length)}>
+                    {preparingAttachmentCount > 0 ? '读取附件…' : savingMessage ? '保存中…' : '发送'} <span aria-hidden="true">↑</span>
+                  </button>
+                </div>
               </div>
             </div>
           </form>

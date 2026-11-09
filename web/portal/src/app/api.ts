@@ -225,7 +225,11 @@ export const portalApi = {
       params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey, 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } }, body,
     });
     const submission = unwrapApiResponse(result);
-    if (result.response.status !== 202) throw new Error('服务端未确认任务创建，请核对后重试。');
+    const { message } = submission;
+    if (result.response.status !== 202 || message.role !== 'user' || message.conversation_id !== id ||
+      message.client_message_id !== body.client_message_id || message.content !== body.content) {
+      throw new Error('服务端未确认消息已接收，请核对后重试。');
+    }
     return submission;
   },
   associateConversationAttachment: async (conversationID: string, messageID: string, clientAttachmentID: string, attachmentID: string, serviceInstanceID: string, actorID: string) => {
@@ -299,6 +303,23 @@ export const portalApi = {
     const response = await requestFetch(`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`);
     if (!response.ok) await throwResponseError(response);
     return response.blob();
+  },
+  previewPersonalOfficeText: async (file: Blob, mediaType: string): Promise<string> => {
+    const supported = new Set([
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    ]);
+    if (!supported.has(mediaType)) throw new Error('仅支持预览 DOCX、XLSX 或 PPTX 文档。');
+    const response = await requestFetch('/api/personal-data/office-preview', {
+      method: 'POST', headers: { 'Content-Type': mediaType }, body: file,
+    });
+    if (!response.ok) await throwResponseError(response);
+    const value: unknown = await response.json();
+    if (!value || typeof value !== 'object' || !('text' in value) || typeof value.text !== 'string') {
+      throw new Error('Office 文本预览响应格式无效。');
+    }
+    return value.text;
   },
   goals: async (cursor?: string) => unwrapApiResponse(await api.GET('/api/goals', {
     params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } },

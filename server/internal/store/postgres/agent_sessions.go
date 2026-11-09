@@ -194,9 +194,9 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Sca
 	return result, err
 }
 
-func (s *Store) ListBackgroundAgentChildSessions(ctx context.Context, fence app.AgentInstanceFence) ([]app.AgentChildSession, error) {
+func (s *Store) ListAgentChildSessions(ctx context.Context, fence app.AgentInstanceFence) ([]app.AgentChildSession, error) {
 	if err := fence.Validate(); err != nil {
-		return nil, domain.InvalidArgument("child_session", "background job fence is invalid")
+		return nil, domain.InvalidArgument("child_session", "child session fence is invalid")
 	}
 	result := make([]app.AgentChildSession, 0)
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
@@ -207,10 +207,10 @@ func (s *Store) ListBackgroundAgentChildSessions(ctx context.Context, fence app.
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
-WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.is_background
+WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3
 ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.AgentSessionID)
 		if err != nil {
-			return fmt.Errorf("list background Agent Sessions: %w", err)
+			return fmt.Errorf("list child Agent Sessions: %w", err)
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -220,16 +220,16 @@ ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.Age
 			if err := rows.Scan(&child.TaskID, &child.SessionID, &child.ParentSessionID, &child.SpawnKey, &child.CheckpointThrough, &child.CheckpointDigest,
 				&allowedTools, &child.Background, &child.CancelRequested, &child.Step.ID, &child.Step.Sequence, &child.Step.Kind,
 				&status, &child.Step.Title, &child.Step.Summary, &child.Step.CreatedAt); err != nil {
-				return fmt.Errorf("scan background Agent Session: %w", err)
+				return fmt.Errorf("scan child Agent Session: %w", err)
 			}
 			child.Step.TaskID, child.Step.Status = child.TaskID, task.StepStatus(status)
 			if err := json.Unmarshal(allowedTools, &child.AllowedTools); err != nil || !validStoredAgentToolNames(child.AllowedTools) {
-				return errors.New("stored background Agent tool allowlist is invalid")
+				return errors.New("stored child Agent tool allowlist is invalid")
 			}
 			result = append(result, child)
 		}
 		if err := rows.Err(); err != nil {
-			return fmt.Errorf("iterate background Agent Sessions: %w", err)
+			return fmt.Errorf("iterate child Agent Sessions: %w", err)
 		}
 		return nil
 	})

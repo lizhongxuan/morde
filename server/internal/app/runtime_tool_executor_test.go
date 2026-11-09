@@ -79,6 +79,7 @@ func TestRuntimeToolExecutorDefinitionsReflectRegisteredCapabilitiesAndScopes(t 
 func TestRuntimeToolExecutorExposesBrowserToolsOnlyWhenRuntimeCapabilitiesExist(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
 		{capability: "browser.actions", action: "open_tab", result: `{"target_id":"target_1","url":"https://example.test/","title":"Example"}`},
+		{capability: "browser.actions", action: "handoff", result: `{"target_id":"target_1","active":true}`},
 		{capability: "browser.observe", action: "snapshot", result: `{"target_id":"target_1","url":"https://example.test/","title":"Example","text":"hello"}`},
 	})
 	definitions, err := fixture.executor.Definitions(context.Background(), fixture.store.details.Task)
@@ -86,7 +87,7 @@ func TestRuntimeToolExecutorExposesBrowserToolsOnlyWhenRuntimeCapabilitiesExist(
 		t.Fatalf("Definitions() error = %v", err)
 	}
 	want := []string{
-		runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserSnapshot,
+		runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserUserHandoff, runtimeToolBrowserSnapshot,
 		runtimeToolBrowserClick, runtimeToolBrowserType, runtimeToolBrowserPressKey, runtimeToolBrowserScreenshot,
 	}
 	got := make([]string, 0, len(definitions))
@@ -145,7 +146,7 @@ func TestWorkspaceTaskDisablesAIDesktopInput(t *testing.T) {
 		t.Fatalf("Workspace Task tools include desktop input or omit safe tools: %v", seen)
 	}
 
-	request := fixture.request(runtimeToolDesktopClick, `{"window_id":"0x1","x":1,"y":1,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`, identity.ScopeComputerOperate)
+	request := fixture.request(runtimeToolDesktopClick, `{"window_id":"0x1","x":1,"y":1,"screenshot_token":"`+strings.Repeat("A", 43)+`"}`, identity.ScopeComputerOperate)
 	if _, err := fixture.executor.Prepare(context.Background(), request); domain.CodeOf(err) != domain.CodeUnsupported {
 		t.Fatalf("Prepare(Workspace desktop input) error = %v; want unsupported", err)
 	}
@@ -173,6 +174,7 @@ func TestWorkspaceTaskDisablesAIDesktopInput(t *testing.T) {
 }
 
 func TestRuntimeDesktopToolArgumentsAreBounded(t *testing.T) {
+	validToken := strings.Repeat("A", 43)
 	cases := []struct {
 		tool  string
 		input string
@@ -183,12 +185,12 @@ func TestRuntimeDesktopToolArgumentsAreBounded(t *testing.T) {
 		{tool: runtimeToolWindowList, input: `{}`, valid: true},
 		{tool: runtimeToolWindowActivate, input: `{"window_id":"0x1"}`, valid: true},
 		{tool: runtimeToolWindowActivate, input: `{"window_id":"0x01"}`},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":0,"y":0,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50}`, valid: true},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":65536,"y":0,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50}`},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50,"button":"right"}`, valid: true},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50,"button":"4"}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":0,"y":0,"screenshot_token":"` + validToken + `"}`, valid: true},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":65536,"y":0,"screenshot_token":"` + validToken + `"}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"screenshot_token":"` + validToken + `","button":"right"}`, valid: true},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2,"screenshot_token":"` + validToken + `","button":"4"}`},
 		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1,"y":2}`},
-		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":100,"y":2,"screenshot_width":100,"screenshot_height":50,"screen_width":100,"screen_height":50}`},
+		{tool: runtimeToolDesktopClick, input: `{"window_id":"0x1","x":1280,"y":2,"screenshot_token":"` + validToken + `"}`},
 		{tool: runtimeToolDesktopClick, input: `{"x":0,"y":0}`},
 		{tool: runtimeToolDesktopType, input: `{"window_id":"0x1","text":"你好"}`, valid: true},
 		{tool: runtimeToolDesktopType, input: `{"window_id":"0x1","text":"x","shell":"echo bad"}`},
@@ -220,6 +222,7 @@ func TestRuntimeToolRiskTiers(t *testing.T) {
 		{runtimeToolFileWrite, `{}`, runtimeToolRiskModerate},
 		{runtimeToolBrowserOpenTab, `{}`, runtimeToolRiskModerate},
 		{runtimeToolBrowserNavigate, `{}`, runtimeToolRiskModerate},
+		{runtimeToolBrowserUserHandoff, `{}`, runtimeToolRiskModerate},
 		{runtimeToolBrowserClick, `{}`, runtimeToolRiskModerate},
 		{runtimeToolBrowserType, `{}`, runtimeToolRiskSensitive},
 		{runtimeToolBrowserPressKey, `{"key":"Enter"}`, runtimeToolRiskModerate},
@@ -302,13 +305,15 @@ func TestRuntimeDesktopScreenshotMapsValidatedJPEGWithoutBase64InOutput(t *testi
 	}
 	imageBytes := imageBuffer.Bytes()
 	encoded, err := json.Marshal(struct {
-		MIMEType     string `json:"mime_type"`
-		Width        int    `json:"width"`
-		Height       int    `json:"height"`
-		ScreenWidth  int    `json:"screen_width"`
-		ScreenHeight int    `json:"screen_height"`
-		DataBase64   string `json:"data_base64"`
-	}{MIMEType: "image/jpeg", Width: 2, Height: 3, ScreenWidth: 2000, ScreenHeight: 3000, DataBase64: base64.StdEncoding.EncodeToString(imageBytes)})
+		MIMEType        string `json:"mime_type"`
+		Width           int    `json:"width"`
+		Height          int    `json:"height"`
+		ScreenWidth     int    `json:"screen_width"`
+		ScreenHeight    int    `json:"screen_height"`
+		ScreenshotToken string `json:"screenshot_token"`
+		DataBase64      string `json:"data_base64"`
+	}{MIMEType: "image/jpeg", Width: 2, Height: 3, ScreenWidth: 2000, ScreenHeight: 3000,
+		ScreenshotToken: strings.Repeat("A", 43), DataBase64: base64.StdEncoding.EncodeToString(imageBytes)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,13 +365,13 @@ func TestRuntimeDesktopResultsMustMatchBoundWindowAndArguments(t *testing.T) {
 			result: `{"window_id":"0x1","activated":true}`, want: `{"window_id":"0x1","activated":true}`, valid: true,
 		},
 		{
-			name: "click defaults to left", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`,
-			result: `{"window_id":"0x1","x":12,"y":34,"button":"left","clicked":true}`,
-			want:   `{"window_id":"0x1","x":12,"y":34,"button":"left","clicked":true}`, valid: true,
+			name: "click defaults to left", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34,"screenshot_token":"` + strings.Repeat("A", 43) + `"}`,
+			result: `{"window_id":"0x1","x":12,"y":34,"button":"left","clicked":true,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`,
+			want:   `{"window_id":"0x1","x":12,"y":34,"button":"left","clicked":true,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`, valid: true,
 		},
 		{
-			name: "click cannot change target", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`,
-			result: `{"window_id":"0x2","x":12,"y":34,"button":"left","clicked":true}`,
+			name: "click cannot change target", tool: runtimeToolDesktopClick, arguments: `{"window_id":"0x1","x":12,"y":34,"screenshot_token":"` + strings.Repeat("A", 43) + `"}`,
+			result: `{"window_id":"0x2","x":12,"y":34,"button":"left","clicked":true,"screenshot_width":100,"screenshot_height":100,"screen_width":100,"screen_height":100}`,
 		},
 		{
 			name: "type counts Unicode characters", tool: runtimeToolDesktopType, arguments: `{"window_id":"0x1","text":"你好🙂"}`,
@@ -874,6 +879,8 @@ func TestRuntimeBrowserToolArgumentsAreBoundedAndDoNotAcceptRawSelectors(t *test
 		{name: "reject javascript", tool: runtimeToolBrowserOpenTab, input: `{"url":"javascript:alert(1)"}`},
 		{name: "reject userinfo", tool: runtimeToolBrowserOpenTab, input: `{"url":"https://user:pass@example.test/"}`},
 		{name: "navigate owned target", tool: runtimeToolBrowserNavigate, input: `{"target_id":"target_1","url":"https://example.test/"}`, valid: true},
+		{name: "handoff exact task target", tool: runtimeToolBrowserUserHandoff, input: `{"target_id":"target_1"}`, valid: true},
+		{name: "handoff rejects extra input", tool: runtimeToolBrowserUserHandoff, input: `{"target_id":"target_1","url":"https://example.test/"}`},
 		{name: "reject invalid target", tool: runtimeToolBrowserSnapshot, input: `{"target_id":"../target"}`},
 		{name: "reject arbitrary selector", tool: runtimeToolBrowserClick, input: `{"target_id":"target_1","selector":"#send"}`},
 		{name: "click by accessible name", tool: runtimeToolBrowserClick, input: `{"target_id":"target_1","role":"button","name":"Continue"}`, valid: true},
@@ -944,6 +951,31 @@ func TestRuntimeBrowserResultMustMatchRequestedOwnedTarget(t *testing.T) {
 	result, err = mapRuntimeToolResult(mapping, operation, json.RawMessage(`{"target_id":"target_1","url":"https://example.test/next"}`))
 	if err != nil || result.Status != AgentToolSucceeded {
 		t.Fatalf("matching target result = %#v, %v; want succeeded", result, err)
+	}
+}
+
+func TestRuntimeBrowserUserHandoffResultMustMatchRequestedTaskTarget(t *testing.T) {
+	mapping, ok := runtimeToolMappingByName(runtimeToolBrowserUserHandoff)
+	if !ok {
+		t.Fatal("browser user handoff mapping missing")
+	}
+	arguments := json.RawMessage(`{"target_id":"target_1"}`)
+	operation := runtimeclient.Operation{OperationID: "o1234567", Status: runtimeclient.OperationSucceeded,
+		Result: json.RawMessage(`{"target_id":"target_2","active":true}`)}
+	result, err := mapRuntimeToolResult(mapping, operation, arguments)
+	if err != nil || result.Status != AgentToolFailed || !strings.Contains(result.Output, "invalid_browser_handoff") {
+		t.Fatalf("mismatched Task browser handoff = %#v, %v; want fail closed", result, err)
+	}
+
+	operation.Result = json.RawMessage(`{"target_id":"target_1","active":true}`)
+	result, err = mapRuntimeToolResult(mapping, operation, arguments)
+	if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, `"active":true`) {
+		t.Fatalf("matching Task browser handoff = %#v, %v; want success", result, err)
+	}
+	operation.Result = json.RawMessage(`{"target_id":"target_1","active":false}`)
+	result, err = mapRuntimeToolResult(mapping, operation, arguments)
+	if err != nil || result.Status != AgentToolFailed {
+		t.Fatalf("inactive browser handoff = %#v, %v; want fail closed", result, err)
 	}
 }
 

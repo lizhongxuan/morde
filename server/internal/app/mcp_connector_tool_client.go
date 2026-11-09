@@ -17,6 +17,7 @@ type MCPConnectorToolResult struct {
 	UnsupportedContent bool
 	StructuredContent  json.RawMessage
 	Text               []string
+	Images             []ModelImage
 }
 
 // MCPConnectorToolClient is the app port for the server-side Streamable HTTP adapter.

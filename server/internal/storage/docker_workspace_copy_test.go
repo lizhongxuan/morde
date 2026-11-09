@@ -91,6 +91,26 @@ func TestCopyWorkspaceVolumePreservesTreeAndIndependence(t *testing.T) {
 	}
 }
 
+func TestCopyWorkspaceVolumeValidatesSourceAndTargetUnderDifferentOwners(t *testing.T) {
+	recipientID := "u7654321"
+	client, _, sourcePath, _ := newWorkspaceCopyDockerForTest(t, func(name string, volume *dockerWorkspaceCopyVolume) {
+		if name == "workspace-"+workspaceCopyTargetID {
+			volume.Labels, _ = workspaceVolumeLabels(name, workspaceCopyInstance, recipientID, workspaceCopyTargetID)
+		}
+	}, "")
+	request := workspaceCopyRequest(t, sourcePath)
+	request.TargetOwnerID = recipientID
+	checker := workspaceCopyFenceFunc(func(_ context.Context, got WorkspaceVolumeCopyRequest) error {
+		if got.SourceOwnerID != workspaceCopyOwnerID || got.TargetOwnerID != recipientID {
+			return errors.New("copy checker received the wrong owners")
+		}
+		return nil
+	})
+	if _, _, err := client.CopyWorkspaceVolume(context.Background(), request, checker); err != nil {
+		t.Fatalf("copy with distinct source/target owners = %v", err)
+	}
+}
+
 func TestCopyWorkspaceVolumeReadsFileTimestampForUnknownCheckpoint(t *testing.T) {
 	client, _, sourcePath, _ := newWorkspaceCopyDockerForTest(t, nil, "")
 	file := filepath.Join(sourcePath, "legacy.txt")
@@ -311,7 +331,8 @@ func workspaceCopyRequest(t *testing.T, sourcePath string) WorkspaceVolumeCopyRe
 	}
 	return WorkspaceVolumeCopyRequest{
 		ReservationID: "copy-reservation-01", ServiceInstanceID: workspaceCopyInstance,
-		OwnerID: workspaceCopyOwnerID, SourceWorkspaceID: workspaceCopySourceID, TargetWorkspaceID: workspaceCopyTargetID,
+		SourceOwnerID: workspaceCopyOwnerID, TargetOwnerID: workspaceCopyOwnerID,
+		SourceWorkspaceID: workspaceCopySourceID, TargetWorkspaceID: workspaceCopyTargetID,
 		Files: files, EmptyDirectories: append([]string{}, manifest.EmptyDirectories...), Directories: directories,
 	}
 }

@@ -49,7 +49,7 @@ func validOpaqueID(value string, limit int) bool {
 
 func validBrowserAction(value string) bool {
 	switch value {
-	case "open_tab", "navigate", "snapshot", "field", "click", "type", "press_key", "screenshot":
+	case "open_tab", "navigate", "handoff", "snapshot", "field", "click", "type", "press_key", "screenshot":
 		return true
 	default:
 		return false

@@ -26,12 +26,13 @@ type processInspector interface {
 }
 
 type Service struct {
-	store      *leaseStore
-	docker     dockerAPI
-	processes  processInspector
-	signingKey ed25519.PrivateKey
-	now        func() time.Time
-	operationM sync.Mutex
+	store                 *leaseStore
+	docker                dockerAPI
+	processes             processInspector
+	signingKey            ed25519.PrivateKey
+	taskSandboxSigningKey ed25519.PrivateKey
+	now                   func() time.Time
+	operationM            sync.Mutex
 }
 
 // Open creates a guardian using a private on-disk lease directory and a Docker
@@ -53,6 +54,20 @@ func Open(stateDir, dockerSocket string, signingKey ed25519.PrivateKey) (*Servic
 		return nil, fmt.Errorf("initialize independent process-tree verification: %w", err)
 	}
 	return &Service{store: store, docker: docker, processes: processes, signingKey: append(ed25519.PrivateKey(nil), signingKey...), now: time.Now}, nil
+}
+
+// OpenWithTaskSandboxGuardianKey enables the independent Task Sandbox proof
+// endpoint. Its private key must not be shared with DSH/account Runtime proofs.
+func OpenWithTaskSandboxGuardianKey(stateDir, dockerSocket string, signingKey, taskSandboxSigningKey ed25519.PrivateKey) (*Service, error) {
+	if !validPrivateKey(taskSandboxSigningKey) || bytes.Equal(signingKey, taskSandboxSigningKey) {
+		return nil, errors.New("task Sandbox Guardian requires a valid, separate Ed25519 attestation key")
+	}
+	service, err := Open(stateDir, dockerSocket, signingKey)
+	if err != nil {
+		return nil, err
+	}
+	service.taskSandboxSigningKey = append(ed25519.PrivateKey(nil), taskSandboxSigningKey...)
+	return service, nil
 }
 
 func validPrivateKey(key ed25519.PrivateKey) bool {
@@ -477,6 +492,27 @@ func (s *Service) sweep(ctx context.Context, onError func(error)) {
 		s.operationM.Unlock()
 		if err != nil && onError != nil {
 			onError(fmt.Errorf("reconcile expired dsh lease %s: %w", value.Guard.ContainerID, err))
+		}
+	}
+	for _, value := range s.store.allTaskSandboxes() {
+		if ctx.Err() != nil {
+			return
+		}
+		if value.Destroyed || value.Guard.ExpiresAt.After(s.now()) {
+			continue
+		}
+		s.operationM.Lock()
+		current, ok := s.store.getTaskSandbox(value.Key)
+		if !ok || !current.Guard.sameIdentity(value.Guard) || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
+			s.operationM.Unlock()
+			continue
+		}
+		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		err := s.destroyExpiredTaskSandbox(opCtx, &current)
+		cancel()
+		s.operationM.Unlock()
+		if err != nil && onError != nil {
+			onError(fmt.Errorf("reconcile expired Task Sandbox lease %s: %w", value.Key, err))
 		}
 	}
 }

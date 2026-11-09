@@ -51,11 +51,12 @@ type AttachmentChunk struct {
 }
 
 type AttachmentUploadReceipt struct {
-	UploadID      string
-	ReservationID string
-	State         AttachmentUploadState
-	ChunkCount    int32
-	Replay        bool
+	UploadID          string
+	ReservationID     string
+	State             AttachmentUploadState
+	ChunkCount        int32
+	ReceivedSequences []int32
+	Replay            bool
 }
 
 type AttachmentUploadState string

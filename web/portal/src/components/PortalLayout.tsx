@@ -46,7 +46,7 @@ export function PortalLayout() {
       <Link to="/" className="morde-brand"><span className="morde-brand-mark">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>
       <nav className="morde-navigation" aria-label="工作导航">
         <span className="morde-nav-heading">工作</span>
-        {primaryLinks.map(({ to, label, icon, end }) => <NavLink className="morde-nav-link" to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
+        {primaryLinks.filter(({ to }) => to !== '/projects' || user?.role === 'user').map(({ to, label, icon, end }) => <NavLink className="morde-nav-link" to={to} end={end} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
         <span className="morde-nav-heading morde-nav-heading-spaced">设置与授权</span>
         {settingLinks.map(({ to, label, icon }) => <NavLink className="morde-nav-link" to={to} key={to} aria-label={label} title={label}><MordeIcon name={icon} /><span>{label}</span></NavLink>)}
       </nav>

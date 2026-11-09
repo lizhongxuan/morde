@@ -112,6 +112,79 @@ func TestPostgresCloudDSHPersonalMutationIsAtomicFencedAndRedacted(t *testing.T)
 	}
 }
 
+func TestPostgresDeletedPersonalMemorySuppressesMatchingAIHistoryOnlyAndCannotRollBack(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	otherOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	deletedText := "我喜欢喝乌龙茶"
+	deletedConversation, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "deleted-memory-history", "我的偏好是："+deletedText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedConversation, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, "", "unrelated-memory-history", "乌龙茶适合用 90 度左右的水冲泡"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherOwnerConversation, err := store.SubmitTask(ctx, newTestTaskSubmission(t, otherOwner.ID, "", "other-owner-history", "我的偏好是："+deletedText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
+	mutations, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutations.ApplyPersonalMutation(ctx, principal, app.PersonalMutationCommand{
+		MutationID: "remember-history-1", ObjectType: personal.ObjectTypeMemory, ObjectID: "m_00000001",
+		Body: json.RawMessage(`{"content":"` + deletedText + `","category":"preference"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutations.ApplyPersonalMutation(ctx, principal, app.PersonalMutationCommand{
+		MutationID: "forget-history-1", ObjectType: personal.ObjectTypeMemory, ObjectID: "m_00000001", BaseRevision: 1, Delete: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deletedIDs, err := store.ListSuppressedPersonalHistoryMessageIDs(ctx, owner.ID, []string{
+		deletedConversation.Message.ID, unrelatedConversation.Message.ID, otherOwnerConversation.Message.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := deletedIDs[deletedConversation.Message.ID]; !ok {
+		t.Fatalf("matching personal history message was not suppressed: %+v", deletedIDs)
+	}
+	if _, ok := deletedIDs[unrelatedConversation.Message.ID]; ok {
+		t.Fatalf("unrelated history message was suppressed: %+v", deletedIDs)
+	}
+	if _, ok := deletedIDs[otherOwnerConversation.Message.ID]; ok {
+		t.Fatalf("another owner's history message was suppressed: %+v", deletedIDs)
+	}
+
+	visible, err := store.ListMessages(ctx, owner.ID, deletedConversation.Conversation.ID, app.PageRequest{Limit: 10})
+	if err != nil || len(visible.Items) != 1 || !strings.Contains(visible.Items[0].Content, deletedText) {
+		t.Fatalf("personal memory deletion changed user-visible conversation history: messages=%+v err=%v", visible.Items, err)
+	}
+
+	provider, closeProvider, err := newMigrationProvider(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProvider()
+	if _, err := provider.DownTo(ctx, 168); err == nil || !strings.Contains(err.Error(), "cannot roll back personal history suppression") {
+		t.Fatalf("history suppression rollback with deletion tombstones error = %v", err)
+	}
+	deletedIDs, err = store.ListSuppressedPersonalHistoryMessageIDs(ctx, owner.ID, []string{deletedConversation.Message.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := deletedIDs[deletedConversation.Message.ID]; !ok {
+		t.Fatalf("history suppression tombstone was lost after refused rollback: %+v", deletedIDs)
+	}
+}
+
 func TestPostgresCloudDSHMemoryWriteCannotRaceConsentWithdrawal(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

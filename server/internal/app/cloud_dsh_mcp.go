@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net/http"
 	"sort"
@@ -23,13 +26,22 @@ import (
 const (
 	cloudDSHMCPToolPrefix      = "mcp_"
 	maxCloudDSHToolDefinitions = 64
+	maxCloudDSHMCPImageBytes   = 36 << 10
+	maxCloudDSHMCPImageWidth   = 1280
+	maxCloudDSHMCPImageHeight  = 720
 )
 
 type cloudDSHMCPOutput struct {
-	IsError            bool            `json:"is_error"`
-	UnsupportedContent bool            `json:"unsupported_content,omitempty"`
-	StructuredContent  json.RawMessage `json:"structured_content,omitempty"`
-	Text               []string        `json:"text"`
+	IsError            bool                     `json:"is_error"`
+	UnsupportedContent bool                     `json:"unsupported_content,omitempty"`
+	StructuredContent  json.RawMessage          `json:"structured_content,omitempty"`
+	Text               []string                 `json:"text"`
+	Images             []cloudDSHMCPStoredImage `json:"images,omitempty"`
+}
+
+type cloudDSHMCPStoredImage struct {
+	MediaType  string `json:"media_type"`
+	DataBase64 string `json:"data_base64"`
 }
 
 type cloudDSHMCPExecutionSource struct {
@@ -140,6 +152,9 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 	if !connector.Enabled || connector.Revision != grant.ConnectorRevision || connector.CredentialVersion != grant.CredentialVersion {
 		return AgentToolResult{}, domain.NewError(domain.CodeConflict, "MCP connector changed after this task was authorized")
 	}
+	if isGitHubMCPRemoteEndpoint(connector.EndpointURL) && !isGitHubMCPReadOnlyTool(definition.MCPRemoteToolName) {
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "GitHub MCP tool is outside the server-side read-only allowlist")
+	}
 	if _, err := definitionForPinnedMCPTool(grant.ToolSchema, grant.ConnectorID, call.Name, definition.MCPRemoteToolName); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "MCP connector tool is not in this task's authorized catalog")
 	}
@@ -150,7 +165,11 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		scope: identity.ScopeMCPControl, endpoint: connector.EndpointURL,
 		remoteTool: definition.MCPRemoteToolName, client: b.mcpClient,
 		headers: func(ctx context.Context) (http.Header, error) {
-			return b.mcpCredentials.CredentialHeaders(ctx, connector)
+			headers, err := b.mcpCredentials.CredentialHeaders(ctx, connector)
+			if err != nil {
+				return nil, err
+			}
+			return githubMCPRequestHeaders(connector.EndpointURL, headers), nil
 		},
 	}
 	if result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source); handled || err != nil {
@@ -722,7 +741,11 @@ func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskD
 	if ctx.Err() != nil {
 		return AgentToolResult{Status: AgentToolUnknown}, ctx.Err()
 	}
-	return b.commitMCPResult(ctx, current, step, usage, call.Name, AgentToolResult{Status: resultStatus, Output: output})
+	completedResult, err := cloudDSHMCPResult(operationStatus, completed.Result)
+	if err != nil || completedResult.Status != resultStatus {
+		return b.pauseMCPUnknown(ctx, current, step, usage, key, "The MCP connector result could not be reconstructed safely.")
+	}
+	return b.commitMCPResult(ctx, current, step, usage, call.Name, completedResult)
 }
 
 func boundCloudDSHMCPContextOutput(output string, limit int) (string, error) {
@@ -759,7 +782,8 @@ func boundCloudDSHMCPContextOutput(output string, limit int) (string, error) {
 	best := ""
 	for low <= high {
 		mid := (low + high) / 2
-		candidate, err := json.Marshal(cloudDSHMCPOutput{IsError: value.IsError, UnsupportedContent: value.UnsupportedContent, Text: []string{string(runes[:mid]) + marker}})
+		candidate, err := json.Marshal(cloudDSHMCPOutput{IsError: value.IsError, UnsupportedContent: value.UnsupportedContent,
+			Text: []string{string(runes[:mid]) + marker}, Images: value.Images})
 		if err != nil {
 			return "", errors.New("MCP task context output cannot be encoded")
 		}
@@ -829,7 +853,9 @@ func sha256Bytes(value []byte) []byte {
 }
 
 func encodeCloudDSHMCPOutput(result MCPConnectorToolResult) (string, error) {
-	if len(result.StructuredContent) > 64<<10 || len(result.StructuredContent) != 0 && !validCloudDSHMCPJSON(result.StructuredContent) || len(result.Text) > 256 {
+	if len(result.StructuredContent) > 64<<10 || len(result.StructuredContent) != 0 && !validCloudDSHMCPJSON(result.StructuredContent) ||
+		len(result.Text) > 256 || len(result.Images) > 1 || result.UnsupportedContent && len(result.Images) != 0 ||
+		result.IsError && len(result.Images) != 0 {
 		return "", errors.New("MCP tool output is invalid")
 	}
 	total := 0
@@ -840,12 +866,21 @@ func encodeCloudDSHMCPOutput(result MCPConnectorToolResult) (string, error) {
 		total += len(text)
 	}
 	total += len(result.StructuredContent)
+	images := make([]cloudDSHMCPStoredImage, 0, len(result.Images))
+	for _, image := range result.Images {
+		if !validCloudDSHMCPImage(image.MediaType, image.Data) {
+			return "", errors.New("MCP tool image output is invalid")
+		}
+		encoded := base64.StdEncoding.EncodeToString(image.Data)
+		total += len(encoded)
+		images = append(images, cloudDSHMCPStoredImage{MediaType: image.MediaType, DataBase64: encoded})
+	}
 	if total > maxAgentToolOutputBytes-1024 {
 		return "", errors.New("MCP tool output exceeds its durable limit")
 	}
 	encoded, err := json.Marshal(cloudDSHMCPOutput{
 		IsError: result.IsError, UnsupportedContent: result.UnsupportedContent,
-		StructuredContent: append(json.RawMessage(nil), result.StructuredContent...), Text: append([]string(nil), result.Text...),
+		StructuredContent: append(json.RawMessage(nil), result.StructuredContent...), Text: append([]string(nil), result.Text...), Images: images,
 	})
 	if err != nil || len(encoded) > maxAgentToolOutputBytes {
 		return "", errors.New("MCP tool output exceeds its durable limit")
@@ -859,7 +894,8 @@ func cloudDSHMCPResult(status task.OperationStatus, output string) (AgentToolRes
 	}
 	var value cloudDSHMCPOutput
 	if err := json.Unmarshal([]byte(output), &value); err != nil || len(value.Text) > 256 ||
-		len(value.StructuredContent) > 64<<10 || len(value.StructuredContent) != 0 && !validCloudDSHMCPJSON(value.StructuredContent) {
+		len(value.StructuredContent) > 64<<10 || len(value.StructuredContent) != 0 && !validCloudDSHMCPJSON(value.StructuredContent) ||
+		len(value.Images) > 1 || value.UnsupportedContent && len(value.Images) != 0 || value.IsError && len(value.Images) != 0 {
 		return AgentToolResult{}, errors.New("MCP operation result is invalid")
 	}
 	for _, text := range value.Text {
@@ -870,6 +906,14 @@ func cloudDSHMCPResult(status task.OperationStatus, output string) (AgentToolRes
 	if (status == task.OperationFailed) != value.IsError {
 		return AgentToolResult{}, errors.New("MCP operation result status is inconsistent")
 	}
+	images := make([]ModelImage, 0, len(value.Images))
+	for _, image := range value.Images {
+		data, err := base64.StdEncoding.Strict().DecodeString(image.DataBase64)
+		if err != nil || base64.StdEncoding.EncodeToString(data) != image.DataBase64 || !validCloudDSHMCPImage(image.MediaType, data) {
+			return AgentToolResult{}, errors.New("MCP operation image result is invalid")
+		}
+		images = append(images, ModelImage{MediaType: image.MediaType, Data: data})
+	}
 	if value.UnsupportedContent {
 		return AgentToolResult{Status: AgentToolNeedsUser, Output: output}, nil
 	}
@@ -877,7 +921,45 @@ func cloudDSHMCPResult(status task.OperationStatus, output string) (AgentToolRes
 	if status == task.OperationFailed {
 		toolStatus = AgentToolFailed
 	}
-	return AgentToolResult{Status: toolStatus, Output: output}, nil
+	if len(images) > 0 {
+		value.Images = nil
+		value.Text = append(value.Text, "[The connector returned 1 verified image for visual analysis.]")
+	}
+	modelOutput, err := json.Marshal(value)
+	if err != nil || len(modelOutput) > maxAgentToolOutputBytes {
+		return AgentToolResult{}, errors.New("MCP operation model output is invalid")
+	}
+	return AgentToolResult{Status: toolStatus, Output: string(modelOutput), Images: images}, nil
+}
+
+func validCloudDSHMCPImage(mediaType string, data []byte) bool {
+	if len(data) < 4 || len(data) > maxCloudDSHMCPImageBytes {
+		return false
+	}
+	var width, height int
+	switch mediaType {
+	case "image/jpeg":
+		config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return false
+		}
+		width, height = config.Width, config.Height
+		if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+			return false
+		}
+	case "image/png":
+		config, err := png.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return false
+		}
+		width, height = config.Width, config.Height
+		if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+			return false
+		}
+	default:
+		return false
+	}
+	return width > 0 && width <= maxCloudDSHMCPImageWidth && height > 0 && height <= maxCloudDSHMCPImageHeight
 }
 
 func (b *CloudDSHToolBroker) pauseMCPUnsupportedResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage,

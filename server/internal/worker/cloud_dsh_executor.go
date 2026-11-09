@@ -46,6 +46,8 @@ var ErrCloudDSHWaitingForUser = errors.New("dsh task is waiting for user input")
 
 var errCloudDSHModelResultUnavailable = errors.New("dsh model result is unavailable or contains an unauthorized tool")
 
+var errCloudDSHConnectionInterrupted = errors.New("dsh connection ended before a verified result")
+
 type cloudDSHModelFailureCategory interface {
 	ModelFailureCategory() string
 }
@@ -508,7 +510,8 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	releaseRuntimeTaskStart()
 	cancelCause(context.Canceled)
 	<-renewDone
-	if err != nil && !errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
+	// A disconnected child is reclaimed from its durable checkpoint; the operation ledger decides whether a tool can be replayed.
+	if err != nil && !errors.Is(err, errCloudDSHConnectionInterrupted) && !errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
 		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -786,12 +789,12 @@ func validCloudDSHToolDefinitions(definitions []app.AgentToolDefinition) bool {
 			return false
 		}
 		var schema struct {
-			Type                 string          `json:"type"`
-			Properties           json.RawMessage `json:"properties"`
-			AdditionalProperties *bool           `json:"additionalProperties"`
+			Type                 string                     `json:"type"`
+			Properties           map[string]json.RawMessage `json:"properties"`
+			AdditionalProperties *bool                      `json:"additionalProperties"`
 		}
 		if json.Unmarshal(definition.Parameters, &schema) != nil || schema.Type != "object" ||
-			len(schema.Properties) == 0 || string(schema.Properties) == "null" ||
+			schema.Properties == nil ||
 			schema.AdditionalProperties == nil || *schema.AdditionalProperties {
 			return false
 		}

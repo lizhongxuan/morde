@@ -36,10 +36,12 @@ func (s *agentChildSessionStoreStub) GetAgentChildSession(_ context.Context, fen
 	return AgentChildSession{TaskID: fence.TaskID, SessionID: sessionID, ParentSessionID: actorSessionID, SpawnKey: "call_1"}, nil
 }
 
-func (s *agentChildSessionStoreStub) ListBackgroundAgentChildSessions(_ context.Context, fence AgentInstanceFence) ([]AgentChildSession, error) {
+func (s *agentChildSessionStoreStub) ListAgentChildSessions(_ context.Context, fence AgentInstanceFence) ([]AgentChildSession, error) {
 	s.listCalls++
-	return []AgentChildSession{{TaskID: fence.TaskID, SessionID: "child_1", ParentSessionID: fence.AgentSessionID,
-		SpawnKey: "call_1", Background: true}}, nil
+	return []AgentChildSession{
+		{TaskID: fence.TaskID, SessionID: "child_1", ParentSessionID: fence.AgentSessionID, SpawnKey: "call_1", Background: true},
+		{TaskID: fence.TaskID, SessionID: "child_2", ParentSessionID: fence.AgentSessionID, SpawnKey: "call_2", Background: false},
+	}, nil
 }
 
 func (s *agentChildSessionStoreStub) RequestAgentChildSessionCancel(_ context.Context, fence AgentInstanceFence, sessionID string) (AgentChildSession, bool, error) {
@@ -112,7 +114,7 @@ func TestAgentChildSessionServiceHashesArgumentsAndRejectsNonObject(t *testing.T
 	}
 }
 
-func TestAgentChildSessionBackgroundListingAndCancelFenceRoot(t *testing.T) {
+func TestAgentChildSessionListingAndCancelFenceRoot(t *testing.T) {
 	store := &agentChildSessionStoreStub{}
 	service, err := NewAgentChildSessionService(store)
 	if err != nil {
@@ -122,11 +124,11 @@ func TestAgentChildSessionBackgroundListingAndCancelFenceRoot(t *testing.T) {
 		AgentSessionID: "session_root", SupervisorID: "supervisor_1", LeaseOwner: "worker_1", LeaseVersion: 1,
 		AuthorizationVersion: 1, EngineVersion: "engine", ProfileVersion: "profile"}
 	jobs, err := service.List(context.Background(), fence, fence.AgentSessionID)
-	if err != nil || store.listCalls != 1 || len(jobs) != 1 || !jobs[0].Background {
-		t.Fatalf("list background jobs = %#v calls=%d err=%v", jobs, store.listCalls, err)
+	if err != nil || store.listCalls != 1 || len(jobs) != 2 || !jobs[0].Background || jobs[1].Background {
+		t.Fatalf("list child sessions = %#v calls=%d err=%v", jobs, store.listCalls, err)
 	}
 	if _, err := service.List(context.Background(), fence, "child_1"); err == nil || store.listCalls != 1 {
-		t.Fatalf("child session listed jobs outside root: calls=%d err=%v", store.listCalls, err)
+		t.Fatalf("child session listed sessions outside root: calls=%d err=%v", store.listCalls, err)
 	}
 	job, replayed, err := service.RequestCancel(context.Background(), AgentChildSessionCancelCommand{
 		Fence: fence, ActorSessionID: fence.AgentSessionID, SessionID: "child_1",

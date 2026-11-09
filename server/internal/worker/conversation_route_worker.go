@@ -161,6 +161,14 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 
 func safeConversationRouteDecision(value app.ConversationRouteContext, decision app.ConversationRouteDecision) app.ConversationRouteDecision {
 	clarify := app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请说明要修改哪个任务，或是否开始一个新任务。"}
+	if decision.Action == app.ConversationRouteNew && app.ConversationRouteHasExplicitControlIntent(value.Content) {
+		if value.ReferenceUnavailable {
+			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
+		}
+		if value.PreviousMissing {
+			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
+		}
+	}
 	if value.PreviousMissing && (decision.Action != app.ConversationRouteNew || strings.TrimSpace(value.Content) == "") {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 	}

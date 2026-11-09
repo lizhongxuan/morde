@@ -1,9 +1,15 @@
 package mcpconnector
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -17,7 +23,7 @@ import (
 
 func TestConnectorClientListsAndCallsToolsWithoutLeakingHeaders(t *testing.T) {
 	var mu sync.Mutex
-	var authHeaders []string
+	var requestHeaders []http.Header
 	server := sdk.NewServer(&sdk.Implementation{Name: "connector-test", Version: "1"}, nil)
 	server.AddTool(&sdk.Tool{
 		Name: "search", Description: "Search records",
@@ -31,13 +37,17 @@ func TestConnectorClientListsAndCallsToolsWithoutLeakingHeaders(t *testing.T) {
 	handler := sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return server }, &sdk.StreamableHTTPOptions{})
 	wrapped := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		mu.Lock()
-		authHeaders = append(authHeaders, request.Header.Get("Authorization"))
+		requestHeaders = append(requestHeaders, request.Header.Clone())
 		mu.Unlock()
 		handler.ServeHTTP(writer, request)
 	})
 	client := &ConnectorClient{transport: inProcessConnectorTransport{handler: wrapped}}
 	endpoint := "https://connector.example.test/mcp"
-	headers := http.Header{"Authorization": []string{"Bearer hidden-test-token"}}
+	headers := http.Header{
+		"Authorization":  []string{"Bearer hidden-test-token"},
+		"X-Mcp-Readonly": []string{"true"},
+		"X-Mcp-Tools":    []string{"get_me,search_code"},
+	}
 
 	tools, err := client.ListTools(context.Background(), endpoint, headers)
 	if err != nil || len(tools) != 1 || tools[0].Name != "search" || !jsonObject(tools[0].InputSchema) {
@@ -49,12 +59,18 @@ func TestConnectorClientListsAndCallsToolsWithoutLeakingHeaders(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(authHeaders) < 4 {
-		t.Fatalf("expected auth on each MCP request, got %d requests", len(authHeaders))
+	if len(requestHeaders) < 4 {
+		t.Fatalf("expected headers on each MCP request, got %d requests", len(requestHeaders))
 	}
-	for _, value := range authHeaders {
-		if value != "Bearer hidden-test-token" {
+	for _, headers := range requestHeaders {
+		if value := headers.Get("Authorization"); value != "Bearer hidden-test-token" {
 			t.Fatalf("credential header was not scoped to the MCP request: %q", value)
+		}
+		if value := headers.Get("X-Mcp-Readonly"); value != "true" {
+			t.Fatalf("read-only profile header was not scoped to the MCP request: %q", value)
+		}
+		if value := headers.Get("X-Mcp-Tools"); value != "get_me,search_code" {
+			t.Fatalf("tool allowlist header was not scoped to the MCP request: %q", value)
 		}
 	}
 }
@@ -79,6 +95,27 @@ func TestConnectorClientRejectsUnsafeEndpointAndCredentialHeaders(t *testing.T) 
 		if err := validateConnectorHeaders(headers); err == nil {
 			t.Errorf("validateConnectorHeaders(%v) succeeded", headers)
 		}
+	}
+	if err := validateConnectorHeaders(http.Header{
+		"Authorization":  []string{"Bearer test"},
+		"X-Api-Key":      []string{"test"},
+		"X-Mcp-Readonly": []string{"true"},
+		"X-Mcp-Tools":    []string{"get_me,search_code"},
+		"X-Trace-Id":     []string{"test"},
+		"X-Request-Id":   []string{"test"},
+	}); err != nil {
+		t.Fatalf("validateConnectorHeaders() rejected bounded six-header request: %v", err)
+	}
+	if err := validateConnectorHeaders(http.Header{
+		"Authorization":  []string{"Bearer test"},
+		"X-Api-Key":      []string{"test"},
+		"X-Mcp-Readonly": []string{"true"},
+		"X-Mcp-Tools":    []string{"get_me,search_code"},
+		"X-Trace-Id":     []string{"test"},
+		"X-Request-Id":   []string{"test"},
+		"X-Correlation":  []string{"test"},
+	}); err == nil {
+		t.Fatal("validateConnectorHeaders() accepted more than six request headers")
 	}
 }
 
@@ -124,6 +161,35 @@ func TestConnectorClientDefaultTransportRejectsUnapprovedDialWithoutDNS(t *testi
 	}
 	if _, err := local.DialContext(context.Background(), "tcp", "localhost:443"); err == nil {
 		t.Fatal("default connector dialer accepted loopback DNS results")
+	}
+}
+
+func TestConnectorClientRejectsMixedPublicAndPrivateDNSAnswersBeforeDial(t *testing.T) {
+	for _, privateAddress := range []string{"127.0.0.1", "10.0.0.1", "::1", "fc00::1"} {
+		t.Run(privateAddress, func(t *testing.T) {
+			lookupCalls := 0
+			dialCalls := 0
+			transport, ok := newConnectorTransportWithLookupAndDial("connector.example.test", func(_ context.Context, network, host string) ([]netip.Addr, error) {
+				lookupCalls++
+				if network != "ip" || host != "connector.example.test" {
+					t.Fatalf("LookupNetIP network/host = %q/%q", network, host)
+				}
+				return []netip.Addr{netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr(privateAddress)}, nil
+			}, func(context.Context, string, string) (net.Conn, error) {
+				dialCalls++
+				return nil, errors.New("network dial should not be attempted for mixed DNS answers")
+			}).(*http.Transport)
+			if !ok || transport.DialContext == nil {
+				t.Fatal("newConnectorTransportWithLookup() did not create a dialer")
+			}
+			connection, err := transport.DialContext(context.Background(), "tcp", "connector.example.test:443")
+			if connection != nil || err == nil || !strings.Contains(err.Error(), "non-public address") || lookupCalls != 1 || dialCalls != 0 {
+				if connection != nil {
+					_ = connection.Close()
+				}
+				t.Fatalf("mixed public/private DNS answer dial = conn %v, err %v, lookups %d, dials %d; want reject before dialing", connection, err, lookupCalls, dialCalls)
+			}
+		})
 	}
 }
 
@@ -195,6 +261,59 @@ func TestConnectorClientRecordsUnsupportedMCPResultContentWithoutLosingCallOutco
 	if err != nil || !result.UnsupportedContent {
 		t.Fatalf("CallTool() = %#v, %v, want confirmed result marked unsupported", result, err)
 	}
+}
+
+func TestConnectorClientReturnsVerifiedMCPImageContent(t *testing.T) {
+	want := connectorTestPNG(t, 2, 2)
+	server := sdk.NewServer(&sdk.Implementation{Name: "connector-test", Version: "1"}, nil)
+	server.AddTool(&sdk.Tool{Name: "chart", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		return &sdk.CallToolResult{Content: []sdk.Content{
+			&sdk.TextContent{Text: "chart ready"}, &sdk.ImageContent{MIMEType: "image/png", Data: want},
+		}}, nil
+	})
+	handler := sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return server }, &sdk.StreamableHTTPOptions{})
+	client := &ConnectorClient{transport: inProcessConnectorTransport{handler: handler}}
+	result, err := client.CallTool(context.Background(), "https://connector.example.test/mcp", nil, "chart", json.RawMessage(`{}`))
+	if err != nil || result.UnsupportedContent || result.IsError || len(result.Text) != 1 || result.Text[0] != "chart ready" ||
+		len(result.Images) != 1 || result.Images[0].MediaType != "image/png" || !bytes.Equal(result.Images[0].Data, want) {
+		t.Fatalf("CallTool() = %#v, %v; want verified PNG and text", result, err)
+	}
+}
+
+func TestConnectorClientRejectsInvalidOrAmbiguousMCPImages(t *testing.T) {
+	valid := connectorTestPNG(t, 2, 2)
+	tooWide := connectorTestPNG(t, connectorImageWidthLimit+1, 1)
+	for _, tc := range []struct {
+		name    string
+		content []sdk.Content
+		isError bool
+	}{
+		{name: "mime mismatch", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/jpeg", Data: valid}}},
+		{name: "unsupported mime", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/gif", Data: valid}}},
+		{name: "malformed image", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/png", Data: []byte("not png")}}},
+		{name: "oversized bytes", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/png", Data: bytes.Repeat([]byte("x"), connectorImageBytesLimit+1)}}},
+		{name: "oversized dimensions", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/png", Data: tooWide}}},
+		{name: "multiple images", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/png", Data: valid}, &sdk.ImageContent{MIMEType: "image/png", Data: valid}}},
+		{name: "error with image", content: []sdk.Content{&sdk.ImageContent{MIMEType: "image/png", Data: valid}}, isError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := decodeConnectorToolResult(&sdk.CallToolResult{Content: tc.content, IsError: tc.isError})
+			if !result.UnsupportedContent || len(result.Images) != 0 {
+				t.Fatalf("decoded MCP result = %#v; want fail-closed unsupported result", result)
+			}
+		})
+	}
+}
+
+func connectorTestPNG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	var encoded bytes.Buffer
+	pixels := image.NewRGBA(image.Rect(0, 0, width, height))
+	pixels.Set(0, 0, color.RGBA{G: 255, A: 255})
+	if err := png.Encode(&encoded, pixels); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
 }
 
 func TestConnectorClientCapsCombinedMCPResult(t *testing.T) {

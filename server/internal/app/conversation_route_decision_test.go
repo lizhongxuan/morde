@@ -87,6 +87,38 @@ func TestUnavailableRouteReferenceIsHiddenAndControlsAreRejected(t *testing.T) {
 	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteNew {
 		t.Fatalf("new work was not allowed: %+v", decision)
 	}
+	for _, content := range []string{"停止任务", "请帮我暂停当前任务", "stop this task", "what is the task status?"} {
+		value.Content = content
+		decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value)
+		if decision.Action != ConversationRouteClarify || decision.Question != UnavailableRouteReferenceMessage {
+			t.Fatalf("explicit control intent with an unavailable reference became new work: content=%q decision=%+v", content, decision)
+		}
+	}
+	for _, content := range []string{"重新整理财报", "搜索一下停止任务的新闻", "show me how to cancel a task"} {
+		value.Content = content
+		decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value)
+		if decision.Action != ConversationRouteNew {
+			t.Fatalf("independent work was blocked by a stale reference: content=%q decision=%+v", content, decision)
+		}
+	}
+	value.Content = "重新整理财报"
+	value.ReferenceUnavailable = false
+	value.ReferenceTaskID = ""
+	value.PreviousMissing = true
+	value.PreviousUnresolved = true
+	value.Content = "停止任务"
+	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteClarify || decision.Question != "前一条消息尚未确认，请先处理或重试。" {
+		t.Fatalf("missing predecessor control intent became new work: %+v", decision)
+	}
+	value.Content = "另外写一首春天的短诗"
+	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteNew {
+		t.Fatalf("independent work was blocked by a missing predecessor: %+v", decision)
+	}
+	value.PreviousMissing = false
+	value.PreviousUnresolved = false
+	value.ReferenceTaskID = "q1234567"
+	value.ReferenceUnavailable = true
+	value.Content = "重新整理财报"
 	value.Candidates = []ConversationRouteCandidate{{TaskID: value.ReferenceTaskID, InitiatorID: value.ActorID, Status: task.StatusWaitingUser}}
 	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("unavailable Task leaked through the candidate list: %v", err)

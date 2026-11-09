@@ -68,6 +68,10 @@ type cloudDSHHistorySummaryResult struct {
 	Partial       bool                                 `json:"partial"`
 }
 
+type cloudDSHPersonalHistorySuppressionReader interface {
+	ListSuppressedPersonalHistoryMessageIDs(context.Context, string, []string) (map[string]struct{}, error)
+}
+
 func cloudDSHConversationHistorySearchDefinition() AgentToolDefinition {
 	parameters, _ := json.Marshal(map[string]any{
 		"type": "object",
@@ -129,7 +133,7 @@ func (b *CloudDSHToolBroker) executeRecentHistorySummary(ctx context.Context, cl
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	if !enabled || settingRevision < 1 {
+	if !enabled {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "conversation history summary requires enabled personal memory")
 	}
 	if current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls {
@@ -196,7 +200,7 @@ func (b *CloudDSHToolBroker) summarizablePersonalHistory(ctx context.Context, pr
 		}
 		result.Scanned++
 		result.Partial = result.Partial || messages.NextCursor != ""
-		allowed := make([]cloudDSHHistorySummaryMessage, 0, cloudDSHHistorySummaryMaxMessages)
+		eligible := make([]conversation.Message, 0, len(messages.Items))
 		for _, message := range messages.Items {
 			if !domain.ValidMessageID(message.ID) || message.ConversationID != item.ID || message.OwnerID != principal.UserID ||
 				(message.Role != conversation.RoleUser && message.Role != conversation.RoleAssistant) ||
@@ -206,10 +210,19 @@ func (b *CloudDSHToolBroker) summarizablePersonalHistory(ctx context.Context, pr
 			if message.DeliveryStatus != conversation.DeliveryApplied || len(message.AttachmentIDs) > 0 || cloudDSHHistoryCredentialPattern.MatchString(message.Content) {
 				continue
 			}
-			if len(allowed) < cloudDSHHistorySummaryMaxMessages {
-				allowed = append(allowed, cloudDSHHistorySummaryMessage{Role: message.Role,
-					Content: truncateHistoryText(message.Content, cloudDSHHistorySummaryContentRunes), CreatedAt: message.CreatedAt.UTC()})
+			eligible = append(eligible, message)
+		}
+		eligible, err = b.filterDeletedPersonalHistory(ctx, principal.UserID, eligible)
+		if err != nil {
+			return cloudDSHHistorySummaryResult{}, err
+		}
+		allowed := make([]cloudDSHHistorySummaryMessage, 0, cloudDSHHistorySummaryMaxMessages)
+		for _, message := range eligible {
+			if len(allowed) == cloudDSHHistorySummaryMaxMessages {
+				break
 			}
+			allowed = append(allowed, cloudDSHHistorySummaryMessage{Role: message.Role,
+				Content: truncateHistoryText(message.Content, cloudDSHHistorySummaryContentRunes), CreatedAt: message.CreatedAt.UTC()})
 		}
 		if len(allowed) == 0 {
 			continue
@@ -269,7 +282,7 @@ func (b *CloudDSHToolBroker) executeConversationHistorySearch(ctx context.Contex
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	if !enabled || settingRevision < 1 {
+	if !enabled {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "conversation history search requires enabled personal memory")
 	}
 	if current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls {
@@ -335,6 +348,7 @@ func (b *CloudDSHToolBroker) searchPersonalConversationHistory(ctx context.Conte
 		}
 		result.ScannedConversations++
 		result.Partial = result.Partial || messages.NextCursor != ""
+		eligible := make([]conversation.Message, 0, len(messages.Items))
 		for _, message := range messages.Items {
 			if !domain.ValidMessageID(message.ID) || message.ConversationID != item.ID || message.OwnerID != principal.UserID ||
 				(message.Role != conversation.RoleUser && message.Role != conversation.RoleAssistant) ||
@@ -348,6 +362,13 @@ func (b *CloudDSHToolBroker) searchPersonalConversationHistory(ctx context.Conte
 			if cloudDSHHistoryCredentialPattern.MatchString(message.Content) {
 				continue
 			}
+			eligible = append(eligible, message)
+		}
+		eligible, err = b.filterDeletedPersonalHistory(ctx, principal.UserID, eligible)
+		if err != nil {
+			return cloudDSHHistorySearchResult{}, err
+		}
+		for _, message := range eligible {
 			score := cloudDSHHistoryMatchScore(query, message.Content)
 			if score == 0 {
 				continue
@@ -373,6 +394,39 @@ func (b *CloudDSHToolBroker) searchPersonalConversationHistory(ctx context.Conte
 		result.Matches = result.Matches[:limit]
 	}
 	return result, nil
+}
+
+func (b *CloudDSHToolBroker) filterDeletedPersonalHistory(ctx context.Context, ownerID string,
+	messages []conversation.Message) ([]conversation.Message, error) {
+	if len(messages) == 0 {
+		return messages, nil
+	}
+	reader, ok := b.store.(cloudDSHPersonalHistorySuppressionReader)
+	if !ok {
+		return nil, domain.NewError(domain.CodeInternal, "personal history deletion filter is unavailable")
+	}
+	messageIDs := make([]string, 0, len(messages))
+	requested := make(map[string]struct{}, len(messages))
+	for _, message := range messages {
+		messageIDs = append(messageIDs, message.ID)
+		requested[message.ID] = struct{}{}
+	}
+	suppressed, err := reader.ListSuppressedPersonalHistoryMessageIDs(ctx, ownerID, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	for messageID := range suppressed {
+		if _, ok := requested[messageID]; !ok || !domain.ValidMessageID(messageID) {
+			return nil, domain.NewError(domain.CodeInternal, "personal history store returned an invalid suppression")
+		}
+	}
+	filtered := make([]conversation.Message, 0, len(messages)-len(suppressed))
+	for _, message := range messages {
+		if _, hidden := suppressed[message.ID]; !hidden {
+			filtered = append(filtered, message)
+		}
+	}
+	return filtered, nil
 }
 
 func cloudDSHHistoryMatchScore(query, content string) int {

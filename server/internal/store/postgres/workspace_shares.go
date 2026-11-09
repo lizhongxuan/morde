@@ -133,50 +133,44 @@ WHERE id=$1 AND state='pending'`, result.ID, claimantID); err != nil {
 	return result, nil
 }
 
-func (s *Store) SetWorkspaceShareTarget(ctx context.Context, id, claimantID, targetWorkspaceID string) error {
-	if !domain.ValidPendingRequestID(id) || !domain.ValidUserID(claimantID) || !domain.ValidWorkspaceID(targetWorkspaceID) {
-		return domain.InvalidArgument("workspace_share", "Workspace share target is invalid")
-	}
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		var state, storedClaimant, storedTarget string
-		if err := tx.QueryRow(ctx, `SELECT state,COALESCE(claimant_id,''),COALESCE(target_workspace_id,'')
-FROM workspace_share_links WHERE id=$1 FOR UPDATE`, id).Scan(&state, &storedClaimant, &storedTarget); err != nil {
-			return storeError("read Workspace share target reservation", "Workspace share link", err)
-		}
-		if state != string(workspace.ShareClaiming) || storedClaimant != claimantID {
-			return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
-		}
-		if storedTarget != "" && storedTarget != targetWorkspaceID {
-			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace share target changed")
-		}
-		if storedTarget == "" {
-			if _, err := tx.Exec(ctx, `UPDATE workspace_share_links SET target_workspace_id=$2 WHERE id=$1 AND state='claiming'`, id, targetWorkspaceID); err != nil {
-				return fmt.Errorf("save Workspace share target: %w", err)
-			}
-		}
-		return nil
-	})
-}
-
 func (s *Store) CompleteWorkspaceShareClaim(ctx context.Context, id, claimantID, targetWorkspaceID string) error {
 	if !domain.ValidPendingRequestID(id) || !domain.ValidUserID(claimantID) || !domain.ValidWorkspaceID(targetWorkspaceID) {
 		return domain.InvalidArgument("workspace_share", "Workspace share completion is invalid")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
-		var state, storedClaimant, storedTarget string
-		if err := tx.QueryRow(ctx, `SELECT state,COALESCE(claimant_id,''),COALESCE(target_workspace_id,'')
-FROM workspace_share_links WHERE id=$1 FOR UPDATE`, id).Scan(&state, &storedClaimant, &storedTarget); err != nil {
+		var state, storedClaimant, storedTarget, permission string
+		if err := tx.QueryRow(ctx, `SELECT state,COALESCE(claimant_id,''),COALESCE(target_workspace_id,''),permission
+FROM workspace_share_links WHERE id=$1 FOR UPDATE`, id).Scan(&state, &storedClaimant, &storedTarget, &permission); err != nil {
 			return storeError("lock Workspace share claim completion", "Workspace share link", err)
 		}
-		if state == string(workspace.ShareClaimed) && storedClaimant == claimantID && storedTarget == targetWorkspaceID {
-			return nil
-		}
-		if state != string(workspace.ShareClaiming) || storedClaimant != claimantID || storedTarget != targetWorkspaceID {
+		alreadyClaimed := state == string(workspace.ShareClaimed) && storedClaimant == claimantID && storedTarget == targetWorkspaceID
+		if !alreadyClaimed && (state != string(workspace.ShareClaiming) || storedClaimant != claimantID || storedTarget != targetWorkspaceID) {
 			return domain.NewError(domain.CodeNotFound, "Workspace share link not found")
 		}
-		if _, err := tx.Exec(ctx, `UPDATE workspace_share_links SET state='claimed',claimed_at=clock_timestamp()
+		var targetOwner, targetState string
+		var readOnly bool
+		if err := tx.QueryRow(ctx, `SELECT owner_id,state,is_read_only FROM workspaces WHERE id=$1 FOR SHARE`, targetWorkspaceID).
+			Scan(&targetOwner, &targetState, &readOnly); err != nil {
+			return storeError("verify recipient-owned Workspace copy", "workspace", err)
+		}
+		var ownedWithoutTransfer bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM workspace_ownership_history h
+WHERE h.workspace_id=$1 AND h.owner_id=$2 AND h.ended_at IS NULL AND h.transfer_id IS NULL
+) AND NOT EXISTS (
+SELECT 1 FROM workspace_ownership_transfers t WHERE t.workspace_id=$1
+)`, targetWorkspaceID, claimantID).Scan(&ownedWithoutTransfer); err != nil {
+			return fmt.Errorf("verify Workspace copy ownership history: %w", err)
+		}
+		wantReadOnly := permission == string(workspace.ShareView)
+		if targetOwner != claimantID || targetState != string(workspace.StateReady) || readOnly != wantReadOnly || !ownedWithoutTransfer {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Workspace share copy is not an independent recipient-owned copy")
+		}
+		if !alreadyClaimed {
+			if _, err := tx.Exec(ctx, `UPDATE workspace_share_links SET state='claimed',claimed_at=clock_timestamp()
 WHERE id=$1 AND state='claiming' AND claimant_id=$2 AND target_workspace_id=$3`, id, claimantID, targetWorkspaceID); err != nil {
-			return fmt.Errorf("complete Workspace share claim: %w", err)
+				return fmt.Errorf("complete Workspace share claim: %w", err)
+			}
 		}
 		return nil
 	})

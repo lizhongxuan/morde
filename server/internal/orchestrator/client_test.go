@@ -138,6 +138,75 @@ func TestCreateRequiresRegisteredVolumesToExist(t *testing.T) {
 	}
 }
 
+func TestCreateSerializesDenyAllNetworkPolicy(t *testing.T) {
+	var got map[string]json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode sandbox request: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `{"id":"sandbox-deny","status":{"state":"Running"}}`)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, nil)
+	client.checkNetworkPolicy = func(context.Context, string, string) error { return nil }
+	client.profile.NetworkPolicyEnabled = true
+	_, err := client.Create(context.Background(), app.SandboxCreateRequest{
+		Image:         "registry.local/cloudhost/task-sandbox@sha256:abc",
+		NetworkPolicy: &app.SandboxNetworkPolicy{DefaultAction: "deny"},
+	})
+	if err != nil {
+		t.Fatalf("Create() = %v", err)
+	}
+	if gotPolicy := string(got["networkPolicy"]); gotPolicy != `{"defaultAction":"deny"}` {
+		t.Fatalf("networkPolicy = %s, want explicit deny-all policy", gotPolicy)
+	}
+}
+
+func TestCreateRejectsNonDenyNetworkPolicyBeforeRequest(t *testing.T) {
+	for _, defaultAction := range []string{"allow", ""} {
+		t.Run("defaultAction="+defaultAction, func(t *testing.T) {
+			var requests int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+
+			client := newTestClient(server.URL, nil)
+			client.checkNetworkPolicy = func(context.Context, string, string) error { return nil }
+			client.profile.NetworkPolicyEnabled = true
+			_, err := client.Create(context.Background(), app.SandboxCreateRequest{
+				Image:         "image",
+				NetworkPolicy: &app.SandboxNetworkPolicy{DefaultAction: defaultAction},
+			})
+			if !errors.Is(err, app.ErrSandboxUnsupported) || requests != 0 {
+				t.Fatalf("Create() error=%v requests=%d, want unsupported and no request", err, requests)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsNetworkPolicyWhenProfileCapabilityIsDisabled(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, nil)
+	client.checkNetworkPolicy = func(context.Context, string, string) error { return nil }
+	_, err := client.Create(context.Background(), app.SandboxCreateRequest{
+		Image:         "image",
+		NetworkPolicy: &app.SandboxNetworkPolicy{DefaultAction: "deny"},
+	})
+	if !errors.Is(err, app.ErrSandboxUnsupported) || requests != 0 {
+		t.Fatalf("Create() error=%v requests=%d, want unsupported and no request", err, requests)
+	}
+}
+
 func TestCreateDoesNotCallOpenSandboxWhenNetworkGuardFails(t *testing.T) {
 	var requests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

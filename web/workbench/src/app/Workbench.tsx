@@ -656,6 +656,7 @@ export default function Workbench() {
                 ) : (
                   <>
                     <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('workspace'))}>Workspace</button>
+                    <button type="button" role="menuitem" onClick={() => runMobileMenuAction(() => selectTab('files'))}>主机文件</button>
                     <button type="button" role="menuitem" disabled={!vscodeAvailable} onClick={() => runMobileMenuAction(() => selectTab('vscode'))}>VS Code</button>
                   </>
                 )}

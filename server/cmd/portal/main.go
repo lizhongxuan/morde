@@ -390,7 +390,7 @@ func serve(ctx context.Context, configPath string) error {
 	}); err != nil {
 		return fmt.Errorf("configure Workspace copy materializer: %w", err)
 	}
-	workspaceShares, err := app.NewWorkspaceShareService(store, workspaceCopies, workspaceOwnershipTransfers)
+	workspaceShares, err := app.NewWorkspaceShareService(store, workspaceCopies)
 	if err != nil {
 		return fmt.Errorf("initialize Workspace share service: %w", err)
 	}
@@ -717,8 +717,10 @@ func serve(ctx context.Context, configPath string) error {
 		ProjectBudget:                  projectBudgets,
 		ProjectMCPConnectors:           projectMCPConnectors,
 		ProjectBudgetExecutionReady:    len(cfg.Models.ProjectRates) > 0,
-		RuntimeOperationLedger:         store,
-		Projects:                       projects, ProjectContent: projects,
+		ConversationAutoRoutingReady: routeWorker != nil && taskWorker != nil && executionControlService != nil &&
+			executionAdapters.tasks != nil && modelGateway != nil,
+		RuntimeOperationLedger: store,
+		Projects:               projects, ProjectContent: projects,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		Hub: hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
 		Goals: goalService, Schedules: executionAdapters.schedules,
@@ -776,6 +778,16 @@ func serve(ctx context.Context, configPath string) error {
 			return err
 		}
 	}
+	goalAgentTriggerService, err := app.NewGoalAgentTriggerService(store, store, schedules, workerSuffix+"-goal-trigger", 2*time.Minute)
+	if err != nil {
+		return fmt.Errorf("initialize Goal agent trigger service: %w", err)
+	}
+	goalAgentTriggerWorker, err := worker.NewGoalAgentTriggerWorker(worker.GoalAgentTriggerWorkerOptions{
+		Service: goalAgentTriggerService, PollInterval: time.Second, BatchSize: 100, Logger: logger,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize Goal agent trigger worker: %w", err)
+	}
 	if workspaceSyncNodeProvisioner != nil {
 		if err := workspaceSyncNodeProvisioner.ReconcileWorkspaceSyncNodesOnStartup(ctx); err != nil {
 			logger.Warn("Workspace sync startup reconciliation incomplete; affected relay gates remain closed", zap.Error(err))
@@ -787,11 +799,12 @@ func serve(ctx context.Context, configPath string) error {
 	logger.Info("portal starting", zap.String("instance", cfg.Instance), zap.Int64("migration_version", migrationVersion), zap.String("api", cfg.Listen.API), zap.String("gateway", cfg.Listen.Gateway), zap.String("metrics", cfg.Listen.Metrics))
 	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
 	defer stopPersonalCleanup()
-	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, logger)
-	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker, resultWorker, recordWorker, scheduleWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
+	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, tasks, logger)
+	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime, gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
-func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService, logger *zap.Logger) {
+func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService,
+	tasks *app.TaskService, logger *zap.Logger) {
 	const (
 		batchLimit int32 = 1000
 		interval         = time.Minute
@@ -809,6 +822,9 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 		}
 		if _, err := quota.CleanupExpiredPersonalDataQuotaReservations(cleanupCtx, time.Now().UTC(), batchLimit); err != nil && logger != nil {
 			logger.Warn("orphan personal data quota reservation cleanup failed", zap.Error(err))
+		}
+		if _, err := tasks.CleanupExpiredConversationMessageUploads(cleanupCtx, time.Now().UTC(), batchLimit); err != nil && logger != nil {
+			logger.Warn("expired conversation message upload cleanup failed", zap.Error(err))
 		}
 		cancel()
 		select {
@@ -1313,7 +1329,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, resultWorker *worker.ConversationResultAggregationWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, resultWorker *worker.ConversationResultAggregationWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -1347,6 +1363,8 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		scheduleWorkerDone = make(chan error, 1)
 		go func() { scheduleWorkerDone <- scheduleWorker.Run(workerCtx) }()
 	}
+	goalAgentTriggerWorkerDone := make(chan error, 1)
+	go func() { goalAgentTriggerWorkerDone <- goalAgentTriggerWorker.Run(workerCtx) }()
 	var taskWorkerDone chan error
 	var cancelTaskWorker context.CancelFunc
 	if taskWorker != nil {
@@ -1410,6 +1428,12 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			runErr = errors.New("schedule worker stopped unexpectedly")
 		} else {
 			runErr = fmt.Errorf("schedule worker stopped unexpectedly: %w", err)
+		}
+	case err := <-goalAgentTriggerWorkerDone:
+		if err == nil {
+			runErr = errors.New("goal agent trigger worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("goal agent trigger worker stopped unexpectedly: %w", err)
 		}
 	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -1480,6 +1504,9 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		if err := <-scheduleWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
 			runErr = fmt.Errorf("stop schedule worker: %w", err)
 		}
+	}
+	if err := <-goalAgentTriggerWorkerDone; err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+		runErr = fmt.Errorf("stop Goal agent trigger worker: %w", err)
 	}
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := runtime.FlushActivity(flushCtx); err != nil {

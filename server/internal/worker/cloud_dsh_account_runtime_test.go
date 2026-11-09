@@ -2,6 +2,7 @@ package worker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -712,6 +713,121 @@ func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
 	}
 }
 
+func TestAccountAgentRuntimeInterleavedTaskFramesStayOnTheirOwnPipes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime := app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{
+		ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567",
+		RuntimeID: "runtime_1", RuntimeGeneration: 1,
+	}, MaxConcurrentTasks: 2}
+	session := &cloudDSHAccountRuntimeSession{runtime: runtime, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask)}
+	startTask := func(taskID, agentID, sessionID string, sequence int64) (app.AgentInstanceFence, io.WriteCloser, *bufio.Reader) {
+		t.Helper()
+		fence := app.AgentInstanceFence{TaskID: taskID, OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: agentID,
+			AgentGeneration: 1, AgentSessionID: sessionID, SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
+			AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+		lease := app.AgentInstanceLease{Fence: fence, RuntimeFence: &runtime.Fence, RuntimeSequence: sequence, ExpiresAt: time.Now().Add(app.MaxAgentLease)}
+		input, output, err := session.StartTask(ctx, fence, []byte(strings.Repeat("n", 32)), lease)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := bufio.NewReader(output)
+		ready, err := reader.ReadBytes('\n')
+		if err != nil || !strings.Contains(string(ready), `"type":"ready"`) {
+			t.Fatalf("Task %s ready frame = %q, %v", taskID, ready, err)
+		}
+		return fence, input, reader
+	}
+	foreignOwnerFence := app.AgentInstanceFence{TaskID: "q9999999", OwnerID: "u9999999", InitiatorID: "u9999999", AgentInstanceID: "agent-foreign",
+		AgentGeneration: 1, AgentSessionID: "session-foreign", SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
+		AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	foreignOwnerLease := app.AgentInstanceLease{Fence: foreignOwnerFence, RuntimeFence: &runtime.Fence, RuntimeSequence: 99,
+		ExpiresAt: time.Now().Add(app.MaxAgentLease)}
+	if _, _, err := session.StartTask(ctx, foreignOwnerFence, []byte(strings.Repeat("n", 32)), foreignOwnerLease); err == nil ||
+		!strings.Contains(err.Error(), "owner does not match") {
+		t.Fatalf("Task from a different owner was not rejected: %v", err)
+	}
+	if len(session.tasks) != 0 {
+		t.Fatalf("rejected foreign Task changed active Task count to %d", len(session.tasks))
+	}
+	fenceA, inputA, readerA := startTask("q1234567", "agent-1", "session-1", 1)
+	fenceB, _, readerB := startTask("q2345678", "agent-2", "session-2", 2)
+	overLimitFence := app.AgentInstanceFence{TaskID: "q3456789", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent-3",
+		AgentGeneration: 1, AgentSessionID: "session-3", SupervisorID: "dsh-supervisor", LeaseOwner: "task-worker", LeaseVersion: 1,
+		AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	overLimitLease := app.AgentInstanceLease{Fence: overLimitFence, RuntimeFence: &runtime.Fence, RuntimeSequence: 3,
+		ExpiresAt: time.Now().Add(app.MaxAgentLease)}
+	if _, _, err := session.StartTask(ctx, overLimitFence, []byte(strings.Repeat("n", 32)), overLimitLease); err == nil ||
+		!strings.Contains(err.Error(), "concurrency limit") {
+		t.Fatalf("third Task was not rejected at Runtime concurrency limit: %v", err)
+	}
+	if len(session.tasks) != 2 {
+		t.Fatalf("rejected Task changed active Task count to %d, want 2", len(session.tasks))
+	}
+
+	frame := func(fence app.AgentInstanceFence, sequence int64, kind, payload string) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{"type": kind, "server_instance_id": runtime.Fence.ServiceInstanceID,
+			"runtime_id": runtime.Fence.RuntimeID, "runtime_generation": runtime.Fence.RuntimeGeneration,
+			"runtime_sequence": sequence, "task_id": fence.TaskID, "owner_id": fence.OwnerID,
+			"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
+			"authorization_version": fence.AuthorizationVersion, "payload": payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	// Reject a frame carrying Task B's identity if it arrives on Task A's input pipe.
+	spoofed, err := json.Marshal(map[string]any{"type": "checkpoint", "task_id": fenceB.TaskID, "owner_id": fenceB.OwnerID,
+		"agent_id": fenceB.AgentInstanceID, "session_id": fenceB.AgentSessionID, "generation": fenceB.AgentGeneration,
+		"authorization_version": fenceB.AuthorizationVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inputA.Write(append(spoofed, '\n')); err == nil {
+		t.Fatal("Task A input pipe accepted Task B identity")
+	}
+
+	// Deliver interleaved frames concurrently and make sure each Task reads only its own payload.
+	frames := [][]byte{frame(fenceB, 2, "checkpoint", "private-to-B"), frame(fenceA, 1, "model", "private-to-A")}
+	var wait sync.WaitGroup
+	errs := make(chan error, len(frames))
+	for _, data := range frames {
+		data := data
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs <- session.routeFrame(data)
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	readPayload := func(reader *bufio.Reader, taskID, payload string) {
+		t.Helper()
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read Task %s event: %v", taskID, err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(line), &got); err != nil {
+			t.Fatalf("decode Task %s event %q: %v", taskID, line, err)
+		}
+		if got["task_id"] != taskID || got["payload"] != payload {
+			t.Fatalf("Task %s received another Task's frame: %#v", taskID, got)
+		}
+	}
+	readPayload(readerA, fenceA.TaskID, "private-to-A")
+	readPayload(readerB, fenceB.TaskID, "private-to-B")
+	if len(session.tasks[fenceA].events) != 0 || len(session.tasks[fenceB].events) != 0 {
+		t.Fatal("a Task pipe retained another Task's unread frame")
+	}
+}
+
 func TestFailedAccountAgentRuntimeCanBeGuardianStoppedBeforeLeaseExpiry(t *testing.T) {
 	control := &accountRuntimeControlStub{}
 	supervisor := &accountRuntimeSupervisorStub{}
@@ -747,7 +863,7 @@ func TestAccountAgentRuntimeBackpressureDoesNotBlockSibling(t *testing.T) {
 	runtime := app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{
 		ServiceInstanceID: "123e4567-e89b-12d3-a456-426614174000", ConversationID: "c1234567", OwnerID: "u1234567",
 		RuntimeID: "runtime_1", RuntimeGeneration: 1,
-	}}
+	}, MaxConcurrentTasks: 2}
 	session := &cloudDSHAccountRuntimeSession{runtime: runtime, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask)}
 	startTask := func(taskID, agentID, sessionID string, sequence int64) (app.AgentInstanceFence, io.ReadCloser) {
 		t.Helper()

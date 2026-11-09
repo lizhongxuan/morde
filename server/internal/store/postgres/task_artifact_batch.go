@@ -327,17 +327,16 @@ func (s *Store) RecordValidatedArtifact(ctx context.Context, ownerID string, art
 		if err != nil {
 			return err
 		}
-		taskRow, err := loadOwnedTaskForUpdate(ctx, tx, ownerID, artifact.TaskID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return missingTaskError()
-		}
-		if err != nil {
+		if _, err := loadOwnedTaskForUpdate(ctx, tx, ownerID, artifact.TaskID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return missingTaskError()
+			}
 			return fmt.Errorf("lock task for artifact record: %w", err)
 		}
 		if err := verifyProjectTaskWorkspaceFence(ctx, tx, artifact.TaskID, projectFence); err != nil {
 			return err
 		}
-		taskRow, err = sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: artifact.TaskID, OwnerID: ownerID})
+		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: artifact.TaskID, OwnerID: ownerID})
 		if err != nil {
 			return fmt.Errorf("read task for artifact record: %w", err)
 		}

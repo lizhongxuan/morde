@@ -228,6 +228,27 @@ func TestPersonalAttachmentServiceCreateReplaysActiveSessionAndConflicts(t *test
 	}
 }
 
+func TestPersonalAttachmentReceivedSequencesMustBeOrderedAndInRange(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		sequences []int32
+		valid     bool
+	}{
+		{name: "empty", sequences: []int32{}, valid: true},
+		{name: "ordered", sequences: []int32{0, 2}, valid: true},
+		{name: "duplicate", sequences: []int32{1, 1}},
+		{name: "unordered", sequences: []int32{2, 1}},
+		{name: "negative", sequences: []int32{-1}},
+		{name: "outside chunk count", sequences: []int32{3}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validPersonalAttachmentReceivedSequences(test.sequences, 3); got != test.valid {
+				t.Fatalf("validPersonalAttachmentReceivedSequences(%v) = %t, want %t", test.sequences, got, test.valid)
+			}
+		})
+	}
+}
+
 func TestPersonalAttachmentServiceFailsClosedWithoutQuotaAndOnQuotaRejection(t *testing.T) {
 	if _, err := NewPersonalAttachmentService(&personalAttachmentStoreStub{}, nil); err == nil {
 		t.Fatal("service accepted missing DATA-05 quota port")

@@ -39,8 +39,15 @@ func (e *CloudDSHExecutor) confirmCloudDSHPersonalWrites(ctx context.Context, cl
 		if !ok || !call.callSeen || len(confirmed[history.sessionID]) >= 100 {
 			return nil, errors.New("personal context write has no provable receipt")
 		}
+		receiptCallID := callID
+		if history.sessionID != fence.AgentSessionID {
+			if !cloudDSHID.MatchString(history.sessionID) {
+				return nil, errors.New("personal context child session identity is invalid")
+			}
+			receiptCallID = cloudDSHNamespacedToolCallID(claimed.ID, history.sessionID, callID)
+		}
 		version, output, err := reader.ConfirmPersonalContextWrite(ctx, claimed, fence, through, digest,
-			app.ModelToolCall{CallID: callID, Name: call.name, Arguments: string(call.arguments)})
+			app.ModelToolCall{CallID: receiptCallID, Name: call.name, Arguments: string(call.arguments)})
 		if err != nil || output == "" || call.resultSeen && call.resultText != output {
 			return nil, errors.New("personal context write receipt could not be reconciled")
 		}

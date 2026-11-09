@@ -1270,7 +1270,7 @@ func (m *f01CloudTaskModel) Complete(ctx context.Context, call app.ModelCall) (a
 		if m.approvalFirst {
 			approvalCall := app.ModelToolCall{
 				CallID: "f01-desktop-click-001", Name: "desktop_click",
-				Arguments: `{"window_id":"0x1","x":1,"y":2,"screenshot_width":1280,"screenshot_height":720,"screen_width":1280,"screen_height":720,"button":"left"}`,
+				Arguments: `{"window_id":"0x1","x":1,"y":2,"screenshot_token":"` + strings.Repeat("A", 43) + `","button":"left"}`,
 			}
 			if m.workspaceID != "" {
 				approvalCall = app.ModelToolCall{

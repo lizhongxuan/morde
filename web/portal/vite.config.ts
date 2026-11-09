@@ -31,6 +31,9 @@ export default defineConfig(({ mode }) => {
       host: "127.0.0.1",
       port: 5173,
       strictPort: true,
+      ...(process.env.CH_E2E_USE_POLLING === "1"
+        ? { watch: { usePolling: true, interval: 1_000 } }
+        : {}),
       proxy: {
         ...(realApi
           ? {

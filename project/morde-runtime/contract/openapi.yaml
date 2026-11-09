@@ -1167,13 +1167,15 @@ components:
             arguments:
               type: object
               description: >-
-                For desktop.input/click, window_id, x, y, screenshot_width,
-                screenshot_height, screen_width and screen_height are required.
-                x/y are pixel coordinates in the latest desktop_screenshot image;
-                screenshot_width/height are that bounded image's dimensions, while
-                screen_width/height are the actual display dimensions returned by the
-                same screenshot. The Host maps x/y to screen pixels and rejects the
-                click if the current display geometry no longer matches screen_width/height.
+                For desktop.input/click, window_id, x, y and screenshot_token are required.
+                x/y are pixel coordinates in the latest bounded desktop_screenshot image.
+                The Host issues screenshot_token and binds it to that image's dimensions,
+                actual display dimensions, Task, Host fence and lease_version. It expires
+                after 90 seconds, is single use, and cannot be supplied by the model as a
+                replacement for the screenshot proof. The Host maps x/y using the bound
+                dimensions and rejects expired, replayed, cross-Task/fence/lease tokens or
+                a changed display/window state before input. Any Task's desktop input or
+                window activation invalidates all pending screenshot tokens on that Host.
     Operation:
       type: object
       required: [host_id, runtime_generation, runtime_instance_id, control_version, task_id, operation_id, lease_version, status]
@@ -1197,8 +1199,10 @@ components:
           description: >-
             A successful desktop.observe/screenshot returns mime_type, width and height
             for the bounded JPEG, screen_width and screen_height for the actual display,
-            and data_base64. A refused click caused by a screen size change returns the
-            bounded failure code desktop_geometry_changed without sending input.
+            a short-lived screenshot_token, and data_base64. A successful click returns
+            the mapped screen coordinates and the trusted image/display dimensions. A
+            refused click caused by an expired proof or changed display/window state
+            returns a bounded failure without sending input.
     OperationStatus:
       type: string
       enum: [accepted, running, succeeded, failed, cancelling, cancelled, unknown]

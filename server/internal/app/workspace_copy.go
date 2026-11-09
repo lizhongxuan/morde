@@ -30,8 +30,28 @@ type WorkspaceCopyResult struct {
 	Replayed          bool                `json:"replayed"`
 }
 
+// WorkspaceCopyReservationRequest records source and destination ownership
+// independently. A non-empty ShareID is accepted only for a live claim by
+// TargetOwnerID and binds its target atomically with this reservation.
+type WorkspaceCopyReservationRequest struct {
+	ID                string
+	SourceOwnerID     string
+	TargetOwnerID     string
+	ShareID           string
+	SourceWorkspaceID string
+	TargetWorkspaceID string
+	TargetName        string
+	ServiceInstanceID string
+	SourceRevision    int64
+	ReservedBytes     int64
+	MaxOwnerBytes     int64
+	TargetQuotaBytes  int64
+	ReadOnly          bool
+	Idempotency       IdempotencyRecord
+}
+
 type WorkspaceCopyStore interface {
-	CreateWorkspaceCopyReservation(context.Context, string, string, string, string, string, string, int64, int64, int64, int64, IdempotencyRecord) (workspace.CopyReservation, bool, error)
+	CreateWorkspaceCopyReservation(context.Context, WorkspaceCopyReservationRequest) (workspace.CopyReservation, bool, error)
 	GetWorkspaceCopyReservationByIdempotency(context.Context, IdempotencyRecord, string, string, int64) (workspace.CopyReservation, bool, error)
 	GetWorkspaceManifestPageForCopy(context.Context, string, string, int64, string, string, int32) (workspace.ManifestPage, error)
 	TryWorkspaceCopyLock(context.Context, string) (LeaderLock, bool, error)
@@ -88,6 +108,30 @@ func (s *WorkspaceCopyService) SetCurrentMaterializer(materializer WorkspaceCopy
 
 func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Principal, sourceWorkspaceID string,
 	command WorkspaceCopyCommand, idempotencyKey string) (WorkspaceCopyResult, error) {
+	return s.copy(ctx, principal, principal.UserID, principal.UserID, "", false, sourceWorkspaceID, command, idempotencyKey)
+}
+
+// copyForWorkspaceShare creates a recipient-owned copy from the immutable
+// source checkpoint represented by a validated, in-progress share claim.
+func (s *WorkspaceCopyService) copyForWorkspaceShare(ctx context.Context, principal identity.Principal,
+	share workspace.ShareLink) (WorkspaceCopyResult, error) {
+	if err := requireWorkspaceShareSession(principal); err != nil {
+		return WorkspaceCopyResult{}, err
+	}
+	if err := share.Validate(); err != nil || share.State != workspace.ShareClaiming || share.ClaimantID != principal.UserID ||
+		share.OwnerID == principal.UserID || share.TargetWorkspaceID != "" && !domain.ValidWorkspaceID(share.TargetWorkspaceID) {
+		return WorkspaceCopyResult{}, domain.NewError(domain.CodeNotFound, "Workspace share link not found")
+	}
+	if share.Permission != workspace.ShareView && share.Permission != workspace.ShareEdit {
+		return WorkspaceCopyResult{}, domain.NewError(domain.CodeInternal, "Workspace share permission is invalid")
+	}
+	return s.copy(ctx, principal, share.OwnerID, principal.UserID, share.ID, share.Permission == workspace.ShareView,
+		share.SourceWorkspaceID, WorkspaceCopyCommand{Name: share.WorkspaceName, ExpectedCurrentRevision: share.SourceRevision},
+		"ws-share-copy-"+share.ID)
+}
+
+func (s *WorkspaceCopyService) copy(ctx context.Context, principal identity.Principal, sourceOwnerID, targetOwnerID, shareID string,
+	readOnly bool, sourceWorkspaceID string, command WorkspaceCopyCommand, idempotencyKey string) (WorkspaceCopyResult, error) {
 	if s == nil || s.store == nil || s.sync == nil || s.blocks == nil || s.materialize == nil {
 		return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceUnavailable, "Workspace copy service is unavailable")
 	}
@@ -97,25 +141,55 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 	if err := validatePrincipal(principal); err != nil {
 		return WorkspaceCopyResult{}, err
 	}
+	if !domain.ValidUserID(sourceOwnerID) || !domain.ValidUserID(targetOwnerID) || targetOwnerID != principal.UserID ||
+		(shareID == "" && (sourceOwnerID != targetOwnerID || readOnly)) || (shareID != "" && sourceOwnerID == targetOwnerID) {
+		return WorkspaceCopyResult{}, domain.InvalidArgument("workspace_copy", "Workspace copy ownership is invalid")
+	}
+	sourcePrincipal := principal
+	if sourceOwnerID != principal.UserID {
+		sourcePrincipal = identity.Principal{UserID: sourceOwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
+	}
 	command.Name = strings.TrimSpace(command.Name)
 	if !domain.ValidWorkspaceID(sourceWorkspaceID) || command.Name == "" || utf8.RuneCountInString(command.Name) > 120 ||
 		!utf8.ValidString(command.Name) || command.ExpectedCurrentRevision < 0 || validateIdempotencyKey(idempotencyKey) != nil {
 		return WorkspaceCopyResult{}, domain.InvalidArgument("workspace_copy", "Workspace copy request is invalid")
 	}
-	requestHash, err := json.Marshal(struct {
-		SourceWorkspaceID string
-		Name              string
-		ExpectedRevision  int64
-	}{sourceWorkspaceID, command.Name, command.ExpectedCurrentRevision})
+	var err error
+	var requestHash []byte
+	if shareID == "" {
+		requestHash, err = json.Marshal(struct {
+			SourceWorkspaceID string
+			Name              string
+			ExpectedRevision  int64
+		}{sourceWorkspaceID, command.Name, command.ExpectedCurrentRevision})
+	} else {
+		requestHash, err = json.Marshal(struct {
+			ShareID           string
+			SourceOwnerID     string
+			TargetOwnerID     string
+			SourceWorkspaceID string
+			Name              string
+			ExpectedRevision  int64
+			ReadOnly          bool
+		}{shareID, sourceOwnerID, targetOwnerID, sourceWorkspaceID, command.Name, command.ExpectedCurrentRevision, readOnly})
+	}
 	if err != nil {
 		return WorkspaceCopyResult{}, domain.NewError(domain.CodeInternal, "Workspace copy request cannot be encoded")
 	}
 	digest := sha256.Sum256(requestHash)
-	record := IdempotencyRecord{OwnerID: principal.UserID, Operation: "workspace.copy", Key: idempotencyKey,
+	operation := "workspace.copy"
+	if shareID != "" {
+		operation = "workspace.share.copy"
+	}
+	record := IdempotencyRecord{OwnerID: targetOwnerID, Operation: operation, Key: idempotencyKey,
 		RequestHash: digest[:], ResourceID: sourceWorkspaceID}
 	reservation, found, err := s.store.GetWorkspaceCopyReservationByIdempotency(ctx, record, command.Name, s.instanceID, s.workspaceQuotaBytes)
 	if err != nil {
 		return WorkspaceCopyResult{}, err
+	}
+	if found && (reservation.SourceOwnerID != sourceOwnerID || reservation.TargetOwnerID != targetOwnerID ||
+		reservation.ShareID != shareID || reservation.ReadOnly != readOnly) {
+		return WorkspaceCopyResult{}, domain.NewError(domain.CodeIdempotencyConflict, "Workspace copy reservation ownership does not match the original request")
 	}
 	if found && reservation.State == workspace.CopyCompleted {
 		return workspaceCopyResult(sourceWorkspaceID, command.Name, reservation, true), nil
@@ -141,7 +215,7 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceBusy, "Workspace copy is already running")
 		}
 		defer func() { _ = lock.Release(context.WithoutCancel(ctx)) }()
-		source, err = s.sync.authorize(ctx, principal, sourceWorkspaceID)
+		source, err = s.sync.authorize(ctx, sourcePrincipal, sourceWorkspaceID)
 		if err != nil {
 			return WorkspaceCopyResult{}, err
 		}
@@ -151,7 +225,7 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		if source.Revision != reservation.SourceRevision || source.State != workspace.StateReady {
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace copy source checkpoint changed")
 		}
-		files, directories, directoryMetadata, err = s.copyReservationManifest(ctx, reservation, principal.UserID)
+		files, directories, directoryMetadata, err = s.copyReservationManifest(ctx, reservation, sourceOwnerID)
 		if err != nil {
 			return WorkspaceCopyResult{}, err
 		}
@@ -164,7 +238,7 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		}
 		blockSizes, replayed = sizes, true
 	} else {
-		source, err = s.sync.authorize(ctx, principal, sourceWorkspaceID)
+		source, err = s.sync.authorize(ctx, sourcePrincipal, sourceWorkspaceID)
 		if err != nil {
 			return WorkspaceCopyResult{}, err
 		}
@@ -174,7 +248,7 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		if source.Revision != command.ExpectedCurrentRevision || source.State != workspace.StateReady {
 			return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed before copy; refresh and retry")
 		}
-		files, directories, directoryMetadata, err = s.copyManifest(ctx, principal, sourceWorkspaceID, command.ExpectedCurrentRevision)
+		files, directories, directoryMetadata, err = s.copyManifest(ctx, sourcePrincipal, sourceWorkspaceID, command.ExpectedCurrentRevision)
 		if err != nil {
 			return WorkspaceCopyResult{}, err
 		}
@@ -191,8 +265,12 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		if err != nil {
 			return WorkspaceCopyResult{}, fmt.Errorf("generate Workspace copy reservation ID: %w", err)
 		}
-		reservation, replayed, err = s.store.CreateWorkspaceCopyReservation(ctx, principal.UserID, sourceWorkspaceID, targetWorkspaceID,
-			command.Name, s.instanceID, reservationID, command.ExpectedCurrentRevision, reservedBytes, s.maxOwnerBytes, s.workspaceQuotaBytes, record)
+		reservation, replayed, err = s.store.CreateWorkspaceCopyReservation(ctx, WorkspaceCopyReservationRequest{
+			ID: reservationID, SourceOwnerID: sourceOwnerID, TargetOwnerID: targetOwnerID, ShareID: shareID,
+			SourceWorkspaceID: sourceWorkspaceID, TargetWorkspaceID: targetWorkspaceID, TargetName: command.Name,
+			ServiceInstanceID: s.instanceID, SourceRevision: command.ExpectedCurrentRevision, ReservedBytes: reservedBytes,
+			MaxOwnerBytes: s.maxOwnerBytes, TargetQuotaBytes: s.workspaceQuotaBytes, ReadOnly: readOnly, Idempotency: record,
+		})
 		if err != nil {
 			return WorkspaceCopyResult{}, err
 		}
@@ -211,7 +289,7 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 				return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceBusy, "Workspace copy is already running")
 			}
 			defer func() { _ = lock.Release(context.WithoutCancel(ctx)) }()
-			files, directories, directoryMetadata, err = s.copyReservationManifest(ctx, reservation, principal.UserID)
+			files, directories, directoryMetadata, err = s.copyReservationManifest(ctx, reservation, sourceOwnerID)
 			if err != nil {
 				return WorkspaceCopyResult{}, err
 			}
@@ -238,20 +316,20 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 	volumeBytes, err := workspaceCopyFileBytes(files)
 	if err != nil {
 		if wasReserved {
-			err = errors.Join(err, s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, principal.UserID, reservation.ID))
+			err = errors.Join(err, s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, targetOwnerID, reservation.ID))
 		}
 		return WorkspaceCopyResult{}, err
 	}
 	if volumeBytes != source.UsedBytes || volumeBytes > s.workspaceQuotaBytes {
 		var err error = domain.NewError(domain.CodeWorkspaceConflict, "Workspace copy manifest totals do not match its current checkpoint")
 		if wasReserved {
-			err = errors.Join(err, s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, principal.UserID, reservation.ID))
+			err = errors.Join(err, s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, targetOwnerID, reservation.ID))
 		}
 		return WorkspaceCopyResult{}, err
 	}
 	if s.sync.verifyCurrent == nil {
 		if wasReserved {
-			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, principal.UserID, reservation.ID); failErr != nil {
+			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, targetOwnerID, reservation.ID); failErr != nil {
 				return WorkspaceCopyResult{}, errors.Join(domain.NewError(domain.CodeWorkspaceUnavailable, "Workspace current-tree verifier is unavailable"), failErr)
 			}
 		} else if reservation.State == workspace.Copying {
@@ -259,11 +337,11 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		}
 		return WorkspaceCopyResult{}, domain.NewError(domain.CodeWorkspaceUnavailable, "Workspace current-tree verifier is unavailable")
 	}
-	matches, verifyErr := s.sync.verifyCurrent(ctx, principal.UserID, sourceWorkspaceID, files, directories, directoryMetadata)
+	matches, verifyErr := s.sync.verifyCurrent(ctx, sourceOwnerID, sourceWorkspaceID, files, directories, directoryMetadata)
 	if verifyErr != nil || !matches {
 		cause := errors.Join(domain.NewError(domain.CodeWorkspaceConflict, "Workspace current tree does not match the confirmed checkpoint"), verifyErr)
 		if wasReserved {
-			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, principal.UserID, reservation.ID); failErr != nil {
+			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, targetOwnerID, reservation.ID); failErr != nil {
 				return WorkspaceCopyResult{}, errors.Join(cause, failErr)
 			}
 		} else if reservation.State == workspace.Copying {
@@ -273,20 +351,20 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 	}
 	if wasReserved {
 		if err := s.capacity.CheckCapacityForWrite(ctx, volumeBytes); err != nil {
-			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, principal.UserID, reservation.ID); failErr != nil {
+			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, targetOwnerID, reservation.ID); failErr != nil {
 				return WorkspaceCopyResult{}, errors.Join(err, failErr)
 			}
 			return WorkspaceCopyResult{}, err
 		}
 	}
 	request := WorkspaceVolumeCopyRequest{
-		ReservationID: reservation.ID, ServiceInstanceID: s.instanceID, OwnerID: principal.UserID,
+		ReservationID: reservation.ID, ServiceInstanceID: s.instanceID, SourceOwnerID: sourceOwnerID, TargetOwnerID: targetOwnerID,
 		SourceWorkspaceID: sourceWorkspaceID, TargetWorkspaceID: reservation.TargetWorkspaceID,
 		SourceRevision: reservation.SourceRevision, Files: files, EmptyDirectories: directories, Directories: directoryMetadata,
 	}
 	if wasReserved {
 		if err := s.preflight.ValidateWorkspaceVolumeCopySource(ctx, request, s.store); err != nil {
-			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, principal.UserID, reservation.ID); failErr != nil {
+			if failErr := s.store.FailWorkspaceCopyReservationBeforeSideEffects(ctx, targetOwnerID, reservation.ID); failErr != nil {
 				return WorkspaceCopyResult{}, errors.Join(fmt.Errorf("validate Workspace copy source before side effects: %w", err), failErr)
 			}
 			return WorkspaceCopyResult{}, fmt.Errorf("validate Workspace copy source before side effects: %w", err)
@@ -303,7 +381,7 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 		}
 		reservation.State = workspace.Copying
 	}
-	if err := s.volumes.EnsureWorkspaceVolume(ctx, WorkspaceNamedVolumeName(request.TargetWorkspaceID), s.instanceID, principal.UserID, request.TargetWorkspaceID); err != nil {
+	if err := s.volumes.EnsureWorkspaceVolume(ctx, WorkspaceNamedVolumeName(request.TargetWorkspaceID), s.instanceID, targetOwnerID, request.TargetWorkspaceID); err != nil {
 		return WorkspaceCopyResult{}, s.copyUnknown(ctx, reservation, fmt.Errorf("provision copied Workspace volume: %w", err))
 	}
 	copyFiles, copyDirectories, err := s.copier.CopyWorkspaceVolume(ctx, request, s.store)
@@ -321,13 +399,13 @@ func (s *WorkspaceCopyService) Copy(ctx context.Context, principal identity.Prin
 	if err != nil {
 		return WorkspaceCopyResult{}, s.copyUnknown(ctx, reservation, err)
 	}
-	if err := s.store.StageWorkspaceCopy(ctx, reservation.ID, principal.UserID, command.Name, files, directories, copyDirectories, allocations, s.workspaceQuotaBytes); err != nil {
+	if err := s.store.StageWorkspaceCopy(ctx, reservation.ID, targetOwnerID, command.Name, files, directories, copyDirectories, allocations, s.workspaceQuotaBytes); err != nil {
 		return WorkspaceCopyResult{}, s.copyUnknown(ctx, reservation, err)
 	}
-	if err := s.materialize(ctx, principal.UserID, reservation.TargetWorkspaceID, 1, files, directories, copyDirectories); err != nil {
+	if err := s.materialize(ctx, targetOwnerID, reservation.TargetWorkspaceID, 1, files, directories, copyDirectories); err != nil {
 		return WorkspaceCopyResult{}, s.copyUnknown(ctx, reservation, fmt.Errorf("materialize copied Workspace current tree: %w", err))
 	}
-	if err := s.store.CompleteWorkspaceCopy(ctx, reservation.ID, principal.UserID, s.maxOwnerBytes); err != nil {
+	if err := s.store.CompleteWorkspaceCopy(ctx, reservation.ID, targetOwnerID, s.maxOwnerBytes); err != nil {
 		return WorkspaceCopyResult{}, s.copyUnknown(ctx, reservation, err)
 	}
 	return WorkspaceCopyResult{

@@ -60,7 +60,7 @@ test('[mock] downloads the package selected in the published manifest', async ({
     await page.goto(`${portalUrl}/download`);
     await expect(page.getByText('版本 0.1.0')).toBeVisible();
     await expect(page.getByRole('heading', { name: 'macOS · Apple 芯片' })).toBeVisible();
-    await expect(page.getByText('用户 Web 与云端工作台', { exact: false })).toBeVisible();
+    await expect(page.getByText('用户 Web 与云端电脑', { exact: false })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Windows · 64 位' })).toHaveCount(0);
     const downloadPromise = page.waitForEvent('download');
     await page.getByRole('link', { name: '下载 macOS · Apple 芯片' }).click();

@@ -45,7 +45,7 @@ func (d *Docker) ValidateWorkspaceVolumeCopySource(ctx context.Context, request 
 	if d == nil || ctx == nil || reservation == nil ||
 		!workspaceCopyReservationID.MatchString(request.ReservationID) ||
 		strings.TrimSpace(request.ServiceInstanceID) == "" || len(request.ServiceInstanceID) > 128 ||
-		!domain.ValidUserID(request.OwnerID) || !domain.ValidWorkspaceID(request.SourceWorkspaceID) ||
+		!domain.ValidUserID(request.SourceOwnerID) || !domain.ValidUserID(request.TargetOwnerID) || !domain.ValidWorkspaceID(request.SourceWorkspaceID) ||
 		!domain.ValidWorkspaceID(request.TargetWorkspaceID) || request.SourceWorkspaceID == request.TargetWorkspaceID ||
 		request.SourceRevision < 0 || request.Files == nil || request.EmptyDirectories == nil || request.Directories == nil {
 		return errors.New("workspace volume copy request and reservation are required")
@@ -59,7 +59,7 @@ func (d *Docker) ValidateWorkspaceVolumeCopySource(ctx context.Context, request 
 	if err != nil {
 		return err
 	}
-	sourcePath, sourceInfo, err := d.workspaceCopyVolumePath(ctx, root, sourceName, request)
+	sourcePath, sourceInfo, err := d.workspaceCopyVolumePath(ctx, root, sourceName, request.SourceOwnerID, request)
 	if err != nil {
 		return fmt.Errorf("inspect source Workspace volume: %w", err)
 	}
@@ -100,7 +100,7 @@ func (d *Docker) CopyWorkspaceVolume(ctx context.Context, request WorkspaceVolum
 		return nil, nil, err
 	}
 	targetName := app.WorkspaceNamedVolumeName(request.TargetWorkspaceID)
-	targetPath, targetInfo, err := d.workspaceCopyVolumePath(ctx, root, targetName, request)
+	targetPath, targetInfo, err := d.workspaceCopyVolumePath(ctx, root, targetName, request.TargetOwnerID, request)
 	if err != nil {
 		return nil, nil, fmt.Errorf("inspect copied Workspace volume metadata: %w", err)
 	}
@@ -158,7 +158,7 @@ func (d *Docker) copyWorkspaceVolume(ctx context.Context, request WorkspaceVolum
 	if d == nil || ctx == nil || reservation == nil ||
 		!workspaceCopyReservationID.MatchString(request.ReservationID) ||
 		strings.TrimSpace(request.ServiceInstanceID) == "" || len(request.ServiceInstanceID) > 128 ||
-		!domain.ValidUserID(request.OwnerID) || !domain.ValidWorkspaceID(request.SourceWorkspaceID) ||
+		!domain.ValidUserID(request.SourceOwnerID) || !domain.ValidUserID(request.TargetOwnerID) || !domain.ValidWorkspaceID(request.SourceWorkspaceID) ||
 		!domain.ValidWorkspaceID(request.TargetWorkspaceID) || request.SourceWorkspaceID == request.TargetWorkspaceID ||
 		request.SourceRevision < 0 || request.Files == nil || request.EmptyDirectories == nil {
 		return errors.New("workspace volume copy request and reservation are required")
@@ -176,11 +176,11 @@ func (d *Docker) copyWorkspaceVolume(ctx context.Context, request WorkspaceVolum
 	if err != nil {
 		return err
 	}
-	sourcePath, sourceInfo, err := d.workspaceCopyVolumePath(ctx, root, sourceName, request)
+	sourcePath, sourceInfo, err := d.workspaceCopyVolumePath(ctx, root, sourceName, request.SourceOwnerID, request)
 	if err != nil {
 		return fmt.Errorf("inspect source Workspace volume: %w", err)
 	}
-	targetPath, targetInfo, err := d.workspaceCopyVolumePath(ctx, root, targetName, request)
+	targetPath, targetInfo, err := d.workspaceCopyVolumePath(ctx, root, targetName, request.TargetOwnerID, request)
 	if err != nil {
 		return fmt.Errorf("inspect destination Workspace volume: %w", err)
 	}
@@ -469,8 +469,11 @@ func (d *Docker) workspaceCopyDockerRoot(ctx context.Context) (string, error) {
 	return filepath.Clean(actualRoot), nil
 }
 
-func (d *Docker) workspaceCopyVolumePath(ctx context.Context, dockerRoot, name string, request WorkspaceVolumeCopyRequest) (string, os.FileInfo, error) {
-	if err := d.VerifyWorkspaceVolume(ctx, name, request.ServiceInstanceID, request.OwnerID, workspaceIDFromVolumeName(name)); err != nil {
+func (d *Docker) workspaceCopyVolumePath(ctx context.Context, dockerRoot, name, ownerID string, request WorkspaceVolumeCopyRequest) (string, os.FileInfo, error) {
+	if !domain.ValidUserID(ownerID) {
+		return "", nil, errors.New("workspace volume owner is invalid")
+	}
+	if err := d.VerifyWorkspaceVolume(ctx, name, request.ServiceInstanceID, ownerID, workspaceIDFromVolumeName(name)); err != nil {
 		return "", nil, err
 	}
 	var volume dockerWorkspaceCopyVolume
@@ -478,7 +481,7 @@ func (d *Docker) workspaceCopyVolumePath(ctx context.Context, dockerRoot, name s
 		return "", nil, err
 	}
 	workspaceID := workspaceIDFromVolumeName(name)
-	labels, err := workspaceVolumeLabels(name, request.ServiceInstanceID, request.OwnerID, workspaceID)
+	labels, err := workspaceVolumeLabels(name, request.ServiceInstanceID, ownerID, workspaceID)
 	if err != nil {
 		return "", nil, err
 	}
@@ -540,7 +543,7 @@ func (d *Docker) cleanWorkspaceCopyDestination(ctx context.Context, request Work
 	if err != nil {
 		return fmt.Errorf("resolve destination for Workspace copy cleanup: %w", err)
 	}
-	verifiedPath, currentInfo, err := d.workspaceCopyVolumePath(cleanupCtx, dockerRoot, name, request)
+	verifiedPath, currentInfo, err := d.workspaceCopyVolumePath(cleanupCtx, dockerRoot, name, request.TargetOwnerID, request)
 	if err != nil {
 		return fmt.Errorf("verify destination before Workspace copy cleanup: %w", err)
 	}

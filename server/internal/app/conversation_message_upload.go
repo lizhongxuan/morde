@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
@@ -46,6 +47,21 @@ type ConversationMessageUploadStore interface {
 	PutConversationMessageChunk(context.Context, ConversationMessageReceipt, int, []byte, []byte) error
 	GetConversationMessageUpload(context.Context, ConversationMessageReceipt) (ConversationMessageUpload, error)
 	CommitConversationMessageUpload(context.Context, ConversationMessageReceipt) (conversation.Message, error)
+}
+
+type ConversationMessageUploadCleanupStore interface {
+	CleanupExpiredConversationMessageUploads(context.Context, time.Time, int32) (int32, error)
+}
+
+func (s *TaskService) CleanupExpiredConversationMessageUploads(ctx context.Context, now time.Time, limit int32) (int32, error) {
+	if now.IsZero() || limit < 1 || limit > 1000 {
+		return 0, domain.InvalidArgument("limit", "conversation message upload cleanup request is invalid")
+	}
+	store, ok := s.store.(ConversationMessageUploadCleanupStore)
+	if !ok {
+		return 0, domain.NewError(domain.CodeUnsupported, "conversation message upload cleanup is unavailable")
+	}
+	return store.CleanupExpiredConversationMessageUploads(ctx, now.UTC(), limit)
 }
 
 func decodeConversationSHA256(value string) ([]byte, error) {

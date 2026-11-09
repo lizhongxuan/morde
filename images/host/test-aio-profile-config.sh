@@ -184,6 +184,35 @@ assert preferences["download"]["default_directory"] == sys.argv[2] + "/Downloads
 PY
 test "$(cat "$preserve_home/Downloads/keep.txt")" = keep-existing-download
 
+# AIO's startup chown leaves the Workspace mount user-owned; restore a sticky,
+# root-owned mount root before services start so gem cannot replace runtime state.
+secure_home="$test_root/secure-workspace-home"
+secure_gid="$(id -g)"
+mkdir -p "$secure_home/workspace"
+chmod 0770 "$secure_home/workspace"
+USER_GID="$secure_gid" MORDE_WORKSPACE_LAYOUT=workspace python3 "$script" secure-workspace-root --home "$secure_home"
+assert_owner_mode "$secure_home/workspace" "$test_uid" "$secure_gid" 3770
+
+# Workspace root validation fails closed on symlinks and world-writable mounts.
+unsafe_home="$test_root/unsafe-workspace-home"
+unsafe_target="$test_root/unsafe-workspace-target"
+mkdir -p "$unsafe_home" "$unsafe_target"
+chmod 0755 "$unsafe_target"
+ln -s "$unsafe_target" "$unsafe_home/workspace"
+if USER_GID="$test_gid" MORDE_WORKSPACE_LAYOUT=workspace python3 "$script" secure-workspace-root --home "$unsafe_home" >/dev/null 2>&1; then
+  echo 'expected a symlinked Workspace root to fail closed' >&2
+  exit 1
+fi
+assert_owner_mode "$unsafe_target" "$test_uid" "$test_gid" 755
+rm "$unsafe_home/workspace"
+mkdir "$unsafe_home/workspace"
+chmod 0777 "$unsafe_home/workspace"
+if USER_GID="$test_gid" MORDE_WORKSPACE_LAYOUT=workspace python3 "$script" secure-workspace-root --home "$unsafe_home" >/dev/null 2>&1; then
+  echo 'expected a world-writable Workspace root to fail closed' >&2
+  exit 1
+fi
+assert_owner_mode "$unsafe_home/workspace" "$test_uid" "$test_gid" 777
+
 # Legacy Host volumes retain the profile's existing defaults.
 legacy_home="$test_root/legacy-home"
 mkdir -p "$legacy_home/workspace" "$legacy_home/Downloads"
@@ -245,4 +274,4 @@ if run_config prepare >/dev/null 2>&1; then
 fi
 test "$(cat "$outside")" = leave-unchanged
 
-echo 'PASS: AIO profile overwrite recovery, stale Chromium locks, initial empty config, interrupted startup, deletion, Workspace separation, and fail-closed symlink checks'
+echo 'PASS: AIO profile recovery, protected Workspace root, stale Chromium locks, empty defaults, interrupted startup, deletion, and fail-closed path checks'

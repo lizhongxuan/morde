@@ -10,6 +10,19 @@ type ConnectorDraft = { name: string; endpointURL: string; credentialJSON: strin
 type OAuthSetup = { connector: Connector; developerURL: string; redirectURI: string; clientID: string; clientSecret: string };
 type OAuthFlow = { connector: Connector; popup: Window; redirectURI: string; credentialVersion: number };
 const blankDraft: ConnectorDraft = { name: '', endpointURL: '', credentialJSON: '' };
+const connectorPresets = {
+  custom: { name: '', endpointURL: '', kind: 'custom' },
+  github: { name: 'GitHub', endpointURL: 'https://api.githubcopilot.com/mcp/', kind: 'github' },
+  google_gmail: { name: 'Gmail', endpointURL: 'https://gmailmcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_calendar: { name: 'Google Calendar', endpointURL: 'https://calendarmcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_drive: { name: 'Google Drive', endpointURL: 'https://drivemcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_docs: { name: 'Google Docs', endpointURL: 'https://docsmcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_sheets: { name: 'Google Sheets', endpointURL: 'https://sheetsmcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_slides: { name: 'Google Slides', endpointURL: 'https://slidesmcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_chat: { name: 'Google Chat', endpointURL: 'https://chatmcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_people: { name: 'Google People', endpointURL: 'https://people.googleapis.com/mcp/v1', kind: 'google_workspace' },
+  google_classroom: { name: 'Google Classroom', endpointURL: 'https://classroommcp.googleapis.com/mcp/v1', kind: 'google_workspace' },
+} as const;
 
 function requireHTTPSURL(value: string, label: string): string {
   try {
@@ -34,6 +47,8 @@ export function MCPConnectorsPanel() {
   const connectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const [showCreate, setShowCreate] = useState(false);
   const [draft, setDraft] = useState<ConnectorDraft>(blankDraft);
+  const [presetID, setPresetID] = useState<keyof typeof connectorPresets>('custom');
+  const [githubToken, setGithubToken] = useState('');
   const [editing, setEditing] = useState<Connector | null>(null);
   const [editDraft, setEditDraft] = useState({ name: '', endpointURL: '' });
   const [rotating, setRotating] = useState<Connector | null>(null);
@@ -63,13 +78,19 @@ export function MCPConnectorsPanel() {
 
   const submitCreate = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const submittedGitHubToken = githubToken.trim();
+    setGithubToken('');
     try {
-      const credential = parseCredential(draft.credentialJSON);
+      const preset = connectorPresets[presetID];
+      const credential = preset.kind === 'github' && submittedGitHubToken
+        ? { kind: 'headers', headers: { Authorization: `Bearer ${submittedGitHubToken}` } }
+        : preset.kind === 'google_workspace' ? undefined : parseCredential(draft.credentialJSON);
       const body = { name: draft.name.trim(), endpoint_url: draft.endpointURL.trim(), ...(credential ? { credential } : {}) };
       setDraft((current) => ({ ...current, credentialJSON: '' }));
       setCreating(true);
       await portalApi.createMCPConnector(body);
       setDraft(blankDraft);
+      setPresetID('custom');
       setShowCreate(false);
       await refresh();
       notify('MCP 工具连接已保存。请启用后再用于新任务。', 'success');
@@ -203,11 +224,24 @@ export function MCPConnectorsPanel() {
     </div>
     {showCreate && <form className="connection-form form-card" onSubmit={submitCreate}>
       <div className="connection-form-grid">
+        <div className="connection-form-wide"><label htmlFor="mcp-connector-preset">连接模板</label><select id="mcp-connector-preset" value={presetID} onChange={(event) => {
+          const selected = event.target.value as keyof typeof connectorPresets;
+          setPresetID(selected);
+          setGithubToken('');
+          setDraft((current) => ({ ...current, name: connectorPresets[selected].name, endpointURL: connectorPresets[selected].endpointURL, credentialJSON: '' }));
+        }}><option value="custom">自定义 MCP 服务</option><option value="github">GitHub 官方 MCP Server</option>
+          <optgroup label="Google Workspace 官方 MCP">{Object.entries(connectorPresets).filter(([id]) => id.startsWith('google_'))
+            .map(([id, preset]) => <option key={id} value={id}>{preset.name}</option>)}</optgroup></select>
+          {presetID === 'github' && <small className="muted">使用 GitHub 官方远程 MCP 服务。账号或组织策略可能限制访问；也可保存连接后再使用 OAuth 授权。工具权限仍按每个任务的授权和确认规则执行。<a href="https://github.com/github/github-mcp-server" target="_blank" rel="noopener noreferrer">查看项目说明</a></small>}
+          {connectorPresets[presetID].kind === 'google_workspace' && <small className="muted">使用 Google 官方托管的 Workspace MCP 服务。先在 Google Cloud 启用对应产品 API 与 MCP API；保存后选择 OAuth 授权，并按提示配置 OAuth 客户端及 Morde 回调地址。授权范围由 Google 在登录时展示，工具仍受每个任务的 Morde 授权与确认规则约束。<a href="https://developers.google.com/workspace/guides/configure-mcp-servers" target="_blank" rel="noopener noreferrer">查看 Google 配置说明</a></small>}
+        </div>
         <div><label htmlFor="mcp-connector-name">连接名称</label><input id="mcp-connector-name" required maxLength={80} value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} placeholder="例如：日历" /></div>
-        <div><label htmlFor="mcp-connector-url">MCP 服务地址</label><input id="mcp-connector-url" type="url" pattern="https://.*" required value={draft.endpointURL} onChange={(event) => setDraft((current) => ({ ...current, endpointURL: event.target.value }))} placeholder="https://mcp.example.com/mcp" /></div>
-        <div className="connection-form-wide"><label htmlFor="mcp-connector-credential">认证凭据 JSON（可选）</label><textarea id="mcp-connector-credential" rows={3} maxLength={32768} autoComplete="off" spellCheck={false} value={draft.credentialJSON} onChange={(event) => setDraft((current) => ({ ...current, credentialJSON: event.target.value }))} placeholder={'{"kind":"headers","headers":{"Authorization":"Bearer …"}}'} /><small className="muted">仅接受服务端支持的请求头凭据格式。提交后立即清空并由 Morde 加密保存；不要粘贴共享账号的密钥。</small></div>
+        <div><label htmlFor="mcp-connector-url">MCP 服务地址</label><input id="mcp-connector-url" type="url" pattern="https://.*" required readOnly={presetID !== 'custom'} value={draft.endpointURL} onChange={(event) => setDraft((current) => ({ ...current, endpointURL: event.target.value }))} placeholder="https://mcp.example.com/mcp" /></div>
+        {presetID === 'github' ? <div className="connection-form-wide"><label htmlFor="mcp-github-token">GitHub Personal Access Token（可选）</label><input id="mcp-github-token" type="password" autoComplete="new-password" spellCheck={false} value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder="仅授予任务所需的最小权限" /><small className="muted">提交后立即清空，并由 Morde 加密保存为 Authorization Bearer 凭据；令牌只发送到上方 GitHub MCP 服务。也可以留空，保存后使用 OAuth。</small></div>
+          : connectorPresets[presetID].kind === 'google_workspace' ? <p className="connection-form-wide muted">此服务使用 Google OAuth。连接保存后，在连接卡片中启动授权；Morde 不要求你粘贴 Google 访问令牌。</p>
+            : <div className="connection-form-wide"><label htmlFor="mcp-connector-credential">认证凭据 JSON（可选）</label><textarea id="mcp-connector-credential" rows={3} maxLength={32768} autoComplete="off" spellCheck={false} value={draft.credentialJSON} onChange={(event) => setDraft((current) => ({ ...current, credentialJSON: event.target.value }))} placeholder={'{"kind":"headers","headers":{"Authorization":"Bearer …"}}'} /><small className="muted">仅接受服务端支持的请求头凭据格式。提交后立即清空并由 Morde 加密保存；不要粘贴共享账号的密钥。</small></div>}
       </div>
-      <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={() => { setShowCreate(false); setDraft(blankDraft); }}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
+      <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={() => { setShowCreate(false); setDraft(blankDraft); setPresetID('custom'); setGithubToken(''); }}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
     </form>}
     {connectors.isPending ? <div className="loading-card" role="status">正在读取工具连接…</div>
       : connectors.isError ? <div className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></div>

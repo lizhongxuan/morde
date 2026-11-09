@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,20 +129,29 @@ func TestConversationRouteWorkerClassifiesEveryFreeTextMessage(t *testing.T) {
 }
 
 func TestConversationRouteWorkerNeverStopsAnUnrelatedOrStaleTask(t *testing.T) {
-	worker, stub := newRouteWorkerTest(t)
-	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 3}}
-	stub.snapshot.Context.ReferenceTaskID = "q1234567"
-	for _, invalid := range []app.ConversationRouteDecision{
-		{Action: app.ConversationRouteStop, TaskID: "q2345678", ExpectedRevision: 3},
-		{Action: app.ConversationRouteUpdate, TaskID: "q1234567", ExpectedRevision: 2},
+	for _, test := range []struct {
+		name     string
+		decision app.ConversationRouteDecision
+	}{
+		{name: "unknown target", decision: app.ConversationRouteDecision{Action: app.ConversationRouteStop, TaskID: "q3456789", ExpectedRevision: 3}},
+		{name: "reference target drift", decision: app.ConversationRouteDecision{Action: app.ConversationRouteStop, TaskID: "q2345678", ExpectedRevision: 2}},
+		{name: "stale revision", decision: app.ConversationRouteDecision{Action: app.ConversationRouteUpdate, TaskID: "q1234567", ExpectedRevision: 2}},
 	} {
-		stub.decision = invalid
-		if _, err := worker.RunOnce(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		if got := stub.applied[len(stub.applied)-1]; got.Action != app.ConversationRouteClarify || got.TaskID != "" {
-			t.Fatalf("unsafe decision was applied: %+v", got)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{
+				{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 3},
+				{TaskID: "q2345678", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 2},
+			}
+			stub.snapshot.Context.ReferenceTaskID = "q1234567"
+			stub.decision = test.decision
+			if _, err := worker.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := stub.applied[len(stub.applied)-1]; got.Action != app.ConversationRouteClarify || got.TaskID != "" {
+				t.Fatalf("unsafe decision was applied: %+v", got)
+			}
+		})
 	}
 }
 
@@ -229,11 +239,21 @@ func TestConversationRouteWorkerRequeuesOnlySafelyRecoveredPredecessorRace(t *te
 }
 
 func TestConversationRouteWorkerRecordsModelFailureWithoutTaskAction(t *testing.T) {
-	worker, stub := newRouteWorkerTest(t)
-	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}
-	stub.classifyErr = errors.New("provider unavailable")
-	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" || len(stub.applied) != 0 {
-		t.Fatalf("model failure affected task routing: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
+	for _, scenario := range []struct {
+		name string
+		err  error
+	}{
+		{name: "provider unavailable", err: errors.New("provider unavailable")},
+		{name: "model budget exceeded", err: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}
+			stub.classifyErr = scenario.err
+			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" || len(stub.applied) != 0 {
+				t.Fatalf("model failure affected task routing: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
+			}
+		})
 	}
 }
 
@@ -274,5 +294,144 @@ func TestConversationRouteWorkerRoutesClaimedProjectAttachment(t *testing.T) {
 	if _, err := worker.RunOnce(context.Background()); err != nil || stub.deferred != 0 || len(stub.applied) != 1 ||
 		stub.applied[0].Action != app.ConversationRouteNew || stub.classifies != 0 {
 		t.Fatalf("committed project attachment was not routed: deferred=%d applied=%v err=%v", stub.deferred, stub.applied, err)
+	}
+}
+
+type concurrentRouteWorkerHarness struct {
+	mu              sync.Mutex
+	claims          []app.ConversationRouteClaim
+	snapshots       map[string]app.ConversationRouteSnapshot
+	classificationA chan struct{}
+	releaseA        chan struct{}
+	completed       chan string
+}
+
+func (h *concurrentRouteWorkerHarness) ClaimConversationRoute(context.Context, string, time.Duration) (app.ConversationRouteClaim, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.claims) == 0 {
+		return app.ConversationRouteClaim{}, false, nil
+	}
+	claim := h.claims[0]
+	h.claims = h.claims[1:]
+	return claim, true, nil
+}
+
+func (*concurrentRouteWorkerHarness) ReleaseConversationRoute(context.Context, app.ConversationRouteClaim) error {
+	return nil
+}
+
+func (h *concurrentRouteWorkerHarness) LoadConversationRouteSnapshot(_ context.Context, claim app.ConversationRouteClaim) (app.ConversationRouteSnapshot, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.snapshots[claim.Message.ID], nil
+}
+
+func (h *concurrentRouteWorkerHarness) ApplyConversationRoute(_ context.Context, claim app.ConversationRouteClaim, _ app.ConversationRouteSnapshot, _ app.ConversationRouteDecision) error {
+	h.completed <- claim.Message.ID
+	return nil
+}
+
+func (*concurrentRouteWorkerHarness) FailConversationRoute(context.Context, app.ConversationRouteClaim, string) error {
+	return nil
+}
+
+func (*concurrentRouteWorkerHarness) DeferConversationRoute(context.Context, app.ConversationRouteClaim, time.Duration) error {
+	return nil
+}
+
+func (*concurrentRouteWorkerHarness) ApplyNextConversationTaskRevision(context.Context) (bool, error) {
+	return false, nil
+}
+
+func (*concurrentRouteWorkerHarness) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
+	return "p1234567", nil
+}
+
+func (h *concurrentRouteWorkerHarness) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim, _ app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	switch claim.Message.ID {
+	case "m1234567":
+		close(h.classificationA)
+		select {
+		case <-ctx.Done():
+			return app.ConversationRouteDecision{}, ctx.Err()
+		case <-h.releaseA:
+			return app.ConversationRouteDecision{Action: app.ConversationRouteNew}, nil
+		}
+	case "m2345678":
+		select {
+		case <-ctx.Done():
+			return app.ConversationRouteDecision{}, ctx.Err()
+		case <-h.classificationA:
+			return app.ConversationRouteDecision{Action: app.ConversationRouteNew}, nil
+		}
+	default:
+		return app.ConversationRouteDecision{}, errors.New("unexpected route claim")
+	}
+}
+
+func TestConversationRouteWorkerRunsIndependentMessageWhileOtherClassificationIsBlocked(t *testing.T) {
+	newClaim := func(messageID string) app.ConversationRouteClaim {
+		return app.ConversationRouteClaim{
+			Message:        conversation.Message{ID: messageID, CreatedAt: time.Now()},
+			LeaseExpiresAt: time.Now().Add(time.Minute),
+		}
+	}
+	harness := &concurrentRouteWorkerHarness{
+		claims: []app.ConversationRouteClaim{
+			newClaim("m1234567"),
+			newClaim("m2345678"),
+		},
+		snapshots: map[string]app.ConversationRouteSnapshot{
+			"m1234567": {Context: app.ConversationRouteContext{ActorID: "u1234567", Content: "first independent request"}},
+			"m2345678": {Context: app.ConversationRouteContext{ActorID: "u1234567", Content: "second independent request"}},
+		},
+		classificationA: make(chan struct{}),
+		releaseA:        make(chan struct{}),
+		completed:       make(chan string, 2),
+	}
+	worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{
+		Queue: harness, Actions: harness, Models: harness, WorkerID: "route-parallel-test",
+		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 2, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- worker.Run(ctx) }()
+
+	select {
+	case <-harness.classificationA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first message did not enter the blocked classifier")
+	}
+	select {
+	case completedID := <-harness.completed:
+		if completedID != "m2345678" {
+			t.Fatalf("completed message while first classifier was blocked = %q, want second message", completedID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second independent message did not complete while first classification was blocked")
+	}
+
+	close(harness.releaseA)
+	select {
+	case completedID := <-harness.completed:
+		if completedID != "m1234567" {
+			t.Fatalf("completion after releasing first classifier = %q, want first message", completedID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first message did not complete after releasing its classifier")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("worker run ended with %v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after cancellation")
 	}
 }

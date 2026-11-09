@@ -170,11 +170,11 @@ type Task struct {
 	// Budget steps are excluded; completed counts include only succeeded steps.
 	StepCount          int64
 	CompletedStepCount int64
-	Result                      string
-	WaitingReason               string
-	CreatedAt                   time.Time
-	UpdatedAt                   time.Time
-	FinishedAt                  *time.Time
+	Result             string
+	WaitingReason      string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	FinishedAt         *time.Time
 }
 
 // ConversationContext is the authorized, bounded history snapshot loaded for

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
@@ -136,6 +137,20 @@ func TestCloudDSHScheduledTaskDoesNotRequirePersonalProof(t *testing.T) {
 	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) ||
 		len(models.calls) != 1 || base.pauseCalls != 0 {
 		t.Fatalf("schedule was blocked by personal proof: err=%v calls=%d pauses=%d", err, len(models.calls), base.pauseCalls)
+	}
+}
+
+func TestCloudDSHScheduledTaskWithPersonalContextRequiresProof(t *testing.T) {
+	executor, _, instances, _, models, value := cloudDSHFixture(t)
+	base := &cloudDSHMemoryTestTools{cloudDSHTestTools: &cloudDSHTestTools{}, instances: instances}
+	executor.options.Tools = &cloudDSHScheduleMemoryTestTools{cloudDSHMemoryTestTools: base}
+	value.Authorization.Kind = string(identity.KindScheduleTask)
+	value.ConversationContext = &task.ConversationContext{OwnerID: value.OwnerID, InitiatorID: value.OwnerID,
+		ConversationID: value.ConversationID, Scope: "personal", Digest: make([]byte, sha256.Size)}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, errCloudDSHPersonalMemoryChanged) ||
+		len(models.calls) != 0 || base.pauseCalls != 1 {
+		t.Fatalf("scheduled personal context without a verifiable proof was accepted: err=%v calls=%d pauses=%d",
+			err, len(models.calls), base.pauseCalls)
 	}
 }
 

@@ -1,0 +1,34 @@
+# API key is injected as OPENSANDBOX_SERVER_API_KEY by the dedicated Compose service.
+# No egress sidecar or networkPolicy is configured; the task bridge is fenced by
+# task-sandbox-network-policy.sh on the Linux host.
+# The loopback-only resolver below disables ordinary resolver lookups. It does
+# not prove that direct queries to Docker's embedded 127.0.0.11 resolver cannot
+# trigger host-side upstream DNS; do not enable this candidate until that path
+# and the systemd preload ordering are verified on the target Linux host.
+
+[server]
+host = "127.0.0.1"
+port = 18081
+eip = "127.0.0.1"
+
+[proxy]
+resolve_internal = false
+
+[runtime]
+type = "docker"
+execd_image = "docker.io/opensandbox/execd:release-1.1.1@sha256:cda2bc35409bbf57561599b316cafb899598f7dce671332e7ceda14eb1cfeded"
+
+[docker]
+network_mode = "morde-task-sandbox"
+publish_host = "127.0.0.1"
+port_range_min = 46000
+port_range_max = 46999
+pids_limit = 64
+no_new_privileges = true
+drop_capabilities = ["NET_RAW"]
+sandbox_binds = ["/etc/cloudhost/task-sandbox-resolv.conf:/etc/resolv.conf:ro"]
+sandbox_env = {}
+
+[secure_runtime]
+type = "gvisor"
+docker_runtime = "runsc"

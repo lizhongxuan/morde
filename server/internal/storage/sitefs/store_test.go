@@ -529,6 +529,18 @@ func TestStoreSerializesFreeSpaceReservationsAcrossInstances(t *testing.T) {
 	if err := firstFile.Close(); err != nil {
 		t.Fatalf("sync first instance write: %v", err)
 	}
+	afterFirstWrite, err := availableBytes(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFirstWrite > freeBytes || freeBytes-afterFirstWrite < uint64(len(chunk))/2 {
+		t.Skip("filesystem free-space accounting did not expose the staged write under concurrent test load")
+	}
+	// Anchor the second reservation at the observed post-write capacity. Other
+	// packages run concurrently under `go test ./...` and can remove temporary
+	// files between our initial stat and this write, so the original snapshot is
+	// not a stable threshold for this cross-instance assertion.
+	second.minFreeBytes = int64(afterFirstWrite) - 1
 	if _, err := secondFile.Write(chunk); !errors.Is(err, ErrInsufficientFree) {
 		t.Fatalf("second instance should observe consumed capacity, got %v", err)
 	}

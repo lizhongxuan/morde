@@ -27,7 +27,63 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/v1/account-runtimes/", s.handleAccountRuntime)
 	mux.HandleFunc("/v1/task-processes", s.handleTaskProcessArm)
 	mux.HandleFunc("/v1/task-processes/", s.handleTaskProcess)
+	mux.HandleFunc("/v1/task-sandboxes", s.handleTaskSandboxRegister)
+	mux.HandleFunc("/v1/task-sandboxes/register-discovered", s.handleTaskSandboxRegisterDiscovered)
+	mux.HandleFunc("/v1/task-sandboxes/stop", s.handleTaskSandboxStop)
 	return mux
+}
+
+func (s *Service) handleTaskSandboxRegisterDiscovered(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/task-sandboxes/register-discovered" || r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	var request TaskSandboxGuard
+	if err := readBody(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid Task Sandbox Guardian discovery request")
+		return
+	}
+	guard, err := s.RegisterDiscoveredTaskSandbox(r.Context(), request)
+	if err != nil {
+		writeError(w, http.StatusConflict, "guardian could not resolve and register Task Sandbox identity")
+		return
+	}
+	writeJSON(w, http.StatusOK, guard)
+}
+
+func (s *Service) handleTaskSandboxRegister(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/task-sandboxes" || r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	var guard TaskSandboxGuard
+	if err := readBody(r, &guard); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid Task Sandbox Guardian registration")
+		return
+	}
+	if err := s.RegisterTaskSandbox(r.Context(), guard); err != nil {
+		writeError(w, http.StatusConflict, "guardian could not register Task Sandbox identity")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) handleTaskSandboxStop(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/task-sandboxes/stop" || r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	var request TaskSandboxStopRequest
+	if err := readBody(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid Task Sandbox Guardian stop request")
+		return
+	}
+	attestation, err := s.StopTaskSandbox(r.Context(), request)
+	if err != nil {
+		writeError(w, http.StatusConflict, "guardian could not verify Task Sandbox destruction")
+		return
+	}
+	writeJSON(w, http.StatusOK, attestation)
 }
 
 func (s *Service) handleAccountRuntimeArm(w http.ResponseWriter, r *http.Request) {
@@ -418,6 +474,27 @@ func NewClient(socket string) (*Client, error) {
 		DisableCompression: true,
 	}
 	return &Client{http: &http.Client{Transport: transport, Timeout: 60 * time.Second}}, nil
+}
+
+func (c *Client) RegisterTaskSandbox(ctx context.Context, guard TaskSandboxGuard) error {
+	return c.do(ctx, http.MethodPost, "/v1/task-sandboxes", guard, nil, http.StatusNoContent)
+}
+
+func (c *Client) RegisterDiscoveredTaskSandbox(ctx context.Context, request TaskSandboxGuard) (TaskSandboxGuard, error) {
+	var result TaskSandboxGuard
+	if err := c.do(ctx, http.MethodPost, "/v1/task-sandboxes/register-discovered", request, &result, http.StatusOK); err != nil {
+		return TaskSandboxGuard{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) StopTaskSandbox(ctx context.Context, guard TaskSandboxGuard, nonce []byte) (app.TaskSandboxGuardianStopAttestation, error) {
+	request := TaskSandboxStopRequest{Guard: guard, Nonce: append([]byte(nil), nonce...)}
+	var result app.TaskSandboxGuardianStopAttestation
+	if err := c.do(ctx, http.MethodPost, "/v1/task-sandboxes/stop", request, &result, http.StatusOK); err != nil {
+		return app.TaskSandboxGuardianStopAttestation{}, err
+	}
+	return result, nil
 }
 
 func (c *Client) Arm(ctx context.Context, guard Guard) error {

@@ -24,7 +24,14 @@ import (
 const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
-observation_config_hash, baseline_fingerprint, created_at, updated_at`
+observation_config_hash, baseline_fingerprint, created_at, updated_at, execution_policy`
+
+func storedScheduleExecutionPolicy(value schedule.ExecutionPolicy) schedule.ExecutionPolicy {
+	if value == "" {
+		return schedule.ExecutionPolicyStandard
+	}
+	return value
+}
 
 type scheduleRowScanner interface {
 	Scan(...any) error
@@ -59,6 +66,7 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 		if !valid {
 			return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
 		}
+		value.ExecutionPolicy = storedScheduleExecutionPolicy(value.ExecutionPolicy)
 		value.ExecutionEpoch = gate.epoch
 		if err := schedule.Validate(value); err != nil {
 			return domain.InvalidArgument("schedule", err.Error())
@@ -78,14 +86,14 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes,
 auth_client_installation_id, misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
-observation_config_hash, baseline_fingerprint
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+observation_config_hash, baseline_fingerprint, execution_policy
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
 			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Title, value.Objective, timing,
 			value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens, value.Authorization.Kind,
 			value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 			notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey,
 			nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt), observation,
-			value.ObservationConfigHash, value.BaselineFingerprint)
+			value.ObservationConfigHash, value.BaselineFingerprint, string(value.ExecutionPolicy))
 		if err != nil {
 			return fmt.Errorf("create schedule: %w", err)
 		}
@@ -549,6 +557,12 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 			if value.HostID == "" {
 				scheduledScopes = identity.HostlessScheduleTaskExecutionScopes()
 			}
+			if value.ExecutionPolicy == schedule.ExecutionPolicyGoalFollowupReadOnly {
+				if value.HostID != "" {
+					return domain.NewError(domain.CodeInvalidState, "read-only Goal follow-up schedule cannot target a Host")
+				}
+				scheduledScopes = identity.GoalFollowupScheduleTaskExecutionScopes()
+			}
 			internalAuthorization := task.Authorization{Kind: string(identity.KindScheduleTask), TokenID: runID, Scopes: make([]string, 0, len(scheduledScopes)), Version: 1}
 			for _, scope := range scheduledScopes {
 				internalAuthorization.Scopes = append(internalAuthorization.Scopes, string(scope))
@@ -745,7 +759,7 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1`, id, ownerID))
 
 func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	var value schedule.Schedule
-	var status, authKind, policy string
+	var status, authKind, misfirePolicy, executionPolicy string
 	var authClientInstallationID pgtype.Text
 	var timingJSON, observationJSON []byte
 	var authScopes, notificationEvents []string
@@ -753,8 +767,8 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	var hostID pgtype.Text
 	err := row.Scan(&value.ID, &value.OwnerID, &value.Version, &status, &value.ExecutionEpoch, &hostID, &value.ModelID,
 		&value.Title, &value.Objective, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
-		&authKind, &value.Authorization.TokenID, &authScopes, &authClientInstallationID, &policy, &notificationEvents, &value.NextOccurrenceKey,
-		&nextRunAt, &nextCheckAt, &observationJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt)
+		&authKind, &value.Authorization.TokenID, &authScopes, &authClientInstallationID, &misfirePolicy, &notificationEvents, &value.NextOccurrenceKey,
+		&nextRunAt, &nextCheckAt, &observationJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt, &executionPolicy)
 	if err != nil {
 		return schedule.Schedule{}, err
 	}
@@ -770,7 +784,8 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	}
 	value.Status = schedule.Status(status)
 	value.HostID = hostID.String
-	value.MisfirePolicy = schedule.MisfirePolicy(policy)
+	value.MisfirePolicy = schedule.MisfirePolicy(misfirePolicy)
+	value.ExecutionPolicy = schedule.ExecutionPolicy(executionPolicy)
 	value.Authorization.Kind = authKind
 	value.Authorization.Scopes = append([]string(nil), authScopes...)
 	value.Authorization.ClientInstallationID = authClientInstallationID.String
@@ -845,12 +860,12 @@ func updateScheduleRow(ctx context.Context, tx pgx.Tx, ownerID string, value sch
 	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,title=$8,objective=$9,timing=$10,
 budget_active_seconds=$11,budget_tool_calls=$12,budget_model_tokens=$13,auth_kind=$14,auth_token_id=$15,auth_scopes=$16,
 auth_client_installation_id=$17,misfire_policy=$18,notification_events=$19,next_occurrence_key=$20,next_run_at=$21,next_check_at=$22,observation_spec=$23,
-observation_config_hash=$24,baseline_fingerprint=$25,updated_at=clock_timestamp()
+observation_config_hash=$24,baseline_fingerprint=$25,execution_policy=$26,updated_at=clock_timestamp()
 		WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID,
 		value.Title, value.Objective, timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
 		value.Authorization.Kind, value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 		notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey, nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt),
-		observation, value.ObservationConfigHash, value.BaselineFingerprint)
+		observation, value.ObservationConfigHash, value.BaselineFingerprint, string(storedScheduleExecutionPolicy(value.ExecutionPolicy)))
 	if err != nil {
 		return fmt.Errorf("update schedule: %w", err)
 	}
@@ -865,7 +880,7 @@ func personalScheduleContentBytesInTx(ctx context.Context, tx pgx.Tx, ownerID, s
 	err := tx.QueryRow(ctx, `SELECT octet_length(jsonb_build_object(
   'title',title,'objective',objective,'model',model_id,'host',host_id,'timing',timing,
   'budgets',jsonb_build_object('active_seconds',budget_active_seconds,'tool_calls',budget_tool_calls,'model_tokens',budget_model_tokens),
-  'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec
+  'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec,'execution_policy',execution_policy
 )::text) FROM schedules WHERE id=$1 AND owner_id=$2`, scheduleID, ownerID).Scan(&contentBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, domain.NewError(domain.CodeNotFound, "schedule not found")

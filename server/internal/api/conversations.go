@@ -81,26 +81,6 @@ type messagePageResponse struct {
 	NextCursor *string           `json:"next_cursor"`
 }
 
-type appendConversationTaskRequest struct {
-	ClientMessageID string             `json:"client_message_id"`
-	Mode            string             `json:"mode"`
-	HostID          string             `json:"host_id"`
-	WorkspaceID     string             `json:"workspace_id"`
-	InputRevision   *int64             `json:"input_revision"`
-	MCPConnectorIDs []string           `json:"mcp_connector_ids"`
-	ApplicationID   string             `json:"application_id"`
-	ModelID         string             `json:"model_id"`
-	Content         string             `json:"content"`
-	AttachmentIDs   []string           `json:"attachment_ids"`
-	Budget          *taskBudgetRequest `json:"budget"`
-}
-
-type appendConversationTaskResponse struct {
-	Message  messageResponse `json:"message"`
-	Task     taskResponse    `json:"task"`
-	Replayed bool            `json:"replayed"`
-}
-
 type conversationMessageRequest struct {
 	ClientMessageID         string             `json:"client_message_id"`
 	PreviousClientMessageID string             `json:"previous_client_message_id,omitempty"`
@@ -499,7 +479,7 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		var request appendConversationTaskRequest
+		var request conversationMessageRequest
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
@@ -511,12 +491,10 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		if request.Mode != "new" || request.ClientMessageID == "" || request.ClientMessageID != key || request.ModelID == "" || len(request.ModelID) > 256 || !validTaskText(request.Content, 32768) {
-			writeError(c, domain.InvalidArgument("message", "a new task requires a message id, model, and content"))
-			return
-		}
-		if (request.WorkspaceID == "") != (request.InputRevision == nil) {
-			writeError(c, domain.InvalidArgument("input_revision", "workspace and input revision must be provided together"))
+		if request.ClientMessageID == "" || request.ClientMessageID != key || !utf8.ValidString(request.Content) ||
+			strings.ContainsRune(request.Content, '\x00') || utf8.RuneCountInString(request.Content) > 32768 ||
+			(strings.TrimSpace(request.Content) == "" && len(request.ClientAttachmentIDs) == 0) {
+			writeError(c, domain.InvalidArgument("message", "message id and text or attachment are required"))
 			return
 		}
 		budget, ok := requestBudget(c, request.Budget)
@@ -524,33 +502,28 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 			return
 		}
 		c.Request = c.Request.WithContext(app.WithExpectedServiceInstance(c.Request.Context(), instanceID))
-		result, err := service.Submit(c.Request.Context(), principal, app.SubmitTaskCommand{
-			ClientMessageID: request.ClientMessageID, AttachmentIDs: request.AttachmentIDs,
-			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
-			MCPConnectorIDs: request.MCPConnectorIDs, ApplicationID: request.ApplicationID, ModelID: request.ModelID,
-			ConversationID: conversationID, Objective: request.Content, Budget: budget, IdempotencyKey: key,
+		message, replayed, err := service.AcceptConversationMessage(c.Request.Context(), principal, conversationID, app.AcceptConversationMessageCommand{
+			ServiceInstanceID: instanceID, ClientMessageID: request.ClientMessageID,
+			PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
+			HostID: request.HostID, WorkspaceID: request.WorkspaceID, MCPConnectorIDs: request.MCPConnectorIDs,
+			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
+			ModelID: request.ModelID, Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)
 			return
 		}
-		if result.Message.ConversationID != conversationID || result.Task.ConversationID != conversationID ||
-			result.Message.TaskID != result.Task.ID || result.Message.ClientMessageID != request.ClientMessageID ||
-			result.Task.ModelID != request.ModelID || result.Task.Objective != request.Content {
+		if message.ConversationID != conversationID || message.Role != conversation.RoleUser ||
+			message.ClientMessageID != request.ClientMessageID || message.Content != request.Content {
 			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
 			return
 		}
-		message, err := toMessageResponse(result.Message)
+		view, err := toMessageResponse(message)
 		if err != nil {
 			writeError(c, err)
 			return
 		}
-		taskView, err := toTaskResponse(app.TaskDetails{Task: result.Task})
-		if err != nil {
-			writeError(c, err)
-			return
-		}
-		c.JSON(http.StatusAccepted, appendConversationTaskResponse{Message: message, Task: taskView, Replayed: result.Replayed})
+		c.JSON(http.StatusAccepted, acceptedConversationMessageResponse{Message: view, Replayed: replayed})
 	}
 }
 

@@ -21,7 +21,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const personalAttachmentUploadLifetime = 24 * time.Hour
+const (
+	personalAttachmentUploadLifetime  = 24 * time.Hour
+	personalAttachmentOrphanRetention = 30 * 24 * time.Hour
+)
 
 type personalAttachmentUploadRow struct {
 	Upload       personal.AttachmentUpload
@@ -82,9 +85,13 @@ ON CONFLICT (service_instance_id,owner_id,idempotency_key) DO NOTHING`,
 		if err != nil {
 			return err
 		}
+		received, err := listPersonalAttachmentReceivedSequences(ctx, tx, instanceID, upload.OwnerID, row.Upload.UploadID, count)
+		if err != nil {
+			return err
+		}
 		receipt = personal.AttachmentUploadReceipt{
 			UploadID: row.Upload.UploadID, ReservationID: row.Reservation, State: row.State,
-			ChunkCount: count, Replay: tag.RowsAffected() == 0,
+			ChunkCount: count, ReceivedSequences: received, Replay: tag.RowsAffected() == 0,
 		}
 		return nil
 	})
@@ -137,13 +144,42 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3`, instanceID
 		if err != nil {
 			return err
 		}
-		receipt.UploadID, receipt.ReservationID, receipt.State, receipt.ChunkCount = uploadID, reservationID, personal.AttachmentUploadActive, count
+		received, err := listPersonalAttachmentReceivedSequences(ctx, tx, instanceID, principal.UserID, uploadID, count)
+		if err != nil {
+			return err
+		}
+		receipt.UploadID, receipt.ReservationID, receipt.State, receipt.ChunkCount, receipt.ReceivedSequences =
+			uploadID, reservationID, personal.AttachmentUploadActive, count, received
 		return nil
 	})
 	if err != nil {
 		return personal.AttachmentUploadReceipt{}, err
 	}
 	return receipt, nil
+}
+
+func listPersonalAttachmentReceivedSequences(ctx context.Context, tx pgx.Tx, instanceID, ownerID, uploadID string, chunkCount int32) ([]int32, error) {
+	rows, err := tx.Query(ctx, `SELECT sequence FROM personal_attachment_chunks
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3 ORDER BY sequence`, instanceID, ownerID, uploadID)
+	if err != nil {
+		return nil, fmt.Errorf("list personal attachment upload chunks: %w", err)
+	}
+	defer rows.Close()
+	sequences := make([]int32, 0)
+	for rows.Next() {
+		var sequence int32
+		if err := rows.Scan(&sequence); err != nil {
+			return nil, fmt.Errorf("read personal attachment upload chunk: %w", err)
+		}
+		if sequence < 0 || sequence >= chunkCount {
+			return nil, domain.NewError(domain.CodeInternal, "personal attachment upload chunks are invalid")
+		}
+		sequences = append(sequences, sequence)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate personal attachment upload chunks: %w", err)
+	}
+	return sequences, nil
 }
 
 func (s *Store) PutPersonalAttachmentChunk(ctx context.Context, principal identity.Principal, chunk personal.AttachmentChunk, body io.Reader) (personal.AttachmentChunkReceipt, error) {
@@ -360,47 +396,55 @@ func (s *Store) OpenPersonalAttachment(ctx context.Context, principal identity.P
 	if (principal.Kind != identity.KindSession && principal.Kind != identity.KindClient) || !personal.ValidPersonalAttachmentID(attachmentID) {
 		return nil, personal.AttachmentMetadata{}, domain.NewError(domain.CodeNotFound, "personal attachment not found")
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, personal.AttachmentMetadata{}, fmt.Errorf("begin personal attachment read: %w", err)
+	}
+	keepTx := false
+	defer func() {
+		if !keepTx {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = tx.Rollback(rollbackCtx)
+		}
+	}()
 	var uploadID string
 	var instanceID string
 	var metadata personal.AttachmentMetadata
-	err := s.WithTx(ctx, func(tx pgx.Tx) error {
-		if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
-			return err
-		}
-		currentInstanceID, err := personalServiceInstanceIDInTx(ctx, tx)
-		if err != nil {
-			return err
-		}
-		instanceID = currentInstanceID
-		err = tx.QueryRow(ctx, `SELECT upload_id,object_type,object_id,media_type,size_bytes,sha256
-FROM personal_attachment_uploads
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND attachment_id=$3 AND state='committed'`,
-			instanceID, principal.UserID, attachmentID).Scan(&uploadID, &metadata.ObjectType, &metadata.ObjectID, &metadata.MediaType, &metadata.SizeBytes, &metadata.SHA256)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.NewError(domain.CodeNotFound, "personal attachment not found")
-		}
-		if err != nil {
-			return fmt.Errorf("load personal attachment: %w", err)
-		}
-		metadata.AttachmentID = attachmentID
-		readable, err := lockPersonalAttachmentReference(ctx, tx, instanceID, principal.UserID, attachmentID)
-		if err != nil {
-			return err
-		}
-		if !readable {
-			return domain.NewError(domain.CodeNotFound, "personal attachment not found")
-		}
-		return nil
-	})
+	if err := authorizePersonalMutationInTx(ctx, tx, principal); err != nil {
+		return nil, personal.AttachmentMetadata{}, err
+	}
+	currentInstanceID, err := personalServiceInstanceIDInTx(ctx, tx)
 	if err != nil {
 		return nil, personal.AttachmentMetadata{}, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT sequence,size_bytes,sha256,body FROM personal_attachment_chunks
+	instanceID = currentInstanceID
+	err = tx.QueryRow(ctx, `SELECT upload_id,object_type,object_id,media_type,size_bytes,sha256
+FROM personal_attachment_uploads
+		WHERE service_instance_id=$1::uuid AND owner_id=$2 AND attachment_id=$3 AND state='committed'
+		  AND content_deleted_at IS NULL FOR SHARE`,
+		instanceID, principal.UserID, attachmentID).Scan(&uploadID, &metadata.ObjectType, &metadata.ObjectID, &metadata.MediaType, &metadata.SizeBytes, &metadata.SHA256)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, personal.AttachmentMetadata{}, domain.NewError(domain.CodeNotFound, "personal attachment not found")
+	}
+	if err != nil {
+		return nil, personal.AttachmentMetadata{}, fmt.Errorf("load personal attachment: %w", err)
+	}
+	metadata.AttachmentID = attachmentID
+	readable, err := lockPersonalAttachmentReference(ctx, tx, instanceID, principal.UserID, attachmentID)
+	if err != nil {
+		return nil, personal.AttachmentMetadata{}, err
+	}
+	if !readable {
+		return nil, personal.AttachmentMetadata{}, domain.NewError(domain.CodeNotFound, "personal attachment not found")
+	}
+	rows, err := tx.Query(ctx, `SELECT sequence,size_bytes,sha256,body FROM personal_attachment_chunks
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3 ORDER BY sequence`, instanceID, principal.UserID, uploadID)
 	if err != nil {
 		return nil, personal.AttachmentMetadata{}, fmt.Errorf("open personal attachment chunks: %w", err)
 	}
-	return &personalAttachmentReader{rows: rows, metadata: metadata}, metadata, nil
+	keepTx = true
+	return &personalAttachmentReader{rows: rows, tx: tx, metadata: metadata}, metadata, nil
 }
 
 func (s *Store) CleanupExpiredPersonalAttachmentUploads(ctx context.Context, now time.Time, limit int32) ([]personal.AttachmentReservation, error) {
@@ -461,6 +505,67 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3`, instanceID
 				reservations = append(reservations, personal.AttachmentReservation{
 					OwnerID: item.ownerID, UploadID: item.uploadID, ReservationID: item.reservationID, SizeBytes: item.sizeBytes,
 				})
+			}
+		}
+		orphanRows, err := tx.Query(ctx, `SELECT owner_id,upload_id,attachment_id,(orphaned_at IS NOT NULL)
+FROM personal_attachment_uploads u
+WHERE service_instance_id=$1::uuid AND state='committed' AND content_deleted_at IS NULL
+  AND (orphaned_at IS NULL OR orphaned_at <= $2::timestamptz - $3::interval)
+  AND NOT EXISTS (SELECT 1 FROM personal_objects p WHERE p.service_instance_id=u.service_instance_id AND p.owner_id=u.owner_id
+    AND p.object_type='library_item' AND p.body IS NOT NULL AND p.body->>'attachment_id'=u.attachment_id)
+  AND NOT EXISTS (SELECT 1 FROM conversation_message_attachments r WHERE r.service_instance_id=u.service_instance_id
+    AND r.owner_id=u.owner_id AND r.attachment_id=u.attachment_id)
+ORDER BY COALESCE(orphaned_at,updated_at),upload_id LIMIT $4 FOR UPDATE SKIP LOCKED`,
+			instanceID, now.UTC(), personalAttachmentOrphanRetention.String(), limit)
+		if err != nil {
+			return fmt.Errorf("select orphaned committed personal attachment content: %w", err)
+		}
+		type orphanCandidate struct {
+			ownerID, uploadID, attachmentID string
+			orphanedAtSet                   bool
+		}
+		orphans := make([]orphanCandidate, 0, limit)
+		for orphanRows.Next() {
+			var item orphanCandidate
+			if err := orphanRows.Scan(&item.ownerID, &item.uploadID, &item.attachmentID, &item.orphanedAtSet); err != nil {
+				orphanRows.Close()
+				return fmt.Errorf("scan orphaned committed personal attachment content: %w", err)
+			}
+			orphans = append(orphans, item)
+		}
+		orphanErr := orphanRows.Err()
+		orphanRows.Close()
+		if orphanErr != nil {
+			return fmt.Errorf("read orphaned committed personal attachment content: %w", orphanErr)
+		}
+		for _, item := range orphans {
+			referenced, err := personalAttachmentReferenced(ctx, tx, instanceID, item.ownerID, item.attachmentID)
+			if err != nil {
+				return err
+			}
+			if referenced {
+				if _, err := tx.Exec(ctx, `UPDATE personal_attachment_uploads SET orphaned_at=NULL,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3`, instanceID, item.ownerID, item.uploadID); err != nil {
+					return fmt.Errorf("clear restored personal attachment orphan marker: %w", err)
+				}
+				continue
+			}
+			if !item.orphanedAtSet {
+				if _, err := tx.Exec(ctx, `UPDATE personal_attachment_uploads SET orphaned_at=$4,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3 AND content_deleted_at IS NULL`,
+					instanceID, item.ownerID, item.uploadID, now.UTC()); err != nil {
+					return fmt.Errorf("mark personal attachment content orphaned: %w", err)
+				}
+				continue
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM personal_attachment_chunks
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3`, instanceID, item.ownerID, item.uploadID); err != nil {
+				return fmt.Errorf("delete orphaned personal attachment chunks: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE personal_attachment_uploads SET content_deleted_at=$4,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3 AND state='committed' AND content_deleted_at IS NULL`,
+				instanceID, item.ownerID, item.uploadID, now.UTC()); err != nil {
+				return fmt.Errorf("mark personal attachment content deleted: %w", err)
 			}
 		}
 		return nil
@@ -679,6 +784,7 @@ func digestAttachmentBytes(body []byte) string {
 
 type personalAttachmentReader struct {
 	rows     pgx.Rows
+	tx       pgx.Tx
 	metadata personal.AttachmentMetadata
 	chunk    []byte
 	offset   int
@@ -715,7 +821,10 @@ func (r *personalAttachmentReader) Read(output []byte) (int, error) {
 			if err != nil || r.sequence != count || r.total != r.metadata.SizeBytes || hex.EncodeToString(r.digest.Sum(nil)) != r.metadata.SHA256 {
 				return 0, r.fail(domain.NewError(domain.CodeInvalidState, "personal attachment stream is incomplete or corrupted"))
 			}
-			_ = r.Close()
+			if err := r.finish(true); err != nil {
+				r.err = fmt.Errorf("finish personal attachment stream: %w", err)
+				return 0, r.err
+			}
 			return 0, io.EOF
 		}
 		var sequence int32
@@ -744,6 +853,10 @@ func (r *personalAttachmentReader) fail(err error) error {
 }
 
 func (r *personalAttachmentReader) Close() error {
+	return r.finish(false)
+}
+
+func (r *personalAttachmentReader) finish(commit bool) error {
 	r.closeMu.Lock()
 	if r.closed {
 		r.closeMu.Unlock()
@@ -752,6 +865,17 @@ func (r *personalAttachmentReader) Close() error {
 	r.closed = true
 	r.closeMu.Unlock()
 	r.rows.Close()
+	if r.tx == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if commit {
+		return r.tx.Commit(ctx)
+	}
+	if err := r.tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		return err
+	}
 	return nil
 }
 

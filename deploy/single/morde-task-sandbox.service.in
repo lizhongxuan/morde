@@ -1,0 +1,31 @@
+# Managed by deploy/single/install-task-sandbox-service.sh
+[Unit]
+Description=Morde opt-in Task OpenSandbox control plane
+Requires=docker.service morde-network-policy.service
+After=network-online.target docker.service morde-network-policy.service
+PartOf=docker.service morde-network-policy.service nftables.service
+Wants=network-online.target
+ConditionPathIsExecutable=/opt/cloudhost/task-sandbox-network-policy.sh
+ConditionPathIsRegularFile=/etc/cloudhost/cloudhost.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@REPO_ROOT@
+ExecStartPre=/opt/cloudhost/task-sandbox-network-policy.sh prepare-network
+ExecStart=@DOCKER_BIN@ compose --project-name cloudhost --env-file /etc/cloudhost/cloudhost.env -f @REPO_ROOT@/deploy/single/docker-compose.yml --profile task-sandbox up --detach --no-deps opensandbox-task-server
+ExecStartPost=/opt/cloudhost/task-sandbox-network-policy.sh apply
+ExecStop=@DOCKER_BIN@ compose --project-name cloudhost --env-file /etc/cloudhost/cloudhost.env -f @REPO_ROOT@/deploy/single/docker-compose.yml --profile task-sandbox rm --force --stop opensandbox-task-server
+TimeoutStartSec=90s
+TimeoutStopSec=45s
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/etc/cloudhost/task-sandbox-network-policy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Intentionally no [Install] section: the candidate profile is not enabled or
+# started by the standard Portal installer. Linux packet-path validation and
+# Task Guardian lifecycle integration remain prerequisites for activation.

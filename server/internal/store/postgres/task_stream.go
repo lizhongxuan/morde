@@ -252,7 +252,7 @@ func requireCloudDSHStreamPersonalProof(ctx context.Context, tx pgx.Tx, instance
 		return invalid()
 	}
 	// Personal mutations take this counter before touching an object, so both
-	// present and absent consent/objects remain stable until this commit.
+	// a saved preference and the default-on missing preference stay stable until this commit.
 	if _, err := lockAccountChangeCounter(ctx, tx, instanceID, ownerID); err != nil {
 		return err
 	}
@@ -265,7 +265,7 @@ LEFT JOIN personal_objects p ON p.service_instance_id=v.service_instance_id AND 
 WHERE v.service_instance_id=$1::uuid AND v.owner_id=$2 AND v.object_type=$3 AND v.object_id='builtin_memory'`,
 		instanceID, ownerID, personal.ObjectTypeSkillSetting).Scan(&settingRevision, &deleted, &body)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && deleted {
-		if proof.Enabled || proof.SettingRevision != 0 {
+		if !proof.Enabled || proof.SettingRevision != 0 {
 			return invalid()
 		}
 	} else if err != nil {

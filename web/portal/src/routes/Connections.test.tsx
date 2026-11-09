@@ -69,6 +69,57 @@ describe('Connections', () => {
     expect(await screen.findByText('已启用')).toBeInTheDocument();
   });
 
+  it('adds the official GitHub MCP preset and clears the token after saving', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [], configuration_status: 'not_configured' });
+    vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
+    const create = vi.spyOn(portalApi, 'createMCPConnector').mockImplementation(async (body) => ({
+      ...mcpConnector, name: body.name, endpoint_url: body.endpoint_url, has_credential: Boolean(body.credential), credential_version: body.credential ? 1 : 0,
+    }));
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '＋ 添加工具连接' }));
+    await user.selectOptions(screen.getByLabelText('连接模板'), 'github');
+    expect(screen.getByLabelText('连接名称')).toHaveValue('GitHub');
+    expect(screen.getByLabelText('MCP 服务地址')).toHaveValue('https://api.githubcopilot.com/mcp/');
+    expect(screen.getByLabelText('MCP 服务地址')).toHaveAttribute('readonly');
+    const token = 'ghp-local-synthetic-token';
+    fireEvent.change(screen.getByLabelText('GitHub Personal Access Token（可选）'), { target: { value: token } });
+    await user.click(screen.getByRole('button', { name: '保存连接' }));
+
+    await waitFor(() => expect(create).toHaveBeenCalledWith({
+      name: 'GitHub', endpoint_url: 'https://api.githubcopilot.com/mcp/',
+      credential: { kind: 'headers', headers: { Authorization: `Bearer ${token}` } },
+    }));
+    expect(screen.queryByDisplayValue(token)).not.toBeInTheDocument();
+    expect(screen.queryByText(token)).not.toBeInTheDocument();
+  });
+
+  it('creates official Google Workspace MCP presets without asking the user to paste an access token', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [], configuration_status: 'not_configured' });
+    vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
+    const create = vi.spyOn(portalApi, 'createMCPConnector').mockResolvedValue({
+      ...mcpConnector, name: 'Gmail', endpoint_url: 'https://gmailmcp.googleapis.com/mcp/v1',
+    });
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: '＋ 添加工具连接' }));
+    await user.selectOptions(screen.getByLabelText('连接模板'), 'google_gmail');
+    expect(screen.getByLabelText('连接名称')).toHaveValue('Gmail');
+    expect(screen.getByLabelText('MCP 服务地址')).toHaveValue('https://gmailmcp.googleapis.com/mcp/v1');
+    expect(screen.getByLabelText('MCP 服务地址')).toHaveAttribute('readonly');
+    expect(screen.getByRole('link', { name: '查看 Google 配置说明' })).toHaveAttribute(
+      'href', 'https://developers.google.com/workspace/guides/configure-mcp-servers');
+    expect(screen.queryByLabelText(/认证凭据 JSON/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Morde 不要求你粘贴 Google 访问令牌/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '保存连接' }));
+
+    await waitFor(() => expect(create).toHaveBeenCalledWith({
+      name: 'Gmail', endpoint_url: 'https://gmailmcp.googleapis.com/mcp/v1',
+    }));
+  });
+
   it('opens OAuth separately and refreshes the connector after the provider callback completes', async () => {
     const user = userEvent.setup();
     let rows = [mcpConnector];

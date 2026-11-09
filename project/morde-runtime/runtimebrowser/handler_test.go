@@ -1,6 +1,7 @@
 package runtimebrowser
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -21,8 +25,8 @@ import (
 func TestBrowserHandlersAreOwnedAndIsolated(t *testing.T) {
 	controller, state := newTestController(t)
 	defer controller.Close()
-	if got := len(controller.Handlers()); got != 8 {
-		t.Fatalf("handler count = %d, want 8", got)
+	if got := len(controller.Handlers()); got != 9 {
+		t.Fatalf("handler count = %d, want 9", got)
 	}
 
 	_, err := executeBrowser(t, controller, "q0000001", "o0000001", "snapshot", `{"target_id":"user-tab-1"}`)
@@ -56,6 +60,56 @@ func TestBrowserHandlersAreOwnedAndIsolated(t *testing.T) {
 	assertTargetPresent(t, state, "user-tab-1", "")
 	assertTaskTargetPresent(t, controller, state, "q0000001", tabA.TargetID)
 	assertTaskTargetPresent(t, controller, state, "q0000002", tabB.TargetID)
+}
+
+func TestBrowserHandoffActivatesOnlyTheOwnedTaskTab(t *testing.T) {
+	controller, state := newTestController(t)
+	defer controller.Close()
+
+	open := func(taskID, operationID, pageURL string) string {
+		t.Helper()
+		result, err := executeBrowser(t, controller, taskID, operationID, "open_tab", `{"url":"`+pageURL+`"}`)
+		if err != nil {
+			t.Fatalf("open tab for %s: %v", taskID, err)
+		}
+		var value struct {
+			TargetID string `json:"target_id"`
+		}
+		if err := json.Unmarshal(result, &value); err != nil || value.TargetID == "" {
+			t.Fatalf("open tab result = %s, %v", result, err)
+		}
+		return value.TargetID
+	}
+	targetA := open("q0000001", "o0000101", "https://example.test/a")
+	targetB := open("q0000002", "o0000102", "https://example.test/b")
+
+	result, err := executeBrowser(t, controller, "q0000001", "o0000103", "handoff", `{"target_id":"`+targetA+`"}`)
+	if err != nil {
+		t.Fatalf("activate Task A page for user takeover: %v", err)
+	}
+	var activated struct {
+		TargetID string `json:"target_id"`
+		Active   bool   `json:"active"`
+	}
+	if err := json.Unmarshal(result, &activated); err != nil || activated.TargetID != targetA || !activated.Active {
+		t.Fatalf("handoff result = %#v, %s, %v", activated, result, err)
+	}
+
+	state.mu.Lock()
+	activeTarget := state.activeTarget
+	state.mu.Unlock()
+	if activeTarget != targetA {
+		t.Fatalf("active browser target = %q, want Task A target %q", activeTarget, targetA)
+	}
+	if _, err := executeBrowser(t, controller, "q0000002", "o0000104", "handoff", `{"target_id":"`+targetA+`"}`); err != runtimecore.ErrFenceRejected {
+		t.Fatalf("cross-Task browser handoff error = %v, want fence rejection", err)
+	}
+	state.mu.Lock()
+	activeTarget = state.activeTarget
+	state.mu.Unlock()
+	if activeTarget != targetA || targetB == targetA {
+		t.Fatalf("cross-Task handoff changed the active page: active=%q TaskA=%q TaskB=%q", activeTarget, targetA, targetB)
+	}
 }
 
 func TestCancelledOpenTabStopsOnlyItsTaskAndPreservesUserTab(t *testing.T) {
@@ -201,7 +255,7 @@ func TestRestartReconcilesOwnedContextButLeavesOperationUncertain(t *testing.T) 
 }
 
 func TestScreenshotIsBoundedJPEGAndReturnsContractShape(t *testing.T) {
-	controller, _ := newTestController(t)
+	controller, state := newTestController(t)
 	defer controller.Close()
 	result, err := executeBrowser(t, controller, "q0000001", "o0000040", "open_tab", `{"url":"https://example.test/a"}`)
 	if err != nil {
@@ -213,6 +267,13 @@ func TestScreenshotIsBoundedJPEGAndReturnsContractShape(t *testing.T) {
 	if err := json.Unmarshal(result, &tab); err != nil {
 		t.Fatal(err)
 	}
+	largeScreenshot := encodeTestJPEG(t, 1920, 1080, 95, true)
+	if len(largeScreenshot) <= maxScreenshotBytes {
+		t.Fatalf("test screenshot is only %d bytes; want input larger than %d", len(largeScreenshot), maxScreenshotBytes)
+	}
+	state.mu.Lock()
+	state.screenshotData = largeScreenshot
+	state.mu.Unlock()
 	result, err = executeBrowser(t, controller, "q0000001", "o0000041", "screenshot", `{"target_id":"`+tab.TargetID+`"}`)
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +289,24 @@ func TestScreenshotIsBoundedJPEGAndReturnsContractShape(t *testing.T) {
 	decoded, err := base64.StdEncoding.DecodeString(screenshotResult.DataBase64)
 	if err != nil || screenshotResult.TargetID != tab.TargetID || screenshotResult.MIMEType != "image/jpeg" || len(decoded) > maxScreenshotBytes {
 		t.Fatalf("unexpected screenshot result: %+v decodedBytes=%d err=%v", screenshotResult, len(decoded), err)
+	}
+	config, err := jpeg.DecodeConfig(bytes.NewReader(decoded))
+	if err != nil || config.Width > maxBrowserScreenshotWidth || config.Height > maxBrowserScreenshotHeight {
+		t.Fatalf("screenshot dimensions = %dx%d, err=%v; want at most %dx%d", config.Width, config.Height, err, maxBrowserScreenshotWidth, maxBrowserScreenshotHeight)
+	}
+}
+
+func TestNormalizeBrowserScreenshotRejectsOversizedInput(t *testing.T) {
+	if _, err := normalizeBrowserScreenshot(make([]byte, maxBrowserScreenshotInputBytes+1)); err != runtimecore.ErrResultTooLarge {
+		t.Fatalf("oversized screenshot error = %v, want %v", err, runtimecore.ErrResultTooLarge)
+	}
+}
+
+func TestBrowserScreenshotInputLimitFitsCDPMessage(t *testing.T) {
+	encodedBytes := base64.StdEncoding.EncodedLen(maxBrowserScreenshotInputBytes)
+	if encodedBytes+maxBrowserScreenshotMessageReserveBytes > maxCDPMessageBytes {
+		t.Fatalf("screenshot base64 (%d) plus protocol reserve (%d) exceeds CDP message limit (%d)",
+			encodedBytes, maxBrowserScreenshotMessageReserveBytes, maxCDPMessageBytes)
 	}
 }
 
@@ -310,6 +389,7 @@ func newTestControllerWithStore(t *testing.T) (*Controller, *fakeBrowserState, s
 		contexts: make(map[string]uint64), targets: map[string]targetInfo{
 			"user-tab-1": {TargetID: "user-tab-1", Type: "page", URL: "https://user.example", Title: "User tab"},
 		}, available: true, observeCount: 1, observeOrigin: "https://example.test",
+		screenshotData: encodeTestJPEG(t, 16, 16, 70, false),
 	}
 	controller, err := NewHandlers(Options{StoreDir: storeDir, ExpectedOwnerUID: uint32(os.Geteuid()), connector: &fakeConnector{state: state}})
 	if err != nil {
@@ -317,6 +397,25 @@ func newTestControllerWithStore(t *testing.T) (*Controller, *fakeBrowserState, s
 	}
 	t.Cleanup(func() { _ = controller.Close() })
 	return controller, state, storeDir
+}
+
+func encodeTestJPEG(t *testing.T, width, height, quality int, noise bool) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	if noise {
+		random := rand.New(rand.NewSource(1))
+		for index := 0; index < len(img.Pix); index += 4 {
+			img.Pix[index] = byte(random.Intn(256))
+			img.Pix[index+1] = byte(random.Intn(256))
+			img.Pix[index+2] = byte(random.Intn(256))
+			img.Pix[index+3] = 0xff
+		}
+	}
+	buffer := &bytes.Buffer{}
+	if err := jpeg.Encode(buffer, img, &jpeg.Options{Quality: quality}); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
 }
 
 func executeBrowser(t *testing.T, controller *Controller, taskID, operationID, action, args string) (json.RawMessage, error) {
@@ -386,6 +485,8 @@ type fakeBrowserState struct {
 	observeValue          string
 	observeCount          int
 	observeOrigin         string
+	screenshotData        []byte
+	activeTarget          string
 }
 
 func (s *fakeBrowserState) setUnavailable(value bool) {
@@ -503,6 +604,19 @@ func (c *fakeBrowserConnection) CreateTarget(ctx context.Context, contextID, raw
 	return id, nil
 }
 
+func (c *fakeBrowserConnection) ActivateTarget(ctx context.Context, targetID string) error {
+	if err := c.check(ctx); err != nil {
+		return err
+	}
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	if _, ok := c.state.targets[targetID]; !ok {
+		return errors.New("fake target is absent")
+	}
+	c.state.activeTarget = targetID
+	return nil
+}
+
 func (c *fakeBrowserConnection) AttachTarget(ctx context.Context, targetID string) (targetConnection, error) {
 	if err := c.check(ctx); err != nil {
 		return nil, err
@@ -601,9 +715,9 @@ func (t *fakeTargetConnection) Call(ctx context.Context, method string, params a
 		t.connection.state.mu.Unlock()
 		return assignFakeResult(result, map[string]any{"result": map[string]any{"value": value}})
 	case "Page.captureScreenshot":
+		jpegData := append([]byte(nil), t.connection.state.screenshotData...)
 		t.connection.state.mu.Unlock()
-		jpeg := []byte{0xff, 0xd8, 0xff, 0xd9}
-		return assignFakeResult(result, map[string]any{"data": base64.StdEncoding.EncodeToString(jpeg)})
+		return assignFakeResult(result, map[string]any{"data": base64.StdEncoding.EncodeToString(jpegData)})
 	default:
 		t.connection.state.mu.Unlock()
 		return errors.New("unsupported fake target method: " + method)

@@ -118,7 +118,7 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		HostID:         command.HostID, ModelID: command.ModelID, Title: title, Objective: command.Objective,
 		Timing: command.Timing, Budget: command.Budget, Authorization: scheduleAuthorization(principal),
 		MisfirePolicy: command.MisfirePolicy, NotificationEvents: command.NotificationEvents,
-		Observation: command.Observation, NextOccurrenceKey: first.Key, NextRunAt: first.ScheduledAt,
+		Observation: command.Observation, ExecutionPolicy: command.executionPolicy, NextOccurrenceKey: first.Key, NextRunAt: first.ScheduledAt,
 		NextCheckAt: &first.CheckAt,
 	}
 	if value.Observation != nil {
@@ -137,7 +137,8 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		Observation        *schedule.ObservationSpec
 		MisfirePolicy      schedule.MisfirePolicy
 		NotificationEvents []schedule.NotificationEvent
-	}{command.HostID, command.ModelID, value.Title, command.Objective, command.Timing, command.Budget, command.Observation, command.MisfirePolicy, command.NotificationEvents})
+		ExecutionPolicy    schedule.ExecutionPolicy
+	}{command.HostID, command.ModelID, value.Title, command.Objective, command.Timing, command.Budget, command.Observation, command.MisfirePolicy, command.NotificationEvents, command.executionPolicy})
 	if err != nil {
 		return schedule.Schedule{}, err
 	}

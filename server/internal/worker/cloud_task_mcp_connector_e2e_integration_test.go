@@ -35,6 +35,63 @@ type f02MCPCommitObserver struct {
 	once    sync.Once
 }
 
+type f01MCPCheckpointCapture struct {
+	CloudDSHCheckpoints
+	mu       sync.Mutex
+	payloads [][]byte
+}
+
+func (capture *f01MCPCheckpointCapture) Save(ctx context.Context, command app.AgentCheckpointCommand) (bool, error) {
+	capture.mu.Lock()
+	capture.payloads = append(capture.payloads, append([]byte(nil), command.Payload...))
+	capture.mu.Unlock()
+	return capture.CloudDSHCheckpoints.Save(ctx, command)
+}
+
+func (capture *f01MCPCheckpointCapture) inspectMordeMemoryContext() (bool, []string) {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	var descriptions []string
+	for _, payload := range capture.payloads {
+		payloadHasProof := bytes.Contains(payload, []byte(app.CloudDSHMemoryProofPrefix))
+		var checkpoint struct {
+			Events []struct {
+				Type string `json:"type"`
+				Data struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+					Source struct {
+						Kind   string `json:"kind"`
+						Plugin string `json:"plugin"`
+					} `json:"source"`
+				} `json:"data"`
+			} `json:"events"`
+		}
+		if json.Unmarshal(payload, &checkpoint) != nil {
+			descriptions = append(descriptions, "invalid-checkpoint:payload-proof="+map[bool]string{true: "yes", false: "no"}[payloadHasProof])
+			continue
+		}
+		for _, event := range checkpoint.Events {
+			description := event.Type + ":" + event.Data.Source.Kind + ":" + event.Data.Source.Plugin
+			proof := false
+			for _, block := range event.Data.Content {
+				if strings.Contains(block.Text, app.CloudDSHMemoryProofPrefix) {
+					proof = true
+				}
+			}
+			descriptions = append(descriptions, description+":proof="+map[bool]string{true: "yes", false: "no"}[proof])
+			if event.Type == "user/message" && event.Data.Source.Kind == "plugin" && event.Data.Source.Plugin == "morde-context" && proof {
+				return true, descriptions
+			}
+		}
+		if payloadHasProof {
+			descriptions = append(descriptions, "checkpoint-payload-proof=yes")
+		}
+	}
+	return false, descriptions
+}
+
 func (s *f02MCPCommitObserver) CommitWorkspaceSyncSession(ctx context.Context, workspaceID, sessionID string, key app.IdempotencyRecord) (workspace.SyncSession, bool, error) {
 	s.once.Do(func() { close(s.entered) })
 	return s.WorkspaceSyncStore.CommitWorkspaceSyncSession(ctx, workspaceID, sessionID, key)
@@ -562,7 +619,32 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 		t.Fatal(err)
 	}
 	provider := newF01LocalMCPProvider()
-	broker, err := app.NewCloudDSHToolBroker(store, runtimeTools, connectorService, provider)
+	personalData, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalSync, err := app.NewPersonalSyncService(store, bytes.Repeat([]byte{0x29}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goals, err := app.NewGoalService(personalData, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalQuota, err := app.NewPersonalDataQuotaService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalFiles, err := app.NewPersonalAttachmentService(store, personalQuota)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordCapture, err := app.NewRecordCaptureService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := app.NewCloudDSHToolBrokerWithPersonalData(store, runtimeTools, connectorService, provider,
+		recordCapture, personalData, personalSync, goals, personalFiles, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,11 +705,12 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkpointCapture := &f01MCPCheckpointCapture{CloudDSHCheckpoints: checkpoints}
 	model := &f01MCPRestartModel{connectorID: connector.ID}
 	interruptingTools := &f01InterruptAfterMCPDispatch{inner: broker, supervisor: supervisor}
 	firstRun, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-mcp-restart-supervisor", AccountRuntimes: conversationRuntimeManager,
-		Instances: instances, Checkpoints: checkpoints, Models: model, Tools: interruptingTools,
+		Instances: instances, Checkpoints: checkpointCapture, Models: model, Tools: interruptingTools,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -639,6 +722,9 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 	if !interruptingTools.interrupted.Load() {
 		t.Fatalf("the interruption did not occur after the MCP ledger committed: err=%v model_calls=%d provider_calls=%d dsh_frames=%s",
 			firstRunErr, model.callCount(), provider.remoteCalls.Load(), supervisor.output())
+	}
+	if hasProof, events := checkpointCapture.inspectMordeMemoryContext(); !hasProof {
+		t.Fatalf("first DSH checkpoint did not retain the authenticated Morde personal context; events=%v", events)
 	}
 	operationKey := f01OperationKey("f01-mcp-call-001")
 	operation, err := store.GetMCPConnectorOperation(ctx, owner.ID, submitted.Task.ID, connector.ID, operationKey)
@@ -653,13 +739,14 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 		afterInterruption.Task.CheckpointThroughSequence < 0 || len(afterInterruption.Task.CheckpointDigest) != 32 {
 		t.Fatalf("persisted dsh recovery point after interruption = %#v, %v", afterInterruption.Task, err)
 	}
-
 	if _, err := pool.Exec(ctx, `UPDATE account_agent_runtimes SET lease_expires_at=clock_timestamp()-interval '1 second'
 		WHERE conversation_id=$1`, submitted.Conversation.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, submitted.Task.ID); err != nil {
-		t.Fatal(err)
+		t.Fatalf("expire Task lease after restart (status=%s reason=%s owner=%q version=%d expiry=%s): %v", afterInterruption.Task.Status,
+			afterInterruption.Task.WaitingReason, afterInterruption.Task.Lease.Owner, afterInterruption.Task.Lease.Version,
+			afterInterruption.Task.Lease.ExpiresAt, err)
 	}
 	recovered, found, err := store.ClaimNextTask(ctx, "f01-mcp-node-recovery", 30*time.Second)
 	if err != nil || !found || recovered.ID != submitted.Task.ID || recovered.AgentSessionID != afterInterruption.Task.AgentSessionID ||
@@ -668,7 +755,7 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 	}
 	secondRun, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-mcp-restart-supervisor", AccountRuntimes: conversationRuntimeManager,
-		Instances: instances, Checkpoints: checkpoints, Models: model, Tools: broker,
+		Instances: instances, Checkpoints: checkpointCapture, Models: model, Tools: broker,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -719,6 +806,23 @@ func (tools *f01InterruptAfterMCPDispatch) Reconcile(ctx context.Context, value 
 
 func (tools *f01InterruptAfterMCPDispatch) PauseRecovery(ctx context.Context, value task.Task) error {
 	return tools.inner.PauseRecovery(ctx, value)
+}
+
+func (tools *f01InterruptAfterMCPDispatch) InitialContext(ctx context.Context, value task.Task) (string, error) {
+	return tools.inner.InitialContext(ctx, value)
+}
+
+func (tools *f01InterruptAfterMCPDispatch) ValidatePersonalMemoryProof(ctx context.Context, value task.Task, proof string,
+	versions []app.CloudDSHMemoryVersion) error {
+	return tools.inner.ValidatePersonalMemoryProof(ctx, value, proof, versions)
+}
+
+func (tools *f01InterruptAfterMCPDispatch) CloudDSHPersonalMemoryProofEnabled() bool {
+	return tools.inner.CloudDSHPersonalMemoryProofEnabled()
+}
+
+func (tools *f01InterruptAfterMCPDispatch) PausePersonalMemoryRecovery(ctx context.Context, value task.Task) error {
+	return tools.inner.PausePersonalMemoryRecovery(ctx, value)
 }
 
 type f01LocalMCPProvider struct {

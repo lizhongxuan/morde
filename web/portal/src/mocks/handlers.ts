@@ -96,6 +96,20 @@ let defaultModelVersion = 0;
 let schedules: Array<{ ownerID: string; value: Schedule }> = [];
 let conversations: Conversation[] = [];
 let conversationMessages: MockConversationMessage[] = [];
+type MockMessageUpload = {
+  ownerID: string;
+  projectID: string | null;
+  conversationID: string;
+  clientMessageID: string;
+  metadata: Record<string, unknown>;
+  totalBytes: number;
+  totalChunks: number;
+  sha256: string;
+  fingerprint: string;
+  chunks: Map<number, Uint8Array>;
+  message?: ConversationMessage | ProjectConversationMessage;
+};
+const conversationMessageUploads = new Map<string, MockMessageUpload>();
 let conversationOwners = new Map<string, string>();
 let mainConversations = new Map<string, MainConversation>();
 let tasks = new Map<string, Task>();
@@ -120,7 +134,7 @@ const projectConversationAcceptances = new Map<string, { request: string; respon
 const conversationCreates = new Map<string, { request: string; response: Conversation }>();
 const projectWorkItemClaimReplays = new Map<string, { request: string; response: ProjectWorkItem }>();
 const taskSubmitReplays = new Map<string, { request: string; response: Task }>();
-const conversationMessageAcceptances = new Map<string, { request: string; response: components["schemas"]["AcceptedConversationMessageResponse"] }>();
+const conversationAcceptances = new Map<string, { request: string; response: components["schemas"]["AcceptedConversationMessageResponse"] }>();
 const taskActionReplays = new Map<string, { request: string; response: components["schemas"]["TaskActionResponse"] }>();
 const mainConversationReplays = new Map<string, { request: string; response: MainConversation }>();
 let userPreferences = new Map<string, UserPreferences>();
@@ -212,7 +226,7 @@ function validPersonalMutation(type: string, objectID: string, value: unknown): 
     typeof body.name === "string" && body.name.trim() === body.name && body.name.length > 0 && body.name.length <= 60 &&
     (body.avatar === "dragon" || body.avatar === "emoji") &&
     (body.emoji === undefined || (typeof body.emoji === "string" && [...body.emoji].length <= 16)) &&
-    (body.color === undefined || (typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color))) &&
+    (body.color === undefined || (typeof body.color === "string" && (body.color === "" || /^#[0-9a-fA-F]{6}$/.test(body.color)))) &&
     (body.description === undefined || (typeof body.description === "string" && [...body.description].length <= 200)) &&
     (body.style === undefined || ["", "muse", "flat", "clay", "watercolor", "pixel", "line", "sticker"].includes(String(body.style))) &&
     (body.avatar === "dragon" ? (!body.emoji || body.emoji === "") && (!body.color || body.color === "") : Boolean(body.emoji) && typeof body.color === "string" && /^#[0-9a-fA-F]{6}$/.test(body.color));
@@ -393,6 +407,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   defaultModelVersion = 1;
   conversations = [];
   conversationMessages = [];
+  conversationMessageUploads.clear();
   conversationOwners = new Map();
   mainConversations = new Map();
   tasks = new Map();
@@ -411,7 +426,7 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
   conversationCreates.clear();
   projectWorkItemClaimReplays.clear();
   taskSubmitReplays.clear();
-  conversationMessageAcceptances.clear();
+  conversationAcceptances.clear();
   taskActionReplays.clear();
   mainConversationReplays.clear();
   userPreferences = new Map();
@@ -574,6 +589,131 @@ function isAutoMessageBody(value: unknown): value is components["schemas"]["Acce
   return Boolean(body.content.trim() || (Array.isArray(attachmentIDs) && attachmentIDs.length));
 }
 
+const messageUploadChunkBytes = 16 * 1024;
+const messageUploadMaxBytes = 8 * 1024 * 1024;
+const messageMetadataFields = ["previous_client_message_id", "reference_task_id", "model_id", "host_id", "workspace_id",
+  "application_id", "mcp_connector_ids", "client_attachment_ids", "budget"] as const;
+
+function canonicalJSON(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJSON).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJSON(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function messageUploadKey(ownerID: string, projectID: string | null, conversationID: string, clientMessageID: string): string {
+  return `${ownerID}:${projectID ?? "personal"}:${conversationID}:${clientMessageID}`;
+}
+
+function messageUploadIdentityFailure(request: Request, user: User, clientMessageID: string, requireIdempotency: boolean) {
+  if (!/^[A-Za-z0-9._~-]{8,128}$/.test(clientMessageID)) return failure("invalid_argument", "消息编号无效", 400);
+  if (request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
+  if (request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
+  if (requireIdempotency && request.headers.get("Idempotency-Key")?.trim() !== clientMessageID) return failure("invalid_argument", "消息编号与请求编号不一致", 400);
+  return null;
+}
+
+function validMessageUploadInit(value: unknown): value is components["schemas"]["ConversationMessageUploadInit"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  const allowed = new Set(["total_bytes", "total_chunks", "sha256", ...messageMetadataFields]);
+  if (Object.keys(body).some((field) => !allowed.has(field))
+    || !Number.isSafeInteger(body.total_bytes) || Number(body.total_bytes) < 1 || Number(body.total_bytes) > messageUploadMaxBytes
+    || !Number.isSafeInteger(body.total_chunks) || Number(body.total_chunks) !== Math.ceil(Number(body.total_bytes) / messageUploadChunkBytes)
+    || typeof body.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(body.sha256)) return false;
+  for (const field of ["previous_client_message_id", "reference_task_id", "model_id", "host_id", "workspace_id", "application_id"] as const) {
+    const item = body[field];
+    if (item !== undefined && (typeof item !== "string" || !item.length || item.length > (field === "model_id" ? 256 : field === "application_id" ? 64 : 128))) return false;
+  }
+  for (const field of ["mcp_connector_ids", "client_attachment_ids"] as const) {
+    const items = body[field];
+    if (items !== undefined && (!Array.isArray(items) || items.length > 16 || items.some((item) => typeof item !== "string"
+      || !/^[A-Za-z0-9._~-]{8,128}$/.test(item)) || new Set(items).size !== items.length)) return false;
+  }
+  if (body.budget !== undefined && body.budget !== null) {
+    if (!body.budget || typeof body.budget !== "object" || Array.isArray(body.budget)) return false;
+    const budget = body.budget as Record<string, unknown>;
+    if (Object.keys(budget).some((field) => !["active_seconds", "tool_calls", "model_tokens"].includes(field))
+      || [budget.active_seconds, budget.tool_calls, budget.model_tokens].some((item) => !Number.isSafeInteger(item) || Number(item) < 0)) return false;
+  }
+  return true;
+}
+
+function messageUploadMetadata(value: components["schemas"]["ConversationMessageUploadInit"]): Record<string, unknown> {
+  return Object.fromEntries(messageMetadataFields.filter((field) => value[field] !== undefined).map((field) => [field, value[field]]));
+}
+
+function messageUploadView(upload: MockMessageUpload): components["schemas"]["ConversationMessageUpload"] {
+  return {
+    client_message_id: upload.clientMessageID,
+    state: upload.message ? "committed" : "uploading",
+    total_bytes: upload.totalBytes,
+    total_chunks: upload.totalChunks,
+    received_sequences: [...upload.chunks.keys()].sort((a, b) => a - b),
+    ...(upload.message ? { message: upload.message } : {}),
+  };
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes).buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  return left.length === right.length && left.every((byte, index) => byte === right[index]);
+}
+
+function decodeMessageChunk(value: unknown): Uint8Array | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  if (Object.keys(body).some((field) => field !== "content_base64" && field !== "sha256")
+    || typeof body.content_base64 !== "string" || body.content_base64.length > 21848
+    || typeof body.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(body.sha256)) return null;
+  try {
+    const binary = atob(body.content_base64);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    if (!bytes.length || btoa(binary) !== body.content_base64) return null;
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+async function putMessageUploadChunk(upload: MockMessageUpload | undefined, sequence: number, body: unknown) {
+  if (!upload) return failure("not_found", "消息上传不存在", 404);
+  if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence >= upload.totalChunks) return failure("invalid_argument", "分片序号无效", 400);
+  const bytes = decodeMessageChunk(body);
+  if (!bytes) return failure("invalid_argument", "消息分片无效", 400);
+  const expectedBytes = sequence === upload.totalChunks - 1
+    ? upload.totalBytes - messageUploadChunkBytes * (upload.totalChunks - 1) : messageUploadChunkBytes;
+  if (bytes.length !== expectedBytes || await sha256Hex(bytes) !== (body as { sha256: string }).sha256) {
+    return failure("invalid_argument", "消息分片长度或摘要无效", 400);
+  }
+  const previous = upload.chunks.get(sequence);
+  if (previous) return bytesEqual(previous, bytes) ? empty() : failure("conflict", "该分片序号已保存不同内容", 409);
+  if (upload.message) return failure("conflict", "消息已提交", 409);
+  upload.chunks.set(sequence, bytes);
+  return empty();
+}
+
+async function assembleMessageUpload(upload: MockMessageUpload): Promise<{ content?: string; response?: Response }> {
+  if (upload.chunks.size !== upload.totalChunks) return { response: failure("conflict", "消息分片尚未全部上传", 409) };
+  const bytes = new Uint8Array(upload.totalBytes);
+  for (let sequence = 0; sequence < upload.totalChunks; sequence += 1) {
+    const chunk = upload.chunks.get(sequence);
+    if (!chunk) return { response: failure("conflict", "消息分片尚未全部上传", 409) };
+    bytes.set(chunk, sequence * messageUploadChunkBytes);
+  }
+  if (await sha256Hex(bytes) !== upload.sha256) return { response: failure("invalid_argument", "完整消息摘要不匹配", 400) };
+  try {
+    return { content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+  } catch {
+    return { response: failure("invalid_argument", "消息内容不是有效 UTF-8", 400) };
+  }
+}
+
 function modelConfigurationStatus(user: User): "configured" | "not_configured" | "unknown" {
   const visible = modelConnections.filter((model) => canAccessModel(user, model));
   return visible.some((model) => model.has_api_key) ? "configured" : visible.length ? "unknown" : "not_configured";
@@ -675,7 +815,7 @@ function createTaskMessage(user: User, conversation: Conversation, modelID: stri
     workspace_id: typeof request.workspace_id === "string" ? request.workspace_id : undefined,
     input_revision: typeof request.input_revision === "number" && Number.isSafeInteger(request.input_revision) ? request.input_revision : undefined,
     execution_location: "server", conversation_id: conversation.id, model_id: modelID, objective: content,
-    status: "queued", event_sequence: 0, current_step: null,
+    status: "queued", event_sequence: 0, current_step: null, step_count: 0, completed_step_count: 0,
     budget: budget ?? { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
     usage: { active_seconds: 0, tool_calls: 0, model_tokens: null }, created_at: timestamp, updated_at: timestamp,
     result: null, waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null,
@@ -921,6 +1061,93 @@ export const handlers = [
     projectConversationCreates.set(replayKey, { request: fingerprint, response: value });
     return json(value, 201);
   }),
+  http.put("/api/projects/:projectID/conversations/:conversationID/message-uploads/:clientMessageID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    if (!projectConversations.some((item) => item.project_id === projectID && item.id === conversationID)) return failure("not_found", "项目共享对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, true);
+    if (identityError) return identityError;
+    const body: unknown = await request.json().catch(() => null);
+    if (!validMessageUploadInit(body)) return failure("invalid_argument", "长消息上传初始化参数无效", 400);
+    const metadata = messageUploadMetadata(body);
+    const fingerprint = canonicalJSON({ metadata, total_bytes: body.total_bytes, total_chunks: body.total_chunks, sha256: body.sha256 });
+    const key = messageUploadKey(user.id, projectID, conversationID, clientMessageID);
+    const existing = conversationMessageUploads.get(key);
+    if (existing) return existing.fingerprint === fingerprint
+      ? json(messageUploadView(existing)) : failure("conflict", "消息编号已用于不同的上传内容", 409);
+    const upload: MockMessageUpload = {
+      ownerID: user.id, projectID, conversationID, clientMessageID, metadata,
+      totalBytes: body.total_bytes, totalChunks: body.total_chunks, sha256: body.sha256,
+      fingerprint, chunks: new Map(),
+    };
+    conversationMessageUploads.set(key, upload);
+    return json(messageUploadView(upload));
+  }),
+  http.get("/api/projects/:projectID/conversations/:conversationID/message-uploads/:clientMessageID", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    if (!projectConversations.some((item) => item.project_id === projectID && item.id === conversationID)) return failure("not_found", "项目共享对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, false);
+    if (identityError) return identityError;
+    const upload = conversationMessageUploads.get(messageUploadKey(user.id, projectID, conversationID, clientMessageID));
+    return upload ? json(messageUploadView(upload)) : failure("not_found", "消息上传不存在", 404);
+  }),
+  http.put("/api/projects/:projectID/conversations/:conversationID/message-uploads/:clientMessageID/chunks/:sequence", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    if (!projectConversations.some((item) => item.project_id === projectID && item.id === conversationID)) return failure("not_found", "项目共享对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, false);
+    if (identityError) return identityError;
+    const upload = conversationMessageUploads.get(messageUploadKey(user.id, projectID, conversationID, clientMessageID));
+    const body: unknown = await request.json().catch(() => null);
+    return putMessageUploadChunk(upload, Number(params.sequence), body);
+  }),
+  http.post("/api/projects/:projectID/conversations/:conversationID/message-uploads/:clientMessageID/commit", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const projectID = String(params.projectID);
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (!readableProject(projectID, user)) return failure("not_found", "项目不存在或无权访问", 404);
+    const conversation = projectConversations.find((item) => item.project_id === projectID && item.id === conversationID);
+    if (!conversation) return failure("not_found", "项目共享对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, true);
+    if (identityError) return identityError;
+    const upload = conversationMessageUploads.get(messageUploadKey(user.id, projectID, conversationID, clientMessageID));
+    if (!upload) return failure("not_found", "消息上传不存在", 404);
+    if (upload.message) return json({ message: upload.message }, 202);
+    const assembled = await assembleMessageUpload(upload);
+    if (assembled.response) return assembled.response;
+    const body = { client_message_id: clientMessageID, ...upload.metadata, content: assembled.content! };
+    if (!isAutoMessageBody(body)) return failure("invalid_argument", "项目消息无效", 400);
+    const replayKey = `${user.id}:${projectID}:${conversationID}:${clientMessageID}`;
+    const replay = projectConversationAcceptances.get(replayKey);
+    let message: ProjectConversationMessage;
+    if (replay) {
+      if (replay.request !== canonicalJSON(body)) return failure("conflict", "幂等键已用于不同的项目消息", 409);
+      message = replay.response.message;
+    } else {
+      const timestamp = now();
+      message = {
+        id: id("m"), conversation_id: conversationID, owner_id: conversation.owner_id, actor_id: user.id,
+        sequence: nextConversationMessageSequence(conversationID), role: "user", content: body.content,
+        client_message_id: clientMessageID, routing_status: "pending", delivery_status: "pending", created_at: timestamp,
+      };
+      conversation.updated_at = timestamp;
+      projectConversationMessages.push(message);
+      projectConversationAcceptances.set(replayKey, { request: canonicalJSON(body), response: { message, replayed: false } });
+    }
+    upload.message = message;
+    return json({ message }, 202);
+  }),
   http.get("/api/projects/:projectID/conversations/:conversationID/messages", ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
     const projectID = String(params.projectID);
@@ -959,7 +1186,7 @@ export const handlers = [
     if (request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
     if (request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
     if (key !== body.client_message_id) return failure("invalid_argument", "消息编号与请求编号不一致", 400);
-    const fingerprint = JSON.stringify(body);
+    const fingerprint = canonicalJSON(body);
     const replayKey = `${user.id}:${projectID}:${conversationID}:${key}`;
     const replay = projectConversationAcceptances.get(replayKey);
     if (replay) return replay.request === fingerprint
@@ -2091,6 +2318,86 @@ export const handlers = [
     const conversation = conversations.find((item) => item.id === String(params.conversationID) && conversationOwners.get(item.id) === user.id);
     return conversation ? json(conversation) : failure("not_found", "对话不存在", 404);
   }),
+  http.put("/api/conversations/:conversationID/message-uploads/:clientMessageID", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, true);
+    if (identityError) return identityError;
+    const body: unknown = await request.json().catch(() => null);
+    if (!validMessageUploadInit(body)) return failure("invalid_argument", "长消息上传初始化参数无效", 400);
+    const metadata = messageUploadMetadata(body);
+    const fingerprint = canonicalJSON({ metadata, total_bytes: body.total_bytes, total_chunks: body.total_chunks, sha256: body.sha256 });
+    const key = messageUploadKey(user.id, null, conversationID, clientMessageID);
+    const existing = conversationMessageUploads.get(key);
+    if (existing) return existing.fingerprint === fingerprint
+      ? json(messageUploadView(existing)) : failure("conflict", "消息编号已用于不同的上传内容", 409);
+    const upload: MockMessageUpload = {
+      ownerID: user.id, projectID: null, conversationID, clientMessageID, metadata,
+      totalBytes: body.total_bytes, totalChunks: body.total_chunks, sha256: body.sha256,
+      fingerprint, chunks: new Map(),
+    };
+    conversationMessageUploads.set(key, upload);
+    return json(messageUploadView(upload));
+  }),
+  http.get("/api/conversations/:conversationID/message-uploads/:clientMessageID", ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, false);
+    if (identityError) return identityError;
+    const upload = conversationMessageUploads.get(messageUploadKey(user.id, null, conversationID, clientMessageID));
+    return upload ? json(messageUploadView(upload)) : failure("not_found", "消息上传不存在", 404);
+  }),
+  http.put("/api/conversations/:conversationID/message-uploads/:clientMessageID/chunks/:sequence", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    if (conversationOwners.get(conversationID) !== user.id) return failure("not_found", "对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, false);
+    if (identityError) return identityError;
+    const upload = conversationMessageUploads.get(messageUploadKey(user.id, null, conversationID, clientMessageID));
+    const body: unknown = await request.json().catch(() => null);
+    return putMessageUploadChunk(upload, Number(params.sequence), body);
+  }),
+  http.post("/api/conversations/:conversationID/message-uploads/:clientMessageID/commit", async ({ params, request, cookies }) => {
+    const user = sessionUser(cookies)!;
+    const conversationID = String(params.conversationID);
+    const clientMessageID = String(params.clientMessageID);
+    const conversation = conversations.find((item) => item.id === conversationID && conversationOwners.get(item.id) === user.id);
+    if (!conversation) return failure("not_found", "对话不存在", 404);
+    const identityError = messageUploadIdentityFailure(request, user, clientMessageID, true);
+    if (identityError) return identityError;
+    const upload = conversationMessageUploads.get(messageUploadKey(user.id, null, conversationID, clientMessageID));
+    if (!upload) return failure("not_found", "消息上传不存在", 404);
+    if (upload.message) return json({ message: upload.message }, 202);
+    const assembled = await assembleMessageUpload(upload);
+    if (assembled.response) return assembled.response;
+    const body = { client_message_id: clientMessageID, ...upload.metadata, content: assembled.content! };
+    if (!isAutoMessageBody(body)) return failure("invalid_argument", "对话消息无效", 400);
+    const replayKey = `${user.id}:${conversationID}:${clientMessageID}`;
+    const replay = conversationAcceptances.get(replayKey);
+    let message: MockConversationMessage;
+    if (replay) {
+      if (replay.request !== canonicalJSON(body)) return failure("conflict", "幂等键已用于不同的对话消息", 409);
+      message = replay.response.message;
+    } else {
+      const timestamp = now();
+      message = {
+        id: id("m"), conversation_id: conversationID, sequence: nextConversationMessageSequence(conversationID),
+        role: "user", content: body.content, client_message_id: clientMessageID,
+        routing_status: "pending", delivery_status: "pending", created_at: timestamp,
+      };
+      conversation.updated_at = timestamp;
+      conversationMessages.push(message);
+      conversationAcceptances.set(replayKey, { request: canonicalJSON(body), response: { message, replayed: false } });
+      persistAssistantState();
+    }
+    upload.message = message;
+    return json({ message }, 202);
+  }),
   http.get("/api/conversations/:conversationID/messages", ({ params, request, cookies }) => {
     const user = sessionUser(cookies)!;
     const conversationID = String(params.conversationID);
@@ -2114,12 +2421,11 @@ export const handlers = [
     if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
     const body = await request.json().catch(() => null) as {
       host_id?: string; workspace_id?: string; input_revision?: number; application_id?: string; model_id?: string;
-      conversation_id?: string | null; objective?: string; budget?: { active_seconds: number; tool_calls: number; model_tokens: number };
+      objective?: string; budget?: { active_seconds: number; tool_calls: number; model_tokens: number };
     } | null;
-    const allowed = ["host_id", "workspace_id", "input_revision", "application_id", "model_id", "conversation_id", "objective", "budget"];
+    const allowed = ["host_id", "workspace_id", "input_revision", "application_id", "model_id", "objective", "budget"];
     if (!body || Object.keys(body).some((field) => !allowed.includes(field)) || typeof body.model_id !== "string"
-      || typeof body.objective !== "string" || !body.objective.trim() || Array.from(body.objective).length > 32768
-      || (body.conversation_id !== undefined && body.conversation_id !== null && typeof body.conversation_id !== "string")) {
+      || typeof body.objective !== "string" || !body.objective.trim() || Array.from(body.objective).length > 32768) {
       return failure("invalid_argument", "任务内容无效", 400);
     }
     const requestText = JSON.stringify({ ...body, objective: body.objective.trim() });
@@ -2127,14 +2433,11 @@ export const handlers = [
     const replay = taskSubmitReplays.get(replayKey);
     if (replay) return replay.request === requestText ? json({ ...replay.response, replayed: true }, 202) : failure("idempotency_conflict", "幂等键已用于其他请求", 409);
     if (!modelConnections.some((item) => item.id === body.model_id && canAccessModel(user, item) && item.has_api_key)) return failure("not_found", "模型不存在", 404);
-    let conversation = body.conversation_id ? conversations.find((item) => item.id === body.conversation_id && conversationOwners.get(item.id) === user.id) : undefined;
-    if (body.conversation_id && !conversation) return failure("not_found", "对话不存在", 404);
-    if (!conversation) {
-      const timestamp = now();
-      conversation = { id: id("c"), scope: "personal", is_main: false, title: Array.from(body.objective.trim()).slice(0, 120).join(""), created_at: timestamp, updated_at: timestamp };
-      conversations.push(conversation);
-      conversationOwners.set(conversation.id, user.id);
-    }
+    const timestamp = now();
+    const conversation: Conversation = { id: id("c"), scope: "personal", is_main: false,
+      title: Array.from(body.objective.trim()).slice(0, 120).join(""), created_at: timestamp, updated_at: timestamp };
+    conversations.push(conversation);
+    conversationOwners.set(conversation.id, user.id);
     const { task } = createTaskMessage(user, conversation, body.model_id, body.objective.trim(), body);
     taskSubmitReplays.set(replayKey, { request: requestText, response: task });
     persistAssistantState();
@@ -2151,21 +2454,22 @@ export const handlers = [
     if (request.headers.get("X-Morde-Service-Instance-ID") !== mockServiceInstanceID) return failure("conflict", "服务身份不匹配", 409);
     if (request.headers.get("X-Morde-Actor-ID") !== user.id) return failure("conflict", "账号身份不匹配", 409);
     if (key !== body.client_message_id) return failure("invalid_argument", "消息编号与请求编号不一致", 400);
-    const requestText = JSON.stringify(body);
+    const requestText = canonicalJSON(body);
     const replayKey = `${user.id}:${conversationID}:${key}`;
-    const replay = conversationMessageAcceptances.get(replayKey);
+    const replay = conversationAcceptances.get(replayKey);
     if (replay) return replay.request === requestText
       ? json({ ...replay.response, replayed: true }, 202)
       : failure("conflict", "幂等键已用于不同的对话消息", 409);
     const timestamp = now();
     const message: MockConversationMessage = {
       id: id("m"), conversation_id: conversationID, sequence: nextConversationMessageSequence(conversationID),
-      role: "user", content: body.content, client_message_id: key, routing_status: "pending", delivery_status: "pending", created_at: timestamp,
+      role: "user", content: body.content, client_message_id: body.client_message_id,
+      routing_status: "pending", delivery_status: "pending", created_at: timestamp,
     };
-    const response: components["schemas"]["AcceptedConversationMessageResponse"] = { message, replayed: false };
     conversation.updated_at = timestamp;
     conversationMessages.push(message);
-    conversationMessageAcceptances.set(replayKey, { request: requestText, response });
+    const response: components["schemas"]["AcceptedConversationMessageResponse"] = { message, replayed: false };
+    conversationAcceptances.set(replayKey, { request: requestText, response });
     persistAssistantState();
     return json(response, 202);
   }),

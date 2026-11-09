@@ -108,3 +108,10 @@ func cursorPointer(value string) *string {
 	}
 	return &value
 }
+
+func positiveInt64Pointer(value int64) *int64 {
+	if value < 1 {
+		return nil
+	}
+	return &value
+}

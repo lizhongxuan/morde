@@ -12,7 +12,9 @@ import { clearProcessingRetryKey, processingRetryKey } from '../app/message-proc
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import { outboxReceiptRequest } from '../app/message-outbox';
-import { ProjectMuseExtensions } from '../components/ProjectMuseExtensions';
+import { ChatMarkdown } from '../components/ChatMarkdown';
+import { AssistantReplySpeech } from '../components/AssistantReplySpeech';
+import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
 import { projectApi } from '../app/project-api';
 import type { CreateProjectWorkItemRequest, Project, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectRole, ProjectWorkItem, ProjectWorkItemCategory } from '../app/project-api';
 
@@ -83,6 +85,15 @@ function displayResource(resource: ProjectResource) {
 }
 
 export function Projects() {
+  const { user } = useAuth();
+  if (user?.role !== 'user') return <section className="connection-section" role="status">
+    <h2>项目功能仅支持普通用户</h2>
+    <p className="muted">当前管理员账号没有项目成员身份。请使用普通用户账号打开项目，管理员账号仍可使用其他用户端功能。</p>
+  </section>;
+  return <UserProjects />;
+}
+
+function UserProjects() {
   const queryClient = useQueryClient();
   const { user } = useAuth();
   const [selectedProjectID, setSelectedProjectID] = useState('');
@@ -309,10 +320,6 @@ export function Projects() {
       const currentCapabilities = await portalApi.capabilities();
       if (currentCapabilities.service_instance_id !== message.serviceInstanceID) {
         throw new Error('服务身份已变化，消息保留在原服务的本机队列中。');
-      }
-      if (!currentCapabilities.supported_features.includes('conversation_auto_routing_v1')) {
-        await outbox.change(scope, id, (current) => ({ ...current, status: 'pending', error: '服务尚不支持自动分流，请升级后重试。' }));
-        return;
       }
       const targetProjectID = message.projectID;
       const targetConversationID = message.conversationID;
@@ -782,6 +789,9 @@ export function Projects() {
         {!projectTaskMock && (projectTaskCapabilitiesQuery.isPending ? <p role="status">正在确认项目模型执行能力…</p>
             : projectTaskCapabilitiesQuery.isError ? <p className="notice notice-warning" role="alert">无法确认项目模型执行能力，消息仍可先保存在本机。</p>
               : !projectTaskExecutionReady && <p className="notice notice-warning" role="note">服务端尚未声明项目模型执行能力；消息仍可先发送或保存在本机。</p>)}
+        {!projectTaskMock && projectTaskCapabilitiesQuery.data &&
+          !projectTaskCapabilitiesQuery.data.supported_features.includes('conversation_auto_routing_v1') &&
+          <p className="notice notice-warning" role="note">服务端尚未确认支持对话自动处理；仍会尝试发送，无法受理的消息会保留在本机。</p>}
         <form onSubmit={(event) => { event.preventDefault(); createProjectConversation(); }} className="inline-form">
           <div><label htmlFor="project-conversation-title-input">新共享对话标题（可选）</label><input id="project-conversation-title-input" value={projectConversationTitle} maxLength={120} onChange={(event) => setProjectConversationTitle(event.target.value)} /></div>
           <button type="submit" className="button button-secondary" disabled={!currentMember || Boolean(pendingAction)}>{pendingAction === `create-project-conversation:${project.id}` ? '正在创建…' : '创建共享对话'}</button>
@@ -806,9 +816,38 @@ export function Projects() {
                     : !projectConversationMessages.length ? <p className="muted">该共享对话暂无消息。</p>
                       : projectConversationMessages.map((message) => {
                         const task = message.task_id ? taskByID.get(message.task_id) : undefined;
-                        return <article className="schedule-card" key={message.id} aria-label="项目对话消息">
+                        const sources = message.role === 'assistant' ? message.sources ?? [] : [];
+                        const sourceContentMatches = sources.length > 0 && sources.every((source) => source.content.length > 0) &&
+                          sources.map((source) => source.content).join('\n\n') === message.content;
+                        return <article id={`project-conversation-message-${encodeURIComponent(message.id)}`} className="schedule-card" key={message.id} aria-label="项目对话消息">
                           <div className="schedule-card-heading"><div><h4>{message.role === 'user' ? '成员提示' : 'AI 回复'}</h4><p className="muted">执行者 {message.actor_id} · 对话创建者 {message.owner_id}</p></div><span className="status">{message.output_status === 'streaming' ? '生成中' : message.output_status === 'interrupted' ? '已中断' : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status)}</span></div>
-                          <p>{message.content}</p>
+                          {sourceContentMatches ? <div className="chat-message-source-list">
+                            {sources.map((source) => {
+                              const sourceMessage = projectConversationMessages.find((candidate) => candidate.id === source.user_message_id);
+                              const prompt = sourceMessage?.content.trim().replace(/\s+/g, ' ');
+                              const excerpt = prompt && [...prompt].length > 72 ? `${[...prompt].slice(0, 72).join('')}…` : prompt;
+                              return <section className="chat-message-source" key={`${source.task_id}:${source.task_revision}:${source.event_sequence}`}>
+                                <div className="chat-message-source-meta">
+                                  {sourceMessage ? <a className="chat-message-source-origin"
+                                    href={`#project-conversation-message-${encodeURIComponent(source.user_message_id)}`}
+                                    title={prompt} aria-label={`查看关联的成员消息：${prompt}`}>
+                                    {excerpt ? `回复消息：${excerpt}` : '查看关联消息'}
+                                  </a> : <span className="chat-message-source-origin">关联消息 {source.user_message_id}</span>}
+                                  <span className="chat-message-source-task">任务 {source.task_id} · 修订 {source.task_revision} · 结果事件 {source.event_sequence}</span>
+                                </div>
+                                <ChatMarkdown content={source.content} />
+                              </section>;
+                            })}
+                          </div> : <>
+                            {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <p>{message.content}</p>}
+                            {sources.length > 0 && <div className="chat-message-source-meta" aria-label="回复来源">
+                              {sources.map((source) => <span className="chat-message-source-task" key={`${source.task_id}:${source.task_revision}:${source.event_sequence}`}>
+                                关联消息 {source.user_message_id} · 任务 {source.task_id} · 修订 {source.task_revision} · 结果事件 {source.event_sequence}
+                              </span>)}
+                            </div>}
+                          </>}
+                          {message.role === 'assistant' && message.output_status !== 'streaming' && message.output_status !== 'interrupted' &&
+                            <AssistantReplySpeech text={message.content} sessionKey={`project:${project.id}:conversation:${message.conversation_id}`} />}
                           {message.attachment_ids?.length ? <p className="muted">附件 · {message.attachment_ids.length}
                             {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
                               href={`/api/projects/${encodeURIComponent(project.id)}/conversations/${encodeURIComponent(message.conversation_id)}/messages/${encodeURIComponent(message.id)}/attachments-by-id/${encodeURIComponent(attachmentID)}/content`}
@@ -822,6 +861,8 @@ export function Projects() {
                               onClick={() => retryProjectProcessing.mutate({ projectID: project.id, conversationID: message.conversation_id, messageID: message.id })}>重试处理</button>}
                           </p>}
                           {message.task_id && <p className="muted">Task {message.task_id} · 状态 {task?.status ?? '未知'}
+                            {task && Number.isSafeInteger(task.step_count) && task.step_count! > 0 && Number.isSafeInteger(task.completed_step_count) &&
+                              <> · 已完成 {Math.min(task.completed_step_count!, task.step_count!)} / {task.step_count!} 步</>}
                             {task && task.initiator_id === user?.id && ['queued', 'running', 'waiting_user', 'paused'].includes(task.status) &&
                               <button type="button" className="button button-small button-secondary" disabled={Boolean(pendingAction)}
                                 onClick={() => stopProjectTask(task)}>停止此任务</button>}
@@ -868,6 +909,8 @@ export function Projects() {
                 <label htmlFor="project-task-prompt">提交到共享对话的提示</label>
                 <textarea id="project-task-prompt" value={projectPrompt} rows={4} onChange={(event) => setProjectPrompt(event.target.value)} required />
                 <div className="form-actions">
+                  <AssistantVoiceInput onTranscript={(transcript) => setProjectPrompt((current) => current.trim()
+                    ? `${current.trimEnd()} ${transcript}` : transcript)} disabled={Boolean(pendingAction)} />
                   <button type="submit" className="button button-primary" disabled={!selectedProjectConversation || !projectPrompt.trim()}>发送消息</button>
                 </div>
               </form>
@@ -979,6 +1022,5 @@ export function Projects() {
         </div>}
       </section>
     </>}
-    {showProjectDetails && <ProjectMuseExtensions />}
   </section>;
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -600,7 +601,7 @@ func (g *f01GatedSignedNodeTaskGuardian) StopTaskProcess(ctx context.Context,
 	return g.f01SignedNodeTaskGuardian.StopTaskProcess(ctx, guard)
 }
 
-func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T) {
+func TestCloudTaskWithCancelledPersonalChildFailsClosedAfterNodeRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	store, pool := newF01TemporaryStore(t)
@@ -678,7 +679,7 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 	}
 	node, script := f01NodeRuntimePaths(t)
 	accountScript := filepath.Join(filepath.Dir(script), "bin-account.mjs")
-	model := &cancelRestartModel{childCheckpointed: make(chan struct{}), parentRecovered: make(chan struct{}), interrupted: make(chan struct{})}
+	model := &cancelRestartModel{childCheckpointed: make(chan struct{}), interrupted: make(chan struct{})}
 	tools := &cancelRestartTools{definition: cloudDSHWriteTool()}
 	guardian := &f01SignedNodeTaskGuardian{key: privateKey}
 	control, err := app.NewAccountAgentRuntimeService(store)
@@ -728,7 +729,7 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 			ctx.Err(), model.callCount(1), model.childCallCount(1), tools.writes.Load())
 	case err := <-firstDone:
 		firstRuntimeManager.mu.Lock()
-		runtimeSession := firstRuntimeManager.sessions[owner.ID]
+		runtimeSession := firstRuntimeManager.sessions[submitted.Conversation.ID]
 		firstRuntimeManager.mu.Unlock()
 		var runtimeFailure string
 		if runtimeSession != nil {
@@ -753,6 +754,17 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 		EngineVersion:        cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
 	if fence.AgentGeneration != 1 || fence.AgentSessionID == "" {
 		t.Fatalf("initial Agent fence was not persisted: %#v", fence)
+	}
+	proofFound := false
+	for _, event := range checkpoints.snapshot() {
+		if strings.Contains(event, "task="+submitted.Task.ID+" session="+fence.AgentSessionID) &&
+			strings.Contains(event, "source=plugin/morde-context proof=true") {
+			proofFound = true
+			break
+		}
+	}
+	if !proofFound {
+		t.Fatalf("root checkpoint is missing authenticated Morde context proof: events=%v", checkpoints.snapshot())
 	}
 	jobs, err := children.List(ctx, fence, fence.AgentSessionID)
 	if err != nil || len(jobs) != 1 || !jobs[0].Background || jobs[0].Step.Status != task.StepRunning ||
@@ -823,7 +835,7 @@ func TestCloudTaskCancelledBackgroundChildRecoversAfterNodeRestart(t *testing.T)
 			parentStatus, parentLeaseOwner == "", pendingStopRequests)
 	}
 	firstRuntimeManager.mu.Lock()
-	oldRuntimeSession := firstRuntimeManager.sessions[owner.ID]
+	oldRuntimeSession := firstRuntimeManager.sessions[submitted.Conversation.ID]
 	firstRuntimeManager.mu.Unlock()
 	if oldRuntimeSession == nil {
 		t.Fatal("old account Runtime session is missing")
@@ -857,14 +869,14 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := secondExecutor.ExecuteTask(ctx, recovered); !errors.Is(err, ErrCloudDSHCompletionPending) {
-		t.Fatalf("parent Agent recovery after child cancel = %v, want a completed candidate; root_calls=%d child_calls=%d",
-			err, model.callCount(fence.AgentGeneration+1), model.childCallCount(fence.AgentGeneration+1))
+	if err := secondExecutor.ExecuteTask(ctx, recovered); !errors.Is(err, errCloudDSHPersonalMemoryChanged) {
+		t.Fatalf("parent Agent recovery with an unknown personal child outcome = %v, want fail-closed personal-memory recovery; root_calls=%d child_calls=%d checkpoints=%v",
+			err, model.callCount(fence.AgentGeneration+1), model.childCallCount(fence.AgentGeneration+1), checkpoints.snapshot())
 	}
-	select {
-	case <-model.parentRecovered:
-	default:
-		t.Fatal("parent model was not called in the new Agent generation")
+	if model.callCount(fence.AgentGeneration+1) != 0 || model.childCallCount(fence.AgentGeneration+1) != 0 ||
+		tools.writes.Load() != 1 || tools.memoryRecoveryPauses.Load() != 1 {
+		t.Fatalf("unsafe parent/child work replayed or recovery was not paused: root_calls=%d child_calls=%d writes=%d pauses=%d",
+			model.callCount(fence.AgentGeneration+1), model.childCallCount(fence.AgentGeneration+1), tools.writes.Load(), tools.memoryRecoveryPauses.Load())
 	}
 
 	var childStatus, childSummary string
@@ -885,12 +897,8 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3`, submitted.Task.ID, ow
 	}
 	parent, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
 	if err != nil || parent.Task.AgentGeneration != fence.AgentGeneration+1 || parent.Task.AgentSessionID != fence.AgentSessionID ||
-		parent.Task.CheckpointThroughSequence <= oldRootCheckpointThrough || len(parent.Task.CheckpointDigest) != 32 {
-		t.Fatalf("parent session did not recover under the next Agent generation: task=%#v err=%v", parent.Task, err)
-	}
-	if tools.writes.Load() != 1 || model.childCallCount(fence.AgentGeneration+1) != 0 {
-		t.Fatalf("cancelled child side effect was replayed: writes=%d new_generation_child_model_calls=%d",
-			tools.writes.Load(), model.childCallCount(fence.AgentGeneration+1))
+		parent.Task.CheckpointThroughSequence != oldRootCheckpointThrough || !bytes.Equal(parent.Task.CheckpointDigest, oldRootCheckpointDigest) {
+		t.Fatalf("failed-closed recovery changed the pinned parent checkpoint: task=%#v err=%v", parent.Task, err)
 	}
 }
 
@@ -925,6 +933,15 @@ func (c *f01ObservedCheckpoints) Save(ctx context.Context, command app.AgentChec
 	type checkpointEvent struct {
 		Sequence int64  `json:"seq"`
 		Type     string `json:"type"`
+		Data     struct {
+			Source struct {
+				Kind   string `json:"kind"`
+				Plugin string `json:"plugin"`
+			} `json:"source"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"data"`
 	}
 	var body struct {
 		Events []checkpointEvent `json:"events"`
@@ -932,8 +949,12 @@ func (c *f01ObservedCheckpoints) Save(ctx context.Context, command app.AgentChec
 	if json.Unmarshal(command.Payload, &body) == nil {
 		c.mu.Lock()
 		for _, event := range body.Events {
+			proof := false
+			for _, block := range event.Data.Content {
+				proof = proof || strings.Contains(block.Text, app.CloudDSHMemoryProofPrefix)
+			}
 			c.events = append(c.events, fmt.Sprintf("task=%s session=%s seq=%d type=%s", command.Fence.TaskID,
-				command.Fence.AgentSessionID, event.Sequence, event.Type))
+				command.Fence.AgentSessionID, event.Sequence, event.Type)+fmt.Sprintf(" source=%s/%s proof=%t", event.Data.Source.Kind, event.Data.Source.Plugin, proof))
 		}
 		c.mu.Unlock()
 	}
@@ -988,10 +1009,8 @@ type cancelRestartModel struct {
 	rootCalls         map[int64]int
 	childCalls        map[int64]int
 	childCheckpointed chan struct{}
-	parentRecovered   chan struct{}
 	interrupted       chan struct{}
 	childOnce         sync.Once
-	parentOnce        sync.Once
 	interruptOnce     sync.Once
 }
 
@@ -1009,8 +1028,7 @@ func (m *cancelRestartModel) Complete(ctx context.Context, call app.ModelCall) (
 		callNumber := m.rootCalls[call.Task.AgentGeneration]
 		m.mu.Unlock()
 		if call.Task.AgentGeneration > 1 {
-			m.parentOnce.Do(func() { close(m.parentRecovered) })
-			return app.ModelResponse{Text: "Parent resumed after the cancelled child was marked unknown.",
+			return app.ModelResponse{Text: "Parent model must not run while the cancelled child outcome is unknown.",
 				StopReason: "stop", Usage: usage}, nil
 		}
 		if callNumber == 1 {
@@ -1081,10 +1099,11 @@ func (m *cancelRestartModel) callCount(generation int64) int {
 }
 
 type cancelRestartTools struct {
-	definition app.AgentToolDefinition
-	writes     atomic.Int32
-	mu         sync.Mutex
-	taskIDs    []string
+	definition           app.AgentToolDefinition
+	writes               atomic.Int32
+	memoryRecoveryPauses atomic.Int32
+	mu                   sync.Mutex
+	taskIDs              []string
 }
 
 type parentSiblingCancelCompletionStore interface {
@@ -1148,6 +1167,24 @@ func (tools *cancelRestartTools) Execute(_ context.Context, value task.Task, cal
 	tools.mu.Unlock()
 	tools.writes.Add(1)
 	return app.AgentToolResult{Status: app.AgentToolSucceeded, Output: `{"path":"cancel-check.txt","revision":1}`}, nil
+}
+
+func (*cancelRestartTools) InitialContext(context.Context, task.Task) (string, error) {
+	return "Authorized test context.\n" + app.CloudDSHMemoryProofPrefix + "f01-test-personal-proof", nil
+}
+
+func (*cancelRestartTools) ValidatePersonalMemoryProof(_ context.Context, _ task.Task, proof string, _ []app.CloudDSHMemoryVersion) error {
+	if proof != "f01-test-personal-proof" {
+		return errors.New("test personal context proof is invalid")
+	}
+	return nil
+}
+
+func (*cancelRestartTools) CloudDSHPersonalMemoryProofEnabled() bool { return true }
+
+func (tools *cancelRestartTools) PausePersonalMemoryRecovery(context.Context, task.Task) error {
+	tools.memoryRecoveryPauses.Add(1)
+	return nil
 }
 
 func (tools *cancelRestartTools) taskIDsSnapshot() []string {
@@ -1425,14 +1462,14 @@ func TestCloudDSHConcurrentOwnersKeepOutputMessagesAndEventsIsolated(t *testing.
 				continue
 			}
 			events, eventsErr := store.ListTaskEvents(diagnosticCtx, value.owner.ID, value.taskID, 0, 100)
-			eventTypes := make([]string, 0, len(events))
+			eventDetails := make([]string, 0, len(events))
 			for _, event := range events {
-				eventTypes = append(eventTypes, event.Type)
+				eventDetails = append(eventDetails, fmt.Sprintf("%s:%s", event.Type, event.Payload))
 			}
-			states = append(states, fmt.Sprintf("owner=%s task=%s status=%s waiting=%s agent=%s/%d session=%s lease=%s/%d result=%q event_types=%v events_error=%v",
+			states = append(states, fmt.Sprintf("owner=%s task=%s status=%s waiting=%s agent=%s/%d session=%s lease=%s/%d result=%q events=%v events_error=%v",
 				value.owner.ID, value.taskID, current.Task.Status, current.Task.WaitingReason, current.Task.AgentInstanceID,
 				current.Task.AgentGeneration, current.Task.AgentSessionID, current.Task.Lease.Owner, current.Task.Lease.Version,
-				current.Task.Result, eventTypes, eventsErr))
+				current.Task.Result, eventDetails, eventsErr))
 		}
 		processes := make([]string, 0)
 		for _, command := range runtimeSupervisor.commandsSnapshot() {
@@ -1442,7 +1479,15 @@ func TestCloudDSHConcurrentOwnersKeepOutputMessagesAndEventsIsolated(t *testing.
 			}
 			processes = append(processes, fmt.Sprintf("pid=%d state=%v", command.Process.Pid, command.ProcessState))
 		}
-		return fmt.Sprintf("tasks=%v node_processes=%v node_stderr_bytes=%d", states, processes, len(runtimeSupervisor.stderrSnapshot()))
+		var executionErrs []string
+		for {
+			select {
+			case executionErr := <-executionErrors:
+				executionErrs = append(executionErrs, executionErr.Error())
+			default:
+				return fmt.Sprintf("tasks=%v node_processes=%v node_stderr=%q execution_errors=%v", states, processes, runtimeSupervisor.stderrSnapshot(), executionErrs)
+			}
+		}
 	}
 	seen := make(map[string]bool, len(ownerTasks))
 	for range ownerTasks {
@@ -1470,7 +1515,7 @@ func TestCloudDSHConcurrentOwnersKeepOutputMessagesAndEventsIsolated(t *testing.
 			current, err := store.GetTask(ctx, value.taskID, value.owner.ID)
 			return err == nil && current.Task.Status == task.StatusCompleted, err
 		}, nil, nil); err != nil {
-			t.Fatalf("owner %s Task did not complete: %v", value.owner.ID, err)
+			t.Fatalf("owner %s Task did not complete: %v; %s", value.owner.ID, err, diagnostic())
 		}
 		current, err := store.GetTask(ctx, value.taskID, value.owner.ID)
 		if err != nil || current.Task.Result != value.output {
@@ -1586,6 +1631,7 @@ func (m *f01ConcurrentOwnerOutputModel) Complete(ctx context.Context, call app.M
 
 type f01OwnerIsolationCompletionStore interface {
 	CommitTaskProgress(context.Context, app.TaskProgress) (task.Event, error)
+	GetTask(context.Context, string, string) (app.TaskDetails, error)
 }
 
 type f01OwnerIsolationRecordingExecutor struct {
@@ -1609,6 +1655,16 @@ type f01OwnerIsolationCompletion struct {
 }
 
 func (completion *f01OwnerIsolationCompletion) Complete(ctx context.Context, claimed task.Task, result app.CloudDSHTaskCompletion) error {
+	details, err := completion.store.GetTask(ctx, claimed.ID, claimed.OwnerID)
+	if err != nil {
+		return err
+	}
+	sequence := int64(1)
+	for _, step := range details.Steps {
+		if step.Sequence >= sequence {
+			sequence = step.Sequence + 1
+		}
+	}
 	stepID, err := domain.NewStepID()
 	if err != nil {
 		return err
@@ -1620,7 +1676,7 @@ func (completion *f01OwnerIsolationCompletion) Complete(ctx context.Context, cla
 	_, err = completion.store.CommitTaskProgress(ctx, app.TaskProgress{
 		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		Status: task.StatusCompleted, CurrentStep: stepID, Result: result.Result, Usage: claimed.Usage,
-		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "result", Status: task.StepSucceeded,
+		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: sequence, Kind: "result", Status: task.StepSucceeded,
 			Title: "Complete owner isolation task", Summary: "Synthetic DSH output was isolated by account owner."}},
 		PublishResultMessage: true,
 		Event:                task.Event{TaskID: claimed.ID, Type: "task.result", Payload: payload},

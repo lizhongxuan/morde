@@ -346,6 +346,7 @@ FROM conversation_message_routes r JOIN tasks t ON t.id=$2 WHERE r.message_id=$1
 			if err != nil || !snapshot.Context.ReferenceUnavailable {
 				t.Fatalf("unavailable Task reference was not detected: %+v err=%v", snapshot.Context, err)
 			}
+			snapshot.Context.ModelID = "p1234567"
 			if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
 				t.Fatal(err)
 			}

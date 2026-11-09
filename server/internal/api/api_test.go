@@ -1235,6 +1235,47 @@ func TestSessionUnsafeRequestsRequireContentTypeOnlyWhenBodyMayExist(t *testing.
 	}
 }
 
+func TestSessionAttachmentChunkUploadsAllowBoundedBinaryContentType(t *testing.T) {
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	personalPath := "/api/personal-data/uploads/pu_0123456789abcdef0123456789abcdef/chunks/0"
+	projectPath := "/api/projects/p1234567/conversations/c1234567/messages/m1234567/attachments/a1234567/chunks/0"
+	router := newRouter(t, newServices(), Options{})
+	request := httptest.NewRequest(http.MethodPut, personalPath, strings.NewReader("x"))
+	request.Host = "portal.example.test"
+	request.RemoteAddr = "192.0.2.1:12345"
+	request.AddCookie(cookie)
+	request.Header.Set("Origin", "https://portal.example.test")
+	request.Header.Set("Content-Type", "application/octet-stream")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_argument") {
+		t.Fatalf("personal binary chunk did not pass the content-type guard: %d %s", response.Code, response.Body)
+	}
+
+	projectRouter := newRouter(t, newServices(), Options{})
+	projectRequest := httptest.NewRequest(http.MethodPut, projectPath, strings.NewReader("x"))
+	projectRequest.Host = "portal.example.test"
+	projectRequest.RemoteAddr = "192.0.2.1:12345"
+	projectRequest.AddCookie(cookie)
+	projectRequest.Header.Set("Origin", "https://portal.example.test")
+	projectRequest.Header.Set("Content-Type", "application/octet-stream")
+	projectResponse := httptest.NewRecorder()
+	projectRouter.ServeHTTP(projectResponse, projectRequest)
+	if projectResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("project binary chunk did not pass the content-type guard: %d %s", projectResponse.Code, projectResponse.Body)
+	}
+
+	request = httptest.NewRequest(http.MethodPut, personalPath, strings.NewReader("x"))
+	request.Host = "portal.example.test"
+	request.RemoteAddr = "192.0.2.1:12345"
+	request.AddCookie(cookie)
+	request.Header.Set("Origin", "https://portal.example.test")
+	request.Header.Set("Content-Type", "text/plain")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	assertError(t, response, http.StatusForbidden, "forbidden")
+}
+
 func TestConstructorAndWorkspaceFailure(t *testing.T) {
 	services := newServices()
 	options := validOptions()

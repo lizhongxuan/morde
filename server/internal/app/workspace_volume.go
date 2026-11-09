@@ -45,7 +45,8 @@ type WorkspaceVolumeCopyCapacityChecker interface {
 type WorkspaceVolumeCopyRequest struct {
 	ReservationID     string
 	ServiceInstanceID string
-	OwnerID           string
+	SourceOwnerID     string
+	TargetOwnerID     string
 	SourceWorkspaceID string
 	TargetWorkspaceID string
 	SourceRevision    int64

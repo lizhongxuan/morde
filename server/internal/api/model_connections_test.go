@@ -144,11 +144,7 @@ func TestClientAvailableModelsReturnsSafeMetadata(t *testing.T) {
 }
 
 func TestClientAvailableModelsIncludesConfiguredDefault(t *testing.T) {
-	checkedAt := time.Now().UTC()
-	manager := &modelConnectionManagerStub{items: []app.ModelConnectionView{{
-		ID: "p1234567", Name: "Shared", BaseURL: "https://private-provider.example.test/v1", ModelName: "model-a",
-		Shared: true, HasAPIKey: true, Capabilities: app.ModelCapabilities{Text: true, Tools: true}, CheckedAt: &checkedAt,
-	}}}
+	manager := &modelConnectionManagerStub{}
 	services := newServices()
 	deps := services.deps()
 	deps.ModelConnections = manager
@@ -164,7 +160,8 @@ func TestClientAvailableModelsIncludesConfiguredDefault(t *testing.T) {
 	response := request(router, http.MethodGet, "/api/available-models", "", "Bearer "+clientCredential, "")
 	body := response.Body.String()
 	if response.Code != http.StatusOK || !strings.Contains(body, `"default_model_configured":true`) ||
-		!strings.Contains(body, `"default_model_id":"p1234567"`) {
+		!strings.Contains(body, `"default_model_id":"p1234567"`) ||
+		!strings.Contains(body, `"configuration_status":"configured"`) || !strings.Contains(body, `"items":[]`) {
 		t.Fatalf("configured model metadata = %d %s", response.Code, body)
 	}
 }
@@ -226,6 +223,7 @@ func TestModelConfigurationStatusDoesNotDependOnProbeCapabilities(t *testing.T) 
 			manager := &modelConnectionManagerStub{items: test.items}
 			deps := newServices().deps()
 			deps.ModelConnections = manager
+			deps.AdminModelDefaults = adminModelDefaultAPIStub{}
 			router, err := New(deps, validOptions())
 			if err != nil {
 				t.Fatal(err)
@@ -269,6 +267,27 @@ func TestModelConfigurationStatusDoesNotDependOnProbeCapabilities(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestAvailableModelsReportsUnknownWhenPlatformConfigurationCannotBeChecked(t *testing.T) {
+	deps := newServices().deps()
+	deps.ModelConnections = &modelConnectionManagerStub{}
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, _, err := identity.NewCredential(identity.KindClient, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(router, http.MethodGet, "/api/available-models", "", "Bearer "+credential, "")
+	var body struct {
+		ConfigurationStatus app.ModelConfigurationStatus `json:"configuration_status"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil ||
+		body.ConfigurationStatus != app.ModelConfigurationUnknown {
+		t.Fatalf("missing platform model lookup = %d %s", response.Code, response.Body)
 	}
 }
 

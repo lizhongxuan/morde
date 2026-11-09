@@ -1,10 +1,13 @@
 package mcpconnector
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -19,10 +22,13 @@ import (
 )
 
 const (
-	connectorResponseLimit = 1 << 20
-	connectorToolLimit     = 256
-	connectorPageLimit     = 8
-	connectorCallTimeout   = 30 * time.Second
+	connectorResponseLimit    = 1 << 20
+	connectorToolLimit        = 256
+	connectorPageLimit        = 8
+	connectorCallTimeout      = 30 * time.Second
+	connectorImageBytesLimit  = 36 << 10
+	connectorImageWidthLimit  = 1280
+	connectorImageHeightLimit = 720
 )
 
 var connectorDNSName = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$`)
@@ -38,6 +44,12 @@ type ConnectorToolResult struct {
 	UnsupportedContent bool
 	StructuredContent  json.RawMessage
 	Text               []string
+	Images             []ConnectorToolImage
+}
+
+type ConnectorToolImage struct {
+	MediaType string
+	Data      []byte
 }
 
 type ConnectorClient struct {
@@ -118,40 +130,94 @@ func decodeConnectorToolResult(result *sdk.CallToolResult) ConnectorToolResult {
 	}
 	resultBytes := 0
 	for _, content := range result.Content {
-		text, ok := content.(*sdk.TextContent)
-		if !ok || text == nil {
+		switch item := content.(type) {
+		case *sdk.TextContent:
+			if item == nil || len(item.Text) > 64<<10 || !utf8.ValidString(item.Text) {
+				value.UnsupportedContent = true
+				value.Text = nil
+				value.Images = nil
+				return value
+			}
+			resultBytes += len(item.Text)
+			if resultBytes > 64<<10 {
+				value.UnsupportedContent = true
+				value.Text = nil
+				value.Images = nil
+				return value
+			}
+			value.Text = append(value.Text, item.Text)
+		case *sdk.ImageContent:
+			if item == nil || len(value.Images) != 0 || !validConnectorImage(item.MIMEType, item.Data) {
+				value.UnsupportedContent = true
+				value.Images = nil
+				continue
+			}
+			resultBytes += len(item.Data)
+			if resultBytes > 64<<10 {
+				value.UnsupportedContent = true
+				value.Images = nil
+				continue
+			}
+			value.Images = append(value.Images, ConnectorToolImage{MediaType: item.MIMEType, Data: append([]byte(nil), item.Data...)})
+		default:
 			value.UnsupportedContent = true
-			continue
+			value.Images = nil
 		}
-		if len(text.Text) > 64<<10 || !utf8.ValidString(text.Text) {
-			value.UnsupportedContent = true
-			value.Text = nil
-			return value
-		}
-		resultBytes += len(text.Text)
-		if resultBytes > 64<<10 {
-			value.UnsupportedContent = true
-			value.Text = nil
-			return value
-		}
-		value.Text = append(value.Text, text.Text)
 	}
 	if result.StructuredContent != nil {
 		encoded, err := json.Marshal(result.StructuredContent)
 		if err != nil || len(encoded) > 64<<10 || !utf8.Valid(encoded) {
 			value.UnsupportedContent = true
 			value.Text = nil
+			value.Images = nil
 			return value
 		}
 		resultBytes += len(encoded)
 		if resultBytes > 64<<10 {
 			value.UnsupportedContent = true
 			value.Text = nil
+			value.Images = nil
 			return value
 		}
 		value.StructuredContent = encoded
 	}
+	if value.IsError && len(value.Images) != 0 {
+		value.UnsupportedContent = true
+	}
+	if value.UnsupportedContent {
+		value.Images = nil
+	}
 	return value
+}
+
+func validConnectorImage(mediaType string, data []byte) bool {
+	if len(data) < 4 || len(data) > connectorImageBytesLimit {
+		return false
+	}
+	var width, height int
+	switch mediaType {
+	case "image/jpeg":
+		config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return false
+		}
+		width, height = config.Width, config.Height
+		if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
+			return false
+		}
+	case "image/png":
+		config, err := png.DecodeConfig(bytes.NewReader(data))
+		if err != nil {
+			return false
+		}
+		width, height = config.Width, config.Height
+		if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+			return false
+		}
+	default:
+		return false
+	}
+	return width > 0 && width <= connectorImageWidthLimit && height > 0 && height <= connectorImageHeightLimit
 }
 
 func (c *ConnectorClient) connect(ctx context.Context, endpoint string, headers http.Header) (*sdk.ClientSession, func(), error) {
@@ -225,7 +291,7 @@ func validateConnectorHeaders(headers http.Header) error {
 			total += len(name) + len(value)
 		}
 	}
-	if count > 4 || total > 8192 {
+	if count > 6 || total > 8192 {
 		return errors.New("MCP connector credential headers exceed their limit")
 	}
 	return nil
@@ -296,6 +362,11 @@ func (body *connectorLimitedBody) Read(value []byte) (int, error) {
 
 func newConnectorTransport(host string) http.RoundTripper {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	return newConnectorTransportWithLookupAndDial(host, net.DefaultResolver.LookupNetIP, dialer.DialContext)
+}
+
+func newConnectorTransportWithLookupAndDial(host string, lookup func(context.Context, string, string) ([]netip.Addr, error),
+	dial func(context.Context, string, string) (net.Conn, error)) http.RoundTripper {
 	return &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -303,7 +374,7 @@ func newConnectorTransport(host string) http.RoundTripper {
 			if err != nil || strings.ToLower(resolvedHost) != host || port != "443" {
 				return nil, errors.New("MCP connector address is invalid")
 			}
-			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			ips, err := lookup(ctx, "ip", host)
 			if err != nil || len(ips) == 0 {
 				return nil, errors.New("MCP connector DNS lookup failed")
 			}
@@ -314,7 +385,7 @@ func newConnectorTransport(host string) http.RoundTripper {
 			}
 			var lastErr error
 			for _, address := range ips {
-				connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(address.String(), port))
+				connection, err := dial(ctx, network, net.JoinHostPort(address.String(), port))
 				if err == nil {
 					return connection, nil
 				}

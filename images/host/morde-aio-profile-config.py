@@ -226,6 +226,53 @@ def workspace_defaults(home: Path) -> None:
         atomic_text(preferences, json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", home)
 
 
+def secure_workspace_root(home: Path) -> None:
+    layout = os.environ.get("MORDE_WORKSPACE_LAYOUT")
+    if layout == "legacy":
+        return
+    if layout != "workspace":
+        raise SafeguardError("Workspace layout is unavailable")
+
+    workspace = home / "workspace"
+    try:
+        info = workspace.lstat()
+    except OSError as exc:
+        raise SafeguardError("Workspace mount is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SafeguardError("Workspace mount is unsafe")
+    if info.st_uid not in {os.geteuid(), AIO_UID} or info.st_mode & stat.S_IWOTH:
+        raise SafeguardError("Workspace mount ownership is unsafe")
+
+    try:
+        group_id = int(os.environ.get("USER_GID", str(AIO_UID)))
+    except ValueError as exc:
+        raise SafeguardError("Workspace user group is invalid") from exc
+    if group_id < 0:
+        raise SafeguardError("Workspace user group is invalid")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(workspace, flags)
+    except OSError as exc:
+        raise SafeguardError("Workspace mount is unsafe") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode) or opened.st_dev != info.st_dev or opened.st_ino != info.st_ino:
+            raise SafeguardError("Workspace mount changed during validation")
+        os.fchown(fd, 0 if os.geteuid() == 0 else os.geteuid(), group_id)
+        os.fchmod(fd, 0o3770)
+        secured = os.fstat(fd)
+        if (secured.st_uid, secured.st_gid, stat.S_IMODE(secured.st_mode)) != (
+            0 if os.geteuid() == 0 else os.geteuid(), group_id, 0o3770
+        ):
+            raise SafeguardError("Workspace mount permissions could not be secured")
+        current = workspace.lstat()
+        if current.st_dev != secured.st_dev or current.st_ino != secured.st_ino:
+            raise SafeguardError("Workspace mount changed during validation")
+    finally:
+        os.close(fd)
+
+
 def prune_browser_metrics(home: Path) -> int:
     directory = check_safe_parent(home, ".config/browser/DeferredBrowserMetrics")
     try:
@@ -513,7 +560,10 @@ def restore(home: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("prepare", "restore", "workspace-defaults", "prune-browser-metrics"))
+    parser.add_argument(
+        "command",
+        choices=("prepare", "restore", "workspace-defaults", "secure-workspace-root", "prune-browser-metrics"),
+    )
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME, help=argparse.SUPPRESS)
     args = parser.parse_args()
     home = args.home
@@ -524,6 +574,8 @@ def main() -> int:
             prepare(home)
         elif args.command == "workspace-defaults":
             workspace_defaults(home)
+        elif args.command == "secure-workspace-root":
+            secure_workspace_root(home)
         elif args.command == "prune-browser-metrics":
             print(prune_browser_metrics(home))
         else:

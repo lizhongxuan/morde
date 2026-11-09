@@ -33,6 +33,7 @@ type CreateScheduleCommand struct {
 	Observation        *schedule.ObservationSpec
 	MisfirePolicy      schedule.MisfirePolicy
 	NotificationEvents []schedule.NotificationEvent
+	executionPolicy    schedule.ExecutionPolicy
 }
 
 type UpdateScheduleCommand struct {

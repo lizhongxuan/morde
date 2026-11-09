@@ -68,7 +68,7 @@ func ValidateCloudDSHGoalReceiptEvent(payload []byte, request CloudDSHGoalReceip
 		return CloudDSHGoalReceipt{}, domain.NewError(domain.CodeInvalidState, "goal write Task receipt is invalid")
 	}
 	if len(payload) == 0 || len(payload) > 16<<10 || json.Unmarshal(payload, &event) != nil ||
-		request.CallID == "" || len(request.CallID) > 256 || request.BaseRevision < 0 || request.BaseRevision >= math.MaxInt64 ||
+		request.CallID == "" || len(request.CallID) > 256 || request.BaseRevision < 0 || request.BaseRevision == math.MaxInt64 ||
 		personal.ValidateObjectIdentifier(personal.ObjectTypeGoal, request.GoalID) != nil {
 		return invalid()
 	}

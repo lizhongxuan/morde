@@ -617,15 +617,13 @@ func TestTaskServiceRejectsNativeInputMetadataWithoutRootSnapshot(t *testing.T) 
 	}
 }
 
-func TestTaskServiceSubmitPinsWorkspaceInputInExistingConversation(t *testing.T) {
+func TestTaskServiceSubmitPinsWorkspaceInputInNewConversation(t *testing.T) {
 	emptyDigest := sha256.Sum256(nil)
 	files := []workspace.File{{Path: "notes.txt", SHA256: hex.EncodeToString(emptyDigest[:]), Mode: 0644, Chunks: []workspace.Chunk{}}}
 	store := &taskWorkspaceStoreStub{
-		taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
-			"c1234567": {ID: "c1234567", OwnerID: "u1234567", HostID: "h1234567"},
-		}},
-		value: workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
-		files: files,
+		taskStoreStub: &taskStoreStub{},
+		value:         workspace.Workspace{ID: "w1234567", OwnerID: "u1234567", State: workspace.StateReady, Revision: 1},
+		files:         files,
 	}
 	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
 	if err != nil {
@@ -633,13 +631,15 @@ func TestTaskServiceSubmitPinsWorkspaceInputInExistingConversation(t *testing.T)
 	}
 	revision := int64(1)
 	_, err = service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
-		ConversationID: "c1234567", HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
+		HostID: "h1234567", WorkspaceID: store.value.ID, InputRevision: &revision,
 		ModelID: "model-a", Objective: "use the uploaded notes", IdempotencyKey: "workspace-submit-existing-001",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(store.submissions) != 1 || store.submissions[0].Task.WorkspaceID != store.value.ID ||
+	if len(store.submissions) != 1 || store.submissions[0].Conversation == nil ||
+		store.submissions[0].Conversation.ID != store.submissions[0].Task.ConversationID ||
+		store.submissions[0].Task.WorkspaceID != store.value.ID ||
 		store.submissions[0].Task.InputRevision == nil || *store.submissions[0].Task.InputRevision != revision || len(store.submissions[0].Task.ContextDigest) != 32 {
 		t.Fatalf("submitted task Workspace input = %#v", store.submissions)
 	}

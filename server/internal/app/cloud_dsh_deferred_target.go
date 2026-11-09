@@ -231,15 +231,16 @@ func (b *CloudDSHToolBroker) pauseDeferredTarget(ctx context.Context, claimed ta
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "task is not running")
 	}
 	message := "所选云端电脑当前不可用或无法确认访问权限，本次操作未执行。"
-	if reason == "computer_target_missing" {
+	switch reason {
+	case "computer_target_missing":
 		message = "尚未选择云端电脑，本次操作未执行。"
-	} else if reason == "computer_target_changed" {
+	case "computer_target_changed":
 		message = "任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。"
-	} else if reason == "workspace_unavailable" {
+	case "workspace_unavailable":
 		message = "所选 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。"
-	} else if reason == "workspace_target_changed" {
+	case "workspace_target_changed":
 		message = "任务已绑定其他 Workspace，无法安全切换；请为新目标另发起任务。"
-	} else if reason == "target_result_unknown" {
+	case "target_result_unknown":
 		message = "上次电脑操作的结果需要核对，暂不能重复执行。"
 	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepWaitingUser, "电脑或工作区需要处理", message)

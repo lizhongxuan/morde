@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router';
+import { Link, useLocation } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, enterHostInNewTab, newIdempotencyKey, portalApi } from '../app/api';
 import type { HostMemberPermission } from '../app/api';
@@ -49,12 +49,19 @@ const hostReasonLabel: Record<string, string> = {
 
 export function Hosts() {
   const queryClient = useQueryClient();
+  const location = useLocation();
   const { user } = useAuth();
   const { notify } = useToast();
   const hosts = useQuery({
     queryKey: ['hosts'], queryFn: portalApi.hosts,
     refetchInterval: (query) => query.state.data?.items.some((host) => unsettled.has(host.state)) ? 3000 : query.state.data?.items.length ? 30000 : false,
   });
+  useEffect(() => {
+    if (!hosts.data || !location.hash.startsWith('#host-')) return;
+    const hostID = location.hash.slice('#host-'.length);
+    if (!/^h[a-z0-9]{7}$/.test(hostID)) return;
+    document.getElementById(`host-${hostID}`)?.scrollIntoView?.({ block: 'center' });
+  }, [hosts.data, location.hash]);
   const workspaces = useQuery({
     queryKey: ['workspaces'], queryFn: portalApi.workspaces,
     enabled: hosts.data?.items.some((host) => host.owner_id === user?.id && host.state === 'stopped'
@@ -155,7 +162,7 @@ export function Hosts() {
               const canViewDesktop = host.permissions.includes('desktop:view') || host.permissions.includes('desktop:control');
               const canControlTerminal = host.permissions.includes('terminal:control');
               const canReadWorkspace = host.permissions.includes('workspace:file:read');
-              return <article className="host-card" key={host.id}>
+              return <article className="host-card" id={`host-${host.id}`} key={host.id}>
               <div className="host-card-heading"><div><h3>{host.name || '未命名主机'}</h3><p className="muted mono">{host.id}</p></div><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
               <p className="muted">权限：{host.permissions.map((permission) => sharingPermissionLabels[permission]).join('、') || '无'}</p>
               <div className="host-actions">
@@ -196,7 +203,7 @@ function HostCard({ host, busy, canEnter, enterReason, workspaceRestorable, canB
   const enterHelpID = `host-enter-help-${host.id}`;
   const hasWorkspaceBinding = host.workspaces.some((binding) => binding.state !== 'detached');
   const selectedWorkspace = bindableWorkspaces.find((workspace) => workspace.id === workspaceID);
-  return <article className="host-card">
+  return <article className="host-card" id={`host-${host.id}`}>
     <div className="host-card-heading"><div><h2>{host.name || '未命名主机'}</h2><p className="muted mono">{host.id} · {host.template_id}</p></div><span className={`status status-${host.state}`}><span aria-hidden="true" className="status-dot" />{hostStateLabel[host.state] || host.state}</span></div>
     <div className="host-facts">
       <div><span>规格</span><strong>{formatCpu(host.resources?.cpu_limit_milli)} / {formatMemory(host.resources?.mem_limit_mib)}</strong></div>

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
+import dns from "node:dns";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { createUrlReaderLookup } from "../node_modules/mcp-searxng/dist/proxy.js";
+import { assertUrlAllowed, URL_SECURITY_POLICY_DNS_ERROR } from "../node_modules/mcp-searxng/dist/url-security.js";
 import { extractPageDateMetadata } from "../patches/page-date.mjs";
-import { applyPatch, PATCH_MARKER, patchUrlReader } from "../apply-mcp-searxng-patch.mjs";
-import { fetchAndConvertToMarkdown } from "../node_modules/mcp-searxng/dist/url-reader.js";
+import { applyPatch, HTTPS_REDIRECT_MARKER, PATCH_MARKER, patchUrlReader } from "../apply-mcp-searxng-patch.mjs";
 
 test("extracts and normalizes article publication metadata", () => {
   const result = extractPageDateMetadata(`
@@ -56,6 +60,9 @@ test("only scans a bounded number and size of JSON-LD scripts", () => {
 });
 
 test("patched web_url_read preserves date metadata from a local HTML fixture", async (t) => {
+  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/mcp-searxng");
+  await applyPatch(packageRoot);
+  const { fetchAndConvertToMarkdown } = await import(`../node_modules/mcp-searxng/dist/url-reader.js?morde-test=${Date.now()}`);
   const previousPrivateUrls = process.env.MCP_HTTP_ALLOW_PRIVATE_URLS;
   process.env.MCP_HTTP_ALLOW_PRIVATE_URLS = "true";
   t.after(() => {
@@ -64,6 +71,10 @@ test("patched web_url_read preserves date metadata from a local HTML fixture", a
   });
 
   const server = createServer((request, response) => {
+    if (request.url === "/redirect") {
+      response.writeHead(302, { location: "/article" });
+      return response.end();
+    }
     response.setHeader("content-type", "text/html; charset=utf-8");
     if (request.method === "HEAD") return response.end();
     response.end('<html><head><meta property="article:published_time" content="2026-11-06"></head><body><h1>Local test article</h1><p>Fixture body.</p></body></html>');
@@ -78,6 +89,52 @@ test("patched web_url_read preserves date metadata from a local HTML fixture", a
   assert.match(markdown, /Page date metadata \(unverified\)/u);
   assert.match(markdown, /Published: 2026-11-06/u);
   assert.match(markdown, /Local test article/u);
+  await assert.rejects(
+    fetchAndConvertToMarkdown({ sendLoggingMessage: async () => {} }, `http://127.0.0.1:${address.port}/redirect`, 3000),
+    /Insecure URL redirect blocked/u,
+  );
+});
+
+test("blocks private URL targets and DNS answers for public hostnames", async () => {
+  const previousPrivateUrls = process.env.MCP_HTTP_ALLOW_PRIVATE_URLS;
+  process.env.MCP_HTTP_ALLOW_PRIVATE_URLS = "false";
+  try {
+    const blockedUrls = [
+      "https://10.0.0.1/private", "https://100.64.0.1/private", "https://127.0.0.1/private",
+      "https://169.254.169.254/private", "https://172.16.0.1/private", "https://192.168.1.1/private",
+      "https://224.0.0.1/private", "https://[::]/private", "https://[::1]/private",
+      "https://[fc00::1]/private", "https://[fe80::1]/private", "https://[ff02::1]/private",
+      "https://[::ffff:127.0.0.1]/private", "https://[64:ff9b::a00:1]/private",
+      "https://service.localhost/private",
+    ];
+    for (const rawUrl of blockedUrls) {
+      assert.throws(() => assertUrlAllowed(new URL(rawUrl)), /blocked by security policy/u, rawUrl);
+    }
+    assert.doesNotThrow(() => assertUrlAllowed(new URL("https://93.184.216.34/public")));
+
+    const originalLookup = dns.lookup;
+    dns.lookup = (_hostname, options, callback) => {
+      assert.equal(options.all, true, "URL reader must inspect every DNS answer");
+      callback(null, [
+        { address: "93.184.216.34", family: 4 },
+        { address: "127.0.0.1", family: 4 },
+      ]);
+    };
+    syncBuiltinESMExports();
+    try {
+      const error = await new Promise(resolve => {
+        createUrlReaderLookup()("rebind.example", { all: true }, resolve);
+      });
+      assert.equal(error?.code, URL_SECURITY_POLICY_DNS_ERROR);
+      assert.match(error.message, /Resolved private address blocked/u);
+    } finally {
+      dns.lookup = originalLookup;
+      syncBuiltinESMExports();
+    }
+  } finally {
+    if (previousPrivateUrls === undefined) delete process.env.MCP_HTTP_ALLOW_PRIVATE_URLS;
+    else process.env.MCP_HTTP_ALLOW_PRIVATE_URLS = previousPrivateUrls;
+  }
 });
 
 test("patches only the pinned upstream conversion and is idempotent", () => {
@@ -86,11 +143,27 @@ test("patches only the pinned upstream conversion and is idempotent", () => {
     "async function convertTextResponse(attempt, response, type) {",
     '    return { kind: "markdown", text: convertText(read.text, type, attempt.url) };',
     "}",
+    "function redirectTarget(response, current) {",
+    "    const next = new URL(location, current);",
+    "    assertUrlAllowed(next);",
+    "    return next;",
+    "}",
   ].join("\n");
   const patched = patchUrlReader(source);
   assert.match(patched, new RegExp(PATCH_MARKER));
   assert.match(patched, /extractPageDateMetadata\(read\.text\)/u);
+  assert.match(patched, new RegExp(HTTPS_REDIRECT_MARKER));
+  assert.match(patched, /next\.protocol !== "https:"/u);
   assert.equal(patchUrlReader(patched), patched);
+  const previousPatch = source.replace('import { NodeHtmlMarkdown } from "node-html-markdown";',
+    'import { NodeHtmlMarkdown } from "node-html-markdown";\nimport { extractPageDateMetadata } from "../../../patches/page-date.mjs"; // MORDE_PAGE_DATE_METADATA_PATCH_V1')
+    .replace('    return { kind: "markdown", text: convertText(read.text, type, attempt.url) };',
+      '    const pageDateMetadata = type.kind === "html" ? extractPageDateMetadata(read.text) : "";\n' +
+      '    const markdown = convertText(read.text, type, attempt.url);\n' +
+      '    return { kind: "markdown", text: pageDateMetadata ? `${pageDateMetadata}\\n\\n${markdown}` : markdown };');
+  const upgraded = patchUrlReader(previousPatch);
+  assert.match(upgraded, new RegExp(HTTPS_REDIRECT_MARKER));
+  assert.equal(patchUrlReader(upgraded), upgraded);
   assert.throws(() => patchUrlReader("different upstream source"), /differs from the expected/u);
   assert.throws(() => patchUrlReader(`${PATCH_MARKER}\n${source}`), /incomplete/u);
 });
@@ -109,6 +182,11 @@ test("patcher verifies the exact package version and updates the installed URL r
     'import { NodeHtmlMarkdown } from "node-html-markdown";',
     "async function convertTextResponse(attempt, response, type) {",
     '    return { kind: "markdown", text: convertText(read.text, type, attempt.url) };',
+    "}",
+    "function redirectTarget(response, current) {",
+    "    const next = new URL(location, current);",
+    "    assertUrlAllowed(next);",
+    "    return next;",
     "}",
   ].join("\n"));
 

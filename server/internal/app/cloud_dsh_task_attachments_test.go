@@ -208,16 +208,67 @@ func TestCloudDSHAttachmentReaderScopesFilesToCurrentTask(t *testing.T) {
 		strings.Contains(officeResult.Output, "not a zip") {
 		t.Fatalf("Office attachment read = %#v, %v", officeResult, err)
 	}
+	pptxID := "pa_5123456789abcdef0123456789abcdef"
+	pptxBytes := cloudDSHPPTXImageFixture(t,
+		`<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Task Reader PPTX content</a:t></a:r></a:p></p:txBody></p:sp><p:pic><p:blipFill><a:blip r:embed="rId1"/></p:blipFill></p:pic></p:spTree></p:cSld></p:sld>`,
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/diagram.png"/></Relationships>`,
+		`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="png" ContentType="image/png"/></Types>`,
+		map[string][]byte{"ppt/media/diagram.png": pngImageBytes})
+	fileStore.metadata[pptxID] = personal.AttachmentMetadata{AttachmentID: pptxID, ObjectType: personal.ObjectTypeLibraryItem,
+		ObjectID: "li_pptx", MediaType: cloudDSHOfficePPTXMediaType, SizeBytes: int64(len(pptxBytes)), SHA256: strings.Repeat("e", 64)}
+	fileStore.content[pptxID] = pptxBytes
+	pptxBody, err := json.Marshal(map[string]any{"name": "briefing.pptx", "kind": "artifact",
+		"mime": cloudDSHOfficePPTXMediaType, "size_bytes": len(pptxBytes), "attachment_id": pptxID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalStore.objects["li_pptx"] = personal.Object{ObjectType: personal.ObjectTypeLibraryItem,
+		ObjectID: "li_pptx", Revision: 1, Body: pptxBody}
+	store.messages[0].AttachmentIDs = append(store.messages[0].AttachmentIDs, pptxID)
+	pptxResult, err := broker.Execute(context.Background(), current, ModelToolCall{
+		CallID: "read-pptx", Name: cloudDSHTaskAttachmentReadToolName, Arguments: `{"attachment_id":"` + pptxID + `"}`,
+	})
+	if err != nil || pptxResult.Status != AgentToolSucceeded || !strings.Contains(pptxResult.Output, "Task Reader PPTX content") ||
+		!strings.Contains(pptxResult.Output, "untrusted data") || len(pptxResult.Images) != 1 ||
+		pptxResult.Images[0].MediaType != "image/png" || !bytes.Equal(pptxResult.Images[0].Data, pngImageBytes) ||
+		!validCloudDSHToolImages(cloudDSHTaskAttachmentReadToolName, pptxResult) {
+		t.Fatalf("PPTX attachment read = %#v, %v", pptxResult, err)
+	}
+	chartID := "pa_6123456789abcdef0123456789abcdef"
+	chartBytes := cloudDSHPPTXChartFixture(t,
+		`<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><c:chart r:id="rIdChart"/></p:spTree></p:cSld></p:sld>`,
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>`,
+		`<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:strCache><c:ptCount val="2"/><c:pt idx="0"><c:v>Q1</c:v></c:pt><c:pt idx="1"><c:v>Q2</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache><c:ptCount val="2"/><c:pt idx="0"><c:v>120</c:v></c:pt><c:pt idx="1"><c:v>140</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>`)
+	fileStore.metadata[chartID] = personal.AttachmentMetadata{AttachmentID: chartID, ObjectType: personal.ObjectTypeLibraryItem,
+		ObjectID: "li_chart", MediaType: cloudDSHOfficePPTXMediaType, SizeBytes: int64(len(chartBytes)), SHA256: strings.Repeat("f", 64)}
+	fileStore.content[chartID] = chartBytes
+	chartBody, err := json.Marshal(map[string]any{"name": "chart.pptx", "kind": "artifact",
+		"mime": cloudDSHOfficePPTXMediaType, "size_bytes": len(chartBytes), "attachment_id": chartID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalStore.objects["li_chart"] = personal.Object{ObjectType: personal.ObjectTypeLibraryItem,
+		ObjectID: "li_chart", Revision: 1, Body: chartBody}
+	store.messages[0].AttachmentIDs = append(store.messages[0].AttachmentIDs, chartID)
+	chartResult, err := broker.Execute(context.Background(), current, ModelToolCall{
+		CallID: "read-pptx-chart", Name: cloudDSHTaskAttachmentReadToolName, Arguments: `{"attachment_id":"` + chartID + `"}`,
+	})
+	if err != nil || chartResult.Status != AgentToolSucceeded || !strings.Contains(chartResult.Output, `Series "Revenue"`) ||
+		!strings.Contains(chartResult.Output, `"Q1"="120"`) || !strings.Contains(chartResult.Output, `"Q2"="140"`) {
+		t.Fatalf("PPTX chart attachment read = %#v, %v", chartResult, err)
+	}
 	before := len(fileStore.opened)
 	_, err = broker.Execute(context.Background(), current, ModelToolCall{
 		CallID: "read-unlinked", Name: cloudDSHTaskAttachmentReadToolName, Arguments: `{"attachment_id":"` + unlinkedID + `"}`,
 	})
-	if domain.CodeOf(err) != domain.CodeForbidden || len(fileStore.opened) != before+4 {
+	if domain.CodeOf(err) != domain.CodeForbidden || len(fileStore.opened) != before+6 {
 		t.Fatalf("unlinked attachment read error=%v opened=%v; want forbidden without opening the requested unlinked id", err, fileStore.opened)
 	}
 	if !validCloudDSHToolImages(cloudDSHTaskAttachmentReadToolName, result) ||
 		!validCloudDSHToolImages(cloudDSHTaskAttachmentReadToolName, pngResult) ||
-		!validCloudDSHTaskAttachmentMediaType("text/plain") || validCloudDSHTaskAttachmentMediaType("application/octet-stream") {
+		!validCloudDSHTaskAttachmentMediaType("text/plain") ||
+		!validCloudDSHTaskAttachmentMediaType(cloudDSHOfficePPTXMediaType) ||
+		validCloudDSHTaskAttachmentMediaType("application/octet-stream") {
 		t.Fatal("attachment tool image or media validation rejected a supported attachment")
 	}
 

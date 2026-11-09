@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -25,15 +26,17 @@ type conversationUploadRow struct {
 	Metadata    []byte
 	State       string
 	MessageID   string
+	Expired     bool
 }
 
 func loadConversationUploadInTx(ctx context.Context, tx pgx.Tx, receipt app.ConversationMessageReceipt) (conversationUploadRow, error) {
 	var row conversationUploadRow
-	err := tx.QueryRow(ctx, `SELECT total_bytes,total_chunks,content_sha256,request_hash,request_metadata,state,COALESCE(message_id,'')
+	err := tx.QueryRow(ctx, `SELECT total_bytes,total_chunks,content_sha256,request_hash,request_metadata,state,COALESCE(message_id,''),
+(expires_at IS NOT NULL AND expires_at <= clock_timestamp())
 FROM conversation_message_uploads
 WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4 FOR UPDATE`,
 		receipt.ServiceInstanceID, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID).
-		Scan(&row.TotalBytes, &row.TotalChunks, &row.ContentHash, &row.RequestHash, &row.Metadata, &row.State, &row.MessageID)
+		Scan(&row.TotalBytes, &row.TotalChunks, &row.ContentHash, &row.RequestHash, &row.Metadata, &row.State, &row.MessageID, &row.Expired)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return conversationUploadRow{}, domain.NewError(domain.CodeNotFound, "message upload not found")
 	}
@@ -98,8 +101,24 @@ func (s *Store) InitializeConversationMessageUpload(ctx context.Context, init ap
 			if !bytes.Equal(row.RequestHash, init.RequestHash) {
 				return domain.NewError(domain.CodeIdempotencyConflict, "client message id was used for a different upload")
 			}
-			result, err = conversationUploadViewInTx(ctx, tx, init.Receipt, row)
-			return err
+			if !row.Expired {
+				result, err = conversationUploadViewInTx(ctx, tx, init.Receipt, row)
+				return err
+			}
+			if row.State != "uploading" {
+				return domain.NewError(domain.CodeInvalidState, "committed message upload cannot expire")
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM conversation_message_upload_chunks
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4`,
+				init.Receipt.ServiceInstanceID, init.Receipt.Message.ActorID, init.Receipt.Message.ConversationID, init.Receipt.ClientID); err != nil {
+				return fmt.Errorf("reset expired conversation upload chunks: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM conversation_message_uploads
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4 AND state='uploading'`,
+				init.Receipt.ServiceInstanceID, init.Receipt.Message.ActorID, init.Receipt.Message.ConversationID, init.Receipt.ClientID); err != nil {
+				return fmt.Errorf("reset expired conversation upload: %w", err)
+			}
+			err = domain.NewError(domain.CodeNotFound, "expired message upload was reset")
 		}
 		if domain.CodeOf(err) != domain.CodeNotFound {
 			return err
@@ -111,8 +130,8 @@ func (s *Store) InitializeConversationMessageUpload(ctx context.Context, init ap
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO conversation_message_uploads
 (service_instance_id,owner_id,actor_id,conversation_id,client_message_id,total_bytes,total_chunks,
- content_sha256,request_hash,request_metadata,authorization_snapshot)
-VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)`, init.Receipt.ServiceInstanceID,
+ content_sha256,request_hash,request_metadata,authorization_snapshot,expires_at)
+VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,clock_timestamp()+interval '24 hours')`, init.Receipt.ServiceInstanceID,
 			init.Receipt.Message.OwnerID, init.Receipt.Message.ActorID, init.Receipt.Message.ConversationID, init.Receipt.ClientID,
 			init.TotalBytes, init.TotalChunks, init.ContentHash, init.RequestHash, metadata, authorization)
 		if err != nil {
@@ -134,6 +153,9 @@ func (s *Store) PutConversationMessageChunk(ctx context.Context, receipt app.Con
 		if err != nil {
 			return err
 		}
+		if row.Expired {
+			return domain.NewError(domain.CodeNotFound, "message upload expired")
+		}
 		if sequence < 0 || sequence >= row.TotalChunks {
 			return domain.InvalidArgument("sequence", "message chunk sequence is out of range")
 		}
@@ -148,8 +170,16 @@ WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND cl
 			receipt.ServiceInstanceID, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID, sequence).
 			Scan(&priorContent, &priorDigest)
 		if err == nil {
-			if !bytes.Equal(priorContent, content) || !bytes.Equal(priorDigest, digest) {
+			if !bytes.Equal(priorDigest, digest) || (priorContent != nil && !bytes.Equal(priorContent, content)) {
 				return domain.NewError(domain.CodeIdempotencyConflict, "message chunk was already uploaded with different content")
+			}
+			if row.State == "uploading" {
+				if _, err := tx.Exec(ctx, `UPDATE conversation_message_uploads
+SET expires_at=clock_timestamp()+interval '24 hours',updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4 AND state='uploading'`,
+					receipt.ServiceInstanceID, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID); err != nil {
+					return fmt.Errorf("refresh conversation message upload expiry: %w", err)
+				}
 			}
 			return nil
 		}
@@ -166,6 +196,12 @@ VALUES ($1::uuid,$2,$3,$4,$5,$6,$7)`, receipt.ServiceInstanceID, receipt.Message
 		if err != nil {
 			return fmt.Errorf("store conversation message chunk: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `UPDATE conversation_message_uploads
+SET expires_at=clock_timestamp()+interval '24 hours',updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4 AND state='uploading'`,
+			receipt.ServiceInstanceID, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID); err != nil {
+			return fmt.Errorf("refresh conversation message upload expiry: %w", err)
+		}
 		return nil
 	})
 }
@@ -179,6 +215,9 @@ func (s *Store) GetConversationMessageUpload(ctx context.Context, receipt app.Co
 		row, err := loadConversationUploadInTx(ctx, tx, receipt)
 		if err != nil {
 			return err
+		}
+		if row.Expired {
+			return domain.NewError(domain.CodeNotFound, "message upload expired")
 		}
 		value, err = conversationUploadViewInTx(ctx, tx, receipt, row)
 		return err
@@ -195,6 +234,9 @@ func (s *Store) CommitConversationMessageUpload(ctx context.Context, receipt app
 		row, err := loadConversationUploadInTx(ctx, tx, receipt)
 		if err != nil {
 			return err
+		}
+		if row.Expired {
+			return domain.NewError(domain.CodeNotFound, "message upload expired")
 		}
 		if row.State == "committed" {
 			result, _, err = loadConversationReceipt(ctx, tx, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID)
@@ -262,13 +304,71 @@ WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND cl
 		if err := s.acceptConversationMessageInTx(ctx, tx, receipt, row.Metadata, authorization, &result, &replayed); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE conversation_message_uploads SET state='committed',message_id=$5,updated_at=clock_timestamp()
+		_, err = tx.Exec(ctx, `UPDATE conversation_message_uploads SET state='committed',message_id=$5,expires_at=NULL,updated_at=clock_timestamp()
 WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4`,
 			receipt.ServiceInstanceID, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID, result.ID)
 		if err != nil {
 			return fmt.Errorf("commit conversation message upload: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `UPDATE conversation_message_upload_chunks SET content=NULL
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4`,
+			receipt.ServiceInstanceID, receipt.Message.ActorID, receipt.Message.ConversationID, receipt.ClientID); err != nil {
+			return fmt.Errorf("discard committed conversation message upload content: %w", err)
+		}
 		return nil
 	})
 	return result, err
+}
+
+func (s *Store) CleanupExpiredConversationMessageUploads(ctx context.Context, now time.Time, limit int32) (int32, error) {
+	if now.IsZero() || limit < 1 || limit > 1000 {
+		return 0, domain.InvalidArgument("limit", "conversation message upload cleanup request is invalid")
+	}
+	var removed int32
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT service_instance_id::text,actor_id,conversation_id,client_message_id
+FROM conversation_message_uploads
+WHERE state='uploading' AND expires_at <= $1
+ORDER BY expires_at,service_instance_id,actor_id,conversation_id,client_message_id
+LIMIT $2 FOR UPDATE SKIP LOCKED`, now.UTC(), limit)
+		if err != nil {
+			return fmt.Errorf("select expired conversation message uploads: %w", err)
+		}
+		type uploadKey struct {
+			serviceInstanceID string
+			actorID           string
+			conversationID    string
+			clientMessageID   string
+		}
+		candidates := make([]uploadKey, 0, limit)
+		for rows.Next() {
+			var key uploadKey
+			if err := rows.Scan(&key.serviceInstanceID, &key.actorID, &key.conversationID, &key.clientMessageID); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan expired conversation message upload: %w", err)
+			}
+			candidates = append(candidates, key)
+		}
+		rowsErr := rows.Err()
+		rows.Close()
+		if rowsErr != nil {
+			return fmt.Errorf("read expired conversation message uploads: %w", rowsErr)
+		}
+		for _, key := range candidates {
+			if _, err := tx.Exec(ctx, `DELETE FROM conversation_message_upload_chunks
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4`,
+				key.serviceInstanceID, key.actorID, key.conversationID, key.clientMessageID); err != nil {
+				return fmt.Errorf("delete expired conversation message upload chunks: %w", err)
+			}
+			result, err := tx.Exec(ctx, `DELETE FROM conversation_message_uploads
+WHERE service_instance_id=$1::uuid AND actor_id=$2 AND conversation_id=$3 AND client_message_id=$4
+  AND state='uploading' AND expires_at <= $5`, key.serviceInstanceID, key.actorID, key.conversationID, key.clientMessageID, now.UTC())
+			if err != nil {
+				return fmt.Errorf("delete expired conversation message upload: %w", err)
+			}
+			removed += int32(result.RowsAffected())
+		}
+		return nil
+	})
+	return removed, err
 }

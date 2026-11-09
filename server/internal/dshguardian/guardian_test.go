@@ -1099,6 +1099,7 @@ func mustFenceJSON(fence app.AgentInstanceFence) string {
 type fakeDocker struct {
 	value       containerInspect
 	exists      bool
+	listResults []containerSummary
 	killCalls   int
 	removeCalls int
 }
@@ -1108,6 +1109,16 @@ func (d *fakeDocker) inspect(_ context.Context, id string) (containerInspect, er
 		return containerInspect{}, errContainerNotFound
 	}
 	return d.value, nil
+}
+
+func (d *fakeDocker) listByLabel(_ context.Context, key, value string) ([]containerSummary, error) {
+	if d.listResults != nil {
+		return append([]containerSummary(nil), d.listResults...), nil
+	}
+	if !d.exists || d.value.Config.Labels[key] != value {
+		return []containerSummary{}, nil
+	}
+	return []containerSummary{{ID: d.value.ID, Names: []string{d.value.Name}, Labels: d.value.Config.Labels}}, nil
 }
 
 func (d *fakeDocker) kill(_ context.Context, _ string) error {

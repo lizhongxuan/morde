@@ -83,7 +83,6 @@ type dockerDSHFakeEngine struct {
 	waitHang        bool
 	unsafeImageEnv  bool
 	barePathEnv     bool
-	badLabel        bool
 	badAccountLabel bool
 	missingPID      bool
 	kills, creates  int

@@ -68,7 +68,7 @@ func TestPendingDeliveryFailureUsesOnlyProvenRevisionCause(t *testing.T) {
 				cause = errors.New("input pipe unavailable")
 			}
 			got := executor.pendingDeliveryFailureCause(ctx, value, cause)
-			if errors.Is(got, app.ErrTaskRevisionInterrupted) != test.wantRevision || !test.wantRevision && got != cause {
+			if errors.Is(got, app.ErrTaskRevisionInterrupted) != test.wantRevision || !test.wantRevision && !errors.Is(got, cause) {
 				t.Fatalf("delivery failure cause = %v", got)
 			}
 		})

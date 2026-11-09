@@ -12,7 +12,12 @@ import { projectApi } from '../app/project-api';
 import type { AcceptedProjectConversationMessageResponse, Project, ProjectBudget, ProjectConversation, ProjectConversationMessage, ProjectInvitation, ProjectMember, ProjectResource, ProjectWorkItem } from '../app/project-api';
 import { Projects } from './Projects';
 
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'uowner01' } }) }));
+const projectAuthState = vi.hoisted(() => ({ role: 'user' as string }));
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { id: 'uowner01', role: projectAuthState.role } }) }));
+vi.mock('../components/AssistantReplySpeech', () => ({
+  AssistantReplySpeech: ({ text, sessionKey }: { text: string; sessionKey: string }) =>
+    <button type="button" aria-label="朗读回复" data-session-key={sessionKey} data-reply-text={text} />,
+}));
 
 const project: Project = { id: 'jproject1', owner_id: 'uowner01', name: '交付协作', description: '', version: 3 };
 const owner: ProjectMember = { project_id: project.id, user_id: project.owner_id, role: 'owner', version: 1 };
@@ -59,6 +64,7 @@ const workItem: ProjectWorkItem = {
 const task = {
   id: 't0000001', owner_id: owner.user_id, initiator_id: owner.user_id, execution_location: 'server' as const, conversation_id: 'c0000001', model_id: 'model-test',
   objective: '验证交付', status: 'completed' as const, current_step: null,
+  step_count: 0, completed_step_count: 0,
   budget: { active_seconds: 0, tool_calls: 0, model_tokens: 0 }, usage: { active_seconds: 0, tool_calls: 0, model_tokens: 0 },
   created_at: '2026-11-02T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
 };
@@ -117,7 +123,15 @@ describe('Projects API integration', () => {
     vi.spyOn(portalApi, 'workspaces').mockResolvedValue({ items: [] });
   });
 
-  afterEach(() => { cleanup(); localStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+  afterEach(() => { cleanup(); localStorage.clear(); projectAuthState.role = 'user'; vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+
+  it('explains that administrators cannot use projects without calling project APIs', () => {
+    projectAuthState.role = 'super_admin';
+    renderProjects();
+    expect(screen.getByRole('status')).toHaveTextContent('项目功能仅支持普通用户');
+    expect(projectApi.projects).not.toHaveBeenCalled();
+    expect(projectApi.myInvitations).not.toHaveBeenCalled();
+  });
 
   it('shows project attachments from another client using their scoped read route', async () => {
     const attachmentID = 'pca_0123456789abcdef0123456789abcdef';
@@ -137,6 +151,19 @@ describe('Projects API integration', () => {
     expect(await screen.findByText(projectHistoryMessage.content)).toBeInTheDocument();
     expect(screen.queryByText('较旧的重复版本')).not.toBeInTheDocument();
     expect(screen.getAllByRole('article', { name: '项目对话消息' })).toHaveLength(1);
+  });
+
+  it('renders project assistant replies as Markdown', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([{
+      ...projectHistoryMessage, role: 'assistant', task_id: undefined, content: '**已完成**\n\n- 搜索\n- 汇总',
+    }]);
+    renderProjects();
+    await openProject();
+
+    await screen.findByText('已完成', {}, { timeout: 5000 });
+    const reply = (await screen.findAllByRole('article', { name: '项目对话消息' }))[0]!;
+    expect(within(reply).getByText('已完成').tagName).toBe('STRONG');
+    expect(within(reply).getByRole('list').querySelectorAll('li')).toHaveLength(2);
   });
 
   it('stops only the current member’s selected project task', async () => {
@@ -267,8 +294,7 @@ describe('Projects API integration', () => {
 
     expect(await screen.findByRole('heading', { name: '我的项目' })).toBeInTheDocument();
     await openProject();
-    expect(screen.getByRole('heading', { name: 'Muse 项目能力演示' })).toBeInTheDocument();
-    expect(screen.getAllByRole('note').some((note) => /本地演示.*刷新即丢.*不连接服务/.test(note.textContent ?? ''))).toBe(true);
+    expect(screen.queryByRole('heading', { name: 'Muse 项目能力演示' })).not.toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: '验证发布' })).toBeInTheDocument();
     expect(screen.getByText(/存在未知费用/)).toBeInTheDocument();
     expect(screen.getByText('unknown')).toBeInTheDocument();
@@ -328,6 +354,48 @@ describe('Projects API integration', () => {
     expect(within(message).getByText('上一位成员提交的提示')).toBeInTheDocument();
   });
 
+  it('shows completed Task step counts beside the related project message', async () => {
+    vi.mocked(projectApi.tasks).mockResolvedValueOnce([{ ...task, step_count: 4, completed_step_count: 2 }]);
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{ ...projectHistoryMessage, task_id: task.id }]);
+    renderProjects();
+    await openProject();
+    expect(await screen.findByText(/Task t0000001 · 状态 completed · 已完成 2 \/ 4 步/)).toBeInTheDocument();
+  });
+
+  it('renders combined project replies by source and links each segment to its member message', async () => {
+    const origin: ProjectConversationMessage = { ...projectHistoryMessage, id: 'morigin01', sequence: 4,
+      role: 'user', task_id: undefined, content: '检查第一项交付' };
+    const combined: ProjectConversationMessage = { ...projectHistoryMessage, id: 'mreply01', sequence: 6,
+      role: 'assistant', task_id: undefined, content: '第一项已完成。\n\n第二项仍在进行。', sources: [
+        { user_message_id: origin.id, task_id: 'qtask001', task_revision: 2, event_sequence: 7, content: '第一项已完成。' },
+        { user_message_id: 'munknown1', task_id: 'qtask002', task_revision: 1, event_sequence: 3, content: '第二项仍在进行。' },
+      ] };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([origin, combined]);
+    renderProjects();
+    await openProject();
+    const reply = (await screen.findAllByRole('article', { name: '项目对话消息' }))[1]!;
+    expect(within(reply).getByRole('link', { name: '查看关联的成员消息：检查第一项交付' }))
+      .toHaveAttribute('href', '#project-conversation-message-morigin01');
+    expect(within(reply).getByText('任务 qtask001 · 修订 2 · 结果事件 7')).toBeInTheDocument();
+    expect(within(reply).getByText('关联消息 munknown1')).toBeInTheDocument();
+    expect(within(reply).getByText('第二项仍在进行。')).toBeInTheDocument();
+  });
+
+  it('keeps the full project reply when source segments do not match its content', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{
+      ...projectHistoryMessage, id: 'mreply02', role: 'assistant', task_id: undefined,
+      content: '完整的服务端回复。', sources: [
+        { user_message_id: 'munknown1', task_id: 'qtask001', task_revision: 1, event_sequence: 2, content: '旧的分段内容。' },
+      ],
+    }]);
+    renderProjects();
+    await openProject();
+    const reply = await screen.findByRole('article', { name: '项目对话消息' });
+    expect(within(reply).getByText('完整的服务端回复。')).toBeInTheDocument();
+    expect(within(reply).getByText('关联消息 munknown1 · 任务 qtask001 · 修订 1 · 结果事件 2')).toBeInTheDocument();
+    expect(within(reply).queryByText('旧的分段内容。')).not.toBeInTheDocument();
+  });
+
   it('shows a project routing failure instead of an agent delivery status', async () => {
     vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([{ ...projectHistoryMessage,
       task_id: undefined, routing_status: 'failed', delivery_status: 'pending' }]);
@@ -351,6 +419,24 @@ describe('Projects API integration', () => {
     expect(messages[0]).toHaveTextContent('回复已中断');
     expect(messages[1]).toHaveTextContent('正在回复');
     expect(messages[1]).toHaveTextContent('正在生成');
+  });
+
+  it('shows speech only for final assistant replies and scopes it to the project conversation', async () => {
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValueOnce([
+      { ...projectHistoryMessage, id: 'mfinal01', sequence: 1, role: 'assistant', content: '最终项目回复', output_status: 'completed' },
+      { ...projectHistoryMessage, id: 'mstream2', sequence: 2, role: 'assistant', content: '生成中的回复', output_status: 'streaming' },
+      { ...projectHistoryMessage, id: 'minter2', sequence: 3, role: 'assistant', content: '中断的回复', output_status: 'interrupted' },
+      { ...projectHistoryMessage, id: 'muser02', sequence: 4, role: 'user', content: '成员提示', output_status: 'completed' },
+    ]);
+    renderProjects();
+    await openProject();
+
+    const messages = await screen.findAllByRole('article', { name: '项目对话消息' });
+    expect(within(messages[0]!).getByRole('button', { name: '朗读回复' }))
+      .toHaveAttribute('data-session-key', `project:${project.id}:conversation:${projectConversation.id}`);
+    expect(within(messages[1]!).queryByRole('button', { name: '朗读回复' })).not.toBeInTheDocument();
+    expect(within(messages[2]!).queryByRole('button', { name: '朗读回复' })).not.toBeInTheDocument();
+    expect(within(messages[3]!).queryByRole('button', { name: '朗读回复' })).not.toBeInTheDocument();
   });
 
   it('renders newest-first project history pages in sequence order', async () => {
@@ -396,6 +482,17 @@ describe('Projects API integration', () => {
     }), expect.any(String), readyCapabilities.service_instance_id, owner.user_id);
     expect(screen.getByText(/消息受理不代表任务已开始或预算已预留/)).toBeInTheDocument();
     expect(screen.getByText(/此处展示服务端返回的预算与账本状态/)).toBeInTheDocument();
+  });
+
+  it('offers explicit voice input in the shared conversation composer without sending automatically', async () => {
+    const append = vi.spyOn(projectApi, 'acceptProjectConversationMessage');
+    renderProjects();
+    await openProject();
+
+    const prompt = await screen.findByLabelText('提交到共享对话的提示');
+    expect(screen.getByRole('button', { name: '开始语音输入' })).toBeInTheDocument();
+    expect(prompt).toHaveValue('');
+    expect(append).not.toHaveBeenCalled();
   });
 
   it('stores successive project messages and accepts them in order', async () => {
@@ -450,16 +547,21 @@ describe('Projects API integration', () => {
     await waitFor(() => expect(projectApi.acceptProjectConversationMessage).toHaveBeenCalledOnce());
   });
 
-  it('retains a project message when automatic routing is unavailable', async () => {
+  it('still attempts to send a project message when automatic routing is not advertised', async () => {
     vi.mocked(portalApi.capabilities).mockResolvedValue({ ...readyCapabilities, supported_features: ['project_budget_execution'] });
+    const accept = vi.spyOn(projectApi, 'acceptProjectConversationMessage');
     const user = userEvent.setup();
     renderProjects();
     await openProject();
     await user.type(await screen.findByLabelText('提交到共享对话的提示'), '项目待发送消息');
     await user.click(screen.getByRole('button', { name: '发送消息' }));
-    expect(await screen.findByText(/服务尚不支持自动分流/)).toBeInTheDocument();
-    expect(screen.getByText('项目待发送消息')).toBeInTheDocument();
-    expect(projectApi.acceptProjectConversationMessage).not.toHaveBeenCalled();
+    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/服务端尚未确认支持对话自动处理；仍会尝试发送/)).toBeInTheDocument();
+    expect(await screen.findByText('服务端已受理消息，等待分流。')).toBeInTheDocument();
+    expect(accept.mock.calls[0]?.[2].content).toBe('项目待发送消息');
+    await waitFor(() => expect(screen.getByLabelText('提交到共享对话的提示')).toHaveValue(''));
+    await user.type(screen.getByLabelText('提交到共享对话的提示'), '下一条项目消息');
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
   });
 
   it('sends explicitly selected project resources without pinning a Workspace revision at receipt', async () => {

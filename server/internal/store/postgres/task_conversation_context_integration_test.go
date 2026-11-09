@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 )
@@ -315,6 +318,131 @@ func TestPostgresScheduledTaskClaimHasExplicitEmptyConversationContext(t *testin
 		claimed.ConversationContext.Scope != "personal" || claimed.ConversationContext.ThroughSequence != 0 ||
 		len(claimed.ConversationContext.Messages) != 0 || len(claimed.ConversationContext.Digest) != sha256.Size {
 		t.Fatalf("claimed scheduled Task context = %#v, found=%t, err=%v", claimed.ConversationContext, found, err)
+	}
+}
+
+func TestPostgresScheduledPersonalContextRequiresExactOwnerRunAndTask(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	otherOwner := createPreRetirementTestUser(t, store, 9, 20_000, 40_000)
+
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	objects := []struct {
+		objectType string
+		objectID   string
+		body       string
+	}{
+		{personal.ObjectTypeProfile, personal.ProfileObjectID, `{"name":"Context owner","avatar":"spark"}`},
+		{personal.ObjectTypeSoul, "default", `{"name":"Morde","content":"Protect private data."}`},
+		{personal.ObjectTypeMemory, "global", `{"content":"prefers short summaries"}`},
+		{personal.ObjectTypeGoal, "g_schedule1", `{"title":"Finish report","status":"active","steps":[]}`},
+		{personal.ObjectTypeSkillSetting, "builtin_memory", `{"enabled":true}`},
+	}
+	for index, object := range objects {
+		mutation := personalObjectMutationForTest(t, owner.ID, fmt.Sprintf("schedule-context-%02d", index),
+			object.objectType, object.objectID, 0, object.body, false)
+		if _, err := store.ApplyPersonalMutation(ctx, principal, mutation); err != nil {
+			t.Fatalf("seed %s/%s: %v", object.objectType, object.objectID, err)
+		}
+	}
+
+	timing := schedule.Timing{Kind: schedule.TimingOnce,
+		RunAt: time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second).Format(time.RFC3339), TimeZone: "UTC"}
+	definition, _ := createPostgresSchedule(t, ctx, store, owner.ID, "", timing, schedule.MisfireRunOnce, nil)
+	occurrence, err := schedule.FirstOccurrence(timing, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+		ScheduleID: definition.ID, OwnerID: owner.ID, ExpectedVersion: definition.Version, ExpectedEpoch: definition.ExecutionEpoch,
+		Occurrence: schedule.Occurrence{Key: occurrence.Key, ScheduledAt: occurrence.ScheduledAt,
+			CheckAt: occurrence.CheckAt, Status: schedule.RunQueued},
+	})
+	if err != nil || !committed || run.TaskID == nil {
+		t.Fatalf("commit scheduled occurrence = %+v, committed=%t, err=%v", run, committed, err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "scheduled-personal-context-worker", time.Minute)
+	if err != nil || !found || claimed.ID != *run.TaskID {
+		t.Fatalf("claim scheduled Task = %q, found=%t, err=%v", claimed.ID, found, err)
+	}
+	broker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !broker.CloudDSHPersonalMemoryProofEnabledForTask(claimed) ||
+		broker.CloudDSHPersonalMemoryProofEnabledForTask(task.Task{Authorization: task.Authorization{Kind: string(identity.KindSession)}}) {
+		t.Fatal("memory checkpoint gate was not scoped to the exact context route")
+	}
+	initialContext, err := broker.InitialContext(ctx, claimed)
+	if err != nil || !strings.Contains(initialContext, "Context owner") || !strings.Contains(initialContext, "Protect private data") ||
+		!strings.Contains(initialContext, "prefers short summaries") || !strings.Contains(initialContext, "Finish report") {
+		t.Fatalf("scheduled context did not flow through the production broker: %q, %v", initialContext, err)
+	}
+	proof := strings.TrimPrefix(initialContext[strings.LastIndex(initialContext, "\n")+1:], app.CloudDSHMemoryProofPrefix)
+	if proof == "" || broker.ValidatePersonalMemoryProof(ctx, claimed, proof, nil) != nil {
+		t.Fatalf("scheduled personal context proof was not verifiable: %q", proof)
+	}
+
+	items, hasMore, err := store.ListScheduledPersonalContext(ctx, owner.ID, run.ID, claimed.ID, true, 10)
+	if err != nil || hasMore || len(items) != 4 {
+		t.Fatalf("scheduled personal snapshot = %d items, more=%t, err=%v", len(items), hasMore, err)
+	}
+	seen := map[string]bool{}
+	for _, item := range items {
+		seen[item.ObjectType+"/"+item.ObjectID] = true
+	}
+	for _, key := range []string{"profile/" + personal.ProfileObjectID, "soul/default", "memory/global", "goal/g_schedule1"} {
+		if !seen[key] {
+			t.Errorf("authorized context omitted %s: %+v", key, items)
+		}
+	}
+	if seen["skill_setting/builtin_memory"] {
+		t.Fatal("memory setting leaked into the model context listing")
+	}
+	withoutMemory, more, err := store.ListScheduledPersonalContext(ctx, owner.ID, run.ID, claimed.ID, false, 10)
+	if err != nil || more || len(withoutMemory) != 3 {
+		t.Fatalf("memory opt-out snapshot = %d items, more=%t, err=%v", len(withoutMemory), more, err)
+	}
+	for _, item := range withoutMemory {
+		if item.ObjectType == personal.ObjectTypeMemory {
+			t.Fatal("memory was returned after opt-out")
+		}
+	}
+	setting, err := store.GetScheduledPersonalContextObject(ctx, owner.ID, run.ID, claimed.ID, personal.ObjectTypeSkillSetting, "builtin_memory")
+	if err != nil || setting.Revision != 1 || string(setting.Body) != `{"enabled": true}` && string(setting.Body) != `{"enabled":true}` {
+		t.Fatalf("read authorized memory setting = %+v, err=%v", setting, err)
+	}
+
+	wrongRun, err := schedule.NewRunID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongTask, err := domain.NewTaskID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, ownerID, runID, taskID string
+	}{
+		{"wrong run", owner.ID, wrongRun, claimed.ID},
+		{"wrong task", owner.ID, run.ID, wrongTask},
+		{"wrong owner", otherOwner.ID, run.ID, claimed.ID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := store.ListScheduledPersonalContext(ctx, test.ownerID, test.runID, test.taskID, true, 10); domain.CodeOf(err) != domain.CodeUnauthenticated {
+				t.Fatalf("mismatched schedule context authorization = %v, want unauthenticated", err)
+			}
+		})
+	}
+	if _, err := store.GetScheduledPersonalContextObject(ctx, otherOwner.ID, run.ID, claimed.ID, personal.ObjectTypeProfile, personal.ProfileObjectID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("cross-owner scheduled personal read = %v, want unauthenticated", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET status='completed',finished_at=clock_timestamp(),lease_owner='',lease_expires_at=NULL WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetScheduledPersonalContextObject(ctx, owner.ID, run.ID, claimed.ID, personal.ObjectTypeProfile, personal.ProfileObjectID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("terminal scheduled Task retained personal read access = %v", err)
 	}
 }
 

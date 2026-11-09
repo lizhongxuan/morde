@@ -656,6 +656,12 @@ func (s *cloudDSHAccountRuntimeSession) StartTask(ctx context.Context, fence app
 		*lease.RuntimeFence != s.runtime.Fence || lease.RuntimeSequence < 1 || !validCloudDSHLease(lease.ExpiresAt) {
 		return nil, nil, errors.New("account Agent Runtime Task lease is invalid")
 	}
+	if fence.OwnerID != s.runtime.Fence.OwnerID {
+		return nil, nil, errors.New("account Agent Runtime Task owner does not match")
+	}
+	if s.runtime.MaxConcurrentTasks < 1 {
+		return nil, nil, errors.New("account Agent Runtime concurrency limit is invalid")
+	}
 	nonceHash := sha256.Sum256(nonce)
 	task := &cloudDSHAccountTask{ctx: ctx, fence: fence, sequence: lease.RuntimeSequence,
 		nonceSHA256: hex.EncodeToString(nonceHash[:]), expiresAt: lease.ExpiresAt,
@@ -664,6 +670,10 @@ func (s *cloudDSHAccountRuntimeSession) StartTask(ctx context.Context, fence app
 	if s.failed != nil || s.stopping || s.tasks[fence] != nil {
 		s.mu.Unlock()
 		return nil, nil, errors.New("account Agent Runtime is unavailable for this Task")
+	}
+	if len(s.tasks) >= s.runtime.MaxConcurrentTasks {
+		s.mu.Unlock()
+		return nil, nil, errors.New("account Agent Runtime Task concurrency limit is reached")
 	}
 	s.tasks[fence] = task
 	s.mu.Unlock()

@@ -263,6 +263,7 @@ type ConversationMessageUpload struct {
 	MessageID             pgtype.Text        `json:"message_id"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
 }
 
 type ConversationMessageUploadChunk struct {
@@ -333,6 +334,25 @@ type DeviceAuthorization struct {
 	State        string             `json:"state"`
 	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type GoalAgentTriggerEvent struct {
+	ID                    int64              `json:"id"`
+	ServiceInstanceID     pgtype.UUID        `json:"service_instance_id"`
+	OwnerID               string             `json:"owner_id"`
+	GoalID                string             `json:"goal_id"`
+	GoalRevision          int64              `json:"goal_revision"`
+	StepID                string             `json:"step_id"`
+	AuthorizationSnapshot []byte             `json:"authorization_snapshot"`
+	ModelConnectionID     string             `json:"model_connection_id"`
+	Status                string             `json:"status"`
+	LeaseOwner            pgtype.Text        `json:"lease_owner"`
+	LeaseUntil            pgtype.Timestamptz `json:"lease_until"`
+	AttemptCount          int32              `json:"attempt_count"`
+	ScheduleID            pgtype.Text        `json:"schedule_id"`
+	SkipReason            pgtype.Text        `json:"skip_reason"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	ProcessedAt           pgtype.Timestamptz `json:"processed_at"`
 }
 
 type Host struct {
@@ -776,6 +796,8 @@ type PersonalAttachmentUpload struct {
 	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	OrphanedAt           pgtype.Timestamptz `json:"orphaned_at"`
+	ContentDeletedAt     pgtype.Timestamptz `json:"content_deleted_at"`
 }
 
 type PersonalDataQuota struct {
@@ -1220,6 +1242,7 @@ type Schedule struct {
 	BaselineFingerprint      string             `json:"baseline_fingerprint"`
 	AuthClientInstallationID pgtype.Text        `json:"auth_client_installation_id"`
 	Title                    string             `json:"title"`
+	ExecutionPolicy          string             `json:"execution_policy"`
 }
 
 type ScheduleRun struct {
@@ -1859,6 +1882,10 @@ type WorkspaceCopyReservation struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	SourceOwnerID     string             `json:"source_owner_id"`
+	TargetOwnerID     string             `json:"target_owner_id"`
+	ShareID           pgtype.Text        `json:"share_id"`
+	ReadOnly          bool               `json:"read_only"`
 }
 
 type WorkspaceCurrentMaterialization struct {

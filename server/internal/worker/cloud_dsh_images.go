@@ -9,14 +9,17 @@ import (
 	"encoding/json"
 	"errors"
 	"image/jpeg"
+	"image/png"
 	"io"
+	"strings"
 
 	"morde/server/internal/app"
 )
 
 const (
 	cloudDSHMaxImageBytes      = 512 << 10
-	cloudDSHMaxToolImageCount  = 1
+	cloudDSHMaxToolImageCount  = 4
+	cloudDSHMaxTaskImageBytes  = 2 << 20
 	cloudDSHMaxModelImageCount = 4
 	cloudDSHMaxModelImageBytes = 2 << 20
 	// shortcut: cap replay cache at 8 MiB per task; use durable bounded attachments if tasks need longer image histories.
@@ -68,15 +71,51 @@ func validCloudDSHToolImageResult(name string, result app.AgentToolResult) bool 
 	if result.Status != app.AgentToolSucceeded {
 		return len(result.Images) == 0
 	}
-	if name == "morde_read_task_attachment" {
-		return len(result.Images) <= 1 && (len(result.Images) == 0 ||
-			(result.Images[0].MediaType == "image/jpeg" && len(result.Images[0].Data) >= 4 && len(result.Images[0].Data) <= cloudDSHMaxImageBytes))
-	}
-	if name != "desktop_screenshot" && name != "browser_screenshot" {
+	imageLimit := 0
+	maxBytes := cloudDSHMaxImageBytes
+	if strings.HasPrefix(name, "mcp_") {
+		imageLimit = 1
+		maxBytes = 36 << 10
+	} else if name == "morde_read_task_attachment" {
+		imageLimit = cloudDSHMaxToolImageCount
+	} else if name == "desktop_screenshot" || name == "browser_screenshot" {
+		imageLimit = 1
+	} else {
 		return len(result.Images) == 0
 	}
-	return len(result.Images) == 1 && result.Images[0].MediaType == "image/jpeg" &&
-		len(result.Images[0].Data) >= 4 && len(result.Images[0].Data) <= cloudDSHMaxImageBytes
+	if len(result.Images) > imageLimit {
+		return false
+	}
+	totalBytes := 0
+	for _, image := range result.Images {
+		if len(image.Data) < 4 || len(image.Data) > maxBytes {
+			return false
+		}
+		if name == "desktop_screenshot" || name == "browser_screenshot" {
+			if image.MediaType != "image/jpeg" {
+				return false
+			}
+		}
+		if _, _, err := validCloudDSHImage(image.MediaType, image.Data); err != nil {
+			return false
+		}
+		totalBytes += len(image.Data)
+	}
+	if name == "morde_read_task_attachment" && totalBytes > cloudDSHMaxTaskImageBytes {
+		return false
+	}
+	return true
+}
+
+func cloudDSHImageCountLimitForTool(name string) int {
+	switch {
+	case name == "morde_read_task_attachment":
+		return cloudDSHMaxToolImageCount
+	case strings.HasPrefix(name, "mcp_") || name == "desktop_screenshot" || name == "browser_screenshot":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func newCloudDSHImageRegistry(fence app.ModelTaskFence) *cloudDSHImageRegistry {
@@ -100,7 +139,7 @@ func decodeCloudDSHImageRef(raw []byte) (cloudDSHImageRef, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&ref) != nil || decoder.Decode(new(any)) != io.EOF || !validCloudDSHImageID(ref.AttachmentID) ||
-		ref.MediaType != "image/jpeg" || ref.Bytes < 4 || ref.Bytes > cloudDSHMaxImageBytes ||
+		(ref.MediaType != "image/jpeg" && ref.MediaType != "image/png") || ref.Bytes < 4 || ref.Bytes > cloudDSHMaxImageBytes ||
 		ref.Width < 1 || ref.Width > cloudDSHMaxImageWidth || ref.Height < 1 || ref.Height > cloudDSHMaxImageHeight {
 		return cloudDSHImageRef{}, errors.New("dsh image reference is invalid")
 	}
@@ -124,8 +163,13 @@ func (r *cloudDSHImageRegistry) add(images []app.ModelImage) ([]cloudDSHToolImag
 		return nil, errors.New("dsh tool returned too many images")
 	}
 	result := make([]cloudDSHToolImage, 0, len(images))
+	totalBytes := 0
 	for _, image := range images {
-		width, height, err := validCloudDSHJPEG(image.MediaType, image.Data)
+		totalBytes += len(image.Data)
+		if totalBytes > cloudDSHMaxTaskImageBytes {
+			return nil, errors.New("dsh tool image result exceeds the aggregate size limit")
+		}
+		width, height, err := validCloudDSHImage(image.MediaType, image.Data)
 		if err != nil {
 			return nil, err
 		}
@@ -173,7 +217,7 @@ func decodeCloudDSHImageAttachment(raw []byte) (cloudDSHImageAttachment, []byte,
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&attachment) != nil || decoder.Decode(new(any)) != io.EOF ||
-		!validCloudDSHImageID(attachment.AttachmentID) || attachment.MediaType != "image/jpeg" ||
+		!validCloudDSHImageID(attachment.AttachmentID) || (attachment.MediaType != "image/jpeg" && attachment.MediaType != "image/png") ||
 		attachment.Bytes < 4 || attachment.Bytes > cloudDSHMaxImageBytes || attachment.Width < 1 ||
 		attachment.Width > cloudDSHMaxImageWidth || attachment.Height < 1 || attachment.Height > cloudDSHMaxImageHeight ||
 		attachment.DataBase64 == "" || len(attachment.DataBase64) > 700<<10 {
@@ -183,7 +227,7 @@ func decodeCloudDSHImageAttachment(raw []byte) (cloudDSHImageAttachment, []byte,
 	if err != nil || len(data) != attachment.Bytes || base64.StdEncoding.EncodeToString(data) != attachment.DataBase64 {
 		return cloudDSHImageAttachment{}, nil, invalid
 	}
-	width, height, err := validCloudDSHJPEG(attachment.MediaType, data)
+	width, height, err := validCloudDSHImage(attachment.MediaType, data)
 	if err != nil || width != attachment.Width || height != attachment.Height {
 		return cloudDSHImageAttachment{}, nil, invalid
 	}
@@ -204,6 +248,24 @@ func validCloudDSHJPEG(mediaType string, data []byte) (int, int, error) {
 	}
 	if _, err := jpeg.Decode(bytes.NewReader(data)); err != nil {
 		return 0, 0, errors.New("dsh JPEG data is invalid")
+	}
+	return config.Width, config.Height, nil
+}
+
+func validCloudDSHImage(mediaType string, data []byte) (int, int, error) {
+	if mediaType == "image/jpeg" {
+		return validCloudDSHJPEG(mediaType, data)
+	}
+	if mediaType != "image/png" || len(data) < 4 || len(data) > cloudDSHMaxImageBytes {
+		return 0, 0, errors.New("dsh image is outside the supported size limit")
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(data))
+	if err != nil || config.Width < 1 || config.Width > cloudDSHMaxImageWidth || config.Height < 1 || config.Height > cloudDSHMaxImageHeight {
+		return 0, 0, errors.New("dsh PNG dimensions are invalid")
+	}
+	decoded, err := png.Decode(bytes.NewReader(data))
+	if err != nil || decoded == nil || decoded.Bounds().Dx() != config.Width || decoded.Bounds().Dy() != config.Height {
+		return 0, 0, errors.New("dsh PNG data is invalid")
 	}
 	return config.Width, config.Height, nil
 }

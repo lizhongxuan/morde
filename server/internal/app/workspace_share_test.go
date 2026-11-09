@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -89,16 +90,22 @@ func (s *workspaceShareTestStore) WorkspaceShareSourceMatches(context.Context, s
 }
 
 type workspaceShareTestCopier struct {
-	mu      sync.Mutex
-	calls   int
-	entered chan struct{}
-	release chan struct{}
+	mu       sync.Mutex
+	calls    int
+	entered  chan struct{}
+	release  chan struct{}
+	store    *workspaceShareTestStore
+	shares   []workspace.ShareLink
+	failOnce bool
 }
 
-func (c *workspaceShareTestCopier) Copy(_ context.Context, _ identity.Principal, sourceID string,
-	command WorkspaceCopyCommand, _ string) (WorkspaceCopyResult, error) {
+func (c *workspaceShareTestCopier) copyForWorkspaceShare(_ context.Context, principal identity.Principal,
+	share workspace.ShareLink) (WorkspaceCopyResult, error) {
 	c.mu.Lock()
 	c.calls++
+	c.shares = append(c.shares, share)
+	failOnce := c.failOnce
+	c.failOnce = false
 	if c.entered != nil {
 		select {
 		case c.entered <- struct{}{}:
@@ -110,41 +117,27 @@ func (c *workspaceShareTestCopier) Copy(_ context.Context, _ identity.Principal,
 	if release != nil {
 		<-release
 	}
-	return WorkspaceCopyResult{SourceWorkspaceID: sourceID, SourceRevision: command.ExpectedCurrentRevision,
-		Workspace: DeviceWorkspaceInfo{ID: "w0000002", Name: command.Name, Revision: 1, State: workspace.StateReady},
+	if share.TargetWorkspaceID == "" {
+		share.TargetWorkspaceID = "w0000002"
+	}
+	if c.store != nil {
+		c.store.mu.Lock()
+		c.store.link.TargetWorkspaceID = share.TargetWorkspaceID
+		c.store.mu.Unlock()
+	}
+	if failOnce {
+		return WorkspaceCopyResult{}, errors.New("copy outcome unknown")
+	}
+	return WorkspaceCopyResult{SourceWorkspaceID: share.SourceWorkspaceID, SourceRevision: share.SourceRevision,
+		Workspace: DeviceWorkspaceInfo{ID: share.TargetWorkspaceID, Name: share.WorkspaceName, Revision: 1, State: workspace.StateReady},
 		State:     workspace.CopyCompleted}, nil
 }
 
-type workspaceShareTestTransfers struct {
-	mu       sync.Mutex
-	readOnly bool
-}
-
-func (*workspaceShareTestTransfers) RequestWorkspaceTransfer(context.Context, identity.Principal, string, string,
-	int64, string) (workspace.OwnershipTransfer, bool, error) {
-	return workspace.OwnershipTransfer{ID: "r0000001"}, false, nil
-}
-
-func (s *workspaceShareTestTransfers) AcceptWorkspaceTransfer(context.Context, identity.Principal, string, string, string) (workspace.OwnershipTransfer, error) {
-	s.mu.Lock()
-	s.readOnly = false
-	s.mu.Unlock()
-	return workspace.OwnershipTransfer{}, nil
-}
-
-func (s *workspaceShareTestTransfers) AcceptWorkspaceTransferReadOnly(context.Context, identity.Principal, string, string,
-	string) (workspace.OwnershipTransfer, error) {
-	s.mu.Lock()
-	s.readOnly = true
-	s.mu.Unlock()
-	return workspace.OwnershipTransfer{}, nil
-}
-
-func newWorkspaceShareTestService(t *testing.T, copier *workspaceShareTestCopier) (*WorkspaceShareService, *workspaceShareTestStore, *workspaceShareTestTransfers, string) {
+func newWorkspaceShareTestService(t *testing.T, copier *workspaceShareTestCopier) (*WorkspaceShareService, *workspaceShareTestStore, string) {
 	t.Helper()
 	store := &workspaceShareTestStore{sourceCurrent: true}
-	transfers := &workspaceShareTestTransfers{}
-	service, err := NewWorkspaceShareService(store, copier, transfers)
+	copier.store = store
+	service, err := NewWorkspaceShareService(store, copier)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,12 +146,12 @@ func newWorkspaceShareTestService(t *testing.T, copier *workspaceShareTestCopier
 	if err != nil {
 		t.Fatal(err)
 	}
-	return service, store, transfers, created.Token
+	return service, store, created.Token
 }
 
 func TestWorkspaceShareCreatesReadOnlyCopyAndInvalidatesLinkAfterSingleClaim(t *testing.T) {
 	copier := &workspaceShareTestCopier{}
-	service, store, transfers, token := newWorkspaceShareTestService(t, copier)
+	service, store, token := newWorkspaceShareTestService(t, copier)
 	if len(token) != 43 || len(store.link.TokenHash) != 32 {
 		t.Fatalf("share token/hash lengths = %d/%d", len(token), len(store.link.TokenHash))
 	}
@@ -178,8 +171,8 @@ func TestWorkspaceShareCreatesReadOnlyCopyAndInvalidatesLinkAfterSingleClaim(t *
 	if err != nil || accepted.WorkspaceID != "w0000002" || accepted.Permission != workspace.ShareView {
 		t.Fatalf("share acceptance = %#v, err=%v", accepted, err)
 	}
-	if !transfers.readOnly || store.link.State != workspace.ShareClaimed || store.link.ClaimantID != recipient.UserID {
-		t.Fatalf("claimed share state = %#v, transfer readOnly=%v", store.link, transfers.readOnly)
+	if store.link.State != workspace.ShareClaimed || store.link.ClaimantID != recipient.UserID || store.link.TargetWorkspaceID != accepted.WorkspaceID {
+		t.Fatalf("claimed share state = %#v", store.link)
 	}
 	if _, err := service.Preview(context.Background(), identity.Principal{UserID: "u0000003", Role: identity.RoleUser, Kind: identity.KindSession}, token); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("claimed link preview error = %v, want not found", err)
@@ -198,11 +191,15 @@ func TestWorkspaceShareCreatesReadOnlyCopyAndInvalidatesLinkAfterSingleClaim(t *
 	if copier.calls != 1 {
 		t.Fatalf("Workspace copy count = %d, want one", copier.calls)
 	}
+	if len(copier.shares) != 1 || copier.shares[0].OwnerID != "u0000001" || copier.shares[0].ClaimantID != recipient.UserID ||
+		copier.shares[0].Permission != workspace.ShareView {
+		t.Fatalf("copy was not requested from the recipient's active read-only claim: %#v", copier.shares)
+	}
 }
 
 func TestWorkspaceShareReservesAnInProgressClaimForOneRecipient(t *testing.T) {
 	copier := &workspaceShareTestCopier{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	service, _, _, token := newWorkspaceShareTestService(t, copier)
+	service, _, token := newWorkspaceShareTestService(t, copier)
 	winner := identity.Principal{UserID: "u0000002", Role: identity.RoleUser, Kind: identity.KindSession}
 	result := make(chan error, 1)
 	go func() {
@@ -226,5 +223,27 @@ func TestWorkspaceShareReservesAnInProgressClaimForOneRecipient(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("reserved recipient claim did not finish")
+	}
+}
+
+func TestWorkspaceShareClaimRetriesRecipientOwnedCopyWithoutTransfer(t *testing.T) {
+	copier := &workspaceShareTestCopier{failOnce: true}
+	service, store, token := newWorkspaceShareTestService(t, copier)
+	recipient := identity.Principal{UserID: "u0000002", Role: identity.RoleUser, Kind: identity.KindSession}
+	if _, err := service.Accept(context.Background(), recipient, token); err == nil {
+		t.Fatal("first copy attempt succeeded despite injected uncertain outcome")
+	}
+	if store.link.TargetWorkspaceID != "w0000002" || store.link.State != workspace.ShareClaiming {
+		t.Fatalf("copy reservation was not preserved for retry: %#v", store.link)
+	}
+	accepted, err := service.Accept(context.Background(), recipient, token)
+	if err != nil || accepted.WorkspaceID != store.link.TargetWorkspaceID {
+		t.Fatalf("recipient retry = %#v, err=%v", accepted, err)
+	}
+	copier.mu.Lock()
+	defer copier.mu.Unlock()
+	if copier.calls != 2 || len(copier.shares) != 2 || copier.shares[0].TargetWorkspaceID != "" ||
+		copier.shares[1].TargetWorkspaceID != "w0000002" {
+		t.Fatalf("retry did not reuse the reserved recipient copy: calls=%d shares=%#v", copier.calls, copier.shares)
 	}
 }

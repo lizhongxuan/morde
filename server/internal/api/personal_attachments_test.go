@@ -82,7 +82,8 @@ func TestPersonalAttachmentRoutesUseOwnerScopedServiceAndBoundedChunks(t *testin
 	router.ServeHTTP(created, create)
 	var uploadResponse personalAttachmentUploadResponse
 	if created.Code != http.StatusOK || json.Unmarshal(created.Body.Bytes(), &uploadResponse) != nil ||
-		service.upload.IdempotencyKey != "upload-key-001" || service.principal.UserID != principal.UserID || uploadResponse.ChunkCount != 1 {
+		service.upload.IdempotencyKey != "upload-key-001" || service.principal.UserID != principal.UserID ||
+		uploadResponse.ChunkCount != 1 || uploadResponse.ReceivedSequences == nil || len(uploadResponse.ReceivedSequences) != 0 {
 		t.Fatalf("create response=%d %s upload=%+v calls=%d", created.Code, created.Body, service.upload, service.calls)
 	}
 

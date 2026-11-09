@@ -3,14 +3,26 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const PATCH_MARKER = "MORDE_PAGE_DATE_METADATA_PATCH_V1";
+export const HTTPS_REDIRECT_MARKER = "MORDE_HTTPS_REDIRECT_POLICY_V1";
 
 const UPSTREAM_IMPORT = 'import { NodeHtmlMarkdown } from "node-html-markdown";';
 const PATCH_IMPORT = 'import { extractPageDateMetadata } from "../../../patches/page-date.mjs";';
 const UPSTREAM_CONVERSION = '    return { kind: "markdown", text: convertText(read.text, type, attempt.url) };';
+const UPSTREAM_REDIRECT = [
+  "    const next = new URL(location, current);",
+  "    assertUrlAllowed(next);",
+  "    return next;",
+].join("\n");
 const PATCHED_CONVERSION = [
   '    const pageDateMetadata = type.kind === "html" ? extractPageDateMetadata(read.text) : "";',
   '    const markdown = convertText(read.text, type, attempt.url);',
   '    return { kind: "markdown", text: pageDateMetadata ? `${pageDateMetadata}\\n\\n${markdown}` : markdown };',
+].join("\n");
+const PATCHED_REDIRECT = [
+  "    const next = new URL(location, current);",
+  "    assertUrlAllowed(next);",
+  `    if (next.protocol !== "https:") throw createContentError("Insecure URL redirect blocked.", next.href); // ${HTTPS_REDIRECT_MARKER}`,
+  "    return next;",
 ].join("\n");
 
 export function patchUrlReader(source) {
@@ -18,14 +30,24 @@ export function patchUrlReader(source) {
     if (!source.includes(PATCH_IMPORT) || !source.includes("extractPageDateMetadata(read.text)")) {
       throw new Error("The existing Morde page-date patch is incomplete; refusing to continue.");
     }
-    return source;
+    if (source.includes(HTTPS_REDIRECT_MARKER)) {
+      if (!source.includes('next.protocol !== "https:"')) {
+        throw new Error("The existing Morde HTTPS redirect patch is incomplete; refusing to continue.");
+      }
+      return source;
+    }
+    if (!source.includes(UPSTREAM_REDIRECT)) {
+      throw new Error("The existing Morde page-date patch cannot be upgraded safely.");
+    }
+    return source.replace(UPSTREAM_REDIRECT, PATCHED_REDIRECT);
   }
-  if (!source.includes(UPSTREAM_IMPORT) || !source.includes(UPSTREAM_CONVERSION)) {
+  if (!source.includes(UPSTREAM_IMPORT) || !source.includes(UPSTREAM_CONVERSION) || !source.includes(UPSTREAM_REDIRECT)) {
     throw new Error("The pinned mcp-searxng URL reader differs from the expected 2.10.0 source; refusing to patch.");
   }
   return source
     .replace(UPSTREAM_IMPORT, `${UPSTREAM_IMPORT}\n${PATCH_IMPORT} // ${PATCH_MARKER}`)
-    .replace(UPSTREAM_CONVERSION, PATCHED_CONVERSION);
+    .replace(UPSTREAM_CONVERSION, PATCHED_CONVERSION)
+    .replace(UPSTREAM_REDIRECT, PATCHED_REDIRECT);
 }
 
 export async function applyPatch(packageDir) {

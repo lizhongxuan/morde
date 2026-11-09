@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -27,14 +28,14 @@ func TestPostgresPersonalAttachmentUploadIdempotencyCancelAndCleanup(t *testing.
 	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
 	createPersonalLibraryItemForAttachmentTest(t, store, principal, "library-item_1")
 
-	content := []byte("hello")
+	content := bytes.Repeat([]byte("x"), int(personal.MaxAttachmentChunkBytes+1))
 	first := newPersonalAttachmentUploadForTest(t, owner.ID, "library-item_1", 1, content)
 	created, err := store.CreatePersonalAttachmentUpload(ctx, principal, first, "attachment-create-001")
-	if err != nil || created.State != personal.AttachmentUploadPending || created.ChunkCount != 1 {
+	if err != nil || created.State != personal.AttachmentUploadPending || created.ChunkCount != 2 || len(created.ReceivedSequences) != 0 {
 		t.Fatalf("create upload = %+v, %v", created, err)
 	}
 	replayed, err := store.CreatePersonalAttachmentUpload(ctx, principal, newPersonalAttachmentUploadForTest(t, owner.ID, "library-item_1", 1, content), "attachment-create-001")
-	if err != nil || !replayed.Replay || replayed.UploadID != created.UploadID {
+	if err != nil || !replayed.Replay || replayed.UploadID != created.UploadID || len(replayed.ReceivedSequences) != 0 {
 		t.Fatalf("create replay = %+v, %v", replayed, err)
 	}
 	conflicting := newPersonalAttachmentUploadForTest(t, owner.ID, "library-item_1", 1, []byte("other"))
@@ -45,21 +46,32 @@ func TestPostgresPersonalAttachmentUploadIdempotencyCancelAndCleanup(t *testing.
 	if _, err := store.ActivatePersonalAttachmentUpload(ctx, principal, created.UploadID, "reservation-001"); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(content)
-	chunk := personal.AttachmentChunk{UploadID: created.UploadID, Sequence: 0, SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:])}
-	put, err := store.PutPersonalAttachmentChunk(ctx, principal, chunk, bytes.NewReader(content))
+	firstChunk := content[:personal.MaxAttachmentChunkBytes]
+	digest := sha256.Sum256(firstChunk)
+	chunk := personal.AttachmentChunk{UploadID: created.UploadID, Sequence: 0, SizeBytes: int64(len(firstChunk)), SHA256: hex.EncodeToString(digest[:])}
+	put, err := store.PutPersonalAttachmentChunk(ctx, principal, chunk, bytes.NewReader(firstChunk))
 	if err != nil || put.Replay {
 		t.Fatalf("first chunk = %+v, %v", put, err)
 	}
-	put, err = store.PutPersonalAttachmentChunk(ctx, principal, chunk, bytes.NewReader(content))
+	put, err = store.PutPersonalAttachmentChunk(ctx, principal, chunk, bytes.NewReader(firstChunk))
 	if err != nil || !put.Replay {
 		t.Fatalf("chunk replay = %+v, %v", put, err)
 	}
-	changed := []byte("other")
+	changed := bytes.Repeat([]byte("y"), len(firstChunk))
 	changedDigest := sha256.Sum256(changed)
 	chunk.SHA256 = hex.EncodeToString(changedDigest[:])
 	if _, err := store.PutPersonalAttachmentChunk(ctx, principal, chunk, bytes.NewReader(changed)); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("changed chunk replay error = %v", err)
+	}
+
+	resumed, err := store.CreatePersonalAttachmentUpload(ctx, principal,
+		newPersonalAttachmentUploadForTest(t, owner.ID, "library-item_1", 1, content), "attachment-create-001")
+	if err != nil || !resumed.Replay || len(resumed.ReceivedSequences) != 1 || resumed.ReceivedSequences[0] != 0 {
+		t.Fatalf("partial upload resume = %+v, %v", resumed, err)
+	}
+	activated, err := store.ActivatePersonalAttachmentUpload(ctx, principal, created.UploadID, "reservation-001")
+	if err != nil || len(activated.ReceivedSequences) != 1 || activated.ReceivedSequences[0] != 0 {
+		t.Fatalf("active upload resume = %+v, %v", activated, err)
 	}
 
 	reservation, err := store.CancelPersonalAttachmentUpload(ctx, principal, created.UploadID)
@@ -155,6 +167,118 @@ func TestPostgresPersonalAttachmentReadRequiresCurrentOwnerReference(t *testing.
 			_ = reader.Close()
 		}
 		t.Fatalf("cross-owner attachment read error = %v", err)
+	}
+}
+
+func TestPostgresPersonalAttachmentCleanupRetainsThenDeletesUnreferencedContent(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	if !requirePersonalAttachmentSchema(t, ctx, pool) {
+		return
+	}
+	owner := createTestUser(t, store, 2, 2000, 4096)
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	createPersonalLibraryItemForAttachmentTest(t, store, principal, "library-gc-source")
+	content := []byte("synthetic attachment bytes for cleanup")
+	upload := newPersonalAttachmentUploadForTest(t, owner.ID, "library-gc-source", 1, content)
+	created, err := store.CreatePersonalAttachmentUpload(ctx, principal, upload, "attachment-gc-create-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReservePersonalAttachment(ctx, principal, created.UploadID, int64(len(content)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ActivatePersonalAttachmentUpload(ctx, principal, created.UploadID, reservation); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	chunk := personal.AttachmentChunk{UploadID: created.UploadID, Sequence: 0, SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:])}
+	if _, err := store.PutPersonalAttachmentChunk(ctx, principal, chunk, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := store.CommitPersonalAttachment(ctx, principal, created.UploadID, "attachment-gc-commit-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := store.CleanupExpiredPersonalAttachmentUploads(ctx, now, 10); err != nil {
+		t.Fatal(err)
+	}
+	var orphanedAt *time.Time
+	var chunks int
+	if err := pool.QueryRow(ctx, `SELECT orphaned_at,(SELECT count(*) FROM personal_attachment_chunks c
+WHERE c.service_instance_id=u.service_instance_id AND c.owner_id=u.owner_id AND c.upload_id=u.upload_id)
+FROM personal_attachment_uploads u WHERE owner_id=$1 AND upload_id=$2`, owner.ID, created.UploadID).Scan(&orphanedAt, &chunks); err != nil || orphanedAt != nil || chunks != 1 {
+		t.Fatalf("referenced attachment cleanup orphaned_at=%v chunks=%d err=%v", orphanedAt, chunks, err)
+	}
+
+	deleted := personal.Mutation{OwnerID: owner.ID, MutationID: "library-delete-gc-001", ObjectType: personal.ObjectTypeLibraryItem,
+		ObjectID: "library-gc-source", BaseRevision: committed.ResultRevision, Delete: true}
+	deleted.RequestHash, err = personal.HashMutationContent(deleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, _, err := store.OpenPersonalAttachment(ctx, principal, committed.AttachmentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteCtx, cancelDelete := context.WithTimeout(ctx, 250*time.Millisecond)
+	_, activeReadDeleteErr := store.ApplyPersonalMutation(deleteCtx, principal, deleted)
+	cancelDelete()
+	if activeReadDeleteErr == nil {
+		_ = reader.Close()
+		t.Fatal("deleting an attachment reference succeeded while its download was active")
+	}
+	if closeErr := reader.Close(); closeErr != nil {
+		t.Fatalf("close incomplete attachment read: %v", closeErr)
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CleanupExpiredPersonalAttachmentUploads(ctx, now, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT orphaned_at,(SELECT count(*) FROM personal_attachment_chunks c
+WHERE c.service_instance_id=u.service_instance_id AND c.owner_id=u.owner_id AND c.upload_id=u.upload_id)
+FROM personal_attachment_uploads u WHERE owner_id=$1 AND upload_id=$2`, owner.ID, created.UploadID).Scan(&orphanedAt, &chunks); err != nil || orphanedAt == nil || chunks != 1 {
+		t.Fatalf("newly orphaned attachment cleanup orphaned_at=%v chunks=%d err=%v", orphanedAt, chunks, err)
+	}
+	if _, err := store.CleanupExpiredPersonalAttachmentUploads(ctx, now.Add(29*24*time.Hour), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM personal_attachment_chunks WHERE owner_id=$1 AND upload_id=$2`, owner.ID, created.UploadID).Scan(&chunks); err != nil || chunks != 1 {
+		t.Fatalf("attachment content was removed before retention elapsed: chunks=%d err=%v", chunks, err)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE personal_attachment_uploads SET orphaned_at=$3
+WHERE owner_id=$1 AND upload_id=$2`, owner.ID, created.UploadID, now.Add(-31*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CleanupExpiredPersonalAttachmentUploads(ctx, now, 10); err != nil {
+		t.Fatal(err)
+	}
+	var contentDeletedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT content_deleted_at,(SELECT count(*) FROM personal_attachment_chunks c
+WHERE c.service_instance_id=u.service_instance_id AND c.owner_id=u.owner_id AND c.upload_id=u.upload_id)
+FROM personal_attachment_uploads u WHERE owner_id=$1 AND upload_id=$2`, owner.ID, created.UploadID).Scan(&contentDeletedAt, &chunks); err != nil || contentDeletedAt == nil || chunks != 0 {
+		t.Fatalf("expired orphan content cleanup deleted_at=%v chunks=%d err=%v", contentDeletedAt, chunks, err)
+	}
+	if reader, _, err := store.OpenPersonalAttachment(ctx, principal, committed.AttachmentID); domain.CodeOf(err) != domain.CodeNotFound {
+		if reader != nil {
+			_ = reader.Close()
+		}
+		t.Fatalf("physically deleted attachment remained readable: %v", err)
+	}
+
+	replacement := personal.Mutation{OwnerID: owner.ID, MutationID: "library-reuse-gc-001", ObjectType: personal.ObjectTypeLibraryItem,
+		ObjectID: "library-gc-replacement", Body: []byte(`{"name":"replacement","kind":"artifact","attachment_id":"` + committed.AttachmentID + `","mime":"application/octet-stream","size_bytes":` + fmt.Sprint(len(content)) + `}`)}
+	replacement.RequestHash, err = personal.HashMutationContent(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, replacement); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("re-attaching garbage-collected content returned %v, want not found", err)
 	}
 }
 

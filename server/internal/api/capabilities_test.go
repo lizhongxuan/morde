@@ -199,7 +199,8 @@ func TestCapabilitiesSeparateTaskAPIFromCloudExecution(t *testing.T) {
 	var result capabilitiesResponse
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil ||
 		!slices.Contains(result.SupportedFeatures, "task_api") || slices.Contains(result.SupportedFeatures, "cloud_tasks") ||
-		slices.Contains(result.SupportedFeatures, "project_work_items_v2") {
+		slices.Contains(result.SupportedFeatures, "project_work_items_v2") ||
+		slices.Contains(result.SupportedFeatures, "conversation_auto_routing_v1") {
 		t.Fatalf("queued-only task capabilities = %d %s; want task_api without cloud_tasks", response.Code, response.Body)
 	}
 
@@ -214,6 +215,45 @@ func TestCapabilitiesSeparateTaskAPIFromCloudExecution(t *testing.T) {
 		!slices.Contains(result.SupportedFeatures, "task_api") || !slices.Contains(result.SupportedFeatures, "cloud_tasks") ||
 		slices.Contains(result.SupportedFeatures, "project_budget_execution") {
 		t.Fatalf("executable task capabilities = %d %s; want task_api and cloud_tasks without the incomplete project stack", response.Code, response.Body)
+	}
+}
+
+func TestConversationAutoRoutingCapabilityRequiresAssembledPipeline(t *testing.T) {
+	services := newServices()
+	deps := services.deps()
+	deps.Tasks = &taskServiceStub{}
+	deps.Conversations = &conversationServiceStub{}
+	deps.ProjectConversations = &projectConversationRoutesStub{}
+	deps.ClientLogin = &clientLoginHTTPStub{}
+	deps.ModelConnections = &modelConnectionManagerStub{}
+	deps.ModelGateway = &modelGatewayContractStub{}
+	options := validOptions()
+	options.ServiceInstanceID = "9f0de095-66ba-49c6-a87b-0c527f4f81a1"
+
+	readCapabilities := func() capabilitiesResponse {
+		t.Helper()
+		router, err := New(deps, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := request(router, http.MethodGet, "/api/capabilities", "", "", "")
+		var result capabilitiesResponse
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+			t.Fatalf("capabilities = %d %s", response.Code, response.Body)
+		}
+		return result
+	}
+
+	if slices.Contains(readCapabilities().SupportedFeatures, "conversation_auto_routing_v1") {
+		t.Fatal("automatic routing advertised without a running routing worker")
+	}
+	deps.ConversationAutoRoutingReady = true
+	if !slices.Contains(readCapabilities().SupportedFeatures, "conversation_auto_routing_v1") {
+		t.Fatal("assembled automatic routing pipeline was not advertised")
+	}
+	deps.ProjectConversations = nil
+	if slices.Contains(readCapabilities().SupportedFeatures, "conversation_auto_routing_v1") {
+		t.Fatal("automatic routing advertised without project conversation routes")
 	}
 }
 
@@ -371,8 +411,9 @@ func TestSharedClientFixtureMatchesCapabilitiesErrorsAndTaskCursorFrame(t *testi
 	if !strings.Contains(assistantSection, "enum: [streaming, completed, interrupted]") {
 		t.Fatal("Portal OpenAPI TaskAssistantMessage status enum differs from the shared fixture")
 	}
-	if !strings.Contains(assistantSection, "required: [id, conversation_id, sequence, task_id, role, content, status, created_at]") {
-		t.Fatal("Portal OpenAPI TaskAssistantMessage must include the conversation sequence")
+	if !strings.Contains(assistantSection, "required: [id, conversation_id, task_id, role, content, status, created_at]") ||
+		!strings.Contains(assistantSection, "sequence: { type: integer, format: int64, minimum: 1") {
+		t.Fatal("Portal OpenAPI TaskAssistantMessage must make a not-yet-durable conversation sequence optional")
 	}
 	if !slices.Equal(fixture.AssistantMessageStatuses, []string{"streaming", "completed", "interrupted"}) {
 		t.Fatalf("shared assistant message statuses = %v", fixture.AssistantMessageStatuses)
@@ -527,9 +568,12 @@ func TestConversationMessageOpenAPIUsesAsyncAcceptanceContract(t *testing.T) {
 		t.Fatal("Portal OpenAPI personal route retains the old direct Task contract")
 	}
 	start := strings.Index(contract, "    AcceptConversationMessageRequest:\n")
+	if start < 0 {
+		t.Fatal("Portal OpenAPI message acceptance request schema is missing")
+	}
 	end := strings.Index(contract[start+1:], "\n    AcceptedConversationMessageResponse:\n")
-	if start < 0 || end < 0 {
-		t.Fatal("Portal OpenAPI message acceptance request schema is missing or unbounded")
+	if end < 0 {
+		t.Fatal("Portal OpenAPI message acceptance request schema is unbounded")
 	}
 	section := contract[start : start+1+end]
 	for _, requiredRule := range []string{
@@ -542,7 +586,34 @@ func TestConversationMessageOpenAPIUsesAsyncAcceptanceContract(t *testing.T) {
 			t.Fatalf("Portal OpenAPI message acceptance request schema is missing %q:\n%s", requiredRule, section)
 		}
 	}
-	if strings.Contains(section, "mode:") || strings.Contains(section, "input_revision:") || strings.Contains(section, "\n        attachment_ids:") {
-		t.Fatalf("Portal OpenAPI message acceptance request contains direct Task fields:\n%s", section)
+	for _, obsolete := range []string{"\n        mode:", "\n        input_revision:", "\n        attachment_ids:"} {
+		if strings.Contains(section, obsolete) {
+			t.Fatalf("Portal OpenAPI message acceptance request contains direct Task field %q", obsolete)
+		}
+	}
+}
+
+func TestConversationTaskOpenAPIIsReadOnly(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI schema: %v", err)
+	}
+	contract := string(openAPI)
+	routeStart := strings.Index(contract, "  /api/conversations/{id}/tasks:\n")
+	if routeStart < 0 {
+		t.Fatal("Portal OpenAPI conversation Task route is missing")
+	}
+	routeEnd := strings.Index(contract[routeStart+1:], "  /api/conversations/{id}/messages:\n")
+	if routeEnd < 0 {
+		t.Fatal("Portal OpenAPI conversation Task route is not bounded")
+	}
+	route := contract[routeStart : routeStart+1+routeEnd]
+	if !strings.Contains(route, "operationId: listConversationActiveTasks\n") || !strings.Contains(route, "    get:\n") ||
+		strings.Contains(route, "    post:\n") {
+		t.Fatalf("Portal OpenAPI conversation Task route must only list active tasks:\n%s", route)
+	}
+	if strings.Contains(contract, "submitConversationTask") || strings.Contains(contract, "SubmitConversationTaskRequest") ||
+		strings.Contains(contract, "SubmittedConversationTaskResponse") {
+		t.Fatal("Portal OpenAPI still exposes direct conversation Task submission")
 	}
 }

@@ -77,6 +77,10 @@ const (
 	ScopeScheduleManage  Scope = "schedule:manage"
 	ScopeMCPControl      Scope = "mcp:control"
 	ScopeWorkspaceSync   Scope = "workspace:sync"
+	// ScopeGoalFollowupReadOnly is an internal execution-policy marker. It is
+	// present only on hostless, automatically generated Goal follow-up Tasks;
+	// it does not grant an API capability.
+	ScopeGoalFollowupReadOnly Scope = "task:goal_followup_read_only"
 )
 
 var apiKeyScopes = [...]Scope{
@@ -174,6 +178,12 @@ func HostlessScheduleTaskExecutionScopes() []Scope {
 	return []Scope{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskControl}
 }
 
+// GoalFollowupScheduleTaskExecutionScopes preserve normal Task lifecycle
+// controls while tagging the Task for a tool-level read-only allowlist.
+func GoalFollowupScheduleTaskExecutionScopes() []Scope {
+	return []Scope{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskControl, ScopeGoalFollowupReadOnly}
+}
+
 func IsScheduleTaskExecutionScopeSet(scopes []Scope) bool {
 	return IsHostBoundScheduleTaskExecutionScopeSet(scopes) || IsHostlessScheduleTaskExecutionScopeSet(scopes)
 }
@@ -183,7 +193,12 @@ func IsHostBoundScheduleTaskExecutionScopeSet(scopes []Scope) bool {
 }
 
 func IsHostlessScheduleTaskExecutionScopeSet(scopes []Scope) bool {
-	return isExactScopeSet(scopes, HostlessScheduleTaskExecutionScopes())
+	return isExactScopeSet(scopes, HostlessScheduleTaskExecutionScopes()) ||
+		isExactScopeSet(scopes, GoalFollowupScheduleTaskExecutionScopes())
+}
+
+func IsGoalFollowupScheduleTaskExecutionScopeSet(scopes []Scope) bool {
+	return isExactScopeSet(scopes, GoalFollowupScheduleTaskExecutionScopes())
 }
 
 func isExactScopeSet(scopes, expected []Scope) bool {

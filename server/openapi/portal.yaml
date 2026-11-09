@@ -80,7 +80,7 @@ paths:
                   minimum_client_version: { type: [string, 'null'] }
                   supported_features:
                     type: array
-                    description: An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
+                    description: An absent feature is unavailable or not yet declared. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised.
                     items: { type: string }
                   default_max_request_bytes: { type: integer, format: int64, minimum: 1 }
         '503': { $ref: '#/components/responses/Error' }
@@ -1900,7 +1900,7 @@ paths:
       tags: [Workspaces]
       operationId: acceptWorkspaceShareLink
       summary: Claim a Workspace copy link
-      description: Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
+      description: Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. The server creates the recipient-owned copy with the selected view/edit permission when it reserves the copy; neither successful nor recovery paths use ownership transfer or transfer the original Workspace or its Host bindings. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -5707,6 +5707,36 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/personal-data/office-preview:
+    post:
+      tags: [Personal Data]
+      operationId: previewPersonalOfficeText
+      summary: Preview plain text from a user-selected Office document
+      description: Requires an approved portal session or active Client credential. This manual operation accepts only DOCX, XLSX, or PPTX bytes up to 16 MiB, extracts bounded plain text in memory, and neither stores the document nor creates a task or model call. Responses are private and non-cacheable.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      requestBody:
+        required: true
+        content:
+          application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+            schema: { type: string, format: binary, maxLength: 16777216 }
+          application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+            schema: { type: string, format: binary, maxLength: 16777216 }
+          application/vnd.openxmlformats-officedocument.presentationml.presentation:
+            schema: { type: string, format: binary, maxLength: 16777216 }
+      responses:
+        '200':
+          description: Bounded plain text extracted from the document
+          headers:
+            Cache-Control: { schema: { type: string, const: 'private, no-store' } }
+            X-Content-Type-Options: { schema: { type: string, const: nosniff } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalOfficePreviewResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
         default: { $ref: '#/components/responses/Error' }
   /api/personal-data/history/import:
     post:
@@ -9611,11 +9641,14 @@ components:
     PersonalAttachmentUploadReceipt:
       type: object
       additionalProperties: false
-      required: [upload_id, state, chunk_count, replay]
+      required: [upload_id, state, chunk_count, received_sequences, replay]
       properties:
         upload_id: { $ref: '#/components/schemas/PersonalAttachmentUploadId' }
         state: { type: string, enum: [pending, active, committed, cancelled, expired] }
         chunk_count: { type: integer, format: int32, minimum: 0 }
+        received_sequences:
+          type: array
+          items: { type: integer, format: int32, minimum: 0 }
         replay: { type: boolean }
     PersonalAttachmentChunkReceipt:
       type: object
@@ -9636,6 +9669,12 @@ components:
         result_revision: { type: integer, format: int64, minimum: 1 }
         account_change_sequence: { type: integer, format: int64, minimum: 1 }
         replay: { type: boolean }
+    PersonalOfficePreviewResponse:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text: { type: string }
     PersonalHistoryImportMessage:
       type: object
       additionalProperties: false
@@ -10598,7 +10637,7 @@ components:
         model_tokens: { type: [integer, 'null'], minimum: 0 }
     TaskSummary:
       type: object
-      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, current_step, budget, usage, created_at, updated_at]
+      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, current_step, step_count, completed_step_count, budget, usage, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/TaskId' }
         owner_id: { $ref: '#/components/schemas/UserId' }
@@ -10692,11 +10731,11 @@ components:
     TaskAssistantMessage:
       type: object
       description: The latest assistant model turn for this Task. Its stable message ID is shared by streamed and final text.
-      required: [id, conversation_id, sequence, task_id, role, content, status, created_at]
+      required: [id, conversation_id, task_id, role, content, status, created_at]
       properties:
         id: { $ref: '#/components/schemas/MessageId' }
         conversation_id: { $ref: '#/components/schemas/ConversationId' }
-        sequence: { type: integer, format: int64, minimum: 1, description: Monotonic sequence within the conversation, matching the durable conversation message. }
+        sequence: { type: integer, format: int64, minimum: 1, description: Monotonic sequence within the conversation, matching the durable conversation message; omitted until the message is durable. }
         task_id: { $ref: '#/components/schemas/TaskId' }
         task_revision: { type: integer, format: int64, minimum: 0 }
         result_event_sequence: { type: integer, format: int64, minimum: 1, description: Exact event identifying this completed result. }
@@ -10791,7 +10830,6 @@ components:
         input_revision: { type: integer, minimum: 0, description: Immutable committed Workspace revision to pin for this task. Required with workspace_id. }
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
-        conversation_id: { oneOf: [{ $ref: '#/components/schemas/ConversationId' }, { type: 'null' }] }
         objective: { type: string, minLength: 1, maxLength: 32768 }
         mcp_connector_ids:
           type: array

@@ -22,7 +22,6 @@ export type PendingConversationMessage = {
   projectID?: string;
   conversationOwnerID?: string;
   messageID?: string;
-  taskID?: string;
   attachments: PendingMessageAttachment[];
   status: 'pending' | 'sending' | 'unknown' | 'failed' | 'accepted';
   error?: string;

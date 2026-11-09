@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -36,21 +37,22 @@ func (s *workspaceCopyServiceStore) GetWorkspaceCopyReservationByIdempotency(_ c
 	return s.reservation, true, nil
 }
 
-func (s *workspaceCopyServiceStore) CreateWorkspaceCopyReservation(_ context.Context, ownerID, sourceID, targetID, name, instanceID, reservationID string,
-	revision, reservedBytes, maxOwnerBytes, quota int64, record IdempotencyRecord) (workspace.CopyReservation, bool, error) {
+func (s *workspaceCopyServiceStore) CreateWorkspaceCopyReservation(_ context.Context, request WorkspaceCopyReservationRequest) (workspace.CopyReservation, bool, error) {
 	if s.reservation.ID != "" {
 		return s.reservation, true, nil
 	}
-	s.record = record
-	s.reservation = workspace.CopyReservation{ID: reservationID, OwnerID: ownerID, SourceWorkspaceID: sourceID,
-		TargetWorkspaceID: targetID, ServiceInstanceID: instanceID, SourceRevision: revision, ReservedBytes: reservedBytes,
+	s.record = request.Idempotency
+	s.reservation = workspace.CopyReservation{ID: request.ID, SourceOwnerID: request.SourceOwnerID, TargetOwnerID: request.TargetOwnerID,
+		ShareID: request.ShareID, ReadOnly: request.ReadOnly, SourceWorkspaceID: request.SourceWorkspaceID,
+		TargetWorkspaceID: request.TargetWorkspaceID, ServiceInstanceID: request.ServiceInstanceID,
+		SourceRevision: request.SourceRevision, ReservedBytes: request.ReservedBytes,
 		State: workspace.CopyReserved}
 	return s.reservation, false, nil
 }
 
 func (s *workspaceCopyServiceStore) GetWorkspaceManifestPageForCopy(ctx context.Context, ownerID, reservationID string,
 	revision int64, prefix, after string, limit int32) (workspace.ManifestPage, error) {
-	if ownerID != s.reservation.OwnerID || reservationID != s.reservation.ID || revision != s.reservation.SourceRevision || !s.reservation.State.Active() {
+	if ownerID != s.reservation.SourceOwnerID || reservationID != s.reservation.ID || revision != s.reservation.SourceRevision || !s.reservation.State.Active() {
 		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "copy manifest unavailable")
 	}
 	return s.GetWorkspaceManifestPage(ctx, s.reservation.SourceWorkspaceID, revision, prefix, after, limit)
@@ -80,7 +82,7 @@ func (s *workspaceCopyServiceStore) SetWorkspaceCopyReservationState(_ context.C
 }
 
 func (s *workspaceCopyServiceStore) FailWorkspaceCopyReservationBeforeSideEffects(_ context.Context, ownerID, id string) error {
-	if ownerID != s.reservation.OwnerID || id != s.reservation.ID || s.reservation.State != workspace.CopyReserved {
+	if ownerID != s.reservation.TargetOwnerID || id != s.reservation.ID || s.reservation.State != workspace.CopyReserved {
 		return domain.NewError(domain.CodeWorkspaceConflict, "copy cannot be safely released")
 	}
 	s.reservation.State = workspace.CopyFailed
@@ -96,7 +98,7 @@ func (s *workspaceCopyServiceStore) CheckWorkspaceVolumeCopyReservation(_ contex
 
 func (s *workspaceCopyServiceStore) StageWorkspaceCopy(_ context.Context, id, ownerID, name string, files []workspace.File,
 	directories []string, metadata []workspace.Directory, allocations []WorkspaceBlockAllocation, quota int64) error {
-	if id != s.reservation.ID || ownerID != s.reservation.OwnerID || name != "copy" || quota != 1<<30 || len(allocations) != 1 {
+	if id != s.reservation.ID || ownerID != s.reservation.TargetOwnerID || name != "copy" || quota != 1<<30 || len(allocations) != 1 {
 		return domain.NewError(domain.CodeWorkspaceConflict, "invalid staged copy")
 	}
 	s.stagedFiles = append([]workspace.File(nil), files...)
@@ -107,7 +109,7 @@ func (s *workspaceCopyServiceStore) StageWorkspaceCopy(_ context.Context, id, ow
 }
 
 func (s *workspaceCopyServiceStore) CompleteWorkspaceCopy(_ context.Context, id, ownerID string, maxOwnerBytes int64) error {
-	if id != s.reservation.ID || ownerID != s.reservation.OwnerID || maxOwnerBytes != 1<<30 || s.staged == 0 {
+	if id != s.reservation.ID || ownerID != s.reservation.TargetOwnerID || maxOwnerBytes != 1<<30 || s.staged == 0 {
 		return domain.NewError(domain.CodeWorkspaceConflict, "invalid completed copy")
 	}
 	s.reservation.State = workspace.CopyCompleted
@@ -115,10 +117,14 @@ func (s *workspaceCopyServiceStore) CompleteWorkspaceCopy(_ context.Context, id,
 	return nil
 }
 
-type workspaceCopyServiceVolumes struct{ checkedBytes, checks, ensures int64 }
+type workspaceCopyServiceVolumes struct {
+	checkedBytes, checks, ensures int64
+	lastOwner                     string
+}
 
-func (v *workspaceCopyServiceVolumes) EnsureWorkspaceVolume(context.Context, string, string, string, string) error {
+func (v *workspaceCopyServiceVolumes) EnsureWorkspaceVolume(_ context.Context, _, _, ownerID, _ string) error {
 	v.ensures++
+	v.lastOwner = ownerID
 	return nil
 }
 
@@ -134,6 +140,7 @@ func (v *workspaceCopyServiceVolumes) CheckCapacityForWrite(_ context.Context, b
 type workspaceCopyServiceCopier struct {
 	files        []workspace.File
 	directories  []workspace.Directory
+	lastRequest  WorkspaceVolumeCopyRequest
 	preflightErr error
 	preflights   int
 	err          error
@@ -143,6 +150,7 @@ type workspaceCopyServiceCopier struct {
 func (c *workspaceCopyServiceCopier) ValidateWorkspaceVolumeCopySource(ctx context.Context, request WorkspaceVolumeCopyRequest,
 	reservation WorkspaceVolumeCopyReservationChecker) error {
 	c.preflights++
+	c.lastRequest = request
 	if err := reservation.CheckWorkspaceVolumeCopyReservation(ctx, request); err != nil {
 		return err
 	}
@@ -152,6 +160,7 @@ func (c *workspaceCopyServiceCopier) ValidateWorkspaceVolumeCopySource(ctx conte
 func (c *workspaceCopyServiceCopier) CopyWorkspaceVolume(ctx context.Context, request WorkspaceVolumeCopyRequest,
 	reservation WorkspaceVolumeCopyReservationChecker) ([]workspace.File, []workspace.Directory, error) {
 	c.calls++
+	c.lastRequest = request
 	if err := reservation.CheckWorkspaceVolumeCopyReservation(ctx, request); err != nil {
 		return nil, nil, err
 	}
@@ -215,7 +224,7 @@ func newWorkspaceCopyServiceForTest(t *testing.T, copier WorkspaceVolumeCopier) 
 		t.Fatal(err)
 	}
 	if err := service.SetCurrentMaterializer(func(_ context.Context, ownerID, workspaceID string, revision int64, files []workspace.File, dirs []string, metadata []workspace.Directory) error {
-		if ownerID != syncStore.workspace.OwnerID || workspaceID != store.reservation.TargetWorkspaceID || revision != 1 ||
+		if ownerID != store.reservation.TargetOwnerID || workspaceID != store.reservation.TargetWorkspaceID || revision != 1 ||
 			!reflect.DeepEqual(files, workspaceCopyTestExpectedFiles(file, copier)) || len(dirs) != 0 || len(metadata) != 2 ||
 			metadata[0].Path != "." || metadata[1].Path != ".hidden" {
 			return errors.New("materializer received the wrong copied checkpoint")
@@ -301,5 +310,42 @@ func TestWorkspaceCopyServiceRetriesUnknownCopyThroughReservationManifest(t *tes
 	result, err := service.Copy(context.Background(), principal, "w1234567", command, "copy-key-02")
 	if err != nil || result.State != workspace.CopyCompleted || !result.Replayed || copier.calls != 2 || store.completed != 1 {
 		t.Fatalf("unknown copy retry = %#v, %v; copier calls=%d store=%#v", result, err, copier.calls, store)
+	}
+}
+
+func TestWorkspaceCopyForShareCreatesRecipientOwnedViewAndEditCopies(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		permission workspace.SharePermission
+		readOnly   bool
+	}{
+		{name: "view", permission: workspace.ShareView, readOnly: true},
+		{name: "edit", permission: workspace.ShareEdit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mode, modified := uint32(0o750), int64(1_700_000_000_123_000_000)
+			copier := &workspaceCopyServiceCopier{directories: []workspace.Directory{{Path: ".hidden", Mode: &mode, ModTimeNS: &modified}}}
+			service, store, volumes, _ := newWorkspaceCopyServiceForTest(t, copier)
+			now := time.Now().UTC()
+			share := workspace.ShareLink{
+				ID: "r7654321", OwnerID: store.workspace.OwnerID, SourceWorkspaceID: store.workspace.ID,
+				SourceRevision: 1, WorkspaceName: "copy", Permission: test.permission, TokenHash: make([]byte, 32),
+				ExpiresAt: now.Add(workspaceShareLifetime), State: workspace.ShareClaiming, ClaimantID: "u7654321", CreatedAt: now,
+			}
+			principal := identity.Principal{UserID: share.ClaimantID, Role: identity.RoleUser, Kind: identity.KindSession}
+			result, err := service.copyForWorkspaceShare(context.Background(), principal, share)
+			if err != nil {
+				t.Fatalf("copyForWorkspaceShare() = %v", err)
+			}
+			reservation := store.reservation
+			if reservation.SourceOwnerID != share.OwnerID || reservation.TargetOwnerID != principal.UserID ||
+				reservation.ShareID != share.ID || reservation.ReadOnly != test.readOnly ||
+				volumes.lastOwner != principal.UserID || copier.lastRequest.SourceOwnerID != share.OwnerID ||
+				copier.lastRequest.TargetOwnerID != principal.UserID || result.Workspace.ID != reservation.TargetWorkspaceID ||
+				reservation.State != workspace.CopyCompleted {
+				t.Fatalf("share copy ownership/permission mismatch: reservation=%#v request=%#v volumeOwner=%q result=%#v",
+					reservation, copier.lastRequest, volumes.lastOwner, result)
+			}
+		})
 	}
 }

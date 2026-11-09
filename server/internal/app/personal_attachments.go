@@ -61,9 +61,10 @@ type PersonalAttachmentStore interface {
 	// none was created, so cancellation can safely race the pending state.
 	CancelPersonalAttachmentUpload(context.Context, identity.Principal, string) (personal.AttachmentReservation, error)
 	OpenPersonalAttachment(context.Context, identity.Principal, string) (io.ReadCloser, personal.AttachmentMetadata, error)
-	// Cleanup must lock each candidate, recheck references, remove only
-	// unreferenced staging, and return reservations that still need release.
-	// Repeating the call after a release failure must return that reservation.
+	// Cleanup must lock each candidate, recheck references, remove expired
+	// staging, and mark committed content for retention-based cleanup only after
+	// all references are gone. It returns reservations that still need release;
+	// repeating after a release failure must return that reservation again.
 	CleanupExpiredPersonalAttachmentUploads(context.Context, time.Time, int32) ([]personal.AttachmentReservation, error)
 	// Acknowledge clears a release-pending reservation after DATA-05 release
 	// succeeds. It must be idempotent so a lost response can safely be retried.
@@ -110,7 +111,7 @@ func (s *PersonalAttachmentService) CreatePersonalAttachmentUpload(ctx context.C
 		return personal.AttachmentUploadReceipt{}, err
 	}
 	if !personal.ValidPersonalAttachmentUploadID(created.UploadID) || created.ChunkCount != attachmentChunkCount(command.SizeBytes) ||
-		!personal.ValidAttachmentUploadState(created.State) {
+		!personal.ValidAttachmentUploadState(created.State) || !validPersonalAttachmentReceivedSequences(created.ReceivedSequences, created.ChunkCount) {
 		return personal.AttachmentUploadReceipt{}, domain.NewError(domain.CodeInternal, "personal attachment upload receipt is invalid")
 	}
 	if created.State == personal.AttachmentUploadCommitted {
@@ -144,10 +145,20 @@ func (s *PersonalAttachmentService) CreatePersonalAttachmentUpload(ctx context.C
 		return personal.AttachmentUploadReceipt{}, err
 	}
 	if activated.UploadID != upload.UploadID || activated.ReservationID != reservationID ||
-		activated.State != personal.AttachmentUploadActive || activated.ChunkCount != created.ChunkCount {
+		activated.State != personal.AttachmentUploadActive || activated.ChunkCount != created.ChunkCount ||
+		!validPersonalAttachmentReceivedSequences(activated.ReceivedSequences, activated.ChunkCount) {
 		return personal.AttachmentUploadReceipt{}, domain.NewError(domain.CodeInternal, "personal attachment activation receipt is invalid")
 	}
 	return activated, nil
+}
+
+func validPersonalAttachmentReceivedSequences(sequences []int32, chunkCount int32) bool {
+	for index, sequence := range sequences {
+		if sequence < 0 || sequence >= chunkCount || index > 0 && sequence <= sequences[index-1] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *PersonalAttachmentService) PutPersonalAttachmentChunk(ctx context.Context, principal identity.Principal, command PersonalAttachmentChunkCommand) (personal.AttachmentChunkReceipt, error) {

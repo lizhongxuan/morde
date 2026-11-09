@@ -139,6 +139,24 @@ func TestProjectServiceRequireAccessReadsCurrentMembershipAndRole(t *testing.T) 
 	}
 }
 
+func TestProjectServiceRejectsAdminAccountsBeforeMembershipLookup(t *testing.T) {
+	store := &projectServiceStoreStub{}
+	service, err := NewProjectService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []identity.Role{identity.RoleAdmin, identity.RoleSuperAdmin} {
+		principal := projectPrincipal("u1234567")
+		principal.Role = role
+		if _, err := service.RequireAccess(context.Background(), principal, "j1234567", project.RoleViewer); domain.CodeOf(err) != domain.CodeForbidden {
+			t.Errorf("RequireAccess(role=%s) error = %v, want forbidden", role, err)
+		}
+	}
+	if store.memberCalls != 0 {
+		t.Fatalf("admin account triggered membership lookups: %d", store.memberCalls)
+	}
+}
+
 func TestProjectServiceAgentContextRequiresCurrentViewerMembershipAndIsBounded(t *testing.T) {
 	principal := projectPrincipal("u1234567")
 	contextTask := projectContextTask(principal.UserID)

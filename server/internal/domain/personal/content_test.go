@@ -56,6 +56,7 @@ func TestValidateObjectIdentifier(t *testing.T) {
 		{ObjectTypeIdeaMark, "train-watch"},
 		{ObjectTypeLibraryItem, "library-item_1"},
 		{ObjectTypeSkillSetting, "builtin_weather"},
+		{ObjectTypeSkillSetting, "builtin_ideas"},
 		{ObjectTypeConnectorSetting, "catalogue_calendar"},
 	}
 	for _, test := range valid {
@@ -110,6 +111,7 @@ func TestValidateObjectBodyAcceptsAllowlistedShapesAndBoundaries(t *testing.T) {
 		{ObjectTypeLibraryItem, "item_1", `{"name":"` + strings.Repeat("n", 255) + `","kind":"media","mime":"` + strings.Repeat("m", 128) + `","size_bytes":0}`},
 		{ObjectTypeLibraryItem, "item_2", `{"name":"x","kind":"artifact","attachment_id":"pa_0123456789abcdef0123456789abcdef","mime":"application/pdf","size_bytes":20}`},
 		{ObjectTypeSkillSetting, "builtin_weather", `{"enabled":false}`},
+		{ObjectTypeSkillSetting, "builtin_ideas", `{"enabled":false}`},
 		{ObjectTypeConnectorSetting, "catalogue_calendar", `{"auth":"open","enabled":true}`},
 	}
 	for _, test := range valid {

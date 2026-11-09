@@ -111,9 +111,12 @@ WHERE workspace_id=$1 AND revision=1 AND file_path='.' AND action='directory_ups
 	if _, err := pool.Exec(ctx, `UPDATE workspace_current_materializations SET applied_revision=1 WHERE workspace_id=$1`, source.ID); err != nil {
 		t.Fatal(err)
 	}
-	reservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, owner.ID, source.ID, "w7654321", "native copy",
-		"native-metadata-copy", "rabc1234", 1, files[0].SizeBytes, 1<<30, 1<<30,
-		syncTestIdempotency(owner.ID, "workspace.copy", "native-metadata-copy", source.ID))
+	reservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, app.WorkspaceCopyReservationRequest{
+		ID: "rabc1234", SourceOwnerID: owner.ID, TargetOwnerID: owner.ID, SourceWorkspaceID: source.ID, TargetWorkspaceID: "w7654321",
+		TargetName: "native copy", ServiceInstanceID: "native-metadata-copy", SourceRevision: 1, ReservedBytes: files[0].SizeBytes,
+		MaxOwnerBytes: 1 << 30, TargetQuotaBytes: 1 << 30,
+		Idempotency: syncTestIdempotency(owner.ID, "workspace.copy", "native-metadata-copy", source.ID),
+	})
 	if err != nil || replayed {
 		t.Fatalf("create metadata Workspace copy reservation = %#v, replayed=%t, err=%v", reservation, replayed, err)
 	}

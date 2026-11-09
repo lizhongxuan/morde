@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -178,6 +179,10 @@ type cloudDSHMemoryProofValidator interface {
 	CloudDSHPersonalMemoryProofEnabled() bool
 }
 
+type cloudDSHTaskMemoryProofValidator interface {
+	CloudDSHPersonalMemoryProofEnabledForTask(task.Task) bool
+}
+
 var errCloudDSHPersonalMemoryChanged = errors.New("个人记忆状态无法确认，无法继续此任务，请重新发送消息")
 
 func cloudDSHMemoryProofFromText(value string) (string, bool) {
@@ -269,10 +274,21 @@ func cloudDSHMemoryWritesWithReceipts(states map[string]*cloudDSHSessionState, i
 // Read the root's pinned history before passing it to DSH. An older checkpoint
 // with no proof cannot safely establish whether it contains revoked memory.
 func (e *CloudDSHExecutor) cloudDSHResumeMemoryProof(ctx context.Context, fence app.AgentInstanceFence, sessionID string, through int64, digest []byte) (string, *cloudDSHCheckpointHistory, error) {
+	proof, history, err := e.cloudDSHReadPinnedCheckpointHistory(ctx, fence, sessionID, through, digest, true)
+	if err != nil {
+		return "", nil, err
+	}
+	return proof, history, nil
+}
+
+func (e *CloudDSHExecutor) cloudDSHReadPinnedCheckpointHistory(ctx context.Context, fence app.AgentInstanceFence,
+	sessionID string, through int64, digest []byte, requireMemoryProof bool) (string, *cloudDSHCheckpointHistory, error) {
+	if !cloudDSHID.MatchString(sessionID) || through < 0 || len(digest) != sha256.Size {
+		return "", nil, errors.New("checkpoint session identity is invalid")
+	}
 	history := newCloudDSHCheckpointHistory(sessionID)
 	history.beginRestore()
 	proof := ""
-	seenUser := false
 	var total int
 	for from := int64(0); from <= through; {
 		page, err := e.options.Checkpoints.ReadPage(ctx, app.AgentCheckpointPageRequest{
@@ -286,6 +302,10 @@ func (e *CloudDSHExecutor) cloudDSHResumeMemoryProof(ctx context.Context, fence 
 		if total > cloudDSHCompletionInputLimit || history.append(page.Payload, page.From, page.Through) != nil {
 			return "", nil, errors.New("personal memory checkpoint is invalid")
 		}
+		if !requireMemoryProof {
+			from = page.Through + 1
+			continue
+		}
 		var payload struct {
 			Events []struct {
 				Type string `json:"type"`
@@ -294,6 +314,10 @@ func (e *CloudDSHExecutor) cloudDSHResumeMemoryProof(ctx context.Context, fence 
 						Type string `json:"type"`
 						Text string `json:"text"`
 					} `json:"content"`
+					Source struct {
+						Kind   string `json:"kind"`
+						Plugin string `json:"plugin"`
+					} `json:"source"`
 				} `json:"data"`
 			} `json:"events"`
 		}
@@ -301,24 +325,145 @@ func (e *CloudDSHExecutor) cloudDSHResumeMemoryProof(ctx context.Context, fence 
 			return "", nil, errors.New("personal memory checkpoint is invalid")
 		}
 		for _, event := range payload.Events {
-			if event.Type != "user/message" || seenUser {
+			if event.Type != "user/message" || event.Data.Source.Kind != "plugin" || event.Data.Source.Plugin != "morde-context" {
 				continue
 			}
-			seenUser = true
 			var text strings.Builder
 			for _, block := range event.Data.Content {
 				if block.Type == "text" {
 					text.WriteString(block.Text)
 				}
 			}
-			proof, _ = cloudDSHMemoryProofFromText(text.String())
+			if candidate, ok := cloudDSHMemoryProofFromText(text.String()); ok {
+				proof = candidate
+				break
+			}
 		}
 		from = page.Through + 1
 	}
-	if proof == "" {
+	if history.nextSeq != through+1 || requireMemoryProof && proof == "" {
 		return "", nil, errors.New("个人记忆上下文无法安全恢复，请重新发送消息")
 	}
 	return proof, history, nil
+}
+
+func validCloudDSHSettledChildCheckpoint(child app.AgentChildSession, history *cloudDSHCheckpointHistory) bool {
+	if history == nil || history.sessionID != child.SessionID || child.CheckpointThrough < 0 ||
+		history.nextSeq != child.CheckpointThrough+1 || !history.hasCompletedResult() ||
+		strings.TrimSpace(child.Step.Summary) != strings.TrimSpace(history.result) {
+		return false
+	}
+	for _, call := range history.calls {
+		if !call.callSeen || !call.resultSeen || call.status != "" || call.reconciled {
+			return false
+		}
+	}
+	return true
+}
+
+func validCloudDSHBackgroundHandle(output, sessionID string) bool {
+	var handle struct {
+		JobID  string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader([]byte(output)))
+	decoder.DisallowUnknownFields()
+	if !uniqueCloudDSHJSON([]byte(output)) || decoder.Decode(&handle) != nil || decoder.Decode(new(any)) != io.EOF || handle.JobID != sessionID {
+		return false
+	}
+	return handle.Status == "running" || handle.Status == "succeeded"
+}
+
+func (e *CloudDSHExecutor) cloudDSHRecoverSettledPersonalChildren(ctx context.Context, claimed task.Task, fence app.AgentInstanceFence,
+	rootThrough int64, rootDigest []byte, parentDefinitions []app.AgentToolDefinition, rootHistory *cloudDSHCheckpointHistory,
+	children []app.AgentChildSession) (map[string]*cloudDSHCheckpointHistory, cloudDSHRecoveredPersonalWrites, error) {
+	if rootHistory == nil || len(children) > 16 {
+		return nil, nil, errors.New("personal child-session set is invalid")
+	}
+	bySpawnKey := make(map[string]app.AgentChildSession, len(children))
+	for _, child := range children {
+		if child.TaskID != claimed.ID || child.Step.TaskID != claimed.ID || child.ParentSessionID != fence.AgentSessionID ||
+			!cloudDSHID.MatchString(child.SessionID) || child.SessionID == fence.AgentSessionID ||
+			!cloudDSHID.MatchString(child.SpawnKey) || !cloudDSHID.MatchString(child.Step.ID) ||
+			child.Step.Sequence < 1 || child.Step.Kind != "subagent" || child.CancelRequested || child.Step.Status != task.StepSucceeded ||
+			child.CheckpointThrough < 0 || child.CheckpointThrough > 1<<53-1 || len(child.CheckpointDigest) != sha256.Size ||
+			!validCloudDSHStoredToolNames(child.AllowedTools) || !utf8.ValidString(child.Step.Summary) || len(child.Step.Summary) > 2048 {
+			return nil, nil, errors.New("personal child session is not a proven success")
+		}
+		if _, exists := bySpawnKey[child.SpawnKey]; exists {
+			return nil, nil, errors.New("personal child spawn key is duplicated")
+		}
+		bySpawnKey[child.SpawnKey] = child
+	}
+
+	delegateCount := 0
+	for callID, call := range rootHistory.calls {
+		if call.name != cloudDSHDelegateToolName {
+			continue
+		}
+		delegateCount++
+		if !call.callSeen || !call.historical || call.status != "" {
+			return nil, nil, errors.New("personal child delegation is not checkpointed")
+		}
+		arguments, definitions, err := validateCloudDSHDelegateArguments(call.arguments, parentDefinitions)
+		if err != nil || len(definitions) != len(arguments.ToolNames) {
+			return nil, nil, errors.New("personal child delegation authorization is invalid")
+		}
+		child, exists := bySpawnKey[callID]
+		if !exists || child.SpawnKey != callID || child.Background != arguments.RunInBackground {
+			return nil, nil, errors.New("personal child does not match its parent delegation")
+		}
+		allowedTools := make([]string, 0, len(definitions))
+		for _, definition := range definitions {
+			allowedTools = append(allowedTools, definition.Name)
+		}
+		if !sameWorkerToolNames(child.AllowedTools, allowedTools) {
+			return nil, nil, errors.New("personal child tool authorization changed")
+		}
+		if call.resultSeen {
+			if call.name != cloudDSHDelegateToolName || call.resultText == "" {
+				return nil, nil, errors.New("personal child result is incomplete")
+			}
+			if child.Background {
+				if !validCloudDSHBackgroundHandle(call.resultText, child.SessionID) {
+					return nil, nil, errors.New("personal child job handle changed")
+				}
+			} else {
+				result := strings.TrimSpace(child.Step.Summary)
+				if result == "" {
+					result = "Child agent completed."
+				}
+				if call.resultText != result {
+					return nil, nil, errors.New("personal child result differs from its settlement")
+				}
+			}
+		}
+	}
+	if delegateCount != len(children) {
+		return nil, nil, errors.New("personal child-session history is incomplete")
+	}
+
+	histories := make(map[string]*cloudDSHCheckpointHistory, len(children))
+	confirmed := make(cloudDSHRecoveredPersonalWrites)
+	for _, child := range children {
+		_, childHistory, err := e.cloudDSHReadPinnedCheckpointHistory(ctx, fence, child.SessionID,
+			child.CheckpointThrough, child.CheckpointDigest, false)
+		if err != nil || !validCloudDSHSettledChildCheckpoint(child, childHistory) {
+			return nil, nil, errors.New("personal child checkpoint is incomplete or inconsistent")
+		}
+		writes, err := e.confirmCloudDSHPersonalWrites(ctx, claimed, fence, rootThrough, rootDigest, childHistory)
+		if err != nil {
+			return nil, nil, errors.New("personal child write receipt is unavailable")
+		}
+		for sessionID, sessionWrites := range writes {
+			if confirmed[sessionID] != nil {
+				return nil, nil, errors.New("personal child write session is duplicated")
+			}
+			confirmed[sessionID] = sessionWrites
+		}
+		histories[child.SessionID] = childHistory
+	}
+	return histories, confirmed, nil
 }
 
 func (w *cloudDSHSerializedWriter) Write(value []byte) (int, error) {
@@ -409,7 +554,7 @@ func validCloudDSHMessageAttachmentIDs(ids []string) bool {
 		return false
 	}
 	for index, id := range ids {
-		if !(personal.ValidPersonalAttachmentID(id) || app.ValidProjectConversationAttachmentID(id)) || index > 0 && ids[index-1] >= id {
+		if (!personal.ValidPersonalAttachmentID(id) && !app.ValidProjectConversationAttachmentID(id)) || index > 0 && ids[index-1] >= id {
 			return false
 		}
 	}
@@ -532,25 +677,32 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	states := map[string]*cloudDSHSessionState{rootIdentity.SessionID: newCloudDSHSessionState(fence, rootIdentity, "", "",
 		rootDefinitions, canDelegate, resume, rootThrough, rootDigest)}
 	memoryValidator, protectsMemory := e.options.Tools.(cloudDSHMemoryProofValidator)
-	protectsMemory = protectsMemory && memoryValidator.CloudDSHPersonalMemoryProofEnabled()
+	if scoped, ok := e.options.Tools.(cloudDSHTaskMemoryProofValidator); ok {
+		protectsMemory = protectsMemory && scoped.CloudDSHPersonalMemoryProofEnabledForTask(value)
+	} else {
+		protectsMemory = protectsMemory && memoryValidator.CloudDSHPersonalMemoryProofEnabled()
+		protectsMemory = protectsMemory &&
+			(value.Authorization.Kind != string(identity.KindScheduleTask) || value.ConversationContext != nil && value.ConversationContext.Scope == "personal")
+	}
 	personalCredential := value.ProjectID == "" && (value.Authorization.Kind == string(identity.KindSession) || value.Authorization.Kind == string(identity.KindClient))
 	if resume && personalCredential && !protectsMemory {
 		// A saved checkpoint may contain personal data even when its original
 		// provider is no longer configured. Its absence is not proof of consent.
 		return errCloudDSHPersonalMemoryChanged
 	}
-	protectsMemory = protectsMemory && value.ProjectID == "" && value.Authorization.Kind != string(identity.KindScheduleTask)
 	if protectsMemory && (value.ConversationContext == nil || value.ConversationContext.Scope != "personal") {
 		return errCloudDSHPersonalMemoryChanged
 	}
 	var recoveredPersonalWrites cloudDSHRecoveredPersonalWrites
 	memoryProof := ""
 	backgroundJobs := make([]map[string]any, 0)
+	var childSessions []app.AgentChildSession
 	if e.options.Children != nil {
 		children, err := e.options.Children.List(ctx, fence, rootIdentity.SessionID)
 		if err != nil {
-			return errors.New("dsh background jobs are unavailable")
+			return errors.New("dsh child sessions are unavailable")
 		}
+		childSessions = children
 		for _, child := range children {
 			if !child.Background || child.Step.Status != task.StepRunning {
 				continue
@@ -744,7 +896,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 		}
 		if item.err != nil {
-			return errors.New("dsh connection ended before a verified result: " + item.err.Error())
+			return fmt.Errorf("%w: %w", errCloudDSHConnectionInterrupted, item.err)
 		}
 		frame, err := decodeCloudDSHFrame(item.frame)
 		if err != nil {
@@ -823,16 +975,30 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if err != nil || len(backgroundJobs) != 0 {
 						return errCloudDSHPersonalMemoryChanged
 					}
-					for _, call := range previous.calls {
-						if call.name == cloudDSHDelegateToolName {
-							return errCloudDSHPersonalMemoryChanged
-						}
-					}
 					recoveredPersonalWrites, err = e.confirmCloudDSHPersonalWrites(ctx, value, fence, rootThrough, rootDigest, previous)
 					if err != nil {
 						return errCloudDSHPersonalMemoryChanged
 					}
-					versions, err := cloudDSHMemoryWritesWithReceipts(map[string]*cloudDSHSessionState{"root": {history: previous}}, true, recoveredPersonalWrites)
+					childHistories, childWrites, err := e.cloudDSHRecoverSettledPersonalChildren(ctx, value, fence, rootThrough, rootDigest,
+						baseDefinitions, previous, childSessions)
+					if err != nil {
+						return errCloudDSHPersonalMemoryChanged
+					}
+					for sessionID, writes := range childWrites {
+						if recoveredPersonalWrites[sessionID] != nil {
+							return errCloudDSHPersonalMemoryChanged
+						}
+						recoveredPersonalWrites[sessionID] = writes
+					}
+					proofStates := map[string]*cloudDSHSessionState{rootIdentity.SessionID: {history: previous}}
+					for sessionID, history := range childHistories {
+						proofStates[sessionID] = &cloudDSHSessionState{history: history}
+						// Keep settled histories in the recovery state so subsequent proof
+						// checks include their confirmed memory writes without restoring a
+						// settled child runtime.
+						states[sessionID] = &cloudDSHSessionState{history: history, settled: true}
+					}
+					versions, err := cloudDSHMemoryWritesWithReceipts(proofStates, true, recoveredPersonalWrites)
 					if err != nil || memoryValidator.ValidatePersonalMemoryProof(ctx, value, memoryProof, versions) != nil {
 						return errCloudDSHPersonalMemoryChanged
 					}
@@ -855,13 +1021,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 						(strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
 						!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') ||
 						len(message.Content) > app.MaxConversationAgentInputBytes || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) ||
-						(message.Content != value.Objective && !(strings.TrimSpace(message.Content) == "" && value.Objective == app.ConversationAttachmentOnlyObjective)) {
+						(message.Content != value.Objective && (strings.TrimSpace(message.Content) != "" || value.Objective != app.ConversationAttachmentOnlyObjective)) {
 						return errors.New("initial conversation message does not match the Task")
 					}
 					initial = message
 				}
 				contextText := ""
-				if initial != nil && value.ConversationContext != nil && len(value.ConversationContext.Messages) != 0 {
+				if value.ConversationContext != nil && len(value.ConversationContext.Messages) != 0 {
 					suffix := "\n\nCurrent request:\n" + value.Objective
 					if !strings.HasSuffix(prompt, suffix) {
 						return errors.New("initial conversation context is invalid")
@@ -901,7 +1067,18 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return cloudDSHModelResultError{category: "context_length_exceeded"}
 				}
 				if initial == nil {
-					start["prompt"] = prompt
+					if len(revisionBatch) != 0 {
+						// Revision messages are delivered separately. Keep the existing
+						// full context as a trusted runtime message for that batch.
+						start["prompt"] = prompt
+					} else {
+						// Keep the current request as a user message and persist prior
+						// conversation/personal context with its trusted source marker.
+						start["prompt"] = value.Objective
+						if contextText != "" {
+							start["initial_context"] = contextText
+						}
+					}
 				} else {
 					if !utf8.ValidString(contextText) {
 						return errors.New("dsh initial context is invalid")
@@ -1246,7 +1423,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if !ok {
 						return errCloudDSHPersonalMemoryChanged
 					}
-					_, output, err := reader.ConfirmPersonalContextWrite(ctx, value, fence, state.through, state.checkpointDigest, call)
+					_, output, err := reader.ConfirmPersonalContextWrite(ctx, value, fence, rootThrough, rootDigest, call)
 					if err != nil || output != recorded {
 						return errCloudDSHPersonalMemoryChanged
 					}

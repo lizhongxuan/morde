@@ -433,7 +433,10 @@ func TestConversationRouteLateRevisionsReachRealNodeInCausalOrder(t *testing.T) 
 	}
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("causal Agent stop error: %v", err)
+		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("causal Agent did not stop")
 	}

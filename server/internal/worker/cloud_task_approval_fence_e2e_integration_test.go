@@ -114,7 +114,32 @@ func TestCloudTaskApprovalIsRevalidatedAfterHostControlFenceChanges(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolBroker, err := app.NewCloudDSHToolBroker(store, runtimeTools, nil, nil)
+	personalData, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalSync, err := app.NewPersonalSyncService(store, bytes.Repeat([]byte{0x23}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goals, err := app.NewGoalService(personalData, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalQuota, err := app.NewPersonalDataQuotaService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalFiles, err := app.NewPersonalAttachmentService(store, personalQuota)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordCapture, err := app.NewRecordCaptureService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolBroker, err := app.NewCloudDSHToolBrokerWithPersonalData(store, runtimeTools, nil, nil,
+		recordCapture, personalData, personalSync, goals, personalFiles, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

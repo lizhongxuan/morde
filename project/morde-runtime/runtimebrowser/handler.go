@@ -116,6 +116,7 @@ func (c *Controller) Handlers() []runtimecore.ActionHandler {
 	definitions := [][2]string{
 		{capabilityBrowserActions, "open_tab"},
 		{capabilityBrowserActions, "navigate"},
+		{capabilityBrowserActions, "handoff"},
 		{capabilityBrowserObserve, "snapshot"},
 		{capabilityBrowserObserve, "field"},
 		{capabilityBrowserActions, "click"},
@@ -326,7 +327,7 @@ func decodeArguments(body []byte, action string) (any, error) {
 			return nil, err
 		}
 		return args, nil
-	case "snapshot", "screenshot":
+	case "snapshot", "screenshot", "handoff":
 		var args targetArguments
 		if err := decode(&args); err != nil || !validTargetID(args.TargetID) {
 			return nil, errors.New("browser target arguments are invalid")
@@ -710,6 +711,20 @@ func (c *Controller) runTargetAction(ctx context.Context, request contract.Execu
 			TargetID   string `json:"target_id"`
 			Dispatched bool   `json:"dispatched"`
 		}{TargetID: targetID, Dispatched: true})
+	case "handoff":
+		if err := c.registry.markEffectStarted(request.OperationID); err != nil {
+			return nil, runtimecore.ErrOperationUncertain
+		}
+		if err := connection.ActivateTarget(ctx, targetID); err != nil {
+			if ctx.Err() != nil {
+				return nil, runtimecore.ErrOperationUncertain
+			}
+			return nil, errors.New("browser tab could not be brought to the foreground")
+		}
+		return marshalResult(struct {
+			TargetID string `json:"target_id"`
+			Active   bool   `json:"active"`
+		}{TargetID: targetID, Active: true})
 	default:
 		return nil, runtimecore.ErrCapabilityUnavailable
 	}
@@ -1128,16 +1143,24 @@ func screenshot(ctx context.Context, target targetConnection, targetID string) (
 	}, &response); err != nil {
 		return nil, errors.New("browser screenshot failed")
 	}
-	data, err := base64.StdEncoding.DecodeString(response.Data)
-	if err != nil || len(data) < 4 || len(data) > maxScreenshotBytes || data[0] != 0xff || data[1] != 0xd8 || data[len(data)-2] != 0xff || data[len(data)-1] != 0xd9 {
+	if len(response.Data) > base64.StdEncoding.EncodedLen(maxBrowserScreenshotInputBytes) {
 		return nil, runtimecore.ErrResultTooLarge
 	}
+	data, err := base64.StdEncoding.DecodeString(response.Data)
+	if err != nil {
+		return nil, runtimecore.ErrResultTooLarge
+	}
+	data, err = normalizeBrowserScreenshot(data)
+	if err != nil {
+		return nil, err
+	}
+	dataBase64 := base64.StdEncoding.EncodeToString(data)
 	encoded, err := marshalResult(struct {
 		TargetID   string `json:"target_id"`
 		MIMEType   string `json:"mime_type"`
 		DataBase64 string `json:"data_base64"`
-	}{TargetID: targetID, MIMEType: "image/jpeg", DataBase64: response.Data})
-	if err != nil || len(response.Data) > 700<<10 || len(encoded) > 700<<10 {
+	}{TargetID: targetID, MIMEType: "image/jpeg", DataBase64: dataBase64})
+	if err != nil || len(encoded) > 700<<10 {
 		return nil, runtimecore.ErrResultTooLarge
 	}
 	return encoded, nil

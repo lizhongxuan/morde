@@ -34,6 +34,11 @@ func TestProjectCheckpointRecoveryRevalidatesSnapshotAndRestartsRealNode(t *test
 		t.Fatal(err)
 	}
 	memberWorkspace := createTestWorkspace(t, ctx, store, member.ID, "member recovery Workspace")
+	if _, err := pool.Exec(ctx, `UPDATE workspace_revision_directories
+SET mode=493, mod_time_ns=1
+WHERE workspace_id=$1 AND valid_from_revision=0 AND directory_path='.' AND valid_to_revision IS NULL`, memberWorkspace.ID); err != nil {
+		t.Fatalf("seed observed member Workspace root metadata: %v", err)
+	}
 	memberHost, binding := createRunningControlHostForWorkspace(t, ctx, store, member.ID, memberWorkspace, host.ControlAI, 0)
 	if _, err := store.TransitionWorkspaceBinding(ctx, memberHost.ID, memberWorkspace.ID, binding.BindingVersion,
 		workspace.BindingPreparing, workspace.BindingActive, memberWorkspace.Revision, 0); err != nil {
@@ -155,7 +160,10 @@ VALUES ('p1234567',NULL,'project recovery test','http://127.0.0.1','test',decode
 	exerciseProjectWorkspacePublicationWithQueuedRevocation(t, ctx, store, bound, owner.ID, initialPage, manifestDigest)
 	cancel()
 	select {
-	case <-firstResult:
+	case err := <-firstResult:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("original project Runtime stop error: %v", err)
+		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("original project Runtime did not stop")
 	}
@@ -167,7 +175,7 @@ VALUES ('p1234567',NULL,'project recovery test','http://127.0.0.1','test',decode
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer projectLock.Rollback(ctx)
+	defer func() { _ = projectLock.Rollback(ctx) }()
 	if _, _, err := lockProjectForActorInTx(ctx, projectLock, member.ID, projectValue.ID, project.RoleMember, false); err != nil {
 		t.Fatal(err)
 	}
@@ -290,8 +298,11 @@ VALUES ('p1234567',NULL,'project recovery test','http://127.0.0.1','test',decode
 		t.Fatal("project member removal deadlocked with recovery")
 	}
 	select {
-	case <-verified:
+	case err := <-verified:
 		// The concurrent read may linearize on either side of the removal.
+		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
+			t.Fatalf("project recovery read failed unexpectedly: %v", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("project recovery deadlocked with member removal")
 	}

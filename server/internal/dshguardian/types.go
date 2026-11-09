@@ -57,6 +57,37 @@ type TaskProcessGuard struct {
 	ExpiresAt          time.Time                    `json:"expires_at"`
 }
 
+// TaskSandboxGuard pins one OpenSandbox container to a durable Morde Task
+// lifecycle. It is registered only after the provider has created the exact
+// running container; stop attestations use a separate signing key.
+type TaskSandboxGuard struct {
+	LifecycleID          string    `json:"lifecycle_id"`
+	TaskID               string    `json:"task_id"`
+	OwnerID              string    `json:"owner_id"`
+	InitiatorID          string    `json:"initiator_id"`
+	LeaseOwner           string    `json:"lease_owner"`
+	LeaseVersion         int64     `json:"lease_version"`
+	AuthorizationVersion int64     `json:"authorization_version"`
+	AgentInstanceID      string    `json:"agent_instance_id"`
+	AgentGeneration      int64     `json:"agent_generation"`
+	SandboxID            string    `json:"sandbox_id"`
+	SandboxGeneration    int64     `json:"sandbox_generation"`
+	ContainerID          string    `json:"container_id"`
+	ContainerName        string    `json:"container_name"`
+	ExpiresAt            time.Time `json:"expires_at"`
+}
+
+type taskSandboxLease struct {
+	Key             string           `json:"key"`
+	Guard           TaskSandboxGuard `json:"guard"`
+	Process         processProof     `json:"process,omitempty"`
+	Started         bool             `json:"started,omitempty"`
+	UnprovenRunning bool             `json:"unproven_running,omitempty"`
+	NonceSHA256     string           `json:"nonce_sha256,omitempty"`
+	Destroyed       bool             `json:"destroyed,omitempty"`
+	DestroyedAt     time.Time        `json:"destroyed_at,omitempty"`
+}
+
 type processProof struct {
 	PID           int    `json:"pid,omitempty"`
 	StartTimeTick uint64 `json:"start_time_ticks,omitempty"`
@@ -178,6 +209,94 @@ func (g TaskProcessGuard) validateNew(now time.Time) error {
 func (g TaskProcessGuard) sameIdentity(other TaskProcessGuard) bool {
 	return g.RuntimeFence == other.RuntimeFence && g.TaskFence == other.TaskFence && g.RuntimeContainerID == other.RuntimeContainerID &&
 		g.ContainerPID == other.ContainerPID && g.NonceSHA256 == other.NonceSHA256
+}
+
+func (g TaskSandboxGuard) validateIdentity() error {
+	if !containerIDRE.MatchString(g.ContainerID) || g.ContainerName != "sandbox-"+g.SandboxID || g.validateFence() != nil {
+		return errors.New("task Sandbox container identity is invalid")
+	}
+	return nil
+}
+
+func (g TaskSandboxGuard) validateDiscoveryRequest(now time.Time) error {
+	if g.ContainerID != "" || g.ContainerName != "" || g.validateFence() != nil {
+		return errors.New("task Sandbox discovery identity is invalid")
+	}
+	remaining := g.ExpiresAt.Sub(now)
+	if remaining <= 0 || remaining > app.MaxAgentLease {
+		return errors.New("task Sandbox lease expiry is outside the allowed window")
+	}
+	return nil
+}
+
+func (g TaskSandboxGuard) validateFence() error {
+	metadata, err := g.lifecycleMetadata()
+	if err != nil {
+		return err
+	}
+	if !app.TaskSandboxMatchesLifecycle(app.Sandbox{ID: g.SandboxID, Metadata: metadata}, g.lifecycle()) {
+		return errors.New("task Sandbox lifecycle fence is invalid")
+	}
+	return nil
+}
+
+func (g TaskSandboxGuard) lifecycleMetadata() (map[string]string, error) {
+	return app.TaskSandboxLifecycleMetadata(g.lifecycle())
+}
+
+func (g TaskSandboxGuard) lifecycle() app.TaskSandboxLifecycle {
+	return app.TaskSandboxLifecycle{
+		ID: g.LifecycleID, TaskID: g.TaskID, OwnerID: g.OwnerID, InitiatorID: g.InitiatorID,
+		LeaseOwner: g.LeaseOwner, LeaseVersion: g.LeaseVersion, AuthorizationVersion: g.AuthorizationVersion,
+		AgentInstanceID: g.AgentInstanceID, AgentGeneration: g.AgentGeneration, SandboxID: g.SandboxID,
+		SandboxGeneration: g.SandboxGeneration,
+	}
+}
+
+func (g TaskSandboxGuard) validateNew(now time.Time) error {
+	if err := g.validateIdentity(); err != nil {
+		return err
+	}
+	remaining := g.ExpiresAt.Sub(now)
+	if remaining <= 0 || remaining > app.MaxAgentLease {
+		return errors.New("task Sandbox lease expiry is outside the allowed window")
+	}
+	return nil
+}
+
+func (g TaskSandboxGuard) sameIdentity(other TaskSandboxGuard) bool {
+	return g.sameLifecycleIdentity(other) && g.ContainerID == other.ContainerID && g.ContainerName == other.ContainerName
+}
+
+func (g TaskSandboxGuard) sameLifecycleIdentity(other TaskSandboxGuard) bool {
+	return g.LifecycleID == other.LifecycleID && g.TaskID == other.TaskID && g.OwnerID == other.OwnerID &&
+		g.InitiatorID == other.InitiatorID && g.LeaseOwner == other.LeaseOwner && g.LeaseVersion == other.LeaseVersion &&
+		g.AuthorizationVersion == other.AuthorizationVersion && g.AgentInstanceID == other.AgentInstanceID &&
+		g.AgentGeneration == other.AgentGeneration && g.SandboxID == other.SandboxID &&
+		g.SandboxGeneration == other.SandboxGeneration && g.ExpiresAt.Equal(other.ExpiresAt)
+}
+
+func validPersistedTaskSandboxLease(value taskSandboxLease) error {
+	if err := value.Guard.validateIdentity(); err != nil || value.Guard.ExpiresAt.IsZero() || !validTaskKey(value.Key) ||
+		value.Key != taskSandboxLeaseKey(value.Guard.LifecycleID) || !value.Started || value.Process.PID < 2 ||
+		value.Process.StartTimeTick == 0 || !containerCgroupMatches(value.Process.CgroupPath, value.Guard.ContainerID) {
+		return errors.New("persisted Task Sandbox identity or process evidence is invalid")
+	}
+	if value.NonceSHA256 != "" && !nonceHashRE.MatchString(value.NonceSHA256) {
+		return errors.New("persisted Task Sandbox stop nonce is invalid")
+	}
+	if !value.Destroyed && !value.DestroyedAt.IsZero() || value.Destroyed && value.UnprovenRunning {
+		return errors.New("persisted Task Sandbox stop state is inconsistent")
+	}
+	if value.Destroyed && value.DestroyedAt.IsZero() {
+		return errors.New("persisted Task Sandbox destruction time is missing")
+	}
+	return nil
+}
+
+func taskSandboxLeaseKey(lifecycleID string) string {
+	digest := sha256.Sum256([]byte(lifecycleID))
+	return hex.EncodeToString(digest[:])
 }
 
 func expectedAccountRuntimeContainerName(fence app.AccountAgentRuntimeFence, nonceHash string) string {

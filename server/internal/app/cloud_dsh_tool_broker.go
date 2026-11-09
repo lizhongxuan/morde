@@ -19,20 +19,22 @@ import (
 
 // CloudDSHToolBroker routes dsh calls through Morde's durable task gates. It does not run a model loop.
 type CloudDSHToolBroker struct {
-	store          TaskStore
-	runtime        *RuntimeToolExecutor
-	recordCapture  *RecordCaptureService
-	mcpCredentials MCPConnectorCredentialProvider
-	mcpClient      MCPConnectorToolClient
-	builtinSearch  MCPConnectorToolClient
-	hub            *HubService
-	personalData   *PersonalMutationService
-	personalFiles  *PersonalAttachmentService
-	workspaceTools *cloudDSHWorkspaceTools
-	personalSync   cloudDSHPersonalSnapshotReader
-	goals          *GoalService
-	schedules      *ScheduleService
-	projectContext *ProjectService
+	store                    TaskStore
+	runtime                  *RuntimeToolExecutor
+	recordCapture            *RecordCaptureService
+	mcpCredentials           MCPConnectorCredentialProvider
+	mcpClient                MCPConnectorToolClient
+	builtinSearch            MCPConnectorToolClient
+	builtinSearchCache       *cloudDSHBuiltinSearchCache
+	hub                      *HubService
+	personalData             *PersonalMutationService
+	personalFiles            *PersonalAttachmentService
+	workspaceTools           *cloudDSHWorkspaceTools
+	personalSync             cloudDSHPersonalSnapshotReader
+	scheduledPersonalContext cloudDSHScheduledPersonalContextReader
+	goals                    *GoalService
+	schedules                *ScheduleService
+	projectContext           *ProjectService
 }
 
 type CloudDSHTaskCompletion struct {
@@ -106,6 +108,9 @@ func newCloudDSHToolBroker(store TaskStore, runtime *RuntimeToolExecutor, record
 		mcpCredentials: mcpCredentials, mcpClient: mcpClient,
 		workspaceTools: newCloudDSHWorkspaceTools(runtime.workspaces),
 	}
+	if reader, ok := store.(cloudDSHScheduledPersonalContextReader); ok {
+		broker.scheduledPersonalContext = reader
+	}
 	if len(hubs) == 1 {
 		broker.hub = hubs[0]
 	}
@@ -165,6 +170,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 	if err != nil {
 		return nil, err
 	}
+	goalFollowupReadOnly := cloudDSHGoalFollowupReadOnlyTask(claimed)
 	if routed {
 		definitions = append(definitions, deferredRuntimeToolDefinitions(target, claimed.Authorization)...)
 	} else if claimed.HostID != "" {
@@ -174,7 +180,10 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		}
 		definitions = append(definitions, hostDefinitions...)
 	}
-	selectedMCP := b.selectedMCPDefinitions(claimed)
+	var selectedMCP []AgentToolDefinition
+	if !goalFollowupReadOnly {
+		selectedMCP = b.selectedMCPDefinitions(claimed)
+	}
 	if claimed.ExecutionLocation == "server" {
 		details, err := b.currentServerTask(ctx, claimed)
 		if err != nil {
@@ -185,7 +194,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		} else if b.workspaceTools != nil && cloudDSHWorkspaceToolsEligible(details.Task) {
 			definitions = append(definitions, cloudDSHWorkspaceToolDefinitions(*details.Task.WorkspaceCheckpointRevision)...)
 		}
-		if b.builtinSearch != nil && b.authorizeBuiltinSearch(ctx, details.Task) == nil {
+		if !goalFollowupReadOnly && b.builtinSearch != nil && b.authorizeBuiltinSearch(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHBuiltinSearchDefinitions()...)
 		}
 		if b.authorizeSkillTask(ctx, details.Task) == nil {
@@ -218,22 +227,27 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		if len(attachments) > 0 {
 			definitions = append(definitions, cloudDSHTaskAttachmentReadDefinition(attachments))
 		}
-		hubDefinitions, err := b.hubTaskDefinitions(ctx, details.Task)
-		if err != nil {
-			return nil, err
+		if !goalFollowupReadOnly {
+			hubDefinitions, err := b.hubTaskDefinitions(ctx, details.Task)
+			if err != nil {
+				return nil, err
+			}
+			available := maxCloudDSHToolDefinitions - len(definitions) - 1
+			if available >= len(selectedMCP) {
+				available -= len(selectedMCP)
+			}
+			if available > 0 {
+				definitions = append(definitions, hubDefinitions[:min(len(hubDefinitions), available)]...)
+			}
 		}
-		available := maxCloudDSHToolDefinitions - len(definitions) - 1
-		if available >= len(selectedMCP) {
-			available -= len(selectedMCP)
-		}
-		if available > 0 {
-			definitions = append(definitions, hubDefinitions[:min(len(hubDefinitions), available)]...)
-		}
+	}
+	if goalFollowupReadOnly {
+		definitions = filterGoalFollowupReadOnlyTools(definitions)
 	}
 	if len(definitions)+len(selectedMCP)+1 <= maxCloudDSHToolDefinitions {
 		definitions = append(definitions, selectedMCP...)
 	}
-	if len(definitions)+1 > maxCloudDSHToolDefinitions {
+	if !goalFollowupReadOnly && len(definitions)+1 > maxCloudDSHToolDefinitions {
 		return nil, domain.NewError(domain.CodeResultTooLarge, "the task has more tools than the model can accept")
 	}
 	seen := make(map[string]struct{}, len(definitions)+1)
@@ -246,7 +260,36 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		}
 		seen[definition.Name] = struct{}{}
 	}
+	if goalFollowupReadOnly {
+		return definitions, nil
+	}
 	return append(definitions, agentAskUserTool), nil
+}
+
+func cloudDSHGoalFollowupReadOnlyTask(value task.Task) bool {
+	return value.ExecutionLocation == "server" && value.HostID == "" && value.ProjectID == "" &&
+		identity.Kind(value.Authorization.Kind) == identity.KindScheduleTask &&
+		identity.IsGoalFollowupScheduleTaskExecutionScopeSet(agentScopeSnapshot(value.Authorization.Scopes))
+}
+
+func goalFollowupReadOnlyToolAllowed(name string) bool {
+	switch name {
+	case cloudDSHSkillReadToolName, cloudDSHTaskAttachmentReadToolName,
+		cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceSearchToolName:
+		return true
+	default:
+		return false
+	}
+}
+
+func filterGoalFollowupReadOnlyTools(definitions []AgentToolDefinition) []AgentToolDefinition {
+	filtered := make([]AgentToolDefinition, 0, len(definitions))
+	for _, definition := range definitions {
+		if goalFollowupReadOnlyToolAllowed(definition.Name) {
+			filtered = append(filtered, definition)
+		}
+	}
+	return filtered
 }
 
 // Complete only commits a dsh result after the worker has confirmed its
@@ -705,6 +748,9 @@ func (b *CloudDSHToolBroker) Reconcile(ctx context.Context, claimed task.Task, c
 func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	if ctx == nil || call.CallID == "" || len(call.CallID) > 256 || len(call.Name) == 0 || len(call.Name) > 128 {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call", "dsh tool call identity is invalid")
+	}
+	if cloudDSHGoalFollowupReadOnlyTask(claimed) && !goalFollowupReadOnlyToolAllowed(call.Name) {
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "tool is not available to read-only Goal follow-up Tasks")
 	}
 	claimed, target, routed, err := b.refreshDeferredTask(ctx, claimed)
 	if err != nil {
@@ -1193,10 +1239,23 @@ func validCloudDSHToolImages(name string, result AgentToolResult) bool {
 	if result.Status != AgentToolSucceeded {
 		return len(result.Images) == 0
 	}
-	if name == cloudDSHTaskAttachmentReadToolName {
+	if strings.HasPrefix(name, cloudDSHMCPToolPrefix) {
 		return len(result.Images) <= 1 && (len(result.Images) == 0 ||
-			((result.Images[0].MediaType == "image/jpeg" || result.Images[0].MediaType == "image/png") &&
-				len(result.Images[0].Data) >= 4 && len(result.Images[0].Data) <= 512<<10))
+			validCloudDSHMCPImage(result.Images[0].MediaType, result.Images[0].Data))
+	}
+	if name == cloudDSHTaskAttachmentReadToolName {
+		if len(result.Images) > maxCloudDSHTaskAttachmentImages {
+			return false
+		}
+		totalBytes := 0
+		for _, image := range result.Images {
+			if len(image.Data) < 4 || len(image.Data) > maxCloudDSHTaskAttachmentImageBytes ||
+				!validCloudDSHTaskAttachmentImage(image.MediaType, image.Data) {
+				return false
+			}
+			totalBytes += len(image.Data)
+		}
+		return totalBytes <= maxCloudDSHTaskAttachmentImagesBytes
 	}
 	if name != runtimeToolDesktopScreenshot && name != runtimeToolBrowserScreenshot {
 		return len(result.Images) == 0

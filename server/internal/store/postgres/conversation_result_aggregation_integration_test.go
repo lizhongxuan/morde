@@ -540,7 +540,7 @@ VALUES ($1,$2,$3,$3,$4,$5,$6,'applied')`, latestID, value.ID, f.ownerID, f.conve
 	}
 }
 
-func TestConversationResultAggregationProjectActorsAndRouteHistoryStayIsolated(t *testing.T) {
+func TestConversationResultAggregationProjectActorsBatchSeparatelyAndShareVerifiedRouteHistory(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
@@ -600,9 +600,15 @@ VALUES ('p1234567',NULL,'result model','http://127.0.0.1','test',decode(repeat('
 		}
 		return false
 	}
-	if !contains(ownerHistory, ownerMessage) || contains(ownerHistory, memberMessage) ||
-		!contains(memberHistory, memberMessage) || contains(memberHistory, ownerMessage) {
-		t.Fatalf("route context mixed project actors: owner=%#v member=%#v", ownerHistory, memberHistory)
+	sharedHistoryIDs := []string{a1.UserMessageID, a2.UserMessageID, b1.UserMessageID, b2.UserMessageID,
+		ownerMessage, memberMessage}
+	// Batches stay actor-specific, but verified published results are shared project conversation history.
+	for actor, history := range map[string][]app.ConversationRouteHistory{"owner": ownerHistory, "member": memberHistory} {
+		for _, id := range sharedHistoryIDs {
+			if !contains(history, id) {
+				t.Fatalf("%s route context omitted a verified published project result source %s: %#v", actor, id, history)
+			}
+		}
 	}
 }
 

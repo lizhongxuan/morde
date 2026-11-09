@@ -132,7 +132,15 @@ func (h *api) listAvailableModels(c *gin.Context) {
 			defaultModelID = &id
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"items": result, "configuration_status": app.ModelConnectionsConfigurationStatus(items),
+	configurationStatus := app.ModelConnectionsConfigurationStatus(items)
+	if h.deps.AdminModelDefaults == nil {
+		if configurationStatus == app.ModelConfigurationNotConfigured {
+			configurationStatus = app.ModelConfigurationUnknown
+		}
+	} else if configured {
+		configurationStatus = app.ModelConfigurationConfigured
+	}
+	c.JSON(http.StatusOK, gin.H{"items": result, "configuration_status": configurationStatus,
 		"default_model_configured": configured, "default_model_id": defaultModelID})
 }
 

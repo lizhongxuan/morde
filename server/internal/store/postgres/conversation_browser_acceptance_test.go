@@ -59,6 +59,26 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	personalData, err := app.NewPersonalMutationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalSync, err := app.NewPersonalSyncService(store, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalQuota, err := app.NewPersonalDataQuotaService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalQuotaUser, err := app.NewPersonalDataQuotaUserService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	personalAttachments, err := app.NewPersonalAttachmentService(store, personalQuota)
+	if err != nil {
+		t.Fatal(err)
+	}
 	sealer, err := app.NewSealer(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +104,20 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if _, err := gateway.CheckModelCapability(ctx, principal, checked.ID, "browser-model-probe-0001", "all"); err != nil {
 		t.Fatal(err)
 	}
-	tasks, err := app.NewTaskService(store, credentials, models)
+	projectResumeMode := os.Getenv("MORDE_BROWSER_PROJECT_ATTACHMENT_RESUME") == "1"
+	var projects *app.ProjectService
+	if projectResumeMode {
+		projects, err = app.NewProjectService(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var tasks *app.TaskService
+	if projects != nil {
+		tasks, err = app.NewTaskService(store, credentials, models, projects)
+	} else {
+		tasks, err = app.NewTaskService(store, credentials, models)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,12 +131,43 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var projectConversations *app.ProjectConversationService
+	var projectAttachments *app.ProjectConversationAttachmentService
+	var projectAttachmentResume *browserProjectAttachmentResumeFixture
+	if projectResumeMode {
+		projectValue := createProjectStoreFixture(t, ctx, store, owner.ID,
+			"本地项目附件恢复验收", "loopback iOS project attachment recovery", "browser-project-attachment-create")
+		projectConversations, err = app.NewProjectConversationService(store, projects, tasks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shared, _, err := projectConversations.Create(ctx, principal, projectValue.ID,
+			app.CreateProjectConversationCommand{Title: "附件恢复验收", IdempotencyKey: "browser-project-attachment-conversation"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		projectAttachments, err = app.NewProjectConversationAttachmentService(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		projectAttachmentResume = &browserProjectAttachmentResumeFixture{
+			projectID: projectValue.ID, conversationID: shared.ID,
+		}
+	}
 	execution, err := app.NewExecutionControlService(store, audit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var activity *browserAcceptanceActivity
 	var executor worker.TaskExecutor = browserAcceptanceExecutor{store: store}
+	var attachmentResume *browserAttachmentResumeFixture
+	var messageUploadResume *browserMessageUploadResumeFixture
+	if os.Getenv("MORDE_BROWSER_ATTACHMENT_RESUME") == "1" {
+		attachmentResume = &browserAttachmentResumeFixture{}
+	}
+	if os.Getenv("MORDE_BROWSER_MESSAGE_UPLOAD_RESUME") == "1" {
+		messageUploadResume = newBrowserMessageUploadResumeFixture(mainConversation.ConversationID)
+	}
 	if os.Getenv("MORDE_BROWSER_ACTIVITY") == "1" {
 		activity, err = newBrowserAcceptanceActivity(store, sealer, mainConversation.ConversationID)
 		if err != nil {
@@ -131,12 +195,18 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	}
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	workerDone := make(chan error, 3)
+	workerCount := 0
 	go func() { workerDone <- taskWorker.Run(workerCtx) }()
-	go func() { workerDone <- routerWorker.Run(workerCtx) }()
+	workerCount++
+	if (projectAttachmentResume == nil || activity != nil) && messageUploadResume == nil {
+		go func() { workerDone <- routerWorker.Run(workerCtx) }()
+		workerCount++
+	}
 	go func() { workerDone <- resultWorker.Run(workerCtx) }()
+	workerCount++
 	t.Cleanup(func() {
 		cancelWorkers()
-		for i := 0; i < 3; i++ {
+		for i := 0; i < workerCount; i++ {
 			if err := <-workerDone; !errors.Is(err, context.Canceled) {
 				t.Errorf("stop browser fixture worker: %v", err)
 			}
@@ -151,10 +221,18 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	portalRoot := filepath.Join("..", "..", "..", "..", "web", "portal", "dist")
-	router, err := api.New(api.Deps{Hosts: nativeAcceptanceHosts{}, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
+	apiDeps := api.Deps{Hosts: nativeAcceptanceHosts{}, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients, Tasks: tasks, Conversations: conversations,
-		ModelConnections: models, ModelGateway: gateway, ExecutionControl: execution, MCPDisabled: true,
-	}, api.Options{Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), ServiceInstanceID: instanceID,
+		PersonalData: personalData, PersonalSync: personalSync, PersonalDataQuotaUser: personalQuotaUser,
+		PersonalAttachments: personalAttachments,
+		ModelConnections:    models, ModelGateway: gateway, ExecutionControl: execution, MCPDisabled: true,
+	}
+	if projects != nil {
+		apiDeps.Projects = projects
+		apiDeps.ProjectConversations = projectConversations
+		apiDeps.ProjectConversationAttachments = projectAttachments
+	}
+	router, err := api.New(apiDeps, api.Options{Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), ServiceInstanceID: instanceID,
 		APIMaxBodyBytes: 16 << 20, MCPMaxBodyBytes: 16 << 20, SessionTTL: 12 * time.Hour,
 		HostScheme: "http", PortalDomain: listener.Addr().String(), HostSuffix: "hosts.invalid", PreviewPortMin: 1024,
 		PortalFiles: os.DirFS(portalRoot)})
@@ -164,12 +242,113 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	// The production capability remains disabled until all acceptance checks
 	// pass. This disposable fixture advertises it only to exercise the UI.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Printf("LOCAL_HTTP %s %s authorization=%t\n", r.Method, r.URL.Path, r.Header.Get("Authorization") != "")
+		if attachmentResume != nil && r.Method == http.MethodGet && r.URL.Path == "/__morde_fixture/attachment-status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(attachmentResume.view())
+			return
+		}
+		if attachmentResume != nil && r.Method == http.MethodPost && r.URL.Path == "/__morde_fixture/allow-attachment-resume" {
+			attachmentResume.allowResume()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if projectAttachmentResume != nil && r.Method == http.MethodGet && r.URL.Path == "/__morde_fixture/project-attachment-status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(projectAttachmentResume.view())
+			return
+		}
+		if projectAttachmentResume != nil && r.Method == http.MethodPost && r.URL.Path == "/__morde_fixture/allow-project-attachment-resume" {
+			projectAttachmentResume.allowResume()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if messageUploadResume != nil && r.Method == http.MethodGet && r.URL.Path == "/__morde_fixture/message-upload-status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(messageUploadResume.view())
+			return
+		}
+		if messageUploadResume != nil && r.Method == http.MethodPost && r.URL.Path == "/__morde_fixture/allow-message-upload-resume" {
+			messageUploadResume.allowResume()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if messageUploadResume != nil && strings.HasPrefix(r.URL.Path,
+			"/api/conversations/"+messageUploadResume.conversationID+"/message-uploads/") {
+			if messageUploadResume.interruptFirstAttempt(w, r) {
+				return
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, r)
+			messageUploadResume.observe(r, recorder.Code)
+			for name, values := range recorder.Header() {
+				for _, value := range values {
+					w.Header().Add(name, value)
+				}
+			}
+			w.WriteHeader(recorder.Code)
+			_, _ = w.Write(recorder.Body.Bytes())
+			return
+		}
+		if projectAttachmentResume != nil && strings.Contains(r.URL.Path, "/attachments/") {
+			if projectAttachmentResume.interruptFirstAttempt(w, r) {
+				return
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, r)
+			projectAttachmentResume.observe(r, recorder.Code)
+			for name, values := range recorder.Header() {
+				for _, value := range values {
+					w.Header().Add(name, value)
+				}
+			}
+			w.WriteHeader(recorder.Code)
+			_, _ = w.Write(recorder.Body.Bytes())
+			return
+		}
+		if attachmentResume != nil && strings.HasPrefix(r.URL.Path, "/api/personal-data/uploads") {
+			if attachmentResume.interruptFirstAttempt(w, r) {
+				return
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, r)
+			attachmentResume.observe(r, recorder.Code)
+			for name, values := range recorder.Header() {
+				for _, value := range values {
+					w.Header().Add(name, value)
+				}
+			}
+			w.WriteHeader(recorder.Code)
+			_, _ = w.Write(recorder.Body.Bytes())
+			return
+		}
 		if activity != nil && strings.HasPrefix(r.URL.Path, "/__morde_fixture/") {
 			activity.serveControl(w, r)
 			return
 		}
 		if activity != nil && strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/events") {
 			activity.serveTaskEvents(w, r, router)
+			return
+		}
+		if activity != nil && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/tasks/") {
+			activity.serveTaskSnapshot(w, r, router)
+			return
+		}
+		if activity != nil && r.Method == http.MethodGet && r.URL.Path == "/api/conversations/"+activity.conversationID+"/tasks" {
+			activity.serveConversationTasks(w, r, router)
+			return
+		}
+		if r.URL.Path == "/api/auth/client-login" {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, r)
+			fmt.Printf("LOCAL_HTTP_RESULT %s %s status=%d\n", r.Method, r.URL.Path, recorder.Code)
+			for name, values := range recorder.Header() {
+				for _, value := range values {
+					w.Header().Add(name, value)
+				}
+			}
+			w.WriteHeader(recorder.Code)
+			_, _ = w.Write(recorder.Body.Bytes())
 			return
 		}
 		if r.URL.Path != "/api/capabilities" {
@@ -185,10 +364,15 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 		}
 		features, _ := value["supported_features"].([]any)
 		value["supported_features"] = append(features, "conversation_auto_routing_v1")
+		if projectAttachmentResume != nil {
+			value["supported_features"] = append(value["supported_features"].([]any), "project_budget_execution")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(value)
 	})
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 30 * time.Second}
+	// Task-event and streamed-message responses are long-lived SSE connections;
+	// a normal response write timeout would silently sever them mid-task.
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	t.Cleanup(func() {
@@ -199,10 +383,25 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 	})
 	stop := filepath.Join(t.TempDir(), "finish")
 	t.Logf("LOCAL_PORTAL=http://%s TEST_USER=%s MAIN_CONVERSATION=%s STOP_FILE=%s", listener.Addr().String(), owner.Name, mainConversation.ConversationID, stop)
-	if activity != nil {
-		t.Logf("LOCAL_ACTIVITY_TOKEN=%s", activity.controlToken)
+	if projectAttachmentResume != nil {
+		t.Logf("PROJECT_ID=%s PROJECT_CONVERSATION_ID=%s", projectAttachmentResume.projectID, projectAttachmentResume.conversationID)
 	}
-	deadline := time.NewTimer(10 * time.Minute)
+	if activity != nil {
+		tokenFile := filepath.Join(t.TempDir(), "activity-control-token")
+		if err := os.WriteFile(tokenFile, []byte(activity.controlToken), 0o600); err != nil {
+			t.Fatalf("write local activity control token: %v", err)
+		}
+		t.Logf("LOCAL_ACTIVITY_TOKEN_FILE=%s", tokenFile)
+	}
+	acceptanceTimeout := 10 * time.Minute
+	if raw := os.Getenv("MORDE_BROWSER_ACCEPTANCE_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			t.Fatalf("invalid MORDE_BROWSER_ACCEPTANCE_TIMEOUT %q", raw)
+		}
+		acceptanceTimeout = parsed
+	}
+	deadline := time.NewTimer(acceptanceTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -211,12 +410,81 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 		case <-ticker.C:
 			if _, err := os.Stat(stop); err == nil {
 				var messages, replies int
-				if err := store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM conversation_messages WHERE owner_id=$1`, owner.ID).Scan(&messages, &replies); err != nil || messages < 2 || replies < 1 {
+				minimumMessages := 2
+				if activity != nil || attachmentResume != nil || projectAttachmentResume != nil || messageUploadResume != nil {
+					minimumMessages = 1
+				}
+				if err := store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE role='user'),count(*) FILTER (WHERE role='assistant') FROM conversation_messages WHERE owner_id=$1`, owner.ID).Scan(&messages, &replies); err != nil || messages < minimumMessages || (attachmentResume == nil && projectAttachmentResume == nil && messageUploadResume == nil && replies < 1) {
 					t.Fatalf("browser messages=%d replies=%d err=%v", messages, replies, err)
 				}
 				if activity != nil {
 					if err := activity.assertVerified(); err != nil {
 						t.Fatal(err)
+					}
+				}
+				if attachmentResume != nil {
+					status := attachmentResume.view()
+					if !status.FailureInjected || status.UploadID == "" || !status.ResumeInitializationSeen ||
+						!status.ResumeAllowed || status.FirstChunkRepeatedAfterRestart || !status.MissingChunkRecovered || !status.Committed {
+						t.Fatalf("attachment did not recover after restart: %+v", status)
+					}
+					var state string
+					if err := store.pool.QueryRow(ctx, `SELECT state FROM personal_attachment_uploads
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND upload_id=$3`, instanceID, owner.ID, status.UploadID).Scan(&state); err != nil || state != "committed" {
+						t.Fatalf("recovered attachment state=%q err=%v", state, err)
+					}
+					var committedUploads int
+					// The synthetic 5 MiB JPEG produces one readable derivative beside its original.
+					if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM personal_attachment_uploads
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND state='committed'`, instanceID, owner.ID).Scan(&committedUploads); err != nil || committedUploads != 2 {
+						t.Fatalf("attachment fixture created %d committed uploads, err=%v", committedUploads, err)
+					}
+				}
+				if messageUploadResume != nil {
+					status := messageUploadResume.view()
+					if !status.FailureInjected || status.ClientMessageID == "" || !status.ResumeInitializationSeen ||
+						!status.ResumeAllowed || status.FirstChunkRepeatedAfterRestart || !status.MissingChunksRecovered || !status.Committed {
+						t.Fatalf("long message upload did not recover after restart: %+v", status)
+					}
+					var messages, completeMessages int
+					if err := store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE message.content=$4)
+FROM conversation_message_routes route
+JOIN conversation_messages message ON message.id=route.message_id
+WHERE route.conversation_id=$1 AND route.client_message_id=$2 AND message.owner_id=$3 AND message.role='user'`,
+						mainConversation.ConversationID, status.ClientMessageID, owner.ID, messageUploadResume.expectedContent).Scan(&messages, &completeMessages); err != nil || messages != 1 || completeMessages != 1 {
+						t.Fatalf("long message persisted messages=%d complete=%d err=%v", messages, completeMessages, err)
+					}
+				}
+				if projectAttachmentResume != nil {
+					status := projectAttachmentResume.view()
+					if !status.FailureInjected || status.MessageID == "" || status.ClientAttachmentID == "" ||
+						!status.ResumeInitializationSeen || !status.ResumeAllowed || status.FirstChunkRepeatedAfterRestart ||
+						!status.MissingChunkRecovered || !status.Committed || !status.DerivativesCompleted {
+						t.Fatalf("project attachment did not recover after restart: %+v", status)
+					}
+					var state, derivativeState, derivativeMode string
+					if err := store.pool.QueryRow(ctx, `SELECT state,derivative_state,derivative_mode FROM project_conversation_attachments
+WHERE service_instance_id=$1::uuid AND project_id=$2 AND conversation_id=$3 AND message_id=$4 AND client_attachment_id=$5`,
+						instanceID, projectAttachmentResume.projectID, projectAttachmentResume.conversationID,
+						status.MessageID, status.ClientAttachmentID).Scan(&state, &derivativeState, &derivativeMode); err != nil || state != "committed" || derivativeState != "completed" {
+						t.Fatalf("project attachment state=%q derivative_state=%q mode=%q err=%v", state, derivativeState, derivativeMode, err)
+					}
+					var derivatives, extractedText, pagePreviews, imageConversions, projectMessages int
+					if err := store.pool.QueryRow(ctx, `SELECT count(*),
+ count(*) FILTER (WHERE kind='extracted_text'),
+ count(*) FILTER (WHERE kind='page_preview'),
+ count(*) FILTER (WHERE kind='image_conversion')
+FROM project_conversation_attachment_derivatives
+WHERE service_instance_id=$1::uuid AND project_id=$2 AND message_id=$3`, instanceID,
+						projectAttachmentResume.projectID, status.MessageID).Scan(&derivatives, &extractedText, &pagePreviews, &imageConversions); err != nil ||
+						derivatives == 0 || (derivativeMode == "pdf" && (extractedText == 0 || pagePreviews == 0)) ||
+						(derivativeMode == "image" && imageConversions == 0) {
+						t.Fatalf("project attachment derivatives=%d text=%d previews=%d image_conversions=%d mode=%q err=%v",
+							derivatives, extractedText, pagePreviews, imageConversions, derivativeMode, err)
+					}
+					if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages
+WHERE owner_id=$1 AND conversation_id=$2 AND role='user'`, owner.ID, projectAttachmentResume.conversationID).Scan(&projectMessages); err != nil || projectMessages != 1 {
+						t.Fatalf("project conversation user messages=%d err=%v", projectMessages, err)
 					}
 				}
 				return
@@ -228,6 +496,369 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 }
 
 type browserAcceptanceModel struct{ nativeAcceptanceModel }
+
+type browserMessageUploadResumeFixture struct {
+	mu                             sync.Mutex
+	conversationID                 string
+	expectedContent                string
+	totalChunks                    int
+	uploadBase                     string
+	clientMessageID                string
+	failureInjected                bool
+	resumeAllowed                  bool
+	resumeInitializationSeen       bool
+	firstChunkRepeatedAfterRestart bool
+	receivedAfterRestart           map[int]struct{}
+	missingChunksRecovered         bool
+	committed                      bool
+}
+
+type browserMessageUploadResumeStatus struct {
+	FailureInjected                bool   `json:"failure_injected"`
+	ResumeAllowed                  bool   `json:"resume_allowed"`
+	ClientMessageID                string `json:"client_message_id"`
+	ResumeInitializationSeen       bool   `json:"resume_initialization_seen"`
+	FirstChunkRepeatedAfterRestart bool   `json:"first_chunk_repeated_after_restart"`
+	MissingChunksRecovered         bool   `json:"missing_chunks_recovered"`
+	Committed                      bool   `json:"committed"`
+}
+
+func newBrowserMessageUploadResumeFixture(conversationID string) *browserMessageUploadResumeFixture {
+	content := strings.Repeat("中文abc🙂", 3000) + "尾部完整"
+	return &browserMessageUploadResumeFixture{
+		conversationID: conversationID, expectedContent: content,
+		totalChunks:          (len(content) + (16 << 10) - 1) / (16 << 10),
+		receivedAfterRestart: make(map[int]struct{}),
+	}
+}
+
+func (f *browserMessageUploadResumeFixture) view() browserMessageUploadResumeStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return browserMessageUploadResumeStatus{
+		FailureInjected: f.failureInjected, ResumeAllowed: f.resumeAllowed, ClientMessageID: f.clientMessageID,
+		ResumeInitializationSeen:       f.resumeInitializationSeen,
+		FirstChunkRepeatedAfterRestart: f.firstChunkRepeatedAfterRestart,
+		MissingChunksRecovered:         f.missingChunksRecovered, Committed: f.committed,
+	}
+}
+
+func conversationMessageUploadPath(path string) (base, conversationID, clientMessageID, operation, sequence string, ok bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 5 || parts[0] != "api" || parts[1] != "conversations" || parts[2] == "" ||
+		parts[3] != "message-uploads" || parts[4] == "" {
+		return "", "", "", "", "", false
+	}
+	conversationID, clientMessageID = parts[2], parts[4]
+	base = "/" + strings.Join(parts[:5], "/")
+	if len(parts) == 5 {
+		return base, conversationID, clientMessageID, "initialize", "", true
+	}
+	if len(parts) == 6 && parts[5] == "commit" {
+		return base, conversationID, clientMessageID, "commit", "", true
+	}
+	if len(parts) == 7 && parts[5] == "chunks" && parts[6] != "" {
+		return base, conversationID, clientMessageID, "chunk", parts[6], true
+	}
+	return "", "", "", "", "", false
+}
+
+func (f *browserMessageUploadResumeFixture) interruptFirstAttempt(w http.ResponseWriter, r *http.Request) bool {
+	base, conversationID, clientMessageID, operation, sequence, ok := conversationMessageUploadPath(r.URL.Path)
+	if !ok || conversationID != f.conversationID {
+		return false
+	}
+	f.mu.Lock()
+	if !f.failureInjected && r.Method == http.MethodPut && operation == "chunk" && sequence == "1" {
+		f.failureInjected = true
+		f.uploadBase = base
+		f.clientMessageID = clientMessageID
+	}
+	blocked := f.failureInjected && !f.resumeAllowed && base == f.uploadBase
+	f.mu.Unlock()
+	if !blocked {
+		return false
+	}
+	http.Error(w, "synthetic local message chunk interruption", http.StatusServiceUnavailable)
+	return true
+}
+
+func (f *browserMessageUploadResumeFixture) allowResume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failureInjected {
+		f.resumeAllowed = true
+	}
+}
+
+func (f *browserMessageUploadResumeFixture) observe(r *http.Request, status int) {
+	base, conversationID, clientMessageID, operation, sequence, ok := conversationMessageUploadPath(r.URL.Path)
+	if !ok || conversationID != f.conversationID {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.failureInjected || !f.resumeAllowed || base != f.uploadBase || clientMessageID != f.clientMessageID {
+		return
+	}
+	if operation == "initialize" && (r.Method == http.MethodPut || r.Method == http.MethodGet) && status == http.StatusOK {
+		f.resumeInitializationSeen = true
+		return
+	}
+	if !f.resumeInitializationSeen {
+		return
+	}
+	if operation == "chunk" && r.Method == http.MethodPut && status == http.StatusNoContent {
+		chunk, err := strconv.Atoi(sequence)
+		if err == nil && chunk == 0 {
+			f.firstChunkRepeatedAfterRestart = true
+		} else if err == nil && chunk > 0 && chunk < f.totalChunks {
+			f.receivedAfterRestart[chunk] = struct{}{}
+			f.missingChunksRecovered = len(f.receivedAfterRestart) == f.totalChunks-1
+		}
+	}
+	if operation == "commit" && r.Method == http.MethodPost && status == http.StatusAccepted {
+		f.committed = true
+	}
+}
+
+func TestBrowserMessageUploadResumeFixtureGate(t *testing.T) {
+	fixture := &browserMessageUploadResumeFixture{
+		conversationID: "conversation-1", clientMessageID: "message-1", totalChunks: 3,
+		receivedAfterRestart: make(map[int]struct{}),
+	}
+	chunkOne := httptest.NewRequest(http.MethodPut,
+		"/api/conversations/conversation-1/message-uploads/message-1/chunks/1", nil)
+	interruption := httptest.NewRecorder()
+	intercepted := fixture.interruptFirstAttempt(interruption, chunkOne)
+	if !intercepted || interruption.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first failed chunk was not intercepted: intercepted=%t status=%d",
+			intercepted, interruption.Code)
+	}
+
+	retry := httptest.NewRecorder()
+	intercepted = fixture.interruptFirstAttempt(retry, chunkOne)
+	if !intercepted || retry.Code != http.StatusServiceUnavailable {
+		t.Fatalf("retry passed before simulated app restart: intercepted=%t status=%d",
+			intercepted, retry.Code)
+	}
+	fixture.allowResume()
+	if fixture.interruptFirstAttempt(httptest.NewRecorder(), chunkOne) {
+		t.Fatal("request remained blocked after releasing the restart gate")
+	}
+
+	fixture.observe(httptest.NewRequest(http.MethodGet,
+		"/api/conversations/conversation-1/message-uploads/message-1", nil), http.StatusOK)
+	for _, sequence := range []string{"1", "2"} {
+		fixture.observe(httptest.NewRequest(http.MethodPut,
+			"/api/conversations/conversation-1/message-uploads/message-1/chunks/"+sequence, nil), http.StatusNoContent)
+	}
+	fixture.observe(httptest.NewRequest(http.MethodPost,
+		"/api/conversations/conversation-1/message-uploads/message-1/commit", nil), http.StatusAccepted)
+
+	status := fixture.view()
+	if !status.FailureInjected || !status.ResumeAllowed || !status.ResumeInitializationSeen ||
+		status.FirstChunkRepeatedAfterRestart || !status.MissingChunksRecovered || !status.Committed {
+		t.Fatalf("fixture did not record the expected restart recovery: %+v", status)
+	}
+}
+
+type browserAttachmentResumeFixture struct {
+	mu                             sync.Mutex
+	failureInjected                bool
+	resumeAllowed                  bool
+	uploadID                       string
+	resumeInitializationSeen       bool
+	firstChunkRepeatedAfterRestart bool
+	missingChunkRecovered          bool
+	committed                      bool
+}
+
+type browserProjectAttachmentResumeFixture struct {
+	mu                             sync.Mutex
+	projectID                      string
+	conversationID                 string
+	messageID                      string
+	clientAttachmentID             string
+	uploadBase                     string
+	failureInjected                bool
+	resumeAllowed                  bool
+	resumeInitializationSeen       bool
+	firstChunkRepeatedAfterRestart bool
+	missingChunkRecovered          bool
+	committed                      bool
+	derivativesCompleted           bool
+}
+
+type browserProjectAttachmentResumeStatus struct {
+	FailureInjected                bool   `json:"failure_injected"`
+	ResumeAllowed                  bool   `json:"resume_allowed"`
+	MessageID                      string `json:"message_id"`
+	ClientAttachmentID             string `json:"client_attachment_id"`
+	ResumeInitializationSeen       bool   `json:"resume_initialization_seen"`
+	FirstChunkRepeatedAfterRestart bool   `json:"first_chunk_repeated_after_restart"`
+	MissingChunkRecovered          bool   `json:"missing_chunk_recovered"`
+	Committed                      bool   `json:"committed"`
+	DerivativesCompleted           bool   `json:"derivatives_completed"`
+}
+
+func (f *browserProjectAttachmentResumeFixture) view() browserProjectAttachmentResumeStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return browserProjectAttachmentResumeStatus{
+		FailureInjected: f.failureInjected, ResumeAllowed: f.resumeAllowed,
+		MessageID: f.messageID, ClientAttachmentID: f.clientAttachmentID,
+		ResumeInitializationSeen:       f.resumeInitializationSeen,
+		FirstChunkRepeatedAfterRestart: f.firstChunkRepeatedAfterRestart,
+		MissingChunkRecovered:          f.missingChunkRecovered, Committed: f.committed,
+		DerivativesCompleted: f.derivativesCompleted,
+	}
+}
+
+func projectAttachmentUploadPath(path string) (base, messageID, clientAttachmentID, sequence string, ok bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 9 || parts[0] != "api" || parts[1] != "projects" || parts[3] != "conversations" ||
+		parts[5] != "messages" || parts[7] != "attachments" || parts[2] == "" || parts[4] == "" ||
+		parts[6] == "" || parts[8] == "" {
+		return "", "", "", "", false
+	}
+	base = "/" + strings.Join(parts[:9], "/")
+	if len(parts) == 11 && parts[9] == "chunks" {
+		sequence = parts[10]
+	}
+	return base, parts[6], parts[8], sequence, true
+}
+
+func (f *browserProjectAttachmentResumeFixture) interruptFirstAttempt(w http.ResponseWriter, r *http.Request) bool {
+	base, messageID, clientAttachmentID, sequence, valid := projectAttachmentUploadPath(r.URL.Path)
+	if !valid {
+		return false
+	}
+	f.mu.Lock()
+	if !f.failureInjected && r.Method == http.MethodPut && sequence == "1" &&
+		strings.HasPrefix(base, "/api/projects/"+f.projectID+"/conversations/"+f.conversationID+"/") {
+		f.failureInjected = true
+		f.messageID = messageID
+		f.clientAttachmentID = clientAttachmentID
+		f.uploadBase = base
+	}
+	blocked := f.failureInjected && !f.resumeAllowed && base == f.uploadBase
+	f.mu.Unlock()
+	if !blocked {
+		return false
+	}
+	http.Error(w, "synthetic local project attachment interruption", http.StatusServiceUnavailable)
+	return true
+}
+
+func (f *browserProjectAttachmentResumeFixture) allowResume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failureInjected {
+		f.resumeAllowed = true
+	}
+}
+
+func (f *browserProjectAttachmentResumeFixture) observe(r *http.Request, status int) {
+	base, _, _, sequence, valid := projectAttachmentUploadPath(r.URL.Path)
+	if !valid {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.failureInjected || base != f.uploadBase {
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == f.uploadBase && f.resumeAllowed {
+		f.resumeInitializationSeen = true
+		return
+	}
+	if r.Method == http.MethodPut && sequence == "0" && status == http.StatusOK && f.resumeInitializationSeen {
+		f.firstChunkRepeatedAfterRestart = true
+	}
+	if r.Method == http.MethodPut && sequence == "1" && status == http.StatusOK && f.resumeInitializationSeen {
+		f.missingChunkRecovered = true
+	}
+	if r.Method == http.MethodPost && r.URL.Path == f.uploadBase+"/commit" && status == http.StatusOK {
+		f.committed = true
+	}
+	if r.Method == http.MethodPut && r.URL.Path == f.uploadBase+"/derivatives" && status == http.StatusOK {
+		f.derivativesCompleted = true
+	}
+}
+
+type browserAttachmentResumeStatus struct {
+	FailureInjected                bool   `json:"failure_injected"`
+	ResumeAllowed                  bool   `json:"resume_allowed"`
+	UploadID                       string `json:"upload_id"`
+	ResumeInitializationSeen       bool   `json:"resume_initialization_seen"`
+	FirstChunkRepeatedAfterRestart bool   `json:"first_chunk_repeated_after_restart"`
+	MissingChunkRecovered          bool   `json:"missing_chunk_recovered"`
+	Committed                      bool   `json:"committed"`
+}
+
+func (f *browserAttachmentResumeFixture) view() browserAttachmentResumeStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return browserAttachmentResumeStatus{
+		FailureInjected: f.failureInjected, ResumeAllowed: f.resumeAllowed, UploadID: f.uploadID,
+		ResumeInitializationSeen:       f.resumeInitializationSeen,
+		FirstChunkRepeatedAfterRestart: f.firstChunkRepeatedAfterRestart,
+		MissingChunkRecovered:          f.missingChunkRecovered, Committed: f.committed,
+	}
+}
+
+func (f *browserAttachmentResumeFixture) interruptFirstAttempt(w http.ResponseWriter, r *http.Request) bool {
+	f.mu.Lock()
+	if !f.failureInjected && r.Method == http.MethodPut {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/personal-data/uploads/"), "/")
+		if len(parts) == 3 && parts[1] == "chunks" && parts[2] == "1" && parts[0] != "" {
+			f.failureInjected = true
+			f.uploadID = parts[0]
+		}
+	}
+	blocked := f.failureInjected && !f.resumeAllowed
+	f.mu.Unlock()
+	if !blocked {
+		return false
+	}
+	http.Error(w, "synthetic local attachment interruption", http.StatusServiceUnavailable)
+	return true
+}
+
+func (f *browserAttachmentResumeFixture) allowResume() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failureInjected {
+		f.resumeAllowed = true
+	}
+}
+
+func (f *browserAttachmentResumeFixture) observe(r *http.Request, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Method == http.MethodPost && r.URL.Path == "/api/personal-data/uploads" && f.failureInjected {
+		f.resumeInitializationSeen = true
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/personal-data/uploads/"), "/")
+	if len(parts) < 1 || parts[0] != f.uploadID {
+		return
+	}
+	if r.Method == http.MethodPut && len(parts) == 3 && parts[1] == "chunks" && status == http.StatusOK {
+		switch parts[2] {
+		case "0":
+			if f.resumeInitializationSeen {
+				f.firstChunkRepeatedAfterRestart = true
+			}
+		case "1":
+			f.missingChunkRecovered = f.resumeInitializationSeen
+		}
+	}
+	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "commit" && status == http.StatusOK {
+		f.committed = true
+	}
+}
 
 func (browserAcceptanceModel) Complete(ctx context.Context, request app.ModelRequest) (app.ModelResponse, error) {
 	if strings.HasPrefix(request.Instructions, "Classify the user's new message") {
@@ -261,22 +892,27 @@ func (e browserAcceptanceExecutor) ExecuteTask(ctx context.Context, current task
 }
 
 // The opt-in activity stages are selected only by these synthetic messages.
-// Its control API is loopback-only and protected by a fresh per-run token.
+// Its control API is loopback-only and protected by a fresh per-run token,
+// written to a mode-0600 file inside the test's temporary directory.
 // No file or user-provided content is needed by any of these scenarios.
 // With MORDE_BROWSER_ACTIVITY=1, GET /__morde_fixture/status lists the fixed
 // inputs and stages. POST /__morde_fixture/advance/{name}/{start|progress|
-// stream|complete} releases one stage, without a request body. Complete
-// merge-a then merge-b within the aggregation window; for separate-a and
-// separate-b wait until the first answer is published before completing the
-// second. Start stream before submitting stream-other, then disconnect both
+// stream|complete} releases one stage, without a request body. The search
+// scenario uses a fixed local result and never accesses the network. Setting
+// MORDE_BROWSER_ACTIVITY_SCENARIOS=search runs only that scenario; omit it to
+// require the full merge, separate, search, stream and reconnect set. For a
+// full run, merge-a and merge-b must complete within the aggregation window;
+// separate-a and separate-b must complete in order. Start stream before
+// submitting stream-other, then disconnect both
 // clients using POST /__morde_fixture/disconnect/stream before completing the
-// pair. GET /__morde_fixture/verify/{merge|separate|reconnect|stream} checks
-// persistent identities, sources, result ordering and reconnect cursors. The
-// fixture does not pass until all four checks succeed; visual deduplication
-// still needs to be checked in both clients after refresh/relaunch.
+// pair. GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream}
+// checks progress/result identity, sources, result ordering and reconnect
+// cursors. The fixture does not pass until all checks succeed; visual
+// deduplication still needs to be checked in both clients after refresh/relaunch.
 var browserActivityObjectives = map[string]string{
 	"merge-a":      "跨端活动验收：合并 A",
 	"merge-b":      "跨端活动验收：合并 B",
+	"search":       "在本地示例索引中搜索 Morde 消息路由",
 	"separate-a":   "跨端活动验收：分开 A",
 	"separate-b":   "跨端活动验收：分开 B",
 	"stream":       "跨端活动验收：流式",
@@ -285,6 +921,34 @@ var browserActivityObjectives = map[string]string{
 
 const browserActivityStreamPrefix = "跨端活动验收：流式回复第一段"
 const browserActivityStreamSuffix = "，第二段完成。"
+const browserActivitySearchResult = "本地搜索结果：Morde 消息路由先持久接收消息，再异步分流。"
+
+func browserActivityProgressTitle(run *browserActivityRun) string {
+	if run.name == "search" {
+		return "正在检索固定的本地索引"
+	}
+	return "正在整理测试信息"
+}
+
+func browserActivityProgressSummary(run *browserActivityRun, completed bool) string {
+	if run.name == "search" {
+		if completed {
+			return "固定索引查询完成，已整理出一条本地结果。"
+		}
+		return "正在查找 Morde 消息路由示例条目。"
+	}
+	if completed {
+		return "合成文字处理完成。"
+	}
+	return "正在处理合成文字。"
+}
+
+func browserActivityResult(name, objective string) string {
+	if name == "search" {
+		return browserActivitySearchResult
+	}
+	return "本地验收结果：" + objective
+}
 
 type browserActivityCommand struct {
 	phase string
@@ -311,6 +975,19 @@ type browserActivityEventRequest struct {
 	LastID int64  `json:"last_event_id"`
 }
 
+type browserActivityTaskListRequest struct {
+	Client     string   `json:"client"`
+	StatusCode int      `json:"status_code"`
+	TaskIDs    []string `json:"task_ids"`
+	Statuses   []string `json:"statuses"`
+}
+
+type browserActivityTaskSnapshotRequest struct {
+	Client     string `json:"client"`
+	TaskID     string `json:"task_id"`
+	StatusCode int    `json:"status_code"`
+}
+
 type browserActivityWatch struct {
 	taskID string
 	client string
@@ -318,17 +995,20 @@ type browserActivityWatch struct {
 }
 
 type browserAcceptanceActivity struct {
-	store          *Store
-	instances      *app.AgentInstanceService
-	checkpoints    *app.AgentCheckpointService
-	conversationID string
-	controlToken   string
-	mu             sync.Mutex
-	runs           map[string]*browserActivityRun
-	verified       map[string]bool
-	watches        map[uint64]browserActivityWatch
-	requests       []browserActivityEventRequest
-	nextWatch      uint64
+	store            *Store
+	instances        *app.AgentInstanceService
+	checkpoints      *app.AgentCheckpointService
+	conversationID   string
+	controlToken     string
+	required         []string
+	mu               sync.Mutex
+	runs             map[string]*browserActivityRun
+	verified         map[string]bool
+	watches          map[uint64]browserActivityWatch
+	requests         []browserActivityEventRequest
+	taskListRequests []browserActivityTaskListRequest
+	taskSnapshots    []browserActivityTaskSnapshotRequest
+	nextWatch        uint64
 }
 
 func newBrowserAcceptanceActivity(store *Store, sealer *app.Sealer, conversationID string) (*browserAcceptanceActivity, error) {
@@ -350,14 +1030,85 @@ func newBrowserAcceptanceActivity(store *Store, sealer *app.Sealer, conversation
 	if _, err := rand.Read(token); err != nil {
 		return nil, err
 	}
+	selected, required, err := browserActivitySelection(os.Getenv("MORDE_BROWSER_ACTIVITY_SCENARIOS"))
+	if err != nil {
+		return nil, err
+	}
 	a := &browserAcceptanceActivity{store: store, instances: instances, checkpoints: checkpoints,
 		conversationID: conversationID, controlToken: hex.EncodeToString(token),
-		runs: make(map[string]*browserActivityRun), verified: make(map[string]bool), watches: make(map[uint64]browserActivityWatch)}
-	for name, objective := range browserActivityObjectives {
+		required: required, runs: make(map[string]*browserActivityRun), verified: make(map[string]bool),
+		watches: make(map[uint64]browserActivityWatch)}
+	for _, name := range selected {
+		objective := browserActivityObjectives[name]
 		a.runs[name] = &browserActivityRun{name: name, objective: objective, stage: "awaiting_message",
 			commands: make(chan browserActivityCommand)}
 	}
 	return a, nil
+}
+
+func browserActivitySelection(raw string) ([]string, []string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []string{"merge-a", "merge-b", "separate-a", "separate-b", "search", "stream", "stream-other"},
+			[]string{"merge", "separate", "search", "stream", "reconnect"}, nil
+	}
+
+	groups := map[string][]string{
+		"merge":    {"merge-a", "merge-b"},
+		"separate": {"separate-a", "separate-b"},
+		"search":   {"search"},
+		"stream":   {"stream", "stream-other"},
+	}
+	var selected, required []string
+	seen := make(map[string]bool)
+	for _, item := range strings.Split(raw, ",") {
+		scenario := strings.TrimSpace(item)
+		runs, ok := groups[scenario]
+		if !ok || seen[scenario] {
+			return nil, nil, fmt.Errorf("invalid or duplicate browser activity scenario %q", scenario)
+		}
+		seen[scenario] = true
+		required = append(required, scenario)
+		if scenario == "stream" {
+			required = append(required, "reconnect")
+		}
+		selected = append(selected, runs...)
+	}
+	return selected, required, nil
+}
+
+func TestBrowserActivitySelection(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		selected string
+		required string
+		wantErr  bool
+	}{
+		{name: "full default", selected: "merge-a,merge-b,separate-a,separate-b,search,stream,stream-other",
+			required: "merge,separate,search,stream,reconnect"},
+		{name: "search only", input: "search", selected: "search", required: "search"},
+		{name: "stream includes reconnect", input: "stream", selected: "stream,stream-other", required: "stream,reconnect"},
+		{name: "combined logical scenarios", input: "search, merge", selected: "search,merge-a,merge-b", required: "search,merge"},
+		{name: "reject reconnect without stream", input: "reconnect", wantErr: true},
+		{name: "reject duplicate", input: "search,search", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selected, required, err := browserActivitySelection(test.input)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected invalid scenario selection to be rejected")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(selected, ",") != test.selected || strings.Join(required, ",") != test.required {
+				t.Fatalf("selection=%v required=%v", selected, required)
+			}
+		})
+	}
 }
 
 func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current task.Task) error {
@@ -500,7 +1251,9 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.ID).Scan(&u
 	run.userMessageID = userID
 	a.mu.Unlock()
 	nonce := make([]byte, 32)
-	nonce[0] = 1
+	if _, err := rand.Read(nonce); err != nil {
+		return app.AgentInstanceLease{}, fmt.Errorf("create synthetic supervisor nonce: %w", err)
+	}
 	lease, replayed, err := a.instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
 		TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
 		AgentInstanceID: "browser_agent_" + current.ID, AgentSessionID: "browser_session_" + current.ID,
@@ -548,7 +1301,7 @@ func (a *browserAcceptanceActivity) commitProgress(ctx context.Context, run *bro
 	}
 	current := run.current
 	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 2, Kind: "progress", Status: task.StepRunning,
-		Title: "正在整理测试信息", Summary: "正在处理合成文字。"}
+		Title: browserActivityProgressTitle(run), Summary: browserActivityProgressSummary(run, false)}
 	payload, err := json.Marshal(map[string]any{"step_id": step.ID, "kind": step.Kind, "status": step.Status,
 		"title": step.Title, "summary": step.Summary})
 	if err != nil {
@@ -637,7 +1390,7 @@ SELECT $1,'task',$2,$3,$4,$1,id,updated_at,0,$5,$6,$7,$7,$8,$9,$10,1,$11,$12 FRO
 
 func (a *browserAcceptanceActivity) complete(ctx context.Context, run *browserActivityRun, delta app.CloudDSHTextDelta) error {
 	current := run.current
-	turnID, result := "", "本地验收结果："+run.objective
+	turnID, result := "", browserActivityResult(run.name, run.objective)
 	if run.name == "stream" {
 		delta.Text = browserActivityStreamSuffix
 		appended, err := a.store.AppendCloudDSHTextDelta(ctx, delta)
@@ -657,7 +1410,7 @@ func (a *browserAcceptanceActivity) complete(ctx context.Context, run *browserAc
 	}
 	steps := []task.Step{
 		{ID: run.progressStepID, TaskID: current.ID, Sequence: 2, Kind: "progress", Status: task.StepSucceeded,
-			Title: "正在整理测试信息", Summary: "合成文字处理完成。"},
+			Title: browserActivityProgressTitle(run), Summary: browserActivityProgressSummary(run, true)},
 		{ID: turnID, TaskID: current.ID, Sequence: 3, Kind: "result", Status: task.StepSucceeded, Title: "处理完成"},
 	}
 	payload, err := json.Marshal(map[string]any{"result": result})
@@ -696,7 +1449,7 @@ func (a *browserAcceptanceActivity) verifyActivityEvents(ctx context.Context, ru
 		if step.Kind == "progress" && step.Title == "开始处理" && step.Summary == "正在处理你的请求。" {
 			startSteps++
 		}
-		if run.progressStepID != "" && step.ID == run.progressStepID && step.Title == "正在整理测试信息" {
+		if run.progressStepID != "" && step.ID == run.progressStepID && step.Title == browserActivityProgressTitle(run) {
 			progressSteps++
 		}
 	}
@@ -783,9 +1536,13 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 			active[watch.taskID][watch.client]++
 		}
 		requests := append([]browserActivityEventRequest(nil), a.requests...)
+		taskListRequests := append([]browserActivityTaskListRequest(nil), a.taskListRequests...)
+		taskSnapshots := append([]browserActivityTaskSnapshotRequest(nil), a.taskSnapshots...)
 		a.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"runs": runs, "active_event_streams": active, "event_requests": requests})
+		_ = json.NewEncoder(w).Encode(map[string]any{"runs": runs, "active_event_streams": active,
+			"event_requests": requests, "conversation_task_list_requests": taskListRequests,
+			"task_snapshot_requests": taskSnapshots})
 		return
 	}
 	if len(parts) == 3 && parts[0] == "advance" && r.Method == http.MethodPost {
@@ -824,7 +1581,7 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 func (a *browserAcceptanceActivity) assertVerified() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, scenario := range []string{"merge", "separate", "stream", "reconnect"} {
+	for _, scenario := range a.required {
 		if !a.verified[scenario] {
 			return fmt.Errorf("synthetic activity scenario %s was not verified", scenario)
 		}
@@ -867,7 +1624,13 @@ func (a *browserAcceptanceActivity) advance(ctx context.Context, name, phase str
 		clearBusy()
 		return err
 	case <-ctx.Done():
-		go func() { <-command.reply; clearBusy() }()
+		go func() {
+			if err := <-command.reply; err != nil {
+				clearBusy()
+				return
+			}
+			clearBusy()
+		}()
 		return ctx.Err()
 	}
 }
@@ -898,6 +1661,58 @@ func (a *browserAcceptanceActivity) serveTaskEvents(w http.ResponseWriter, r *ht
 		a.mu.Unlock()
 	}()
 	next.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func (a *browserAcceptanceActivity) serveConversationTasks(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	recorder := httptest.NewRecorder()
+	next.ServeHTTP(recorder, r)
+	if recorder.Code == http.StatusOK {
+		var page struct {
+			Items []struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			} `json:"items"`
+		}
+		if json.Unmarshal(recorder.Body.Bytes(), &page) == nil {
+			client := "browser"
+			if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				client = "ios"
+			}
+			request := browserActivityTaskListRequest{Client: client, StatusCode: recorder.Code}
+			for _, item := range page.Items {
+				request.TaskIDs = append(request.TaskIDs, item.ID)
+				request.Statuses = append(request.Statuses, item.Status)
+			}
+			a.mu.Lock()
+			a.taskListRequests = append(a.taskListRequests, request)
+			a.mu.Unlock()
+		}
+	}
+	for key, values := range recorder.Header() {
+		w.Header()[key] = append([]string(nil), values...)
+	}
+	w.WriteHeader(recorder.Code)
+	_, _ = w.Write(recorder.Body.Bytes())
+}
+
+func (a *browserAcceptanceActivity) serveTaskSnapshot(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+	recorder := httptest.NewRecorder()
+	next.ServeHTTP(recorder, r)
+	client := "browser"
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		client = "ios"
+	}
+	a.mu.Lock()
+	a.taskSnapshots = append(a.taskSnapshots, browserActivityTaskSnapshotRequest{
+		Client: client, TaskID: id, StatusCode: recorder.Code,
+	})
+	a.mu.Unlock()
+	for key, values := range recorder.Header() {
+		w.Header()[key] = append([]string(nil), values...)
+	}
+	w.WriteHeader(recorder.Code)
+	_, _ = w.Write(recorder.Body.Bytes())
 }
 
 func (a *browserAcceptanceActivity) disconnect(name string) error {
@@ -949,6 +1764,8 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 		names = []string{"merge-a", "merge-b"}
 	case "separate":
 		names = []string{"separate-a", "separate-b"}
+	case "search":
+		names = []string{"search"}
 	case "stream":
 		names = []string{"stream", "stream-other"}
 	default:
@@ -999,7 +1816,7 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 					otherCount++
 					if message.ID == run.StreamMessageID || len(message.Sources) != 1 || source.UserMessageID != other.UserMessageID ||
 						source.TaskRevision != 0 || source.EventSequence != other.ResultEventSequence ||
-						source.Content != "本地验收结果："+other.Objective {
+						source.Content != browserActivityResult(other.Name, other.Objective) {
 						return errors.New("the later independent result was combined with the visible stream")
 					}
 				}
@@ -1020,12 +1837,20 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 				}
 				counts[run.TaskID]++
 				if source.UserMessageID != run.UserMessageID || source.TaskRevision != 0 ||
-					source.EventSequence != run.ResultEventSequence || source.Content != "本地验收结果："+run.Objective {
+					source.EventSequence != run.ResultEventSequence || source.Content != browserActivityResult(run.Name, run.Objective) {
 					return errors.New("published reply source does not match the original task result")
 				}
 				matched[run.TaskID] = message
 			}
 		}
+	}
+	if scenario == "search" {
+		run := runs[0]
+		message := matched[run.TaskID]
+		if counts[run.TaskID] != 1 || message.ID == "" || len(message.Sources) != 1 || message.Content != browserActivitySearchResult {
+			return errors.New("fixed local search result is missing, duplicated or detached from its task")
+		}
+		return nil
 	}
 	first, second := matched[runs[0].TaskID], matched[runs[1].TaskID]
 	if counts[runs[0].TaskID] != 1 || counts[runs[1].TaskID] != 1 || first.ID == "" || second.ID == "" {

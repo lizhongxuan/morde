@@ -10,6 +10,12 @@ if ! /usr/local/bin/morde-aio-profile-config restore; then
     exit 1
 fi
 
+if ! /usr/local/bin/morde-aio-profile-config secure-workspace-root; then
+    echo 'Morde could not restore the protected Workspace root; refusing AIO startup.' >&2
+    kill -TERM "$PPID" 2>/dev/null || true
+    exit 1
+fi
+
 if ! /usr/local/bin/morde-aio-profile-config workspace-defaults; then
     echo 'Morde could not prepare safe Workspace-backed desktop directories; refusing AIO startup.' >&2
     kill -TERM "$PPID" 2>/dev/null || true

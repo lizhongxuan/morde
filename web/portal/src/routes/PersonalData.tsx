@@ -3,7 +3,7 @@ import type { FormEvent } from 'react';
 import { Link } from 'react-router';
 import { newIdempotencyKey, portalApi } from '../app/api';
 import { useAuth } from '../app/auth';
-import { catalogue } from '../../../../project/nanoMuse/web/src/ideas/index.js';
+import { ideasFromFeedPreferences, personalIdeas } from '../data/ideas';
 import {
   getPersonalDataSyncEnabled,
   PersonalDataStore,
@@ -25,6 +25,9 @@ type SoulBody = { name: string; emoji?: string; style?: string; lang?: string; c
 type MemoryBody = { content: string; category?: string };
 type FeedPostBody = { title: string; type: string; emoji?: string; created_at?: string; liked?: boolean; body: string };
 type LibraryBody = { name: string; kind: 'artifact' | 'media'; mime?: string; size_bytes?: number; attachment_id?: string };
+type GoalStepBody = { id?: unknown; title?: unknown; status?: unknown };
+type GoalSuggestionBody = { title?: unknown; status?: unknown; steps?: unknown };
+type GoalSuggestion = { id: string; title: string; stepLabel: string; stepTitle: string; prompt: string };
 
 const sections: Array<{ id: Section; title: string }> = [
   { id: 'profile', title: '个人资料' }, { id: 'soul', title: 'AI 个性' }, { id: 'memory', title: '记忆' }, { id: 'feed', title: '动态' },
@@ -53,6 +56,34 @@ function objectsWithDrafts(state: PersonalDataState): PersonalObject[] {
 
 function objectOf<T extends PersonalObjectBody>(objects: PersonalObject[], type: PersonalObjectType, id: string): (PersonalObject & { body: T }) | undefined {
   return objects.find((item) => item.object_type === type && item.object_id === id) as (PersonalObject & { body: T }) | undefined;
+}
+
+function goalSuggestionsFrom(objects: PersonalObject[]): GoalSuggestion[] {
+  return objects.flatMap((item) => {
+    if (item.object_type !== 'goal') return [];
+    const body = item.body as GoalSuggestionBody;
+    if (body.status !== 'active' || typeof body.title !== 'string' || !Array.isArray(body.steps)) return [];
+    const steps = body.steps as GoalStepBody[];
+    const step = steps.find((candidate) => candidate.status === 'blocked' &&
+      typeof candidate.title === 'string' && candidate.title.trim()) ??
+      steps.find((candidate) => candidate.status === 'in_progress' && typeof candidate.title === 'string' && candidate.title.trim()) ??
+      steps.find((candidate) => candidate.status === 'pending' &&
+      typeof candidate.title === 'string' && candidate.title.trim());
+    if (!step || typeof step.title !== 'string') return [];
+    const title = body.title.trim();
+    const stepTitle = step.title.trim();
+    if (!title || !stepTitle) return [];
+    const stepLabel = step.status === 'blocked' ? '受阻步骤' : '当前步骤';
+    return [{
+      id: item.object_id,
+      title,
+      stepLabel,
+      stepTitle,
+      prompt: step.status === 'blocked'
+        ? `请根据我的目标“${title}”帮我处理受阻步骤“${stepTitle}”。先检查已有记录并提出可行的解决办法；涉及修改、发送或其他需要确认的操作时，先向我说明并等待确认。`
+        : `请根据我的目标“${title}”继续推进当前步骤“${stepTitle}”。先结合已有记录和可用工具给出下一步；涉及修改、发送或其他需要确认的操作时，先向我说明并等待确认。`,
+    }];
+  }).slice(0, 5);
 }
 
 function profileFrom(value: PersonalObject | undefined, fallbackName: string): ProfileBody {
@@ -175,17 +206,25 @@ export function PersonalData() {
   }, [store, sync]);
 
   const allObjects = useMemo(() => state ? objectsWithDrafts(state) : [], [state]);
+  const goalSuggestions = useMemo(() => goalSuggestionsFrom(allObjects), [allObjects]);
   const profileObject = objectOf<ProfileBody>(allObjects, 'profile', 'default');
   const soulObject = objectOf<SoulBody>(allObjects, 'soul', 'default');
   const memoryObjects = allObjects.filter((item) => item.object_type === 'memory');
   // Show the confirmed server value, not an offline draft, for this consent.
   const memorySetting = state?.objects[personalObjectKey('skill_setting', 'builtin_memory')];
-  const memoryEnabled = memorySetting?.body.enabled === true;
+  const memoryEnabled = memorySetting ? memorySetting.body.enabled === true : state?.snapshotComplete === true;
   const memorySettingPending = state?.outbox.some((item) => item.objectType === 'skill_setting' && item.objectID === 'builtin_memory' && !item.resolutionQueued) ?? false;
+  const ideasSetting = state?.objects[personalObjectKey('skill_setting', 'builtin_ideas')];
+  const ideasEnabled = ideasSetting ? ideasSetting.body.enabled === true : state?.snapshotComplete === true;
+  const ideasSettingPending = state?.outbox.some((item) => item.objectType === 'skill_setting' && item.objectID === 'builtin_ideas' && !item.resolutionQueued) ?? false;
+  const goalFollowupsSetting = state?.objects[personalObjectKey('skill_setting', 'builtin_goal_followups')];
+  const goalFollowupsEnabled = goalFollowupsSetting?.body.enabled === true;
+  const goalFollowupsSettingPending = state?.outbox.some((item) => item.objectType === 'skill_setting' && item.objectID === 'builtin_goal_followups' && !item.resolutionQueued) ?? false;
   const feedObjects = allObjects.filter((item) => item.object_type === 'feed_post').sort((a, b) => asString(b.body.created_at).localeCompare(asString(a.body.created_at)));
   const ideaMarks = new Map(allObjects.filter((item) => item.object_type === 'idea_mark').map((item) => [item.object_id, asString(item.body.state)]));
   const libraryObjects = allObjects.filter((item) => item.object_type === 'library_item');
   const feedPreference = objectOf<{ content: string }>(allObjects, 'feed_preferences', 'default');
+  const preferenceIdeas = useMemo(() => ideasFromFeedPreferences(feedPreference?.body.content ?? ''), [feedPreference?.body.content]);
   const conflicts = useMemo(() => state?.outbox.filter((item) => item.status === 'conflict' && !item.resolutionQueued) ?? [], [state?.outbox]);
   const archivedConflicts = useMemo(() => state?.outbox.filter((item) => item.status === 'conflict' && item.resolutionQueued) ?? [], [state?.outbox]);
   const pendingCount = (state?.outbox.filter((item) => item.status === 'pending').length ?? 0) + (state?.attachments.filter((item) => item.status === 'pending').length ?? 0);
@@ -392,11 +431,11 @@ export function PersonalData() {
     </section>}
 
     {state && !remoteLoading && activeSection === 'memory' && <section className="connection-section" aria-labelledby="personal-memory-title">
-      <div className="connection-section-heading"><div><h2 id="personal-memory-title">记忆</h2><p className="muted">允许后，AI 可以在个人对话中使用已保存的记忆。项目对话不会读取个人记忆。</p></div></div>
+      <div className="connection-section-heading"><div><h2 id="personal-memory-title">记忆</h2><p className="muted">默认开启后，Morde 可在个人对话中按需检索有限的历史片段和已保存记忆；不会注入完整历史。项目对话不会读取个人记忆。</p></div></div>
       <label className="checkbox-row"><input type="checkbox" checked={memoryEnabled}
         disabled={!syncEnabled || !state.snapshotComplete || syncing || memorySettingPending}
         onChange={(event) => void saveObject('skill_setting', 'builtin_memory', { enabled: event.target.checked })} />允许 AI 使用个人记忆</label>
-      <p className="muted">{memorySettingPending ? '设置正在同步，服务端确认后生效。' : '默认关闭；修改或删除记忆在服务端同步成功后生效。'}</p>
+      <p className="muted">{memorySettingPending ? '设置正在同步，服务端确认后生效。' : '默认开启；关闭后，个人对话不会读取历史片段或已保存记忆。修改和删除在服务端同步成功后生效。'}</p>
       <form className="form-card form-stack" onSubmit={addMemory}>
         <label>新增记忆<textarea value={memoryContent} maxLength={65536} required onChange={(event) => setMemoryContent(event.target.value)} /></label>
         <label>分类（可选）<input value={memoryCategory} maxLength={64} onChange={(event) => setMemoryCategory(event.target.value)} /></label>
@@ -427,8 +466,35 @@ export function PersonalData() {
     </section>}
 
     {state && !remoteLoading && activeSection === 'ideas' && <section className="connection-section" aria-labelledby="personal-ideas-title">
-      <div className="connection-section-heading"><div><h2 id="personal-ideas-title">灵感</h2><p className="muted">灵感来自 Morde 内置目录；服务端只保存你的收藏或忽略标记。</p></div></div>
-      {catalogue('zh-CN').sections.map((group) => <section key={group.id} aria-label={group.title}>
+      <div className="connection-section-heading"><div><h2 id="personal-ideas-title">灵感</h2><p className="muted">建议基于当前账号的目标、关注偏好和 Morde 内置目录生成；点选后会预填助手，不会自动提交任务。</p></div></div>
+      <section className="form-card form-stack" aria-labelledby="goal-followups-title">
+        <h3 id="goal-followups-title">目标受阻自动跟进</h3>
+        <label className="checkbox-row"><input type="checkbox" checked={goalFollowupsEnabled}
+          disabled={!syncEnabled || !state.snapshotComplete || syncing || goalFollowupsSettingPending}
+          onChange={(event) => void saveObject('skill_setting', 'builtin_goal_followups', { enabled: event.target.checked })} />自动分析新受阻的目标</label>
+        <p className="muted">默认关闭。开启后，目标步骤首次变为受阻时，Morde 会创建一个无电脑目标的一次性后台分析任务，使用当前账号的默认模型和只读工具，并给你下一步建议；不会修改目标、创建计划、发送外部消息或操作电脑。执行服务未运行时，任务会排队等待服务启动。关闭后不会创建新的跟进任务。{goalFollowupsSettingPending ? '设置正在同步，服务端确认后生效。' : '修改在服务端确认后生效。'}</p>
+      </section>
+      <label className="checkbox-row"><input type="checkbox" checked={ideasEnabled}
+        disabled={!syncEnabled || !state.snapshotComplete || syncing || ideasSettingPending}
+        onChange={(event) => void saveObject('skill_setting', 'builtin_ideas', { enabled: event.target.checked })} />显示个性化建议</label>
+      <p className="muted">只控制灵感页中根据你的目标和关注偏好生成的建议；不会在后台自动创建任务，也不影响已设置的计划和通知。{ideasSettingPending ? '设置正在同步，服务端确认后生效。' : '修改在服务端确认后生效。'}</p>
+      {ideasEnabled && preferenceIdeas.length > 0 && <section aria-label="根据我的关注偏好生成的搜索建议">
+        <h3>根据你的关注主题</h3><ul className="personal-object-list">{preferenceIdeas.map((idea) => (
+          <li className="model-connection-card" key={idea.id}>
+            <div className="model-connection-main"><h3>{idea.emoji} {idea.title}</h3><p>{idea.body}</p><small className="muted">来自你保存的动态偏好</small></div>
+            <div className="inline-actions"><Link className="button button-primary" to="/assistant" state={{ ideaID: idea.id, ideaPrompt: idea.prompt }}>按主题搜索</Link></div>
+          </li>
+        ))}</ul>
+      </section>}
+      {ideasEnabled && goalSuggestions.length > 0 && <section aria-label="根据我的目标生成的建议">
+        <h3>继续你的目标</h3><ul className="personal-object-list">{goalSuggestions.map((idea) => (
+          <li className="model-connection-card" key={`goal-${idea.id}`}>
+            <div className="model-connection-main"><h3>🎯 {idea.title}</h3><p>{idea.stepLabel}：{idea.stepTitle}</p><small className="muted">来自你的目标进度</small></div>
+            <div className="inline-actions"><Link className="button button-primary" to="/assistant" state={{ ideaID: `goal-${idea.id}`, ideaPrompt: idea.prompt }}>继续目标</Link></div>
+          </li>
+        ))}</ul>
+      </section>}
+      {personalIdeas.map((group) => <section key={group.id} aria-label={group.title}>
         <h3>{group.title}</h3><ul className="personal-object-list">{group.ideas.map((idea) => {
           const mark = ideaMarks.get(idea.id);
           return <li className="model-connection-card" key={idea.id}>

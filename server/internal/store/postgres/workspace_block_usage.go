@@ -409,7 +409,7 @@ WHERE u.state='reserved'
 UPDATE workspace_owner_block_usage o SET
   allocated_bytes=COALESCE((SELECT sum(u.allocated_bytes) FROM workspace_block_usage u JOIN workspaces w ON w.id=u.workspace_id WHERE w.owner_id=o.owner_id),0),
   reserved_bytes=COALESCE((SELECT sum(u.reserved_bytes) FROM workspace_block_usage u JOIN workspaces w ON w.id=u.workspace_id WHERE w.owner_id=o.owner_id),0)
-    + COALESCE((SELECT sum(c.reserved_bytes) FROM workspace_copy_reservations c WHERE c.owner_id=o.owner_id AND c.state IN ('reserved','copying','unknown')),0),
+    + COALESCE((SELECT sum(c.reserved_bytes) FROM workspace_copy_reservations c WHERE c.target_owner_id=o.owner_id AND c.state IN ('reserved','copying','unknown')),0),
   updated_at=now()`); err != nil {
 			return fmt.Errorf("rebuild workspace owner block usage counters: %w", err)
 		}

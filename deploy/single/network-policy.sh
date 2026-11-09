@@ -542,8 +542,32 @@ preload_network() {
   pass 'nftables isolation policy preloaded before Docker starts'
 }
 
+task_sandbox_idle_preflight() {
+  local task_policy=/opt/cloudhost/task-sandbox-network-policy.sh
+  if [[ ! -e "$task_policy" && ! -L "$task_policy" ]]; then
+    return 0
+  fi
+  [[ -f "$task_policy" && ! -L "$task_policy" && -x "$task_policy" && $(stat -c '%u' "$task_policy") == 0 ]] \
+    || fail 'installed Task Sandbox policy checker must be a root-owned executable file'
+  local lock_path=/run/lock/morde-task-sandbox-network-policy.lock lock_mode
+  command -v flock >/dev/null 2>&1 || fail 'flock is required for Task Sandbox lifecycle coordination'
+  [[ -d /run/lock && ! -L "$lock_path" ]] || fail 'Task Sandbox policy lock path is invalid'
+  if [[ ! -e "$lock_path" ]]; then
+    install -o root -g root -m 0600 /dev/null "$lock_path"
+  fi
+  [[ -f "$lock_path" && ! -L "$lock_path" && $(stat -c '%u' "$lock_path") == 0 ]] \
+    || fail 'Task Sandbox policy lock must be a root-owned regular file'
+  lock_mode="$(stat -c '%a' "$lock_path")" || fail 'cannot inspect Task Sandbox policy lock permissions'
+  (( (8#$lock_mode & 8#022) == 0 )) || fail 'Task Sandbox policy lock is writable by group or others'
+  exec 8>"$lock_path"
+  flock -x 8
+  "$task_policy" assert-idle-locked >/dev/null \
+    || fail 'Task Sandbox must be stopped and have no attached containers before nftables changes'
+}
+
 nftables_before() {
   ((EUID == 0)) || fail 'nftables lifecycle actions must run as root'
+  task_sandbox_idle_preflight
   lock_policy_state
   portal_service_stopped || fail 'Portal must be stopped before loading the nftables base configuration'
   close_relay_gates_or_stop_nodes || fail 'could not revoke relay access or stop Workspace sync nodes before nftables start'
@@ -556,6 +580,7 @@ nftables_before() {
 
 nftables_stop() {
   ((EUID == 0)) || fail 'nftables lifecycle actions must run as root'
+  task_sandbox_idle_preflight
   lock_policy_state
   if ! stop_portal_service; then
     stop_workspace_sync_nodes || true
@@ -572,6 +597,7 @@ nftables_stop() {
 
 nftables_reload() {
   ((EUID == 0)) || fail 'nftables lifecycle actions must run as root'
+  task_sandbox_idle_preflight
   local portal_state portal_was_active=no base_config="$TMP_DIR/nftables.conf" combined="$TMP_DIR/nftables-with-morde.nft"
   portal_state="$(systemctl show --property=ActiveState --value morde-portal.service 2>/dev/null)" \
     || fail 'could not inspect Portal before nftables reload'

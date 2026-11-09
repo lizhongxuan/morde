@@ -67,6 +67,7 @@ func TestDeviceCredentialUsesDynamicWorkspaceAuthorization(t *testing.T) {
 func TestScheduledTaskExecutionScopesDependOnHostBinding(t *testing.T) {
 	hostBound := ScheduleTaskExecutionScopes()
 	hostless := HostlessScheduleTaskExecutionScopes()
+	goalFollowup := GoalFollowupScheduleTaskExecutionScopes()
 	if !IsScheduleTaskExecutionScopeSet(hostBound) || !IsHostBoundScheduleTaskExecutionScopeSet(hostBound) ||
 		IsHostlessScheduleTaskExecutionScopeSet(hostBound) {
 		t.Fatalf("host-bound scheduled Task scopes were not recognized: %v", hostBound)
@@ -74,6 +75,11 @@ func TestScheduledTaskExecutionScopesDependOnHostBinding(t *testing.T) {
 	if !IsScheduleTaskExecutionScopeSet(hostless) || !IsHostlessScheduleTaskExecutionScopeSet(hostless) ||
 		IsHostBoundScheduleTaskExecutionScopeSet(hostless) {
 		t.Fatalf("hostless scheduled Task scopes were not recognized: %v", hostless)
+	}
+	if !IsScheduleTaskExecutionScopeSet(goalFollowup) || !IsGoalFollowupScheduleTaskExecutionScopeSet(goalFollowup) ||
+		!IsHostlessScheduleTaskExecutionScopeSet(goalFollowup) || IsHostBoundScheduleTaskExecutionScopeSet(goalFollowup) ||
+		ValidScope(ScopeGoalFollowupReadOnly) {
+		t.Fatalf("read-only Goal follow-up Task scopes were not recognized as internal-only: %v", goalFollowup)
 	}
 	for _, scope := range hostless {
 		if scope == ScopeComputerObserve || scope == ScopeComputerOperate {
@@ -87,6 +93,7 @@ func TestScheduledTaskExecutionScopesDependOnHostBinding(t *testing.T) {
 	}
 	for _, invalid := range [][]Scope{
 		append(append([]Scope(nil), hostless...), ScopeComputerObserve),
+		append(append([]Scope(nil), goalFollowup...), ScopeComputerObserve),
 		{ScopeTaskRead, ScopeTaskSubmit, ScopeTaskRead},
 		{ScopeTaskRead, ScopeTaskSubmit},
 	} {

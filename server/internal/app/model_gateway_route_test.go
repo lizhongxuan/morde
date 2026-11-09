@@ -14,6 +14,7 @@ type routeGatewayStoreTest struct {
 	*modelGatewayStoreTest
 	reservation ModelCallReservation
 	project     *ProjectModelReservation
+	prepareErr  error
 	decision    *ConversationRouteDecision
 	usage       ModelUsage
 	unknown     bool
@@ -25,6 +26,9 @@ func (s *routeGatewayStoreTest) ResolveConversationRouteModel(_ context.Context,
 }
 func (s *routeGatewayStoreTest) PrepareConversationRouteModelCall(_ context.Context, call ModelCallReservation, project *ProjectModelReservation) (*ConversationRouteDecision, error) {
 	s.reservation, s.project = call, project
+	if s.prepareErr != nil {
+		return nil, s.prepareErr
+	}
 	return s.decision, nil
 }
 func (s *routeGatewayStoreTest) BeginConversationRouteModelCall(_ context.Context, _ ModelCallReservation) error {
@@ -79,6 +83,23 @@ func TestConversationRouteGatewayHoldsUnknownProviderOutcome(t *testing.T) {
 	}
 	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); err == nil || !store.unknown || store.decision != nil {
 		t.Fatalf("unknown provider result was not held: %v", err)
+	}
+}
+
+func TestConversationRouteGatewayBudgetDenialDoesNotReachProvider(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{},
+		prepareErr: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: `{"action":"new","task_id":"","question":""}`,
+		StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeQuotaExceeded ||
+		client.calls != 0 || store.begins != 0 || store.decision != nil || store.unknown {
+		t.Fatalf("route budget denial dispatched or settled a model call: calls=%d begins=%d decision=%+v unknown=%t err=%v",
+			client.calls, store.begins, store.decision, store.unknown, err)
 	}
 }
 

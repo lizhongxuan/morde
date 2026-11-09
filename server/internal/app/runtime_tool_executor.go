@@ -37,6 +37,7 @@ const (
 	runtimeToolFileFind            = "file_find"
 	runtimeToolBrowserOpenTab      = "browser_open_tab"
 	runtimeToolBrowserNavigate     = "browser_navigate"
+	runtimeToolBrowserUserHandoff  = "browser_prepare_user_handoff"
 	runtimeToolBrowserSnapshot     = "browser_snapshot"
 	runtimeToolBrowserClick        = "browser_click"
 	runtimeToolBrowserType         = "browser_type"
@@ -119,6 +120,11 @@ var runtimeToolMappings = []runtimeToolMapping{
 		parameters:  json.RawMessage(`{"type":"object","properties":{"target_id":{"type":"string","minLength":1,"maxLength":128},"url":{"type":"string","minLength":1,"maxLength":2048}},"required":["target_id","url"],"additionalProperties":false}`),
 	},
 	{
+		name: runtimeToolBrowserUserHandoff, capability: "browser.actions", action: "handoff", scope: identity.ScopeComputerOperate,
+		description: "Bring this Task's isolated browser tab to the foreground on its Host so the user can sign in. Use only when the user must authenticate; never ask for passwords in chat. After success, tell the user to open and take over the Task's cloud computer, finish sign-in, release control to AI, then confirm here so you can continue in the same isolated browser context.",
+		parameters:  json.RawMessage(`{"type":"object","properties":{"target_id":{"type":"string","minLength":1,"maxLength":128}},"required":["target_id"],"additionalProperties":false}`),
+	},
+	{
 		name: runtimeToolBrowserSnapshot, capability: "browser.observe", action: "snapshot", scope: identity.ScopeComputerObserve,
 		description: "Read bounded text from an AI-owned browser tab.",
 		parameters:  json.RawMessage(`{"type":"object","properties":{"target_id":{"type":"string","minLength":1,"maxLength":128}},"required":["target_id"],"additionalProperties":false}`),
@@ -150,7 +156,7 @@ var runtimeToolMappings = []runtimeToolMapping{
 	},
 	{
 		name: runtimeToolDesktopScreenshot, capability: "desktop.observe", action: "screenshot", scope: identity.ScopeComputerObserve,
-		description: "Capture a bounded screenshot of the Host desktop. The result gives image width/height and actual screen_width/screen_height. For desktop_click, use the screenshot pixel coordinates directly as x/y and pass all four dimensions from this result; the Host maps them to screen pixels.",
+		description: "Capture a bounded screenshot of the Host desktop. The result gives image and screen dimensions plus a short-lived screenshot_token. For desktop_click, use screenshot pixel coordinates and pass that token; the Host binds dimensions to the image and current Task lease/control fence. Capture a new screenshot after any Task on this Host activates a window or sends desktop input.",
 		parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 	},
 	{
@@ -165,8 +171,8 @@ var runtimeToolMappings = []runtimeToolMapping{
 	},
 	{
 		name: runtimeToolDesktopClick, capability: "desktop.input", action: "click", scope: identity.ScopeComputerOperate,
-		description: "Click a point from the most recent desktop_screenshot. Set x/y in screenshot pixels and include screenshot_width/height from that image plus screen_width/height for the actual display. The Host maps the screenshot point to screen pixels and rejects the click if the display size changed.",
-		parameters:  json.RawMessage(`{"type":"object","properties":{"window_id":{"type":"string","pattern":"^0x[1-9a-f][0-9a-f]*$","maxLength":10},"x":{"type":"integer","minimum":0,"maximum":1279},"y":{"type":"integer","minimum":0,"maximum":719},"screenshot_width":{"type":"integer","minimum":1,"maximum":1280},"screenshot_height":{"type":"integer","minimum":1,"maximum":720},"screen_width":{"type":"integer","minimum":1,"maximum":16384},"screen_height":{"type":"integer","minimum":1,"maximum":16384},"button":{"type":"string","enum":["left","middle","right"]}},"required":["window_id","x","y","screenshot_width","screenshot_height","screen_width","screen_height"],"additionalProperties":false}`),
+		description: "Click a point from the most recent desktop_screenshot. Set x/y in screenshot pixels and include its screenshot_token. The Host binds dimensions to that screenshot and the current Task lease/control fence, accepts the token once, and rejects it after expiry, any Task's window activation/desktop input, or a display change. Capture a new screenshot if the token was invalidated.",
+		parameters:  json.RawMessage(`{"type":"object","properties":{"window_id":{"type":"string","pattern":"^0x[1-9a-f][0-9a-f]*$","maxLength":10},"x":{"type":"integer","minimum":0,"maximum":1279},"y":{"type":"integer","minimum":0,"maximum":719},"screenshot_token":{"type":"string","minLength":43,"maxLength":43},"button":{"type":"string","enum":["left","middle","right"]}},"required":["window_id","x","y","screenshot_token"],"additionalProperties":false}`),
 	},
 	{
 		name: runtimeToolDesktopType, capability: "desktop.input", action: "type", scope: identity.ScopeComputerOperate,
@@ -364,7 +370,7 @@ func runtimeToolRisk(name string, arguments json.RawMessage) runtimeToolRiskTier
 	case runtimeToolFileRead, runtimeToolFileList, runtimeToolFileFind, runtimeToolBrowserSnapshot,
 		runtimeToolBrowserScreenshot, runtimeToolDesktopScreenshot, runtimeToolWindowList, runtimeToolBrowserObserveField:
 		return runtimeToolRiskSafe
-	case runtimeToolFileWrite, runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserClick,
+	case runtimeToolFileWrite, runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserUserHandoff, runtimeToolBrowserClick,
 		runtimeToolBrowserPressKey, runtimeToolWindowActivate:
 		return runtimeToolRiskModerate
 	case runtimeToolDesktopPressKey:
@@ -388,24 +394,18 @@ func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMe
 		return AgentApprovalRequest{Object: "Browser input", Content: "Type text into the selected browser field?", Impact: "The website may receive and store the text."}
 	case runtimeToolDesktopClick:
 		var click struct {
-			WindowID         string `json:"window_id"`
-			X                int    `json:"x"`
-			Y                int    `json:"y"`
-			ScreenshotWidth  int    `json:"screenshot_width"`
-			ScreenshotHeight int    `json:"screenshot_height"`
-			ScreenWidth      int    `json:"screen_width"`
-			ScreenHeight     int    `json:"screen_height"`
-			Button           string `json:"button"`
+			WindowID string `json:"window_id"`
+			X        int    `json:"x"`
+			Y        int    `json:"y"`
+			Button   string `json:"button"`
 		}
 		if json.Unmarshal(arguments, &click) == nil {
 			if click.Button == "" {
 				click.Button = "left"
 			}
-			screenX := screenshotPointToScreen(click.X, click.ScreenshotWidth, click.ScreenWidth)
-			screenY := screenshotPointToScreen(click.Y, click.ScreenshotHeight, click.ScreenHeight)
 			return AgentApprovalRequest{Object: "Host desktop input",
-				Content: fmt.Sprintf("Click window %s at screenshot point (%d, %d) from a %d × %d image (screen point %d, %d) with the %s button?", click.WindowID, click.X, click.Y, click.ScreenshotWidth, click.ScreenshotHeight, screenX, screenY, click.Button),
-				Impact:  "The action is rejected if the screen size changes or the target window is not active."}
+				Content: fmt.Sprintf("Click window %s at screenshot point (%d, %d) with the %s button using its one-time screenshot proof?", click.WindowID, click.X, click.Y, click.Button),
+				Impact:  "The Host derives the screen coordinates from the captured screenshot and rejects the action if the display changes or the target window loses focus."}
 		}
 		return AgentApprovalRequest{Object: "Host desktop input", Content: "Click a point on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
 	case runtimeToolDesktopType:
@@ -1912,6 +1912,20 @@ func mapBrowserToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 			return invalid("invalid_browser_result")
 		}
 		result.Output = string(encoded)
+	case runtimeToolBrowserUserHandoff:
+		var value struct {
+			TargetID string `json:"target_id"`
+			Active   bool   `json:"active"`
+		}
+		if decodeStrictRuntimeResult(operation.Result, &value) != nil || !validBrowserTargetID(value.TargetID) ||
+			!browserResultTargetMatches(mapping.name, arguments, value.TargetID) || !value.Active {
+			return invalid("invalid_browser_handoff")
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return invalid("invalid_browser_handoff")
+		}
+		result.Output = string(encoded)
 	case runtimeToolBrowserSnapshot:
 		var value struct {
 			TargetID string `json:"target_id"`
@@ -2073,16 +2087,18 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 	switch mapping.name {
 	case runtimeToolDesktopScreenshot:
 		var value struct {
-			MIMEType     string `json:"mime_type"`
-			Width        int    `json:"width"`
-			Height       int    `json:"height"`
-			ScreenWidth  int    `json:"screen_width"`
-			ScreenHeight int    `json:"screen_height"`
-			DataBase64   string `json:"data_base64"`
+			MIMEType        string `json:"mime_type"`
+			Width           int    `json:"width"`
+			Height          int    `json:"height"`
+			ScreenWidth     int    `json:"screen_width"`
+			ScreenHeight    int    `json:"screen_height"`
+			ScreenshotToken string `json:"screenshot_token"`
+			DataBase64      string `json:"data_base64"`
 		}
 		if decodeStrictRuntimeResult(operation.Result, &value) != nil || value.MIMEType != "image/jpeg" ||
 			value.Width < 1 || value.Width > maxDesktopScreenshotWidth || value.Height < 1 || value.Height > maxDesktopScreenshotHeight ||
 			!validRuntimeScreenshotGeometry(value.Width, value.Height, value.ScreenWidth, value.ScreenHeight) ||
+			!validRuntimeScreenshotToken(value.ScreenshotToken) ||
 			len(value.DataBase64) == 0 || len(value.DataBase64) > 700<<10 {
 			return invalid("invalid_desktop_screenshot")
 		}
@@ -2092,8 +2108,8 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 			return invalid("invalid_desktop_screenshot")
 		}
 		result.Images = []ModelImage{{MediaType: value.MIMEType, Data: data}}
-		result.Output = fmt.Sprintf(`{"mime_type":"image/jpeg","width":%d,"height":%d,"screen_width":%d,"screen_height":%d}`,
-			value.Width, value.Height, value.ScreenWidth, value.ScreenHeight)
+		result.Output = fmt.Sprintf(`{"mime_type":"image/jpeg","width":%d,"height":%d,"screen_width":%d,"screen_height":%d,"screenshot_token":%q}`,
+			value.Width, value.Height, value.ScreenWidth, value.ScreenHeight, value.ScreenshotToken)
 	case runtimeToolWindowList:
 		var value struct {
 			Windows []runtimeDesktopWindow `json:"windows"`
@@ -2133,21 +2149,22 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 		result.Output = `{"window_id":"` + value.WindowID + `","activated":true}`
 	case runtimeToolDesktopClick:
 		var request struct {
+			WindowID        string `json:"window_id"`
+			X               int    `json:"x"`
+			Y               int    `json:"y"`
+			ScreenshotToken string `json:"screenshot_token"`
+			Button          string `json:"button"`
+		}
+		var value struct {
 			WindowID         string `json:"window_id"`
 			X                int    `json:"x"`
 			Y                int    `json:"y"`
+			Button           string `json:"button"`
+			Clicked          bool   `json:"clicked"`
 			ScreenshotWidth  int    `json:"screenshot_width"`
 			ScreenshotHeight int    `json:"screenshot_height"`
 			ScreenWidth      int    `json:"screen_width"`
 			ScreenHeight     int    `json:"screen_height"`
-			Button           string `json:"button"`
-		}
-		var value struct {
-			WindowID string `json:"window_id"`
-			X        int    `json:"x"`
-			Y        int    `json:"y"`
-			Button   string `json:"button"`
-			Clicked  bool   `json:"clicked"`
 		}
 		if !validRuntimeToolArguments(mapping, arguments) || json.Unmarshal(arguments, &request) != nil ||
 			!validDesktopWindowID(request.WindowID) || decodeStrictRuntimeResult(operation.Result, &value) != nil {
@@ -2156,8 +2173,12 @@ func mapDesktopToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 		if request.Button == "" {
 			request.Button = "left"
 		}
-		expectedX := screenshotPointToScreen(request.X, request.ScreenshotWidth, request.ScreenWidth)
-		expectedY := screenshotPointToScreen(request.Y, request.ScreenshotHeight, request.ScreenHeight)
+		if !validRuntimeScreenshotToken(request.ScreenshotToken) ||
+			!validRuntimeScreenshotGeometry(value.ScreenshotWidth, value.ScreenshotHeight, value.ScreenWidth, value.ScreenHeight) {
+			return invalid("desktop_click_failed")
+		}
+		expectedX := screenshotPointToScreen(request.X, value.ScreenshotWidth, value.ScreenWidth)
+		expectedY := screenshotPointToScreen(request.Y, value.ScreenshotHeight, value.ScreenHeight)
 		if value.WindowID != request.WindowID || value.X != expectedX || value.Y != expectedY || value.Button != request.Button || !value.Clicked {
 			return invalid("desktop_click_failed")
 		}
@@ -2330,6 +2351,7 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 		runtimeToolFileFind:            {"workspace_id": true, "path": true, "query": true},
 		runtimeToolBrowserOpenTab:      {"url": true},
 		runtimeToolBrowserNavigate:     {"target_id": true, "url": true},
+		runtimeToolBrowserUserHandoff:  {"target_id": true},
 		runtimeToolBrowserSnapshot:     {"target_id": true},
 		runtimeToolBrowserObserveField: {"url": true, "selector": true, "field": true},
 		runtimeToolBrowserClick:        {"target_id": true, "role": true, "name": true},
@@ -2339,7 +2361,7 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 		runtimeToolDesktopScreenshot:   {},
 		runtimeToolWindowList:          {},
 		runtimeToolWindowActivate:      {"window_id": true},
-		runtimeToolDesktopClick:        {"window_id": true, "x": true, "y": true, "screenshot_width": true, "screenshot_height": true, "screen_width": true, "screen_height": true, "button": true},
+		runtimeToolDesktopClick:        {"window_id": true, "x": true, "y": true, "screenshot_token": true, "button": true},
 		runtimeToolDesktopType:         {"window_id": true, "text": true},
 		runtimeToolDesktopPressKey:     {"window_id": true, "key": true},
 	}
@@ -2437,7 +2459,7 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 			len(observe.Selector) > 1024 || !utf8.ValidString(observe.Selector) || observe.Field != "text" && observe.Field != "value" {
 			return false
 		}
-	case runtimeToolBrowserSnapshot, runtimeToolBrowserScreenshot:
+	case runtimeToolBrowserSnapshot, runtimeToolBrowserScreenshot, runtimeToolBrowserUserHandoff:
 		var targetID string
 		if !stringValue("target_id", true) || json.Unmarshal(fields["target_id"], &targetID) != nil || !validBrowserTargetID(targetID) {
 			return false
@@ -2472,23 +2494,17 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 			return false
 		}
 	case runtimeToolDesktopClick:
-		var windowID string
+		var windowID, screenshotToken string
 		if !stringValue("window_id", true) || json.Unmarshal(fields["window_id"], &windowID) != nil || !validDesktopWindowID(windowID) ||
 			!nonnegativeIntValue("x", maxDesktopScreenshotWidth-1) || !nonnegativeIntValue("y", maxDesktopScreenshotHeight-1) ||
-			!nonnegativeIntValue("screenshot_width", maxDesktopScreenshotWidth) || !nonnegativeIntValue("screenshot_height", maxDesktopScreenshotHeight) ||
-			!nonnegativeIntValue("screen_width", maxDesktopScreenWidth) || !nonnegativeIntValue("screen_height", maxDesktopScreenHeight) {
+			!stringValue("screenshot_token", true) || json.Unmarshal(fields["screenshot_token"], &screenshotToken) != nil || !validRuntimeScreenshotToken(screenshotToken) {
 			return false
 		}
-		var click struct {
-			X                int `json:"x"`
-			Y                int `json:"y"`
-			ScreenshotWidth  int `json:"screenshot_width"`
-			ScreenshotHeight int `json:"screenshot_height"`
-			ScreenWidth      int `json:"screen_width"`
-			ScreenHeight     int `json:"screen_height"`
+		var point struct {
+			X int `json:"x"`
+			Y int `json:"y"`
 		}
-		if json.Unmarshal(raw, &click) != nil || !validRuntimeScreenshotGeometry(click.ScreenshotWidth, click.ScreenshotHeight, click.ScreenWidth, click.ScreenHeight) ||
-			click.X >= click.ScreenshotWidth || click.Y >= click.ScreenshotHeight {
+		if json.Unmarshal(raw, &point) != nil || point.X >= maxDesktopScreenshotWidth || point.Y >= maxDesktopScreenshotHeight {
 			return false
 		}
 		if value, exists := fields["button"]; exists {
@@ -2518,6 +2534,14 @@ func screenshotPointToScreen(point, screenshotSize, screenSize int) int {
 		return -1
 	}
 	return int(int64(point) * int64(screenSize) / int64(screenshotSize))
+}
+
+func validRuntimeScreenshotToken(token string) bool {
+	if len(token) != 43 {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	return err == nil && len(decoded) == 32
 }
 
 func runtimeToolWorkspaceID(mapping runtimeToolMapping, raw json.RawMessage) string {

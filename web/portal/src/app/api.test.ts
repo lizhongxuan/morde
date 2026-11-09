@@ -253,7 +253,7 @@ describe('typed Portal API client', () => {
       if (path.endsWith('/attachments/client-attachment-1')) return new Response(null, { status: 204 });
       if (path.endsWith('/commit')) return Response.json({ attachment_id: 'pa_test', result_revision: 2 });
       if (path.includes('/chunks/')) return Response.json({ upload_id: 'pu_test', sequence: 0, replay: false });
-      return Response.json({ upload_id: 'pu_test', state: 'active', chunk_count: 1, replay: false });
+      return Response.json({ upload_id: 'pu_test', state: 'active', chunk_count: 1, received_sequences: [], replay: false });
     }));
     const serviceID = '00000000-0000-4000-8000-000000000001';
     await portalApi.replacePersonalObject('library_item', 'chat-test', 0, { name: 'brief.txt', kind: 'artifact' }, 'attachment-object-1', 'u1', serviceID);
@@ -490,11 +490,16 @@ describe('typed Portal API client', () => {
     expect(await request!.json()).toEqual({ confirm_process_termination: false });
   });
 
-  it('uses the durable conversation and Task endpoints with stable retry keys', async () => {
+  it('uses durable message acceptance and standalone Task endpoints with stable retry keys', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
+      if (request.method === 'POST' && new URL(request.url).pathname === '/api/conversations/c1234567/messages') {
+        return Response.json({ message: { id: 'm1234567', conversation_id: 'c1234567', sequence: 1, role: 'user',
+          content: '继续', client_message_id: 'task-message-key-001', routing_status: 'pending', delivery_status: 'pending',
+          created_at: '2026-11-07T00:00:00Z' }, replayed: false }, { status: 202 });
+      }
       return Response.json({}, { status: request.method === 'POST' && new URL(request.url).pathname === '/api/conversations/c1234567/messages' ? 202 : 200 });
     }));
 

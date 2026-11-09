@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/worker"
 )
@@ -84,6 +86,48 @@ func (m *revisionBlockingModel) Complete(ctx context.Context, call app.ModelCall
 		return app.ModelResponse{Text: "STALE ORIGINAL RESULT", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}, nil
 	}
 	return app.ModelResponse{Text: "Updated result.", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}, nil
+}
+
+type revisionSideEffectModel struct {
+	mu                sync.Mutex
+	calls             []app.ModelCall
+	started           chan struct{}
+	firstNoted        chan struct{}
+	firstCause        error
+	lifecycleAlive    bool
+	explicitStillOpen bool
+}
+
+func (*revisionSideEffectModel) TaskToolCapability(context.Context, task.Task) (bool, error) {
+	return true, nil
+}
+
+func (m *revisionSideEffectModel) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, call)
+	callNumber := len(m.calls)
+	m.mu.Unlock()
+	switch callNumber {
+	case 1:
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "revision_memory_write_1", Name: "morde_personal_object_update",
+			Arguments: `{"object_type":"memory","object_id":"global","base_revision":0,"body":"{\"content\":\"completed before revision\"}"}`}},
+			StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}, nil
+	case 2:
+		close(m.started)
+		<-ctx.Done()
+		m.mu.Lock()
+		m.firstCause = context.Cause(ctx)
+		lifecycle, explicit := app.ModelTaskLifecycle(ctx), app.ModelExplicitCancellation(ctx)
+		m.lifecycleAlive = lifecycle != nil && lifecycle.Err() == nil
+		m.explicitStillOpen = explicit != nil && explicit.Err() == nil
+		m.mu.Unlock()
+		close(m.firstNoted)
+		return app.ModelResponse{Text: "STALE ORIGINAL RESULT", StopReason: "stop",
+			Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}, nil
+	default:
+		return app.ModelResponse{Text: "Updated result.", StopReason: "stop",
+			Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}, nil
+	}
 }
 
 func revisionTestExecutor(t *testing.T, store *Store, model worker.CloudDSHModels) *worker.CloudDSHExecutor {
@@ -187,6 +231,19 @@ func TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages(t *test
 	service, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	ctx := app.WithModelTaskLifecycle(service, service)
+	f.authorization.Scopes = []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit), string(identity.ScopeTaskControl)}
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession,
+		TokenID: f.authorization.TokenID}
+	personalData, err := app.NewPersonalMutationService(f.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := personalData.ApplyPersonalMutation(ctx, principal, app.PersonalMutationCommand{
+		MutationID: "revision-e2e-enable-memory", ObjectType: personal.ObjectTypeSkillSetting,
+		ObjectID: "builtin_memory", Body: json.RawMessage(`{"enabled":true}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	initial := f.receive(t, "revision-e2e-001", "Summarize the report", app.ConversationRoutingInput{})
 	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, initial)
 	if err != nil {
@@ -216,7 +273,7 @@ func TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages(t *test
 	if err != nil || !found || first.ID != taskID {
 		t.Fatalf("claim initial task: found=%t err=%v", found, err)
 	}
-	model := &revisionBlockingModel{started: make(chan struct{}), firstNoted: make(chan struct{})}
+	model := &revisionSideEffectModel{started: make(chan struct{}), firstNoted: make(chan struct{})}
 	executor := revisionTestExecutorWithCheckpoints(t, f.store, model, nil, revisionPersonalBroker(t, f.store))
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- executor.ExecuteTask(ctx, first) }()
@@ -226,6 +283,10 @@ func TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages(t *test
 		t.Fatalf("initial Agent stopped before model start: %v", err)
 	case <-time.After(20 * time.Second):
 		t.Fatal("initial model did not start")
+	}
+	completedMutation, err := f.store.GetPersonalObject(ctx, principal, personal.ObjectTypeMemory, "global")
+	if err != nil || completedMutation.Revision != 1 {
+		t.Fatalf("initial personal mutation was not committed before revision: object=%+v err=%v", completedMutation, err)
 	}
 	var startsAtFirstTurn int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_revision_starts WHERE task_id=$1 AND revision=0`, taskID).Scan(&startsAtFirstTurn); err != nil || startsAtFirstTurn != 1 {
@@ -343,7 +404,7 @@ FROM task_revision_starts WHERE task_id=$1`, taskID).Scan(&initialStarts, &skipp
 	model.mu.Lock()
 	calls := append([]app.ModelCall(nil), model.calls...)
 	model.mu.Unlock()
-	if len(calls) != 2 {
+	if len(calls) != 3 {
 		t.Fatalf("revisions made %d total model calls", len(calls))
 	}
 	var request struct {
@@ -354,7 +415,7 @@ FROM task_revision_starts WHERE task_id=$1`, taskID).Scan(&initialStarts, &skipp
 			} `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(calls[1].RawRequest, &request); err != nil {
+	if err := json.Unmarshal(calls[2].RawRequest, &request); err != nil {
 		t.Fatal(err)
 	}
 	var seen []string
@@ -372,6 +433,14 @@ FROM task_revision_starts WHERE task_id=$1`, taskID).Scan(&initialStarts, &skipp
 	}
 	if strings.Join(seen, ",") != strings.Join(changes, ",") {
 		t.Fatalf("revision inputs lost, duplicated or reordered: got=%v want=%v", seen, changes)
+	}
+	completedMutation, err = f.store.GetPersonalObject(ctx, principal, personal.ObjectTypeMemory, "global")
+	if err != nil || completedMutation.Revision != 1 {
+		t.Fatalf("completed tool side effect was repeated during revision recovery: object=%+v err=%v", completedMutation, err)
+	}
+	details, err := f.store.GetTask(ctx, taskID, f.ownerID)
+	if err != nil || details.Task.Usage.ToolCalls != 1 {
+		t.Fatalf("revision recovery duplicated the completed tool call: calls=%d err=%v", details.Task.Usage.ToolCalls, err)
 	}
 	var routed, delivered int
 	if err := f.store.pool.QueryRow(ctx, `SELECT

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"testing"
 	"time"
 
@@ -146,7 +147,10 @@ VALUES ('p1234567',NULL,'project test','http://127.0.0.1','test',decode(repeat('
 	}
 	cancel()
 	select {
-	case <-result:
+	case err := <-result:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("member Agent stop error: %v", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("member Agent did not stop after cancellation")
 	}

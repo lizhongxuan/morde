@@ -95,26 +95,45 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 		t.Fatalf("background job replay changed mode: %v", err)
 	}
 	jobs, err := service.List(ctx, lease.Fence, lease.Fence.AgentSessionID)
-	if err != nil || len(jobs) != 1 || jobs[0].SessionID != job.SessionID || !jobs[0].Background || jobs[0].CancelRequested {
-		t.Fatalf("list background jobs: jobs=%#v err=%v", jobs, err)
+	if err != nil || len(jobs) != 2 || jobs[0].SessionID != job.SessionID || !jobs[0].Background || jobs[0].CancelRequested ||
+		jobs[1].SessionID != ordinary.SessionID || jobs[1].Background {
+		t.Fatalf("list child sessions: jobs=%#v err=%v", jobs, err)
 	}
 	if _, err := service.List(ctx, lease.Fence, ordinary.SessionID); err == nil {
-		t.Fatal("non-root session listed background jobs")
+		t.Fatal("non-root session listed child sessions")
 	}
 	stale := lease.Fence
 	stale.AgentGeneration++
 	if _, err := service.List(ctx, stale, stale.AgentSessionID); domain.CodeOf(err) != domain.CodeUnauthenticated {
-		t.Fatalf("stale generation listed background jobs: %v", err)
+		t.Fatalf("stale generation listed child sessions: %v", err)
 	}
 	wrongOwner := lease.Fence
 	wrongOwner.OwnerID = "u7654321"
 	if _, err := service.List(ctx, wrongOwner, wrongOwner.AgentSessionID); err == nil {
-		t.Fatalf("other owner listed background jobs: %v", err)
+		t.Fatalf("other owner listed child sessions: %v", err)
 	}
 	wrongTask := lease.Fence
 	wrongTask.TaskID = "q7654321"
 	if _, err := service.List(ctx, wrongTask, wrongTask.AgentSessionID); domain.CodeOf(err) != domain.CodeUnauthenticated {
-		t.Fatalf("other Task listed background jobs: %v", err)
+		t.Fatalf("other Task listed child sessions: %v", err)
+	}
+	persistedChildren, err := store.ListAgentChildSessions(ctx, lease.Fence)
+	if err != nil || len(persistedChildren) != 2 || persistedChildren[0].SessionID != job.SessionID ||
+		persistedChildren[0].ParentSessionID != lease.Fence.AgentSessionID || persistedChildren[0].SpawnKey != job.SpawnKey ||
+		!persistedChildren[0].Background || persistedChildren[0].Step.Status != task.StepRunning ||
+		persistedChildren[1].SessionID != ordinary.SessionID || persistedChildren[1].ParentSessionID != lease.Fence.AgentSessionID ||
+		persistedChildren[1].SpawnKey != ordinary.SpawnKey || persistedChildren[1].Background ||
+		persistedChildren[1].Step.Status != task.StepRunning {
+		t.Fatalf("list persisted direct child sessions: children=%#v err=%v", persistedChildren, err)
+	}
+	if _, err := store.ListAgentChildSessions(ctx, stale); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("stale generation listed persisted child sessions: %v", err)
+	}
+	if _, err := store.ListAgentChildSessions(ctx, wrongOwner); err == nil {
+		t.Fatal("other owner listed persisted child sessions")
+	}
+	if _, err := store.ListAgentChildSessions(ctx, wrongTask); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("other Task listed persisted child sessions: %v", err)
 	}
 
 	cancel := app.AgentChildSessionCancelCommand{Fence: lease.Fence, ActorSessionID: lease.Fence.AgentSessionID, SessionID: job.SessionID}

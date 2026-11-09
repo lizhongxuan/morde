@@ -72,8 +72,11 @@ func TestWorkspaceHardlinkMigrationDownUpAndPreservesIdentity(t *testing.T) {
 			t.Fatalf("read complete hardlink source snapshot: %v", err)
 		}
 		copyKey := syncTestIdempotency(owner.ID, "workspace.copy", "hardlink-copy", source.ID)
-		reservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, owner.ID, source.ID, "w7654321", "hardlink copy target",
-			"hardlink-copy-test", "rabc1234", 1, int64(len("shared inode")), 1<<30, 1<<30, copyKey)
+		reservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, app.WorkspaceCopyReservationRequest{
+			ID: "rabc1234", SourceOwnerID: owner.ID, TargetOwnerID: owner.ID, SourceWorkspaceID: source.ID, TargetWorkspaceID: "w7654321",
+			TargetName: "hardlink copy target", ServiceInstanceID: "hardlink-copy-test", SourceRevision: 1,
+			ReservedBytes: int64(len("shared inode")), MaxOwnerBytes: 1 << 30, TargetQuotaBytes: 1 << 30, Idempotency: copyKey,
+		})
 		if err != nil || replayed {
 			t.Fatalf("create hardlink Workspace copy reservation = %#v, replayed=%t, err=%v", reservation, replayed, err)
 		}

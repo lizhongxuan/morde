@@ -149,8 +149,8 @@ func syntheticNodeSSEProxy(t *testing.T, provider *nodeSSEProvider, certPath, ke
 			_ = upstream.Close()
 			return
 		}
-		defer client.Close()
-		defer upstream.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = upstream.Close() }()
 		if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 			return
 		}

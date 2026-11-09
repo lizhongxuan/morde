@@ -17,6 +17,7 @@ type cloudDSHHistoryTaskStore struct {
 	*cloudDSHBrokerTaskStore
 	conversations ConversationPage
 	messages      map[string]MessagePage
+	suppressed    map[string]struct{}
 	listOwner     string
 	messageOwners []string
 	messageIDs    []string
@@ -45,7 +46,71 @@ func (s *cloudDSHHistoryTaskStore) ListMessages(ctx context.Context, ownerID, co
 	return s.messages[conversationID], nil
 }
 
-func TestCloudDSHConversationHistorySearchIsConsentGatedAndOwnerScoped(t *testing.T) {
+func (s *cloudDSHHistoryTaskStore) ListSuppressedPersonalHistoryMessageIDs(ctx context.Context, _ string, messageIDs []string) (map[string]struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := make(map[string]struct{})
+	for _, id := range messageIDs {
+		if _, suppressed := s.suppressed[id]; suppressed {
+			result[id] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func TestCloudDSHDeletedPersonalMemoryIsFilteredFromHistorySearchAndSummary(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	previousID, err := domain.NewConversationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedMemoryMessageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedMessageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &cloudDSHHistoryTaskStore{
+		cloudDSHBrokerTaskStore: baseStore,
+		conversations: ConversationPage{Items: []conversation.Conversation{
+			{ID: previousID, OwnerID: claimed.OwnerID, Title: "偏好对话"},
+		}},
+		messages: map[string]MessagePage{previousID: {Items: []conversation.Message{
+			{ID: deletedMemoryMessageID, ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+				Content: "我喜欢喝乌龙茶", DeliveryStatus: conversation.DeliveryApplied},
+			{ID: unrelatedMessageID, ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleAssistant,
+				Content: "乌龙茶适合用 90 度左右的水冲泡", DeliveryStatus: conversation.DeliveryApplied},
+		}}},
+		suppressed: map[string]struct{}{deletedMemoryMessageID: {}},
+	}
+	broker.store = store
+	principal, ok := cloudDSHPersonalPrincipal(claimed)
+	if !ok {
+		t.Fatal("fixture did not produce a personal principal")
+	}
+
+	search, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "乌龙茶", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(search.Matches) != 1 || search.Matches[0].Content != "乌龙茶适合用 90 度左右的水冲泡" {
+		t.Fatalf("deleted memory text remained searchable or unrelated history was lost: %+v", search)
+	}
+
+	summary, err := broker.summarizablePersonalHistory(context.Background(), principal, claimed.ConversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Conversations) != 1 || len(summary.Conversations[0].Messages) != 1 ||
+		summary.Conversations[0].Messages[0].Content != "乌龙茶适合用 90 度左右的水冲泡" {
+		t.Fatalf("deleted memory text remained in summary or unrelated history was lost: %+v", summary)
+	}
+}
+
+func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope(t *testing.T) {
 	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
 	settingStore := &personalMutationStoreStub{objects: map[string]personal.Object{}}
 	personalData, err := NewPersonalMutationService(settingStore)
@@ -53,22 +118,25 @@ func TestCloudDSHConversationHistorySearchIsConsentGatedAndOwnerScoped(t *testin
 		t.Fatal(err)
 	}
 	broker.personalData = personalData
+	disabledSetting := enabledMemorySetting()
+	disabledSetting.Body = json.RawMessage(`{"enabled":false}`)
+	settingStore.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = disabledSetting
 	definitions, err := broker.Definitions(context.Background(), claimed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if containsAgentTool(definitions, cloudDSHConversationHistorySearchToolName) || containsAgentTool(definitions, cloudDSHRecentHistorySummaryToolName) {
-		t.Fatal("history tools were exposed without explicit memory consent")
+		t.Fatal("history tools were exposed after the user explicitly disabled memory")
 	}
 	call := ModelToolCall{CallID: "call_history_disabled", Name: cloudDSHConversationHistorySearchToolName, Arguments: `{"query":"茶叶"}`}
 	if _, err := broker.execute(context.Background(), claimed, call, false, nil); domain.CodeOf(err) != domain.CodeForbidden {
-		t.Fatalf("history search without consent error = %v, want forbidden", err)
+		t.Fatalf("history search after explicit opt-out error = %v, want forbidden", err)
 	}
 	if len(baseStore.events) != 0 {
 		t.Fatalf("denied search wrote task progress: %+v", baseStore.events)
 	}
 
-	settingStore.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = enabledMemorySetting()
+	delete(settingStore.objects, personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID)
 	previousID, err := domain.NewConversationID()
 	if err != nil {
 		t.Fatal(err)
@@ -126,10 +194,10 @@ func TestCloudDSHConversationHistorySearchIsConsentGatedAndOwnerScoped(t *testin
 		t.Fatal(err)
 	}
 	if !containsAgentTool(definitions, cloudDSHConversationHistorySearchToolName) {
-		t.Fatal("history search was not exposed after explicit memory consent")
+		t.Fatal("history search was not exposed with the default personal memory setting")
 	}
 	if !containsAgentTool(definitions, cloudDSHRecentHistorySummaryToolName) {
-		t.Fatal("recent history summary was not exposed after explicit memory consent")
+		t.Fatal("recent history summary was not exposed with the default personal memory setting")
 	}
 	call = ModelToolCall{CallID: "call_history_enabled", Name: cloudDSHConversationHistorySearchToolName,
 		Arguments: `{"query":"茶叶","limit":1}`}

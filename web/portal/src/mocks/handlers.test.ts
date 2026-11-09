@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { setupServer } from "msw/node";
 import { handlers, resetMockState, setMockWorkspaceSyncConflict } from "./handlers";
 
@@ -143,6 +144,18 @@ describe("portal personal-data mock reads", () => {
     expect((await member(`/api/goals/${goal.id}`)).status).toBe(404);
     expect(await (await member("/api/goals")).json()).toEqual({ items: [], next_cursor: null });
     expect(await (await member("/api/sync/snapshot")).json()).toEqual({ watermark: 0, items: [], next_cursor: null });
+  });
+
+  it("accepts the default dragon profile saved by the Portal editor", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const body = { name: "本机验收用户", avatar: "dragon", emoji: "", color: "", description: "", style: "" };
+    const response = await api("/api/personal-data/profile/default", {
+      ...json("PUT", { base_revision: 0, body }),
+      headers: { "content-type": "application/json", "Idempotency-Key": "profile-editor-save-001" },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ object_type: "profile", object_id: "default", result_revision: 1 });
+    expect(await (await api("/api/personal-data/profile/default")).json()).toMatchObject({ body });
   });
 
   it("writes only contract-shaped legacy personal objects with scoped revision and idempotency", async () => {
@@ -1148,7 +1161,7 @@ describe("portal mock admin workspaces", () => {
 });
 
 describe("portal mock durable tasks", () => {
-  it("creates one independent Task per personal conversation message and replays exact retries", async () => {
+  it("accepts personal messages before routing and replays exact retries without creating a Task", async () => {
     await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
     const blocked = await api("/api/conversations", { ...json("POST", {}),
       headers: { "content-type": "application/json", "Idempotency-Key": "conversation-create-01",
@@ -1161,31 +1174,94 @@ describe("portal mock durable tasks", () => {
     const path = `/api/conversations/${conversation.id}/messages`;
     const headers = { "content-type": "application/json", "Idempotency-Key": "first-message-1",
       "X-Morde-Service-Instance-ID": "00000000-0000-4000-8000-000000000001", "X-Morde-Actor-ID": "u1a2b3c4" };
-    const body = { client_message_id: "first-message-1", mode: "new", model_id: "pmodel01", content: "第一条" };
+    const body = { client_message_id: "first-message-1", content: "第一条" };
     const first = await api(path, { ...json("POST", body), headers });
-    const result = await first.json() as { message: { id: string; task_id: string; client_message_id: string }; task: { id: string; conversation_id: string; status: string }; replayed: boolean };
+    const result = await first.json() as { message: { id: string; sequence: number; task_id?: string; client_message_id: string; delivery_status: string; routing_status: string }; replayed: boolean };
     expect(first.status).toBe(202);
-    expect(result).toMatchObject({ message: { client_message_id: body.client_message_id, task_id: expect.any(String), delivery_status: "applied" },
-      task: { conversation_id: conversation.id, status: "queued" }, replayed: false });
-    expect(result.message.task_id).toBe(result.task.id);
+    expect(result).toMatchObject({ message: { client_message_id: body.client_message_id, delivery_status: "pending", routing_status: "pending" }, replayed: false });
+    expect(result.message.task_id).toBeUndefined();
     const replay = await api(path, { ...json("POST", body), headers });
     expect(replay.status).toBe(202);
-    expect(await replay.json()).toMatchObject({ message: { id: result.message.id }, task: { id: result.task.id }, replayed: true });
+    expect(await replay.json()).toMatchObject({ message: { id: result.message.id }, replayed: true });
     expect((await api(path, { ...json("POST", { ...body, content: "变化" }), headers })).status).toBe(409);
-    expect((await api(path, { ...json("POST", { ...body, mode: "append" }), headers })).status).toBe(400);
-    expect((await api(path, { ...json("POST", { ...body, previous_client_message_id: body.client_message_id }), headers })).status).toBe(400);
+    expect((await api(path, { ...json("POST", { ...body, mode: "new", model_id: "pmodel01" }), headers })).status).toBe(400);
+    expect((await api(path, { ...json("POST", { ...body, input_revision: 5 }), headers })).status).toBe(400);
     expect((await api(`${path}?client_message_id=${body.client_message_id}`, { headers })).status).toBe(200);
-    const secondBody = { client_message_id: "second-message-1", mode: "new", model_id: "pmodel01", content: "第二条" };
+    const secondBody = { client_message_id: "second-message-1", content: "第二条" };
     const second = await api(path, { ...json("POST", secondBody), headers: { ...headers, "Idempotency-Key": secondBody.client_message_id } });
     expect(second.status).toBe(202);
-    const secondResult = await second.json() as { message: { task_id: string }; task: { id: string } };
-    expect(secondResult.message.task_id).toBe(secondResult.task.id);
-    expect(secondResult.task.id).not.toBe(result.task.id);
+    const secondResult = await second.json() as { message: { id: string; task_id?: string; sequence: number } };
+    expect(secondResult.message.task_id).toBeUndefined();
+    expect(secondResult.message.sequence).toBeGreaterThan(result.message.sequence);
     expect((await (await api(path)).json()).items).toHaveLength(2);
-    expect((await (await api(`/api/conversations/${conversation.id}/tasks`)).json()).items).toHaveLength(2);
+    expect((await (await api(`/api/conversations/${conversation.id}/tasks`)).json()).items).toHaveLength(0);
     const member = createApiClient();
     await member("/api/auth/login", json("POST", { name: "member", password: "member" }));
     expect((await member(path)).status).toBe(404);
+  });
+
+  it("resumes and commits multilingual personal and project message uploads exactly once", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const serviceID = "00000000-0000-4000-8000-000000000001";
+    const identityHeaders = { "X-Morde-Service-Instance-ID": serviceID, "X-Morde-Actor-ID": "u1a2b3c4" };
+    const personalConversation = await api("/api/conversations", {
+      ...json("POST", {}), headers: { ...identityHeaders, "content-type": "application/json", "Idempotency-Key": "upload-conversation-01" },
+    });
+    expect(personalConversation.status).toBe(201);
+    const personalConversationID = (await personalConversation.json() as { id: string }).id;
+    const projectConversation = await api("/api/projects/pdem0001/conversations", {
+      ...json("POST", { title: "上传协议回归" }), headers: { "content-type": "application/json", "Idempotency-Key": "upload-project-conversation-01" },
+    });
+    expect(projectConversation.status).toBe(201);
+    const projectConversationID = (await projectConversation.json() as { id: string }).id;
+    const content = "长消息🙂内容".repeat(7_000);
+    const bytes = new TextEncoder().encode(content);
+    const chunkSize = 16 * 1024;
+    const totalChunks = Math.ceil(bytes.length / chunkSize);
+
+    for (const target of [
+      { path: `/api/conversations/${personalConversationID}`, messages: `/api/conversations/${personalConversationID}/messages`, clientID: "upload-personal-01" },
+      { path: `/api/projects/pdem0001/conversations/${projectConversationID}`, messages: `/api/projects/pdem0001/conversations/${projectConversationID}/messages`, clientID: "upload-project-01" },
+    ]) {
+      const uploadPath = `${target.path}/message-uploads/${target.clientID}`;
+      const headers = { ...identityHeaders, "content-type": "application/json", "Idempotency-Key": target.clientID };
+      const init = {
+        total_bytes: bytes.length, total_chunks: totalChunks, sha256: createHash("sha256").update(bytes).digest("hex"),
+        previous_client_message_id: "previous-message-01", model_id: "pmodel01",
+      };
+      const initialized = await api(uploadPath, { ...json("PUT", init), headers });
+      expect(initialized.status).toBe(200);
+      expect(await initialized.json()).toMatchObject({ client_message_id: target.clientID, state: "uploading", received_sequences: [] });
+      const initReplay = await api(uploadPath, { ...json("PUT", init), headers });
+      expect(initReplay.status).toBe(200);
+      expect((await initReplay.json() as { received_sequences: number[] }).received_sequences).toEqual([]);
+      expect((await api(uploadPath, { ...json("PUT", { ...init, model_id: "different-model" }), headers })).status).toBe(409);
+
+      const sendChunk = async (sequence: number) => {
+        const chunk = bytes.subarray(sequence * chunkSize, Math.min((sequence + 1) * chunkSize, bytes.length));
+        return api(`${uploadPath}/chunks/${sequence}`, {
+          ...json("PUT", { content_base64: Buffer.from(chunk).toString("base64"), sha256: createHash("sha256").update(chunk).digest("hex") }),
+          headers: identityHeaders,
+        });
+      };
+      expect((await sendChunk(totalChunks - 1)).status).toBe(204);
+      expect((await sendChunk(totalChunks - 1)).status).toBe(204);
+      const progress = await api(uploadPath, { headers: identityHeaders });
+      expect(await progress.json()).toMatchObject({ state: "uploading", received_sequences: [totalChunks - 1] });
+      expect((await api(`${uploadPath}/commit`, { method: "POST", headers: { ...identityHeaders, "Idempotency-Key": target.clientID } })).status).toBe(409);
+      for (let sequence = 0; sequence < totalChunks - 1; sequence += 1) expect((await sendChunk(sequence)).status).toBe(204);
+
+      const committed = await api(`${uploadPath}/commit`, { method: "POST", headers: { ...identityHeaders, "Idempotency-Key": target.clientID } });
+      expect(committed.status).toBe(202);
+      const receipt = await committed.json() as { message: { id: string; content: string; client_message_id: string; delivery_status: string } };
+      expect(receipt.message).toMatchObject({ content, client_message_id: target.clientID, delivery_status: "pending" });
+      const replay = await api(`${uploadPath}/commit`, { method: "POST", headers: { ...identityHeaders, "Idempotency-Key": target.clientID } });
+      expect(await replay.json()).toEqual(receipt);
+      const listed = await api(`${target.messages}?client_message_id=${target.clientID}`, { headers: identityHeaders });
+      const persisted = (await listed.json() as { items: Array<{ id: string; content: string }> }).items;
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]).toMatchObject({ id: receipt.message.id, content });
+    }
   });
 
   it("persists a queued Task, replays an exact retry, and protects conversation ownership", async () => {

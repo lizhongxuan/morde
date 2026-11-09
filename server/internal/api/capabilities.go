@@ -54,6 +54,12 @@ func (h *api) capabilities(c *gin.Context) {
 	if taskAPIAvailable {
 		features = append(features, "task_api")
 	}
+	conversationAutoRoutingAvailable := h.deps.ConversationAutoRoutingReady && taskAPIAvailable &&
+		h.deps.ProjectConversations != nil && h.deps.ClientLogin != nil && clientVerifier &&
+		h.deps.ModelConnections != nil && h.deps.ModelGateway != nil
+	if conversationAutoRoutingAvailable {
+		features = append(features, "conversation_auto_routing_v1")
+	}
 	if h.deps.ProjectWorkItems != nil {
 		features = append(features, "project_work_items_v2")
 	}

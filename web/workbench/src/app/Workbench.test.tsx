@@ -146,6 +146,10 @@ describe('Workbench mobile menus', () => {
 
     fireEvent.contextMenu(files);
     expect(screen.getByRole('menu', { name: '更多功能' })).toBeVisible();
+    fireEvent.click(screen.getByRole('menuitem', { name: '主机文件' }));
+    expect(await screen.findByText('请先接管电脑后使用文件。')).toBeVisible();
+
+    fireEvent.contextMenu(files);
     fireEvent.click(screen.getByRole('menuitem', { name: 'Workspace' }));
     expect(files).toHaveAttribute('aria-current', 'page');
     expect(await screen.findByText('此电脑没有可访问的工作区。')).toBeVisible();

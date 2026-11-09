@@ -21,12 +21,31 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.CloudDSH.Enabled ||
+	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled ||
 		cfg.SiteStorage.RootDir == "" || cfg.SiteStorage.MaxReleaseBytes != 10737418240 || cfg.SiteStorage.MaxOwnerBytes != 53687091200 || cfg.SiteStorage.MinFreeBytes != 10737418240 {
 		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.SiteStorage)
 	}
 	if cfg.MCP != (MCP{Enabled: true, MaxOutputBytes: 65536, ScreenshotMaxWidth: 1280}) {
 		t.Fatalf("MCP defaults = %+v", cfg.MCP)
+	}
+}
+
+func TestLoadOrchestratorNetworkPolicyCapabilityIsExplicit(t *testing.T) {
+	workbenchDir := t.TempDir()
+	t.Setenv("T02_TEST_INSTANCE", "test-instance")
+	data := strings.Replace(validConfigYAML(workbenchDir),
+		"network_guard_path: /opt/cloudhost/network-policy.sh\n",
+		"network_guard_path: /opt/cloudhost/network-policy.sh\n      network_policy_enabled: true\n", 1)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled {
+		t.Fatal("explicit network_policy_enabled was not loaded")
 	}
 }
 

@@ -45,6 +45,7 @@ type browserConnection interface {
 	DisposeBrowserContext(context.Context, string) error
 	Targets(context.Context) ([]targetInfo, error)
 	CreateTarget(context.Context, string, string, bool) (string, error)
+	ActivateTarget(context.Context, string) error
 	AttachTarget(context.Context, string) (targetConnection, error)
 	Close() error
 }
@@ -264,6 +265,13 @@ func (c *cdpBrowser) CreateTarget(ctx context.Context, contextID, pageURL string
 		return "", errors.New("CDP returned an invalid target ID")
 	}
 	return response.TargetID, nil
+}
+
+func (c *cdpBrowser) ActivateTarget(ctx context.Context, targetID string) error {
+	if !validTargetID(targetID) {
+		return errors.New("target ID is invalid")
+	}
+	return c.ws.call(ctx, "Target.activateTarget", map[string]any{"targetId": targetID}, "", nil)
 }
 
 func (c *cdpBrowser) AttachTarget(ctx context.Context, targetID string) (targetConnection, error) {

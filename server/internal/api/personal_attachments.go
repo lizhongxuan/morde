@@ -36,10 +36,11 @@ type personalAttachmentUploadRequest struct {
 }
 
 type personalAttachmentUploadResponse struct {
-	UploadID   string `json:"upload_id"`
-	State      string `json:"state"`
-	ChunkCount int32  `json:"chunk_count"`
-	Replay     bool   `json:"replay"`
+	UploadID          string  `json:"upload_id"`
+	State             string  `json:"state"`
+	ChunkCount        int32   `json:"chunk_count"`
+	ReceivedSequences []int32 `json:"received_sequences"`
+	Replay            bool    `json:"replay"`
 }
 
 type personalAttachmentChunkResponse struct {
@@ -98,8 +99,12 @@ func RegisterPersonalAttachmentRoutes(group *gin.RouterGroup, service personalAt
 			writeError(c, err)
 			return
 		}
+		if receipt.ReceivedSequences == nil {
+			receipt.ReceivedSequences = []int32{}
+		}
 		c.JSON(http.StatusOK, personalAttachmentUploadResponse{
-			UploadID: receipt.UploadID, State: string(receipt.State), ChunkCount: receipt.ChunkCount, Replay: receipt.Replay,
+			UploadID: receipt.UploadID, State: string(receipt.State), ChunkCount: receipt.ChunkCount,
+			ReceivedSequences: receipt.ReceivedSequences, Replay: receipt.Replay,
 		})
 	})
 

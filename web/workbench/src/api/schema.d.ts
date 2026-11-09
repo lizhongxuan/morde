@@ -1352,7 +1352,7 @@ export interface paths {
         put?: never;
         /**
          * Claim a Workspace copy link
-         * @description Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
+         * @description Portal session only. A link can be claimed by one account. A failed in-progress claim can be retried only by that same account. The server creates the recipient-owned copy with the selected view/edit permission when it reserves the copy; neither successful nor recovery paths use ownership transfer or transfer the original Workspace or its Host bindings. Once successful, the token is invalid and the recipient owns an independent copy permanently. The original Workspace is not shared or changed.
          */
         post: operations["acceptWorkspaceShareLink"];
         delete?: never;
@@ -6889,6 +6889,7 @@ export interface components {
             state: "pending" | "active" | "committed" | "cancelled" | "expired";
             /** Format: int32 */
             chunk_count: number;
+            received_sequences: number[];
             replay: boolean;
         };
         PersonalAttachmentChunkReceipt: {
@@ -7756,12 +7757,12 @@ export interface components {
              * Format: int64
              * @description Count of Task steps excluding budget steps.
              */
-            step_count?: number;
+            step_count: number;
             /**
              * Format: int64
              * @description Count of succeeded Task steps excluding budget steps; never greater than step_count.
              */
-            completed_step_count?: number;
+            completed_step_count: number;
             budget: components["schemas"]["TaskBudget"];
             usage: components["schemas"]["TaskUsage"];
             /** Format: date-time */
@@ -7853,7 +7854,7 @@ export interface components {
              * Format: int64
              * @description Monotonic sequence within the conversation
              */
-            sequence: number;
+            sequence?: number;
             task_id: components["schemas"]["TaskId"];
             /** Format: int64 */
             task_revision?: number;
@@ -7947,7 +7948,6 @@ export interface components {
             input_revision?: number;
             application_id?: string;
             model_id: string;
-            conversation_id?: components["schemas"]["ConversationId"] | null;
             objective: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
@@ -8746,7 +8746,7 @@ export interface operations {
                         hub_version: string | null;
                         event_version: string | null;
                         minimum_client_version: string | null;
-                        /** @description An absent feature is unavailable or not yet declared. task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
+                        /** @description An absent feature is unavailable or not yet declared. conversation_auto_routing_v1 means personal and project conversation messages can be durably accepted before asynchronous relationship classification and task execution; task_api means conversation and Task endpoints are assembled and may accept durable queued work; cloud_tasks means those client endpoints and cloud execution control are assembled; task_media_generation means server-managed image, video and speech generation plus token reservation/settlement, durable idempotent provider-operation recovery, owner-authorized preview, explicit save confirmation and verified Workspace artifact publication are assembled; project_budget_execution means project conversation, cloud Task, configured project model rates, platform-model project/account budget reservation and settlement, and work-item delivery evidence validation are assembled; hub means the installation-bound realtime endpoint is assembled; personal_sync means the snapshot and change-feed services for supported personal objects and schedules are assembled. Native login clients must require ordered_client_login before sending account credentials; the older client_login feature is no longer advertised. */
                         supported_features: string[];
                         /** Format: int64 */
                         default_max_request_bytes: number;

@@ -407,6 +407,28 @@ VALUES ($1::uuid,$2,$3,$4,1,false)`, f.instanceID, f.task.OwnerID, personal.Obje
 	}
 }
 
+func TestCloudDSHStreamDefaultsPersonalMemoryOnAndFencesOptOut(t *testing.T) {
+	f := newCloudDSHStreamFixture(t)
+	ctx := context.Background()
+	f.delta.PersonalProof = &app.CloudDSHStreamPersonalProof{Enabled: true, SettingRevision: 0, Objects: []app.CloudDSHMemoryVersion{}}
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, f.delta); err != nil || !appended {
+		t.Fatalf("missing preference should use default-on personal memory: appended=%t err=%v", appended, err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `INSERT INTO personal_objects(service_instance_id,owner_id,object_type,object_id,body)
+VALUES ($1::uuid,$2,$3,'builtin_memory','{"enabled":false}'::jsonb)`, f.instanceID, f.task.OwnerID, personal.ObjectTypeSkillSetting); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `INSERT INTO account_object_versions(service_instance_id,owner_id,object_type,object_id,revision,is_deleted)
+VALUES ($1::uuid,$2,$3,'builtin_memory',1,false)`, f.instanceID, f.task.OwnerID, personal.ObjectTypeSkillSetting); err != nil {
+		t.Fatal(err)
+	}
+	second := f.delta
+	second.Text = "should be rejected after memory opt-out"
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, second); appended || domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("explicit memory opt-out did not fence the prior stream: appended=%t err=%v", appended, err)
+	}
+}
+
 func TestCloudDSHStreamRevisionAndCancelKeepInterruptedText(t *testing.T) {
 	for _, action := range []string{"revision", "cancel"} {
 		t.Run(action, func(t *testing.T) {

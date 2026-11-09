@@ -20,12 +20,15 @@ const (
 
 type CopyReservation struct {
 	ID                string
-	OwnerID           string
+	SourceOwnerID     string
+	TargetOwnerID     string
+	ShareID           string
 	SourceWorkspaceID string
 	TargetWorkspaceID string
 	ServiceInstanceID string
 	SourceRevision    int64
 	ReservedBytes     int64
+	ReadOnly          bool
 	State             CopyState
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
@@ -33,8 +36,13 @@ type CopyReservation struct {
 
 func (reservation CopyReservation) Validate() error {
 	if !domain.ValidPendingRequestID(reservation.ID) ||
-		!domain.ValidUserID(reservation.OwnerID) || !domain.ValidWorkspaceID(reservation.SourceWorkspaceID) ||
-		!domain.ValidWorkspaceID(reservation.TargetWorkspaceID) || reservation.SourceWorkspaceID == reservation.TargetWorkspaceID ||
+		!domain.ValidUserID(reservation.SourceOwnerID) || !domain.ValidUserID(reservation.TargetOwnerID) ||
+		(reservation.ShareID != "" && !domain.ValidPendingRequestID(reservation.ShareID)) ||
+		!domain.ValidWorkspaceID(reservation.SourceWorkspaceID) || !domain.ValidWorkspaceID(reservation.TargetWorkspaceID) ||
+		reservation.SourceWorkspaceID == reservation.TargetWorkspaceID ||
+		(reservation.ShareID != "" || reservation.SourceOwnerID != reservation.TargetOwnerID || reservation.ReadOnly) &&
+			(reservation.ShareID != "" || reservation.SourceOwnerID == reservation.TargetOwnerID || reservation.State != CopyCompleted) &&
+			(reservation.ShareID == "" || reservation.SourceOwnerID == reservation.TargetOwnerID) ||
 		strings.TrimSpace(reservation.ServiceInstanceID) == "" || len(reservation.ServiceInstanceID) > 128 ||
 		reservation.SourceRevision < 0 || reservation.ReservedBytes < 0 || !reservation.State.Valid() ||
 		reservation.CreatedAt.IsZero() || reservation.UpdatedAt.IsZero() {

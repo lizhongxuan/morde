@@ -391,6 +391,13 @@ available_after=clock_timestamp(),updated_at=clock_timestamp() WHERE message_id=
 		if current.PreviousCycle && decision.Action != app.ConversationRouteClarify {
 			return domain.NewError(domain.CodeConflict, "conversation predecessor chain is invalid")
 		}
+		if decision.Action == app.ConversationRouteNew && app.ConversationRouteHasExplicitControlIntent(current.Context.Content) {
+			if current.Context.ReferenceUnavailable {
+				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
+			} else if current.PreviousMissing {
+				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
+			}
+		}
 		if current.PreviousMissing && decision.Action == app.ConversationRouteNew {
 			var independent bool
 			err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
@@ -447,8 +454,8 @@ COALESCE((SELECT expected_revision FROM task_revision_intents WHERE task_id=$1 O
 				Scan(&lastRevisionSequence, &lastRevisionMessage, &lastExpectedRevision); err != nil {
 				return fmt.Errorf("verify task revision order: %w", err)
 			}
-			if lastRevisionSequence >= claim.Message.Sequence && !(current.PreviousSequence > claim.Message.Sequence &&
-				current.PreviousMessageID == lastRevisionMessage && lastExpectedRevision+1 == candidate.Revision) {
+			if lastRevisionSequence >= claim.Message.Sequence && (current.PreviousSequence <= claim.Message.Sequence ||
+				current.PreviousMessageID != lastRevisionMessage || lastExpectedRevision+1 != candidate.Revision) {
 				return finishConversationRoute(ctx, tx, claim, "waiting_user", "另一条较新的修改已收到，请确认这条修改是否仍要执行。", "", false)
 			}
 			if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {

@@ -37,9 +37,12 @@ VALUES ($1,'client','call-0001',$2,'p1234567','model-a',20,'settled',8,3,$3,$3),
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO account_agent_runtimes(service_instance_id,owner_id,runtime_id,runtime_generation,state,lease_owner,lease_version,execution_epoch,lease_expires_at,max_concurrent_tasks,failure_reason)
-VALUES ($1,$2,'runtime-running',1,'running','lease',1,1,$3,1,''),($1,$4,'runtime-failed',1,'failed','lease',1,1,NULL,1,'runtime_failed')`,
-		serviceInstanceID, owner.ID, now.Add(time.Hour), createTestUser(t, store, 3, 20_000, 40_000).ID); err != nil {
+	runningConversationID := runtimeTestConversation(t, store, owner.ID)
+	failedOwner := createTestUser(t, store, 3, 20_000, 40_000)
+	failedConversationID := runtimeTestConversation(t, store, failedOwner.ID)
+	if _, err := pool.Exec(ctx, `INSERT INTO account_agent_runtimes(service_instance_id,owner_id,runtime_id,runtime_generation,state,lease_owner,lease_version,execution_epoch,lease_expires_at,max_concurrent_tasks,failure_reason,conversation_id)
+		VALUES ($1,$2,'runtime-running',1,'running','lease',1,1,$3,1,'',$4),($1,$5,'runtime-failed',1,'failed','lease',1,1,NULL,1,'runtime_failed',$6)`,
+		serviceInstanceID, owner.ID, now.Add(time.Hour), runningConversationID, failedOwner.ID, failedConversationID); err != nil {
 		t.Fatal(err)
 	}
 

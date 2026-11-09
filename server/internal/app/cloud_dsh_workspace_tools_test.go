@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -190,6 +191,85 @@ func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T)
 	}
 }
 
+func TestCloudDSHWorkspaceSearchIsBoundedRevisionScopedAndOmitsRestrictedFiles(t *testing.T) {
+	content := []byte("first line\nAI news from the report\nlast line")
+	file := syncServiceFile("notes/report.txt", content)
+	large := syncServiceFile("archive/large.txt", bytes.Repeat([]byte("x"), cloudDSHWorkspaceReadMaxBytes+1))
+	secret := syncServiceFile(".env", []byte("AI_SECRET=do-not-return"))
+	link := workspaceSymlinkFile("linked", "outside")
+	tools, _, blocks, current := newCloudDSHT08WorkspaceTools(t, []workspace.File{file, large, secret, link}, nil, nil)
+	blocks.data[file.SHA256] = content
+
+	call := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-workspace", cloudDSHWorkspaceSearchArguments{
+		ExpectedRevision: 0, Query: "  aI NEWS ", Prefix: "notes", MaxResults: 10,
+	})
+	result, err := tools.execute(context.Background(), current, call, false, nil)
+	var found cloudDSHWorkspaceSearchOutput
+	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &found) != nil ||
+		found.WorkspaceID != current.WorkspaceID || found.Revision != 0 || !found.Complete || found.FilesScanned != 1 ||
+		len(found.Matches) != 1 || found.Matches[0].Path != file.Path || found.Matches[0].Line != 2 || found.Matches[0].Text != "AI news from the report" {
+		t.Fatalf("Workspace search = %#v, %#v, %v", result, found, err)
+	}
+
+	call = workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-workspace-bounded", cloudDSHWorkspaceSearchArguments{
+		ExpectedRevision: 0, Query: "AI",
+	})
+	result, err = tools.execute(context.Background(), current, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &found) != nil ||
+		found.Complete || found.SkippedFiles != 1 || len(found.Matches) != 1 || found.Matches[0].Path != file.Path {
+		t.Fatalf("bounded Workspace search = %#v, %#v, %v", result, found, err)
+	}
+	if strings.Contains(result.Output, ".env") || strings.Contains(result.Output, "do-not-return") {
+		t.Fatalf("Workspace search exposed restricted content: %s", result.Output)
+	}
+
+	symlinkPrefix := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-symlink-prefix", cloudDSHWorkspaceSearchArguments{
+		ExpectedRevision: 0, Query: "AI", Prefix: "linked",
+	})
+	result, err = tools.execute(context.Background(), current, symlinkPrefix, false, nil)
+	if err != nil || result.Status != AgentToolFailed {
+		t.Fatalf("search through symlink prefix = %#v, %v; want rejected tool result", result, err)
+	}
+
+	stale := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-stale-workspace", cloudDSHWorkspaceSearchArguments{
+		ExpectedRevision: 1, Query: "AI",
+	})
+	result, err = tools.execute(context.Background(), current, stale, false, nil)
+	if err != nil || result.Status != AgentToolFailed {
+		t.Fatalf("search stale revision = %#v, %v; want failed tool result", result, err)
+	}
+}
+
+func TestCloudDSHWorkspaceSearchIsRegisteredForHostlessTasks(t *testing.T) {
+	_, _, broker, _, current := newCloudDSHT08WorkspaceBroker(t)
+	definitions, err := broker.Definitions(context.Background(), current)
+	if err != nil {
+		t.Fatalf("broker tool definitions = %v", err)
+	}
+	seen := make(map[string]bool, len(definitions))
+	for _, definition := range definitions {
+		seen[definition.Name] = true
+		if definition.Name == cloudDSHWorkspaceSearchToolName && !definition.Strict {
+			t.Errorf("Hostless Workspace search tool must use strict arguments: %#v", definition)
+		}
+	}
+	if !seen[cloudDSHWorkspaceListToolName] || !seen[cloudDSHWorkspaceReadToolName] ||
+		!seen[cloudDSHWorkspaceSearchToolName] || !seen[cloudDSHWorkspaceWriteToolName] {
+		t.Fatalf("Hostless Workspace tools missing from broker definitions: %#v", definitions)
+	}
+	for _, forbidden := range []string{
+		runtimeToolShellExec, runtimeToolFileRead, runtimeToolFileWrite, runtimeToolFileList, runtimeToolFileFind,
+		runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserSnapshot, runtimeToolBrowserClick,
+		runtimeToolBrowserType, runtimeToolBrowserPressKey, runtimeToolBrowserObserveField, runtimeToolBrowserScreenshot,
+		runtimeToolDesktopScreenshot, runtimeToolWindowList, runtimeToolWindowActivate,
+		runtimeToolDesktopClick, runtimeToolDesktopType, runtimeToolDesktopPressKey,
+	} {
+		if seen[forbidden] {
+			t.Errorf("Hostless Workspace task exposed Host/runtime tool %q: %#v", forbidden, definitions)
+		}
+	}
+}
+
 func TestCloudDSHWorkspaceWriteRequiresApprovalAndCommitsOnlyTheApprovedCall(t *testing.T) {
 	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
 	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-requires-approval", cloudDSHWorkspaceWriteArguments{
@@ -299,12 +379,20 @@ func TestCloudDSHWorkspaceToolsIsolateOwnerDataAcrossOwners(t *testing.T) {
 		if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, current.want) {
 			t.Fatalf("%s could not read its own Workspace: result=%#v err=%v", current.name, result, err)
 		}
+		search := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-"+current.name,
+			cloudDSHWorkspaceSearchArguments{ExpectedRevision: 0, Query: "workspace"})
+		result, err = tools.execute(context.Background(), current.task, search, false, nil)
+		if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, current.file.Path) ||
+			!strings.Contains(result.Output, current.want) {
+			t.Fatalf("%s could not search its own Workspace: result=%#v err=%v", current.name, result, err)
+		}
 	}
 
 	taskA.WorkspaceID = storeB.workspace.ID
 	attacks := []ModelToolCall{
 		workspaceToolCall(t, cloudDSHWorkspaceListToolName, "owner-a-list-owner-b", cloudDSHWorkspaceListArguments{ExpectedRevision: 0, Limit: 10}),
 		workspaceToolCall(t, cloudDSHWorkspaceReadToolName, "owner-a-read-owner-b", cloudDSHWorkspaceReadArguments{ExpectedRevision: 0, Path: ownerBFile.Path}),
+		workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "owner-a-search-owner-b", cloudDSHWorkspaceSearchArguments{ExpectedRevision: 0, Query: "private workspace"}),
 		workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "owner-a-write-owner-b", cloudDSHWorkspaceWriteArguments{
 			ExpectedRevision: 0, Path: ownerBFile.Path, Content: "owner A overwrite",
 		}),

@@ -34,9 +34,13 @@ func (client *mcpConnectorToolClient) CallTool(ctx context.Context, endpoint str
 	if err != nil {
 		return app.MCPConnectorToolResult{}, err
 	}
+	images := make([]app.ModelImage, 0, len(result.Images))
+	for _, image := range result.Images {
+		images = append(images, app.ModelImage{MediaType: image.MediaType, Data: append([]byte(nil), image.Data...)})
+	}
 	return app.MCPConnectorToolResult{
 		IsError: result.IsError, UnsupportedContent: result.UnsupportedContent,
-		StructuredContent: result.StructuredContent, Text: result.Text,
+		StructuredContent: result.StructuredContent, Text: result.Text, Images: images,
 	}, nil
 }
 

@@ -108,7 +108,7 @@ type taskStopRequestResponse struct {
 type taskAssistantMessageResponse struct {
 	ID                  string            `json:"id"`
 	ConversationID      string            `json:"conversation_id"`
-	Sequence            int64             `json:"sequence"`
+	Sequence            *int64            `json:"sequence,omitempty"`
 	TaskID              string            `json:"task_id"`
 	TaskRevision        *int64            `json:"task_revision,omitempty"`
 	ResultEventSequence *int64            `json:"result_event_sequence,omitempty"`
@@ -223,7 +223,6 @@ type submitTaskRequest struct {
 	MCPConnectorIDs []string           `json:"mcp_connector_ids"`
 	ApplicationID   string             `json:"application_id"`
 	ModelID         string             `json:"model_id"`
-	ConversationID  *string            `json:"conversation_id"`
 	Objective       string             `json:"objective"`
 	Budget          *taskBudgetRequest `json:"budget"`
 	BatchItems      []batchItemRequest `json:"batch_items"`
@@ -537,18 +536,10 @@ func (h *api) submitTask(service TaskService) gin.HandlerFunc {
 		for _, item := range request.BatchItems {
 			batchItems = append(batchItems, app.BatchItemInput{Key: item.Key, Input: item.Input})
 		}
-		conversationID := ""
-		if request.ConversationID != nil {
-			if !domain.ValidConversationID(*request.ConversationID) {
-				writeError(c, domain.InvalidArgument("conversation_id", "conversation id is invalid"))
-				return
-			}
-			conversationID = *request.ConversationID
-		}
 		result, err := service.Submit(c.Request.Context(), principal, app.SubmitTaskCommand{
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
 			MCPConnectorIDs: request.MCPConnectorIDs,
-			ApplicationID:   request.ApplicationID, ModelID: request.ModelID, ConversationID: conversationID,
+			ApplicationID:   request.ApplicationID, ModelID: request.ModelID,
 			Objective: request.Objective, Budget: budget, BatchItems: batchItems,
 			IdempotencyKey: c.GetHeader("Idempotency-Key"),
 		})
@@ -678,23 +669,23 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
 		message := assistant.Message
+		status := string(assistant.Status)
 		if !domain.ValidMessageID(message.ID) || !domain.ValidConversationID(message.ConversationID) ||
 			message.ConversationID != value.Task.ConversationID || message.TaskID != value.Task.ID ||
-			message.Sequence < 1 || message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
+			(message.Sequence < 1 && status == "completed") || message.Sequence < 0 || message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
 			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) ||
 			strings.ContainsRune(message.Content, '\x00') || message.CreatedAt.IsZero() ||
 			(assistant.TaskRevision != nil && *assistant.TaskRevision < 0) ||
 			(assistant.ResultEventSequence != nil && (*assistant.ResultEventSequence < 1 || assistant.TaskRevision == nil)) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
-		status := string(assistant.Status)
 		switch status {
 		case "streaming", "completed", "interrupted":
 		default:
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.AssistantMessage = &taskAssistantMessageResponse{
-			ID: message.ID, ConversationID: message.ConversationID, Sequence: message.Sequence, TaskID: message.TaskID,
+			ID: message.ID, ConversationID: message.ConversationID, Sequence: positiveInt64Pointer(message.Sequence), TaskID: message.TaskID,
 			TaskRevision: assistant.TaskRevision, ResultEventSequence: assistant.ResultEventSequence,
 			Role: message.Role, Content: message.Content, Status: status, CreatedAt: message.CreatedAt,
 		}

@@ -4,10 +4,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PortalLayout } from './PortalLayout';
 import { ToastProvider } from '../app/toast';
 
-vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: 'user' }, signOut: vi.fn() }) }));
+const portalLayoutAuthState = vi.hoisted(() => ({ role: 'user' as string }));
+vi.mock('../app/auth', () => ({ useAuth: () => ({ user: { name: 'Alice', role: portalLayoutAuthState.role }, signOut: vi.fn() }) }));
 
 describe('PortalLayout', () => {
-  afterEach(cleanup);
+  afterEach(() => { cleanup(); portalLayoutAuthState.role = 'user'; });
 
   it('opens the cloud computer page first and links to the same-origin mobile app', () => {
     render(<ToastProvider><MemoryRouter initialEntries={['/hosts']}><PortalLayout /></MemoryRouter></ToastProvider>);
@@ -22,5 +23,11 @@ describe('PortalLayout', () => {
     expect(screen.getAllByRole('link', { name: '工作区' })).toHaveLength(1);
     expect(screen.getByRole('link', { name: '工作区' })).toHaveAttribute('href', '/workspaces');
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
+  });
+
+  it('does not advertise projects to administrator accounts', () => {
+    portalLayoutAuthState.role = 'super_admin';
+    render(<ToastProvider><MemoryRouter initialEntries={['/hosts']}><PortalLayout /></MemoryRouter></ToastProvider>);
+    expect(screen.queryByRole('link', { name: '项目' })).not.toBeInTheDocument();
   });
 });

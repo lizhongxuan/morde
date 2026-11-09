@@ -111,35 +111,6 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, taskValue.ID, taskValue.OwnerID, snaps
 	return nil
 }
 
-func requireTaskMCPConnectorGrantSet(ctx context.Context, tx pgx.Tx, ownerID, taskID string, selected []string) error {
-	rows, err := tx.Query(ctx, `SELECT connector_id FROM task_mcp_connector_grants
-WHERE owner_id=$1 AND task_id=$2 AND revoked_at IS NULL ORDER BY connector_id`, ownerID, taskID)
-	if err != nil {
-		return fmt.Errorf("read task MCP connector grant set: %w", err)
-	}
-	defer rows.Close()
-	granted := make([]string, 0, len(selected))
-	for rows.Next() {
-		var connectorID string
-		if err := rows.Scan(&connectorID); err != nil {
-			return fmt.Errorf("scan task MCP connector grant set: %w", err)
-		}
-		granted = append(granted, connectorID)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read task MCP connector grant set: %w", err)
-	}
-	if len(granted) != len(selected) {
-		return domain.NewError(domain.CodeConflict, "active task MCP connector grants cannot be changed")
-	}
-	for index := range granted {
-		if granted[index] != selected[index] {
-			return domain.NewError(domain.CodeConflict, "active task MCP connector grants cannot be changed")
-		}
-	}
-	return nil
-}
-
 func listTaskMCPConnectorGrantsTx(ctx context.Context, tx pgx.Tx, ownerID, taskID string) ([]app.TaskMCPConnectorGrant, error) {
 	rows, err := tx.Query(ctx, `
 SELECT task_id, owner_id, connector_owner_id, COALESCE(project_id,''), COALESCE(project_grant_version,0),

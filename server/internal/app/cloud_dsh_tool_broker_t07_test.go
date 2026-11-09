@@ -21,7 +21,7 @@ func TestT07BrokerWorksThroughBrowserAndPrivateWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
-		{capability: "desktop.observe", action: "screenshot", result: `{"mime_type":"image/jpeg","width":8,"height":4,"screen_width":1600,"screen_height":800,"data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`},
+		{capability: "desktop.observe", action: "screenshot", result: `{"mime_type":"image/jpeg","width":8,"height":4,"screen_width":1600,"screen_height":800,"screenshot_token":"` + strings.Repeat("A", 43) + `","data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`},
 		{capability: "browser.actions", action: "open_tab", result: `{"target_id":"target_1","url":"https://example.test/","title":"Local test"}`},
 		{capability: "browser.observe", action: "snapshot", result: `{"target_id":"target_1","url":"https://example.test/","title":"Local test","text":"synthetic page"}`},
 		{taskWorkspaceAction: "write"}, {taskWorkspaceAction: "read"},
@@ -76,7 +76,7 @@ func TestT07BrokerReturnsGeometryChangeAsFailedWithoutClaimingClick(t *testing.T
 		t.Fatal(err)
 	}
 	call := ModelToolCall{CallID: "t07-size-changed", Name: runtimeToolDesktopClick,
-		Arguments: `{"window_id":"0x1","x":4,"y":2,"screenshot_width":8,"screenshot_height":4,"screen_width":1600,"screen_height":800}`}
+		Arguments: `{"window_id":"0x1","x":4,"y":2,"screenshot_token":"` + strings.Repeat("A", 43) + `"}`}
 	waiting, err := broker.Execute(context.Background(), store.details.Task, call)
 	if err != nil || waiting.Status != AgentToolNeedsUser || handler.calls.Load() != 0 {
 		t.Fatalf("approval = %#v, %v; calls=%d", waiting, err, handler.calls.Load())
@@ -100,8 +100,8 @@ func TestT07ScaledScreenshotAndDesktopClickApproval(t *testing.T) {
 				t.Fatal(err)
 			}
 			fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
-				{capability: "desktop.observe", action: "screenshot", result: `{"mime_type":"image/jpeg","width":8,"height":4,"screen_width":1600,"screen_height":800,"data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`},
-				{capability: "desktop.input", action: "click", result: `{"window_id":"0x1","x":800,"y":400,"button":"left","clicked":true}`},
+				{capability: "desktop.observe", action: "screenshot", result: `{"mime_type":"image/jpeg","width":8,"height":4,"screen_width":1600,"screen_height":800,"screenshot_token":"` + strings.Repeat("A", 43) + `","data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`},
+				{capability: "desktop.input", action: "click", result: `{"window_id":"0x1","x":800,"y":400,"button":"left","clicked":true,"screenshot_width":8,"screenshot_height":4,"screen_width":1600,"screen_height":800}`},
 			})
 			fixture.store.details.Task.WorkspaceID = ""
 			fixture.store.details.Task.InputRevision = nil
@@ -118,26 +118,25 @@ func TestT07ScaledScreenshotAndDesktopClickApproval(t *testing.T) {
 				t.Fatalf("screenshot = %#v, %v", imageResult, err)
 			}
 			var geometry struct {
-				Width        int `json:"width"`
-				Height       int `json:"height"`
-				ScreenWidth  int `json:"screen_width"`
-				ScreenHeight int `json:"screen_height"`
+				Width           int    `json:"width"`
+				Height          int    `json:"height"`
+				ScreenWidth     int    `json:"screen_width"`
+				ScreenHeight    int    `json:"screen_height"`
+				ScreenshotToken string `json:"screenshot_token"`
 			}
 			if err := json.Unmarshal([]byte(imageResult.Output), &geometry); err != nil || geometry.Width != 8 || geometry.Height != 4 ||
-				geometry.ScreenWidth != 1600 || geometry.ScreenHeight != 800 {
+				geometry.ScreenWidth != 1600 || geometry.ScreenHeight != 800 || len(geometry.ScreenshotToken) != 43 {
 				t.Fatalf("screenshot geometry = %#v, %v", geometry, err)
 			}
 			x, y := 4, 2
-			arguments, _ := json.Marshal(map[string]any{"window_id": "0x1", "x": x, "y": y,
-				"screenshot_width": geometry.Width, "screenshot_height": geometry.Height,
-				"screen_width": geometry.ScreenWidth, "screen_height": geometry.ScreenHeight})
+			arguments, _ := json.Marshal(map[string]any{"window_id": "0x1", "x": x, "y": y, "screenshot_token": geometry.ScreenshotToken})
 			call := ModelToolCall{CallID: "t07-click", Name: runtimeToolDesktopClick, Arguments: string(arguments)}
 			waiting, err := broker.Execute(context.Background(), store.details.Task, call)
 			if err != nil || waiting.Status != AgentToolNeedsUser || fixture.handlers["desktop.input"].calls.Load() != 0 {
 				t.Fatalf("desktop click approval = %#v, %v", waiting, err)
 			}
 			if pending := store.details.PendingRequest; pending == nil || !strings.Contains(pending.Content, "(4, 2)") ||
-				!strings.Contains(pending.Content, "screen point 800, 400") || !strings.Contains(pending.Content, "8 × 4 image") ||
+				strings.Contains(pending.Content, "screen point") || !strings.Contains(pending.Content, "one-time screenshot proof") ||
 				!strings.Contains(pending.Content, "0x1") || !strings.Contains(pending.Content, "left button") {
 				t.Fatalf("desktop click approval is missing target or geometry: %#v", pending)
 			}

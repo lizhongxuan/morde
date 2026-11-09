@@ -55,7 +55,9 @@ func NewBuiltinSearchClient(nodePath, scriptPath, searxngURL string, maxConcurre
 	readerPatch, err := os.ReadFile(filepath.Join(filepath.Dir(scriptPath), "url-reader.js"))
 	if err != nil || len(readerPatch) > 1<<20 || !strings.Contains(string(readerPatch), "MORDE_PAGE_DATE_METADATA_PATCH_V1") ||
 		!strings.Contains(string(readerPatch), `import { extractPageDateMetadata } from "../../../patches/page-date.mjs";`) ||
-		!strings.Contains(string(readerPatch), "extractPageDateMetadata(read.text)") {
+		!strings.Contains(string(readerPatch), "extractPageDateMetadata(read.text)") ||
+		!strings.Contains(string(readerPatch), "MORDE_HTTPS_REDIRECT_POLICY_V1") ||
+		!strings.Contains(string(readerPatch), `next.protocol !== "https:"`) {
 		return nil, errors.New("built-in search requires the Morde page-date patch")
 	}
 	helperPath := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(scriptPath)))), "patches", "page-date.mjs")
@@ -81,18 +83,21 @@ func (c *BuiltinSearchClient) CallTool(ctx context.Context, name string, argumen
 	if c == nil || ctx == nil || !validBuiltinSearchArguments(name, arguments) {
 		return ConnectorToolResult{}, errors.New("built-in search tool call is invalid")
 	}
+	if err := ctx.Err(); err != nil {
+		return ConnectorToolResult{}, err
+	}
 	callCtx, cancel := context.WithTimeout(ctx, builtinSearchTimeout)
 	defer cancel()
 	select {
 	case c.concurrency <- struct{}{}:
 		defer func() { <-c.concurrency }()
 	case <-callCtx.Done():
-		return ConnectorToolResult{}, errors.New("built-in search capacity or request timed out")
+		return ConnectorToolResult{}, callCtx.Err()
 	}
 	command := exec.CommandContext(callCtx, c.nodePath, c.scriptPath)
 	command.Env = []string{
 		"PATH=/usr/bin:/bin", "HOME=/nonexistent", "NODE_ENV=production", "SEARXNG_URL=" + c.searxngURL,
-		"SEARXNG_LITE_TOOLS=true", "MCP_HTTP_ALLOW_PRIVATE_URLS=false", "SEARCH_CACHE_TTL_MS=300000", "CACHE_TTL_MS=300000",
+		"SEARXNG_LITE_TOOLS=true", "MCP_HTTP_ALLOW_PRIVATE_URLS=false",
 		"SEARXNG_TIMEOUT_MS=10000", "FETCH_TIMEOUT_MS=10000", "SEARXNG_MAX_RESULTS=10", "SEARXNG_MAX_RESULT_CHARS=500",
 		"URL_READ_MAX_CHARS=24000", "SEARXNG_MAX_RESPONSE_BYTES=1048576", "URL_READ_MAX_CONTENT_LENGTH_BYTES=1048576",
 	}
@@ -108,6 +113,9 @@ func (c *BuiltinSearchClient) CallTool(ctx context.Context, name string, argumen
 	client := sdk.NewClient(&sdk.Implementation{Name: "morde-builtin-search", Version: "1"}, &sdk.ClientOptions{})
 	session, err := client.Connect(callCtx, &sdk.CommandTransport{Command: command, TerminateDuration: time.Second}, nil)
 	if err != nil {
+		if callCtx.Err() != nil {
+			return ConnectorToolResult{}, callCtx.Err()
+		}
 		return ConnectorToolResult{}, errors.New("built-in search service is unavailable")
 	}
 	defer func() { _ = session.Close() }()
@@ -117,6 +125,9 @@ func (c *BuiltinSearchClient) CallTool(ctx context.Context, name string, argumen
 	}
 	result, err := session.CallTool(callCtx, &sdk.CallToolParams{Name: name, Arguments: input})
 	if err != nil || result == nil {
+		if callCtx.Err() != nil {
+			return ConnectorToolResult{}, callCtx.Err()
+		}
 		return ConnectorToolResult{}, errors.New("built-in search returned no confirmed result")
 	}
 	return decodeConnectorToolResult(result), nil
@@ -162,7 +173,7 @@ func validBuiltinSearchArguments(name string, arguments json.RawMessage) bool {
 	}
 	if key == "url" {
 		parsed, err := url.Parse(value)
-		return err == nil && (parsed.Scheme == "https" || parsed.Scheme == "http") && parsed.Hostname() != "" &&
+		return err == nil && parsed.Scheme == "https" && parsed.Hostname() != "" &&
 			parsed.User == nil && parsed.Fragment == "" && parsed.Opaque == ""
 	}
 	return len(value) <= 512

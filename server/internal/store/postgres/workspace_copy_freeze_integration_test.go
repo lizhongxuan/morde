@@ -62,12 +62,17 @@ func TestPostgresWorkspaceCopyReservationChecksIdentityAndReplays(t *testing.T) 
 		OwnerID: owner.ID, Operation: "workspace.copy", Key: "copy:" + value.ID,
 		RequestHash: hash[:], ResourceID: value.ID,
 	}
-	reservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, owner.ID, value.ID, "w7654321", "copy target", "test-instance", "rabc1234", 0, 32, 1<<40, 1<<30, record)
+	reservationRequest := app.WorkspaceCopyReservationRequest{
+		ID: "rabc1234", SourceOwnerID: owner.ID, TargetOwnerID: owner.ID, SourceWorkspaceID: value.ID,
+		TargetWorkspaceID: "w7654321", TargetName: "copy target", ServiceInstanceID: "test-instance",
+		SourceRevision: 0, ReservedBytes: 32, MaxOwnerBytes: 1 << 40, TargetQuotaBytes: 1 << 30, Idempotency: record,
+	}
+	reservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, reservationRequest)
 	if err != nil || replayed || reservation.State != workspace.CopyReserved || reservation.SourceRevision != value.Revision {
 		t.Fatalf("create Workspace copy reservation = %#v, replayed=%t, err=%v", reservation, replayed, err)
 	}
 	request := app.WorkspaceVolumeCopyRequest{
-		ReservationID: reservation.ID, ServiceInstanceID: reservation.ServiceInstanceID, OwnerID: owner.ID,
+		ReservationID: reservation.ID, ServiceInstanceID: reservation.ServiceInstanceID, SourceOwnerID: owner.ID, TargetOwnerID: owner.ID,
 		SourceWorkspaceID: value.ID, TargetWorkspaceID: reservation.TargetWorkspaceID,
 	}
 	if err := store.CheckWorkspaceVolumeCopyReservation(ctx, request); err != nil {
@@ -76,8 +81,9 @@ func TestPostgresWorkspaceCopyReservationChecksIdentityAndReplays(t *testing.T) 
 	if err := store.SetWorkspaceCopyReservationState(ctx, reservation.ID, workspace.CopyReserved, workspace.Copying); err != nil {
 		t.Fatalf("mark copy started: %v", err)
 	}
-	replayedReservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, owner.ID, value.ID, reservation.TargetWorkspaceID,
-		"copy target", reservation.ServiceInstanceID, reservation.ID, reservation.SourceRevision, reservation.ReservedBytes, 1<<40, 1<<30, record)
+	reservationRequest.TargetWorkspaceID = reservation.TargetWorkspaceID
+	reservationRequest.ID = reservation.ID
+	replayedReservation, replayed, err := store.CreateWorkspaceCopyReservation(ctx, reservationRequest)
 	if err != nil || !replayed || replayedReservation.State != workspace.Copying {
 		t.Fatalf("replay Workspace copy reservation = %#v, replayed=%t, err=%v", replayedReservation, replayed, err)
 	}
@@ -196,8 +202,8 @@ func insertWorkspaceCopyReservationForTest(t *testing.T, ctx context.Context, st
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_copy_reservations
-(id,owner_id,source_workspace_id,target_workspace_id,service_instance_id,source_revision,state)
-VALUES ($1,$2,$3,$4,'test-instance',0,'copying')`, "rabc1234", ownerID, sourceWorkspaceID, targetWorkspaceID); err != nil {
+(id,owner_id,source_owner_id,target_owner_id,source_workspace_id,target_workspace_id,service_instance_id,source_revision,read_only,state)
+VALUES ($1,$2,$2,$2,$3,$4,'test-instance',0,false,'copying')`, "rabc1234", ownerID, sourceWorkspaceID, targetWorkspaceID); err != nil {
 		t.Fatalf("insert Workspace copy reservation: %v", err)
 	}
 }

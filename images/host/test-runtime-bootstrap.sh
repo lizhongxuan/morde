@@ -3,6 +3,10 @@ set -euo pipefail
 
 image="${IMAGE_TAG:-registry.local/cloudhost/host:1.0.0}"
 platform="${IMAGE_PLATFORM:-linux/amd64}"
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "Host image is not available locally: $image" >&2
+  exit 1
+fi
 credential=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 replica_credential=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
 codex_auth_fixture='{"morde_test_fixture":"SYNTHETIC_NOT_A_CREDENTIAL"}'
@@ -13,6 +17,11 @@ workspace_volume="morde-workspace-smoke-${smoke_id}"
 apps_volume="morde-apps-smoke-${smoke_id}"
 container=""
 entrypoint="$(dirname "${BASH_SOURCE[0]}")/morde-host-entrypoint.sh"
+host_scripts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+helper_bind_dir="$(mktemp -d /tmp/morde-host-smoke-scripts.XXXXXX)"
+cp "$host_scripts_dir/morde-aio-profile-config.py" "$helper_bind_dir/morde-aio-profile-config"
+cp "$host_scripts_dir/morde-aio-profile-hook.sh" "$helper_bind_dir/morde-aio-profile-hook"
+chmod 0755 "$helper_bind_dir/morde-aio-profile-config" "$helper_bind_dir/morde-aio-profile-hook"
 apps_setup_line="$(grep -nF 'install -d -o root -g root -m 0700 /run/morde-runtime "$apps_store"' "$entrypoint" | cut -d: -f1)"
 restore_apps_line="$(grep -nFx '/usr/local/bin/morde-runtime restore-apps' "$entrypoint" | cut -d: -f1)"
 aio_start_line="$(grep -nFx '/opt/gem/run.sh "$@" &' "$entrypoint" | cut -d: -f1)"
@@ -27,6 +36,7 @@ cleanup() {
   docker volume rm "$profile_volume" >/dev/null 2>&1 || true
   docker volume rm "$workspace_volume" >/dev/null 2>&1 || true
   docker volume rm "$apps_volume" >/dev/null 2>&1 || true
+  rm -rf "$helper_bind_dir"
 }
 trap cleanup EXIT
 for volume in "$runtime_volume" "$profile_volume" "$workspace_volume" "$apps_volume"; do
@@ -40,7 +50,7 @@ docker volume create "$profile_volume" >/dev/null
 docker volume create "$workspace_volume" >/dev/null
 docker volume create "$apps_volume" >/dev/null
 
-if missing_apps_output="$(docker run --rm --platform "$platform" --network none \
+if missing_apps_output="$(docker run --pull=never --rm --platform "$platform" --network none \
   --entrypoint /usr/local/bin/morde-host-entrypoint "$image" 2>&1)"; then
   echo "Host unexpectedly started without the required Runtime credential" >&2
   exit 1
@@ -51,8 +61,11 @@ if ! grep -Fq 'Morde runtime credential is missing or invalid' <<<"$missing_apps
   exit 1
 fi
 for apps_setup in 'mkdir -p /run/morde-runtime && touch /run/morde-runtime/apps' 'mkdir -p /run/morde-runtime && ln -s /tmp /run/morde-runtime/apps'; do
-  if invalid_apps_output="$(docker run --rm --platform "$platform" --network none \
-    --entrypoint /bin/sh "$image" -c "set -e; $apps_setup; exec /usr/local/bin/morde-host-entrypoint" 2>&1)"; then
+  if invalid_apps_output="$(docker run --pull=never --rm --platform "$platform" --network none \
+    --user 0:0 \
+    --env "MORDE_RUNTIME_BOOTSTRAP_KEY=$credential" \
+    --env "MORDE_HOST_REPLICA_KEY=$replica_credential" \
+    --entrypoint /bin/sh "$image" -c "if ! ( $apps_setup ); then exit 90; fi; exec /usr/local/bin/morde-host-entrypoint" 2>&1)"; then
     echo "Host unexpectedly started with an unsafe temporary application path: $apps_setup" >&2
     exit 1
   fi
@@ -64,14 +77,134 @@ for apps_setup in 'mkdir -p /run/morde-runtime && touch /run/morde-runtime/apps'
 done
 
 assert_legacy_apps_volume() {
-  docker run --rm --platform "$platform" --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps,readonly" \
+  docker run --pull=never --rm --platform "$platform" --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps,readonly" \
     --entrypoint /bin/sh "$image" -c 'test "$(stat -c "%u:%g:%a" /opt/morde/apps)" = 0:0:755 && test "$(cat /opt/morde/apps/smoke-marker)" = installed-app'
 }
 
-docker run --rm --platform "$platform" --network none \
+start_host_container() {
+  docker run --pull=never -d --platform "$platform" --network none \
+    --mount "type=volume,src=$profile_volume,dst=/home/gem" \
+    --mount "type=volume,src=$workspace_volume,dst=/home/gem/workspace" \
+    --mount "type=volume,src=$runtime_volume,dst=/var/lib/morde-runtime" \
+    --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps" \
+    --mount "type=bind,src=$helper_bind_dir/morde-aio-profile-config,dst=/usr/local/bin/morde-aio-profile-config,readonly" \
+    --mount "type=bind,src=$helper_bind_dir/morde-aio-profile-hook,dst=/usr/local/bin/morde-aio-profile-hook,readonly" \
+    --env "MORDE_RUNTIME_BOOTSTRAP_KEY=$credential" \
+    --env "MORDE_HOST_REPLICA_KEY=$replica_credential" \
+    --env MORDE_HOST_ID=h1234567 \
+    --env MORDE_RUNTIME_GENERATION=1 \
+    --env MORDE_WORKSPACE_LAYOUT=workspace \
+    --env MORDE_PORTAL_URL=https://127.0.0.1:7443 \
+    --env SSL_CERT_FILE=/run/morde-runtime/mock-portal-cert.pem \
+    --env MOCK_OPERATION_LEDGER_PATH=/var/lib/morde-runtime/mock-operation-ledger.json \
+    --env SANDBOX_API_KEY=synthetic-aio-key \
+    --env JUPYTER_POOL_SIZE=0 \
+    --env DISABLE_BROWSER=true \
+    --entrypoint /bin/sh "$image" -c '
+set -eu
+install -d -o root -g root -m 0700 /run/morde-runtime /var/lib/morde-runtime
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout /run/morde-runtime/mock-portal-key.pem \
+  -out /run/morde-runtime/mock-portal-cert.pem \
+  -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 >/dev/null 2>&1
+cat > /run/morde-runtime/mock-portal.py <<'"'"'PY'"'"'
+import json
+import os
+import ssl
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+state_path = os.environ["MOCK_OPERATION_LEDGER_PATH"]
+replica_key = os.environ["MORDE_HOST_REPLICA_KEY"]
+
+def load_events():
+    try:
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            return json.load(state_file)
+    except FileNotFoundError:
+        return []
+
+def save_events(events):
+    temporary = state_path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as state_file:
+        json.dump(events, state_file, separators=(",", ":"))
+        state_file.flush()
+        os.fsync(state_file.fileno())
+    os.replace(temporary, state_path)
+
+class Handler(BaseHTTPRequestHandler):
+    def send_json(self, status, value):
+        encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def authorized(self):
+        return self.headers.get("Authorization") == "Bearer " + replica_key
+
+    def do_GET(self):
+        if not self.authorized():
+            self.send_json(401, {"error": "unauthorized"})
+            return
+        path = urlsplit(self.path).path
+        if path.endswith("/operation-ledger/runtime_core"):
+            self.send_json(200, {"items": load_events(), "has_more": False})
+        elif path.endswith("/workspace-bindings"):
+            self.send_json(200, {"runtime_generation": 1, "items": []})
+        elif path.endswith("/task-workspace-view-deletions"):
+            self.send_json(200, {"runtime_generation": 1, "items": []})
+        else:
+            self.send_json(200, {})
+
+    def do_POST(self):
+        if not self.authorized():
+            self.send_json(401, {"error": "unauthorized"})
+            return
+        size = int(self.headers.get("Content-Length", "0"))
+        payload = self.rfile.read(size)
+        path = urlsplit(self.path).path
+        if path.endswith("/operation-ledger/runtime_core"):
+            event = json.loads(payload)
+            events = load_events()
+            if event["sequence"] == len(events) + 1:
+                events.append(event)
+                save_events(events)
+            elif event["sequence"] > len(events) or events[event["sequence"] - 1] != event:
+                self.send_json(409, {"error": "operation ledger conflict"})
+                return
+            self.send_json(200, event)
+        else:
+            self.send_json(200, {})
+
+    def log_message(self, *_args):
+        return
+
+server = ThreadingHTTPServer(("127.0.0.1", 7443), Handler)
+tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls.load_cert_chain(
+    certfile="/run/morde-runtime/mock-portal-cert.pem",
+    keyfile="/run/morde-runtime/mock-portal-key.pem",
+)
+server.socket = tls.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+PY
+python3 /run/morde-runtime/mock-portal.py >/var/log/morde-test-portal.log 2>&1 &
+for attempt in $(seq 1 50); do
+  if curl --insecure --silent --output /dev/null https://127.0.0.1:7443/health; then
+    break
+  fi
+  sleep 0.1
+done
+exec /usr/local/bin/morde-host-entrypoint
+'
+}
+
+docker run --pull=never --rm --platform "$platform" --network none \
   --mount "type=volume,src=$apps_volume,dst=/opt/morde/apps" \
   --entrypoint /bin/sh "$image" -c 'printf installed-app > /opt/morde/apps/smoke-marker'
-docker run --rm --platform "$platform" --network none \
+docker run --pull=never --rm --platform "$platform" --network none \
   --mount "type=volume,src=$profile_volume,dst=/home/gem" \
   --entrypoint /bin/sh "$image" -c '
   mkdir -p /home/gem/.config/code-server/vscode/User /home/gem/.config/matplotlib /home/gem/.config/browser/Default
@@ -83,24 +216,14 @@ docker run --rm --platform "$platform" --network none \
 '
 # GUI readiness and Chromium sandboxing are verified separately on isolated Linux.
 # shortcut: Docker Desktop's emulated Jupyter prewarm blocks AIO, remove this override after native Linux Jupyter verification.
-container="$(docker run -d --platform "$platform" --network none \
-  --mount "type=volume,src=$profile_volume,dst=/home/gem" \
-  --mount "type=volume,src=$workspace_volume,dst=/home/gem/workspace" \
-  --mount "type=volume,src=$runtime_volume,dst=/var/lib/morde-runtime" \
-  --env "MORDE_RUNTIME_BOOTSTRAP_KEY=$credential" \
-  --env "MORDE_HOST_REPLICA_KEY=$replica_credential" \
-  --env MORDE_HOST_ID=h1234567 \
-  --env MORDE_RUNTIME_GENERATION=1 \
-  --env MORDE_WORKSPACE_LAYOUT=workspace \
-  --env SANDBOX_API_KEY=synthetic-aio-key \
-  --env JUPYTER_POOL_SIZE=0 \
-  --env DISABLE_BROWSER=true "$image")"
+container="$(start_host_container)"
 
 ready=false
 deadline=$((SECONDS + 90))
 while (( SECONDS < deadline )); do
   state="$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)"
   if [[ "$state" != running ]]; then
+    docker logs "$container" >&2 || true
     echo "host container stopped before AIO became ready" >&2
     exit 1
   fi
@@ -112,6 +235,7 @@ while (( SECONDS < deadline )); do
   sleep 1
 done
 if [[ "$ready" != true ]]; then
+  docker logs "$container" >&2 || true
   echo "AIO did not become ready within 90 seconds" >&2
   exit 1
 fi
@@ -146,6 +270,7 @@ deadline=$((SECONDS + 45))
 while (( SECONDS < deadline )); do
   state="$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)"
   if [[ "$state" != running ]]; then
+    docker logs "$container" >&2 || true
     echo "Host container stopped when Morde Runtime exited" >&2
     exit 1
   fi
@@ -192,10 +317,19 @@ docker exec --user 0:0 "$container" sh -c '
 '
 docker exec --user 1000:1000 "$container" sh -c '
   if mv /home/gem/workspace/.morde-task-views /home/gem/workspace/.morde-task-views-replaced 2>/dev/null; then
+    echo "unprivileged Workspace user replaced the root-owned task view directory" >&2
+    grep -E "^(Uid|Gid|CapEff|CapPrm|CapBnd):" /proc/self/status >&2 || true
+    stat -c "%u:%g:%a %n" /home/gem/workspace /home/gem/workspace/.morde-task-views-replaced >&2 || true
     exit 1
   fi
-  test -d /home/gem/workspace/.morde-task-views
-  test ! -r /home/gem/workspace/.morde-task-views
+  if [ ! -d /home/gem/workspace/.morde-task-views ]; then
+    echo "root-owned task view directory disappeared" >&2
+    exit 1
+  fi
+  if [ -r /home/gem/workspace/.morde-task-views ]; then
+    echo "unprivileged Workspace user read the root-owned task view directory" >&2
+    exit 1
+  fi
 '
 docker exec "$container" sh -c '
   for process_env in /proc/[0-9]*/environ; do
@@ -234,18 +368,7 @@ docker exec --user 1000:1000 "$container" sh -c '
 ' sh "$codex_auth_fixture"
 docker rm -f "$container" >/dev/null
 container=""
-container="$(docker run -d --platform "$platform" --network none \
-  --mount "type=volume,src=$profile_volume,dst=/home/gem" \
-  --mount "type=volume,src=$workspace_volume,dst=/home/gem/workspace" \
-  --mount "type=volume,src=$runtime_volume,dst=/var/lib/morde-runtime" \
-  --env "MORDE_RUNTIME_BOOTSTRAP_KEY=$credential" \
-  --env "MORDE_HOST_REPLICA_KEY=$replica_credential" \
-  --env MORDE_HOST_ID=h1234567 \
-  --env MORDE_RUNTIME_GENERATION=1 \
-  --env MORDE_WORKSPACE_LAYOUT=workspace \
-  --env SANDBOX_API_KEY=synthetic-aio-key \
-  --env JUPYTER_POOL_SIZE=0 \
-  --env DISABLE_BROWSER=true "$image")"
+container="$(start_host_container)"
 ready=false
 deadline=$((SECONDS + 90))
 while (( SECONDS < deadline )); do
@@ -261,6 +384,7 @@ while (( SECONDS < deadline )); do
   sleep 1
 done
 if [[ "$ready" != true ]]; then
+  docker logs "$container" >&2 || true
   echo "AIO did not become ready after container recreation" >&2
   exit 1
 fi

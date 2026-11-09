@@ -95,7 +95,7 @@ test.describe("Portal feature mock flows", () => {
     let retryBody: { expected_binding_version: number } | undefined;
     const host = {
       id: "h1234567", name: "接力电脑", owner_id: user.id, template_id: "std-2c4g", isolation: "container", state: "running",
-      state_reason: "", runtime_generation: 1, control_version: 1, control_state: "ai", url: "http://127.0.0.1:5184",
+      state_reason: "", runtime_generation: 1, control_version: 1, control_state: "ai", workspace_runtime_online: true, url: "http://127.0.0.1:5184",
       workspaces: [{
         workspace: { id: workspace.id, name: workspace.name, revision: workspace.revision, used_bytes: workspace.used_bytes, state: workspace.state },
         directory: `projects/${workspace.id}`, state: "active", binding_version: 7, desired_revision: 2, applied_revision: 2,
@@ -179,13 +179,13 @@ test.describe("Portal feature mock flows", () => {
     await page.getByLabel(/主机名称/).fill(hostName);
     await page.getByRole("button", { name: "创建主机" }).click();
 
-    const host = page.locator(".host-card").filter({ hasText: hostName });
+    const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: hostName, exact: true }) });
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
     await expect(host.getByRole("button", { name: /暂停主机|恢复主机|管理主机令牌/ })).toHaveCount(0);
     const workspaceId = await host.locator(".host-facts > div").nth(2).locator("strong").innerText();
 
     const workbenchPromise = page.waitForEvent("popup");
-    await host.getByRole("button", { name: `进入主机 ${hostName}` }).click();
+    await host.getByRole("button", { name: `查看主机 ${hostName}` }).click();
     const workbench = await workbenchPromise;
     await expect(workbench.getByText("本地测试主机")).toBeVisible();
 
@@ -194,13 +194,13 @@ test.describe("Portal feature mock flows", () => {
     await expect(deleteDialog).toContainText("绑定的独立工作区会自动解绑并保留在服务端，不随主机删除");
     await expect(deleteDialog).toContainText("正在运行的终端命令及服务会中止");
     await deleteDialog.getByRole("button", { name: "删除主机" }).click();
-    await expect(host).toHaveCount(0);
+    await expect(host).toHaveCount(0, { timeout: 10_000 });
     await workbench.close();
 
-    await page.getByRole("link", { name: "工作目录" }).click();
+    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
     const workspace = page.getByRole("row").filter({ hasText: workspaceId });
     await expect(workspace).toBeVisible();
-    await expect(workspace.getByText("未绑定")).toBeVisible();
+    await expect(workspace.getByRole("cell", { name: /绑定主机 未绑定/ })).toBeVisible();
     await workspace.getByRole("button", { name: `删除工作区 ${workspaceId}` }).click();
     const deleteWorkspaceDialog = page.getByRole("dialog", { name: "删除工作区" });
     await expect(deleteWorkspaceDialog).toContainText("永久删除 Morde 云端工作区及其已同步数据");
@@ -217,7 +217,7 @@ test.describe("Portal feature mock flows", () => {
     await page.getByLabel(/主机名称/).fill(hostName);
     await page.getByRole("button", { name: "创建主机" }).click();
 
-    const host = page.locator(".host-card").filter({ hasText: hostName });
+    const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: hostName, exact: true }) });
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
     const hostIdentity = await host.locator(".mono").innerText();
     const workspaceId = await host.locator(".host-facts > div").nth(2).locator("strong").innerText();
@@ -251,28 +251,28 @@ test.describe("Portal feature mock flows", () => {
     await page.getByLabel(/主机名称/).fill(sourceName);
     await page.getByRole("button", { name: "创建主机" }).click();
 
-    const sourceHost = page.locator(".host-card").filter({ hasText: sourceName });
+    const sourceHost = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: sourceName, exact: true }) });
     await expect(sourceHost.getByText("运行中")).toBeVisible({ timeout: 10_000 });
     const workspaceId = await sourceHost.locator(".host-facts > div").nth(2).locator("strong").innerText();
     await sourceHost.getByRole("button", { name: `删除主机 ${sourceName}` }).click();
     const sourceDeleteDialog = page.getByRole("dialog", { name: `删除主机 ${sourceName}` });
     await sourceDeleteDialog.getByRole("button", { name: "删除主机" }).click();
 
-    await page.getByRole("link", { name: "工作目录" }).click();
+    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
     const workspace = page.getByRole("row").filter({ hasText: workspaceId });
-    await expect(workspace.getByText("未绑定")).toBeVisible();
+    await expect(workspace.getByRole("cell", { name: /绑定主机 未绑定/ })).toBeVisible();
 
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
     await page.getByRole("link", { name: "创建电脑" }).click();
     await page.getByLabel(/主机名称/).fill(targetName);
     await page.getByRole("radio", { name: "绑定已有工作区" }).check();
-    await page.getByRole("checkbox", { name: new RegExp(sourceName) }).check();
+    await page.getByRole("radio", { name: new RegExp(sourceName) }).check();
     await page.getByRole("button", { name: "创建主机" }).click();
 
-    const targetHost = page.locator(".host-card").filter({ hasText: targetName });
+    const targetHost = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: targetName, exact: true }) });
     await expect(targetHost.getByText("运行中")).toBeVisible({ timeout: 10_000 });
     await expect(targetHost.locator(".host-facts > div").nth(2).locator("strong")).toHaveText(workspaceId);
-    await page.getByRole("link", { name: "工作目录" }).click();
+    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
     const attachedWorkspace = page.getByRole("row").filter({ hasText: workspaceId });
     await expect(attachedWorkspace).toContainText(targetName);
     await expect(attachedWorkspace).toContainText("应用：已应用");
@@ -281,9 +281,9 @@ test.describe("Portal feature mock flows", () => {
     await page.getByRole("link", { name: "云端电脑", exact: true }).click();
     await targetHost.getByRole("button", { name: `删除主机 ${targetName}` }).click();
     await page.getByRole("dialog", { name: `删除主机 ${targetName}` }).getByRole("button", { name: "删除主机" }).click();
-    await page.getByRole("link", { name: "工作目录" }).click();
+    await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
     const detachedWorkspace = page.getByRole("row").filter({ hasText: workspaceId });
-    await expect(detachedWorkspace.getByText("未绑定")).toBeVisible();
+    await expect(detachedWorkspace.getByRole("cell", { name: /绑定主机 未绑定/ })).toBeVisible();
     await detachedWorkspace.getByRole("button", { name: `删除工作区 ${workspaceId}` }).click();
     await page.getByRole("dialog", { name: "删除工作区" }).getByRole("button", { name: "删除工作区" }).click();
     await expect(detachedWorkspace).toHaveCount(0, { timeout: 10_000 });
@@ -293,13 +293,13 @@ test.describe("Portal feature mock flows", () => {
     await signIn(page);
     await page.getByRole("link", { name: "管理后台" }).click();
     await expect(page.getByRole("heading", { name: "总览", exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "主机状态" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Host 状态" })).toBeVisible();
 
     const adminNav = page.getByRole("navigation", { name: "管理导航" });
     await adminNav.getByRole("link", { name: "用户" }).click();
     await expect(page.getByRole("row").filter({ hasText: "demo" })).toBeVisible();
     await adminNav.getByRole("link", { name: "总览" }).click();
-    await expect(page.getByRole("heading", { name: "主机状态" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Host 状态" })).toBeVisible();
     await adminNav.getByRole("link", { name: "审计" }).click();
     await expect(page.getByRole("row").filter({ hasText: "h-audit-demo" })).toBeVisible();
   });
@@ -331,9 +331,9 @@ test.describe("Portal feature mock flows", () => {
     await context.route("**/api/me", (route) => route.fulfill({
       status: 200, contentType: "application/json", body: JSON.stringify({ ...admin, role: revoked ? "user" : "admin" }),
     }));
-    await context.route("**/api/admin/users", (route) => route.fulfill(revoked
+    await context.route((url) => url.pathname === "/api/admin/users", (route) => route.fulfill(revoked
       ? { status: 403, contentType: "application/json", body: JSON.stringify({ error: { code: "forbidden", message: "没有执行此操作的权限", details: {} } }) }
-      : { status: 200, contentType: "application/json", body: JSON.stringify({ items: [adminRecord] }) }));
+      : { status: 200, contentType: "application/json", body: JSON.stringify({ items: [adminRecord], total: 1, limit: 50, offset: 0 }) }));
 
     const page = await context.newPage();
     try {
@@ -358,7 +358,7 @@ test.describe("Portal feature mock flows", () => {
 
     await signIn(page);
     await page.getByRole("link", { name: "管理后台" }).click();
-    await expect(page.getByRole('heading', { name: '主机状态' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Host 状态' })).toBeVisible();
     const registrationStatus = await page.evaluate(async ({ name, password: secret }) => (await fetch('/api/auth/register', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, password: secret }),

@@ -24,6 +24,7 @@ type leaseStore struct {
 	data        map[string]lease
 	runtimes    map[string]accountRuntimeLease
 	taskProcess map[string]taskProcessLease
+	taskSandbox map[string]taskSandboxLease
 }
 
 func openLeaseStore(dir string) (*leaseStore, error) {
@@ -37,7 +38,10 @@ func openLeaseStore(dir string) (*leaseStore, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o700 != 0o700 || info.Mode().Perm()&0o077 != 0 {
 		return nil, errors.New("guardian state directory must be a private, non-symlink directory")
 	}
-	store := &leaseStore{dir: dir, data: make(map[string]lease), runtimes: make(map[string]accountRuntimeLease), taskProcess: make(map[string]taskProcessLease)}
+	store := &leaseStore{
+		dir: dir, data: make(map[string]lease), runtimes: make(map[string]accountRuntimeLease),
+		taskProcess: make(map[string]taskProcessLease), taskSandbox: make(map[string]taskSandboxLease),
+	}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
@@ -68,11 +72,13 @@ func (s *leaseStore) load() error {
 		kind := "agent"
 		if strings.HasPrefix(id, "runtime-") {
 			kind, id = "runtime", strings.TrimPrefix(id, "runtime-")
+		} else if strings.HasPrefix(id, "task-sandbox-") {
+			kind, id = "task-sandbox", strings.TrimPrefix(id, "task-sandbox-")
 		} else if strings.HasPrefix(id, "task-") {
 			kind, id = "task", strings.TrimPrefix(id, "task-")
 		}
 		validID := containerIDRE.MatchString(id)
-		if kind == "task" {
+		if kind == "task" || kind == "task-sandbox" {
 			validID = validTaskKey(id)
 		}
 		if !validID || entry.Type()&os.ModeSymlink != 0 {
@@ -119,6 +125,20 @@ func (s *leaseStore) load() error {
 				return errors.New("task process lease state is inconsistent")
 			}
 			s.taskProcess[id] = value
+		case "task-sandbox":
+			var value taskSandboxLease
+			if err := decodeStrictJSON(data, &value); err != nil {
+				return fmt.Errorf("decode Task Sandbox lease %s: %w", id, err)
+			}
+			if value.Key != id || validPersistedTaskSandboxLease(value) != nil || time.Until(value.Guard.ExpiresAt) > app.MaxAgentLease {
+				return errors.New("task Sandbox lease state is inconsistent")
+			}
+			for _, existing := range s.taskSandbox {
+				if existing.Guard.ContainerID == value.Guard.ContainerID {
+					return errors.New("task Sandbox container is bound to multiple Guardian lifecycles")
+				}
+			}
+			s.taskSandbox[id] = value
 		}
 	}
 	return nil
@@ -296,6 +316,58 @@ func (s *leaseStore) allTasks() []taskProcessLease {
 	defer s.mu.Unlock()
 	values := make([]taskProcessLease, 0, len(s.taskProcess))
 	for _, value := range s.taskProcess {
+		values = append(values, value)
+	}
+	return values
+}
+
+func (s *leaseStore) getTaskSandbox(key string) (taskSandboxLease, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.taskSandbox[key]
+	return value, ok
+}
+
+func (s *leaseStore) createTaskSandbox(value taskSandboxLease) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.taskSandbox[value.Key]; exists {
+		return errors.New("guardian already has a lease for this Task Sandbox")
+	}
+	for _, existing := range s.taskSandbox {
+		if existing.Guard.ContainerID == value.Guard.ContainerID {
+			return errors.New("task Sandbox container is already bound to another Guardian lifecycle")
+		}
+	}
+	if err := s.persistNamed("task-sandbox-"+value.Key+".json", value, validPersistedTaskSandboxLease(value)); err != nil {
+		return err
+	}
+	s.taskSandbox[value.Key] = value
+	return nil
+}
+
+func (s *leaseStore) replaceTaskSandbox(value taskSandboxLease) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, exists := s.taskSandbox[value.Key]
+	if !exists {
+		return errors.New("task Sandbox lease was not found")
+	}
+	if !existing.Guard.sameIdentity(value.Guard) {
+		return errors.New("task Sandbox Guardian lifecycle identity cannot be replaced")
+	}
+	if err := s.persistNamed("task-sandbox-"+value.Key+".json", value, validPersistedTaskSandboxLease(value)); err != nil {
+		return err
+	}
+	s.taskSandbox[value.Key] = value
+	return nil
+}
+
+func (s *leaseStore) allTaskSandboxes() []taskSandboxLease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	values := make([]taskSandboxLease, 0, len(s.taskSandbox))
+	for _, value := range s.taskSandbox {
 		values = append(values, value)
 	}
 	return values

@@ -20,7 +20,9 @@ import (
 )
 
 const (
-	maxCommandOutput = 1 << 20
+	maxCommandOutput      = 1 << 20
+	maxWindowTreeOutput   = 64 << 10
+	maxPointerWindowDepth = 8
 )
 
 var dimensionsPattern = regexp.MustCompile(`(?m)^\s*dimensions:\s*([0-9]+)x([0-9]+) pixels`)
@@ -28,6 +30,7 @@ var dimensionsPattern = regexp.MustCompile(`(?m)^\s*dimensions:\s*([0-9]+)x([0-9
 type executablePaths struct {
 	xdpyinfo string
 	xdotool  string
+	xwininfo string
 	importer string
 }
 
@@ -41,8 +44,8 @@ func newSystemBackend() (desktopBackend, error) {
 	if display == "" || len(display) > 256 || strings.IndexByte(display, 0) >= 0 {
 		return nil, ErrDesktopUnavailable
 	}
-	paths := executablePaths{xdpyinfo: "/usr/bin/xdpyinfo", xdotool: "/usr/bin/xdotool", importer: "/usr/bin/import"}
-	for _, path := range []string{paths.xdpyinfo, paths.xdotool, paths.importer} {
+	paths := executablePaths{xdpyinfo: "/usr/bin/xdpyinfo", xdotool: "/usr/bin/xdotool", xwininfo: "/usr/bin/xwininfo", importer: "/usr/bin/import"}
+	for _, path := range []string{paths.xdpyinfo, paths.xdotool, paths.xwininfo, paths.importer} {
 		info, err := os.Stat(path)
 		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 || filepath.Clean(path) != path {
 			return nil, ErrDesktopUnavailable
@@ -149,11 +152,12 @@ func (b *linuxBackend) listWindows(ctx context.Context) ([]window, error) {
 		if err != nil {
 			continue // The visible window may have closed after enumeration.
 		}
-		geometryOutput, err := b.run(ctx, b.paths.xdotool, 1024, "getwindowgeometry", "--shell", rawID)
+		// xdotool geometry can include reparented window-manager frame offsets.
+		geometryOutput, err := b.run(ctx, b.paths.xwininfo, 4<<10, "-id", id)
 		if err != nil {
 			continue
 		}
-		geometry, err := parseGeometry(geometryOutput)
+		geometry, err := parseXWindowInfoGeometry(geometryOutput)
 		if err != nil {
 			return nil, ErrDesktopUnavailable
 		}
@@ -192,17 +196,168 @@ func (b *linuxBackend) click(ctx context.Context, id string, x, y int, button st
 		return err
 	}
 	buttonNumber := map[string]string{"left": "1", "middle": "2", "right": "3"}[button]
-	_, err = b.run(ctx, b.paths.xdotool, 64,
-		"mousemove", "--sync", "--window", number, strconv.Itoa(x), strconv.Itoa(y),
-		"click", buttonNumber)
+	if _, err = b.run(ctx, b.paths.xdotool, 64, "mousemove", "--window", number, strconv.Itoa(x), strconv.Itoa(y)); err != nil {
+		return err
+	}
+	locationOutput, err := b.run(ctx, b.paths.xdotool, 4<<10, "getmouselocation", "--shell")
+	if err != nil {
+		return err
+	}
+	location, err := parsePointerLocation(locationOutput)
+	if err != nil {
+		return err
+	}
+	geometryOutput, err := b.run(ctx, b.paths.xwininfo, 4<<10, "-id", id)
+	if err != nil {
+		return err
+	}
+	geometry, err := parseXWindowInfoGeometry(geometryOutput)
+	if err != nil || int64(geometry.x)+int64(x) != int64(location.x) || int64(geometry.y)+int64(y) != int64(location.y) {
+		return runtimecore.ErrDesktopGeometryChanged
+	}
+	treeOutput, err := b.run(ctx, b.paths.xwininfo, maxWindowTreeOutput, "-id", id, "-tree")
+	if err != nil {
+		return err
+	}
+	parent, err := parseXWindowInfoParent(treeOutput)
+	if err != nil {
+		return runtimecore.ErrDesktopGeometryChanged
+	}
+	belongs, err := b.pointerWindowBelongsToTarget(ctx, location.windowID, id, parent)
+	if err != nil || !belongs {
+		return runtimecore.ErrDesktopGeometryChanged
+	}
+	if err := b.requireActiveWindow(ctx, id); err != nil {
+		return err
+	}
+	// Dispatch at the verified pointer so controls inside the window receive the click.
+	_, err = b.run(ctx, b.paths.xdotool, 64, "click", buttonNumber)
 	return err
+}
+
+func (b *linuxBackend) pointerWindowBelongsToTarget(ctx context.Context, pointerID, targetID, parentID string) (bool, error) {
+	current := pointerID
+	for depth := 0; depth < maxPointerWindowDepth; depth++ {
+		if current == targetID || current == parentID {
+			return true, nil
+		}
+		tree, err := b.run(ctx, b.paths.xwininfo, maxWindowTreeOutput, "-id", current, "-tree")
+		if err != nil {
+			return false, err
+		}
+		ancestor, err := parseXWindowInfoParent(tree)
+		if err != nil {
+			return false, err
+		}
+		if ancestor == targetID {
+			return true, nil
+		}
+		if ancestor == parentID || ancestor == "0x0" || ancestor == current {
+			return false, nil
+		}
+		current = ancestor
+	}
+	return false, nil
+}
+
+func parseXWindowInfoGeometry(output []byte) (windowGeometry, error) {
+	values := make(map[string]int, 4)
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := ""
+		switch strings.TrimSpace(parts[0]) {
+		case "Absolute upper-left X":
+			key = "X"
+		case "Absolute upper-left Y":
+			key = "Y"
+		case "Width":
+			key = "WIDTH"
+		case "Height":
+			key = "HEIGHT"
+		default:
+			continue
+		}
+		if _, exists := values[key]; exists {
+			return windowGeometry{}, ErrDesktopUnavailable
+		}
+		value, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return windowGeometry{}, ErrDesktopUnavailable
+		}
+		values[key] = value
+	}
+	if len(values) != 4 || values["WIDTH"] < 1 || values["HEIGHT"] < 1 {
+		return windowGeometry{}, ErrDesktopUnavailable
+	}
+	return windowGeometry{x: values["X"], y: values["Y"], width: values["WIDTH"], height: values["HEIGHT"]}, nil
+}
+
+type pointerLocation struct {
+	x, y     int
+	windowID string
+}
+
+func parsePointerLocation(output []byte) (pointerLocation, error) {
+	values := make(map[string]int, 2)
+	for _, line := range strings.Fields(string(output)) {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 || (parts[0] != "X" && parts[0] != "Y" && parts[0] != "WINDOW") {
+			continue
+		}
+		if _, exists := values[parts[0]]; exists {
+			return pointerLocation{}, ErrDesktopUnavailable
+		}
+		if parts[0] == "WINDOW" {
+			value, err := strconv.ParseUint(parts[1], 10, 32)
+			if err != nil {
+				return pointerLocation{}, ErrDesktopUnavailable
+			}
+			values[parts[0]] = int(value)
+			continue
+		}
+		value, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return pointerLocation{}, ErrDesktopUnavailable
+		}
+		values[parts[0]] = value
+	}
+	if len(values) != 3 {
+		return pointerLocation{}, ErrDesktopUnavailable
+	}
+	return pointerLocation{x: values["X"], y: values["Y"], windowID: fmt.Sprintf("0x%x", values["WINDOW"])}, nil
+}
+
+func parseXWindowInfoParent(output []byte) (string, error) {
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) != "Parent window id" {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) == 0 {
+			return "", ErrDesktopUnavailable
+		}
+		value, err := strconv.ParseUint(fields[0], 0, 32)
+		if err != nil {
+			return "", ErrDesktopUnavailable
+		}
+		return fmt.Sprintf("0x%x", value), nil
+	}
+	return "", ErrDesktopUnavailable
 }
 
 func (b *linuxBackend) typeText(ctx context.Context, id, text string) error {
 	if err := b.requireActiveWindow(ctx, id); err != nil {
 		return err
 	}
-	_, err := b.run(ctx, b.paths.xdotool, 64, "type", "--clearmodifiers", "--delay", "0", "--", text)
+	number, err := windowIDDecimal(id)
+	if err != nil {
+		return err
+	}
+	_, err = b.run(ctx, b.paths.xdotool, 64, "type", "--window", number, "--clearmodifiers", "--delay", "0", "--", text)
 	return err
 }
 
@@ -219,7 +374,11 @@ func (b *linuxBackend) pressKey(ctx context.Context, id, key string) error {
 	if !ok {
 		return ErrDesktopUnavailable
 	}
-	_, err := b.run(ctx, b.paths.xdotool, 64, "key", "--clearmodifiers", keysym)
+	number, err := windowIDDecimal(id)
+	if err != nil {
+		return err
+	}
+	_, err = b.run(ctx, b.paths.xdotool, 64, "key", "--window", number, "--clearmodifiers", keysym)
 	return err
 }
 
@@ -247,7 +406,9 @@ func (b *linuxBackend) requireActiveWindow(ctx context.Context, id string) error
 	if strings.TrimSpace(string(output)) != wanted {
 		return errDesktopFocusChanged
 	}
-	// shortcut: focus can change before XTEST sends, replace with atomic targeted input if this race affects users.
+	// The caller also requires the selected window to be active. Every input command
+	// must still target this window explicitly because focus can change after this
+	// check and before XTEST would otherwise dispatch to the newly focused window.
 	return nil
 }
 

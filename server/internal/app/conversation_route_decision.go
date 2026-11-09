@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
@@ -123,10 +124,64 @@ func ParseConversationRouteDecision(text string, candidates []ConversationRouteC
 // unknown Task and an explicitly referenced Task that cannot be recovered.
 func ParseConversationRouteDecisionForContext(text string, value ConversationRouteContext) ConversationRouteDecision {
 	decision := parseConversationRouteDecision(text, value.Candidates, value.ReferenceUnavailable)
+	if decision.Action == ConversationRouteNew && ConversationRouteHasExplicitControlIntent(value.Content) {
+		if value.ReferenceUnavailable {
+			return ConversationRouteDecision{Action: ConversationRouteClarify, Question: UnavailableRouteReferenceMessage}
+		}
+		if value.PreviousMissing {
+			return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
+		}
+	}
 	if value.PreviousMissing && decision.Action != ConversationRouteNew && decision.Action != ConversationRouteClarify {
 		return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 	}
 	return decision
+}
+
+// ConversationRouteHasExplicitControlIntent is a fail-safe for the narrow case
+// where a stale explicit task reference cannot be recovered. If the model
+// incorrectly labels a recognizable stop/status command as independent work,
+// ask the user to retry without that reference instead of creating a new Task.
+func ConversationRouteHasExplicitControlIntent(content string) bool {
+	var normalized strings.Builder
+	for _, char := range strings.ToLower(content) {
+		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
+			continue
+		}
+		normalized.WriteRune(char)
+	}
+	value := normalized.String()
+	for _, preamble := range []string{"麻烦你", "请帮我", "请帮忙", "帮我", "麻烦", "请", "你能不能", "你能否", "能不能", "能否", "couldyou", "wouldyou", "canyou", "please"} {
+		value = strings.TrimPrefix(value, preamble)
+	}
+	if value == "" {
+		return false
+	}
+	for _, verb := range []string{"停止", "停掉", "取消", "撤销", "终止", "暂停", "恢复", "继续", "stop", "cancel", "pause", "resume", "terminate", "abort"} {
+		if !strings.HasPrefix(value, verb) {
+			continue
+		}
+		remainder := strings.TrimPrefix(value, verb)
+		if remainder == "" || containsAnyRouteIntent(remainder, []string{"任务", "当前", "这个", "刚才", "它", "执行", "运行", "工作", "task", "agent", "job", "this", "that", "it"}) {
+			return true
+		}
+	}
+	for _, query := range []string{"查看", "查询", "查下", "查一下", "看下", "看一下", "检查", "告诉", "汇报", "show", "check", "whatisthe", "get"} {
+		if strings.HasPrefix(value, query) && !containsAnyRouteIntent(value, []string{"howto", "howcan", "howdo", "howwould", "howshould"}) &&
+			containsAnyRouteIntent(value, []string{"任务", "进度", "状态", "运行到哪", "taskstatus", "taskprogress", "status", "progress"}) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyRouteIntent(value string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseConversationRouteDecision(text string, candidates []ConversationRouteCandidate, referenceUnavailable bool) ConversationRouteDecision {

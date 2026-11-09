@@ -80,6 +80,17 @@ func (e NotificationEvent) Valid() bool {
 	return e == NotifyCompleted || e == NotifyFailed || e == NotifyWaitingUser
 }
 
+type ExecutionPolicy string
+
+const (
+	ExecutionPolicyStandard             ExecutionPolicy = "standard"
+	ExecutionPolicyGoalFollowupReadOnly ExecutionPolicy = "goal_followup_read_only"
+)
+
+func (p ExecutionPolicy) Valid() bool {
+	return p == "" || p == ExecutionPolicyStandard || p == ExecutionPolicyGoalFollowupReadOnly
+}
+
 type ObservationField string
 
 const (
@@ -205,14 +216,17 @@ type Schedule struct {
 	Observation           *ObservationSpec
 	ObservationConfigHash string
 	BaselineFingerprint   string
-	NextOccurrenceKey     string
-	NextRunAt             *time.Time
-	NextCheckAt           *time.Time
-	LastRun               *Run
-	CurrentRun            *Run
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
-	ExecutionEpoch        int64
+	// ExecutionPolicy is an internal control-plane policy and is omitted from
+	// public JSON responses. Blank values from legacy callers mean standard.
+	ExecutionPolicy   ExecutionPolicy `json:"-"`
+	NextOccurrenceKey string
+	NextRunAt         *time.Time
+	NextCheckAt       *time.Time
+	LastRun           *Run
+	CurrentRun        *Run
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	ExecutionEpoch    int64
 }
 
 type Run struct {
@@ -352,9 +366,12 @@ func Validate(s Schedule) error {
 	if !ValidID(s.ID) || s.OwnerID == "" || s.Version < 1 || !s.Status.Valid() ||
 		(s.HostID != "" && !domain.ValidHostID(s.HostID)) || s.ModelID == "" ||
 		strings.TrimSpace(s.Title) == "" || len(strings.TrimSpace(s.Title)) > 32768 ||
-		strings.TrimSpace(s.Objective) == "" || len(strings.TrimSpace(s.Objective)) > 32768 ||
+		strings.TrimSpace(s.Objective) == "" || len(strings.TrimSpace(s.Objective)) > 32768 || !s.ExecutionPolicy.Valid() ||
 		s.Authorization.Kind == "" || !s.MisfirePolicy.Valid() || s.ExecutionEpoch < 1 {
 		return errors.New("schedule fields are invalid")
+	}
+	if s.ExecutionPolicy == ExecutionPolicyGoalFollowupReadOnly && (s.HostID != "" || s.Observation != nil) {
+		return errors.New("read-only Goal follow-up schedule must be hostless and cannot configure computer observation")
 	}
 	if s.HostID == "" && s.Observation != nil {
 		return errors.New("hostless schedule cannot configure computer observation")

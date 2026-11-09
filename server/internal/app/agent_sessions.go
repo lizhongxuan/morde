@@ -42,7 +42,7 @@ type AgentChildSessionCreate struct {
 type AgentChildSessionStore interface {
 	CreateAgentChildSession(context.Context, AgentChildSessionCreate) (AgentChildSession, bool, error)
 	GetAgentChildSession(context.Context, AgentInstanceFence, string, string) (AgentChildSession, error)
-	ListBackgroundAgentChildSessions(context.Context, AgentInstanceFence) ([]AgentChildSession, error)
+	ListAgentChildSessions(context.Context, AgentInstanceFence) ([]AgentChildSession, error)
 	RequestAgentChildSessionCancel(context.Context, AgentInstanceFence, string) (AgentChildSession, bool, error)
 	SettleAgentChildSession(context.Context, AgentInstanceFence, string, string, task.StepStatus, int64, []byte, string) (AgentChildSession, bool, error)
 }
@@ -115,9 +115,9 @@ func (s *AgentChildSessionService) Create(ctx context.Context, command AgentChil
 func (s *AgentChildSessionService) List(ctx context.Context, fence AgentInstanceFence, actorSessionID string) ([]AgentChildSession, error) {
 	if err := fence.Validate(); err != nil || actorSessionID != fence.AgentSessionID ||
 		!agentCheckpointIDPattern.MatchString(actorSessionID) {
-		return nil, domain.InvalidArgument("child_session", "background job actor is invalid")
+		return nil, domain.InvalidArgument("child_session", "child session actor is invalid")
 	}
-	return s.store.ListBackgroundAgentChildSessions(ctx, fence)
+	return s.store.ListAgentChildSessions(ctx, fence)
 }
 
 func (s *AgentChildSessionService) RequestCancel(ctx context.Context, command AgentChildSessionCancelCommand) (AgentChildSession, bool, error) {

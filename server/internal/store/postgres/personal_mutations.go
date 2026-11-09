@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -115,6 +116,17 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	if !objectExists && mutation.Delete {
 		return personal.MutationReceipt{}, domain.NewError(domain.CodeNotFound, "personal object not found")
 	}
+	if mutation.Delete && mutation.ObjectType == personal.ObjectTypeMemory {
+		var previousMemory struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(previousBody, &previousMemory); err != nil || strings.TrimSpace(previousMemory.Content) == "" {
+			return personal.MutationReceipt{}, domain.NewError(domain.CodeInternal, "stored personal memory content is invalid")
+		}
+		if err := suppressPersonalHistoryForDeletedMemoryInTx(ctx, tx, instanceID, mutation.OwnerID, previousMemory.Content); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
 	if mutation.ObjectType == personal.ObjectTypeGoal && !mutation.Delete {
 		if err := validatePersonalGoalMaterialOwnershipInTx(ctx, tx, instanceID, mutation.OwnerID, mutation.Body); err != nil {
 			return personal.MutationReceipt{}, err
@@ -182,7 +194,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 		return personal.MutationReceipt{}, fmt.Errorf("read personal object revision: %w", err)
 	}
 	if mutation.ObjectType == personal.ObjectTypeGoal && objectExists && !mutation.Delete {
-		if err := enqueueGoalNotificationEventsInTx(ctx, tx, mutation.OwnerID, mutation.ObjectID, receipt.ResultRevision, previousBody, mutation.Body); err != nil {
+		if err := enqueueGoalNotificationEventsInTx(ctx, tx, instanceID, principal, mutation.OwnerID, mutation.ObjectID, receipt.ResultRevision, previousBody, mutation.Body); err != nil {
 			return personal.MutationReceipt{}, err
 		}
 	}
@@ -198,6 +210,18 @@ VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8)`, instanceID, mutation.OwnerID, mutation.
 		return personal.MutationReceipt{}, fmt.Errorf("write personal mutation receipt: %w", err)
 	}
 	return receipt, nil
+}
+
+func suppressPersonalHistoryForDeletedMemoryInTx(ctx context.Context, tx pgx.Tx, serviceInstanceID, ownerID, content string) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO personal_history_suppressions (service_instance_id, owner_id, message_id)
+SELECT $1::uuid, $2, messages.id
+FROM conversation_messages messages
+JOIN conversations conversations ON conversations.id=messages.conversation_id AND conversations.owner_id=messages.owner_id
+WHERE messages.owner_id=$2 AND conversations.project_id IS NULL AND position($3 IN messages.content)>0
+ON CONFLICT (service_instance_id, owner_id, message_id) DO NOTHING`, serviceInstanceID, ownerID, content); err != nil {
+		return fmt.Errorf("suppress deleted personal memory history: %w", err)
+	}
+	return nil
 }
 
 func validatePersonalGoalMaterialOwnershipInTx(ctx context.Context, tx pgx.Tx, instanceID, ownerID string, body []byte) error {
@@ -313,15 +337,13 @@ func validatePersonalAttachmentReferenceInTx(ctx context.Context, tx pgx.Tx, ins
 	if body.AttachmentID == "" || body.AttachmentID == allowedNewAttachmentID {
 		return nil
 	}
-	var exists bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (
-  SELECT 1 FROM personal_attachment_uploads
-  WHERE service_instance_id=$1::uuid AND owner_id=$2 AND attachment_id=$3 AND state='committed'
-)`, instanceID, ownerID, body.AttachmentID).Scan(&exists)
+	tag, err := tx.Exec(ctx, `UPDATE personal_attachment_uploads SET orphaned_at=NULL,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND attachment_id=$3 AND state='committed'
+  AND content_deleted_at IS NULL`, instanceID, ownerID, body.AttachmentID)
 	if err != nil {
 		return fmt.Errorf("validate personal attachment reference: %w", err)
 	}
-	if !exists {
+	if tag.RowsAffected() == 0 {
 		return domain.NewError(domain.CodeNotFound, "personal attachment not found")
 	}
 	return nil

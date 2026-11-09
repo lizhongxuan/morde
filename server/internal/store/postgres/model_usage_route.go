@@ -563,7 +563,7 @@ WHERE r.message_id=$1 AND r.actor_id=$2 AND r.lease_owner=$3 AND r.lease_version
 		return releaseRouteReservationInTx(releaseCtx, tx, call.OwnerID, messageID)
 	})
 	if releaseErr != nil {
-		return fmt.Errorf("%w; release undispatched route reservation: %v", err, releaseErr)
+		return fmt.Errorf("%w; release undispatched route reservation: %w", err, releaseErr)
 	}
 	return err
 }
@@ -623,7 +623,7 @@ WHERE message_id=$1 AND actor_id=$2 AND call_id=$3 FOR UPDATE`, call.Route.Claim
 		if state == "unknown" && unknown {
 			return nil
 		}
-		if state != "dispatched" && !(state == "unknown" && !unknown) {
+		if state != "dispatched" && (state != "unknown" || unknown) {
 			return domain.NewError(domain.CodeConflict, "route model call is not awaiting settlement")
 		}
 		var accountState string

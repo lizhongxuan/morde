@@ -236,6 +236,62 @@ FROM tasks t JOIN conversations c ON c.id=t.conversation_id AND c.owner_id=t.own
 	}
 }
 
+func TestPostgresGoalFollowupSchedulePersistsReadOnlyTaskPolicy(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+	occurrence, err := schedule.FirstOccurrence(timing, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mustID(t, schedule.NewID)
+	value := schedule.Schedule{
+		ID: id, OwnerID: owner.ID, Version: 1, Status: schedule.StatusEnabled, ExecutionEpoch: 1,
+		ModelID: "model-test", Title: "Goal follow-up", Objective: "Analyze a blocked Goal step", Timing: timing,
+		Budget:        task.Budget{ActiveSeconds: 300, ToolCalls: 20, ModelTokens: 8000},
+		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: testSessionTokenID(owner.ID)},
+		MisfirePolicy: schedule.MisfireSkip, NotificationEvents: []schedule.NotificationEvent{schedule.NotifyCompleted},
+		NextOccurrenceKey: occurrence.Key, NextRunAt: occurrence.ScheduledAt, NextCheckAt: &occurrence.CheckAt,
+		ExecutionPolicy: schedule.ExecutionPolicyGoalFollowupReadOnly,
+	}
+	record := testIdempotency(owner.ID, "schedule.create", "goal-followup-read-only-"+id)
+	record.ResourceID = id
+	created, replayed, err := store.CreateSchedule(ctx, value, record)
+	if err != nil || replayed || created.ExecutionPolicy != schedule.ExecutionPolicyGoalFollowupReadOnly {
+		t.Fatalf("create read-only Goal schedule = %#v replayed=%t err=%v", created, replayed, err)
+	}
+	loaded, err := store.GetSchedule(ctx, owner.ID, id)
+	if err != nil || loaded.ExecutionPolicy != schedule.ExecutionPolicyGoalFollowupReadOnly {
+		t.Fatalf("read persisted Goal schedule policy = %q, err=%v", loaded.ExecutionPolicy, err)
+	}
+	run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+		ScheduleID: id, OwnerID: owner.ID, ExpectedVersion: created.Version, ExpectedEpoch: created.ExecutionEpoch,
+		Occurrence: schedule.Occurrence{Key: occurrence.Key, ScheduledAt: occurrence.ScheduledAt,
+			CheckAt: occurrence.CheckAt, Status: schedule.RunQueued},
+		NotificationEvents: created.NotificationEvents,
+	})
+	if err != nil || !committed || run.TaskID == nil {
+		t.Fatalf("commit read-only Goal schedule = %#v committed=%t err=%v", run, committed, err)
+	}
+	var scopes []string
+	if err := store.pool.QueryRow(ctx, `SELECT auth_scopes FROM tasks WHERE id=$1 AND owner_id=$2`, *run.TaskID, owner.ID).Scan(&scopes); err != nil {
+		t.Fatal(err)
+	}
+	wantScopes := []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit),
+		string(identity.ScopeTaskControl), string(identity.ScopeGoalFollowupReadOnly)}
+	if !sameStringSlices(scopes, wantScopes) {
+		t.Fatalf("Goal follow-up Task scopes = %v, want %v", scopes, wantScopes)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeTaskRead); err != nil {
+		t.Fatalf("read-only Goal follow-up Task lifecycle read: %v", err)
+	}
+	if err := store.AuthorizeScheduledTaskAction(ctx, owner.ID, run.ID, "", identity.ScopeComputerObserve); err == nil {
+		t.Fatal("read-only Goal follow-up Task received computer authorization")
+	}
+}
+
 func TestPostgresScheduleCanBeUnbound(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

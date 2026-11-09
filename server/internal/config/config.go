@@ -96,6 +96,8 @@ type Profile struct {
 	APIKey           string        `yaml:"api_key"`
 	RequestTimeout   time.Duration `yaml:"request_timeout"`
 	NetworkGuardPath string        `yaml:"network_guard_path"`
+	// Enable only after this profile's provider and runtime enforce NetworkPolicy.
+	NetworkPolicyEnabled bool `yaml:"network_policy_enabled"`
 }
 
 type Templates struct {

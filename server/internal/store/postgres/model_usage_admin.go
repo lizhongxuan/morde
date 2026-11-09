@@ -196,7 +196,7 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 FROM conversation_route_model_calls c JOIN conversation_message_routes r ON r.message_id=c.message_id
 WHERE c.actor_id=$1 AND c.source='route' AND c.call_id=$2 FOR UPDATE OF c,r`, command.OwnerID, command.CallID).
 				Scan(&taskProjectID, &routeState, &routeMessageID, &abandoned); err != nil ||
-				(routeState != "unknown" && !(routeState == "dispatched" && abandoned)) {
+				(routeState != "unknown" && (routeState != "dispatched" || !abandoned)) {
 				return domain.NewError(domain.CodeInvalidState, "unknown route model attribution is unavailable")
 			}
 			if taskProjectID != "" {

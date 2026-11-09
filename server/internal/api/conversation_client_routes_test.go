@@ -28,6 +28,7 @@ func TestClientCredentialsCanUseOutboxRoutesOnlyForUserOperations(t *testing.T) 
 		{http.MethodGet, "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id"},
 		{http.MethodPost, "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id/commit"},
 		{http.MethodPut, "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id"},
+		{http.MethodPut, "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/derivatives"},
 		{http.MethodGet, "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id"},
 		{http.MethodPut, "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/chunks/:sequence"},
 		{http.MethodPost, "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/commit"},

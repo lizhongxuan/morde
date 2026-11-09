@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -17,6 +19,10 @@ import (
 const (
 	cloudDSHMCPDiscoverToolName = "mcp_discover"
 	cloudDSHMCPCallToolName     = "mcp_call"
+	githubMCPRemoteHostname     = "api.githubcopilot.com"
+	githubMCPReadonlyHeader     = "X-Mcp-Readonly"
+	githubMCPToolsHeader        = "X-Mcp-Tools"
+	githubMCPReadonlyTools      = "get_me,get_file_contents,issue_read,pull_request_read,search_code,search_commits,search_issues,search_pull_requests,search_repositories"
 )
 
 // TaskMCPSelectionStore resolves user selections only under the current Task
@@ -170,6 +176,7 @@ func (b *CloudDSHToolBroker) discoverSelectedMCP(ctx context.Context, value task
 	if err != nil {
 		return selectedMCPFailure(ctx, err)
 	}
+	headers = githubMCPRequestHeaders(connector.EndpointURL, headers)
 	current, err := selections.GrantSelectedTaskMCPConnector(ctx, value, grant.ConnectorID)
 	if err != nil || current.GrantVersion != grant.GrantVersion || current.ConnectorRevision != grant.ConnectorRevision ||
 		current.CredentialVersion != grant.CredentialVersion {
@@ -179,6 +186,7 @@ func (b *CloudDSHToolBroker) discoverSelectedMCP(ctx context.Context, value task
 	if err != nil {
 		return selectedMCPFailure(ctx, err)
 	}
+	tools = filterGitHubMCPReadOnlyTools(connector.EndpointURL, tools)
 	encoded, digest, err := canonicalMCPToolSchema(tools)
 	if err != nil {
 		return AgentToolResult{Status: AgentToolFailed, Output: "MCP 连接器返回的工具目录无效。"}, nil
@@ -203,6 +211,55 @@ func (b *CloudDSHToolBroker) discoverSelectedMCP(ctx context.Context, value task
 		return AgentToolResult{Status: AgentToolFailed, Output: "MCP 工具目录过大，无法在当前任务中使用。"}, nil
 	}
 	return AgentToolResult{Status: AgentToolSucceeded, Output: string(output)}, nil
+}
+
+func isGitHubMCPRemoteEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed == nil || !strings.EqualFold(parsed.Scheme, "https") ||
+		!strings.EqualFold(strings.TrimSuffix(parsed.Hostname(), "."), githubMCPRemoteHostname) || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return false
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return false
+	}
+	return true
+}
+
+func isGitHubMCPReadOnlyTool(name string) bool {
+	switch name {
+	case "get_me", "get_file_contents", "issue_read", "pull_request_read", "search_code", "search_commits",
+		"search_issues", "search_pull_requests", "search_repositories":
+		return true
+	default:
+		return false
+	}
+}
+
+func filterGitHubMCPReadOnlyTools(endpoint string, tools []MCPConnectorToolDefinition) []MCPConnectorToolDefinition {
+	if !isGitHubMCPRemoteEndpoint(endpoint) {
+		return tools
+	}
+	filtered := make([]MCPConnectorToolDefinition, 0, len(tools))
+	for _, tool := range tools {
+		if isGitHubMCPReadOnlyTool(tool.Name) {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
+}
+
+func githubMCPRequestHeaders(endpoint string, headers http.Header) http.Header {
+	if !isGitHubMCPRemoteEndpoint(endpoint) {
+		return headers
+	}
+	readonly := headers.Clone()
+	if readonly == nil {
+		readonly = make(http.Header)
+	}
+	readonly.Set(githubMCPReadonlyHeader, "true")
+	readonly.Set(githubMCPToolsHeader, githubMCPReadonlyTools)
+	return readonly
 }
 
 func validateSelectedMCPArguments(rawSchema, arguments []byte) error {

@@ -304,13 +304,12 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	}
 	call := h.calls[event.Message.ToolCallID]
 	if call == nil || !call.callSeen || call.resultSeen || sourceSeqs[0] != call.callSeq || call.turn != event.Turn || call.step != event.Step ||
-		len(event.Message.Content) < 1 || len(event.Message.Content) > 2 || event.Message.Content[0].Type != "text" {
+		len(event.Message.Content) < 1 || len(event.Message.Content) > 1+cloudDSHImageCountLimitForTool(call.name) || event.Message.Content[0].Type != "text" {
 		return errors.New("dsh tool result does not match its durable tool call")
 	}
 	var imageRefs []cloudDSHImageRef
-	if len(event.Message.Content) == 2 {
-		block := event.Message.Content[1]
-		if block.Type != "image" || (call.name != "desktop_screenshot" && call.name != "browser_screenshot") {
+	for _, block := range event.Message.Content[1:] {
+		if block.Type != "image" {
 			return errors.New("dsh tool result contains an unauthorized image")
 		}
 		ref, err := decodeCloudDSHImageRef(block.Attachment)

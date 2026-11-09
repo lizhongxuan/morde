@@ -10,6 +10,7 @@ import (
 	"errors"
 	"image"
 	"image/jpeg"
+	"image/png"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,44 @@ type cloudDSHBrokerTaskStore struct {
 	events []task.Event
 }
 
+func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	imageData := encoded.Bytes()
+	images := make([]ModelImage, maxCloudDSHTaskAttachmentImages)
+	for index := range images {
+		images[index] = ModelImage{MediaType: "image/png", Data: imageData}
+	}
+	valid := AgentToolResult{Status: AgentToolSucceeded, Images: images}
+	if !validCloudDSHToolImages(cloudDSHTaskAttachmentReadToolName, valid) {
+		t.Fatal("Task Reader rejected four fully decoded bounded images")
+	}
+
+	tooMany := valid
+	tooMany.Images = append(append([]ModelImage(nil), images...), images[0])
+	badMIME := AgentToolResult{Status: AgentToolSucceeded, Images: []ModelImage{{MediaType: "image/gif", Data: imageData}}}
+	badImage := AgentToolResult{Status: AgentToolSucceeded, Images: []ModelImage{{MediaType: "image/png", Data: []byte("bad image")}}}
+	oversized := AgentToolResult{Status: AgentToolSucceeded, Images: []ModelImage{{MediaType: "image/png",
+		Data: bytes.Repeat([]byte("x"), maxCloudDSHTaskAttachmentImageBytes+1)}}}
+	for name, result := range map[string]AgentToolResult{
+		"too many images": tooMany,
+		"unknown MIME":    badMIME,
+		"corrupt image":   badImage,
+		"oversized image": oversized,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if validCloudDSHToolImages(cloudDSHTaskAttachmentReadToolName, result) {
+				t.Fatal("invalid Task Reader image result was accepted")
+			}
+		})
+	}
+	if validCloudDSHToolImages(cloudDSHMCPToolPrefix+"search", valid) || validCloudDSHToolImages(runtimeToolDesktopScreenshot, valid) {
+		t.Fatal("Task Reader multi-image limits leaked into MCP or desktop tools")
+	}
+}
+
 type cloudDSHRecordCaptureStore struct {
 	taskStore       *cloudDSHBrokerTaskStore
 	calls           int
@@ -33,6 +72,85 @@ type cloudDSHRecordCaptureStore struct {
 	input           record.CaptureInput
 	statusAtEnqueue task.Status
 	err             error
+}
+
+func TestGoalFollowupReadOnlyToolsUseExplicitAllowlist(t *testing.T) {
+	allowed := []string{
+		cloudDSHSkillReadToolName, cloudDSHTaskAttachmentReadToolName,
+		cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceSearchToolName,
+	}
+	for _, name := range allowed {
+		if !goalFollowupReadOnlyToolAllowed(name) {
+			t.Errorf("read-only tool %q was rejected", name)
+		}
+	}
+	blocked := []string{
+		cloudDSHWebSearchToolName, cloudDSHWebReadToolName, cloudDSHPersonalUpdateToolName,
+		cloudDSHGoalUpdateToolName, cloudDSHScheduleCreateToolName, cloudDSHMCPDiscoverToolName,
+		agentAskUserToolName, runtimeToolShellExec, "morde_hub_send_message",
+	}
+	for _, name := range blocked {
+		if goalFollowupReadOnlyToolAllowed(name) {
+			t.Errorf("side-effecting or external tool %q was allowed", name)
+		}
+	}
+	definitions := []AgentToolDefinition{
+		{ModelTool: ModelTool{Name: cloudDSHSkillReadToolName}},
+		{ModelTool: ModelTool{Name: cloudDSHPersonalUpdateToolName}},
+		{ModelTool: ModelTool{Name: cloudDSHWebSearchToolName}},
+	}
+	filtered := filterGoalFollowupReadOnlyTools(definitions)
+	if len(filtered) != 1 || filtered[0].Name != cloudDSHSkillReadToolName {
+		t.Fatalf("read-only definitions = %#v", filtered)
+	}
+}
+
+func TestGoalFollowupReadOnlyRejectsDisallowedCallsBeforeDispatch(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.HostID = ""
+	store.details.Task.ExecutionLocation = "server"
+	store.details.Task.WorkspaceID = ""
+	store.details.Task.WorkspaceOwnerID = ""
+	store.details.Task.InputRevision = nil
+	store.details.Task.WorkspaceCheckpointRevision = nil
+	store.details.Task.ContextDigest = nil
+	store.details.Task.Authorization = task.Authorization{
+		Kind: string(identity.KindScheduleTask), TokenID: "y1234567", Version: 1,
+		Scopes: []string{
+			string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit), string(identity.ScopeTaskControl),
+			string(identity.ScopeGoalFollowupReadOnly),
+		},
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions, err := broker.Definitions(context.Background(), store.details.Task)
+	if err != nil {
+		t.Fatalf("read-only Goal follow-up definitions: %v", err)
+	}
+	for _, definition := range definitions {
+		if !goalFollowupReadOnlyToolAllowed(definition.Name) {
+			t.Fatalf("read-only Goal follow-up exposed disallowed tool %q", definition.Name)
+		}
+	}
+	if len(definitions) != 0 {
+		t.Fatalf("Goal follow-up without user attachments or Workspace should expose no tools: %#v", definitions)
+	}
+	_, err = broker.Execute(context.Background(), store.details.Task, ModelToolCall{
+		CallID: "blocked-update", Name: cloudDSHPersonalUpdateToolName, Arguments: `{}`,
+	})
+	if domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("mutating Goal follow-up call error = %v, want forbidden", err)
+	}
+	_, err = broker.Reconcile(context.Background(), store.details.Task, ModelToolCall{
+		CallID: "recovered-blocked-update", Name: cloudDSHPersonalUpdateToolName, Arguments: `{}`,
+	}, nil)
+	if domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("recovered mutating Goal follow-up call error = %v, want forbidden", err)
+	}
 }
 
 type cloudDSHSkillTaskAuthorizationRecorder struct {
@@ -702,7 +820,7 @@ func TestCloudDSHToolBrokerUsesAuthorizedHostOperationLedger(t *testing.T) {
 	if err := jpeg.Encode(&screenshot, image.NewRGBA(image.Rect(0, 0, 2, 2)), nil); err != nil {
 		t.Fatal(err)
 	}
-	screenshotResult := `{"mime_type":"image/jpeg","width":2,"height":2,"screen_width":100,"screen_height":100,"data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`
+	screenshotResult := `{"mime_type":"image/jpeg","width":2,"height":2,"screen_width":100,"screen_height":100,"screenshot_token":"` + strings.Repeat("A", 43) + `","data_base64":"` + base64.StdEncoding.EncodeToString(screenshot.Bytes()) + `"}`
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
 		{capability: "file.read", action: "read", result: `{"path":"README.md","text":"from Host"}`},
 		{capability: "desktop.observe", action: "screenshot", result: screenshotResult},

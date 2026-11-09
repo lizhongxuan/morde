@@ -29,6 +29,7 @@ func run() error {
 	stateDir := flags.String("state-dir", "/var/lib/morde/dsh-guardian", "private durable lease directory")
 	dockerSocket := flags.String("docker-socket", "/var/run/docker.sock", "local Docker Engine Unix socket")
 	attestationKeyFile := flags.String("attestation-key-file", "", "protected raw Ed25519 private key for stop attestations")
+	taskSandboxAttestationKeyFile := flags.String("task-sandbox-attestation-key-file", "", "optional separate protected Ed25519 private key for Task Sandbox proofs")
 	interval := flags.Duration("sweep-interval", time.Second, "lease expiry sweep interval")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
@@ -40,7 +41,22 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load dsh guardian attestation key: %w", err)
 	}
-	service, err := dshguardian.Open(*stateDir, *dockerSocket, attestationKey)
+	var service *dshguardian.Service
+	if *taskSandboxAttestationKeyFile == "" {
+		service, err = dshguardian.Open(*stateDir, *dockerSocket, attestationKey)
+	} else {
+		taskSandboxAttestationKey, keyErr := dshguardian.LoadAttestationPrivateKey(*taskSandboxAttestationKeyFile)
+		if keyErr != nil {
+			for i := range attestationKey {
+				attestationKey[i] = 0
+			}
+			return fmt.Errorf("load Task Sandbox Guardian attestation key: %w", keyErr)
+		}
+		service, err = dshguardian.OpenWithTaskSandboxGuardianKey(*stateDir, *dockerSocket, attestationKey, taskSandboxAttestationKey)
+		for i := range taskSandboxAttestationKey {
+			taskSandboxAttestationKey[i] = 0
+		}
+	}
 	for i := range attestationKey {
 		attestationKey[i] = 0
 	}

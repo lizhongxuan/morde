@@ -341,11 +341,11 @@ func (s *ControlService) authorizeControlHost(ctx context.Context, principal ide
 		return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")
 	}
 	for _, permission := range access.Permissions {
-		if permission == host.PermissionDesktopView || permission == host.PermissionDesktopControl ||
-			permission == host.PermissionTerminalControl || permission == host.PermissionMCPControl {
-			if !operate || permission != host.PermissionDesktopView {
-				return value, nil
-			}
+		if operate && permission == host.PermissionDesktopControl {
+			return value, nil
+		}
+		if !operate && (permission == host.PermissionDesktopView || permission == host.PermissionDesktopControl) {
+			return value, nil
 		}
 	}
 	return host.Host{}, domain.NewError(domain.CodeNotFound, "host not found")

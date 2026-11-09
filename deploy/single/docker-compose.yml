@@ -52,6 +52,20 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${CH_OSB_CONFIG_FILE:-/etc/opensandbox/opensandbox.toml}:/etc/opensandbox/opensandbox.toml:ro
 
+  # Deliberately opt-in: systemd starts this control plane only after the
+  # dedicated Task bridge and host deny policy have been prepared.
+  opensandbox-task-server:
+    image: registry.local/cloudhost/opensandbox-server:release-1.1.1-runtime-8090
+    profiles: [task-sandbox]
+    network_mode: host
+    restart: "no"
+    command: ["--config", "/etc/opensandbox/opensandbox-task.toml"]
+    environment:
+      OPENSANDBOX_SERVER_API_KEY: ${CH_OSB_API_KEY:?Set CH_OSB_API_KEY in /etc/cloudhost/cloudhost.env}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/opensandbox/opensandbox-task.toml:/etc/opensandbox/opensandbox-task.toml:ro
+
   caddy:
     image: docker.io/library/caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
     network_mode: host
@@ -75,7 +89,7 @@ services:
     init: true
     read_only: true
     cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
+    security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     cpus: 0.25
     pids_limit: 64

@@ -21,20 +21,13 @@ type WorkspaceShareStore interface {
 	CreateWorkspaceShare(context.Context, workspace.ShareLink) (workspace.ShareLink, error)
 	GetWorkspaceShareByToken(context.Context, []byte) (workspace.ShareLink, error)
 	StartWorkspaceShareClaim(context.Context, []byte, string) (workspace.ShareLink, error)
-	SetWorkspaceShareTarget(context.Context, string, string, string) error
 	CompleteWorkspaceShareClaim(context.Context, string, string, string) error
 	InvalidateWorkspaceShare(context.Context, string, string) error
 	WorkspaceShareSourceMatches(context.Context, string, string, int64) (bool, error)
 }
 
 type WorkspaceShareCopier interface {
-	Copy(context.Context, identity.Principal, string, WorkspaceCopyCommand, string) (WorkspaceCopyResult, error)
-}
-
-type WorkspaceShareTransferService interface {
-	RequestWorkspaceTransfer(context.Context, identity.Principal, string, string, int64, string) (workspace.OwnershipTransfer, bool, error)
-	AcceptWorkspaceTransfer(context.Context, identity.Principal, string, string, string) (workspace.OwnershipTransfer, error)
-	AcceptWorkspaceTransferReadOnly(context.Context, identity.Principal, string, string, string) (workspace.OwnershipTransfer, error)
+	copyForWorkspaceShare(context.Context, identity.Principal, workspace.ShareLink) (WorkspaceCopyResult, error)
 }
 
 type WorkspaceShareCreated struct {
@@ -57,17 +50,15 @@ type WorkspaceShareAccepted struct {
 }
 
 type WorkspaceShareService struct {
-	store     WorkspaceShareStore
-	copies    WorkspaceShareCopier
-	transfers WorkspaceShareTransferService
+	store  WorkspaceShareStore
+	copies WorkspaceShareCopier
 }
 
-func NewWorkspaceShareService(store WorkspaceShareStore, copies WorkspaceShareCopier,
-	transfers WorkspaceShareTransferService) (*WorkspaceShareService, error) {
-	if store == nil || copies == nil || transfers == nil {
-		return nil, errors.New("workspace share store, copy service, and transfer service are required")
+func NewWorkspaceShareService(store WorkspaceShareStore, copies WorkspaceShareCopier) (*WorkspaceShareService, error) {
+	if store == nil || copies == nil {
+		return nil, errors.New("workspace share store and copy service are required")
 	}
-	return &WorkspaceShareService{store: store, copies: copies, transfers: transfers}, nil
+	return &WorkspaceShareService{store: store, copies: copies}, nil
 }
 
 func (s *WorkspaceShareService) Create(ctx context.Context, principal identity.Principal, workspaceID string,
@@ -142,8 +133,7 @@ func (s *WorkspaceShareService) Accept(ctx context.Context, principal identity.P
 		share.OwnerID == principal.UserID {
 		return WorkspaceShareAccepted{}, domain.NewError(domain.CodeInternal, "Workspace share claim state is invalid")
 	}
-	targetID := share.TargetWorkspaceID
-	if targetID == "" {
+	if share.TargetWorkspaceID == "" {
 		current, err := s.store.WorkspaceShareSourceMatches(ctx, share.OwnerID, share.SourceWorkspaceID, share.SourceRevision)
 		if err != nil {
 			return WorkspaceShareAccepted{}, err
@@ -156,38 +146,19 @@ func (s *WorkspaceShareService) Accept(ctx context.Context, principal identity.P
 		}
 	}
 
-	owner := identity.Principal{UserID: share.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession}
-	if targetID == "" {
-		copied, err := s.copies.Copy(ctx, owner, share.SourceWorkspaceID, WorkspaceCopyCommand{
-			Name: share.WorkspaceName, ExpectedCurrentRevision: share.SourceRevision,
-		}, "ws-share-copy-"+share.ID)
-		if err != nil {
-			if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
-				stillCurrent, checkErr := s.store.WorkspaceShareSourceMatches(ctx, share.OwnerID, share.SourceWorkspaceID, share.SourceRevision)
-				if checkErr == nil && !stillCurrent {
-					_ = s.store.InvalidateWorkspaceShare(ctx, share.ID, principal.UserID)
-				}
+	copied, err := s.copies.copyForWorkspaceShare(ctx, principal, share)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeWorkspaceConflict && share.TargetWorkspaceID == "" {
+			stillCurrent, checkErr := s.store.WorkspaceShareSourceMatches(ctx, share.OwnerID, share.SourceWorkspaceID, share.SourceRevision)
+			if checkErr == nil && !stillCurrent {
+				_ = s.store.InvalidateWorkspaceShare(ctx, share.ID, principal.UserID)
 			}
-			return WorkspaceShareAccepted{}, err
 		}
-		targetID = copied.Workspace.ID
-		if err := s.store.SetWorkspaceShareTarget(ctx, share.ID, principal.UserID, targetID); err != nil {
-			return WorkspaceShareAccepted{}, err
-		}
-	}
-
-	transfer, _, err := s.transfers.RequestWorkspaceTransfer(ctx, owner, targetID, principal.UserID, 1,
-		"ws-share-transfer-"+share.ID)
-	if err != nil {
 		return WorkspaceShareAccepted{}, err
 	}
-	if share.Permission == workspace.ShareView {
-		_, err = s.transfers.AcceptWorkspaceTransferReadOnly(ctx, principal, targetID, transfer.ID, "ws-share-accept-"+share.ID)
-	} else {
-		_, err = s.transfers.AcceptWorkspaceTransfer(ctx, principal, targetID, transfer.ID, "ws-share-accept-"+share.ID)
-	}
-	if err != nil {
-		return WorkspaceShareAccepted{}, err
+	targetID := copied.Workspace.ID
+	if !domain.ValidWorkspaceID(targetID) || (share.TargetWorkspaceID != "" && share.TargetWorkspaceID != targetID) {
+		return WorkspaceShareAccepted{}, domain.NewError(domain.CodeInternal, "Workspace share copy target is invalid")
 	}
 	if err := s.store.CompleteWorkspaceShareClaim(ctx, share.ID, principal.UserID, targetID); err != nil {
 		return WorkspaceShareAccepted{}, err

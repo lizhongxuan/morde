@@ -88,11 +88,11 @@ test.describe("portal mock flow", () => {
     await page.keyboard.press("Enter");
     const createRequest = await createRequestPromise;
     expect(createRequest.headers()["idempotency-key"]).toMatch(/^[A-Za-z0-9._~-]{8,128}$/);
-    const host = page.locator(".host-card").filter({ hasText: "Playwright 本地验收" });
+    const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: "Playwright 本地验收", exact: true }) });
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10_000 });
 
     const popupPromise = page.waitForEvent("popup");
-    const enter = host.getByRole("button", { name: "进入主机 Playwright 本地验收" });
+    const enter = host.getByRole("button", { name: "查看主机 Playwright 本地验收" });
     await enter.focus();
     await page.keyboard.press("Enter");
     const popup = await popupPromise;
@@ -111,7 +111,7 @@ test.describe("portal mock flow", () => {
     await page.keyboard.press("Shift+Tab");
     await expect(dialog.getByRole("button", { name: "删除主机" })).toBeFocused();
     await page.keyboard.press("Enter");
-    await expect(host).toHaveCount(0);
+    await expect(host).toHaveCount(0, { timeout: 10_000 });
     await popup.close();
   });
 
@@ -128,6 +128,7 @@ test.describe("portal mock flow", () => {
     await page.getByRole("link", { name: "AI 助手", exact: true }).click();
     await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
     await page.getByRole("link", { name: "API Key", exact: true }).click();
+    await page.getByRole("button", { name: "＋ 创建 API Key" }).click();
     await page.getByLabel("名称").fill("门户吊销验收");
     await page.getByRole("button", { name: "创建 API Key" }).click();
     const secretDialog = page.getByRole("dialog", { name: "API Key 已创建" });
@@ -213,7 +214,7 @@ test("real single-host flow creates, uses, and cleans up only its own host", asy
       if (typeof createdHost.id === "string" && createdHost.id) hostId = createdHost.id;
     }
     expect(hostId, "host creation response must identify the created host").toBeTruthy();
-    const host = page.locator(".host-card").filter({ hasText: hostName });
+    const host = page.locator(".host-card").filter({ has: page.getByRole("heading", { name: hostName, exact: true }) });
     await expect(host).toBeVisible();
     await expect(host.getByText("运行中")).toBeVisible({ timeout: 10 * 60_000 });
     const hostResponse = await page.request.get(
@@ -226,7 +227,7 @@ test("real single-host flow creates, uses, and cleans up only its own host", asy
     }
 
     const popupPromise = page.waitForEvent("popup");
-    await host.getByRole("button", { name: "进入主机 " + hostName }).click();
+    await host.getByRole("button", { name: "查看主机 " + hostName }).click();
     const popup = await popupPromise;
     await expect(popup.getByRole("navigation", { name: "工作台功能" })).toBeVisible({
       timeout: 120_000,

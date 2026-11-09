@@ -28,6 +28,12 @@ type SandboxResources struct {
 	Memory string
 }
 
+// SandboxNetworkPolicy currently supports only deny-by-default, no-egress sandboxes.
+// Add allow rules only with a separate reviewed policy contract and enforcement tests.
+type SandboxNetworkPolicy struct {
+	DefaultAction string
+}
+
 type SandboxVolume struct {
 	Name            string
 	MountPath       string
@@ -37,14 +43,15 @@ type SandboxVolume struct {
 }
 
 type SandboxCreateRequest struct {
-	Image      string
-	Entrypoint []string
-	Timeout    time.Duration
-	Requests   SandboxResources
-	Limits     SandboxResources
-	Env        map[string]string
-	Metadata   map[string]string
-	Volumes    []SandboxVolume
+	Image         string
+	Entrypoint    []string
+	Timeout       time.Duration
+	Requests      SandboxResources
+	Limits        SandboxResources
+	NetworkPolicy *SandboxNetworkPolicy
+	Env           map[string]string
+	Metadata      map[string]string
+	Volumes       []SandboxVolume
 }
 
 type Sandbox struct {

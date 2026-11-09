@@ -35,71 +35,72 @@ const (
 )
 
 type Deps struct {
-	Hosts                       app.HostService
-	HostSharing                 app.HostSharingService
-	HostReplicas                app.HostReplicaService
-	HostUsage                   HostUsageReceiptService
-	TLSAuthorizer               app.HostTLSAuthorizer
-	Verifier                    app.Verifier
-	Auth                        AuthService
-	WorkspaceOps                WorkspaceService
-	WorkspaceSync               WorkspaceSyncService
-	WorkspaceSyncDevices        WorkspaceSyncDeviceService
-	WorkspaceDiff               WorkspaceDiffService
-	WorkspaceCopies             WorkspaceCopyEndpointService
-	WorkspaceTransfers          WorkspaceOwnershipTransferService
-	WorkspaceShares             WorkspaceShareEndpointService
-	Sites                       SiteService
-	Templates                   TemplateReader
-	Tokens                      TokenService
-	ClientLogin                 ClientLoginService
-	Notifications               NotificationService
-	Control                     ControlService
-	ExecutionControl            ExecutionControlService
-	Tasks                       TaskService
-	TaskMedia                   TaskMediaService
-	TaskObservationTickets      TaskWorkbenchObservationTicketService
-	Conversations               ConversationService
-	ProjectConversations        projectConversationRoutesService
-	ProjectWorkItems            projectWorkItemRoutesService
-	ProjectBudget               projectBudgetRoutesService
-	ProjectMCPConnectors        projectMCPConnectorRoutesService
-	ProjectBudgetExecutionReady bool
-	RuntimeOperationLedger      app.RuntimeOperationLedgerService
-	Projects                    projectRoutesService
-	ProjectContent              projectContentRoutesService
-	ModelConnections            ModelConnectionManager
-	MCPConnectors               MCPConnectorManager
-	ModelGateway                ModelGateway
-	ModelUsageAdmin             ModelUsageAdmin
-	Hub                         app.HubConnectionService
-	Devices                     deviceService
-	PersonalData                personalDataService
-	PersonalSync                personalSyncService
-	Goals                       goalRoutesService
-	Schedules                   scheduleRoutesService
-	PersonalDataQuotaUser       personalDataQuotaUserService
-	PersonalDataQuota           AdminPersonalDataQuotaService
-	PersonalAttachments         *app.PersonalAttachmentService
-	PersonalHistoryImport       *app.PersonalHistoryImportService
-	Onboarding                  OnboardingManager
-	Admin                       AdminService
-	AdminConsole                AdminConsoleService
-	AdminQualityActivity        AdminQualityActivityService
-	AdminControls               AdminControlsService
-	AdminOperations             AdminOperationsService
-	AdminModelBudgetDefaults    AdminModelBudgetDefaultService
-	AdminModelDefaults          AdminModelDefaultService
-	RecordConsents              RecordConsentService
-	RecordAccess                RecordAccessService
-	RecordCaptureStatus         RecordCaptureStatusService
-	AdminHostResources          AdminHostResourcesService
-	AdminHostRecovery           AdminHostRecoveryService
-	AdminWorkspaces             AdminWorkspaceService
-	AdminAudit                  AdminAuditWriter
-	Readiness                   ReadinessChecker
-	MCP                         http.Handler
-	MCPDisabled                 bool
+	Hosts                        app.HostService
+	HostSharing                  app.HostSharingService
+	HostReplicas                 app.HostReplicaService
+	HostUsage                    HostUsageReceiptService
+	TLSAuthorizer                app.HostTLSAuthorizer
+	Verifier                     app.Verifier
+	Auth                         AuthService
+	WorkspaceOps                 WorkspaceService
+	WorkspaceSync                WorkspaceSyncService
+	WorkspaceSyncDevices         WorkspaceSyncDeviceService
+	WorkspaceDiff                WorkspaceDiffService
+	WorkspaceCopies              WorkspaceCopyEndpointService
+	WorkspaceTransfers           WorkspaceOwnershipTransferService
+	WorkspaceShares              WorkspaceShareEndpointService
+	Sites                        SiteService
+	Templates                    TemplateReader
+	Tokens                       TokenService
+	ClientLogin                  ClientLoginService
+	Notifications                NotificationService
+	Control                      ControlService
+	ExecutionControl             ExecutionControlService
+	Tasks                        TaskService
+	TaskMedia                    TaskMediaService
+	TaskObservationTickets       TaskWorkbenchObservationTicketService
+	Conversations                ConversationService
+	ProjectConversations         projectConversationRoutesService
+	ProjectWorkItems             projectWorkItemRoutesService
+	ProjectBudget                projectBudgetRoutesService
+	ProjectMCPConnectors         projectMCPConnectorRoutesService
+	ProjectBudgetExecutionReady  bool
+	ConversationAutoRoutingReady bool
+	RuntimeOperationLedger       app.RuntimeOperationLedgerService
+	Projects                     projectRoutesService
+	ProjectContent               projectContentRoutesService
+	ModelConnections             ModelConnectionManager
+	MCPConnectors                MCPConnectorManager
+	ModelGateway                 ModelGateway
+	ModelUsageAdmin              ModelUsageAdmin
+	Hub                          app.HubConnectionService
+	Devices                      deviceService
+	PersonalData                 personalDataService
+	PersonalSync                 personalSyncService
+	Goals                        goalRoutesService
+	Schedules                    scheduleRoutesService
+	PersonalDataQuotaUser        personalDataQuotaUserService
+	PersonalDataQuota            AdminPersonalDataQuotaService
+	PersonalAttachments          *app.PersonalAttachmentService
+	PersonalHistoryImport        *app.PersonalHistoryImportService
+	Onboarding                   OnboardingManager
+	Admin                        AdminService
+	AdminConsole                 AdminConsoleService
+	AdminQualityActivity         AdminQualityActivityService
+	AdminControls                AdminControlsService
+	AdminOperations              AdminOperationsService
+	AdminModelBudgetDefaults     AdminModelBudgetDefaultService
+	AdminModelDefaults           AdminModelDefaultService
+	RecordConsents               RecordConsentService
+	RecordAccess                 RecordAccessService
+	RecordCaptureStatus          RecordCaptureStatusService
+	AdminHostResources           AdminHostResourcesService
+	AdminHostRecovery            AdminHostRecoveryService
+	AdminWorkspaces              AdminWorkspaceService
+	AdminAudit                   AdminAuditWriter
+	Readiness                    ReadinessChecker
+	MCP                          http.Handler
+	MCPDisabled                  bool
 
 	ProjectConversationAttachments projectConversationAttachmentService
 }
@@ -222,6 +223,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	personalDataGroup := group.Group("/personal-data")
 	RegisterPersonalDataQuotaRoute(personalDataGroup, deps.PersonalDataQuotaUser)
 	RegisterPersonalAttachmentRoutes(personalDataGroup, deps.PersonalAttachments)
+	RegisterPersonalOfficePreviewRoute(personalDataGroup)
 	RegisterPersonalHistoryImportRoutes(personalDataGroup, deps.PersonalHistoryImport)
 	h.registerNotifications(group, deps.Notifications)
 	h.registerModelConnections(group)
@@ -251,6 +253,8 @@ func (h *api) limitBody(c *gin.Context) {
 		limit = workspaceSyncJSONBodyLimit
 	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/uploads":
 		limit = personalAttachmentJSONLimit
+	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/office-preview":
+		limit = int64(app.PersonalOfficePreviewMaxBytes)
 	case c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/history/import":
 		limit = personalHistoryImportLimit
 	case c.Request.Method == http.MethodPut && c.FullPath() == "/api/personal-data/uploads/:upload_id/chunks/:sequence":
@@ -439,9 +443,23 @@ func (h *api) checkOrigin(c *gin.Context) {
 			return
 		}
 		mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+		if c.Request.Method == http.MethodPost && c.FullPath() == "/api/personal-data/office-preview" {
+			if err != nil || !isPersonalOfficePreviewMediaType(mediaType) {
+				writeError(c, domain.NewError(domain.CodeForbidden, "content type is not allowed"))
+				c.Abort()
+				return
+			}
+			c.Next()
+			return
+		}
 		expected := "application/json"
-		if c.Request.Method == http.MethodPut && c.FullPath() == "/api/workspaces/:id/sync-sessions/:session_id/blocks/:digest" {
-			expected = "application/octet-stream"
+		if c.Request.Method == http.MethodPut {
+			switch c.FullPath() {
+			case "/api/workspaces/:id/sync-sessions/:session_id/blocks/:digest",
+				"/api/personal-data/uploads/:upload_id/chunks/:sequence",
+				"/api" + projectConversationAttachmentBase + "/chunks/:sequence":
+				expected = "application/octet-stream"
+			}
 		}
 		if err != nil || mediaType != expected {
 			writeError(c, domain.NewError(domain.CodeForbidden, "content type is not allowed"))
@@ -592,7 +610,8 @@ func clientCredentialRoute(method, path string) bool {
 		case "/api/notifications/:id/read", "/api/hosts/:id/enter", "/api/hosts/:id/observation-ticket",
 			"/api/hosts/:id/control/actions", "/api/hosts/:id/control/lease/renew":
 			return true
-		case "/api/personal-data/uploads", "/api/personal-data/uploads/:upload_id/commit", "/api/personal-data/history/import":
+		case "/api/personal-data/uploads", "/api/personal-data/uploads/:upload_id/commit", "/api/personal-data/history/import",
+			"/api/personal-data/office-preview":
 			return true
 		case "/api/me/main-conversation/ensure":
 			return true
@@ -605,6 +624,7 @@ func clientCredentialRoute(method, path string) bool {
 			path == "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id" ||
 			path == "/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id/chunks/:sequence" ||
 			path == "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id" ||
+			path == "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/derivatives" ||
 			path == "/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/chunks/:sequence" ||
 			path == "/api/schedules/:id" || path == "/api/model-connections/:id" || path == "/api/me/main-conversation"
 	case http.MethodPatch:

@@ -152,7 +152,7 @@ test.describe("Portal visible error mock flows", () => {
       });
     });
     try {
-      await page.getByRole("link", { name: "工作目录" }).click();
+      await page.getByRole("navigation", { name: "工作导航" }).getByRole("link", { name: "工作区" }).click();
       const workspace = page.getByRole("row").filter({ hasText: detachedWorkspace.id });
       await workspace.getByRole("button", { name: `删除工作区 ${detachedWorkspace.name}` }).click();
       await page.getByRole("dialog", { name: "删除工作区" }).getByRole("button", { name: "删除工作区" }).click();

@@ -354,7 +354,7 @@ func checkpointMessageContent(raw json.RawMessage) (string, []string, bool) {
 			return "", nil, false
 		}
 		for index, id := range attachmentIDs {
-			if !(personal.ValidPersonalAttachmentID(id) || ValidProjectConversationAttachmentID(id)) || index > 0 && attachmentIDs[index-1] == id {
+			if (!personal.ValidPersonalAttachmentID(id) && !ValidProjectConversationAttachmentID(id)) || index > 0 && attachmentIDs[index-1] == id {
 				return "", nil, false
 			}
 		}

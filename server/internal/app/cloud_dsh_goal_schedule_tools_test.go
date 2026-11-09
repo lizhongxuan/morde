@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -209,6 +210,14 @@ func TestCloudDSHGoalContextAcceptsSubmitScopeButRejectsUnknownScope(t *testing.
 	definition.RequiredScope = identity.Scope("invalid:scope")
 	if _, err := validateAgentTools([]AgentToolDefinition{definition}); err == nil {
 		t.Fatal("unknown scope was accepted")
+	}
+}
+
+func TestCloudDSHGoalReceiptRejectsRevisionOverflow(t *testing.T) {
+	request := CloudDSHGoalReceiptRequest{CallID: "goal_receipt_1", ToolName: cloudDSHGoalUpdateToolName,
+		GoalID: "g_1234", BaseRevision: math.MaxInt64}
+	if _, err := ValidateCloudDSHGoalReceiptEvent([]byte(`{}`), request); err == nil {
+		t.Fatal("goal receipt accepted a base revision that overflows BaseRevision+1")
 	}
 }
 

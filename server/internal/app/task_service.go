@@ -278,11 +278,8 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 			ID: conversationID, OwnerID: principal.UserID, HostID: command.HostID,
 			Title: truncateRunes(strings.TrimSpace(command.Objective), 120),
 		}
-	} else {
-		_, getErr := s.store.GetConversation(ctx, conversationID, principal.UserID)
-		if getErr != nil {
-			return TaskSubmissionResult{}, getErr
-		}
+	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
+		return TaskSubmissionResult{}, err
 	}
 
 	taskID, err := domain.NewTaskID()
