@@ -15,6 +15,7 @@ const CHECKPOINT_TIMEOUT_MS = 30_000
 const TOOL_RESULT_TIMEOUT_MS = 6 * 60_000
 const CHILD_RESULT_TIMEOUT_MS = 6 * 60_000
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+const COORDINATOR_IDENTITY_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
 
 function deferred() {
   let resolve, reject
@@ -28,6 +29,14 @@ function abortError() {
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function exactKeys(value, expected) {
+  return Object.keys(value).sort().join(',') === [...expected].sort().join(',')
+}
+
+function matchesCoordinatorIdentity(frame, identity) {
+  return identity?.context_role === 'coordinator' && COORDINATOR_IDENTITY_FIELDS.every(key => frame[key] === identity[key])
 }
 
 function jpegDimensions(bytes) {
@@ -205,6 +214,10 @@ export class WorkerIPC {
     }
     if (!this.started) throw new Error('runtime has not started')
     if (frame.type === 'cancel') {
+      if (this.startFrame.context_role === 'coordinator' &&
+          (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS]) || !matchesCoordinatorIdentity(frame, this.startFrame))) {
+        throw new Error('invalid coordinator cancellation fence')
+      }
       this.cancel()
       return
     }
@@ -242,6 +255,9 @@ export class WorkerIPC {
     if (frame.type === 'checkpoint_ack') {
       const pending = this.pending.get(frame.id)
       if (!pending || pending.kind !== 'checkpoint_ack') throw new Error('unknown checkpoint response')
+      if (pending.identity.context_role === 'coordinator' &&
+          (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok', 'through_seq', 'sha256']) ||
+            !matchesCoordinatorIdentity(frame, pending.identity))) throw new Error('invalid coordinator checkpoint acknowledgment')
       this.pending.delete(frame.id)
       clearTimeout(pending.timer)
       if (frame.ok !== true || frame.through_seq !== pending.through || frame.sha256 !== pending.digest ||
@@ -255,6 +271,9 @@ export class WorkerIPC {
     if (frame.type === 'checkpoint_page') {
       const pending = this.pending.get(frame.id)
       if (!pending || pending.kind !== 'checkpoint_page') throw new Error('unknown checkpoint page')
+      if (pending.identity.context_role === 'coordinator' &&
+          (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256']) ||
+            !matchesCoordinatorIdentity(frame, pending.identity))) throw new Error('invalid coordinator checkpoint page')
       this.pending.delete(frame.id)
       clearTimeout(pending.timer)
       if (frame.ok !== true || !Object.entries(pending.identity).every(([key, value]) => frame[key] === value)) {
@@ -317,12 +336,24 @@ export class WorkerIPC {
     if (frame.type === 'model_chunk' || frame.type === 'model_end') {
       const cancelledIdentity = this.cancelledModels.get(frame.id)
       if (cancelledIdentity) {
+        if (cancelledIdentity.context_role === 'coordinator' &&
+            (!exactKeys(frame, frame.type === 'model_chunk'
+              ? ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'index', 'chunk']
+              : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, cancelledIdentity))) {
+          throw new Error('invalid coordinator model response identity')
+        }
         if (!Object.entries(cancelledIdentity).every(([key, value]) => frame[key] === value)) throw new Error('invalid model response identity')
         if (frame.type === 'model_end') this.cancelledModels.delete(frame.id)
         return
       }
       const model = this.models.get(frame.id)
       if (!model) throw new Error('unknown model response')
+      if (model.identity.context_role === 'coordinator' &&
+          (!exactKeys(frame, frame.type === 'model_chunk'
+            ? ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'index', 'chunk']
+            : ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok']) || !matchesCoordinatorIdentity(frame, model.identity))) {
+        throw new Error('invalid coordinator model response identity')
+      }
       if (!Object.entries(model.identity).every(([key, value]) => frame[key] === value)) throw new Error('invalid model response identity')
       model.receive(frame)
       return

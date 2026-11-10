@@ -377,6 +377,18 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if err != nil {
 			return err
 		}
+		if !app.ValidConversationRouteModelOutput(decision.ModelOutput) {
+			return domain.InvalidArgument("route_decision", "conversation route model output is invalid")
+		}
+		if decision.Action == app.ConversationRouteReply {
+			if decision.TaskID != "" || decision.ExpectedRevision != 0 || decision.Question != "" ||
+				!app.ValidConversationRouteReply(decision.Reply) {
+				return domain.InvalidArgument("route_decision", "direct conversation reply is invalid")
+			}
+			decision.Reply = strings.TrimSpace(decision.Reply)
+		} else if decision.Reply != "" {
+			return domain.InvalidArgument("route_decision", "reply text is only valid for a direct reply")
+		}
 		modelID := snapshot.Context.ModelID
 		snapshot.Context.ModelID = ""
 		if !reflect.DeepEqual(snapshot, current) {
@@ -391,12 +403,17 @@ available_after=clock_timestamp(),updated_at=clock_timestamp() WHERE message_id=
 		if current.PreviousCycle && decision.Action != app.ConversationRouteClarify {
 			return domain.NewError(domain.CodeConflict, "conversation predecessor chain is invalid")
 		}
-		if decision.Action == app.ConversationRouteNew && app.ConversationRouteHasExplicitControlIntent(current.Context.Content) {
+		if (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) &&
+			app.ConversationRouteHasExplicitControlIntent(current.Context.Content) {
 			if current.Context.ReferenceUnavailable {
 				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
 			} else if current.PreviousMissing {
 				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
 			}
+		}
+		if current.PreviousMissing && decision.Action == app.ConversationRouteReply {
+			decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+				Question: "前一条消息尚未确认，请先处理或重试。", ModelOutput: decision.ModelOutput}
 		}
 		if current.PreviousMissing && decision.Action == app.ConversationRouteNew {
 			var independent bool
@@ -429,6 +446,17 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		switch decision.Action {
 		case app.ConversationRouteNew:
 			return createConversationRouteTask(ctx, tx, claim, modelID)
+		case app.ConversationRouteReply:
+			result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied'
+WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user' AND task_id IS NULL AND delivery_status='pending'`,
+				claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID)
+			if err != nil {
+				return fmt.Errorf("mark directly answered conversation message as applied: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "conversation message is no longer awaiting a direct reply")
+			}
+			return finishConversationRoute(ctx, tx, claim, "routed", decision.Reply, "", true)
 		case app.ConversationRouteUpdate:
 			if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskControl); err != nil {
 				return err
@@ -705,6 +733,16 @@ func finishConversationRoute(ctx context.Context, tx pgx.Tx, claim app.Conversat
 		}
 		if _, err := tx.Exec(ctx, `UPDATE conversation_messages SET task_id=$2,delivery_status=$3 WHERE id=$1`, claim.Message.ID, taskID, status); err != nil {
 			return fmt.Errorf("associate routed message with task: %w", err)
+		}
+	} else if applied {
+		result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied'
+WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user' AND task_id IS NULL AND delivery_status IN ('pending','applied')`,
+			claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID)
+		if err != nil {
+			return fmt.Errorf("mark completed conversation action as applied: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "conversation message is no longer awaiting a completed action")
 		}
 	}
 	if reply != "" {

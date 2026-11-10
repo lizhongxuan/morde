@@ -350,6 +350,80 @@ func TestAccountAgentRuntimeSessionsAreIsolatedByConversation(t *testing.T) {
 	_ = third.process.Output.Close()
 }
 
+type coordinatorRuntimeWriteCounter struct {
+	writes int
+}
+
+func (w *coordinatorRuntimeWriteCounter) Write(value []byte) (int, error) {
+	w.writes++
+	return len(value), nil
+}
+
+func (w *coordinatorRuntimeWriteCounter) Close() error { return nil }
+
+func TestAccountAgentRuntimeRejectsCoordinatorFromDifferentRuntimeSession(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		mutateClaim func(*app.ConversationRouteClaim)
+		mutateFence func(*app.AccountAgentRuntimeFence)
+	}{
+		{
+			name: "conversation",
+			mutateClaim: func(claim *app.ConversationRouteClaim) {
+				claim.Message.ConversationID = "c7654321"
+			},
+		},
+		{
+			name: "owner",
+			mutateClaim: func(claim *app.ConversationRouteClaim) {
+				claim.Message.OwnerID = "u7654321"
+			},
+		},
+		{
+			name: "service instance",
+			mutateFence: func(fence *app.AccountAgentRuntimeFence) {
+				fence.ServiceInstanceID = "00000000-0000-4000-8000-000000000002"
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			claim, _ := coordinatorTestClaimAndContext()
+			if testCase.mutateClaim != nil {
+				testCase.mutateClaim(&claim)
+			}
+			identity := cloudDSHCoordinatorIdentity(claim)
+			runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: claim.ServiceInstanceID,
+				ConversationID: "c1234567", OwnerID: "u1234567", RuntimeID: "runtime_123",
+				RuntimeGeneration: 1, LeaseOwner: "route-worker", LeaseVersion: 1, ExecutionEpoch: 1}
+			if testCase.mutateFence != nil {
+				testCase.mutateFence(&runtimeFence)
+			}
+			writer := &coordinatorRuntimeWriteCounter{}
+			session := &cloudDSHAccountRuntimeSession{
+				runtime: app.AccountAgentRuntime{Fence: runtimeFence, MaxConcurrentTasks: 1},
+				input:   &cloudDSHRuntimeInput{target: writer}, coordinators: make(map[string]*cloudDSHAccountCoordinator),
+				coordinatorSlots: make(chan struct{}, 1),
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			_, err := session.StartCoordinator(ctx, claim, identity, map[string]any{
+				"type": "coordinator_start", "context_role": "coordinator", "conversation_id": identity.ConversationID,
+				"message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID,
+				"agent_id": identity.AgentID, "generation": identity.Generation,
+				"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
+				"model": "p1234567", "tools": []any{}, "system_prompt": "route", "prompt": "hello",
+			})
+			if err == nil {
+				t.Fatal("coordinator from a different Runtime fence was accepted")
+			}
+			if writer.writes != 0 || len(session.coordinators) != 0 || session.coordinatorSequence != 0 {
+				t.Fatalf("rejected coordinator crossed Runtime boundary: writes=%d coordinators=%d sequence=%d",
+					writer.writes, len(session.coordinators), session.coordinatorSequence)
+			}
+		})
+	}
+}
+
 func (s *accountRuntimeSupervisorStub) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
 	s.mu.Lock()
 	s.renewCalls++

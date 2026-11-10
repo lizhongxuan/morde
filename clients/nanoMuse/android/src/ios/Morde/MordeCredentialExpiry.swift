@@ -2643,3 +2643,17 @@ enum MordeCredentialExpiry {
         return max(0, expiry.timeIntervalSince(now))
     }
 }
+
+enum MordePreferredModelPolicy {
+    static func resolve(selectedModelID: String?, availableModelIDs: Set<String>,
+                        administratorDefaultModelID: String?, singleAvailableModelID: String?) -> String? {
+        if let selectedModelID, availableModelIDs.contains(selectedModelID) { return selectedModelID }
+        if let administratorDefaultModelID, availableModelIDs.contains(administratorDefaultModelID) {
+            return administratorDefaultModelID
+        }
+        if let singleAvailableModelID, availableModelIDs.contains(singleAvailableModelID) {
+            return singleAvailableModelID
+        }
+        return nil
+    }
+}

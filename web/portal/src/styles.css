@@ -389,6 +389,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .chat-message-source-task { color: var(--muted); font-size: .68rem; overflow-wrap: anywhere; }
 .task-activity { max-width: min(780px, 92%); justify-self: start; padding: 13px 15px; border: 1px solid #e0e7f0; border-radius: 10px; background: #fbfcfe; }
 .task-activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-activity-heading strong { font-size: .88rem; }
+.task-activity-heading span { color: var(--muted); font-size: .78rem; text-align: right; }
 .task-activity-current { margin: 10px 0 0; color: var(--muted); font-size: .88rem; }
 .task-activity-steps { margin: 10px 0 0; padding: 0; display: grid; gap: 9px; list-style: none; }
 .task-activity-steps li { display: grid; grid-template-columns: 14px minmax(0, 1fr); align-items: start; gap: 8px; }
@@ -400,6 +402,15 @@ tbody tr:last-child td { border-bottom: 0; }
 .task-activity-result strong { font-size: .84rem; }
 .task-activity-result p { margin: 5px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
 .task-activity .notice { margin: 10px 0; }
+.task-activity-k2 { margin-top: 10px; padding: 10px 12px; border: 1px solid #e3e9f2; border-radius: 8px; background: #fff; }
+.task-activity-k2 h4 { margin: 0; font-size: .84rem; }
+.task-activity-k2 ul { margin: 8px 0 0; padding: 0; display: grid; gap: 8px; list-style: none; }
+.task-activity-k2 li { display: grid; gap: 3px; line-height: 1.4; }
+.task-activity-k2 li > span { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.task-activity-k2 small { color: var(--muted); overflow-wrap: anywhere; }
+.task-activity-review p { margin: 7px 0 4px; font-size: .88rem; }
+.task-activity-review details { margin-top: 8px; }
+.task-activity-review details > :last-child { margin-top: 6px; }
 .task-activity-artifact { margin: 10px 0 0; color: var(--muted); font-size: .84rem; }
 .task-activity-link { display: inline-flex; margin-top: 11px; font-size: .84rem; font-weight: 650; text-decoration: none; }
 .task-activity-error, .error-inline { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; color: #8b211a; }

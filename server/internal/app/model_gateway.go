@@ -79,6 +79,8 @@ type ModelCallReservation struct {
 	NeedsVision       bool
 	CallID            string
 	RequestDigest     []byte
+	LegacyCallID      string
+	LegacyDigest      []byte
 	ReservedTokens    int64
 }
 

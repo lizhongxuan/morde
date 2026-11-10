@@ -657,15 +657,26 @@ func serve(ctx context.Context, configPath string) error {
 		if err != nil {
 			return err
 		}
-		taskWorker, err = newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
+		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
 			hubService, workerSuffix, logger)
+		if workerErr != nil {
+			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
+		}
+		taskWorker = cloudDSHWorkers.taskWorker
+		coordinatorCheckpoints, err := app.NewConversationCoordinatorCheckpointService(store, sealer)
 		if err != nil {
-			return fmt.Errorf("initialize cloud dsh task worker: %w", err)
+			return err
+		}
+		coordinator, err := worker.NewCloudDSHConversationCoordinator(worker.CloudDSHConversationCoordinatorOptions{
+			AccountRuntimes: cloudDSHWorkers.accountRuntimes, Models: modelGateway, Checkpoints: coordinatorCheckpoints,
+		})
+		if err != nil {
+			return err
 		}
 		routeWorker, err = worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
-			Queue: store, Actions: store, Models: modelGateway, WorkerID: workerSuffix + "-route",
+			Queue: store, Actions: store, Models: coordinator, WorkerID: workerSuffix + "-route",
 			LeaseDuration: 2 * time.Minute, PollInterval: 500 * time.Millisecond,
 			MaxConcurrent: min(cfg.CloudDSH.MaxConcurrentTasks, 16), Logger: logger,
 		})
@@ -835,12 +846,17 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 	}
 }
 
+type cloudDSHTaskWorkerBundle struct {
+	taskWorker      *worker.TaskWorker
+	accountRuntimes *worker.CloudDSHAccountRuntimeManager
+}
+
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
 	runtimeControl *app.RuntimeControl, workspaceSync *app.WorkspaceSyncService, models *app.ModelGatewayService,
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
-	workerID string, logger *zap.Logger) (*worker.TaskWorker, error) {
+	workerID string, logger *zap.Logger) (*cloudDSHTaskWorkerBundle, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -934,11 +950,15 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	return worker.NewTaskWorker(worker.TaskWorkerOptions{
+	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
 		Store: store, Executor: executor, Lifecycle: accountRuntimes.Run, WorkerID: workerID + "-task",
 		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond,
 		MaxConcurrentTasks: cfg.MaxConcurrentTasks, MaxConcurrentTasksPerOwner: cfg.MaxConcurrentPerOwner, Logger: logger,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &cloudDSHTaskWorkerBundle{taskWorker: taskWorker, accountRuntimes: accountRuntimes}, nil
 }
 
 func migrate(ctx context.Context, configPath, action string, stdout io.Writer) error {

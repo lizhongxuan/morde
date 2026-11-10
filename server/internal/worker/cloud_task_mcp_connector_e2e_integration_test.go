@@ -200,6 +200,13 @@ func newF02MCPWorkspaceFixture(t *testing.T, ctx context.Context) f02MCPWorkspac
 		t.Fatal(err)
 	}
 	host, _, _ := createF01Host(t, ctx, store, sealer, owner.ID, value.ID)
+	if err := store.SetRuntimeInstanceID(ctx, host.ID, host.RuntimeGeneration, host.ControlVersion, "",
+		"mcp-test-runtime-"+host.ID); err != nil {
+		t.Fatalf("record authenticated Host runtime identity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_state='ai' WHERE id=$1`, host.ID); err != nil {
+		t.Fatalf("enable AI control for the local Host runtime fixture: %v", err)
+	}
 	if _, err := store.TransitionWorkspaceBinding(ctx, host.ID, value.ID, 1, workspace.BindingPreparing, workspace.BindingActive, 0, 0); err != nil {
 		t.Fatal(err)
 	}

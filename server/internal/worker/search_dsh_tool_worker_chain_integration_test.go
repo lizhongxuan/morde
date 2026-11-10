@@ -197,7 +197,7 @@ func TestDSHSearchReadThroughBrokerPersistsSourceDateAndWorkChain(t *testing.T) 
 	var model *searchDSHNewsModel
 	run := runSearchDSHWorkerTask(t, "Search for a recent AI research announcement, read its source, and cite its publication date.",
 		"morde-search-read-news-worker-e2e-2026-11-09", "morde-search-read-news-worker-e2e", adapter,
-		searchDSHNoCredentialProvider{}, nil,
+		nil, nil,
 		func(taskID string) CloudDSHModels {
 			model = &searchDSHNewsModel{taskID: taskID}
 			return model

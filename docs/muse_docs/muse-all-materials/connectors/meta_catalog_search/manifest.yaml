@@ -1,0 +1,33 @@
+version: 1
+metadata:
+  visible_in_settings: true
+auth: none
+connector: meta_catalog_search
+category: social
+display_name: Shopping search
+description: Enable Muse shopping with faster results and more choice
+icon: meta_catalog_search
+actions:
+  read:
+    default: allow
+    label: Read permissions
+    methods:
+      catalog.search:
+        label: Search
+        approval_phrase: search Meta's product catalog
+consent_screen:
+  bullets:
+    - icon: info
+      title: "You choose what Muse can do"
+      text: "By default, Muse will ask before taking actions it thinks need review. Disconnect at any time in Settings."
+    - icon: caution
+      title: "Keep an eye on things"
+      text: "Muse may take unexpected actions. Monitor it carefully."
+  callout_title: "Non-confidential connector"
+  footer_paragraphs:
+    - text: "Shopping search works by connecting through Meta, which means the info exchanged will be visible to Meta. [Learn more](https://muse.ai/privacy)"
+      variants:
+        confidential_vm:
+          text: "Shopping search works by connecting through Meta, which means the info exchanged will be visible to Meta. [Learn more](https://muse.ai/privacy)"
+          placement: callout
+    - text: "Muse will exchange info with Meta. To learn more, view Meta's [terms](https://www.facebook.com/legal/terms) and [privacy policy](https://www.facebook.com/privacy/policy/)."

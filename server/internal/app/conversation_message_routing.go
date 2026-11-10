@@ -33,6 +33,7 @@ type AcceptConversationMessageCommand struct {
 // ConversationRoutingInput contains only the immutable options needed after receipt.
 type ConversationRoutingInput struct {
 	ProjectID               string      `json:"project_id,omitempty"`
+	ResultReviewID          string      `json:"result_review_id,omitempty"`
 	PreviousClientMessageID string      `json:"previous_client_message_id,omitempty"`
 	ReferenceTaskID         string      `json:"reference_task_id,omitempty"`
 	ModelID                 string      `json:"model_id,omitempty"`

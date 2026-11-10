@@ -1,0 +1,68 @@
+version: 1
+gating:
+  allowed_countries: [US, PR]
+metadata:
+  visible_in_settings: true
+auth:
+  client_id: "8aa2cb16-4c3e-4fec-a267-ff8719e55c1a"
+  provider: expedia
+  required: false
+cli:
+  binary: expedia
+  skill: expedia
+connector: expedia
+display_name: Expedia
+icon: expedia
+description: Search, book, and retrieve Expedia lodging.
+request_quota:
+  mode: enforce
+  workers: [expedia]
+  # CAGI caps each user's Expedia requests at 30 in any trailing minute and
+  # 915 per hour, then rejects for the rest of that window. This bucket stops a
+  # runaway loop first: a full bucket plus a minute of refill stays at 27, and
+  # an hour at 735, so no separate hourly cap is needed. The burst covers a
+  # search plus several hotel panel opens, each a quote and details.
+  queries_per_minute: 12
+  burst: 15
+actions:
+  read:
+    default: allow
+    label: Read
+    response_guard: verification_codes
+    methods:
+      profile.read:
+        label: read your expedia profile
+        approval_phrase: read your expedia profile
+      lodging.browse:
+        label: Browse Lodging
+        approval_phrase: browse Expedia lodging
+      lodging.booking.read:
+        label: Read my bookings
+        approval_phrase: read your Expedia lodging bookings
+cli_subcommands:
+  - profile
+  - search
+  - property-details
+  - quote
+  - validate-booking
+  - book
+  - booking-status
+consent_screen:
+  bullets:
+    - icon: data_types
+      title: "Level up with Expedia"
+      text: "Muse will access things like your member profile, member prices and hotel bookings."
+    - icon: info
+      title: "You choose what Muse can do"
+      text: "By default, Muse will ask before taking actions it thinks need review. Disconnect at any time in Settings."
+    - icon: caution
+      title: "Keep an eye on things"
+      text: "Muse may take unexpected actions. Monitor it carefully."
+  callout_title: "Non-confidential connector"
+  footer_paragraphs:
+    - text: "The info used for your tasks is part of your interactions with Muse, which we may use to improve AI at Meta. You can manage this in Settings. [Learn more](https://muse.ai/privacy)"
+      variants:
+        confidential_vm:
+          text: "Expedia works by connecting through Meta, which means the info exchanged is visible to Meta. [Learn more](https://muse.ai/privacy)"
+          placement: callout
+    - "Muse will exchange info with Expedia. To learn more, view their [terms](https://www.expedia.com/lp/lg-terms) and [privacy policy](https://www.expedia.com/lp/lg-privacy)."

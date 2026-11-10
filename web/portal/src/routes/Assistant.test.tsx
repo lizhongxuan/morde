@@ -68,9 +68,19 @@ const task = {
   model_id: model.id, objective: message.content, status: 'completed' as const, event_sequence: 0, current_step: null,
   step_count: 0, completed_step_count: 0,
   budget: { active_seconds: 600, tool_calls: 10, model_tokens: 1000 }, usage: { active_seconds: 2, tool_calls: 0, model_tokens: 12 },
+  dependencies: [], child_jobs: [], result_review: null,
   created_at: timestamp, updated_at: timestamp, result: reply.content, waiting_reason: null, steps: [], batch_items: [],
   artifacts: [], pending_request: null, clarification_request: null, stop_request: null, assistant_message: null, finished_at: timestamp,
 } satisfies Awaited<ReturnType<typeof portalApi.task>>;
+
+// Older server snapshots predate the required K2 projection fields.
+function asLegacyTask(value: Task): Task {
+  const legacy: Record<string, unknown> = { ...value };
+  delete legacy.dependencies;
+  delete legacy.child_jobs;
+  delete legacy.result_review;
+  return legacy as unknown as Task;
+}
 let acceptedMessageSequence = 0;
 
 function acceptedReceipt(conversationID: string, body: AcceptConversationMessageRequest): Awaited<ReturnType<typeof portalApi.acceptConversationMessage>> {
@@ -928,13 +938,13 @@ describe('Assistant durable tasks', () => {
 
   it('recovers a streaming assistant message from the Task snapshot after conversation history expires', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    vi.spyOn(portalApi, 'task').mockResolvedValue({
+    vi.spyOn(portalApi, 'task').mockResolvedValue(asLegacyTask({
       ...task, status: 'running', result: null, finished_at: null,
       assistant_message: {
         id: 'm8765432', conversation_id: conversation.id, sequence: 2, task_id: task.id, role: 'assistant',
         content: 'A persisted partial answer', status: 'streaming', created_at: timestamp,
       },
-    });
+    }));
     const user = userEvent.setup();
     renderPage();
 
@@ -945,7 +955,7 @@ describe('Assistant durable tasks', () => {
 
   it('shows a completed task result as the answer when no assistant message was saved', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, result: '已完成整理。' });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(asLegacyTask({ ...task, result: '已完成整理。' }));
     renderPage();
 
     const answer = await screen.findByText('已完成整理。');
@@ -1005,12 +1015,12 @@ describe('Assistant durable tasks', () => {
   });
 
   it('deduplicates a snapshot against the same committed conversation message', () => {
-    const merged = mergeTaskAssistantMessage([reply], {
+    const merged = mergeTaskAssistantMessage([reply], asLegacyTask({
       ...task, status: 'running', result: null, finished_at: null,
       assistant_message: {
         ...reply, status: 'streaming',
       },
-    });
+    }));
     expect(merged).toHaveLength(1);
     expect(merged[0]?.content).toBe(reply.content);
     expect(merged[0]?.snapshotStatus).toBe('completed');
@@ -1018,7 +1028,7 @@ describe('Assistant durable tasks', () => {
 
   it('places an unsequenced streaming snapshot after accepted conversation messages', () => {
     const snapshot = { ...reply, id: 'msnapshot1', sequence: undefined, status: 'streaming' as const };
-    const merged = mergeTaskAssistantMessage([message], { ...task, assistant_message: snapshot });
+    const merged = mergeTaskAssistantMessage([message], asLegacyTask({ ...task, assistant_message: snapshot }));
 
     expect(merged).toHaveLength(2);
     expect(merged[1]).toMatchObject({ id: snapshot.id, sequence: 2, snapshotStatus: 'completed' });
@@ -1029,10 +1039,10 @@ describe('Assistant durable tasks', () => {
       { user_message_id: message.id, task_id: task.id, task_revision: 2, event_sequence: 5, content: reply.content },
     ] };
     const snapshot = { ...reply, id: 'msnapshot', status: 'completed' as const, task_revision: 2, result_event_sequence: 5 };
-    expect(mergeTaskAssistantMessage([combined], { ...task, assistant_message: snapshot })).toHaveLength(1);
-    expect(mergeTaskAssistantMessage([combined], { ...task, assistant_message: { ...snapshot, task_revision: 3 } })).toHaveLength(2);
-    expect(mergeTaskAssistantMessage([combined], { ...task, assistant_message: { ...snapshot, result_event_sequence: 6 } })).toHaveLength(2);
-    expect(mergeTaskAssistantMessage([combined], { ...task, assistant_message: { ...snapshot, result_event_sequence: undefined } })).toHaveLength(2);
+    expect(mergeTaskAssistantMessage([combined], asLegacyTask({ ...task, assistant_message: snapshot }))).toHaveLength(1);
+    expect(mergeTaskAssistantMessage([combined], asLegacyTask({ ...task, assistant_message: { ...snapshot, task_revision: 3 } }))).toHaveLength(2);
+    expect(mergeTaskAssistantMessage([combined], asLegacyTask({ ...task, assistant_message: { ...snapshot, result_event_sequence: 6 } }))).toHaveLength(2);
+    expect(mergeTaskAssistantMessage([combined], asLegacyTask({ ...task, assistant_message: { ...snapshot, result_event_sequence: undefined } }))).toHaveLength(2);
   });
 
   it('renders each combined reply segment with its originating message and Task revision', async () => {
@@ -1064,15 +1074,15 @@ describe('Assistant durable tasks', () => {
     const saved = { ...reply, id: 'mstream01', content: '前缀', sequence: 4,
       output_status: 'streaming' as const, output_task_revision: 2 };
     const snapshot = { ...reply, id: saved.id, content: '前缀和后续', status: 'streaming' as const, task_revision: 2 };
-    const merged = mergeTaskAssistantMessage([saved], { ...task, assistant_message: snapshot });
+    const merged = mergeTaskAssistantMessage([saved], asLegacyTask({ ...task, assistant_message: snapshot }));
     expect(merged).toHaveLength(1);
     expect(merged[0]).toMatchObject({ sequence: 4, content: '前缀和后续', snapshotStatus: 'completed' });
 
     const interrupted = { ...saved, output_status: 'interrupted' as const };
-    expect(mergeTaskAssistantMessage([interrupted], { ...task, assistant_message: snapshot })[0])
+    expect(mergeTaskAssistantMessage([interrupted], asLegacyTask({ ...task, assistant_message: snapshot }))[0])
       .toMatchObject({ sequence: 4, content: '前缀', snapshotStatus: 'interrupted' });
     expect(mergeTaskAssistantMessage([interrupted], undefined)[0]?.snapshotStatus).toBe('interrupted');
-    expect(mergeTaskAssistantMessage([saved], { ...task, assistant_message: { ...snapshot, task_revision: 3 } })[0]?.content).toBe('前缀');
+    expect(mergeTaskAssistantMessage([saved], asLegacyTask({ ...task, assistant_message: { ...snapshot, task_revision: 3 } }))[0]?.content).toBe('前缀');
   });
 
   it('does not render a final Task result while its conversation reply is pending or already published', async () => {
@@ -1080,21 +1090,200 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, result_message_pending: true });
     renderPage();
     expect(await screen.findByText('任务已完成，正在整理回复。')).toBeInTheDocument();
-    expect(screen.queryByText(reply.content)).not.toBeInTheDocument();
+    const rawResult = screen.getByRole('region', { name: `任务 ${task.id} 的原始结果` });
+    expect(within(rawResult).getByText(reply.content)).toBeInTheDocument();
+    expect(Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent))
+      .not.toEqual(expect.arrayContaining([expect.stringContaining(reply.content)]));
     const snapshot = { ...reply, status: 'completed' as const, task_revision: 0, result_event_sequence: 5 };
-    expect(mergeTaskAssistantMessage([], { ...task, assistant_message: snapshot, result_message_pending: true })).toHaveLength(0);
-    expect(mergeTaskAssistantMessage([], { ...task, assistant_message: snapshot, result_message_published: true })).toHaveLength(0);
-    expect(mergeTaskAssistantMessage([], { ...task, assistant_message: { ...snapshot, status: 'streaming' }, result_message_pending: true })).toHaveLength(1);
+    expect(mergeTaskAssistantMessage([], { ...task, current_revision: 0, assistant_message: snapshot, result_message_pending: true })).toHaveLength(0);
+    expect(mergeTaskAssistantMessage([], { ...task, current_revision: 0, assistant_message: snapshot, result_message_published: true })).toHaveLength(0);
+    expect(mergeTaskAssistantMessage([], asLegacyTask({ ...task, current_revision: 0,
+      assistant_message: { ...snapshot, status: 'streaming' }, result_message_pending: true }))).toHaveLength(1);
     const oldInterrupted = { ...snapshot, id: 'moldreply', status: 'interrupted' as const, task_revision: 0, result_event_sequence: undefined };
     const newReply = { ...reply, id: 'mnewreply', sources: [{ user_message_id: message.id, task_id: task.id,
       task_revision: 1, event_sequence: 7, content: reply.content }] };
-    expect(mergeTaskAssistantMessage([], { ...task, current_revision: 1, assistant_message: oldInterrupted, result_message_pending: true })).toHaveLength(1);
-    expect(mergeTaskAssistantMessage([newReply], { ...task, current_revision: 1, assistant_message: oldInterrupted, result_message_published: true })).toHaveLength(2);
+    expect(mergeTaskAssistantMessage([], asLegacyTask({ ...task, current_revision: 1, assistant_message: oldInterrupted, result_message_pending: true }))).toHaveLength(1);
+    expect(mergeTaskAssistantMessage([newReply], asLegacyTask({ ...task, current_revision: 1, assistant_message: oldInterrupted, result_message_published: true }))).toHaveLength(2);
+  });
+
+  it('shows K2 task dependencies, child outcomes, and result review without promoting raw results', async () => {
+    const secondMessage = { ...message, id: 'm2345678', sequence: 3, task_id: 'q7654321', content: '并发任务 B' };
+    const thirdMessage = { ...message, id: 'm3456789', sequence: 5, task_id: 'q8901234', content: '依赖任务 C' };
+    const firstTask = {
+      ...task, status: 'completed' as const, current_revision: 2, desired_revision: 2, result: 'Task A 原始结果',
+      child_jobs: [
+        { job_id: 'child-a-done', task_step_id: 's1234567', title: '整理来源 A', task_revision: 2, status: 'succeeded' },
+        { job_id: 'child-a-failed', task_step_id: 's2345678', title: '校验来源 B', task_revision: 2, status: 'failed' },
+      ],
+      dependencies: [],
+      result_review: { state: 'failed', source_task_id: task.id, source_task_revision: 2, source_event_sequence: 7, reply_message_id: null },
+    } as unknown as Task;
+    const secondTask = {
+      ...task, id: secondMessage.task_id, status: 'completed' as const, current_revision: 2, desired_revision: 3,
+      result: 'Task B 原始结果', child_jobs: [
+        { job_id: 'child-b-done', task_step_id: 's3456789', title: '搜索资料', task_revision: 2, status: 'succeeded' },
+      ],
+      dependencies: [],
+      result_review: { state: 'processing', source_task_id: secondMessage.task_id, source_task_revision: 2, source_event_sequence: 9, reply_message_id: null },
+    } as unknown as Task;
+    const thirdTask = {
+      ...task, id: thirdMessage.task_id, status: 'queued' as const, current_revision: 0, desired_revision: 1, result: null,
+      dependencies: [{ task_id: secondTask.id, required_revision: 3, task_status: 'completed', satisfied: false }],
+      child_jobs: [], result_review: null,
+    } as unknown as Task;
+    const taskSnapshots = new Map([[firstTask.id, firstTask], [secondTask.id, secondTask], [thirdTask.id, thirdTask]]);
+    mockCommon({ conversations: [conversation], messages: [message, secondMessage, thirdMessage] });
+    vi.mocked(portalApi.task).mockImplementation(async (id) => taskSnapshots.get(id) ?? task);
+    const user = userEvent.setup();
+    renderPage();
+
+    const firstPanel = await screen.findByRole('region', { name: `任务 ${firstTask.id} 的工作过程` });
+    const secondPanel = await screen.findByRole('region', { name: `任务 ${secondTask.id} 的工作过程` });
+    const thirdPanel = await screen.findByRole('region', { name: `任务 ${thirdTask.id} 的工作过程` });
+    expect(firstPanel).toHaveTextContent('服务端状态：已完成 · 修订 2 / 2');
+    expect(within(firstPanel).getByRole('region', { name: `任务 ${firstTask.id} 的子任务` })).toHaveTextContent('整理来源 A已完成');
+    expect(within(firstPanel).getByRole('region', { name: `任务 ${firstTask.id} 的子任务` })).toHaveTextContent('校验来源 B失败');
+    expect(within(firstPanel).getByRole('region', { name: `任务 ${firstTask.id} 的结果整理` }))
+      .toHaveTextContent('结果整理失败；原始任务结果仍保留，尚未发布最终回复。');
+    expect(within(secondPanel).getByRole('region', { name: `任务 ${secondTask.id} 的结果整理` }))
+      .toHaveTextContent('主助手正在整理原始结果。');
+    expect(within(thirdPanel).getByRole('region', { name: `任务 ${thirdTask.id} 的依赖` }))
+      .toHaveTextContent('等待任务 q7654321 修订 3（当前状态：已完成）');
+    expect(thirdPanel).toHaveTextContent('服务端状态：排队中 · 修订 0 / 1');
+
+    await user.click(within(firstPanel).getByText('查看 Task 原始结果（不是最终回复）'));
+    expect(within(firstPanel).getByText('Task A 原始结果')).toBeInTheDocument();
+    expect(Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent))
+      .not.toEqual(expect.arrayContaining([expect.stringContaining('Task A 原始结果'), expect.stringContaining('Task B 原始结果')]));
+
+    const composer = screen.getByRole('textbox', { name: '消息内容' });
+    expect(composer).toBeEnabled();
+    await user.type(composer, '继续处理另一项');
+    expect(composer).toHaveValue('继续处理另一项');
+  });
+
+  it('shows the second parallel Task result while the first Task is still being reviewed', async () => {
+    const secondMessage = { ...message, id: 'm2345678', sequence: 2, task_id: 'q7654321', content: '并发任务 B' };
+    const finalReply = { ...reply, id: 'm3456789', sequence: 3, task_id: undefined, content: '任务 B 的汇总回复', sources: [{
+      user_message_id: secondMessage.id, task_id: secondMessage.task_id!, task_revision: 1, event_sequence: 9, content: '任务 B 的汇总回复',
+    }] };
+    const firstTask = {
+      ...task, status: 'running' as const, result: '任务 A 的原始结果', current_revision: 1, desired_revision: 1,
+      dependencies: [], child_jobs: [{ job_id: 'child-a', task_step_id: 's1234567', title: '任务 A 子工作', task_revision: 1, status: 'running' }],
+      result_review: { state: 'processing', source_task_id: task.id, source_task_revision: 1, source_event_sequence: 7, reply_message_id: null },
+    } as unknown as Task;
+    const secondTask = {
+      ...task, id: secondMessage.task_id, status: 'completed' as const, result: '任务 B 的原始结果', current_revision: 1, desired_revision: 1,
+      dependencies: [], child_jobs: [{ job_id: 'child-b', task_step_id: 's2345678', title: '任务 B 子工作', task_revision: 1, status: 'succeeded' }],
+      result_review: { state: 'published', source_task_id: secondMessage.task_id, source_task_revision: 1, source_event_sequence: 9, reply_message_id: finalReply.id },
+      assistant_message: { ...finalReply, task_id: secondMessage.task_id, task_revision: 1, result_event_sequence: 9, status: 'completed' as const },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [message, secondMessage, finalReply] });
+    vi.mocked(portalApi.task).mockImplementation(async (id) => id === secondTask.id ? secondTask : firstTask);
+    renderPage();
+
+    const firstPanel = await screen.findByRole('region', { name: `任务 ${firstTask.id} 的工作过程` });
+    const secondPanel = await screen.findByRole('region', { name: `任务 ${secondTask.id} 的工作过程` });
+    expect(within(firstPanel).getByRole('region', { name: `任务 ${firstTask.id} 的结果整理` }))
+      .toHaveTextContent('主助手正在整理原始结果。');
+    expect(within(secondPanel).getByRole('region', { name: `任务 ${secondTask.id} 的结果整理` }))
+      .toHaveTextContent('最终回复已同步到会话。');
+    expect(await screen.findByText('任务 B 的汇总回复')).toBeInTheDocument();
+    const assistantReplies = Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent ?? '');
+    expect(assistantReplies.some((content) => content.includes('任务 A 的原始结果') || content.includes('任务 B 的原始结果'))).toBe(false);
+  });
+
+  it('does not report a published reply as synced when its source revision does not match', async () => {
+    const publishedTask = {
+      ...task, current_revision: 1, desired_revision: 1, result: 'Task 原始结果',
+      dependencies: [], child_jobs: [],
+      result_review: { state: 'published', source_task_id: task.id, source_task_revision: 1,
+        source_event_sequence: 4, reply_message_id: 'mfinal001' },
+    } as unknown as Task;
+    const staleReply = { ...reply, id: 'mfinal001', sequence: 3, task_id: undefined, content: '旧修订的消息',
+      sources: [{ user_message_id: message.id, task_id: task.id, task_revision: 0, event_sequence: 3, content: '旧修订的消息' }] };
+    mockCommon({ conversations: [conversation], messages: [message, staleReply] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(publishedTask);
+    renderPage();
+
+    const panel = await screen.findByRole('region', { name: `任务 ${task.id} 的工作过程` });
+    expect(within(panel).getByRole('region', { name: `任务 ${task.id} 的结果整理` }))
+      .toHaveTextContent('最终回复已发布，正在从会话历史补取。');
+  });
+
+  it.each([
+    ['pending', '原始结果已保存，等待主助手整理。'],
+    ['published', '最终回复已发布，正在从会话历史补取。'],
+  ] as const)('does not present a %s K2 review result as a final assistant reply', async (state, reviewText) => {
+    const reviewTask = {
+      ...task, current_revision: 1, desired_revision: 1, result: '仅属于 Task 的原始结果',
+      dependencies: [], child_jobs: [],
+      result_review: {
+        state, source_task_id: task.id, source_task_revision: 1, source_event_sequence: 4,
+        reply_message_id: state === 'published' ? 'mfinal001' : null,
+      },
+      assistant_message: { ...reply, id: 'msnapshot1', task_revision: 1, result_event_sequence: 4, status: 'completed' as const },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.mocked(portalApi.task).mockResolvedValue(reviewTask);
+    renderPage();
+
+    const panel = await screen.findByRole('region', { name: `任务 ${task.id} 的工作过程` });
+    expect(within(panel).getByRole('region', { name: `任务 ${task.id} 的结果整理` })).toHaveTextContent(reviewText);
+    expect(mergeTaskAssistantMessage([], reviewTask)).toHaveLength(0);
+    if (state === 'published') {
+      const publishedReply = { ...reply, id: 'mfinal001', sources: [{ user_message_id: message.id, task_id: task.id,
+        task_revision: 1, event_sequence: 4, content: reply.content }] };
+      expect(mergeTaskAssistantMessage([publishedReply], reviewTask)).toHaveLength(1);
+    }
+    const assistantReplies = Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent ?? '');
+    expect(assistantReplies.some((content) => content.includes('仅属于 Task 的原始结果'))).toBe(false);
+  });
+
+  it('does not merge a completed Task snapshot when its K2 projection is malformed', () => {
+    const invalidTask = { ...task, dependencies: [], assistant_message: {
+      ...reply, id: 'msnapshot-invalid', task_revision: 1, result_event_sequence: 4, status: 'completed' as const,
+    } } as unknown as Task;
+    expect(mergeTaskAssistantMessage([], invalidTask)).toHaveLength(0);
+  });
+
+  it('does not merge a streaming K2 Task snapshot from an older revision', () => {
+    const staleTask = {
+      ...task, status: 'running' as const, current_revision: 3, desired_revision: 3,
+      dependencies: [], child_jobs: [], result_review: null,
+      assistant_message: { ...reply, id: 'msnapshot-old-revision', task_revision: 2,
+        result_event_sequence: 6, status: 'streaming' as const },
+    } as unknown as Task;
+    const currentSnapshotTask = {
+      ...staleTask, current_revision: 2, desired_revision: 3,
+      assistant_message: { ...staleTask.assistant_message!, id: 'msnapshot-current-revision', task_revision: 2 },
+    } as unknown as Task;
+
+    expect(mergeTaskAssistantMessage([], staleTask)).toHaveLength(0);
+    expect(mergeTaskAssistantMessage([], currentSnapshotTask)).toHaveLength(1);
+  });
+
+  it('keeps a Task result inspectable but never promotes it when K2 review is not published', async () => {
+    const unreviewedTask = {
+      ...task, status: 'completed' as const, current_revision: 1, desired_revision: 1, result: '尚未整理的 Task 原始结果',
+      dependencies: [], child_jobs: [], result_review: null,
+      assistant_message: { ...reply, id: 'msnapshot-unreviewed', task_revision: 1, result_event_sequence: 4, status: 'completed' as const },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(unreviewedTask);
+    renderPage();
+
+    const panel = await screen.findByRole('region', { name: `任务 ${task.id} 的工作过程` });
+    const rawResult = within(panel).getByRole('region', { name: `任务 ${task.id} 的原始结果` });
+    expect(within(rawResult).getByText('查看 Task 原始结果（不是最终回复）')).toBeInTheDocument();
+    expect(mergeTaskAssistantMessage([], unreviewedTask)).toHaveLength(0);
+    expect(Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent))
+      .not.toEqual(expect.arrayContaining([expect.stringContaining('尚未整理的 Task 原始结果')]));
   });
 
   it('shows a failed task snapshot as interrupted instead of still generating', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const failedTask = {
+    const failedTask = asLegacyTask({
       ...task,
       status: 'failed' as const,
       result: null,
@@ -1103,7 +1292,7 @@ describe('Assistant durable tasks', () => {
         id: 'm2345678', conversation_id: conversation.id, sequence: 2, task_id: task.id,
         role: 'assistant' as const, content: '部分回复', status: 'streaming' as const, created_at: timestamp,
       },
-    };
+    });
     vi.spyOn(portalApi, 'task').mockResolvedValue(failedTask);
     renderPage();
 
@@ -1123,9 +1312,9 @@ describe('Assistant durable tasks', () => {
       ...message, id: streamedSnapshot.id, sequence: streamedSnapshot.sequence, role: 'assistant' as const,
       content: '部分回复', output_status: 'streaming' as const, output_task_revision: 0,
     };
-    const failedTask = {
+    const failedTask = asLegacyTask({
       ...task, status: 'failed' as const, assistant_message: streamedSnapshot,
-    };
+    });
 
     expect(mergeTaskAssistantMessage([persistedPrefix], failedTask)[0]?.snapshotStatus).toBe('interrupted');
   });
@@ -1229,6 +1418,41 @@ describe('Assistant durable tasks', () => {
     expect(invalidate).toHaveBeenCalledTimes(calls);
   });
 
+  it('keeps the current Task revision when a late older-revision event arrives', async () => {
+    const currentTask = {
+      ...task, status: 'running' as const, result: null, finished_at: null, event_sequence: 10,
+      current_revision: 3, desired_revision: 3, current_revision_started: true,
+      dependencies: [], child_jobs: [{ job_id: 'child-current', task_step_id: 's1234567', title: '当前修订工作', task_revision: 3, status: 'running' }],
+      result_review: null,
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const getTask = vi.mocked(portalApi.task).mockResolvedValue(currentTask);
+    const sources: Array<{ listeners: Map<string, EventListener> }> = [];
+    class TestEventSource {
+      onopen: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      listeners = new Map<string, EventListener>();
+      constructor(public url: string) { sources.push(this); }
+      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener); }
+      close() {}
+    }
+    vi.stubGlobal('EventSource', TestEventSource);
+    const { client } = renderPage();
+    await waitFor(() => expect(sources).toHaveLength(1));
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+
+    await act(async () => sources[0]?.listeners.get('task.result')?.(new MessageEvent('task.result', { data: JSON.stringify({
+      task_id: task.id, sequence: 11, task_revision: 2, status: 'completed', result: '旧修订结果不能覆盖当前任务',
+    }) })));
+
+    await waitFor(() => expect(getTask.mock.calls.length).toBeGreaterThan(1));
+    const panel = await screen.findByRole('region', { name: `任务 ${task.id} 的工作过程` });
+    expect(panel).toHaveTextContent('服务端状态：运行中 · 修订 3 / 3');
+    expect(panel).toHaveTextContent('当前修订工作');
+    expect(panel).not.toHaveTextContent('旧修订结果不能覆盖当前任务');
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['task', task.id] });
+  });
+
   it('keeps two task workchains and the selected stop action isolated', async () => {
     const firstOutput = { ...reply, id: 'm2345678', sequence: 2, content: '第一项任务已完成首轮建议。',
       output_status: 'completed' as const, output_task_revision: 1 };
@@ -1288,7 +1512,7 @@ describe('Assistant durable tasks', () => {
     await user.selectOptions(stopTarget, firstTask.id);
     await user.click(within(composer).getByRole('button', { name: '停止任务' }));
     await waitFor(() => expect(stop).toHaveBeenCalledWith(firstTask.id,
-      { action: 'cancel', expected_status: 'waiting_user' }, expect.any(String)));
+      { action: 'cancel', expected_status: 'waiting_user', expected_current_revision: 1, expected_desired_revision: 1 }, expect.any(String)));
     expect(await within(firstPanel).findByText('正在等待服务端确认停止结果。')).toBeInTheDocument();
     expect(within(secondPanel).getByText('AI 正在处理…')).toBeInTheDocument();
     expect(snapshots.get(secondTask.id)?.status).toBe('running');
@@ -1403,7 +1627,7 @@ describe('Assistant durable tasks', () => {
         created_at: timestamp,
       }] };
     const cancelled = { ...interrupted, status: 'cancelled' as const, waiting_reason: null, finished_at: timestamp };
-    vi.spyOn(portalApi, 'task').mockResolvedValueOnce(interrupted).mockResolvedValue(cancelled);
+    vi.spyOn(portalApi, 'task').mockResolvedValueOnce(interrupted).mockResolvedValueOnce(interrupted).mockResolvedValue(cancelled);
     const stop = vi.spyOn(portalApi, 'taskAction').mockResolvedValue({
       task_id: task.id, action: 'cancel', status: 'cancelled', unsettled_operation_ids: [],
     });
@@ -1547,7 +1771,26 @@ describe('Assistant durable tasks', () => {
     expect(respond.mock.calls[1]?.[3]).toBe(respond.mock.calls[0]?.[3]);
   });
 
-  it('refreshes the task and prompts before retrying a stale approval', async () => {
+  it('prevents duplicate approval calls while the first response is pending', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件' };
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'approval', pending_request: approval, finished_at: null });
+    const response = { task_id: task.id, action: 'respond', status: 'queued' as const, unsettled_operation_ids: [] };
+    let release!: (value: typeof response) => void;
+    const pending = new Promise<typeof response>((resolve) => { release = resolve; });
+    const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockImplementation(() => pending);
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /你好/ }));
+    const approve = await screen.findByRole('button', { name: '批准并继续' });
+    await user.click(approve);
+    expect(approve).toBeDisabled();
+    await user.click(approve);
+    expect(respond).toHaveBeenCalledOnce();
+    await act(async () => { release(response); await pending; });
+  });
+
+  it('refreshes after another device changes the pending approval version', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件' };
     const freshTask = { ...task, status: 'queued' as const, result: null, waiting_reason: null, pending_request: null, finished_at: null };
@@ -1624,7 +1867,7 @@ describe('Assistant durable tasks', () => {
     expect(answer.mock.calls[1]?.[2]).toBe(answer.mock.calls[0]?.[2]);
   });
 
-  it('refreshes the task and prompts before retrying stale clarification input', async () => {
+  it('refreshes after another device changes the clarification version', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
     const freshTask = { ...task, status: 'queued' as const, result: null, waiting_reason: null, clarification_request: null, finished_at: null };
@@ -1642,15 +1885,46 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByRole('form', { name: '补充任务信息' })).not.toBeInTheDocument();
   });
 
+  it.each(['approval', 'clarification'] as const)('does not report a %s response as successful after access is revoked', async (kind) => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件' };
+    const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: kind,
+      pending_request: kind === 'approval' ? approval : null,
+      clarification_request: kind === 'clarification' ? clarification : null, finished_at: null });
+    const revoked = new ApiError({ message: 'Task access was revoked', code: 'not_found', status: 404 });
+    const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(revoked);
+    const answer = vi.spyOn(portalApi, 'answerTaskInput').mockRejectedValue(revoked);
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /你好/ }));
+    if (kind === 'approval') {
+      await user.click(await screen.findByRole('button', { name: '批准并继续' }));
+      await waitFor(() => expect(respond).toHaveBeenCalledWith(task.id, approval.id,
+        { version: approval.version, decision: 'approve' }, expect.any(String)));
+      expect(screen.queryByText('已批准，任务正在恢复。')).not.toBeInTheDocument();
+    } else {
+      await user.type(await screen.findByRole('textbox', { name: '你的回答' }), '放到报告目录');
+      await user.click(screen.getByRole('button', { name: '提交并继续' }));
+      await waitFor(() => expect(answer).toHaveBeenCalledWith(task.id, {
+        clarification_id: clarification.id, clarification_version: clarification.version, answer: '放到报告目录',
+      }, expect.any(String)));
+      expect(screen.queryByText('补充信息已提交，任务正在恢复。')).not.toBeInTheDocument();
+    }
+    expect(await screen.findByRole('alert')).toHaveTextContent('请求的内容不存在');
+  });
+
   it('submits an idempotent stop request and waits for server confirmation', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const runningTask = { ...task, status: 'running' as const, result: null, finished_at: null };
+    const runningTask = { ...task, status: 'running' as const, result: null, finished_at: null,
+      current_revision: 2, desired_revision: 3 };
     const stoppingTask = {
       ...task, status: 'cancelling' as const, result: null, finished_at: null,
+      current_revision: 2, desired_revision: 3,
       stop_request: { id: 'stop12345', action: 'cancel' as const, status: 'pending' as const,
         safe_after: timestamp, unsettled_operation_ids: ['op1234567'] },
     };
-    vi.spyOn(portalApi, 'task').mockResolvedValueOnce(runningTask).mockResolvedValue(stoppingTask);
+    vi.spyOn(portalApi, 'task').mockResolvedValueOnce(runningTask).mockResolvedValueOnce(runningTask).mockResolvedValue(stoppingTask);
     const stop = vi.spyOn(portalApi, 'taskAction').mockResolvedValue({
       task_id: task.id, action: 'cancel', status: 'cancelling', unsettled_operation_ids: ['op1234567'],
     });
@@ -1660,14 +1934,15 @@ describe('Assistant durable tasks', () => {
     expect(await screen.findByRole('button', { name: '停止任务' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '停止任务' }));
     await waitFor(() => expect(stop).toHaveBeenCalledWith(task.id,
-      { action: 'cancel', expected_status: 'running' }, expect.any(String)));
+      { action: 'cancel', expected_status: 'running', expected_current_revision: 2, expected_desired_revision: 3 }, expect.any(String)));
     expect(await screen.findByText('停止请求已受理，等待任务状态更新。')).toBeInTheDocument();
     expect(await screen.findByText('停止请求已受理，仍有 1 个操作结果待确认。')).toBeInTheDocument();
   });
 
   it('can resume a previously paused Task with its current status', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const pausedTask = { ...task, status: 'paused' as const, result: null, finished_at: null };
+    const pausedTask = { ...task, status: 'paused' as const, result: null, finished_at: null,
+      current_revision: 5, desired_revision: 5 };
     vi.spyOn(portalApi, 'task').mockResolvedValue(pausedTask);
     const action = vi.spyOn(portalApi, 'taskAction')
       .mockResolvedValue({ task_id: task.id, action: 'resume', status: 'queued', unsettled_operation_ids: [] });
@@ -1677,7 +1952,7 @@ describe('Assistant durable tasks', () => {
     expect(await screen.findByRole('button', { name: '继续任务' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '继续任务' }));
     await waitFor(() => expect(action).toHaveBeenCalledWith(task.id,
-      { action: 'resume', expected_status: 'paused' }, expect.any(String)));
+      { action: 'resume', expected_status: 'paused', expected_current_revision: 5, expected_desired_revision: 5 }, expect.any(String)));
   });
 
   it('reuses the same idempotency key when a stop response is lost', async () => {
@@ -1694,6 +1969,45 @@ describe('Assistant durable tasks', () => {
     await user.click(await screen.findByRole('button', { name: '停止任务' }));
     await waitFor(() => expect(stop).toHaveBeenCalledTimes(2));
     expect(stop.mock.calls[1]?.[2]).toBe(stop.mock.calls[0]?.[2]);
+  });
+
+  it('prevents duplicate stop calls while the selected task is awaiting the first response', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'running', result: null, finished_at: null });
+    const response = { task_id: task.id, action: 'cancel', status: 'cancelling' as const, unsettled_operation_ids: [] };
+    let release!: (value: typeof response) => void;
+    const pending = new Promise<typeof response>((resolve) => { release = resolve; });
+    const stop = vi.spyOn(portalApi, 'taskAction').mockImplementation(() => pending);
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /你好/ }));
+    const stopButton = await screen.findByRole('button', { name: '停止任务' });
+    await user.click(stopButton);
+    expect(stopButton).toBeDisabled();
+    await user.click(stopButton);
+    expect(stop).toHaveBeenCalledOnce();
+    await act(async () => { release(response); await pending; });
+  });
+
+  it('refreshes instead of stopping a Task whose revision changed after it was selected', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const selectedTask = { ...task, status: 'running' as const, result: null, finished_at: null,
+      current_revision: 2, desired_revision: 3 };
+    const latestTask = { ...selectedTask, current_revision: 3, desired_revision: 3 };
+    const getTask = vi.spyOn(portalApi, 'task').mockResolvedValueOnce(selectedTask).mockResolvedValue(latestTask);
+    const stop = vi.spyOn(portalApi, 'taskAction').mockResolvedValue({
+      task_id: task.id, action: 'cancel', status: 'cancelling', unsettled_operation_ids: [],
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole('button', { name: /你好/ }));
+    await user.click(await screen.findByRole('button', { name: '停止任务' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('任务状态已变化，已刷新最新状态');
+    expect(stop).not.toHaveBeenCalled();
+    await waitFor(() => expect(getTask.mock.calls.length).toBeGreaterThanOrEqual(3));
+    expect(screen.getByRole('region', { name: `任务 ${task.id} 的工作过程` }))
+      .toHaveTextContent('修订 3 / 3');
   });
 
   it('does not label a stop without a server receipt as completed', async () => {

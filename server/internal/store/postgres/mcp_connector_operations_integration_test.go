@@ -378,7 +378,7 @@ func TestPostgresTaskStopWaitsForDispatchedMCPConnectorOperation(t *testing.T) {
 
 	stopID := mustID(t, domain.NewTaskActionID)
 	stopRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "mcp-stop-action", fixture.running.ID, task.StatusRunning, stopID)
-	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionCancel, task.StatusRunning, stopID)
+	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionCancel, task.StatusRunning, nil, stopID)
 	if err != nil || requested.Task.Status != task.StatusCancelling || len(requested.UnsettledOperationIDs) != 2 {
 		t.Fatalf("stop request = %#v err=%v", requested, err)
 	}

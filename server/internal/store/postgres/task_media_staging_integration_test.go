@@ -184,7 +184,7 @@ func TestPostgresTaskCancellationDiscardsPendingMediaPreview(t *testing.T) {
 	store, ctx, ownerID, taskID := createPostgresTaskMediaPreviewFixture(t, "cancel", "o5234567", "r5234567", "media-call-523")
 	actionID := "x5234567"
 	record := taskActionIdempotency(ownerID, task.ActionCancel, "cancel-media-preview", taskID, task.StatusWaitingUser, actionID)
-	if _, err := store.RequestTaskAction(ctx, record, taskID, task.ActionCancel, task.StatusWaitingUser, actionID); err != nil {
+	if _, err := store.RequestTaskAction(ctx, record, taskID, task.ActionCancel, task.StatusWaitingUser, nil, actionID); err != nil {
 		t.Fatal(err)
 	}
 	details, err := store.GetTaskMediaOperationDetails(ctx, taskID, "o5234567")

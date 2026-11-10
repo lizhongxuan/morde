@@ -161,28 +161,45 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 
 func safeConversationRouteDecision(value app.ConversationRouteContext, decision app.ConversationRouteDecision) app.ConversationRouteDecision {
 	clarify := app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请说明要修改哪个任务，或是否开始一个新任务。"}
-	if decision.Action == app.ConversationRouteNew && app.ConversationRouteHasExplicitControlIntent(value.Content) {
+	clarify.ModelOutput = decision.ModelOutput
+	if !app.ValidConversationRouteModelOutput(decision.ModelOutput) ||
+		decision.Action != app.ConversationRouteReply && decision.Reply != "" {
+		return clarify
+	}
+	if (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) &&
+		app.ConversationRouteHasExplicitControlIntent(value.Content) {
 		if value.ReferenceUnavailable {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
+			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage,
+				ModelOutput: decision.ModelOutput}
 		}
 		if value.PreviousMissing {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
+			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。",
+				ModelOutput: decision.ModelOutput}
 		}
 	}
 	if value.PreviousMissing && (decision.Action != app.ConversationRouteNew || strings.TrimSpace(value.Content) == "") {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。"}
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "前一条消息尚未确认，请先处理或重试。",
+			ModelOutput: decision.ModelOutput}
 	}
 	switch decision.Action {
 	case app.ConversationRouteNew:
-		if decision.TaskID == "" {
+		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" {
+			return decision
+		}
+	case app.ConversationRouteReply:
+		if decision.TaskID == "" && decision.ExpectedRevision == 0 && decision.Question == "" &&
+			app.ValidConversationRouteReply(decision.Reply) {
 			return decision
 		}
 	case app.ConversationRouteClarify:
-		if decision.TaskID == "" && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
+		if decision.TaskID == "" && decision.ExpectedRevision == 0 && strings.TrimSpace(decision.Question) != "" && utf8.ValidString(decision.Question) &&
 			!strings.ContainsRune(decision.Question, '\x00') && len([]rune(decision.Question)) <= 200 {
 			return decision
 		}
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
+		if decision.Question != "" {
+			return clarify
+		}
 		if value.ReferenceUnavailable {
 			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
 		}

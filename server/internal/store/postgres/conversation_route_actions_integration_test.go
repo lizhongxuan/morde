@@ -217,6 +217,55 @@ FROM tasks t WHERE t.id=$1`, taskID, []string{second.Message.ID, third.Message.I
 	}
 }
 
+func TestConversationRouteDirectReplyIsAtomicAndIdempotent(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-direct-reply-001", "What is 6 times 7?", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	answer := "42."
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: answer,
+		ModelOutput: `{"action":"reply","task_id":"","question":"","reply":"42."}`}
+
+	invalid := []app.ConversationRouteDecision{
+		{Action: app.ConversationRouteReply},
+		{Action: app.ConversationRouteReply, Reply: answer, TaskID: "q1234567"},
+		{Action: app.ConversationRouteReply, Reply: answer, Question: "unexpected"},
+		{Action: app.ConversationRouteReply, Reply: strings.Repeat("x", app.MaxConversationRouteReplyRunes+1)},
+		{Action: app.ConversationRouteReply, Reply: string([]byte{0xff})},
+		{Action: app.ConversationRouteReply, Reply: answer, ModelOutput: string([]byte{0xff})},
+	}
+	for _, candidate := range invalid {
+		if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, candidate); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Fatalf("invalid direct reply was accepted: %+v err=%v", candidate, err)
+		}
+	}
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, decision); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("replayed direct reply did not hit the completed route fence: %v", err)
+	}
+	var routeState, delivery, taskID string
+	var assistantCount, messageCount int
+	var storedAnswer string
+	if err := f.store.pool.QueryRow(ctx, `SELECT r.state,m.delivery_status,COALESCE(m.task_id,''),
+(SELECT count(*) FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant' AND a.source_kind='conversation'),
+(SELECT count(*) FROM conversation_messages all_messages WHERE all_messages.conversation_id=m.conversation_id),
+(SELECT a.content FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant' AND a.source_kind='conversation' LIMIT 1)
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).
+		Scan(&routeState, &delivery, &taskID, &assistantCount, &messageCount, &storedAnswer); err != nil {
+		t.Fatal(err)
+	}
+	if routeState != "routed" || delivery != "applied" || taskID != "" || assistantCount != 1 || messageCount != 2 || storedAnswer != answer {
+		t.Fatalf("direct reply was not committed exactly once: route=%s delivery=%s task=%s assistants=%d messages=%d answer=%q",
+			routeState, delivery, taskID, assistantCount, messageCount, storedAnswer)
+	}
+}
+
 func TestConversationRouteNeverAppliesRevisionsOutOfMessageOrder(t *testing.T) {
 	for _, pendingPredecessor := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pending_predecessor=%t", pendingPredecessor), func(t *testing.T) {

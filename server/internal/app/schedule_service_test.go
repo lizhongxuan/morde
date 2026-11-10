@@ -277,7 +277,7 @@ func (s *scheduleServiceStoreFake) ListScheduleRuns(_ context.Context, ownerID, 
 	return s.runsResult, s.runsErr
 }
 
-func (s *scheduleServiceStoreFake) RequestTaskAction(_ context.Context, record IdempotencyRecord, taskID string, action task.Action, expectedStatus task.Status, requestID string) (TaskActionResult, error) {
+func (s *scheduleServiceStoreFake) RequestTaskAction(_ context.Context, record IdempotencyRecord, taskID string, action task.Action, expectedStatus task.Status, _ *TaskActionRevisionFence, requestID string) (TaskActionResult, error) {
 	s.taskActionCalls++
 	s.taskActionRecord, s.taskActionTaskID = record, taskID
 	s.taskActionAction, s.taskActionExpected, s.taskActionRequestID = action, expectedStatus, requestID

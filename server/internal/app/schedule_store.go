@@ -83,5 +83,5 @@ type ScheduleStore interface {
 	ListDueSchedules(context.Context, time.Time, int32) ([]schedule.Schedule, error)
 	CommitScheduleOccurrence(context.Context, ScheduleOccurrenceCommit) (schedule.Run, bool, error)
 	GetTask(context.Context, string, string) (TaskDetails, error)
-	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, string) (TaskActionResult, error)
+	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, *TaskActionRevisionFence, string) (TaskActionResult, error)
 }

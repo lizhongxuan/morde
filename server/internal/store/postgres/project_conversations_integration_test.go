@@ -197,7 +197,7 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 	otherMemberAction := taskActionIdempotency(owner.ID, task.ActionCancel, "project-task-owner-cancel", memberTask.Task.ID,
 		task.StatusRunning, otherMemberActionID)
 	if _, err := store.RequestTaskAction(ctx, otherMemberAction, memberTask.Task.ID, task.ActionCancel,
-		task.StatusRunning, otherMemberActionID); domain.CodeOf(err) != domain.CodeNotFound {
+		task.StatusRunning, nil, otherMemberActionID); domain.CodeOf(err) != domain.CodeNotFound {
 		t.Fatalf("conversation owner controlled another member's Task = %v, want not found", err)
 	}
 

@@ -12,7 +12,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"morde/server/internal/app"
@@ -32,7 +31,7 @@ type Service struct {
 	signingKey            ed25519.PrivateKey
 	taskSandboxSigningKey ed25519.PrivateKey
 	now                   func() time.Time
-	operationM            sync.Mutex
+	operationLocks        operationLocker
 }
 
 // Open creates a guardian using a private on-disk lease directory and a Docker
@@ -120,8 +119,11 @@ func (s *Service) Arm(ctx context.Context, guard Guard) error {
 	if err := s.processes.Ready(); err != nil {
 		return fmt.Errorf("independent process-tree verification is unavailable: %w", err)
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskOperationKey(guard.Fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	if existing, ok := s.store.get(guard.ContainerID); ok {
 		if existing.Guard.sameIdentity(guard) && existing.Guard.ExpiresAt.Equal(guard.ExpiresAt) && !existing.Destroyed {
 			return nil
@@ -149,8 +151,11 @@ func (s *Service) Started(ctx context.Context, guard Guard, pid int) error {
 	if ctx == nil || ctx.Err() != nil || pid < 1 {
 		return errors.New("guardian started identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskOperationKey(guard.Fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	value, err := s.lookupGuard(guard)
 	if err != nil {
 		return err
@@ -189,8 +194,11 @@ func (s *Service) Renew(ctx context.Context, guard Guard) error {
 	if err := guard.validateNew(s.now()); err != nil {
 		return err
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskOperationKey(guard.Fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	value, err := s.lookupGuardIdentity(guard)
 	if err != nil {
 		return err
@@ -219,8 +227,11 @@ func (s *Service) ConfirmDestroyed(ctx context.Context, guard Guard) (bool, erro
 	if ctx == nil || ctx.Err() != nil {
 		return false, errors.New("guardian confirmation context is unavailable")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskOperationKey(guard.Fence))
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	value, err := s.lookupGuard(guard)
 	if err != nil {
 		return false, err
@@ -237,8 +248,15 @@ func (s *Service) RecoverStopped(ctx context.Context, fence app.AgentInstanceFen
 	if ctx == nil || ctx.Err() != nil || fence.Validate() != nil || fence.SupervisorID == "" || !nonceHashRE.MatchString(nonceSHA256) {
 		return app.AgentGuardianStopAttestation{}, errors.New("guardian recovery identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	leases, ok, err := s.store.find(fence, nonceSHA256)
+	if err != nil || !ok {
+		return app.AgentGuardianStopAttestation{}, errors.New("guardian lease for the exact Agent fence is unknown")
+	}
+	release, err := s.lockOperation(ctx, taskOperationKey(leases.Guard.Fence))
+	if err != nil {
+		return app.AgentGuardianStopAttestation{}, err
+	}
+	defer release()
 	value, ok, err := s.store.find(fence, nonceSHA256)
 	if err != nil || !ok {
 		return app.AgentGuardianStopAttestation{}, errors.New("guardian lease for the exact Agent fence is unknown")
@@ -434,16 +452,27 @@ func (s *Service) sweep(ctx context.Context, onError func(error)) {
 		if value.Destroyed || value.Guard.ExpiresAt.After(s.now()) {
 			continue
 		}
-		s.operationM.Lock()
-		current, ok := s.store.getTask(value.Key)
-		if !ok || current.Guard != value.Guard || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
-			s.operationM.Unlock()
+		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		release, err := s.lockRuntimeTask(opCtx, value.Guard.RuntimeFence, value.Guard.TaskFence)
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if onError != nil {
+				onError(fmt.Errorf("reconcile expired Task process lease %s: %w", value.Key, err))
+			}
 			continue
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		err := s.destroyTaskProcess(opCtx, &current)
+		current, ok := s.store.getTask(value.Key)
+		if !ok || current.Guard != value.Guard || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
+			release()
+			cancel()
+			continue
+		}
+		err = s.destroyTaskProcess(opCtx, &current)
 		cancel()
-		s.operationM.Unlock()
+		release()
 		if err != nil && onError != nil {
 			onError(fmt.Errorf("reconcile expired Task process lease %s: %w", value.Key, err))
 		}
@@ -455,20 +484,31 @@ func (s *Service) sweep(ctx context.Context, onError func(error)) {
 		if value.Destroyed || value.Guard.ExpiresAt.After(s.now()) {
 			continue
 		}
-		s.operationM.Lock()
-		current, ok := s.store.getRuntime(value.Guard.ContainerID)
-		if !ok || current.Guard != value.Guard || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
-			s.operationM.Unlock()
+		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		release, err := s.lockOperation(opCtx, accountRuntimeOperationKey(value.Guard.Fence))
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if onError != nil {
+				onError(fmt.Errorf("reconcile expired account Runtime lease %s: %w", value.Guard.ContainerID, err))
+			}
 			continue
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		current, ok := s.store.getRuntime(value.Guard.ContainerID)
+		if !ok || current.Guard != value.Guard || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
+			release()
+			cancel()
+			continue
+		}
 		taskStopErr := s.stopRuntimeTasks(opCtx, current)
-		err := s.destroyAccountRuntime(opCtx, &current)
+		err = s.destroyAccountRuntime(opCtx, &current)
 		if taskStopErr != nil {
 			err = errors.Join(err, fmt.Errorf("one or more Task cgroups remain unproven: %w", taskStopErr))
 		}
 		cancel()
-		s.operationM.Unlock()
+		release()
 		if err != nil && onError != nil {
 			onError(fmt.Errorf("reconcile expired account Runtime lease %s: %w", value.Guard.ContainerID, err))
 		}
@@ -480,16 +520,27 @@ func (s *Service) sweep(ctx context.Context, onError func(error)) {
 		if value.Destroyed || value.Guard.ExpiresAt.After(s.now()) {
 			continue
 		}
-		s.operationM.Lock()
-		current, ok := s.store.get(value.Guard.ContainerID)
-		if !ok || current.Guard != value.Guard || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
-			s.operationM.Unlock()
+		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		release, err := s.lockOperation(opCtx, taskOperationKey(value.Guard.Fence))
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if onError != nil {
+				onError(fmt.Errorf("reconcile expired dsh lease %s: %w", value.Guard.ContainerID, err))
+			}
 			continue
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		err := s.destroyAndVerify(opCtx, &current)
+		current, ok := s.store.get(value.Guard.ContainerID)
+		if !ok || current.Guard != value.Guard || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
+			release()
+			cancel()
+			continue
+		}
+		err = s.destroyAndVerify(opCtx, &current)
 		cancel()
-		s.operationM.Unlock()
+		release()
 		if err != nil && onError != nil {
 			onError(fmt.Errorf("reconcile expired dsh lease %s: %w", value.Guard.ContainerID, err))
 		}
@@ -501,16 +552,27 @@ func (s *Service) sweep(ctx context.Context, onError func(error)) {
 		if value.Destroyed || value.Guard.ExpiresAt.After(s.now()) {
 			continue
 		}
-		s.operationM.Lock()
-		current, ok := s.store.getTaskSandbox(value.Key)
-		if !ok || !current.Guard.sameIdentity(value.Guard) || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
-			s.operationM.Unlock()
+		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		release, err := s.lockOperation(opCtx, taskSandboxOperationKey(value.Guard.LifecycleID))
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if onError != nil {
+				onError(fmt.Errorf("reconcile expired Task Sandbox lease %s: %w", value.Key, err))
+			}
 			continue
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		err := s.destroyExpiredTaskSandbox(opCtx, &current)
+		current, ok := s.store.getTaskSandbox(value.Key)
+		if !ok || !current.Guard.sameIdentity(value.Guard) || current.Destroyed || current.Guard.ExpiresAt.After(s.now()) {
+			release()
+			cancel()
+			continue
+		}
+		err = s.destroyExpiredTaskSandbox(opCtx, &current)
 		cancel()
-		s.operationM.Unlock()
+		release()
 		if err != nil && onError != nil {
 			onError(fmt.Errorf("reconcile expired Task Sandbox lease %s: %w", value.Key, err))
 		}

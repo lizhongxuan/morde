@@ -91,6 +91,40 @@ func TestConversationRouteWorkerRoutesFirstMessageAfterModelClassification(t *te
 	}
 }
 
+func TestConversationRouteWorkerAppliesSafeDirectReply(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	modelOutput := `{"action":"reply","task_id":"","question":"","reply":"你好。"}`
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "你好。", ModelOutput: modelOutput}
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 {
+		t.Fatalf("direct reply was not applied: decisions=%+v err=%v", stub.applied, err)
+	}
+	if got := stub.applied[0]; got.Action != app.ConversationRouteReply || got.TaskID != "" || got.ExpectedRevision != 0 ||
+		got.Question != "" || got.Reply != "你好。" || got.ModelOutput != modelOutput {
+		t.Fatalf("direct reply changed during worker validation: %+v", got)
+	}
+}
+
+func TestConversationRouteWorkerRejectsUnsafeDirectReply(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		context  app.ConversationRouteContext
+		decision app.ConversationRouteDecision
+		question string
+	}{
+		{name: "task target", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, TaskID: "q1234567", Reply: "answer"}, question: "请说明要修改哪个任务，或是否开始一个新任务。"},
+		{name: "empty text", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply}, question: "请说明要修改哪个任务，或是否开始一个新任务。"},
+		{name: "model output too long", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "answer", ModelOutput: strings.Repeat("x", app.MaxConversationRouteModelOutputBytes+1)}, question: "请说明要修改哪个任务，或是否开始一个新任务。"},
+		{name: "unavailable control", context: app.ConversationRouteContext{Content: "停止任务", ReferenceUnavailable: true}, decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "I cannot stop it."}, question: app.UnavailableRouteReferenceMessage},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := safeConversationRouteDecision(test.context, test.decision)
+			if decision.Action != app.ConversationRouteClarify || decision.Question != test.question || decision.Reply != "" {
+				t.Fatalf("unsafe direct reply survived validation: %+v", decision)
+			}
+		})
+	}
+}
+
 func TestConversationRouteWorkerClassifiesEveryFreeTextMessage(t *testing.T) {
 	for _, content := range []string{"帮我整理资料", "停止任务", "查看进度"} {
 		t.Run(content, func(t *testing.T) {

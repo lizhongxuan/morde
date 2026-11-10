@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import { AccountRuntime } from '../src/account-runtime.mjs'
-import { ENGINE_VERSION, modelCallID, validMessageDelivery, validStart } from '../src/engine.mjs'
+import { coordinatorModelCallID, ENGINE_VERSION, modelCallID, validMessageDelivery, validStart } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
 const start = {
@@ -22,12 +22,14 @@ function launch(onFrame, extraEnv = {}, entrypoint = 'bin.mjs') {
     env: { PATH: process.env.PATH, LANG: 'C.UTF-8', ...extraEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
-  child.responseFences = entrypoint === 'bin.mjs' ? new Map() : undefined
+  child.responseFences = new Map()
   const frames = []
   const lines = createInterface({ input: child.stdout })
   lines.on('line', line => {
     const frame = JSON.parse(line)
-    if (child.responseFences && ['checkpoint', 'model'].includes(frame.type)) child.responseFences.set(frame.id, taskFence(frame))
+    if (child.responseFences && ['checkpoint', 'checkpoint_read', 'model'].includes(frame.type)) {
+      child.responseFences.set(frame.id, frame.context_role === 'coordinator' ? coordinatorFence(frame) : taskFence(frame))
+    }
     frames.push(frame)
     onFrame(frame, child)
   })
@@ -45,9 +47,9 @@ function launchAccount(onFrame) {
 
 function send(child, frame) {
   const fence = child.responseFences?.get(frame.id)
-  if (fence && ['checkpoint_ack', 'model_chunk', 'model_end'].includes(frame.type)) {
+  if (fence && ['checkpoint_ack', 'checkpoint_page', 'model_chunk', 'model_end'].includes(frame.type)) {
     frame = { ...fence, ...frame }
-    if (frame.type !== 'model_chunk') child.responseFences.delete(frame.id)
+    if (!['model_chunk'].includes(frame.type)) child.responseFences.delete(frame.id)
   }
   child.stdin.write(`${JSON.stringify(frame)}\n`)
 }
@@ -71,6 +73,37 @@ function taskProcessAdmission(frame) {
     runtime_generation: frame.runtime_generation, runtime_sequence: frame.runtime_sequence,
     ...taskFence(frame),
   }
+}
+
+function coordinatorFence(frame) {
+  return Object.fromEntries(['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+    .map(key => [key, frame[key]]))
+}
+
+function coordinatorStart(messageID = 'm1234567', runtimeSequence = 1) {
+  return {
+    type: 'coordinator_start', version: 1, context_role: 'coordinator', conversation_id: 'conversation_123', message_id: messageID,
+    owner_id: account.owner_id, actor_id: 'actor_123', agent_id: 'agent_coord', generation: 1, authorization_version: 1, session_id: 'session_coord',
+    server_instance_id: account.server_instance_id, runtime_id: account.runtime_id, runtime_generation: account.runtime_generation,
+    runtime_sequence: runtimeSequence, model: 'test-model', tools: [], system_prompt: 'Use this coordinator instruction.',
+    prompt: '{"intent":"route this request"}',
+  }
+}
+
+function coordinatorProcessAdmission(frame) {
+  return {
+    type: 'coordinator_process_admit', server_instance_id: frame.server_instance_id, owner_id: frame.owner_id,
+    runtime_id: frame.runtime_id, runtime_generation: frame.runtime_generation, runtime_sequence: frame.runtime_sequence,
+    ...coordinatorFence(frame),
+  }
+}
+
+function launchCoordinatorAccount(onFrame) {
+  return launch((frame, proc) => {
+    onFrame(frame, proc)
+    if (frame.type === 'coordinator_process_ready') send(proc, coordinatorProcessAdmission(frame))
+    if (frame.type === 'task_process_ready') send(proc, taskProcessAdmission(frame))
+  }, {}, 'bin-account.mjs')
 }
 
 function taskFence(frame) {
@@ -99,6 +132,18 @@ function replyWithText(proc, frame, text) {
   ]
   chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', ...taskFence(frame), id: frame.id, index, chunk }))
   send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: true })
+}
+
+function replyCoordinatorWithText(proc, frame, text) {
+  const chunks = [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
+    { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', ...coordinatorFence(frame), id: frame.id, index, chunk }))
+  send(proc, { type: 'model_end', ...coordinatorFence(frame), id: frame.id, ok: true })
 }
 
 function testJpeg(width = 3, height = 2) {
@@ -179,6 +224,37 @@ test('model ID has a stable cross-language test vector', () => {
   assert.throws(() => modelCallID('task\n123', 'session_456', 7))
 })
 
+test('coordinator model ID has a stable cross-language test vector', () => {
+  assert.equal(coordinatorModelCallID('conversation_123', 'm1234567', 'session_coord', 7),
+    'mdl_c7855d4cc4fc2b54a9fed295b0f0fc27754995f60151893aa5ad949a14136ed1')
+  assert.throws(() => coordinatorModelCallID('conversation_123', 'm1234567', 'session_coord', -1))
+})
+
+test('coordinator checkpoint acknowledgements require the complete actor fence', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const identity = {
+    context_role: 'coordinator', conversation_id: 'conversation_123', message_id: 'm1234567',
+    owner_id: 'user_123', actor_id: 'project_456', agent_id: 'agent_coord', generation: 1,
+    authorization_version: 1, session_id: 'session_coord',
+  }
+  input.write(`${JSON.stringify({ type: 'start', version: 1, ...identity, model: 'test-model', tools: [],
+    system_prompt: 'Route safely.', prompt: '{"request":"route"}' })}\n`)
+  await ipc.start.promise
+  const payload = '{}'
+  const digest = createHash('sha256').update(payload).digest('hex')
+  const request = ipc.checkpoint(identity, 0, 0, payload, digest)
+  const [bytes] = await once(output, 'data')
+  const checkpoint = JSON.parse(bytes.toString().trim())
+  input.write(`${JSON.stringify({ type: 'checkpoint_ack', ...identity, actor_id: 'other_actor', id: checkpoint.id,
+    ok: true, through_seq: 0, sha256: digest })}\n`)
+  await assert.rejects(request, /checkpoint not confirmed|invalid worker frame/)
+  assert.equal(ipc.failed, true)
+  input.destroy()
+  output.destroy()
+})
+
 test('keeps Morde checkpoint compatibility version independent of the upstream DSH release', () => {
   assert.equal(ENGINE_VERSION, '0.2.0-rc.2')
 })
@@ -243,9 +319,15 @@ test('uses Morde SOUL as the system persona across conversation turns', async ()
   assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
 })
 
-test('keeps the DSH runtime SOUL identical to the model gateway SOUL', async () => {
+test('keeps the DSH runtime SOUL identical to the model gateway SOUL', async t => {
   const runtimeSoul = await readFile(new URL('../src/SOUL.md', import.meta.url), 'utf8')
-  const modelGatewaySoul = await readFile(new URL('../../../../../server/internal/app/SOUL.md', import.meta.url), 'utf8')
+  let modelGatewaySoul
+  try {
+    modelGatewaySoul = await readFile(new URL('../../../server/internal/app/SOUL.md', import.meta.url), 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return t.skip('model gateway source is outside the runtime build context')
+    throw error
+  }
   assert.equal(runtimeSoul, modelGatewaySoul)
   assert.match(runtimeSoul, /You are Morde, the user's AI assistant\./)
   assert.match(runtimeSoul, /GPT, DeepSeek, and other model providers are implementation details/)
@@ -509,6 +591,94 @@ test('real dsh runs only after worker confirms its events', async () => {
   assert.equal(settled?.state, 'completed_candidate')
   assert.equal(settled.through_seq, through)
   assert.ok(frames.some(frame => frame.type === 'checkpoint' && JSON.parse(frame.payload).events.some(event => event.type === 'assistant/message')))
+})
+
+test('runs one coordinator turn with its own DSH identity and returns only completed assistant text', async () => {
+  const source = coordinatorStart()
+  const { server_instance_id, runtime_id, runtime_generation, runtime_sequence, ...internalStart } = source
+  internalStart.type = 'start'
+  let through = -1
+  let modelCalls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, internalStart)
+    if (frame.type === 'checkpoint') {
+      assert.deepEqual(coordinatorFence(frame), coordinatorFence(internalStart))
+      assert.equal(frame.from_seq, through + 1)
+      through = frame.through_seq
+      send(proc, { type: 'checkpoint_ack', ...coordinatorFence(frame), id: frame.id, ok: true,
+        through_seq: through, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model') {
+      modelCalls += 1
+      assert.deepEqual(coordinatorFence(frame), coordinatorFence(internalStart))
+      assert.equal(frame.id, coordinatorModelCallID(internalStart.conversation_id, internalStart.message_id, internalStart.session_id, frame.through_seq))
+      assert.deepEqual(frame.request.tools, [])
+      assert.equal(frame.request.messages.some(message => message.id === internalStart.message_id), false)
+      assert.ok(frame.request.messages.some(message => message.role === 'user' && message.content.some(block => block.text === internalStart.prompt)))
+      assert.ok(frame.request.messages.some(message => message.role === 'system' && message.content.some(block => block.text.includes(internalStart.system_prompt))))
+      replyCoordinatorWithText(proc, frame, 'route target')
+    }
+  })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 1)
+  const terminal = frames.find(frame => frame.type === 'coordinator_settled')
+  assert.equal(terminal?.result, 'route target')
+  assert.equal(terminal?.through_seq, through)
+  assert.deepEqual(coordinatorFence(terminal), coordinatorFence(internalStart))
+  for (const frame of frames.filter(item => ['checkpoint', 'checkpoint_read', 'model', 'model_cancel', 'coordinator_settled'].includes(item.type))) {
+    assert.equal(Object.hasOwn(frame, 'task_id'), false)
+    assert.deepEqual(coordinatorFence(frame), coordinatorFence(internalStart))
+  }
+  assert.equal(validStart({ ...internalStart, task_id: 'task_should_not_exist' }), false)
+})
+
+test('resumes a completed coordinator checkpoint and returns its saved text without a model call', async () => {
+  const source = coordinatorStart()
+  const { server_instance_id, runtime_id, runtime_generation, runtime_sequence, ...freshStart } = source
+  freshStart.type = 'start'
+  const pages = []
+  const first = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, freshStart)
+    if (frame.type === 'checkpoint') {
+      pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+      send(proc, { type: 'checkpoint_ack', ...coordinatorFence(frame), id: frame.id, ok: true,
+        through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model') replyCoordinatorWithText(proc, frame, 'saved coordinator result')
+  })
+  const [firstCode] = await once(first.child, 'close')
+  assert.equal(firstCode, 0)
+  const tail = pages.at(-1)
+  assert.ok(tail)
+
+  const resumeStart = { ...freshStart, resume: true, checkpoint_through_seq: tail.through_seq, checkpoint_sha256: tail.sha256 }
+  delete resumeStart.prompt
+  let modelCalls = 0
+  const resumed = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, resumeStart)
+    if (frame.type === 'checkpoint') send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true,
+      through_seq: frame.through_seq, sha256: frame.sha256 })
+    if (frame.type === 'checkpoint_read') {
+      const page = pages.find(item => item.from_seq === frame.from_seq)
+      assert.ok(page)
+      send(proc, { type: 'checkpoint_page', ...coordinatorFence(frame), id: frame.id, ok: true, ...page })
+    }
+    if (frame.type === 'model') modelCalls += 1
+  })
+  let timeoutID
+  const closeResult = await Promise.race([
+    once(resumed.child, 'close').then(([code]) => ({ code })),
+    new Promise(resolve => { timeoutID = setTimeout(() => { resumed.child.kill(); resolve({ timeout: true }) }, 5_000) }),
+  ])
+  clearTimeout(timeoutID)
+  assert.equal(closeResult.timeout, undefined, `resume frames: ${JSON.stringify(resumed.frames.map(frame => ({ type: frame.type, code: frame.code, id: frame.id, from_seq: frame.from_seq })))}`)
+  const resumeCode = closeResult.code
+  assert.equal(resumeCode, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 0)
+  const terminal = resumed.frames.find(frame => frame.type === 'coordinator_settled')
+  assert.equal(terminal?.result, 'saved coordinator result')
+  assert.deepEqual(coordinatorFence(terminal), coordinatorFence(freshStart))
 })
 
 test('starts a first attachment message once with its authorized context', async t => {
@@ -2373,6 +2543,202 @@ test('restages a partially persisted revision batch before one model turn', asyn
   for (const message of revisionMessages) {
     assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === message.message_id).length, 1)
   }
+})
+
+test('account runtime starts and settles a fenced coordinator outside the Task map', async t => {
+  const startFrame = coordinatorStart()
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, startFrame)
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model') {
+      assert.equal(frame.context_role, 'coordinator')
+      assert.deepEqual(frame.request.tools, [])
+      replyCoordinatorWithText(proc, frame, 'route target')
+    }
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'coordinator_settled') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  const ready = frames.find(frame => frame.type === 'coordinator_process_ready')
+  assert.deepEqual(frames.filter(frame => frame.type === 'protocol_error').map(frame => frame), [])
+  assert.ok(ready?.container_pid > 0)
+  assert.equal(ready?.context_role, 'coordinator')
+  assert.ok(frames.some(frame => frame.type === 'coordinator_started'))
+  const terminal = frames.find(frame => frame.type === 'coordinator_settled')
+  assert.equal(terminal?.result, 'route target')
+  assert.equal(terminal?.state, 'completed')
+  assert.deepEqual(coordinatorFence(terminal), coordinatorFence(startFrame))
+  assert.equal(Object.hasOwn(terminal, 'task_id'), false)
+  assert.equal(frames.some(frame => frame.type === 'settled' || frame.type === 'task_started'), false)
+  for (const frame of frames.filter(item => ['checkpoint', 'model', 'coordinator_settled'].includes(item.type))) {
+    assert.deepEqual(coordinatorFence(frame), coordinatorFence(startFrame))
+    assert.equal(Object.hasOwn(frame, 'task_id'), false)
+  }
+})
+
+test('coordinator cancellation leaves an independent Task worker running', async t => {
+  const coordinator = coordinatorStart('m7654321', 1)
+  const task = accountTask('task_survives_coordinator_cancel', 'finish task', 1)
+  const models = new Map()
+  const terminals = new Map()
+  let cancelled = false
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') {
+      send(proc, task)
+      send(proc, coordinator)
+    }
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model') {
+      const key = frame.context_role === 'coordinator' ? 'coordinator' : frame.task_id
+      models.set(key, frame)
+      if (models.has('coordinator') && models.has(task.task_id) && !cancelled) {
+        cancelled = true
+        send(proc, { type: 'coordinator_cancel', ...coordinatorFence(models.get('coordinator')),
+          server_instance_id: account.server_instance_id, runtime_id: account.runtime_id,
+          runtime_generation: account.runtime_generation })
+        replyWithText(proc, models.get(task.task_id), 'Task completed independently.')
+      }
+    }
+    if (frame.type === 'settled') terminals.set('task', frame)
+    if (frame.type === 'coordinator_terminated') terminals.set('coordinator', frame)
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (terminals.size === 2) send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(terminals.get('task')?.state, 'completed_candidate', JSON.stringify(frames.map(frame => ({ type: frame.type, code: frame.code, state: frame.state, task_id: frame.task_id, context_role: frame.context_role }))))
+  assert.equal(terminals.get('coordinator')?.state, 'cancelled')
+  assert.equal(terminals.get('coordinator')?.reason, 'cancelled')
+  assert.ok(frames.some(frame => frame.type === 'model_cancel' && frame.context_role === 'coordinator'))
+  assert.equal(frames.some(frame => frame.type === 'model_cancel' && frame.task_id === task.task_id), false)
+  assert.equal(Object.hasOwn(terminals.get('coordinator'), 'task_id'), false)
+})
+
+test('coordinator handles the next message while an independent Task keeps running', async t => {
+  const firstCoordinator = coordinatorStart('m7654321', 1)
+  const nextCoordinator = {
+    ...coordinatorStart('m4567890', 2), agent_id: 'agent_coord_next', session_id: 'session_coord_next',
+  }
+  const task = accountTask('task_survives_next_coordinator', 'finish independently', 1)
+  const coordinatorResults = new Map()
+  const coordinatorModels = new Map()
+  let taskModel
+  let taskReplySent = false
+  let nextStarted = false
+  let taskTerminal
+  const maybeStartNextCoordinator = proc => {
+    if (coordinatorResults.has(firstCoordinator.message_id) && taskModel && !nextStarted) {
+      nextStarted = true
+      send(proc, nextCoordinator)
+    }
+  }
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') {
+      send(proc, task)
+      send(proc, firstCoordinator)
+    }
+    if (frame.type === 'checkpoint') send(proc, {
+      type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256,
+    })
+    if (frame.type === 'model' && frame.context_role === 'coordinator') {
+      coordinatorModels.set(frame.message_id, frame)
+      replyCoordinatorWithText(proc, frame, `route ${frame.message_id}`)
+    }
+    if (frame.type === 'model' && !frame.context_role) {
+      taskModel = frame
+      maybeStartNextCoordinator(proc)
+    }
+    if (frame.type === 'coordinator_settled') {
+      coordinatorResults.set(frame.message_id, frame)
+      if (frame.message_id === nextCoordinator.message_id) {
+        assert.ok(taskModel, 'Task should already be running before the next coordinator message starts')
+        assert.equal(taskReplySent, false, 'Task should remain active while the next coordinator settles')
+        replyWithText(proc, taskModel, 'Task completed independently.')
+        taskReplySent = true
+      } else {
+        maybeStartNextCoordinator(proc)
+      }
+    }
+    if (frame.type === 'settled') taskTerminal = frame
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (coordinatorResults.size === 2 && taskTerminal) send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  const closed = once(child, 'close')
+  send(child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(nextStarted, true)
+  assert.equal(taskReplySent, true)
+  assert.equal(taskTerminal?.state, 'completed_candidate')
+  assert.equal(coordinatorModels.size, 2)
+  for (const coordinator of [firstCoordinator, nextCoordinator]) {
+    const result = coordinatorResults.get(coordinator.message_id)
+    assert.equal(result?.state, 'completed')
+    assert.equal(result?.result, `route ${coordinator.message_id}`)
+    assert.equal(Object.hasOwn(result ?? {}, 'task_id'), false)
+  }
+  assert.deepEqual(frames.filter(frame => frame.type === 'protocol_error'), [])
+})
+
+test('account runtime resumes a settled message after the route action can be retried', async t => {
+  const firstStart = coordinatorStart('m7654321', 1)
+  const pages = []
+  let modelCalls = 0
+  let settledCount = 0
+  const { child, frames } = launchCoordinatorAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, firstStart)
+    if (frame.type === 'checkpoint') {
+      pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'checkpoint_read') {
+      const page = pages.find(item => item.from_seq === frame.from_seq)
+      assert.ok(page, `missing saved checkpoint page at sequence ${frame.from_seq}`)
+      send(proc, { type: 'checkpoint_page', id: frame.id, ok: true, ...page })
+    }
+    if (frame.type === 'model') {
+      modelCalls += 1
+      replyCoordinatorWithText(proc, frame, 'route result survives retry')
+    }
+    if (frame.type === 'coordinator_settled') {
+      settledCount += 1
+      if (settledCount === 1) {
+        const tail = pages.at(-1)
+        assert.ok(tail)
+        const resumed = { ...coordinatorStart('m7654321', 2), resume: true,
+          checkpoint_through_seq: tail.through_seq, checkpoint_sha256: tail.sha256 }
+        delete resumed.prompt
+        send(proc, resumed)
+      } else {
+        send(proc, { ...account, type: 'runtime_shutdown' })
+      }
+    }
+    if (frame.type === 'protocol_error') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.kill())
+  send(child, account)
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(frames.filter(frame => frame.type === 'protocol_error').length, 0)
+  assert.equal(settledCount, 2)
+  assert.equal(modelCalls, 1)
+  assert.ok(frames.filter(frame => frame.type === 'coordinator_settled').every(frame => frame.result === 'route result survives retry'))
 })
 
 test('account runtime routes concurrent Tasks independently and cancels only the selected Task', async t => {

@@ -1,0 +1,10 @@
+id: shop-pay
+title: "Shop Pay"
+description: "Pay with a card saved in your Shop Pay wallet after approving the purchase."
+aliases: [shop_wallet]
+include_in_prompt: true
+availability:
+  confidential_vm: true
+auth:
+  authorize: "/opt/hatch/bin/shop-wallet-cli auth.start"
+  disconnect: shop-wallet-cli

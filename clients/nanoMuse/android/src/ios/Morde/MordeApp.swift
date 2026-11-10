@@ -29,6 +29,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskApprovalConflictFixtureLaunchArgument = "-morde.localTaskApprovalConflictFixture"
     static let taskSequentialSendFixtureLaunchArgument = "-morde.localTaskSequentialSendFixture"
     static let taskQueueFixtureLaunchArgument = "-morde.localTaskQueueFixture"
+    static let chatSendOfflineFixtureLaunchArgument = "-morde.localChatSendOfflineFixture"
+    static let chatOfflineRecoveryFixtureLaunchArgument = "-morde.localChatOfflineRecoveryFixture"
+    private static let chatOfflineRecoveryMessageDefaultsKey = "morde.localChatOfflineRecoveryMessage.v1"
     static let messageSendWithoutAutoRoutingFixtureLaunchArgument = "-morde.localMessageSendWithoutAutoRoutingFixture"
     static let selectedUnavailableHostSendFixtureLaunchArgument = "-morde.localSelectedUnavailableHostSendFixture"
     static let selectedUnavailableWorkspaceSendFixtureLaunchArgument = "-morde.localSelectedUnavailableWorkspaceSendFixture"
@@ -137,6 +140,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let resourceDefaultHostPreferenceFailureFixtureLaunchArgument = "-morde.localResourceDefaultHostPreferenceFailureFixture"
     static let resourceRefreshRecoveryFixtureLaunchArgument = "-morde.localResourceRefreshRecoveryFixture"
     static let mainChatFixtureLaunchArgument = "-morde.localMainChatFixture"
+    static let selectedModelPreferenceFixtureLaunchArgument = "-morde.localSelectedModelPreferenceFixture"
     static let noAdminModelFixtureLaunchArgument = "-morde.localNoAdminModelFixture"
     static let noCloudModelFixtureLaunchArgument = "-morde.localNoCloudModelFixture"
     static let unknownCloudModelFixtureLaunchArgument = "-morde.localUnknownCloudModelFixture"
@@ -2165,6 +2169,12 @@ private final class MordeAuthURLProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: error)
             return
         }
+        if ProcessInfo.processInfo.arguments.contains(Self.chatSendOfflineFixtureLaunchArgument),
+           request.url?.host == "127.0.0.1", request.url?.path.hasPrefix("/api/conversations/") == true,
+           request.url?.path.hasSuffix("/messages") == true, request.httpMethod == "POST" {
+            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-morde.localProjectQueueOffline"),
            request.url?.host == "127.0.0.1", request.url?.path == "/api/capabilities",
            request.httpMethod == "GET" {
@@ -2229,6 +2239,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
         if isFixtureOrigin, request.url?.path == "/api/auth/client-login",
            ProcessInfo.processInfo.arguments.contains(Self.mainChatFixtureLaunchArgument) {
             Self.resetMainChatFixture()
+        }
+        if isFixtureOrigin, request.url?.path == "/api/auth/client-login",
+           ProcessInfo.processInfo.arguments.contains(Self.chatOfflineRecoveryFixtureLaunchArgument),
+           ProcessInfo.processInfo.arguments.contains(Self.chatSendOfflineFixtureLaunchArgument) {
+            UserDefaults.standard.removeObject(forKey: Self.chatOfflineRecoveryMessageDefaultsKey)
         }
         if isFixtureOrigin, request.url?.path == "/api/auth/client-login",
            ProcessInfo.processInfo.arguments.contains(Self.chatAttachmentFixtureLaunchArgument) {
@@ -2448,6 +2463,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
             if ProcessInfo.processInfo.arguments.contains(Self.resourceDefaultHostPreferenceFailureFixtureLaunchArgument) {
                 statusCode = 503
                 body = Data(#"{"error":{"code":"unavailable","message":"Synthetic preference service unavailable"}}"#.utf8)
+            } else if ProcessInfo.processInfo.arguments.contains(Self.selectedModelPreferenceFixtureLaunchArgument) {
+                statusCode = 200
+                body = Data(#"{"assistant_name":"morde","selected_model_id":"p2345678","default_host_id":null,"updated_at":null}"#.utf8)
             } else {
                 statusCode = 200
                 body = Data(#"{"assistant_name":"morde","selected_model_id":null,"default_host_id":null,"updated_at":null}"#.utf8)
@@ -2920,6 +2938,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   request.url?.path.hasPrefix("/api/conversations/") == true,
                   request.url?.path.hasSuffix("/messages") == true,
                   (ProcessInfo.processInfo.arguments.contains(Self.messageSendWithoutAutoRoutingFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.selectedModelPreferenceFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.selectedUnavailableHostSendFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.serviceUpgradeRetryFixtureLaunchArgument)) {
             let payload = Self.jsonPayload(request)
@@ -2937,10 +2956,14 @@ private final class MordeAuthURLProtocol: URLProtocol {
             let selectedUnavailableWorkspaceIsPreserved =
                 !ProcessInfo.processInfo.arguments.contains(Self.selectedUnavailableWorkspaceSendFixtureLaunchArgument) ||
                 (payload?["host_id"] as? String == "h0000003" && payload?["workspace_id"] as? String == "w0000002")
+            let selectedModelPreferenceIsPreserved =
+                !ProcessInfo.processInfo.arguments.contains(Self.selectedModelPreferenceFixtureLaunchArgument) ||
+                payload?["model_id"] as? String == "p2345678"
             let valid = !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !clientID.isEmpty &&
                 !conversationID.isEmpty &&
                 payload?["mode"] == nil && payload?["expected_task_id"] == nil &&
                 selectedUnavailableHostIsPreserved && selectedUnavailableWorkspaceIsPreserved &&
+                selectedModelPreferenceIsPreserved &&
                 (!ProcessInfo.processInfo.arguments.contains(Self.resourceListFailureFixtureLaunchArgument) || targetIsUnassigned) &&
                 request.value(forHTTPHeaderField: "Idempotency-Key") == clientID &&
                 request.value(forHTTPHeaderField: "X-Morde-Service-Instance-ID") == "00000000-0000-0000-0000-000000000001" &&
@@ -2956,6 +2979,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
                     "routing_status": "pending", "delivery_status": "pending",
                     "created_at": "2026-11-07T00:00:00Z",
                 ]
+                if ProcessInfo.processInfo.arguments.contains(Self.chatOfflineRecoveryFixtureLaunchArgument) {
+                    UserDefaults.standard.set(message, forKey: Self.chatOfflineRecoveryMessageDefaultsKey)
+                }
                 statusCode = 202
                 body = (try? JSONSerialization.data(withJSONObject: ["message": message, "replayed": false])) ?? Data()
             } else {
@@ -3152,14 +3178,23 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   ProcessInfo.processInfo.arguments.contains(Self.mainChatFixtureLaunchArgument) {
             let conversationID = request.url?.path == "/api/conversations/c1234567/messages" ? "c1234567" : "c2345678"
             let messageQuery = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems ?? []
+            let requestedClientMessageID = messageQuery.first(where: { $0.name == "client_message_id" })?.value
+            let offlineRecoveredMessage = ProcessInfo.processInfo.arguments.contains(Self.chatOfflineRecoveryFixtureLaunchArgument)
+                ? UserDefaults.standard.dictionary(forKey: Self.chatOfflineRecoveryMessageDefaultsKey) : nil
             shouldDelayConversationHistoryResponse = conversationID == "c1234567" &&
                 ProcessInfo.processInfo.arguments.contains("-morde.localDelayConversationHistoryFixture") &&
                 !messageQuery.contains(where: { $0.name == "client_message_id" })
-            if conversationID == "c1234567",
-               messageQuery.contains(where: { $0.name == "client_message_id" }) {
+            if conversationID == "c1234567", let requestedClientMessageID {
                 // A client_message_id lookup returns only the matching user message; the seed assistant reply is unrelated.
                 statusCode = 200
-                body = Data(#"{"items":[],"next_cursor":null}"#.utf8)
+                let items: [[String: Any]]
+                if let offlineRecoveredMessage,
+                   offlineRecoveredMessage["client_message_id"] as? String == requestedClientMessageID {
+                    items = [offlineRecoveredMessage]
+                } else {
+                    items = []
+                }
+                body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
             } else if conversationID == "c1234567",
                ProcessInfo.processInfo.arguments.contains(Self.conversationHistoryPaginationFixtureLaunchArgument) {
                 let cursor = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
@@ -3195,7 +3230,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
             } else {
                 statusCode = 200
                 let content = conversationID == "c1234567" ? "Main chat is ready." : "Side conversation is sidebar-only."
-                body = Data("{\"items\":[{\"id\":\"m1234567\",\"conversation_id\":\"\(conversationID)\",\"task_id\":null,\"role\":\"assistant\",\"content\":\"\(content)\",\"status\":\"completed\",\"delivery_status\":null,\"created_at\":\"2026-11-05T00:00:00Z\"}],\"next_cursor\":null}".utf8)
+                var items: [[String: Any]] = [["id": "m1234567", "conversation_id": conversationID,
+                    "task_id": NSNull(), "role": "assistant", "content": content,
+                    "status": "completed", "delivery_status": NSNull(), "created_at": "2026-11-05T00:00:00Z"]]
+                if let offlineRecoveredMessage { items.append(offlineRecoveredMessage) }
+                body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
             }
         } else if isFixtureOrigin, request.url?.path == "/api/conversations/c1234567/messages", request.httpMethod == "GET",
                   ProcessInfo.processInfo.arguments.contains(Self.conversationFailureFixtureLaunchArgument) {
@@ -3766,7 +3805,14 @@ private struct MordeKeychain {
                                     kSecValueData as String: Data(value.utf8),
                                     kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
         let addStatus = SecItemAdd(query as CFDictionary, nil)
-        guard addStatus == errSecSuccess else { throw URLError(.cannotWriteToFile) }
+        guard addStatus == errSecSuccess else {
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains(MordeAuthURLProtocol.selectedModelPreferenceFixtureLaunchArgument) {
+                NSLog("Morde local fixture Keychain add failed status=%d", addStatus)
+            }
+#endif
+            throw URLError(.cannotWriteToFile)
+        }
     }
     func remove(_ account: String) {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
@@ -4112,6 +4158,7 @@ private struct MordeLoadedModels {
     let items: [MordeModel]
     let defaultModelConfigured: Bool
     let defaultModelID: String?
+    let selectedModelID: String?
     let personalModelIDs: Set<String>
     let configurationStatus: String
 }
@@ -4145,6 +4192,7 @@ struct MordeExecutionControl: Decodable, Equatable {
     }
 }
 private struct MordeUserPreferences: Decodable {
+    let selected_model_id: String?
     let default_host_id: String?
 }
 struct MordeBatchItem: Decodable, Identifiable { let id: String; let key: String; let status: String }
@@ -5489,6 +5537,7 @@ private struct MordeIndependentSendTarget {
     @Published var models: [MordeModel] = []
     @Published private(set) var defaultModelConfigured = false
     @Published private(set) var defaultModelID: String?
+    @Published private(set) var selectedModelID: String?
     @Published private(set) var personalModelIDs: Set<String> = []
     @Published private(set) var modelConfigurationStatus = "unknown"
     private var modelConfigurationCheckedAt: Date?
@@ -5997,7 +6046,7 @@ private struct MordeIndependentSendTarget {
         let generation = UUID()
         resourceLoadGeneration = generation
         hosts = []; sharedHosts = []; workspaces = []; models = []
-        defaultModelConfigured = false; defaultModelID = nil; personalModelIDs = []
+        defaultModelConfigured = false; defaultModelID = nil; selectedModelID = nil; personalModelIDs = []
         conversations = []; conversationNextCursor = nil; tasks = []; notifications = []
         notificationNextCursor = nil; loadingMoreNotifications = false
         for resource in Self.listResources { setResourceState(.loading, for: resource) }
@@ -7464,7 +7513,7 @@ private struct MordeIndependentSendTarget {
         hostRestoreInFlightID = nil
         hostControlActionGeneration = UUID()
         user = nil; hosts = []; sharedHosts = []; workspaces = []; models = []
-        defaultModelConfigured = false; defaultModelID = nil; personalModelIDs = []
+        defaultModelConfigured = false; defaultModelID = nil; selectedModelID = nil; personalModelIDs = []
         modelConfigurationStatus = "unknown"; modelConfigurationCheckedAt = nil
         pendingMessages = []
         draftConversationAliases = [:]
@@ -10317,6 +10366,7 @@ private struct MordeIndependentSendTarget {
             await loadResource(.models, generation: generation, fetch: {
                 let available: MordeAvailableModels = try await self.call("/api/available-models")
                 let connections: MordeModelConnectionList = try await self.call("/api/model-connections")
+                let preferences: MordeUserPreferences? = try? await self.call("/api/me/preferences")
                 let eligible = available.items.filter { $0.capabilities.text }
                 let eligibleIDs = Set(eligible.map(\.id))
                 let defaultID = available.default_model_id.flatMap { eligibleIDs.contains($0) ? $0 : nil }
@@ -10324,10 +10374,12 @@ private struct MordeIndependentSendTarget {
                 let personalIDs = Set(connections.items.filter { !$0.shared && $0.checked_at != nil }.map(\.id))
                     .intersection(eligibleIDs)
                 let allowedIDs = personalIDs.union(configured ? Set([defaultID].compactMap { $0 }) : [])
+                let selectedModelID = preferences?.selected_model_id.flatMap { allowedIDs.contains($0) ? $0 : nil }
                 return MordeLoadedModels(
                     items: eligible.filter { allowedIDs.contains($0.id) },
                     defaultModelConfigured: configured,
                     defaultModelID: configured ? defaultID : nil,
+                    selectedModelID: selectedModelID,
                     personalModelIDs: personalIDs,
                     configurationStatus: ["configured", "not_configured", "unknown"].contains(available.configuration_status ?? "")
                         ? (available.configuration_status ?? "unknown") : "unknown")
@@ -10335,6 +10387,7 @@ private struct MordeIndependentSendTarget {
                 self.models = $0.items
                 self.defaultModelConfigured = $0.defaultModelConfigured
                 self.defaultModelID = $0.defaultModelID
+                self.selectedModelID = $0.selectedModelID
                 self.personalModelIDs = $0.personalModelIDs
                 self.modelConfigurationStatus = $0.configurationStatus
                 self.modelConfigurationCheckedAt = Date()
@@ -10342,6 +10395,7 @@ private struct MordeIndependentSendTarget {
                 self.models = []
                 self.defaultModelConfigured = false
                 self.defaultModelID = nil
+                self.selectedModelID = nil
                 self.personalModelIDs = []
                 self.modelConfigurationStatus = "unknown"
                 self.modelConfigurationCheckedAt = nil
@@ -15065,7 +15119,11 @@ private struct MordeRoot: View {
     }
     private func modelsChanged(_ state: MordeResourceLoadState?) {
         guard state?.isLoaded == true, model.isEmpty else { return }
-        model = client.defaultModelID ?? (client.models.count == 1 ? client.models.first?.id : nil) ?? ""
+        model = MordePreferredModelPolicy.resolve(
+            selectedModelID: client.selectedModelID,
+            availableModelIDs: Set(client.models.map(\.id)),
+            administratorDefaultModelID: client.defaultModelID,
+            singleAvailableModelID: client.models.count == 1 ? client.models.first?.id : nil) ?? ""
     }
     @ViewBuilder
     private func emptyResourceState(_ resource: MordeResource, itemCount: Int, emptyMessage: String) -> some View {

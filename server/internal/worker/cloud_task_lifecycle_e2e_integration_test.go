@@ -59,6 +59,15 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.CreateModelConnection(ctx, app.ModelConnectionRecord{
+		ID: "p1234567", OwnerID: owner.ID, Name: "Synthetic cloud lifecycle", BaseURL: "https://models.example.invalid/v1",
+		ModelName: "synthetic-cloud-lifecycle", APIKeyCipher: bytes.Repeat([]byte{0x51}, 32),
+	}); err != nil {
+		t.Fatalf("create local synthetic model connection: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true WHERE id=$1`, "p1234567"); err != nil {
+		t.Fatalf("mark local synthetic text model as checked: %v", err)
+	}
 	workspaceValue := createF01Workspace(t, ctx, store, owner.ID)
 	sealer, err := app.NewSealer(make([]byte, 32))
 	if err != nil {
@@ -192,9 +201,10 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		t.Fatal(err)
 	}
 	completionSyncReceipts := make(chan int64, 4)
-	toolBroker, err := app.NewCloudDSHToolBrokerWithPersonalData(&f01WorkspaceSyncCompletionGateTaskStore{
+	gateStore := &f01WorkspaceSyncCompletionGateTaskStore{
 		TaskStore: store, appliedRevisions: completionSyncReceipts, requiredRevision: 1,
-	}, runtimeTools, nil, nil, recordCapture, personalData, personalSync, goals, personalAttachments, nil)
+	}
+	toolBroker, err := app.NewCloudDSHToolBrokerWithPersonalData(gateStore, runtimeTools, nil, nil, recordCapture, personalData, personalSync, goals, personalAttachments, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,15 +278,16 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	}
 	model := &f01CloudTaskModel{workspaceID: workspaceValue.ID, approvalFirst: true,
 		secondStarted: make(chan struct{}), content: "Morde kept the cloud task running after the client disconnected.\n"}
+	observedTools := &f01ObservedCloudDSHTools{CloudDSHToolBroker: toolBroker, store: store}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-e2e-supervisor", AccountRuntimes: conversationRuntimeManager,
-		Instances: instances, Checkpoints: checkpointDiagnostics, Children: childSessions, Models: model, Tools: toolBroker, Completion: toolBroker,
+		Instances: instances, Checkpoints: checkpointDiagnostics, Children: childSessions, Models: model, Tools: observedTools, Completion: toolBroker,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	executionErrors := make(chan error, 4)
-	recorder := f01RecordingExecutor{inner: executor, errors: executionErrors, supervisor: supervisor, tools: toolBroker, checkpoints: checkpointDiagnostics}
+	recorder := f01RecordingExecutor{inner: executor, errors: executionErrors, supervisor: supervisor, tools: observedTools, checkpoints: checkpointDiagnostics}
 	backgroundWorker, err := NewTaskWorker(TaskWorkerOptions{
 		Store: store, Executor: recorder, WorkerID: "f01-e2e-worker", LeaseDuration: 30 * time.Second,
 		PollInterval: 5 * time.Millisecond, Logger: zap.NewNop(),
@@ -312,9 +323,40 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	if conversationResponse.StatusCode != http.StatusCreated || createdConversation.ID == "" {
 		t.Fatalf("POST /api/conversations = status %d, response %#v", conversationResponse.StatusCode, createdConversation)
 	}
+	serviceInstanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeClassifier := &f01ConversationRouteClassifier{}
+	routeActions := &f01ObservedConversationRouteActions{ConversationRouteActions: store}
+	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{
+		Queue: store, Actions: routeActions, Models: routeClassifier, WorkerID: "f01-e2e-route-worker",
+		LeaseDuration: time.Minute, PollInterval: 5 * time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- backgroundWorker.Run(workerCtx) }()
+	routeWorkerDone := make(chan error, 1)
+	go func() { routeWorkerDone <- routeWorker.Run(workerCtx) }()
+	defer func() {
+		cancelWorker()
+		for name, done := range map[string]<-chan error{"TaskWorker": workerDone, "ConversationRouteWorker": routeWorkerDone} {
+			select {
+			case runErr := <-done:
+				if !errors.Is(runErr, context.Canceled) {
+					t.Errorf("%s.Run() = %v, want context canceled during cleanup", name, runErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s did not stop", name)
+			}
+		}
+	}()
 	postCtx, cancelPost := context.WithCancel(ctx)
 	postBody, err := json.Marshal(map[string]any{
-		"mode": "new", "host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(0),
+		"client_message_id": "f01-cloud-lifecycle-e2e-001", "host_id": hostValue.ID, "workspace_id": workspaceValue.ID,
 		"model_id": "p1234567", "content": "Run an approved bounded Workspace command, then write a short note in the attached Workspace.",
 		"budget": map[string]int64{"active_seconds": 120, "tool_calls": 5, "model_tokens": 1000},
 	})
@@ -329,23 +371,22 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	postRequest.Header.Set("Content-Type", "application/json")
 	postRequest.Header.Set("Origin", portal.URL)
 	postRequest.Header.Set("Idempotency-Key", "f01-cloud-lifecycle-e2e-001")
+	postRequest.Header.Set("X-Morde-Service-Instance-ID", serviceInstanceID)
+	postRequest.Header.Set("X-Morde-Actor-ID", owner.ID)
 	postResponse, err := httpClient.Do(postRequest)
 	if err != nil {
 		cancelPost()
 		t.Fatal(err)
 	}
-	type acceptedTask struct {
-		ID             string `json:"id"`
-		Status         string `json:"status"`
-		WorkspaceID    string `json:"workspace_id"`
-		InputRevision  *int64 `json:"input_revision"`
-		ConversationID string `json:"conversation_id"`
-	}
 	var submission struct {
 		Message struct {
-			TaskID string `json:"task_id"`
+			ID              string `json:"id"`
+			ClientMessageID string `json:"client_message_id"`
+			TaskID          string `json:"task_id"`
+			RoutingStatus   string `json:"routing_status"`
+			DeliveryStatus  string `json:"delivery_status"`
 		} `json:"message"`
-		Task acceptedTask `json:"task"`
+		Replayed bool `json:"replayed"`
 	}
 	if err := json.NewDecoder(postResponse.Body).Decode(&submission); err != nil {
 		_ = postResponse.Body.Close()
@@ -354,12 +395,37 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	}
 	_ = postResponse.Body.Close()
 	cancelPost()
-	accepted := submission.Task
-	if postResponse.StatusCode != http.StatusAccepted || accepted.ID == "" || accepted.Status != string(task.StatusQueued) ||
-		accepted.WorkspaceID != workspaceValue.ID || accepted.InputRevision == nil || *accepted.InputRevision != 0 ||
-		accepted.ConversationID != createdConversation.ID || submission.Message.TaskID != accepted.ID {
-		t.Fatalf("POST /api/conversations/{id}/messages acceptance = status %d, response %#v", postResponse.StatusCode, submission)
+	if postResponse.StatusCode != http.StatusAccepted || submission.Message.ID == "" ||
+		submission.Message.ClientMessageID != "f01-cloud-lifecycle-e2e-001" || submission.Message.TaskID != "" ||
+		submission.Message.RoutingStatus != "pending" || submission.Message.DeliveryStatus != "pending" || submission.Replayed {
+		t.Fatalf("K1 POST /api/conversations/{id}/messages receipt = status %d, response %#v", postResponse.StatusCode, submission)
 	}
+	var routedTaskID string
+	if err := waitF01(t, ctx, func() (bool, error) {
+		message, found, err := store.FindConversationMessageByClientID(ctx, owner.ID, "", createdConversation.ID,
+			"f01-cloud-lifecycle-e2e-001", serviceInstanceID)
+		if err != nil || !found {
+			return false, err
+		}
+		if message.RoutingStatus == "failed" {
+			return false, fmt.Errorf("accepted message routing failed: %s: %w", message.RoutingFailureReason, routeActions.lastApplyError())
+		}
+		if message.RoutingStatus != "routed" || message.TaskID == "" {
+			return false, nil
+		}
+		routedTaskID = message.TaskID
+		return true, nil
+	}, executionErrors, nil); err != nil {
+		t.Fatalf("ConversationRouteWorker did not route the accepted message after client disconnect: %v", err)
+	}
+	accepted, err := store.GetTask(ctx, routedTaskID, owner.ID)
+	if err != nil || accepted.Task.ConversationID != createdConversation.ID {
+		t.Fatalf("routed cloud Task = %#v, %v", accepted.Task, err)
+	}
+	if routeClassifier.calls.Load() != 1 {
+		t.Fatalf("synthetic route classifier calls after first message = %d, want 1", routeClassifier.calls.Load())
+	}
+	acceptedTaskID := accepted.Task.ID
 	conversationTasksRequest, err := http.NewRequest(http.MethodGet, portal.URL+"/api/conversations/"+createdConversation.ID+"/tasks", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -380,25 +446,10 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		t.Fatal(err)
 	}
 	_ = conversationTasksResponse.Body.Close()
-	if conversationTasksResponse.StatusCode != http.StatusOK || len(conversationTasks.Items) != 1 || conversationTasks.Items[0].ID != accepted.ID {
+	if conversationTasksResponse.StatusCode != http.StatusOK || len(conversationTasks.Items) != 1 || conversationTasks.Items[0].ID != acceptedTaskID {
 		t.Fatalf("GET /api/conversations/{id}/tasks recovery = status %d, response %#v", conversationTasksResponse.StatusCode, conversationTasks)
 	}
 	resumedTask := conversationTasks.Items[0]
-
-	workerCtx, cancelWorker := context.WithCancel(context.Background())
-	workerDone := make(chan error, 1)
-	go func() { workerDone <- backgroundWorker.Run(workerCtx) }()
-	defer func() {
-		cancelWorker()
-		select {
-		case runErr := <-workerDone:
-			if !errors.Is(runErr, context.Canceled) {
-				t.Errorf("TaskWorker.Run() = %v, want context canceled during cleanup", runErr)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("TaskWorker did not stop")
-		}
-	}()
 
 	liveClient, err := mordesync.New(portal.URL, activeCredential, httpClient)
 	if err != nil {
@@ -493,11 +544,11 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	}
 	decodeErr := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(resumeDataLine, "data:"))), &resumedFrame)
 	if eventErr != nil || dataErr != nil || !strings.HasPrefix(resumeEventLine, "event: ") ||
-		!strings.HasPrefix(resumeDataLine, "data:") || decodeErr != nil || resumedFrame.TaskID != accepted.ID || resumedFrame.Sequence != resumedSequence {
+		!strings.HasPrefix(resumeDataLine, "data:") || decodeErr != nil || resumedFrame.TaskID != acceptedTaskID || resumedFrame.Sequence != resumedSequence {
 		_ = streamResponse.Body.Close()
 		cancelStream()
 		t.Fatalf("resumed event does not belong to Task %s: id=%q event=%q data=%q decoded=%+v errors=%v/%v/%v",
-			accepted.ID, resumeIDLine, resumeEventLine, resumeDataLine, resumedFrame, eventErr, dataErr, decodeErr)
+			acceptedTaskID, resumeIDLine, resumeEventLine, resumeDataLine, resumedFrame, eventErr, dataErr, decodeErr)
 	}
 	cancelStream()
 	_ = streamResponse.Body.Close()
@@ -505,9 +556,20 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	var approvalID string
 	var approvalVersion int64
 	if err := waitF01(t, ctx, func() (bool, error) {
-		current, err := store.GetTask(ctx, accepted.ID, owner.ID)
+		bindErr := gateStore.lastDeferredTargetBindError()
+		if bindErr != nil {
+			return false, fmt.Errorf("deferred target binding failed: %w", bindErr)
+		}
+		current, err := store.GetTask(ctx, acceptedTaskID, owner.ID)
 		if err != nil {
 			return false, err
+		}
+		if current.Task.Status == task.StatusWaitingUser && current.Task.WaitingReason == "workspace_unavailable" {
+			return false, fmt.Errorf("routed target became unavailable: bind_error=none tools=%s", observedTools.initialSummary())
+		}
+		if current.Task.Status == task.StatusWaitingUser && current.PendingRequest == nil {
+			return false, fmt.Errorf("task entered waiting_user without approval: reason=%s bind_error=none tools=%s",
+				current.Task.WaitingReason, observedTools.initialSummary())
 		}
 		if current.Task.Status != task.StatusWaitingUser || current.PendingRequest == nil {
 			return false, nil
@@ -518,23 +580,23 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	}, executionErrors, nil); err != nil {
 		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelDiagnostic()
-		current, taskErr := store.GetTask(diagnosticCtx, accepted.ID, owner.ID)
+		current, taskErr := store.GetTask(diagnosticCtx, acceptedTaskID, owner.ID)
 		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
 		var executionErr error
 		select {
 		case executionErr = <-executionErrors:
 		default:
 		}
-		t.Fatalf("sensitive Host action did not wait for approval: wait_error=%v execution_error=%v task_status=%s waiting_reason=%s host=%s workspace=%s input_revision=%v checkpoint_revision=%v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s task_error=%v binding_error=%v",
+		t.Fatalf("sensitive Host action did not wait for approval: wait_error=%v execution_error=%v task_status=%s waiting_reason=%s host=%s workspace=%s input_revision=%v checkpoint_revision=%v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s task_error=%v binding_error=%v initial_tool_definitions=%s",
 			err, executionErr, current.Task.Status, current.Task.WaitingReason, current.Task.HostID, current.Task.WorkspaceID,
 			current.Task.InputRevision, current.Task.WorkspaceCheckpointRevision, model.callCount(), binding.State, binding.BindingVersion,
-			binding.DesiredRevision, binding.AppliedRevision, binding.SyncState, taskErr, bindingErr)
+			binding.DesiredRevision, binding.AppliedRevision, binding.SyncState, taskErr, bindingErr, observedTools.initialSummary())
 	}
 	if approvalCommand.calls.Load() != 0 {
 		t.Fatalf("Host Workspace command ran before approval: calls=%d", approvalCommand.calls.Load())
 	}
 	secondClientCredential := createF01Session(t, ctx, store, owner.ID)
-	getTask, err := http.NewRequest(http.MethodGet, portal.URL+"/api/tasks/"+accepted.ID, nil)
+	getTask, err := http.NewRequest(http.MethodGet, portal.URL+"/api/tasks/"+acceptedTaskID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +630,7 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	approvalCredentials := []string{secondClientCredential, sessionCredential}
 	for attempt, credential := range approvalCredentials {
 		approvalRequest, err := http.NewRequest(http.MethodPost,
-			portal.URL+"/api/tasks/"+accepted.ID+"/approvals/"+approvalID+"/responses", bytes.NewReader(approvalBody))
+			portal.URL+"/api/tasks/"+acceptedTaskID+"/approvals/"+approvalID+"/responses", bytes.NewReader(approvalBody))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -596,11 +658,11 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		case <-model.secondStarted:
 			secondTurnReached = true
 		case executionErr := <-executionErrors:
-			current, taskErr := store.GetTask(ctx, accepted.ID, owner.ID)
+			current, taskErr := store.GetTask(ctx, acceptedTaskID, owner.ID)
 			t.Fatalf("real CloudDSHExecutor stopped before its second model call: %v; task=%#v task_error=%v",
 				executionErr, current.Task, taskErr)
 		case <-secondTurn.C:
-			current, getErr := store.GetTask(ctx, accepted.ID, owner.ID)
+			current, getErr := store.GetTask(ctx, acceptedTaskID, owner.ID)
 			t.Logf("waiting for dsh second model turn: err=%v status=%s agent=%s/%d checkpoint=%d reason=%s model_calls=%d steps=%d",
 				getErr, current.Task.Status, current.Task.AgentInstanceID, current.Task.AgentGeneration,
 				current.Task.CheckpointThroughSequence, current.Task.WaitingReason, model.callCount(), len(current.Steps))
@@ -608,7 +670,7 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 			t.Fatalf("dsh did not continue to its next model turn after the client stream closed: %v", ctx.Err())
 		}
 	}
-	details, err := store.GetTask(ctx, accepted.ID, owner.ID)
+	details, err := store.GetTask(ctx, acceptedTaskID, owner.ID)
 	if err != nil || details.Task.Status != task.StatusRunning && details.Task.Status != task.StatusCompleted {
 		t.Fatalf("task after client stream disconnect = %s, %v; want running or completed", details.Task.Status, err)
 	}
@@ -616,22 +678,22 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		t.Fatalf("approved Host Workspace command ran %d times, want exactly once", approvalCommand.calls.Load())
 	}
 	if err := waitF01(t, ctx, func() (bool, error) {
-		current, err := store.GetTask(ctx, accepted.ID, owner.ID)
+		current, err := store.GetTask(ctx, acceptedTaskID, owner.ID)
 		return err == nil && current.Task.Status == task.StatusCompleted, err
 	}, executionErrors, nil); err != nil {
 		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelDiagnostic()
-		current, taskErr := store.GetTask(diagnosticCtx, accepted.ID, owner.ID)
+		current, taskErr := store.GetTask(diagnosticCtx, acceptedTaskID, owner.ID)
 		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
 		currentHost, hostErr := store.GetHost(diagnosticCtx, hostValue.ID)
 		currentFence, fenceErr := runtimeControl.ReadTaskFence(diagnosticCtx, current.Task.InitiatorID, current.Task.HostID)
-		approvalOperation, approvalOperationErr := store.GetOperation(diagnosticCtx, owner.ID, accepted.ID, f01OperationKey("f01-workspace-command-001"))
-		writeOperation, writeOperationErr := store.GetOperation(diagnosticCtx, owner.ID, accepted.ID, f01OperationKey("f01-write-note-001"))
+		approvalOperation, approvalOperationErr := store.GetOperation(diagnosticCtx, owner.ID, acceptedTaskID, f01OperationKey("f01-workspace-command-001"))
+		writeOperation, writeOperationErr := store.GetOperation(diagnosticCtx, owner.ID, acceptedTaskID, f01OperationKey("f01-write-note-001"))
 		var verificationOperation task.Operation
 		var verificationOperationErr error
 		for _, step := range current.Steps {
 			if step.Kind == "verification" {
-				verificationOperation, verificationOperationErr = store.GetOperation(diagnosticCtx, owner.ID, accepted.ID,
+				verificationOperation, verificationOperationErr = store.GetOperation(diagnosticCtx, owner.ID, acceptedTaskID,
 					fmt.Sprintf("agent:verify:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
 			}
 		}
@@ -652,11 +714,11 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	}, liveErrors, liveReceipts); err != nil {
 		t.Fatal(err)
 	}
-	details, err = store.GetTask(ctx, accepted.ID, owner.ID)
+	details, err = store.GetTask(ctx, acceptedTaskID, owner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	approvalOperation, approvalOperationErr := store.GetOperation(ctx, owner.ID, accepted.ID, f01OperationKey("f01-workspace-command-001"))
+	approvalOperation, approvalOperationErr := store.GetOperation(ctx, owner.ID, acceptedTaskID, f01OperationKey("f01-workspace-command-001"))
 	if details.PendingRequest == nil || details.PendingRequest.Status != task.PendingRequestApproved ||
 		details.PendingRequest.Decision != task.PendingDecisionApprove || approvalOperationErr != nil ||
 		approvalOperation.Status != task.OperationSucceeded || approvalCommand.calls.Load() != 1 || model.callCount() != 3 {
@@ -705,7 +767,7 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	var agentState, agentInstanceID string
 	var agentGeneration int64
 	if err := pool.QueryRow(ctx, `SELECT state,agent_instance_id,agent_generation FROM task_agent_instances
-WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accepted.ID, owner.ID).
+WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, acceptedTaskID, owner.ID).
 		Scan(&agentState, &agentInstanceID, &agentGeneration); err != nil || agentState != "stopped" || agentInstanceID == hostValue.ID {
 		t.Fatalf("completed Task Agent = state %s instance %q generation %d, %v", agentState, agentInstanceID, agentGeneration, err)
 	}
@@ -729,7 +791,8 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 
 	model.enableBackgroundChild()
 	backgroundRequest, err := json.Marshal(map[string]any{
-		"mode": "new", "host_id": hostValue.ID, "workspace_id": workspaceValue.ID, "input_revision": int64(1),
+		"client_message_id": "f01-cloud-background-e2e-001", "previous_client_message_id": "f01-cloud-lifecycle-e2e-001",
+		"host_id": hostValue.ID, "workspace_id": workspaceValue.ID,
 		"model_id": "p1234567", "content": "Read the existing Workspace note in a background job, then create and save a completion note in the Workspace.",
 		"budget": map[string]int64{"active_seconds": 120, "tool_calls": 20, "model_tokens": 1000},
 	})
@@ -745,39 +808,65 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 	backgroundPost.Header.Set("Content-Type", "application/json")
 	backgroundPost.Header.Set("Origin", portal.URL)
 	backgroundPost.Header.Set("Idempotency-Key", "f01-cloud-background-e2e-001")
+	backgroundPost.Header.Set("X-Morde-Service-Instance-ID", serviceInstanceID)
+	backgroundPost.Header.Set("X-Morde-Actor-ID", owner.ID)
 	backgroundResponse, err := httpClient.Do(backgroundPost)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var backgroundSubmission struct {
 		Message struct {
-			TaskID string `json:"task_id"`
+			ID              string `json:"id"`
+			ClientMessageID string `json:"client_message_id"`
+			TaskID          string `json:"task_id"`
+			RoutingStatus   string `json:"routing_status"`
 		} `json:"message"`
-		Task struct {
-			ID             string `json:"id"`
-			Status         string `json:"status"`
-			ConversationID string `json:"conversation_id"`
-		} `json:"task"`
+		Replayed bool `json:"replayed"`
 	}
 	if err := json.NewDecoder(backgroundResponse.Body).Decode(&backgroundSubmission); err != nil {
 		_ = backgroundResponse.Body.Close()
 		t.Fatal(err)
 	}
 	_ = backgroundResponse.Body.Close()
-	backgroundAccepted := backgroundSubmission.Task
-	if backgroundResponse.StatusCode != http.StatusAccepted || backgroundAccepted.ID == "" || backgroundAccepted.Status != string(task.StatusQueued) ||
-		backgroundAccepted.ConversationID != createdConversation.ID || backgroundSubmission.Message.TaskID != backgroundAccepted.ID {
-		t.Fatalf("background POST /api/conversations/{id}/messages acceptance = status %d, response %#v", backgroundResponse.StatusCode, backgroundSubmission)
+	if backgroundResponse.StatusCode != http.StatusAccepted || backgroundSubmission.Message.ID == "" ||
+		backgroundSubmission.Message.ClientMessageID != "f01-cloud-background-e2e-001" ||
+		backgroundSubmission.Message.RoutingStatus != "pending" || backgroundSubmission.Message.TaskID != "" || backgroundSubmission.Replayed {
+		t.Fatalf("background K1 message receipt = status %d, response %#v", backgroundResponse.StatusCode, backgroundSubmission)
+	}
+	var backgroundTaskID string
+	if err := waitF01(t, ctx, func() (bool, error) {
+		message, found, err := store.FindConversationMessageByClientID(ctx, owner.ID, "", createdConversation.ID,
+			"f01-cloud-background-e2e-001", serviceInstanceID)
+		if err != nil || !found {
+			return false, err
+		}
+		if message.RoutingStatus == "failed" {
+			return false, fmt.Errorf("background message routing failed: %s", message.RoutingFailureReason)
+		}
+		if message.RoutingStatus != "routed" || message.TaskID == "" {
+			return false, nil
+		}
+		backgroundTaskID = message.TaskID
+		return true, nil
+	}, executionErrors, nil); err != nil {
+		t.Fatalf("ConversationRouteWorker did not route the background message: %v", err)
+	}
+	backgroundAccepted, err := store.GetTask(ctx, backgroundTaskID, owner.ID)
+	if err != nil || backgroundAccepted.Task.ConversationID != createdConversation.ID {
+		t.Fatalf("routed background cloud Task = %#v, %v", backgroundAccepted.Task, err)
+	}
+	if routeClassifier.calls.Load() != 2 {
+		t.Fatalf("synthetic route classifier calls after second message = %d, want 2", routeClassifier.calls.Load())
 	}
 	childWaitCtx, cancelChildWait := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelChildWait()
 	if err := waitF01(t, childWaitCtx, func() (bool, error) {
-		current, err := store.GetTask(ctx, backgroundAccepted.ID, owner.ID)
+		current, err := store.GetTask(ctx, backgroundAccepted.Task.ID, owner.ID)
 		return err == nil && current.Task.Status == task.StatusCompleted, err
 	}, executionErrors, nil); err != nil {
 		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelDiagnostic()
-		current, taskErr := store.GetTask(diagnosticCtx, backgroundAccepted.ID, owner.ID)
+		current, taskErr := store.GetTask(diagnosticCtx, backgroundAccepted.Task.ID, owner.ID)
 		binding, bindingErr := store.GetWorkspaceBinding(diagnosticCtx, hostValue.ID, workspaceValue.ID)
 		t.Fatalf("background Task did not finish: wait=%v status=%s reason=%s steps=%#v model_calls=%d workspace_revision=%d desired_revision=%d applied_revision=%d sync_state=%s task_error=%v binding_error=%v",
 			err, current.Task.Status, current.Task.WaitingReason, current.Steps, model.callCount(), binding.Workspace.Revision,
@@ -792,14 +881,14 @@ WHERE task_id=$1 AND owner_id=$2 ORDER BY agent_generation DESC LIMIT 1`, accept
 	}, liveErrors, liveReceipts); err != nil {
 		t.Fatalf("Host did not apply the background Task's published Workspace revision: %v", err)
 	}
-	backgroundDetails, err := store.GetTask(ctx, backgroundAccepted.ID, owner.ID)
+	backgroundDetails, err := store.GetTask(ctx, backgroundAccepted.Task.ID, owner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var childSessionID string
 	var allowedTools []byte
 	if err := pool.QueryRow(ctx, `SELECT session_id, allowed_tools FROM task_agent_sessions
-WHERE task_id=$1 AND owner_id=$2 AND parent_session_id IS NOT NULL AND is_background`, backgroundAccepted.ID, owner.ID).
+WHERE task_id=$1 AND owner_id=$2 AND parent_session_id IS NOT NULL AND is_background`, backgroundAccepted.Task.ID, owner.ID).
 		Scan(&childSessionID, &allowedTools); err != nil {
 		t.Fatalf("load persisted background child: %v", err)
 	}
@@ -815,13 +904,15 @@ WHERE task_id=$1 AND owner_id=$2 AND parent_session_id IS NOT NULL AND is_backgr
 	}
 	if !childSucceeded || !model.backgroundOutputWasVerified() || len(backgroundDetails.Artifacts) != 1 ||
 		backgroundDetails.Artifacts[0].Path != "background-result.txt" || backgroundDetails.Task.WorkspaceCheckpointRevision == nil ||
-		*backgroundDetails.Task.WorkspaceCheckpointRevision != 2 {
+		*backgroundDetails.Task.WorkspaceCheckpointRevision != 2 || backgroundDetails.Task.HostID != hostValue.ID ||
+		backgroundDetails.Task.WorkspaceID != workspaceValue.ID || backgroundDetails.Task.InputRevision == nil ||
+		*backgroundDetails.Task.InputRevision != 1 {
 		t.Fatalf("background job result was not durably read and published: child_succeeded=%t output_verified=%t checkpoint=%#v artifacts=%#v steps=%#v",
 			childSucceeded, model.backgroundOutputWasVerified(), backgroundDetails.Task.WorkspaceCheckpointRevision,
 			backgroundDetails.Artifacts, backgroundDetails.Steps)
 	}
-	backgroundReadCall := cloudDSHNamespacedToolCallID(backgroundAccepted.ID, childSessionID, "f01-background-read-001")
-	backgroundReadOperation, backgroundReadErr := store.GetOperation(ctx, owner.ID, backgroundAccepted.ID, f01OperationKey(backgroundReadCall))
+	backgroundReadCall := cloudDSHNamespacedToolCallID(backgroundAccepted.Task.ID, childSessionID, "f01-background-read-001")
+	backgroundReadOperation, backgroundReadErr := store.GetOperation(ctx, owner.ID, backgroundAccepted.Task.ID, f01OperationKey(backgroundReadCall))
 	if backgroundReadErr != nil || backgroundReadOperation.Status != task.OperationSucceeded {
 		t.Fatalf("background Host Runtime read operation = %#v, %v", backgroundReadOperation, backgroundReadErr)
 	}
@@ -836,6 +927,46 @@ func f01OperationKey(callID string) string {
 	return "agent:" + hex.EncodeToString(digest[:])
 }
 
+type f01ConversationRouteClassifier struct {
+	calls atomic.Int64
+}
+
+func (*f01ConversationRouteClassifier) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
+	return "p1234567", nil
+}
+
+func (classifier *f01ConversationRouteClassifier) ClassifyConversationRoute(ctx context.Context, _ app.ConversationRouteClaim,
+	_ app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return app.ConversationRouteDecision{}, err
+	}
+	classifier.calls.Add(1)
+	return app.ConversationRouteDecision{Action: app.ConversationRouteNew}, nil
+}
+
+type f01ObservedConversationRouteActions struct {
+	app.ConversationRouteActions
+	mu       sync.Mutex
+	applyErr error
+}
+
+func (actions *f01ObservedConversationRouteActions) ApplyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
+	snapshot app.ConversationRouteSnapshot, decision app.ConversationRouteDecision) error {
+	err := actions.ConversationRouteActions.ApplyConversationRoute(ctx, claim, snapshot, decision)
+	if err != nil {
+		actions.mu.Lock()
+		actions.applyErr = err
+		actions.mu.Unlock()
+	}
+	return err
+}
+
+func (actions *f01ObservedConversationRouteActions) lastApplyError() error {
+	actions.mu.Lock()
+	defer actions.mu.Unlock()
+	return actions.applyErr
+}
+
 // f01WorkspaceSyncCompletionGateTaskStore keeps this test's final commit
 // behind the real Host applied-revision receipt, so the completion path does
 // not race into a later DSH recovery with an already-advanced Workspace view.
@@ -843,6 +974,8 @@ type f01WorkspaceSyncCompletionGateTaskStore struct {
 	app.TaskStore
 	appliedRevisions <-chan int64
 	requiredRevision int64
+	bindErrMu        sync.Mutex
+	deferredBindErr  error
 }
 
 func (s *f01WorkspaceSyncCompletionGateTaskStore) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
@@ -867,6 +1000,66 @@ func (s *f01WorkspaceSyncCompletionGateTaskStore) CommitTaskProgress(ctx context
 	return s.TaskStore.CommitTaskProgress(ctx, progress)
 }
 
+func (s *f01WorkspaceSyncCompletionGateTaskStore) LoadDeferredTaskTarget(ctx context.Context,
+	value task.Task) (app.DeferredTaskTarget, bool, error) {
+	store, ok := s.TaskStore.(app.DeferredTaskTargetStore)
+	if !ok {
+		return app.DeferredTaskTarget{}, false, errors.New("deferred Task target storage is unavailable")
+	}
+	return store.LoadDeferredTaskTarget(ctx, value)
+}
+
+func (s *f01WorkspaceSyncCompletionGateTaskStore) BindDeferredTaskTarget(ctx context.Context, value task.Task,
+	selected app.DeferredTaskTarget, revision *int64, digest []byte) (task.Task, error) {
+	store, ok := s.TaskStore.(app.DeferredTaskTargetStore)
+	if !ok {
+		return task.Task{}, errors.New("deferred Task target storage is unavailable")
+	}
+	bound, err := store.BindDeferredTaskTarget(ctx, value, selected, revision, digest)
+	if err != nil {
+		s.bindErrMu.Lock()
+		s.deferredBindErr = err
+		s.bindErrMu.Unlock()
+	}
+	return bound, err
+}
+
+func (s *f01WorkspaceSyncCompletionGateTaskStore) lastDeferredTargetBindError() error {
+	s.bindErrMu.Lock()
+	defer s.bindErrMu.Unlock()
+	return s.deferredBindErr
+}
+
+func (s *f01WorkspaceSyncCompletionGateTaskStore) BindDeferredTaskWorkspace(ctx context.Context, value task.Task,
+	workspaceID string, revision int64, digest []byte) (task.Task, error) {
+	store, ok := s.TaskStore.(app.DeferredTaskWorkspaceStore)
+	if !ok {
+		return task.Task{}, errors.New("deferred Task Workspace storage is unavailable")
+	}
+	return store.BindDeferredTaskWorkspace(ctx, value, workspaceID, revision, digest)
+}
+
+func (s *f01WorkspaceSyncCompletionGateTaskStore) GetWorkspace(ctx context.Context, workspaceID string) (workspace.Workspace, error) {
+	reader, ok := s.TaskStore.(interface {
+		GetWorkspace(context.Context, string) (workspace.Workspace, error)
+	})
+	if !ok {
+		return workspace.Workspace{}, errors.New("Workspace snapshot storage is unavailable")
+	}
+	return reader.GetWorkspace(ctx, workspaceID)
+}
+
+func (s *f01WorkspaceSyncCompletionGateTaskStore) GetWorkspaceManifestPageForOwner(ctx context.Context, ownerID, workspaceID string,
+	revision int64, pathPrefix, afterPath string, limit int32) (workspace.ManifestPage, error) {
+	reader, ok := s.TaskStore.(interface {
+		GetWorkspaceManifestPageForOwner(context.Context, string, string, int64, string, string, int32) (workspace.ManifestPage, error)
+	})
+	if !ok {
+		return workspace.ManifestPage{}, errors.New("Workspace manifest snapshot storage is unavailable")
+	}
+	return reader.GetWorkspaceManifestPageForOwner(ctx, ownerID, workspaceID, revision, pathPrefix, afterPath, limit)
+}
+
 type f01CloudTaskModel struct {
 	mu                       sync.Mutex
 	calls                    int
@@ -882,6 +1075,96 @@ type f01CloudTaskModel struct {
 	backgroundLastGetCallID  string
 	backgroundOutputCallID   string
 	backgroundOutputVerified bool
+}
+
+type f01ObservedCloudDSHTools struct {
+	*app.CloudDSHToolBroker
+	store                  *storepostgres.Store
+	mu                     sync.Mutex
+	definitionCalls        int
+	firstDefinitions       []string
+	firstDefinitionsErr    string
+	firstTarget            app.DeferredTaskTarget
+	firstTargetFound       bool
+	firstTargetErr         string
+	firstAuthorization     string
+	firstScopeCount        int
+	firstCanObserve        bool
+	firstCanOperate        bool
+	lastToolName           string
+	lastWorkspaceArg       string
+	lastToolStatus         string
+	lastWaitingReason      string
+	lastToolErr            string
+	executeTarget          app.DeferredTaskTarget
+	executeTargetFound     bool
+	executeTargetErr       string
+	executeTaskHostID      string
+	executeTaskWorkspaceID string
+}
+
+func (tools *f01ObservedCloudDSHTools) Execute(ctx context.Context, value task.Task, call app.ModelToolCall) (app.AgentToolResult, error) {
+	var args struct {
+		WorkspaceID string `json:"workspace_id"`
+	}
+	_ = json.Unmarshal([]byte(call.Arguments), &args)
+	target, found, targetErr := tools.store.LoadDeferredTaskTarget(ctx, value)
+	result, err := tools.CloudDSHToolBroker.Execute(ctx, value, call)
+	tools.mu.Lock()
+	tools.lastToolName, tools.lastWorkspaceArg = call.Name, args.WorkspaceID
+	tools.lastToolStatus, tools.lastWaitingReason = string(result.Status), result.WaitingReason
+	tools.executeTarget, tools.executeTargetFound = target, found
+	tools.executeTaskHostID, tools.executeTaskWorkspaceID = value.HostID, value.WorkspaceID
+	if targetErr != nil {
+		tools.executeTargetErr = targetErr.Error()
+	}
+	if err != nil {
+		tools.lastToolErr = err.Error()
+	}
+	tools.mu.Unlock()
+	return result, err
+}
+
+func (tools *f01ObservedCloudDSHTools) Definitions(ctx context.Context, value task.Task) ([]app.AgentToolDefinition, error) {
+	target, found, targetErr := tools.store.LoadDeferredTaskTarget(ctx, value)
+	definitions, err := tools.CloudDSHToolBroker.Definitions(ctx, value)
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		names = append(names, definition.Name)
+	}
+	tools.mu.Lock()
+	tools.definitionCalls++
+	if tools.definitionCalls == 1 {
+		tools.firstDefinitions = names
+		tools.firstTarget, tools.firstTargetFound = target, found
+		principal := identity.Principal{Kind: identity.Kind(value.Authorization.Kind)}
+		for _, scope := range value.Authorization.Scopes {
+			principal.Scopes = append(principal.Scopes, identity.Scope(scope))
+		}
+		tools.firstAuthorization = value.Authorization.Kind
+		tools.firstScopeCount = len(value.Authorization.Scopes)
+		tools.firstCanObserve = principal.HasScope(identity.ScopeComputerObserve)
+		tools.firstCanOperate = principal.HasScope(identity.ScopeComputerOperate)
+		if targetErr != nil {
+			tools.firstTargetErr = targetErr.Error()
+		}
+		if err != nil {
+			tools.firstDefinitionsErr = err.Error()
+		}
+	}
+	tools.mu.Unlock()
+	return definitions, err
+}
+
+func (tools *f01ObservedCloudDSHTools) initialSummary() string {
+	tools.mu.Lock()
+	defer tools.mu.Unlock()
+	return fmt.Sprintf("calls=%d names=%v error=%q target=%+v found=%t target_error=%q auth_kind=%s scope_count=%d can_observe=%t can_operate=%t tool=%s workspace_arg=%s status=%s reason=%s tool_error=%q execute_target=%+v execute_found=%t execute_target_error=%q task_host=%s task_workspace=%s",
+		tools.definitionCalls, tools.firstDefinitions, tools.firstDefinitionsErr, tools.firstTarget,
+		tools.firstTargetFound, tools.firstTargetErr, tools.firstAuthorization, tools.firstScopeCount,
+		tools.firstCanObserve, tools.firstCanOperate, tools.lastToolName, tools.lastWorkspaceArg,
+		tools.lastToolStatus, tools.lastWaitingReason, tools.lastToolErr, tools.executeTarget,
+		tools.executeTargetFound, tools.executeTargetErr, tools.executeTaskHostID, tools.executeTaskWorkspaceID)
 }
 
 type f01RecordingExecutor struct {

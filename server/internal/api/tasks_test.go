@@ -37,6 +37,7 @@ type taskServiceStub struct {
 	actionTaskID           string
 	action                 task.Action
 	actionExpected         task.Status
+	actionRevisionFence    *app.TaskActionRevisionFence
 	actionKey              string
 	actionCalls            int
 	retryTaskID            string
@@ -187,9 +188,13 @@ func (s *taskServiceStub) Get(_ context.Context, _ identity.Principal, id string
 	return app.TaskDetails{Task: apiTestTask()}, s.err
 }
 
-func (s *taskServiceStub) RequestAction(_ context.Context, _ identity.Principal, taskID string, action task.Action, expected task.Status, key string) (app.TaskActionResult, error) {
+func (s *taskServiceStub) RequestAction(ctx context.Context, principal identity.Principal, taskID string, action task.Action, expected task.Status, key string) (app.TaskActionResult, error) {
+	return s.RequestActionWithRevisionFence(ctx, principal, taskID, action, expected, nil, key)
+}
+
+func (s *taskServiceStub) RequestActionWithRevisionFence(_ context.Context, _ identity.Principal, taskID string, action task.Action, expected task.Status, revisionFence *app.TaskActionRevisionFence, key string) (app.TaskActionResult, error) {
 	s.actionCalls++
-	s.actionTaskID, s.action, s.actionExpected, s.actionKey = taskID, action, expected, key
+	s.actionTaskID, s.action, s.actionExpected, s.actionRevisionFence, s.actionKey = taskID, action, expected, revisionFence, key
 	return app.TaskActionResult{Task: apiTestTask(), Action: action, UnsettledOperationIDs: []string{"o1234567"}}, s.err
 }
 
@@ -379,6 +384,20 @@ func TestTaskActionRequestsPauseWithExpectedStatusAndReturnsUnsettledOperations(
 	}
 }
 
+func TestTaskActionRequestsRevisionFencedPause(t *testing.T) {
+	service := &taskServiceStub{}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/actions", strings.NewReader(`{"action":"pause","expected_status":"queued","expected_current_revision":3,"expected_desired_revision":4}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "pause-revision-key-001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || service.actionCalls != 1 || service.actionRevisionFence == nil ||
+		service.actionRevisionFence.CurrentRevision != 3 || service.actionRevisionFence.DesiredRevision != 4 {
+		t.Fatalf("status=%d calls=%d fence=%#v body=%s", response.Code, service.actionCalls, service.actionRevisionFence, response.Body.String())
+	}
+}
+
 func TestTaskActionRejectsUnsupportedOrExtendedRequests(t *testing.T) {
 	for _, body := range []string{
 		`{"action":"cancel","batch_item_id":"b1234567"}`,
@@ -386,6 +405,11 @@ func TestTaskActionRejectsUnsupportedOrExtendedRequests(t *testing.T) {
 		`{"action":"resume","expected_status":"running"}`,
 		`{"action":"cancel","expected_status":"completed"}`,
 		`{"action":"pause","expected_status":"running","batch_item_id":"b1234567"}`,
+		`{"action":"pause","expected_status":"queued","expected_current_revision":3}`,
+		`{"action":"cancel","expected_status":"running","expected_desired_revision":4}`,
+		`{"action":"pause","expected_status":"queued","expected_current_revision":null}`,
+		`{"action":"resume","expected_status":"paused","expected_current_revision":-1,"expected_desired_revision":4}`,
+		`{"action":"retry_batch_item","batch_item_id":"b1234567","expected_current_revision":3,"expected_desired_revision":4}`,
 		`{"action":"retry_batch_item","batch_item_id":"b1234567","force":true}`,
 		`{"action":"retry_batch_item"}`,
 		`{"action":"respond","pending_id":"r1234567","pending_version":1,"decision":"maybe"}`,
@@ -404,8 +428,8 @@ func TestTaskActionRejectsUnsupportedOrExtendedRequests(t *testing.T) {
 		request.Header.Set("Idempotency-Key", "retry-key-102")
 		response := httptest.NewRecorder()
 		engine.ServeHTTP(response, request)
-		if response.Code != http.StatusBadRequest || service.retryCalls != 0 || service.responseCalls != 0 || service.clarificationCalls != 0 {
-			t.Errorf("body=%s status=%d retry_calls=%d response_calls=%d clarification_calls=%d", body, response.Code, service.retryCalls, service.responseCalls, service.clarificationCalls)
+		if response.Code != http.StatusBadRequest || service.actionCalls != 0 || service.retryCalls != 0 || service.responseCalls != 0 || service.clarificationCalls != 0 {
+			t.Errorf("body=%s status=%d action_calls=%d retry_calls=%d response_calls=%d clarification_calls=%d", body, response.Code, service.actionCalls, service.retryCalls, service.responseCalls, service.clarificationCalls)
 		}
 	}
 }
@@ -712,15 +736,107 @@ func TestListTasksReturnsStepCounts(t *testing.T) {
 	}
 	var body struct {
 		Items []struct {
-			StepCount          int64 `json:"step_count"`
-			CompletedStepCount int64 `json:"completed_step_count"`
+			StepCount          int64             `json:"step_count"`
+			CompletedStepCount int64             `json:"completed_step_count"`
+			Dependencies       []json.RawMessage `json:"dependencies"`
+			ChildJobs          []json.RawMessage `json:"child_jobs"`
+			ResultReview       json.RawMessage   `json:"result_review"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Items) != 1 || body.Items[0].StepCount != 3 || body.Items[0].CompletedStepCount != 1 {
+	if len(body.Items) != 1 || body.Items[0].StepCount != 3 || body.Items[0].CompletedStepCount != 1 ||
+		body.Items[0].Dependencies == nil || len(body.Items[0].Dependencies) != 0 ||
+		body.Items[0].ChildJobs == nil || len(body.Items[0].ChildJobs) != 0 || string(body.Items[0].ResultReview) != "null" {
 		t.Fatalf("task summary counts = %#v; want total 3, completed 1", body.Items)
+	}
+}
+
+func TestTaskDetailMapsDependenciesChildJobsAndResultReview(t *testing.T) {
+	current := apiTestTask()
+	replyMessageID := "m1234567"
+	view, err := toTaskResponse(app.TaskDetails{
+		Task:         current,
+		Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusCompleted, Satisfied: true}},
+		ChildJobs:    []app.ChildJob{{JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning}},
+		ResultReview: &app.ResultReview{
+			State: "published", SourceTaskID: current.ID, SourceTaskRevision: 3, SourceEventSequence: 9, ReplyMessageID: &replyMessageID,
+		},
+	})
+	if err != nil || len(view.Dependencies) != 1 || view.Dependencies[0] != (taskDependencyResponse{
+		TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusCompleted, Satisfied: true,
+	}) || len(view.ChildJobs) != 1 || view.ChildJobs[0] != (taskChildJobResponse{
+		JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning,
+	}) || view.ResultReview == nil || view.ResultReview.State != "published" ||
+		view.ResultReview.SourceTaskID != current.ID || view.ResultReview.SourceTaskRevision != 3 ||
+		view.ResultReview.SourceEventSequence != 9 || view.ResultReview.ReplyMessageID == nil || *view.ResultReview.ReplyMessageID != replyMessageID {
+		t.Fatalf("coordination detail response = %#v, err=%v", view, err)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		Dependencies []json.RawMessage `json:"dependencies"`
+		ChildJobs    []json.RawMessage `json:"child_jobs"`
+		ResultReview struct {
+			ReplyMessageID *string `json:"reply_message_id"`
+		} `json:"result_review"`
+	}
+	if err := json.Unmarshal(encoded, &body); err != nil || len(body.Dependencies) != 1 || len(body.ChildJobs) != 1 ||
+		body.ResultReview.ReplyMessageID == nil || *body.ResultReview.ReplyMessageID != replyMessageID {
+		t.Fatalf("coordination detail JSON = %s, err=%v", encoded, err)
+	}
+
+	view, err = toTaskResponse(app.TaskDetails{Task: current, ResultReview: &app.ResultReview{
+		State: "pending", SourceTaskID: current.ID, SourceTaskRevision: 0, SourceEventSequence: 1,
+	}})
+	if err != nil || view.ResultReview == nil || view.ResultReview.ReplyMessageID != nil {
+		t.Fatalf("null review reply message = %#v, err=%v", view.ResultReview, err)
+	}
+	encoded, err = json.Marshal(view)
+	if err != nil || !strings.Contains(string(encoded), `"reply_message_id":null`) {
+		t.Fatalf("nullable review reply JSON = %s, err=%v", encoded, err)
+	}
+}
+
+func TestTaskDetailRejectsInvalidCoordinationFields(t *testing.T) {
+	base := func() app.TaskDetails {
+		current := apiTestTask()
+		return app.TaskDetails{
+			Task:         current,
+			Dependencies: []app.Dependency{{TaskID: "q7654321", RequiredRevision: 2, TaskStatus: task.StatusRunning}},
+			ChildJobs:    []app.ChildJob{{JobID: "dsh-child-1", TaskStepID: "s1234567", Title: "Research", TaskRevision: 3, Status: task.StepRunning}},
+			ResultReview: &app.ResultReview{State: "processing", SourceTaskID: current.ID, SourceTaskRevision: 3, SourceEventSequence: 9},
+		}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*app.TaskDetails)
+	}{
+		{"dependency task id", func(v *app.TaskDetails) { v.Dependencies[0].TaskID = "bad" }},
+		{"dependency revision", func(v *app.TaskDetails) { v.Dependencies[0].RequiredRevision = -1 }},
+		{"dependency status", func(v *app.TaskDetails) { v.Dependencies[0].TaskStatus = "unknown" }},
+		{"child job id", func(v *app.TaskDetails) { v.ChildJobs[0].JobID = "" }},
+		{"child job id length", func(v *app.TaskDetails) { v.ChildJobs[0].JobID = strings.Repeat("a", 129) }},
+		{"child step id", func(v *app.TaskDetails) { v.ChildJobs[0].TaskStepID = "bad" }},
+		{"child task revision", func(v *app.TaskDetails) { v.ChildJobs[0].TaskRevision = -1 }},
+		{"child status", func(v *app.TaskDetails) { v.ChildJobs[0].Status = "unknown-status" }},
+		{"review state", func(v *app.TaskDetails) { v.ResultReview.State = "unknown" }},
+		{"review source task id", func(v *app.TaskDetails) { v.ResultReview.SourceTaskID = "bad" }},
+		{"review source revision", func(v *app.TaskDetails) { v.ResultReview.SourceTaskRevision = -1 }},
+		{"review event sequence", func(v *app.TaskDetails) { v.ResultReview.SourceEventSequence = 0 }},
+		{"review reply message id", func(v *app.TaskDetails) { invalid := "bad"; v.ResultReview.ReplyMessageID = &invalid }},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			value := base()
+			test.mutate(&value)
+			if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+				t.Fatalf("invalid coordination data error = %v, want internal", err)
+			}
+		})
 	}
 }
 
@@ -861,6 +977,52 @@ func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 		body.Message.ConversationID != "c1234567" || body.Message.RoutingStatus != conversation.RoutingPending ||
 		body.Message.DeliveryStatus != conversation.DeliveryPending || !body.Replayed {
 		t.Fatalf("accept conversation message: status=%d body=%s response=%#v service=%#v err=%v", response.Code, response.Body.String(), body, service, err)
+	}
+}
+
+func TestConversationMessageExpiredSessionDoesNotAcceptAndReloginReplaysStableID(t *testing.T) {
+	const (
+		conversationID  = "c1234567"
+		clientMessageID = "message-expired-0001"
+		instanceID      = "11111111-1111-4111-8111-111111111111"
+	)
+	body := `{"client_message_id":"message-expired-0001","content":"继续"}`
+	path := "/api/conversations/" + conversationID + "/messages"
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	newRequest := func(router *gin.Engine) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		request.Host = "portal.example.test"
+		request.RemoteAddr = "192.0.2.1:12345"
+		request.AddCookie(cookie)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", "https://portal.example.test")
+		request.Header.Set("X-Morde-Actor-ID", testUserID)
+		request.Header.Set("X-Morde-Service-Instance-ID", instanceID)
+		request.Header.Set("Idempotency-Key", clientMessageID)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	expiredService := &taskServiceStub{}
+	expired := newServices()
+	expired.tasks = expiredService
+	expired.verifier = verifierStub{err: domain.NewError(domain.CodeUnauthenticated, "session expired")}
+	expiredResponse := newRequest(newRouter(t, expired, Options{}))
+	if expiredResponse.Code != http.StatusUnauthorized || expiredService.acceptCalls != 0 {
+		t.Fatalf("expired session message = %d accept_calls=%d: %s", expiredResponse.Code, expiredService.acceptCalls, expiredResponse.Body)
+	}
+
+	reloggedService := &taskServiceStub{acceptReplayed: true}
+	relogged := newServices()
+	relogged.tasks = reloggedService
+	reloggedResponse := newRequest(newRouter(t, relogged, Options{}))
+	var accepted acceptedConversationMessageResponse
+	if err := json.Unmarshal(reloggedResponse.Body.Bytes(), &accepted); err != nil ||
+		reloggedResponse.Code != http.StatusAccepted || reloggedService.acceptCalls != 1 ||
+		accepted.Message.ClientMessageID != clientMessageID || !accepted.Replayed {
+		t.Fatalf("relogin retry = status %d accepted=%+v accept_calls=%d err=%v body=%s",
+			reloggedResponse.Code, accepted, reloggedService.acceptCalls, err, reloggedResponse.Body)
 	}
 }
 

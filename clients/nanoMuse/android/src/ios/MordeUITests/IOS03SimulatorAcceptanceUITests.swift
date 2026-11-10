@@ -43,6 +43,340 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["已停止 · AI 控制"].exists)
     }
 
+    @MainActor
+    func testC10PortalMessagePersistsAcrossAppRestart() async throws {
+        guard let username = ProcessInfo.processInfo.environment["MORDE_C10_TEST_USERNAME"],
+              !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let password = ProcessInfo.processInfo.environment["MORDE_C10_TEST_PASSWORD"],
+              !password.isEmpty else {
+            throw XCTSkip("Set MORDE_C10_TEST_USERNAME and MORDE_C10_TEST_PASSWORD for the local Portal acceptance test.")
+        }
+
+        let configuredPortalOrigin = ProcessInfo.processInfo.environment["MORDE_C10_PORTAL_ORIGIN"]
+        let portalOrigin: String
+        if let configuredPortalOrigin {
+            guard configuredPortalOrigin == configuredPortalOrigin.trimmingCharacters(in: .whitespacesAndNewlines),
+                  var components = URLComponents(string: configuredPortalOrigin),
+                  let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                  let host = components.host?.lowercased(), ["127.0.0.1", "localhost"].contains(host),
+                  components.user == nil, components.password == nil,
+                  components.query == nil, components.fragment == nil,
+                  components.path.isEmpty || components.path == "/",
+                  components.port.map({ (1...65_535).contains($0) }) ?? true,
+                  components.url != nil else {
+                XCTFail("MORDE_C10_PORTAL_ORIGIN must be an http(s) origin on 127.0.0.1 or localhost.")
+                return
+            }
+            components.scheme = scheme
+            components.host = host
+            components.path = ""
+            portalOrigin = components.string!
+        } else {
+            portalOrigin = "http://127.0.0.1:24131"
+        }
+        let serverArguments = ["-morde.server", portalOrigin]
+        let portalBaseURL = URL(string: portalOrigin)!
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.timeoutIntervalForRequest = 30
+        let portalSession = URLSession(configuration: sessionConfiguration)
+        defer { portalSession.invalidateAndCancel() }
+
+        func portalJSON(_ path: String, method: String = "GET", bearerCredential: String? = nil,
+                        headers: [String: String] = [:], requestBody: [String: Any]? = nil,
+                        expectedStatus: Int = 200) async throws -> [String: Any] {
+            guard let url = URL(string: path, relativeTo: portalBaseURL)?.absoluteURL else {
+                XCTFail("Could not construct the local Portal API URL.")
+                return [:]
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            if let bearerCredential {
+                request.setValue("Bearer \(bearerCredential)", forHTTPHeaderField: "Authorization")
+            }
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+            if let requestBody {
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+            }
+
+            let (data, response) = try await portalSession.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                XCTFail("The local Portal API did not return an HTTP response.")
+                return [:]
+            }
+            guard httpResponse.statusCode == expectedStatus else {
+                XCTFail("Portal API \(method) \(path) returned HTTP \(httpResponse.statusCode); expected \(expectedStatus).")
+                return [:]
+            }
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                XCTFail("The local Portal API response was not a JSON object.")
+                return [:]
+            }
+            return object
+        }
+
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = serverArguments
+        app.launch()
+
+        let usernameField = app.textFields["morde.auth.username"]
+        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu")).firstMatch
+        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20),
+                      "The Portal app should show either sign-in or its authenticated route.")
+        if app.buttons["morde.nav.menu"].exists {
+            signOutCurrentMordeAccount(app)
+        }
+
+        XCTAssertTrue(usernameField.waitForExistence(timeout: 15), "The real Portal sign-in form should be visible.")
+        usernameField.tap()
+        if let currentUsername = usernameField.value as? String,
+           currentUsername != usernameField.placeholderValue {
+            usernameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: currentUsername.count))
+        }
+        usernameField.typeText(username)
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        passwordField.tap()
+        passwordField.typeText(password)
+        app.buttons["morde.auth.submit"].tap()
+
+        let chatComposer = app.textFields["morde.chat.composer"]
+        let chatTab = app.buttons["morde.nav.tab.chat"]
+        if !chatComposer.waitForExistence(timeout: 5), chatTab.waitForExistence(timeout: 10) {
+            chatTab.tap()
+        }
+        XCTAssertTrue(chatComposer.waitForExistence(timeout: 30),
+                      "Real Portal login should open the authenticated chat composer.")
+
+        let marker = "C10-Portal-\(UUID().uuidString)"
+        let messageText = "\(marker) Create a new task to reply with a short acknowledgment."
+        let composer = app.textFields["morde.chat.composer"]
+        composer.tap()
+        composer.typeText(messageText)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        let sendEnabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: send)
+        XCTAssertEqual(XCTWaiter.wait(for: [sendEnabled], timeout: 20), .completed,
+                       "The Portal composer should enable sending the unique marker.")
+        send.tap()
+
+        let messageContents = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.chat.message.content."))
+        let sentMessageQuery = app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
+        XCTAssertTrue(sentMessageQuery.firstMatch.waitForExistence(timeout: 30),
+                      "The submitted marker should appear in the Portal conversation.")
+        XCTAssertEqual(sentMessageQuery.count, 1, "The submitted marker should appear only once before restart.")
+
+        let contentIdentifierPrefix = "morde.chat.message.content."
+        let sentMessage = sentMessageQuery.firstMatch
+        guard sentMessage.identifier.hasPrefix(contentIdentifierPrefix) else {
+            XCTFail("The persisted message should expose its client message ID.")
+            return
+        }
+        let clientMessageID = String(sentMessage.identifier.dropFirst(contentIdentifierPrefix.count))
+        let sentStatus = app.staticTexts["morde.chat.message.status.\(clientMessageID)"]
+        XCTAssertTrue(sentStatus.waitForExistence(timeout: 120),
+                      "The Portal should confirm the original client message before the app is restarted.")
+
+        app.terminate()
+        XCTAssertEqual(app.state, .notRunning, "The app should stay closed while the Portal finishes processing the message.")
+        Thread.sleep(forTimeInterval: 15)
+
+        let capabilities = try await portalJSON("/api/capabilities")
+        guard let serviceInstanceID = capabilities["service_instance_id"] as? String,
+              let supportedFeatures = capabilities["supported_features"] as? [String],
+              ["ordered_client_login", "available_models", "task_api", "conversation_auto_routing_v1"]
+                .allSatisfy({ supportedFeatures.contains($0) }) else {
+            XCTFail("The local Portal must advertise ordered login, available models, Task API, and conversation auto-routing.")
+            return
+        }
+
+        let peerClientInstanceID = UUID().uuidString.lowercased()
+        let peerLogin = try await portalJSON("/api/auth/client-login", method: "POST",
+            headers: ["Idempotency-Key": UUID().uuidString],
+            requestBody: [
+                "name": username,
+                "password": password,
+                "platform": "ios",
+                "display_name": "C10 second simulator client \(peerClientInstanceID.prefix(8))",
+                "client_instance_id": peerClientInstanceID,
+                "attempt_generation": 1,
+            ])
+        guard let peerCredential = peerLogin["client_credential"] as? String,
+              let user = peerLogin["user"] as? [String: Any],
+              let actorID = user["id"] as? String,
+              !peerCredential.isEmpty, !actorID.isEmpty else {
+            XCTFail("Ordered login should return a second installation credential for the same Portal account.")
+            return
+        }
+
+        let scopedHeaders = [
+            "X-Morde-Actor-ID": actorID,
+            "X-Morde-Service-Instance-ID": serviceInstanceID,
+        ]
+        let mainConversation = try await portalJSON("/api/me/main-conversation", bearerCredential: peerCredential)
+        guard mainConversation["status"] as? String == "ready",
+              let conversationID = mainConversation["conversation_id"] as? String,
+              !conversationID.isEmpty else {
+            XCTFail("The second Portal installation should read the same ready main conversation.")
+            return
+        }
+
+        let availableModels = try await portalJSON("/api/available-models", bearerCredential: peerCredential)
+        let availableModelIDs = Set((availableModels["items"] as? [[String: Any]] ?? [])
+            .compactMap { $0["id"] as? String })
+        let modelConnections = try await portalJSON("/api/model-connections", bearerCredential: peerCredential)
+        let personalModels = (modelConnections["items"] as? [[String: Any]] ?? []).filter { model in
+            model["shared"] as? Bool == false && model["has_api_key"] as? Bool == true &&
+                availableModelIDs.contains(model["id"] as? String ?? "")
+        }
+        guard let personalModelID = personalModels.first?["id"] as? String else {
+            XCTFail("The account needs an available checked personal text model for the second installation message.")
+            return
+        }
+
+        let historyPath = "/api/conversations/\(conversationID)/messages?limit=100"
+        let firstHistory = try await portalJSON(historyPath, bearerCredential: peerCredential, headers: scopedHeaders)
+        let firstHistoryItems = firstHistory["items"] as? [[String: Any]] ?? []
+        let firstHistoryMatches = firstHistoryItems.filter {
+            $0["role"] as? String == "user" &&
+                $0["client_message_id"] as? String == clientMessageID &&
+                $0["content"] as? String == messageText
+        }
+        guard firstHistoryMatches.count == 1 else {
+            XCTFail("The first iOS installation message should appear exactly once in the shared Portal history.")
+            return
+        }
+
+        let peerMessageID = UUID().uuidString
+        let peerMessageText = "C10-Portal-peer-\(UUID().uuidString) Create an independent task to reply with a short acknowledgment."
+        let acceptedPeerMessage = try await portalJSON(historyPath, method: "POST", bearerCredential: peerCredential,
+            headers: scopedHeaders.merging(["Idempotency-Key": peerMessageID]) { _, new in new },
+            requestBody: [
+                "client_message_id": peerMessageID,
+                "previous_client_message_id": clientMessageID,
+                "model_id": personalModelID,
+                "content": peerMessageText,
+            ], expectedStatus: 202)
+        guard let acceptedPeerBody = acceptedPeerMessage["message"] as? [String: Any],
+              let peerServerMessageID = acceptedPeerBody["id"] as? String,
+              acceptedPeerBody["client_message_id"] as? String == peerMessageID else {
+            XCTFail("The second installation message should receive a durable Portal message receipt.")
+            return
+        }
+
+        try await Task.sleep(nanoseconds: 15_000_000_000)
+        XCTAssertEqual(app.state, .notRunning, "The iOS app should remain closed while the second Portal message runs.")
+
+        var completedHistoryItems: [[String: Any]]?
+        var completedPeerReply: [String: Any]?
+        for _ in 0..<90 {
+            let history = try await portalJSON(historyPath, bearerCredential: peerCredential, headers: scopedHeaders)
+            let items = history["items"] as? [[String: Any]] ?? []
+            let firstMatches = items.filter {
+                $0["role"] as? String == "user" && $0["client_message_id"] as? String == clientMessageID &&
+                    $0["content"] as? String == messageText
+            }
+            let peerMatches = items.filter {
+                $0["role"] as? String == "user" && $0["client_message_id"] as? String == peerMessageID &&
+                    $0["content"] as? String == peerMessageText
+            }
+            if firstMatches.count > 1 || peerMatches.count > 1 {
+                XCTFail("A client message ID should have only one persisted history entry.")
+                break
+            }
+            if firstMatches.count == 1, peerMatches.count == 1,
+               let peerMessage = peerMatches.first,
+               let sequence = (peerMessage["sequence"] as? NSNumber)?.intValue {
+                let peerTaskID = peerMessage["task_id"] as? String
+                let reply = items.first { candidate in
+                    let candidateSequence = (candidate["sequence"] as? NSNumber)?.intValue ?? 0
+                    guard candidate["role"] as? String == "assistant",
+                          candidateSequence > sequence,
+                          let content = candidate["content"] as? String,
+                          !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+                    let outputStatus = candidate["output_status"] as? String
+                    guard outputStatus == nil || outputStatus == "completed" else { return false }
+                    let sourceMatches = (candidate["sources"] as? [[String: Any]] ?? []).contains {
+                        $0["user_message_id"] as? String == peerServerMessageID
+                    }
+                    let sameTask = peerTaskID.map { taskID in
+                        !taskID.isEmpty && (candidate["task_id"] as? String == taskID)
+                    } ?? false
+                    return sourceMatches || sameTask
+                }
+                if let reply {
+                    completedHistoryItems = items
+                    completedPeerReply = reply
+                    break
+                }
+            }
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+
+        guard let finalHistoryItems = completedHistoryItems,
+              let peerReply = completedPeerReply,
+              let peerReplyID = peerReply["id"] as? String,
+              let peerReplyText = peerReply["content"] as? String,
+              let peerReplySource = (peerReply["sources"] as? [[String: Any]])?.first(where: {
+                  $0["user_message_id"] as? String == peerServerMessageID
+              }),
+              let peerReplyTaskID = peerReplySource["task_id"] as? String,
+              let peerReplyTaskRevision = (peerReplySource["task_revision"] as? NSNumber)?.intValue,
+              let peerReplyEventSequence = (peerReplySource["event_sequence"] as? NSNumber)?.intValue,
+              !peerReplyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            XCTFail("The second installation message and its completed reply should be present in Portal history while iOS is closed.")
+            return
+        }
+        XCTAssertEqual(finalHistoryItems.filter {
+            $0["role"] as? String == "user" && $0["client_message_id"] as? String == clientMessageID &&
+                $0["content"] as? String == messageText
+        }.count, 1, "The first iOS message should exist once in the server history.")
+        XCTAssertEqual(finalHistoryItems.filter {
+            $0["role"] as? String == "user" && $0["client_message_id"] as? String == peerMessageID &&
+                $0["content"] as? String == peerMessageText
+        }.count, 1, "The second installation message should exist once in the server history.")
+        XCTAssertEqual(finalHistoryItems.filter { $0["id"] as? String == peerReplyID }.count, 1,
+                       "The second installation reply should exist once in the server history.")
+
+        app.launchArguments = serverArguments
+        app.launch()
+
+        if !chatComposer.waitForExistence(timeout: 5), chatTab.waitForExistence(timeout: 10) {
+            chatTab.tap()
+        }
+        XCTAssertTrue(chatComposer.waitForExistence(timeout: 40),
+                      "The same Portal account should return to chat after relaunch.")
+        let restoredMessageQuery = app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
+        XCTAssertTrue(restoredMessageQuery.firstMatch.waitForExistence(timeout: 60),
+                      "The original Portal message should be restored from server conversation history.")
+        XCTAssertEqual(restoredMessageQuery.count, 1,
+                       "The original Portal message should still appear exactly once after restart.")
+        let restoredPeerMessageQuery = app.staticTexts.matching(NSPredicate(format: "label == %@", peerMessageText))
+        XCTAssertTrue(restoredPeerMessageQuery.firstMatch.waitForExistence(timeout: 60),
+                      "The second installation message should reconcile into the iOS conversation after relaunch.")
+        XCTAssertEqual(restoredPeerMessageQuery.count, 1,
+                       "The second installation message should appear exactly once after relaunch.")
+        XCTAssertTrue(app.staticTexts["morde.chat.message.status.\(clientMessageID)"].waitForExistence(timeout: 30),
+                      "The original server-accepted client message status should survive restart.")
+        XCTAssertTrue(app.staticTexts["morde.chat.message.status.\(peerMessageID)"].waitForExistence(timeout: 30),
+                      "The second installation client message should be reconciled with its server status.")
+
+        let restoredReplyQuery = app.staticTexts.matching(identifier:
+            "morde.chat.message.source.\(peerReplyTaskID).r\(peerReplyTaskRevision).e\(peerReplyEventSequence)")
+        XCTAssertTrue(restoredReplyQuery.firstMatch.waitForExistence(timeout: 60),
+                      "The second installation cloud reply should remain readable after relaunch.")
+        XCTAssertEqual(restoredReplyQuery.count, 1,
+                       "The cloud reply should appear exactly once in the relaunched iOS conversation.")
+        XCTAssertTrue(restoredReplyQuery.firstMatch.label.contains(peerReplyText),
+                      "The restored task source should contain the cloud reply text.")
+    }
+
     func testMordeDesignNavigationRoutes() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localTaskPagesFixture", "-morde.localExecutionFixture"])
@@ -2349,20 +2683,44 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The detailed ticket error should remain available on the resource row after leaving the compact computer page.")
     }
 
+    func testMordeChatUsesSelectedModelPreferenceWhenAvailable() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: ["-morde.localSelectedModelPreferenceFixture"],
+                        resetExistingAccount: true)
+
+        let message = "Selected personal model preference fixture"
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        composer.tap()
+        composer.typeText(message)
+
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        let sendEnabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: send)
+        XCTAssertEqual(XCTWaiter.wait(for: [sendEnabled], timeout: 20), .completed)
+        send.tap()
+
+        XCTAssertTrue(app.staticTexts[message].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "已发送"))
+            .firstMatch.waitForExistence(timeout: 20),
+                      "The strict local Portal receipt should accept the message only when iOS sends the selected personal model ID.")
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", message)).count, 1)
+    }
+
     func testMordeChatComposerSubmitsFromKeyboardReturn() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: [
             "-morde.localTaskSSEFixture", "-morde.localTaskSequentialSendFixture",
-        ])
+            "-morde.localIndependentSendFixture",
+        ], resetExistingAccount: true)
 
         let composer = app.textFields["morde.chat.composer"]
         XCTAssertTrue(composer.waitForExistence(timeout: 15))
         composer.tap()
         composer.typeText("Keyboard submit fixture\n")
 
-        XCTAssertTrue(app.descendants(matching: .any)["morde.chat.taskSummary"].waitForExistence(timeout: 20),
+        XCTAssertTrue(app.staticTexts["Keyboard submit fixture"].waitForExistence(timeout: 20),
                       "The keyboard Return action should submit through the same guarded chat path.")
-        XCTAssertTrue(app.staticTexts["Keyboard submit fixture"].exists)
     }
 
     func testMordeDrawerHidesProjectManagementWhileWorkItemsKeepProjectScope() {
@@ -2458,7 +2816,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: [
             "-morde.localTaskSSEFixture", "-morde.localTaskSequentialSendFixture", "-morde.localTaskQueueFixture",
-        ])
+        ], resetExistingAccount: true)
 
         selectChatTaskTarget(app, taskID: "q1234567")
         XCTAssertEqual(app.staticTexts["morde.chat.header.status"].label, "进行中…",
@@ -2479,6 +2837,43 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                        "A task stop control should not add a permanent button to the composer.")
         attachScreen(app, named: "MDA-02 active Task chat header")
         assertChatLongPressMenuOffersStopTask(app, taskID: "q1234567")
+    }
+
+    func testMordeChatComposerSendsSequentialPlainTextMessages() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskSSEFixture", "-morde.localTaskSequentialSendFixture",
+        ], resetExistingAccount: true)
+
+        let composer = app.textFields["morde.chat.composer"]
+        let send = app.buttons["morde.task.send"]
+        let transcript = app.scrollViews["morde.chat.transcript"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+
+        composer.tap()
+        composer.typeText("Sequential plain-text message one")
+        let firstReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: send)
+        XCTAssertEqual(XCTWaiter.wait(for: [firstReady], timeout: 15), .completed)
+        send.tap()
+        XCTAssertTrue(app.staticTexts["Sequential plain-text message one"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["已发送"].waitForExistence(timeout: 20),
+                      "The first message must be accepted before its client ID can be the next message's predecessor.")
+
+        for _ in 0..<6 where !composer.isHittable { transcript.swipeUp() }
+        composer.tap()
+        composer.typeText("Sequential plain-text message two")
+        let secondReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: send)
+        XCTAssertEqual(XCTWaiter.wait(for: [secondReady], timeout: 15), .completed)
+        send.tap()
+        XCTAssertTrue(app.staticTexts["Sequential plain-text message two"].waitForExistence(timeout: 20))
+        let twoAcceptedMessages = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "count == 2"),
+            object: app.staticTexts.matching(NSPredicate(format: "label == %@", "已发送")))
+        XCTAssertEqual(XCTWaiter.wait(for: [twoAcceptedMessages], timeout: 20), .completed,
+                       "The second message must be accepted with the first message as its predecessor.")
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", "Sequential plain-text message one")).count, 1)
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", "Sequential plain-text message two")).count, 1)
     }
 
     func testMordeChatComposerQueuesImageAndPDFAttachmentsOnActiveTask() {
@@ -2521,7 +2916,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             "-morde.localTaskSSEFixture", "-morde.localTaskSequentialSendFixture",
             "-morde.localTaskQueueFixture", "-morde.localChatAttachmentFixture",
             "-morde.localChatAttachmentSendRetryFixture",
-        ])
+        ], resetExistingAccount: true)
 
         XCTAssertTrue(app.staticTexts["fixture-image.jpg"].waitForExistence(timeout: 40))
         XCTAssertTrue(app.staticTexts["fixture.pdf"].waitForExistence(timeout: 40))
@@ -2537,17 +2932,19 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [enqueueEnabled], timeout: 40), .completed)
         enqueue.tap()
 
-        XCTAssertFalse(app.staticTexts["Retry queued image and PDF after response loss"].waitForExistence(timeout: 3),
-                       "A lost response must not be presented as an acknowledged message.")
-        let failureAlert = app.alerts["请求失败"]
-        XCTAssertTrue(failureAlert.waitForExistence(timeout: 10), "The ambiguous first response should be reported as a failure.")
-        failureAlert.buttons["确定"].tap()
+        XCTAssertTrue(app.staticTexts["Retry queued image and PDF after response loss"].waitForExistence(timeout: 10),
+                      "The local outbox should keep the message visible while its receipt is uncertain.")
+        XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 10),
+                      "An accepted request with a lost response must be shown as unconfirmed until reconciled.")
+        XCTAssertFalse(app.staticTexts["已发送"].exists,
+                       "An uncertain message must not be shown as sent before its server receipt is reconciled.")
         XCTAssertTrue(app.staticTexts["fixture-image.jpg"].exists, "The image chip should stay in the composer after an ambiguous response.")
         XCTAssertTrue(app.staticTexts["fixture.pdf"].exists, "The PDF chip should stay in the composer after an ambiguous response.")
-        let retryEnqueue = app.buttons["morde.chat.enqueueTask"]
-        XCTAssertTrue(retryEnqueue.waitForExistence(timeout: 10))
-        XCTAssertTrue(retryEnqueue.isEnabled)
-        retryEnqueue.tap()
+        let retryMessage = app.buttons.matching(
+            NSPredicate(format: "label == %@ OR label == %@", "重试", "Retry")).firstMatch
+        XCTAssertTrue(retryMessage.waitForExistence(timeout: 10),
+                      "An uncertain outbox message should expose a manual retry action.")
+        retryMessage.tap()
 
         XCTAssertTrue(app.staticTexts["Retry queued image and PDF after response loss"].waitForExistence(timeout: 20),
                       "Retry with the same idempotency key should reconcile the accepted queue message.")
@@ -2555,6 +2952,85 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "fixture.pdf")).firstMatch.exists)
         XCTAssertFalse(app.buttons["morde.chat.stopTask"].exists)
         assertChatLongPressMenuOffersStopTask(app, taskID: "q1234567")
+    }
+
+    func testMordeChatComposerRecoversPlainTextAfterOfflineRestart() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        let fixtures = ["-morde.localMessageSendWithoutAutoRoutingFixture", "-morde.localChatOfflineRecoveryFixture"]
+        let messageText = "Keep plain text while offline and send after restart"
+        launchLocalChat(app, additionalArguments: fixtures + ["-morde.localChatSendOfflineFixture"],
+                        resetExistingAccount: true)
+
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        composer.tap()
+        composer.typeText(messageText)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        XCTAssertTrue(send.isEnabled,
+                      "A temporary network outage must not disable ordinary text in the chat composer.")
+        send.tap()
+
+        XCTAssertTrue(app.staticTexts[messageText].waitForExistence(timeout: 15),
+                      "The unsent plain-text message should remain visible in the local outbox.")
+        XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 15),
+                      "The offline attempt must remain unconfirmed instead of appearing sent.")
+        XCTAssertFalse(app.staticTexts["已发送"].exists)
+
+        app.terminate()
+        launchLocalChat(app, additionalArguments: fixtures)
+
+        let recoveredMessages = app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
+        let recovered = recoveredMessages.firstMatch
+        XCTAssertTrue(recovered.waitForExistence(timeout: 40),
+                      "After connectivity returns, the persisted outbox message should be sent.")
+        XCTAssertEqual(recoveredMessages.count, 1, "Offline recovery must not duplicate the message.")
+        XCTAssertTrue(app.staticTexts["已发送"].waitForExistence(timeout: 20))
+        XCTAssertFalse(app.staticTexts["发送结果待确认"].exists)
+    }
+
+    func testMordeChatComposerReconcilesAcceptedMessageAfterAppRestart() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        let resumeFixtures = [
+            "-morde.localTaskSSEFixture", "-morde.localTaskSequentialSendFixture",
+            "-morde.localTaskQueueFixture", "-morde.localChatAttachmentFixture",
+            "-morde.localChatAttachmentSendRetryFixture", "-morde.localChatAttachmentResumeFixture",
+            "-morde.localChatAttachmentFixtureCleanup",
+        ]
+        let messageText = "Reconcile accepted message after app restart"
+        launchLocalChat(app, additionalArguments: resumeFixtures + ["-morde.localChatAttachmentFixtureReset"],
+                        resetExistingAccount: true)
+
+        XCTAssertTrue(app.staticTexts["fixture-image.jpg"].waitForExistence(timeout: 40))
+        selectChatTaskTarget(app, taskID: "q1234567")
+
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        composer.tap()
+        composer.typeText(messageText)
+        let enqueue = app.buttons["morde.chat.enqueueTask"]
+        XCTAssertTrue(enqueue.waitForExistence(timeout: 15))
+        let enqueueEnabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: enqueue)
+        XCTAssertEqual(XCTWaiter.wait(for: [enqueueEnabled], timeout: 40), .completed)
+        enqueue.tap()
+
+        XCTAssertTrue(app.staticTexts[messageText].waitForExistence(timeout: 10),
+                      "The local outbox should keep the message visible while its receipt is uncertain.")
+        XCTAssertTrue(app.staticTexts["发送结果待确认"].waitForExistence(timeout: 10),
+                      "The uncertain receipt must remain explicit until restart reconciliation completes.")
+        XCTAssertFalse(app.staticTexts["已发送"].exists)
+        XCTAssertTrue(app.staticTexts["fixture-image.jpg"].exists)
+
+        app.terminate()
+        launchLocalChat(app, additionalArguments: resumeFixtures)
+
+        let reconciledMessage = app.staticTexts.matching(NSPredicate(format: "label == %@", messageText))
+        XCTAssertTrue(reconciledMessage.firstMatch.waitForExistence(timeout: 40),
+                      "After restart, the persisted outbox ID should reconcile the already accepted server message.")
+        XCTAssertEqual(reconciledMessage.count, 1, "Restart reconciliation must not duplicate the message.")
+        XCTAssertTrue(app.staticTexts["已发送"].exists,
+                      "Only a reconciled server receipt should change the local status to sent.")
+        XCTAssertFalse(app.staticTexts["发送结果待确认"].exists)
     }
 
     func testMordeChatDraftAndAttachmentsStayWithTheirConversation() {
@@ -2603,9 +3079,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
     func testMordeChatDraftIsClearedWhenAccountChanges() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: ["-morde.localAccountIsolationFixture"], loginName: "account-a")
-        signOutCurrentMordeAccount(app)
-        signInLocalFixtureAccount(app, name: "account-a")
+        launchLocalChat(app, additionalArguments: ["-morde.localAccountIsolationFixture"], loginName: "account-a",
+                        resetExistingAccount: true)
         XCTAssertTrue(app.staticTexts["account-a-private-message"].waitForExistence(timeout: 15))
 
         let composer = app.textFields["morde.chat.composer"]
@@ -2615,6 +3090,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
         signOutCurrentMordeAccount(app)
         signInLocalFixtureAccount(app, name: "account-b")
+        app.buttons["morde.nav.tab.chat"].tap()
         XCTAssertTrue(app.staticTexts["account-b-private-message"].waitForExistence(timeout: 15))
         let accountBComposer = app.textFields["morde.chat.composer"]
         XCTAssertTrue(accountBComposer.waitForExistence(timeout: 15))
@@ -3226,7 +3702,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         password.tap()
         password.typeText("local-password")
         app.buttons["morde.auth.submit"].tap()
-        XCTAssertTrue(app.buttons["morde.nav.menu"].waitForExistence(timeout: 20))
+        let authenticatedRoute = app.buttons.matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.nav.menu", "morde.nav.tab.chat")).firstMatch
+        XCTAssertTrue(authenticatedRoute.waitForExistence(timeout: 20),
+                      "Sign-in should return to an authenticated Morde route.")
     }
 
     private func waitForHittable(_ element: XCUIElement, timeout: TimeInterval = 5) -> Bool {

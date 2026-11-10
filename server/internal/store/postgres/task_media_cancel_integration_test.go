@@ -67,7 +67,7 @@ VALUES ($1,$2,$3,$4,$5,$6::bigint,$7,CASE WHEN $7='succeeded' THEN repeat('0',64
 			cancelID := mustID(t, domain.NewTaskActionID)
 			_, cancelErr := store.RequestTaskAction(ctx, taskActionIdempotency(claimed.OwnerID, task.ActionCancel,
 				"cancel-media-"+name, claimed.ID, task.StatusRunning, cancelID), claimed.ID, task.ActionCancel,
-				task.StatusRunning, cancelID)
+				task.StatusRunning, nil, cancelID)
 			if receiptState == "succeeded" {
 				if domain.CodeOf(cancelErr) != domain.CodeConflict {
 					t.Fatalf("cancel before Task media Artifact is recorded = %v, want conflict", cancelErr)

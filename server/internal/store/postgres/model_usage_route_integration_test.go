@@ -222,6 +222,166 @@ WHERE c.message_id=$1`, claim.Message.ID).Scan(&routeState, &ledgerState, &count
 	}
 }
 
+func TestRouteModelDirectReplySettlesReplaysAndAppliesOnce(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"答案是 42。"}`}
+	store, gateway, _, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+
+	decision, err := gateway.ClassifyConversationRoute(ctx, claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || decision.Reply != "答案是 42。" || decision.ModelOutput != client.reply {
+		t.Fatalf("settle direct reply: decision=%+v err=%v", decision, err)
+	}
+	if client.calls.Load() != 1 {
+		t.Fatalf("direct reply model call count = %d, want 1", client.calls.Load())
+	}
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := app.NewModelConnectionService(store, sealer, client, []string{"model.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := app.NewModelGatewayService(store, models, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := restarted.ClassifyConversationRoute(ctx, claim, value)
+	if err != nil || replayed != decision || client.calls.Load() != 1 {
+		t.Fatalf("direct reply was not replayed from the settled route receipt: replay=%+v calls=%d err=%v", replayed, client.calls.Load(), err)
+	}
+
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = value.ModelID
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, replayed); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, replayed); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("replayed direct reply was applied twice: %v", err)
+	}
+	var routeState, delivery, taskID, answer string
+	var assistantCount int
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,m.delivery_status,COALESCE(m.task_id,''),
+(SELECT count(*) FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant' AND a.source_kind='conversation'),
+(SELECT a.content FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant' AND a.source_kind='conversation' LIMIT 1)
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).
+		Scan(&routeState, &delivery, &taskID, &assistantCount, &answer); err != nil {
+		t.Fatal(err)
+	}
+	if routeState != "routed" || delivery != "applied" || taskID != "" || assistantCount != 1 || answer != "答案是 42。" {
+		t.Fatalf("direct reply route result = route:%s delivery:%s task:%s answers:%d content:%q",
+			routeState, delivery, taskID, assistantCount, answer)
+	}
+	var stored app.ConversationRouteDecision
+	if err := store.pool.QueryRow(ctx, `SELECT decision FROM conversation_route_model_calls WHERE message_id=$1`, claim.Message.ID).Scan(&stored); err != nil || stored != decision {
+		t.Fatalf("durable direct reply/model output differed from replay: stored=%+v want=%+v err=%v", stored, decision, err)
+	}
+}
+
+func TestDSHCoordinatorDirectReplyUsesNoToolsModelAndAppliesOnce(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"答案是 42。"}`}
+	store, gateway, _, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	var toolsSupported bool
+	if err := store.pool.QueryRow(ctx, `SELECT capability_tools FROM model_connections WHERE id=$1`, value.ModelID).Scan(&toolsSupported); err != nil || toolsSupported {
+		t.Fatalf("fixture must exercise a model without tool support: tools=%t err=%v", toolsSupported, err)
+	}
+	selected, err := gateway.ResolveConversationRouteModel(ctx, claim)
+	if err != nil || selected != value.ModelID {
+		t.Fatalf("resolve coordinator model: model=%q err=%v", selected, err)
+	}
+	routeRequest, err := app.ConversationRouteModelRequest(value)
+	if err != nil || len(routeRequest.Input) != 1 {
+		t.Fatalf("build authorized text route request: %+v err=%v", routeRequest, err)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"provider": "morde", "model": value.ModelID,
+		"messages": []any{
+			map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": routeRequest.Instructions}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": routeRequest.Input[0].Text}}},
+		},
+		"tools": []any{}, "max_tokens": routeRequest.MaxOutputTokens,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "coord_session_12345678"
+	response, err := gateway.CompleteConversationCoordinatorModel(ctx, claim, value, sessionID, 0, raw)
+	if err != nil || response.Text != client.reply || len(response.ToolCalls) != 0 || !response.Usage.Known ||
+		response.Usage.InputTokens != 8 || response.Usage.OutputTokens != 3 || client.calls.Load() != 1 {
+		t.Fatalf("coordinator model response=%+v provider_calls=%d err=%v", response, client.calls.Load(), err)
+	}
+	replayed, err := gateway.CompleteConversationCoordinatorModel(ctx, claim, value, sessionID, 0, raw)
+	if err != nil || replayed.Text != response.Text || client.calls.Load() != 1 {
+		t.Fatalf("coordinator model retry did not reuse its settled output: response=%+v calls=%d err=%v",
+			replayed, client.calls.Load(), err)
+	}
+	decision := app.ParseConversationRouteDecisionForContext(response.Text, value)
+	decision.ModelOutput = response.Text
+	if decision.Action != app.ConversationRouteReply || decision.Reply != "答案是 42。" {
+		t.Fatalf("coordinator direct reply decision = %+v", decision)
+	}
+	snapshot, err := store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = value.ModelID
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatalf("apply coordinator direct reply: %v", err)
+	}
+	if err := store.ApplyConversationRoute(ctx, claim, snapshot, decision); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("coordinator direct reply was applied twice: %v", err)
+	}
+	var routeState, delivery, taskID, answer string
+	var assistantCount, routeCallCount int
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,m.delivery_status,COALESCE(m.task_id,''),
+(SELECT count(*) FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant' AND a.source_kind='conversation'),
+(SELECT a.content FROM conversation_messages a WHERE a.conversation_id=m.conversation_id AND a.role='assistant' AND a.source_kind='conversation' LIMIT 1),
+(SELECT count(*) FROM model_call_ledger WHERE source='route')
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).
+		Scan(&routeState, &delivery, &taskID, &assistantCount, &answer, &routeCallCount); err != nil {
+		t.Fatal(err)
+	}
+	if routeState != "routed" || delivery != "applied" || taskID != "" || assistantCount != 1 ||
+		answer != "答案是 42。" || routeCallCount != 1 || client.calls.Load() != 1 {
+		t.Fatalf("coordinator route outcome: state=%s delivery=%s task=%s answers=%d content=%q calls=%d provider_calls=%d",
+			routeState, delivery, taskID, assistantCount, answer, routeCallCount, client.calls.Load())
+	}
+}
+
+func TestCoordinatorResumesSettledLegacyRouteDecisionWithoutRedispatch(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"reply","task_id":"","question":"","reply":"答案是 42。"}`}
+	_, gateway, _, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+
+	legacyDecision, err := gateway.ClassifyConversationRoute(ctx, claim, value)
+	if err != nil || legacyDecision.Action != app.ConversationRouteReply || legacyDecision.ModelOutput != client.reply {
+		t.Fatalf("settle legacy route decision: %+v %v", legacyDecision, err)
+	}
+	legacyRequest, err := app.ConversationRouteModelRequest(value)
+	if err != nil || len(legacyRequest.Input) != 1 {
+		t.Fatalf("build legacy coordinator model request: %+v %v", legacyRequest, err)
+	}
+	request, err := json.Marshal(map[string]any{
+		"provider": "morde", "model": value.ModelID,
+		"messages": []any{
+			map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": legacyRequest.Instructions}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": legacyRequest.Input[0].Text}}},
+		},
+		"tools": []any{}, "max_tokens": legacyRequest.MaxOutputTokens,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := gateway.CompleteConversationCoordinatorModel(ctx, claim, value, "coord_session_12345678", 0, request)
+	if err != nil || response.Text != client.reply || client.calls.Load() != 1 {
+		t.Fatalf("resume prior route decision through coordinator: response=%+v calls=%d err=%v", response, client.calls.Load(), err)
+	}
+}
+
 func TestRouteModelLeaseTakeoverHoldsAndRecoversLateResult(t *testing.T) {
 	client := &routeModelClientTest{started: make(chan struct{}), release: make(chan struct{})}
 	defer releaseRouteTestClient(client)

@@ -467,12 +467,29 @@ export function modelCallID(taskID, sessionID, throughSeq) {
   return `mdl_${createHash('sha256').update(input, 'utf8').digest('hex')}`
 }
 
+export function coordinatorModelCallID(conversationID, messageID, sessionID, throughSeq) {
+  if (![conversationID, messageID, sessionID].every(value => ID.test(value)) ||
+      !Number.isSafeInteger(throughSeq) || throughSeq < 0) throw new Error('invalid coordinator model call identity')
+  const input = `morde-dsh-coordinator-model-v1\n${conversationID}\n${messageID}\n${sessionID}\n${throughSeq}`
+  return `mdl_${createHash('sha256').update(input, 'utf8').digest('hex')}`
+}
+
 export function validStart(frame) {
   if (frame.version !== 1 || frame.type !== 'start') return false
-  if (!['task_id', 'owner_id', 'agent_id', 'session_id'].every(key => typeof frame[key] === 'string' && ID.test(frame[key]))) return false
+  const coordinator = frame.context_role === 'coordinator'
+  if (coordinator) {
+    if (Object.hasOwn(frame, 'task_id') || !['conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'session_id']
+      .every(key => typeof frame[key] === 'string' && ID.test(frame[key])) ||
+      !/^[a-z0-9]{1,128}$/.test(frame.message_id) || !Array.isArray(frame.tools) || frame.tools.length !== 0 ||
+      typeof frame.system_prompt !== 'string' || !frame.system_prompt.trim() || !frame.system_prompt.isWellFormed() ||
+      frame.system_prompt.includes('\0') || Buffer.byteLength(frame.system_prompt) > 64 * 1024 ||
+      frame.initial_message !== undefined || frame.initial_context !== undefined || frame.revision_messages !== undefined ||
+      frame.background_jobs !== undefined) return false
+  } else if (!['task_id', 'owner_id', 'agent_id', 'session_id'].every(key => typeof frame[key] === 'string' && ID.test(frame[key]))) return false
   if (!['generation', 'authorization_version'].every(key => Number.isSafeInteger(frame[key]) && frame[key] > 0)) return false
   if (typeof frame.model !== 'string' || !frame.model.trim() || Buffer.byteLength(frame.model) > 256) return false
   if (!validTools(frame.tools)) return false
+  if (coordinator && frame.tools.length !== 0) return false
   const delegate = frame.tools?.find(tool => tool.name === DELEGATE_TOOL)
   if (delegate && !validDelegateTool(delegate)) return false
   const jobTools = frame.tools?.filter(tool => JOB_TOOLS.has(tool.name)) ?? []
@@ -495,13 +512,14 @@ export function validStart(frame) {
   if (frame.checkpoint !== undefined || (frame.resume !== undefined && typeof frame.resume !== 'boolean')) return false
   if (frame.initial_message !== undefined) {
     const initial = frame.initial_message
-    if (!isObject(initial) || !exactKeys(initial, ['message_id', 'content', 'attachment_ids']) ||
-        !validMessageDelivery({ type: 'message_delivery', version: 2,
+    if (!isObject(initial) || !exactKeys(initial, ['message_id', 'content', 'attachment_ids']) || frame.prompt !== undefined ||
+        (coordinator && (initial.message_id !== frame.message_id || !validCoordinatorMessage(initial))) ||
+        (!coordinator && (!validMessageDelivery({ type: 'message_delivery', version: 2,
           ...Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id'].map(key => [key, frame[key]])),
-          ...initial }, frame) || frame.prompt !== undefined || frame.resume === true) return false
+          ...initial }, frame) || frame.resume === true))) return false
   }
   if (frame.initial_context !== undefined && (typeof frame.initial_context !== 'string' || !frame.initial_context.isWellFormed() ||
-      frame.initial_context.includes('\0') || Buffer.byteLength(frame.initial_context) > MAX_CHECKPOINT_PAYLOAD_BYTES / 2 || frame.resume === true)) return false
+      frame.initial_context.includes('\0') || Buffer.byteLength(frame.initial_context) > MAX_CHECKPOINT_PAYLOAD_BYTES / 2 || (!coordinator && frame.resume === true))) return false
   if (frame.revision_messages !== undefined) {
     if (!Array.isArray(frame.revision_messages) || frame.revision_messages.length < 1 || frame.revision_messages.length > 128) return false
     const seen = new Set(frame.initial_message ? [frame.initial_message.message_id] : [])
@@ -519,7 +537,18 @@ export function validStart(frame) {
     if (frame.checkpoint_through_seq !== undefined || frame.checkpoint_sha256 !== undefined) return false
     if (frame.initial_message === undefined && (typeof frame.prompt !== 'string' || !frame.prompt.trim() || Buffer.byteLength(frame.prompt) > MAX_CHECKPOINT_PAYLOAD_BYTES / 2)) return false
   }
+  if (coordinator && frame.resume === true && frame.prompt !== undefined) return false
   return frame.max_tokens === undefined || (Number.isSafeInteger(frame.max_tokens) && frame.max_tokens > 0 && frame.max_tokens <= 1_000_000)
+}
+
+function validCoordinatorMessage(message) {
+  return /^[a-z0-9]{1,128}$/.test(message.message_id ?? '') &&
+    typeof message.content === 'string' && message.content.isWellFormed() && !message.content.includes('\0') &&
+    Buffer.byteLength(message.content, 'utf8') <= MAX_USER_MESSAGE_BYTES &&
+    Array.isArray(message.attachment_ids) && message.attachment_ids.length <= MAX_MESSAGE_ATTACHMENTS &&
+    (message.content.trim().length !== 0 || message.attachment_ids.length !== 0) &&
+    message.attachment_ids.every((id, index, ids) => typeof id === 'string' && MESSAGE_ATTACHMENT_ID.test(id) &&
+      (index === 0 || ids[index - 1] < id))
 }
 
 class DurableSession {
@@ -807,7 +836,10 @@ function persistencePlugin(durables) {
 
 export async function runAgent(ipc, frame) {
   if (!validStart(frame)) throw new Error('invalid start request')
-  const identity = Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id'].map(key => [key, frame[key]]))
+  const coordinator = frame.context_role === 'coordinator'
+  const identity = coordinator
+    ? Object.fromEntries(['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id'].map(key => [key, frame[key]]))
+    : Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id'].map(key => [key, frame[key]]))
   const durables = new Map()
   const durable = new DurableSession(ipc, identity, frame)
   durables.set(identity.session_id, durable)
@@ -818,6 +850,10 @@ export async function runAgent(ipc, frame) {
   ctx.systemPrompt.section({
     name: 'morde:soul', order: ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
     text: SOUL, interpolate: false,
+  })
+  if (coordinator) ctx.systemPrompt.section({
+    name: 'morde:coordinator', order: ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX') - 1,
+    text: frame.system_prompt, interpolate: false,
   })
   if (!frame.tools || frame.tools.length === 0) {
     ctx.systemPrompt.section({
@@ -1078,7 +1114,10 @@ export async function runAgent(ipc, frame) {
         tools: options.tools ?? [],
         ...(options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens }),
       }
-      const id = modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, sessionDurable.through)
+      const id = sessionDurable.identity.context_role === 'coordinator'
+        ? coordinatorModelCallID(sessionDurable.identity.conversation_id, sessionDurable.identity.message_id,
+          sessionDurable.identity.session_id, sessionDurable.through)
+        : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, sessionDurable.through)
       yield* ipc.streamModel(sessionDurable.identity, id, sessionDurable.through, request, options.signal)
     }
   }
@@ -1111,7 +1150,7 @@ export async function runAgent(ipc, frame) {
         id: MessageId(message_id), role: 'user', content: deliveredMessageBlocks(content, attachmentIDs), source: { kind: 'user' },
       }))
     })
-    const revisionMessages = frame.revision_messages ?? []
+    let revisionMessages = frame.revision_messages ?? []
     const stageRevisionMessages = deliveries => {
       const byID = new Map(deliveries.map(message => [message.message_id, message]))
       for (const event of agent.session.snapshotEvents()) {
@@ -1136,6 +1175,11 @@ export async function runAgent(ipc, frame) {
         else agent.inject(value)
       }
     }
+    if (coordinator && frame.resume === true && frame.initial_message) {
+      const alreadyPersisted = agent.session.snapshotEvents().some(event =>
+        event.type === 'user/message' && event.data?.id === frame.initial_message.message_id)
+      if (!alreadyPersisted) revisionMessages = [frame.initial_message]
+    }
     if (frame.resume === true && revisionMessages.length === 0) installMessageDeliveryHandler()
     for (const record of frame.background_jobs ?? []) {
       const child = {
@@ -1147,6 +1191,7 @@ export async function runAgent(ipc, frame) {
     await Promise.all([...backgroundJobs.values()].map(job => job.started.promise))
     const recovery = frame.resume === true ? durable.recoveryHistory : undefined
     if (ipc.cancelled) {
+      if (coordinator) return { type: 'coordinator_cancelled', ...identity, through_seq: durable.through }
       return { type: 'settled', ...identity, state: 'cancelled', through_seq: durable.through }
     }
     if (frame.resume === true) {
@@ -1171,6 +1216,7 @@ export async function runAgent(ipc, frame) {
       }
       const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
       if (end?.data?.reason?.kind !== 'completed') throw new Error('recovered dsh turn did not complete')
+      if (coordinator) return coordinatorSettled(identity, agent, durable)
       await waitForBackgroundJobs()
       return { type: 'settled', ...identity, state: 'completed_candidate', through_seq: durable.through }
     }
@@ -1196,6 +1242,11 @@ export async function runAgent(ipc, frame) {
     const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
     const reason = end?.data?.reason?.kind
     const resultState = state.toolFailure || state.failed ? 'failed' : ipc.cancelled || reason === 'aborted' ? 'cancelled' : reason === 'completed' ? 'completed_candidate' : 'failed'
+    if (coordinator) {
+      if (resultState === 'cancelled') return { type: 'coordinator_cancelled', ...identity, through_seq: durable.through }
+      if (resultState !== 'completed_candidate') throw new Error('coordinator turn did not complete')
+      return coordinatorSettled(identity, agent, durable)
+    }
     if (resultState === 'completed_candidate') await waitForBackgroundJobs()
     return { type: 'settled', ...identity, state: resultState, through_seq: durable.through }
   } finally {
@@ -1223,4 +1274,26 @@ function delegatedSummary(agent) {
     (end.data?.turn === undefined || event.data.turn === end.data.turn))
   const content = message?.data?.message?.content
   return Array.isArray(content) ? content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('').trim() : ''
+}
+
+function coordinatorSettled(identity, agent, durable) {
+  const events = agent.session.snapshotEvents()
+  const endIndex = events.findLastIndex(event => event.type === 'turn/end')
+  const end = events[endIndex]
+  if (!end || end.data?.reason?.kind !== 'completed') throw new Error('coordinator turn is not complete')
+  const turn = end.data.turn
+  const turnEvents = events.filter(event => event.data?.turn === turn)
+  if (turnEvents.some(event => event.type === 'tool/call' || event.type === 'tool/result')) {
+    throw new Error('coordinator turn contains tool activity')
+  }
+  const message = events.slice(0, endIndex + 1).findLast(event =>
+    event.type === 'assistant/message' && event.data?.message?.role === 'assistant' &&
+    (turn === undefined || event.data.turn === turn))
+  const content = message?.data?.message?.content
+  if (!Array.isArray(content) || content.some(block => block?.type === 'tool-call' || block?.type === 'tool-result')) {
+    throw new Error('coordinator response contains tool output')
+  }
+  const result = content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text).join('')
+  if (Buffer.byteLength(result, 'utf8') > 4096) throw new Error('coordinator response exceeds limit')
+  return { type: 'coordinator_settled', ...identity, through_seq: durable.through, result }
 }

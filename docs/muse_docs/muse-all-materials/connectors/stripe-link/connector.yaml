@@ -1,0 +1,14 @@
+id: stripe-link
+title: "Link by Stripe"
+description: "Pay a merchant with a one-time virtual card funded from a card saved in the user's Link wallet, after its native purchase approval."
+aliases: ["stripe link"]
+include_in_prompt: false
+availability:
+  confidential_vm: true
+auth:
+  authorize: "/opt/hatch/bin/stripe-link auth authorize-url --format json"
+sync:
+  fetch_kind: connector_sync_stripe_financial_insights
+  cadence_minutes: 10080
+  read_methods: [financial_insights]
+  content_hints: [purchase_activity]

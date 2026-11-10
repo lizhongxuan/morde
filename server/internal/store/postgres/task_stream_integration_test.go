@@ -344,7 +344,7 @@ VALUES ($1::uuid,$2,$3,$4,'{"name":"Synthetic"}'::jsonb)`, f.instanceID, f.task.
 VALUES ($1::uuid,$2,$3,$4,1,false)`, f.instanceID, f.task.OwnerID, personal.ObjectTypeProfile, personal.ProfileObjectID); err != nil {
 		t.Fatal(err)
 	}
-	f.delta.PersonalProof = &app.CloudDSHStreamPersonalProof{Objects: []app.CloudDSHMemoryVersion{
+	f.delta.PersonalProof = &app.CloudDSHStreamPersonalProof{Enabled: true, SettingRevision: 0, Objects: []app.CloudDSHMemoryVersion{
 		{ObjectType: personal.ObjectTypeProfile, ID: personal.ProfileObjectID, Revision: 1},
 	}}
 	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, f.delta); err != nil || !appended {
@@ -452,7 +452,7 @@ func TestCloudDSHStreamRevisionAndCancelKeepInterruptedText(t *testing.T) {
 			} else {
 				requestID := mustID(t, domain.NewTaskActionID)
 				record := taskActionIdempotency(f.task.InitiatorID, task.ActionCancel, "stream-cancel-action", f.task.ID, task.StatusRunning, requestID)
-				if _, err := f.route.store.RequestTaskAction(ctx, record, f.task.ID, task.ActionCancel, task.StatusRunning, requestID); err != nil {
+				if _, err := f.route.store.RequestTaskAction(ctx, record, f.task.ID, task.ActionCancel, task.StatusRunning, nil, requestID); err != nil {
 					t.Fatal(err)
 				}
 			}

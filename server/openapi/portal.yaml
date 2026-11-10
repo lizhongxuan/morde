@@ -5033,6 +5033,7 @@ paths:
               schema: { $ref: '#/components/schemas/TaskActionResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/inputs:
     parameters:
@@ -10613,6 +10614,9 @@ components:
     TaskStatus:
       type: string
       enum: [queued, running, waiting_user, pausing, paused, cancelling, completed, failed, cancelled]
+    TaskStepStatus:
+      type: string
+      enum: [queued, running, waiting_user, succeeded, failed, unknown]
     TaskBudgetRequest:
       type: object
       additionalProperties: false
@@ -10635,9 +10639,35 @@ components:
         active_seconds: { type: integer, minimum: 0 }
         tool_calls: { type: integer, minimum: 0 }
         model_tokens: { type: [integer, 'null'], minimum: 0 }
+    TaskDependency:
+      type: object
+      required: [task_id, required_revision, task_status, satisfied]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        required_revision: { type: integer, format: int64, minimum: 0 }
+        task_status: { $ref: '#/components/schemas/TaskStatus' }
+        satisfied: { type: boolean }
+    TaskChildJob:
+      type: object
+      required: [job_id, task_step_id, title, task_revision, status]
+      properties:
+        job_id: { type: string, minLength: 1, maxLength: 128, description: Opaque DSH child session identifier; it is not an independently authorized Task. }
+        task_step_id: { $ref: '#/components/schemas/StepId' }
+        title: { type: string }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        status: { $ref: '#/components/schemas/TaskStepStatus' }
+    TaskResultReview:
+      type: object
+      required: [state, source_task_id, source_task_revision, source_event_sequence, reply_message_id]
+      properties:
+        state: { type: string, enum: [pending, processing, published, failed] }
+        source_task_id: { $ref: '#/components/schemas/TaskId' }
+        source_task_revision: { type: integer, format: int64, minimum: 0 }
+        source_event_sequence: { type: integer, format: int64, minimum: 1 }
+        reply_message_id: { oneOf: [{ $ref: '#/components/schemas/MessageId' }, { type: 'null' }] }
     TaskSummary:
       type: object
-      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, current_step, step_count, completed_step_count, budget, usage, created_at, updated_at]
+      required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, current_step, step_count, completed_step_count, budget, usage, dependencies, child_jobs, result_review, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/TaskId' }
         owner_id: { $ref: '#/components/schemas/UserId' }
@@ -10659,6 +10689,9 @@ components:
         completed_step_count: { type: integer, format: int64, minimum: 0, description: Count of succeeded Task steps excluding budget steps; never greater than step_count. }
         budget: { $ref: '#/components/schemas/TaskBudget' }
         usage: { $ref: '#/components/schemas/TaskUsage' }
+        dependencies: { type: array, items: { $ref: '#/components/schemas/TaskDependency' } }
+        child_jobs: { type: array, items: { $ref: '#/components/schemas/TaskChildJob' } }
+        result_review: { oneOf: [{ $ref: '#/components/schemas/TaskResultReview' }, { type: 'null' }] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     TaskStep:
@@ -10668,7 +10701,7 @@ components:
         id: { $ref: '#/components/schemas/StepId' }
         sequence: { type: integer, minimum: 1 }
         kind: { type: string, enum: [plan, model, tool, wait, clarification, budget, verification, verify, batch_item, batch_result, subagent, progress, result] }
-        status: { type: string, enum: [queued, running, waiting_user, succeeded, failed, unknown] }
+        status: { $ref: '#/components/schemas/TaskStepStatus' }
         title: { type: string }
         summary: { type: string }
         created_at: { type: string, format: date-time }
@@ -10855,8 +10888,15 @@ components:
       properties:
         action: { type: string, enum: [retry_batch_item, pause, resume, cancel] }
         expected_status: { $ref: '#/components/schemas/TaskStatus' }
+        expected_current_revision: { type: integer, format: int64, minimum: 0 }
+        expected_desired_revision: { type: integer, format: int64, minimum: 0 }
         batch_item_id: { $ref: '#/components/schemas/BatchItemId' }
-      description: retry_batch_item requires batch_item_id only; pause, resume and cancel require expected_status only.
+      description: >-
+        retry_batch_item requires batch_item_id only. Pause, resume and cancel
+        require expected_status. expected_current_revision and
+        expected_desired_revision are optional together; when both are present,
+        both task revisions are compared atomically before applying the action.
+        Legacy clients may omit both revision fields. Supplying only one is invalid.
     TaskWorkspaceViewDeletionRequest:
       type: object
       additionalProperties: false

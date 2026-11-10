@@ -1,6 +1,7 @@
 import { http, HttpResponse } from "msw";
 import type { components } from "../api/schema";
 import type { ConversationDeliveryStatus, HostMemberPermission, MainConversation } from "../app/api";
+import { createK2TaskFixture } from "./k2-task-fixture";
 
 type User = { id: string; name: string; role: components["schemas"]["UserRole"]; status: components["schemas"]["AccountStatus"]; must_change_password: boolean; quota: { hosts: number; cpu_milli: number; mem_mib: number }; usage: { hosts: number; cpu_milli: number; mem_mib: number }; default_host_resources: { cpu_milli: number; mem_mib: number }; created_at?: string };
 type AuditLog = { id: number; at: string; actor_id: string; actor_kind: string; action: string; target: string; detail: Record<string, unknown>; ip: string };
@@ -557,6 +558,15 @@ export function resetMockState(options: { restoreAssistantState?: boolean } = {}
     ];
     notificationOwners = new Map(notifications.map((item) => [item.id, demoUser.id]));
   }
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1" && import.meta.env.VITE_K2_TASK_FIXTURE === "1"
+  ) {
+    const fixture = createK2TaskFixture(demoUser.id, defaultModelID ?? "pmodel01", now());
+    conversations = [fixture.conversation, ...conversations.filter((conversation) => conversation.id !== fixture.conversation.id)];
+    conversationMessages = [...conversationMessages.filter((message) => message.conversation_id !== fixture.conversation.id), ...fixture.messages];
+    conversationOwners.set(fixture.conversation.id, demoUser.id);
+    mainConversations.set(demoUser.id, fixture.mainConversation);
+    for (const task of fixture.tasks) tasks.set(task.id, task);
+  }
 }
 
 export function setMockWorkspaceSyncConflict(hostID: string, workspaceID: string, conflicts: string[]) {
@@ -815,9 +825,10 @@ function createTaskMessage(user: User, conversation: Conversation, modelID: stri
     workspace_id: typeof request.workspace_id === "string" ? request.workspace_id : undefined,
     input_revision: typeof request.input_revision === "number" && Number.isSafeInteger(request.input_revision) ? request.input_revision : undefined,
     execution_location: "server", conversation_id: conversation.id, model_id: modelID, objective: content,
-    status: "queued", event_sequence: 0, current_step: null, step_count: 0, completed_step_count: 0,
+    status: "queued", event_sequence: 0, current_revision: 0, desired_revision: 0, current_step: null, step_count: 0, completed_step_count: 0,
     budget: budget ?? { active_seconds: 1800, tool_calls: 100, model_tokens: 50000 },
     usage: { active_seconds: 0, tool_calls: 0, model_tokens: null }, created_at: timestamp, updated_at: timestamp,
+    dependencies: [], child_jobs: [], result_review: null,
     result: null, waiting_reason: null, steps: [], batch_items: [], artifacts: [], pending_request: null,
     clarification_request: null, stop_request: null, assistant_message: null, finished_at: null,
   };
@@ -2480,10 +2491,23 @@ export const handlers = [
     if (!task || task.owner_id !== user.id) return failure("not_found", "任务不存在", 404);
     const key = request.headers.get("Idempotency-Key") ?? "";
     if (!/^[A-Za-z0-9._~-]{8,128}$/.test(key)) return failure("invalid_argument", "Idempotency-Key 无效", 400);
-    const body = await request.json().catch(() => null) as { action?: unknown; expected_status?: unknown } | null;
-    if (!body || Object.keys(body).some((field) => field !== "action" && field !== "expected_status")
+    const body = await request.json().catch(() => null) as {
+      action?: unknown;
+      expected_status?: unknown;
+      expected_current_revision?: unknown;
+      expected_desired_revision?: unknown;
+    } | null;
+    if (!body || Object.keys(body).some((field) => !["action", "expected_status", "expected_current_revision", "expected_desired_revision"].includes(field))
       || !["pause", "resume", "cancel"].includes(String(body.action)) || typeof body.expected_status !== "string") {
       return failure("invalid_argument", "任务操作请求无效", 400);
+    }
+    const hasCurrentRevision = Object.hasOwn(body, "expected_current_revision");
+    const hasDesiredRevision = Object.hasOwn(body, "expected_desired_revision");
+    if (hasCurrentRevision !== hasDesiredRevision || (hasCurrentRevision && (
+      typeof body.expected_current_revision !== "number" || !Number.isSafeInteger(body.expected_current_revision) || body.expected_current_revision < 0
+      || typeof body.expected_desired_revision !== "number" || !Number.isSafeInteger(body.expected_desired_revision) || body.expected_desired_revision < 0
+    ))) {
+      return failure("invalid_argument", "任务修订条件必须同时提供非负整数", 400);
     }
     const action = body.action as "pause" | "resume" | "cancel";
     const replayKey = `${user.id}:${key}`;
@@ -2495,6 +2519,8 @@ export const handlers = [
         : ["queued", "running", "waiting_user", "paused"];
     if (!allowedExpectedStatuses.includes(body.expected_status)) return failure("invalid_argument", "当前任务状态不允许此操作", 400);
     if (task.status !== body.expected_status) return failure("conflict", "任务状态已变化", 409);
+    if (hasCurrentRevision && (task.current_revision !== body.expected_current_revision
+      || task.desired_revision !== body.expected_desired_revision)) return failure("conflict", "任务修订已变化", 409);
     const timestamp = now();
     const nextStatus = action === "pause" ? "pausing" : action === "resume" ? "queued" : "cancelling";
     task.status = nextStatus;

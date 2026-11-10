@@ -23,8 +23,11 @@ func (s *Service) ArmAccountRuntime(ctx context.Context, guard AccountRuntimeGua
 	if err := s.processes.Ready(); err != nil {
 		return fmt.Errorf("independent process-tree verification is unavailable: %w", err)
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(guard.Fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	if existing, ok := s.store.getRuntime(guard.ContainerID); ok {
 		if existing.Guard.sameIdentity(guard) && existing.Guard.ExpiresAt.Equal(guard.ExpiresAt) && !existing.Destroyed {
 			return nil
@@ -53,8 +56,11 @@ func (s *Service) StartedAccountRuntime(ctx context.Context, guard AccountRuntim
 	if ctx == nil || ctx.Err() != nil {
 		return errors.New("account Runtime start context is unavailable")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(guard.Fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	value, err := s.lookupAccountRuntime(guard)
 	if err != nil {
 		return err
@@ -89,8 +95,11 @@ func (s *Service) RenewAccountRuntime(ctx context.Context, guard AccountRuntimeG
 	if ctx == nil || ctx.Err() != nil || guard.validateNew(s.now()) != nil {
 		return errors.New("account Runtime renewal identity or context is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(guard.Fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	return s.renewAccountRuntimeLocked(ctx, guard)
 }
 
@@ -98,8 +107,11 @@ func (s *Service) LookupAccountRuntime(ctx context.Context, fence app.AccountAge
 	if ctx == nil || ctx.Err() != nil || fence.Validate() != nil || !nonceHashRE.MatchString(nonceSHA256) {
 		return AccountRuntimeGuard{}, errors.New("account Runtime lookup identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(fence))
+	if err != nil {
+		return AccountRuntimeGuard{}, err
+	}
+	defer release()
 	value, ok, err := s.store.findRuntime(fence, nonceSHA256)
 	if err != nil || !ok {
 		return AccountRuntimeGuard{}, errors.New("guardian lease for the exact account Runtime fence is unknown")
@@ -119,8 +131,11 @@ func (s *Service) RenewAccountRuntimeByIdentity(ctx context.Context, fence app.A
 	if remaining <= 0 || remaining > app.MaxAgentLease {
 		return errors.New("account Runtime lease expiry is outside the allowed window")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(fence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	value, ok, err := s.store.findRuntime(fence, nonceSHA256)
 	if err != nil || !ok {
 		return errors.New("guardian lease for the exact account Runtime fence is unknown")
@@ -179,8 +194,11 @@ func (s *Service) AcknowledgeAccountRuntimeStopped(ctx context.Context, runtimeF
 		!nonceHashRE.MatchString(nonceSHA256) || !nonceHashRE.MatchString(proofSHA256) {
 		return errors.New("account Runtime proof acknowledgement identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(runtimeFence))
+	if err != nil {
+		return err
+	}
+	defer release()
 	return s.store.acknowledgeAccountRuntimeProof(runtimeFence, nonceSHA256, proofSHA256)
 }
 
@@ -188,8 +206,11 @@ func (s *Service) accountRuntimeStopAttestation(ctx context.Context, fence app.A
 	if ctx == nil || ctx.Err() != nil || fence.Validate() != nil || !nonceHashRE.MatchString(nonceSHA256) {
 		return app.AccountAgentRuntimeStopAttestation{}, errors.New("account Runtime stop identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, accountRuntimeOperationKey(fence))
+	if err != nil {
+		return app.AccountAgentRuntimeStopAttestation{}, err
+	}
+	defer release()
 	value, ok, err := s.store.findRuntime(fence, nonceSHA256)
 	if err != nil {
 		return app.AccountAgentRuntimeStopAttestation{}, errors.New("guardian lease for the exact account Runtime fence is unavailable")
@@ -299,8 +320,11 @@ func (s *Service) ArmTaskProcess(ctx context.Context, guard TaskProcessGuard) er
 	if !ok {
 		return errors.New("independent task cgroup isolation is unavailable")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockRuntimeTask(ctx, guard.RuntimeFence, guard.TaskFence)
+	if err != nil {
+		return err
+	}
+	defer release()
 	runtimeLease, err := s.activeAccountRuntime(ctx, guard.RuntimeFence, guard.RuntimeContainerID)
 	if err != nil {
 		return err
@@ -352,8 +376,11 @@ func (s *Service) StartedTaskProcess(ctx context.Context, guard TaskProcessGuard
 	if ctx == nil || ctx.Err() != nil {
 		return errors.New("task process start context is unavailable")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockRuntimeTask(ctx, guard.RuntimeFence, guard.TaskFence)
+	if err != nil {
+		return err
+	}
+	defer release()
 	value, err := s.lookupTaskProcess(guard)
 	if err != nil {
 		return err
@@ -384,8 +411,11 @@ func (s *Service) RenewTaskProcess(ctx context.Context, guard TaskProcessGuard) 
 	if ctx == nil || ctx.Err() != nil || guard.validateNew(s.now()) != nil {
 		return errors.New("task process renewal identity or context is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockRuntimeTask(ctx, guard.RuntimeFence, guard.TaskFence)
+	if err != nil {
+		return err
+	}
+	defer release()
 	value, err := s.lookupTaskProcessIdentity(guard)
 	if err != nil {
 		return err
@@ -416,8 +446,11 @@ func (s *Service) StopTaskProcess(ctx context.Context, guard TaskProcessGuard) (
 	if ctx == nil || ctx.Err() != nil {
 		return app.AccountAgentTaskStopAttestation{}, errors.New("task process stop context is unavailable")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockRuntimeTask(ctx, guard.RuntimeFence, guard.TaskFence)
+	if err != nil {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	defer release()
 	value, err := s.lookupTaskProcess(guard)
 	if err != nil {
 		return app.AccountAgentTaskStopAttestation{}, err
@@ -432,8 +465,11 @@ func (s *Service) RecoverTaskProcessStopped(ctx context.Context, runtimeFence ap
 	if ctx == nil || ctx.Err() != nil || runtimeFence.Validate() != nil || taskFence.Validate() != nil || !nonceHashRE.MatchString(nonceSHA256) {
 		return app.AccountAgentTaskStopAttestation{}, errors.New("task process recovery identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockRuntimeTask(ctx, runtimeFence, taskFence)
+	if err != nil {
+		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	defer release()
 	value, ok, err := s.store.findTask(runtimeFence, taskFence, nonceSHA256)
 	if err != nil || !ok {
 		return app.AccountAgentTaskStopAttestation{}, errors.New("guardian lease for the exact account Runtime and Task fences is unknown")
@@ -450,8 +486,11 @@ func (s *Service) AcknowledgeTaskProcessStopped(ctx context.Context, runtimeFenc
 		runtimeFence.OwnerID != taskFence.OwnerID || !nonceHashRE.MatchString(nonceSHA256) || !nonceHashRE.MatchString(proofSHA256) {
 		return errors.New("task process proof acknowledgement identity is invalid")
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockRuntimeTask(ctx, runtimeFence, taskFence)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return s.store.acknowledgeTaskProcessProof(runtimeFence, taskFence, nonceSHA256, proofSHA256)
 }
 
@@ -570,6 +609,12 @@ func (s *Service) stopRuntimeTasks(ctx context.Context, runtimeValue accountRunt
 }
 
 func (s *Service) destroyAccountRuntime(ctx context.Context, value *accountRuntimeLease) error {
+	if value.Destroyed {
+		if value.DestroyedAt.IsZero() || value.UnprovenRunning {
+			return errors.New("persisted account Runtime destruction proof is inconsistent")
+		}
+		return nil
+	}
 	inspected, err := s.docker.inspect(ctx, value.Guard.ContainerID)
 	switch {
 	case errors.Is(err, errContainerNotFound):

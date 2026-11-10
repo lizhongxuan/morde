@@ -31,8 +31,11 @@ func (s *Service) RegisterTaskSandbox(ctx context.Context, guard TaskSandboxGuar
 	if err := s.processes.Ready(); err != nil {
 		return fmt.Errorf("independent Task Sandbox process verification is unavailable: %w", err)
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskSandboxOperationKey(guard.LifecycleID))
+	if err != nil {
+		return err
+	}
+	defer release()
 	return s.registerTaskSandboxLocked(ctx, guard)
 }
 
@@ -49,8 +52,11 @@ func (s *Service) RegisterDiscoveredTaskSandbox(ctx context.Context, request Tas
 	if err := s.processes.Ready(); err != nil {
 		return TaskSandboxGuard{}, fmt.Errorf("independent Task Sandbox process verification is unavailable: %w", err)
 	}
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskSandboxOperationKey(request.LifecycleID))
+	if err != nil {
+		return TaskSandboxGuard{}, err
+	}
+	defer release()
 
 	containers, err := s.docker.listByLabel(ctx, openSandboxContainerIDLabel, request.SandboxID)
 	if err != nil {
@@ -119,8 +125,11 @@ func (s *Service) StopTaskSandbox(ctx context.Context, request TaskSandboxStopRe
 		return app.TaskSandboxGuardianStopAttestation{}, err
 	}
 	key := taskSandboxLeaseKey(request.Guard.LifecycleID)
-	s.operationM.Lock()
-	defer s.operationM.Unlock()
+	release, err := s.lockOperation(ctx, taskSandboxOperationKey(request.Guard.LifecycleID))
+	if err != nil {
+		return app.TaskSandboxGuardianStopAttestation{}, err
+	}
+	defer release()
 	value, ok := s.store.getTaskSandbox(key)
 	identityMatches := ok && value.Guard.sameIdentity(request.Guard)
 	if lookupByLifecycle {

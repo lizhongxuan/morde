@@ -194,6 +194,38 @@ type ConversationAttachmentSlot struct {
 	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 }
 
+type ConversationCoordinatorCheckpointHead struct {
+	ServiceInstanceID    pgtype.UUID        `json:"service_instance_id"`
+	OwnerID              string             `json:"owner_id"`
+	ActorID              string             `json:"actor_id"`
+	ConversationID       string             `json:"conversation_id"`
+	MessageID            string             `json:"message_id"`
+	AgentID              string             `json:"agent_id"`
+	Generation           int64              `json:"generation"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	SessionID            string             `json:"session_id"`
+	ThroughSequence      int64              `json:"through_sequence"`
+	Digest               []byte             `json:"digest"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	ContextDigest        []byte             `json:"context_digest"`
+}
+
+type ConversationCoordinatorCheckpointPage struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	ActorID           string             `json:"actor_id"`
+	ConversationID    string             `json:"conversation_id"`
+	MessageID         string             `json:"message_id"`
+	SessionID         string             `json:"session_id"`
+	FromSequence      int64              `json:"from_sequence"`
+	ThroughSequence   int64              `json:"through_sequence"`
+	Digest            []byte             `json:"digest"`
+	Ciphertext        []byte             `json:"ciphertext"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	ContextDigest     []byte             `json:"context_digest"`
+}
+
 type ConversationMessage struct {
 	ID                        string             `json:"id"`
 	ConversationID            string             `json:"conversation_id"`
@@ -835,6 +867,13 @@ type PersonalHistoryImportMapping struct {
 	CanonicalMessageID      pgtype.Text        `json:"canonical_message_id"`
 	ContentHash             []byte             `json:"content_hash"`
 	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+}
+
+type PersonalHistorySuppression struct {
+	ServiceInstanceID pgtype.UUID        `json:"service_instance_id"`
+	OwnerID           string             `json:"owner_id"`
+	MessageID         string             `json:"message_id"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
 type PersonalMutationReceipt struct {
@@ -1681,6 +1720,61 @@ type TaskRevisionStart struct {
 	StepID        string             `json:"step_id"`
 	EventSequence int64              `json:"event_sequence"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type TaskSandboxCallReceipt struct {
+	ID                     string             `json:"id"`
+	TaskID                 string             `json:"task_id"`
+	OwnerID                string             `json:"owner_id"`
+	InitiatorID            string             `json:"initiator_id"`
+	ProjectID              string             `json:"project_id"`
+	ProjectResourceVersion int64              `json:"project_resource_version"`
+	WorkspaceID            string             `json:"workspace_id"`
+	WorkspaceOwnerID       string             `json:"workspace_owner_id"`
+	InputRevision          int64              `json:"input_revision"`
+	WorkspaceCheckpoint    int64              `json:"workspace_checkpoint"`
+	ContextDigest          []byte             `json:"context_digest"`
+	AuthorizationVersion   int64              `json:"authorization_version"`
+	LeaseOwner             string             `json:"lease_owner"`
+	LeaseVersion           int64              `json:"lease_version"`
+	CallID                 string             `json:"call_id"`
+	RequestHash            []byte             `json:"request_hash"`
+	SandboxID              string             `json:"sandbox_id"`
+	SandboxGeneration      int64              `json:"sandbox_generation"`
+	Status                 string             `json:"status"`
+	ExitCode               pgtype.Int4        `json:"exit_code"`
+	Output                 string             `json:"output"`
+	ResultSha256           []byte             `json:"result_sha256"`
+	UnknownCode            string             `json:"unknown_code"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	AgentInstanceID        string             `json:"agent_instance_id"`
+	AgentGeneration        int64              `json:"agent_generation"`
+	AgentSessionID         string             `json:"agent_session_id"`
+	AgentEngineVersion     string             `json:"agent_engine_version"`
+	AgentProfileVersion    string             `json:"agent_profile_version"`
+}
+
+type TaskSandboxLifecycle struct {
+	ID                   string             `json:"id"`
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	InitiatorID          string             `json:"initiator_id"`
+	LeaseOwner           string             `json:"lease_owner"`
+	LeaseVersion         int64              `json:"lease_version"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	AgentInstanceID      string             `json:"agent_instance_id"`
+	AgentGeneration      int64              `json:"agent_generation"`
+	SandboxID            string             `json:"sandbox_id"`
+	SandboxGeneration    int64              `json:"sandbox_generation"`
+	Status               string             `json:"status"`
+	ExpiresAt            pgtype.Timestamptz `json:"expires_at"`
+	UnknownCode          string             `json:"unknown_code"`
+	TerminationEvidence  []byte             `json:"termination_evidence"`
+	TerminatedAt         pgtype.Timestamptz `json:"terminated_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	GuardianNonceSha256  string             `json:"guardian_nonce_sha256"`
 }
 
 type TaskStep struct {

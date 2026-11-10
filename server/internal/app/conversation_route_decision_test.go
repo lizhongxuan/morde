@@ -21,6 +21,7 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 		{"independent", `{"action":"new","task_id":"","question":""}`, ConversationRouteNew, ""},
 		{"status", `{"action":"status","task_id":"q1234567","question":""}`, ConversationRouteStatus, "q1234567"},
 		{"stop", `{"action":"stop","task_id":"q1234567","question":""}`, ConversationRouteStop, "q1234567"},
+		{"direct reply", `{"action":"reply","task_id":"","question":"","reply":"你好，答案是 42。"}`, ConversationRouteReply, ""},
 		{"ambiguous", `{"action":"clarify","task_id":"","question":"你指的是哪个任务？"}`, ConversationRouteClarify, ""},
 		{"unknown task", `{"action":"stop","task_id":"q7654321","question":""}`, ConversationRouteClarify, ""},
 		{"extra fields", `{"action":"update","task_id":"q1234567","question":"","admin":true}`, ConversationRouteClarify, ""},
@@ -38,7 +39,51 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 			if test.action == ConversationRouteClarify && decision.Question == "" {
 				t.Fatal("clarification must have a visible question")
 			}
+			if test.action == ConversationRouteReply && (decision.Reply != "你好，答案是 42。" || decision.ModelOutput != test.output) {
+				t.Fatalf("direct reply or original model output was not preserved: %+v", decision)
+			}
 		})
+	}
+}
+
+func TestConversationRouteDirectReplyRequiresValidTargetlessText(t *testing.T) {
+	for _, output := range []string{
+		`{"action":"reply","task_id":"q1234567","question":"","reply":"answer"}`,
+		`{"action":"reply","task_id":"","question":"which?","reply":"answer"}`,
+		`{"action":"reply","task_id":"","question":"","reply":""}`,
+		`{"action":"reply","task_id":"","question":"","reply":"   "}`,
+		`{"action":"reply","task_id":"","question":"","reply":"\u0000"}`,
+		`{"action":"reply","task_id":"","question":"","reply":"` + strings.Repeat("x", MaxConversationRouteReplyRunes+1) + `"}`,
+		`{"action":"new","task_id":"","question":"","reply":"must not be smuggled"}`,
+	} {
+		decision := ParseConversationRouteDecision(output, nil)
+		if decision.Action != ConversationRouteClarify || decision.Reply != "" {
+			t.Errorf("unsafe output was accepted as a reply: %q => %+v", output, decision)
+		}
+	}
+	invalidUTF8 := string([]byte{'{', '"', 'a', 'c', 't', 'i', 'o', 'n', '"', ':', '"', 'r', 'e', 'p', 'l', 'y', '"', ',', 0xff, '}'})
+	if decision := ParseConversationRouteDecision(invalidUTF8, nil); decision.Action != ConversationRouteClarify {
+		t.Fatalf("invalid UTF-8 model output was accepted: %+v", decision)
+	}
+	if ValidConversationRouteModelOutput(strings.Repeat("x", MaxConversationRouteModelOutputBytes+1)) ||
+		ValidConversationRouteModelOutput(string([]byte{0xff})) || ValidConversationRouteModelOutput("model\x00output") {
+		t.Fatal("invalid durable model output passed validation")
+	}
+}
+
+func TestConversationRouteDirectReplyCannotHideUnknownTaskControl(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "停止任务", ReferenceTaskID: "q1234567", ReferenceUnavailable: true}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"I cannot stop it."}`, value)
+	if decision.Action != ConversationRouteClarify || decision.Question != UnavailableRouteReferenceMessage || decision.ModelOutput == "" {
+		t.Fatalf("reply bypassed unavailable-reference safety or lost source output: %+v", decision)
+	}
+	value.ReferenceUnavailable = false
+	value.ReferenceTaskID = ""
+	value.PreviousMissing = true
+	value.PreviousUnresolved = true
+	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"The answer is 42."}`, value)
+	if decision.Action != ConversationRouteClarify || decision.Question != "前一条消息尚未确认，请先处理或重试。" || decision.ModelOutput == "" {
+		t.Fatalf("reply used unavailable predecessor context or lost source output: %+v", decision)
 	}
 }
 

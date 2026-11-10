@@ -66,6 +66,7 @@ const task = {
   objective: '验证交付', status: 'completed' as const, current_step: null,
   step_count: 0, completed_step_count: 0,
   budget: { active_seconds: 0, tool_calls: 0, model_tokens: 0 }, usage: { active_seconds: 0, tool_calls: 0, model_tokens: 0 },
+  dependencies: [], child_jobs: [], result_review: null,
   created_at: '2026-11-02T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
 };
 
@@ -167,7 +168,8 @@ describe('Projects API integration', () => {
   });
 
   it('stops only the current member’s selected project task', async () => {
-    const mine = { ...task, id: 'qhistory1', conversation_id: projectConversation.id, status: 'running' as const };
+    const mine = { ...task, id: 'qhistory1', conversation_id: projectConversation.id, status: 'running' as const,
+      current_revision: 2, desired_revision: 3 };
     const other = { ...mine, id: 'qhistory2', initiator_id: teammate.user_id };
     vi.mocked(projectApi.tasks).mockResolvedValue([mine, other]);
     vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([projectHistoryMessage,
@@ -179,7 +181,8 @@ describe('Projects API integration', () => {
     const button = await screen.findByRole('button', { name: '停止此任务' });
     expect(screen.getAllByRole('button', { name: '停止此任务' })).toHaveLength(1);
     await user.click(button);
-    await waitFor(() => expect(stop).toHaveBeenCalledWith(mine.id, { action: 'cancel', expected_status: 'running' }, expect.any(String)));
+    await waitFor(() => expect(stop).toHaveBeenCalledWith(mine.id,
+      { action: 'cancel', expected_status: 'running', expected_current_revision: 2, expected_desired_revision: 3 }, expect.any(String)));
     expect(await screen.findByText('停止请求已受理，正在等待服务端确认任务状态。')).toBeInTheDocument();
   });
 

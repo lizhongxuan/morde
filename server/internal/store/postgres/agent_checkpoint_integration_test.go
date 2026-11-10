@@ -429,7 +429,7 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 	}
 	cancelID := mustID(t, domain.NewTaskActionID)
 	cancelRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "cancel-child-sessions", firstTask.ID, task.StatusRunning, cancelID)
-	cancelling, err := store.RequestTaskAction(ctx, cancelRecord, firstTask.ID, task.ActionCancel, task.StatusRunning, cancelID)
+	cancelling, err := store.RequestTaskAction(ctx, cancelRecord, firstTask.ID, task.ActionCancel, task.StatusRunning, nil, cancelID)
 	if err != nil || cancelling.Task.Status != task.StatusCancelling {
 		t.Fatalf("request parent task cancellation: task=%#v err=%v", cancelling.Task, err)
 	}

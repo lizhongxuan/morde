@@ -171,7 +171,7 @@ func TestPostgresPausedTaskResumeRacesWithSameConversationSubmission(t *testing.
 	pauseID := mustID(t, domain.NewTaskActionID)
 	pause, err := store.RequestTaskAction(ctx,
 		taskActionIdempotency(owner.ID, task.ActionPause, "pause-for-resume-race", created.Task.ID, task.StatusQueued, pauseID),
-		created.Task.ID, task.ActionPause, task.StatusQueued, pauseID)
+		created.Task.ID, task.ActionPause, task.StatusQueued, nil, pauseID)
 	if err != nil || pause.Task.Status != task.StatusPausing {
 		t.Fatalf("request pause: task=%q err=%v", pause.Task.Status, err)
 	}
@@ -200,7 +200,7 @@ func TestPostgresPausedTaskResumeRacesWithSameConversationSubmission(t *testing.
 	go func() {
 		defer workers.Done()
 		<-start
-		_, err := store.RequestTaskAction(ctx, resumeRecord, created.Task.ID, task.ActionResume, task.StatusPaused, resumeID)
+		_, err := store.RequestTaskAction(ctx, resumeRecord, created.Task.ID, task.ActionResume, task.StatusPaused, nil, resumeID)
 		results <- outcome{resumed: err == nil, err: err}
 	}()
 	go func() {

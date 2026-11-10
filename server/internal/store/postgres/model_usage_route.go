@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -180,7 +181,9 @@ func conversationRouteModelPhase(value app.ConversationRouteContext) string {
 
 func (s *Store) PrepareConversationRouteModelCall(ctx context.Context, call app.ModelCallReservation, projectCall *app.ProjectModelReservation) (*app.ConversationRouteDecision, error) {
 	if call.Source != app.ModelCallRoute || call.Route == nil || call.OwnerID != call.Route.Claim.Message.ActorID ||
-		call.ProjectID != call.Route.Claim.Input.ProjectID || len(call.RequestDigest) != 32 || call.ReservedTokens < 1 {
+		call.ProjectID != call.Route.Claim.Input.ProjectID || len(call.RequestDigest) != 32 || call.ReservedTokens < 1 ||
+		(call.LegacyCallID == "") != (len(call.LegacyDigest) == 0) || (call.LegacyCallID != "" &&
+		(!strings.HasPrefix(call.CallID, "mdl_") || !strings.HasPrefix(call.LegacyCallID, "route_") || len(call.LegacyDigest) != 32)) {
 		return nil, domain.InvalidArgument("route_model", "route model call is invalid")
 	}
 	if projectCall != nil {
@@ -228,6 +231,15 @@ ORDER BY (state IN ('reserved','dispatched','unknown')) DESC,(phase=$3) DESC LIM
 			}
 			err = pgx.ErrNoRows
 		}
+		legacyPrior := err == nil && priorPhase == phase && call.LegacyCallID != "" && priorCall == call.LegacyCallID &&
+			priorProject == call.ProjectID && priorModel == call.ModelID && bytes.Equal(digest, call.LegacyDigest) &&
+			priorVersion.Equal(call.ConnectionVersion)
+		if legacyPrior && state == "reserved" {
+			if err := releaseRouteReservationInTx(ctx, tx, call.OwnerID, call.Route.Claim.Message.ID); err != nil {
+				return err
+			}
+			err = pgx.ErrNoRows
+		}
 		if err == nil {
 			if priorProject != call.ProjectID {
 				return domain.NewError(domain.CodeInvalidState, "route project attribution changed")
@@ -245,6 +257,14 @@ ORDER BY (state IN ('reserved','dispatched','unknown')) DESC,(phase=$3) DESC LIM
 			}
 			if err := checkModelCaller(ctx, tx, call); err != nil {
 				return err
+			}
+			if legacyPrior && state == "settled" {
+				var value app.ConversationRouteDecision
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context.Candidates) {
+					return domain.NewError(domain.CodeInvalidState, "settled legacy route decision is invalid")
+				}
+				decision = &value
+				return nil
 			}
 			if priorCall != call.CallID || priorModel != call.ModelID || !bytes.Equal(digest, call.RequestDigest) || !priorVersion.Equal(call.ConnectionVersion) {
 				return domain.NewError(domain.CodeConflict, "route model context changed and requires clarification")
@@ -706,14 +726,19 @@ WHERE message_id=$1 AND call_id=$3 AND state IN ('dispatched','unknown')`, call.
 }
 
 func validStoredRouteDecision(value app.ConversationRouteDecision, candidates []app.ConversationRouteCandidate) bool {
+	if !app.ValidConversationRouteModelOutput(value.ModelOutput) {
+		return false
+	}
 	switch value.Action {
 	case app.ConversationRouteNew:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == ""
+		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && value.Reply == ""
+	case app.ConversationRouteReply:
+		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question == "" && app.ValidConversationRouteReply(value.Reply)
 	case app.ConversationRouteClarify:
-		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Question != "" &&
+		return value.TaskID == "" && value.ExpectedRevision == 0 && value.Reply == "" && value.Question != "" &&
 			utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
-		if value.Question != "" {
+		if value.Question != "" || value.Reply != "" {
 			return false
 		}
 		for _, candidate := range candidates {
@@ -723,4 +748,53 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, candidates []
 		}
 	}
 	return false
+}
+
+func (s *Store) RecoverConversationCoordinatorModelOutput(ctx context.Context, fence app.ConversationRouteModelFence) (string, error) {
+	claim := fence.Claim
+	value := fence.Context
+	if ctx == nil || !domain.ValidModelConnectionID(value.ModelID) || value.ActorID != claim.Message.ActorID ||
+		value.Content != claim.Message.Content || value.ReferenceTaskID != claim.Input.ReferenceTaskID {
+		return "", domain.InvalidArgument("route_context", "coordinator model recovery fence is invalid")
+	}
+	var output string
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
+			return err
+		}
+		var state, modelID string
+		var encoded []byte
+		err := tx.QueryRow(ctx, `SELECT state,model_id,decision FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND phase=$3`, claim.Message.ID, claim.Message.ActorID,
+			conversationRouteModelPhase(value)).Scan(&state, &modelID, &encoded)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "coordinator model result is unavailable")
+		}
+		if err != nil {
+			return fmt.Errorf("read settled coordinator model result: %w", err)
+		}
+		var decision app.ConversationRouteDecision
+		if state != "settled" || modelID != value.ModelID || json.Unmarshal(encoded, &decision) != nil ||
+			!validStoredRouteDecision(decision, value.Candidates) {
+			return domain.NewError(domain.CodeInvalidState, "coordinator model result is not safely recoverable")
+		}
+		output = decision.ModelOutput
+		if output == "" {
+			fallback, err := json.Marshal(struct {
+				Action   app.ConversationRouteAction `json:"action"`
+				TaskID   string                      `json:"task_id"`
+				Question string                      `json:"question"`
+				Reply    string                      `json:"reply,omitempty"`
+			}{decision.Action, decision.TaskID, decision.Question, decision.Reply})
+			if err != nil {
+				return fmt.Errorf("encode settled coordinator model result: %w", err)
+			}
+			output = string(fallback)
+		}
+		if !app.ValidConversationRouteModelOutput(output) || output == "" {
+			return domain.NewError(domain.CodeInvalidState, "coordinator model result is invalid")
+		}
+		return nil
+	})
+	return output, err
 }

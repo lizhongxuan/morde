@@ -53,6 +53,7 @@ type taskStoreStub struct {
 	actionTaskID           string
 	action                 task.Action
 	actionExpected         task.Status
+	actionRevisionFence    *TaskActionRevisionFence
 	actionRequestID        string
 	actionCalls            int
 	events                 []task.Event
@@ -227,9 +228,9 @@ func (s *taskStoreStub) AnswerClarificationRequest(_ context.Context, record Ide
 	return s.storeErr
 }
 
-func (s *taskStoreStub) RequestTaskAction(_ context.Context, record IdempotencyRecord, taskID string, action task.Action, expected task.Status, requestID string) (TaskActionResult, error) {
+func (s *taskStoreStub) RequestTaskAction(_ context.Context, record IdempotencyRecord, taskID string, action task.Action, expected task.Status, revisionFence *TaskActionRevisionFence, requestID string) (TaskActionResult, error) {
 	s.actionCalls++
-	s.actionRecord, s.actionTaskID, s.action, s.actionExpected, s.actionRequestID = record, taskID, action, expected, requestID
+	s.actionRecord, s.actionTaskID, s.action, s.actionExpected, s.actionRevisionFence, s.actionRequestID = record, taskID, action, expected, revisionFence, requestID
 	if s.storeErr != nil {
 		return TaskActionResult{}, s.storeErr
 	}
@@ -1131,17 +1132,37 @@ func TestTaskServiceRequestActionRequiresControlAndUsesExpectedStatusInIdempoten
 		t.Fatalf("task action authorization/record mismatch: calls=%d request=%#v auth=%#v", store.actionCalls, store.actionRecord, authorizer)
 	}
 	firstHash := append([]byte(nil), store.actionRecord.RequestHash...)
+	legacyHash, err := hashIdempotencyRequest(struct {
+		Action         task.Action `json:"action"`
+		TaskID         string      `json:"task_id"`
+		ExpectedStatus task.Status `json:"expected_status"`
+	}{task.ActionPause, taskValue.ID, task.StatusRunning})
+	if err != nil || !bytes.Equal(firstHash, legacyHash) {
+		t.Fatalf("omitting revision fence changed legacy idempotency hash: err=%v", err)
+	}
 	if _, err := service.RequestAction(context.Background(), principal, taskValue.ID, task.ActionPause, task.StatusQueued, "pause-key-001"); err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Equal(firstHash, store.actionRecord.RequestHash) {
 		t.Fatal("expected_status did not affect the idempotency request hash")
 	}
+	statusHash := append([]byte(nil), store.actionRecord.RequestHash...)
+	fence := &TaskActionRevisionFence{CurrentRevision: 5, DesiredRevision: 7}
+	if _, err := service.RequestActionWithRevisionFence(context.Background(), principal, taskValue.ID, task.ActionPause, task.StatusRunning, fence, "pause-revision-key-001"); err != nil {
+		t.Fatal(err)
+	}
+	if store.actionRevisionFence == nil || *store.actionRevisionFence != *fence || bytes.Equal(statusHash, store.actionRecord.RequestHash) {
+		t.Fatalf("revision fence was not passed or included in idempotency hash: fence=%#v", store.actionRevisionFence)
+	}
+	if _, err := service.RequestActionWithRevisionFence(context.Background(), principal, taskValue.ID, task.ActionPause, task.StatusRunning,
+		&TaskActionRevisionFence{CurrentRevision: -1, DesiredRevision: 7}, "pause-invalid-fence-key"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.actionCalls != 4 {
+		t.Fatalf("negative revision fence err=%v calls=%d", err, store.actionCalls)
+	}
 	principal = identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "t1234567", HostIDs: []string{taskValue.HostID}, Scopes: []identity.Scope{identity.ScopeTaskRead}}
-	if _, err := service.RequestAction(context.Background(), principal, taskValue.ID, task.ActionCancel, task.StatusRunning, "cancel-key-001"); domain.CodeOf(err) != domain.CodeNotFound || store.actionCalls != 3 {
+	if _, err := service.RequestAction(context.Background(), principal, taskValue.ID, task.ActionCancel, task.StatusRunning, "cancel-key-001"); domain.CodeOf(err) != domain.CodeNotFound || store.actionCalls != 4 {
 		t.Fatalf("unscoped cancel err=%v writes=%d", err, store.actionCalls)
 	}
-	if _, err := service.RequestAction(context.Background(), taskTestPrincipal(), taskValue.ID, task.ActionResume, task.StatusRunning, "resume-key-001"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.actionCalls != 3 {
+	if _, err := service.RequestAction(context.Background(), taskTestPrincipal(), taskValue.ID, task.ActionResume, task.StatusRunning, "resume-key-001"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.actionCalls != 4 {
 		t.Fatalf("invalid expected status err=%v writes=%d", err, store.actionCalls)
 	}
 }

@@ -248,7 +248,7 @@ func TestPostgresTaskConversationContextRejectsMissingHistoryAndInitialEvent(t *
 	})
 }
 
-func TestPostgresTaskClaimWithCheckpointDoesNotReloadConversationHistory(t *testing.T) {
+func TestPostgresTaskClaimWithCheckpointRequiresFixedConversationHistory(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
@@ -283,10 +283,13 @@ lease_expires_at=clock_timestamp()-interval '1 second',updated_at=clock_timestam
 		t.Fatalf("retire old conversation rows after checkpoint: %v", err)
 	}
 	recovered, found, err := store.ClaimNextTask(ctx, "context-checkpoint-recovery", time.Minute)
-	if err != nil || !found || recovered.ID != second.Task.ID || recovered.CheckpointThroughSequence != 0 ||
-		recovered.AgentSessionID != "session_context" || recovered.ConversationContext != nil {
-		t.Fatalf("recovered claim = task %q checkpoint=%d session=%q context=%#v found=%t err=%v",
-			recovered.ID, recovered.CheckpointThroughSequence, recovered.AgentSessionID, recovered.ConversationContext, found, err)
+	if err != nil || found {
+		t.Fatalf("personal checkpoint with missing fixed conversation history was claimed: task=%q found=%t err=%v", recovered.ID, found, err)
+	}
+	var status, result string
+	if err := store.pool.QueryRow(ctx, `SELECT status,result FROM tasks WHERE id=$1`, second.Task.ID).Scan(&status, &result); err != nil ||
+		status != string(task.StatusCancelling) || !strings.Contains(result, "历史上下文无法恢复") {
+		t.Fatalf("Task after missing fixed conversation history = status %q result %q err=%v", status, result, err)
 	}
 }
 
@@ -327,7 +330,7 @@ func TestPostgresScheduledPersonalContextRequiresExactOwnerRunAndTask(t *testing
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
 	otherOwner := createPreRetirementTestUser(t, store, 9, 20_000, 40_000)
 
-	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
 	objects := []struct {
 		objectType string
 		objectID   string

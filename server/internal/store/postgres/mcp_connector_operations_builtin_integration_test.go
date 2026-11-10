@@ -74,7 +74,7 @@ VALUES ($1,$2,$2,$3,1,0,1)`, claimed.ID, owner.ID, connectorID); err != nil {
 	}
 	stopID := mustID(t, domain.NewTaskActionID)
 	stopRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "builtin-search-stop", claimed.ID, task.StatusRunning, stopID)
-	stopping, err := store.RequestTaskAction(ctx, stopRecord, claimed.ID, task.ActionCancel, task.StatusRunning, stopID)
+	stopping, err := store.RequestTaskAction(ctx, stopRecord, claimed.ID, task.ActionCancel, task.StatusRunning, nil, stopID)
 	if err != nil || len(stopping.UnsettledOperationIDs) != 2 {
 		t.Fatalf("cancel request = %#v, err=%v", stopping, err)
 	}

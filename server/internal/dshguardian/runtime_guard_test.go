@@ -144,6 +144,32 @@ func TestRuntimeAndTaskStopAttestationsHaveSeparateScopesAndPersist(t *testing.T
 	}
 }
 
+func TestRecoverAccountRuntimeReplaysPersistedGuardianDestructionProof(t *testing.T) {
+	now := time.Now().UTC()
+	guard := testAccountRuntimeGuard(now)
+	process := processProof{PID: 321, StartTimeTick: 88, CgroupPath: "/system.slice/docker-" + guard.ContainerID + ".scope"}
+	store, err := openLeaseStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.createRuntime(accountRuntimeLease{Guard: guard, Process: process, Started: true,
+		Destroyed: true, DestroyedAt: now.Add(-time.Second)}); err != nil {
+		t.Fatalf("persist previously confirmed Runtime destruction: %v", err)
+	}
+	docker := newFakeAccountRuntimeDocker(guard, false, 0)
+	docker.exists = false
+	processes := &fakeProcessInspector{proof: process, killTreeErr: errors.New("already destroyed cgroup must not be killed again")}
+	service := newService(store, docker, combinedFakeProcessInspector{processes, &fakeTaskProcessInspector{}}, func() time.Time { return now })
+	attestation, err := service.RecoverAccountRuntimeStopped(context.Background(), guard.Fence, guard.NonceSHA256)
+	if err != nil || !attestation.Destroyed || attestation.Fence != guard.Fence || attestation.ContainerID != guard.ContainerID {
+		t.Fatalf("recover persisted Guardian Runtime proof: attestation=%+v err=%v", attestation, err)
+	}
+	if processes.killTreeCalls != 0 {
+		t.Fatalf("recovery repeated process destruction after a durable proof: kill calls=%d", processes.killTreeCalls)
+	}
+	verifyRuntimeAttestation(t, attestation)
+}
+
 func TestGuardianClientRunsRuntimeAndTaskControlRoutes(t *testing.T) {
 	now := time.Now().UTC()
 	runtimeGuard := testAccountRuntimeGuard(now)

@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Morde iOS · nanoMuse 与 Morde 融合后目标态设计稿</title>
+  <style>
+    :root {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #111214;
+      background: #f3f4f5;
+      --canvas: #fafafa;
+      --surface: #fff;
+      --ink: #111214;
+      --muted: #777b80;
+      --line: #e5e6e8;
+      --selected: #f1f2f3;
+      --agent: #ecedee;
+      --user: #b9deff;
+      --action: #54b4f8;
+      --success: #2dbe73;
+      --working: #e8a43b;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; min-width: 320px; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #65b6f5; outline-offset: 3px; }
+    svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .review { min-height: 100vh; display: grid; grid-template-columns: 300px minmax(0, 1fr); }
+    .review-rail { position: sticky; top: 0; height: 100vh; padding: 34px 26px; background: #fff; border-right: 1px solid var(--line); overflow: auto; }
+    .eyebrow { margin: 0 0 10px; color: #6e8fa9; font-size: 11px; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; }
+    .lead { margin: 12px 0 28px; color: var(--muted); font-size: 14px; line-height: 1.65; }
+    .scene-list { display: grid; gap: 6px; }
+    .scene-button { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 48px; padding: 9px 13px; border: 0; border-radius: 15px; background: transparent; color: #565b60; text-align: left; font-size: 14px; font-weight: 650; }
+    .scene-button svg { width: 20px; height: 20px; }
+    .scene-button:hover, .scene-button.active { background: #edf4f9; color: #173b58; }
+    .scene-button.active { box-shadow: inset 3px 0 0 var(--action); }
+    .rail-note { margin-top: 30px; padding: 17px; border-radius: 18px; background: #f5f7f8; color: #5f686f; font-size: 12px; line-height: 1.65; }
+    .rail-note strong { display: block; margin-bottom: 6px; color: #23323e; }
+    .rail-note a { color: #176da9; }
+    .display { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; min-width: 0; padding: 28px 20px; background: radial-gradient(circle at 48% 28%, #e7f3fd 0, transparent 38%), #f3f4f5; }
+    .display-head { width: min(390px, 100%); display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13px; color: #66717b; }
+    .display-head strong { color: #1b2c3a; font-size: 15px; }
+    .display-head span { border: 1px solid #dbe4e9; background: #ffffffb8; padding: 6px 10px; border-radius: 999px; white-space: nowrap; }
+    .device { position: relative; width: min(390px, 100%); height: 844px; overflow: hidden; border: 7px solid #24272b; border-radius: 48px; background: var(--canvas); box-shadow: 0 30px 90px #18314434, 0 3px 8px #14283d1e; }
+    .statusbar { position: absolute; z-index: 35; top: 0; left: 0; right: 0; height: 45px; display: flex; align-items: center; justify-content: space-between; padding: 5px 24px 0 30px; color: #101113; background: #fafafae3; font-size: 15px; font-weight: 750; }
+    .device[data-scene="browser"] .statusbar { color: #fff; background: #17181a; }
+    .status-icons { display: flex; align-items: center; gap: 7px; }
+    .signal { display: flex; align-items: end; gap: 2px; height: 15px; }
+    .signal i { display: block; width: 3px; border-radius: 3px; background: currentColor; }
+    .signal i:nth-child(1) { height: 5px; }.signal i:nth-child(2) { height: 8px; }.signal i:nth-child(3) { height: 11px; }.signal i:nth-child(4) { height: 14px; }
+    .wifi { width: 16px; height: 11px; border: 3px solid currentColor; border-bottom: 0; border-radius: 16px 16px 0 0; transform: rotate(45deg) scale(.75); }
+    .battery { position: relative; padding: 2px 5px; border-radius: 4px; background: #111214; color: #fff; font-size: 10px; line-height: 14px; }
+    .battery:after { content: ""; position: absolute; right: -3px; top: 5px; width: 2px; height: 8px; border-radius: 0 2px 2px 0; background: #111214; }
+    .device[data-scene="browser"] .battery { background: #fff; color: #17181a; }
+    .device[data-scene="browser"] .battery:after { background: #fff; }
+    .screen { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; padding-top: 45px; background: var(--canvas); }
+    .round { display: grid; place-items: center; flex: none; min-width: 46px; height: 46px; border: 1px solid #d8dadd; border-radius: 999px; background: #fffffff0; color: var(--ink); box-shadow: 0 3px 8px #0000000a, inset 0 1px 1px #fff; }
+    .round svg { width: 25px; height: 25px; }
+    .mascot { position: relative; display: block; flex: none; width: 62px; height: 62px; border-radius: 46% 46% 42% 42%; background: radial-gradient(circle at 46% 32%, #fbf4e7 10%, #e6d9c7 60%, #d5c5b0 100%); box-shadow: inset 6px 6px 12px #fff8e9, inset -5px -7px 10px #b7a89762, 0 5px 12px #87715a20; }
+    .mascot:before { content: ""; position: absolute; inset: 10px 8px 14px; border-radius: 45% 45% 48% 48%; background: radial-gradient(circle at 50% 18%, #fff3e4, #e9ceb3); box-shadow: inset 0 -2px 5px #c69f8050; }
+    .mascot:after { content: "• ᴗ •"; position: absolute; top: 21px; left: 0; right: 0; text-align: center; color: #443a32; font-size: 15px; letter-spacing: -1px; }
+    .mascot.small { width: 44px; height: 44px; }.mascot.small:before { inset: 7px 6px 10px; }.mascot.small:after { top: 13px; font-size: 12px; }
+    .mascot.large { width: 96px; height: 96px; }.mascot.large:before { inset: 16px 13px 22px; }.mascot.large:after { top: 34px; font-size: 21px; }
+    .chat-head { position: absolute; z-index: 10; top: 45px; left: 0; right: 0; height: 105px; display: flex; align-items: flex-start; padding: 9px 12px; background: linear-gradient(#fafafae8, #fafafac8 76%, #fafafa00); backdrop-filter: blur(8px); }
+    .avatar-trigger { position: absolute; left: 50%; top: 4px; width: 100px; display: flex; flex-direction: column; align-items: center; gap: 0; transform: translateX(-50%); border: 0; background: transparent; color: var(--ink); }
+    .avatar-trigger .mascot { outline: 7px solid #ffffffd9; }
+    .avatar-name { position: relative; margin-top: -4px; min-width: 73px; padding: 3px 11px 4px; border: 1px solid #d9dade; border-radius: 999px; background: #ffffffeb; font-size: 18px; font-weight: 700; }
+    .chat-feed { flex: 1; min-height: 0; overflow: auto; padding: 118px 14px 16px; scrollbar-width: thin; }
+    .dayline { margin: 2px 0 18px; color: #9a9da1; text-align: center; font-size: 12px; }
+    .message { width: fit-content; max-width: 94%; margin-bottom: 17px; padding: 15px 17px; border-radius: 24px; font-size: 16px; line-height: 1.55; overflow-wrap: anywhere; }
+    .message p { margin: 0; }.message p + p { margin-top: 13px; }
+    .message.agent { margin-right: auto; background: var(--agent); border-bottom-left-radius: 8px; }
+    .message.user { margin-left: auto; background: var(--user); border-bottom-right-radius: 8px; }
+    .message.user small { display:block; margin-top:7px; color:#476b87; font-size:11px; }
+    .message a { color: #217ac7; text-decoration: underline; text-underline-offset: 2px; }
+    .reaction { display: block; width: max-content; margin: -10px 11px 18px auto; padding: 2px 5px; border-radius: 999px; background: #f7f8f9; box-shadow: 0 2px 6px #00000012; font-size: 16px; }
+    .tool-card { margin: 0 0 17px; padding: 13px; border-radius: 24px; background: var(--agent); }
+    .tool-title { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 16px; font-weight: 750; }
+    .tool-title small { display: block; color: var(--muted); font-size: 13px; font-weight: 450; }
+    .tool-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; background: #e4f6ff; color: #188ce4; }
+    .tool-thumb { height: 132px; overflow: hidden; border-radius: 15px; background: #fff; border: 1px solid #d9dcde; }
+    .mock-top { height: 23px; display: flex; align-items: center; gap: 5px; padding: 0 9px; background: #f2f4f6; color: #a0a5a9; font-size: 7px; }
+    .mock-top b { width: 4px; height: 4px; border-radius: 50%; background: #b6bdc1; }
+    .mock-search { width: 62%; height: 12px; margin-left: 20px; border: 1px solid #d9dce0; border-radius: 99px; background: white; }
+    .mock-layout { display: flex; height: calc(100% - 23px); gap: 13px; padding: 12px; }
+    .mock-side { width: 20%; display: grid; align-content: start; gap: 8px; }
+    .mock-side i, .mock-lines i { display: block; height: 5px; border-radius: 5px; background: #e4e7e9; }
+    .mock-side i:nth-child(2) { width: 75%; }.mock-side i:nth-child(3) { width: 84%; }
+    .mock-main { flex: 1; display: grid; align-content: start; gap: 10px; }
+    .mock-main strong { font-size: 13px; }.mock-lines { display: grid; gap: 6px; }.mock-lines i:nth-child(2) { width: 70%; }
+    .card-action { width: 100%; min-height: 40px; margin-top: 11px; border: 0; border-radius: 999px; background: #fff; color: var(--ink); font-size: 15px; font-weight: 750; }
+    .chat-footer { flex: none; padding: 7px 11px 16px; background: linear-gradient(#fafafa99, #fafafa 28%); }
+    .composer { display: flex; align-items: center; gap: 6px; height: 51px; padding: 3px 5px 3px 7px; border: 1px solid #dedfe2; border-radius: 999px; background: #ffffffed; box-shadow: 0 4px 18px #3040520e; }
+    .composer button { display: grid; place-items: center; flex: none; width: 40px; height: 40px; border: 0; border-radius: 50%; background: transparent; color: var(--ink); }
+    .composer input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 16px; }
+    .composer input::placeholder { color: #a3a6aa; }
+    .composer .send { display: none; background: var(--action); color: #fff; }
+    .composer:focus-within .send { display: grid; }.composer:focus-within .mic { display: none; }
+    .bottom-nav { display: flex; align-items: center; justify-content: space-around; height: 58px; margin-top: 8px; padding: 3px; border: 1px solid #dfe1e3; border-radius: 999px; background: #fffffff0; box-shadow: 0 6px 24px #2934440d; }
+    .bottom-nav button { display: grid; place-items: center; flex: 1; height: 50px; border: 0; border-radius: 999px; background: transparent; color: #141719; }
+    .bottom-nav button.active { background: #eceeef; }
+    .bottom-nav svg { width: 24px; height: 24px; }
+    .profile-screen { background: #fff; }
+    .profile-header { padding: 10px 14px 18px; text-align: center; }
+    .profile-top { display: flex; justify-content: space-between; }
+    .profile-avatar { position: relative; width: max-content; margin: -9px auto 10px; }
+    .profile-avatar .mascot { outline: 8px solid #fbfbfb; }
+    .edit-badge { position: absolute; right: -9px; bottom: -10px; width: 35px; height: 35px; display: grid; place-items: center; border: 1px solid #dedfe1; border-radius: 50%; background: #fff; }
+    .edit-badge svg { width: 18px; height: 18px; }
+    .profile-header h2 { margin: 18px 0 1px; font-size: 28px; line-height: 1.2; }
+    .connection { margin: 5px 0 0; color: #2d3032; font-size: 16px; }
+    .connection b { color: var(--success); }
+    .profile-tabs { display: flex; align-items: center; margin: 0 14px; padding: 4px; border: 1px solid var(--line); border-radius: 999px; }
+    .profile-tabs button { display: grid; place-items: center; flex: 1; height: 42px; border: 0; border-radius: 999px; background: transparent; }
+    .profile-tabs button.active { background: var(--selected); }
+    .profile-tabs svg { width: 22px; height: 22px; }
+    .profile-body { flex: 1; min-height: 0; overflow: auto; padding: 20px 15px 30px; }
+    .profile-panel h3 { margin: 0 0 17px; font-size: 21px; }
+    .profile-panel h3:not(:first-child) { margin-top: 27px; }
+    .list-row { width: 100%; display: flex; align-items: flex-start; gap: 12px; padding: 12px 0 14px; border: 0; background: transparent; color: var(--ink); text-align: left; }
+    .list-row + .list-row { border-top: 1px solid #f1f2f3; }
+    .list-row .row-icon { display: grid; place-items: center; flex: none; width: 38px; height: 38px; border-radius: 50%; background: #e9eef2; color: #667b8f; }
+    .list-row .row-icon.purple { background: #e6e6ee; color: #727590; }
+    .list-row .row-icon svg { width: 20px; height: 20px; }
+    .row-copy { flex: 1; min-width: 0; }.row-copy strong { display: block; font-size: 16px; line-height: 1.35; }.row-copy small { display: block; margin-top: 4px; color: var(--muted); font-size: 13px; line-height: 1.35; }.row-copy em { display: block; margin-top: 5px; color: #a1a4a8; font-size: 12px; font-style: normal; }
+    .list-chevron { width: 17px; height: 17px; margin-top: 11px; color: #a5a8ab; }
+    .status-chip { align-self: center; padding: 5px 8px; border-radius: 99px; background: #fff0d9; color: #a26414; font-size: 11px; white-space: nowrap; }
+    .soft-action { display: block; width: 100%; min-height: 42px; margin: 15px 0 18px; border: 0; border-radius: 999px; background: #f2f3f4; font-size: 15px; font-weight: 700; }
+    .memory-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .memory-card { min-height: 132px; display: flex; flex-direction: column; justify-content: space-between; padding: 16px; border: 0; border-radius: 22px; color: #fff; text-align: left; background: linear-gradient(145deg, #a77785, #574852); }
+    .memory-card.blue { background: linear-gradient(145deg, #12b2c2, #16517d); }
+    .memory-card strong { font-size: 19px; }.memory-card small { display: block; margin-top: 3px; opacity: .85; font-size: 11px; }.memory-card span:last-child { font-size: 12px; opacity: .8; }
+    .browser-screen { padding: 55px 0 0; background: #17181a; color: #fff; }
+    .browser-heading { display: flex; justify-content: space-between; align-items: center; padding: 2px 16px 14px; text-align: center; }
+    .browser-heading .spacer { width: 42px; }
+    .browser-heading strong { display: block; font-size: 20px; }.browser-heading small { display: block; color: #a5a6a9; font-size: 13px; }
+    .browser-heading .round { width: 42px; height: 42px; min-width: 42px; color: #fff; border-color: #46484c; background: #333538; }
+    .remote { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-radius: 19px; background: #fff; color: #151719; }
+    .remote-tab { display: flex; align-items: center; gap: 8px; height: 31px; padding: 0 12px; background: #e9e9eb; font-size: 11px; }
+    .remote-tab span { padding: 5px 10px; border-radius: 9px 9px 0 0; background: #fff; }
+    .remote-bar { display: flex; align-items: center; gap: 8px; height: 42px; padding: 4px 10px; border-bottom: 1px solid #e4e6e7; color: #74777a; }
+    .remote-bar svg { width: 16px; height: 16px; }.remote-bar .url { flex: 1; overflow: hidden; padding: 7px 12px; border: 1px solid #dfe1e3; border-radius: 999px; color: #5c6064; font-size: 11px; white-space: nowrap; }
+    .remote-page { flex: 1; padding: 30px 17px; background: #fff; }
+    .remote-page .mark { margin-top: 15px; color: #4285f4; text-align: center; font-size: 38px; font-weight: 700; letter-spacing: -.07em; }
+    .remote-page .searchbar { height: 34px; margin: 15px 10px 28px; border: 1px solid #e2e5e8; border-radius: 999px; }
+    .remote-page .result { margin: 0 14px 24px; }.remote-page .result strong { color: #2570bd; font-size: 12px; }.remote-page .result small { display: block; color: #a2a5a8; font-size: 10px; }.remote-page .result i { display: block; width: 80%; height: 4px; margin-top: 6px; border-radius: 4px; background: #eaedf0; }
+    .browser-controls { display: flex; align-items: center; gap: 8px; padding: 12px 12px 18px; }
+    .browser-controls button { border: 0; background: #303235; color: #fff; }
+    .control-tools { flex: 1; display: flex; justify-content: space-around; align-items: center; height: 45px; border-radius: 999px; background: #303235; }
+    .control-tools button { display: grid; place-items: center; min-width: 42px; height: 42px; border-radius: 50%; }
+    .control-tools button[aria-pressed="true"] { background: var(--action); color: #0f2332; }
+    .control-tools svg { width: 21px; height: 21px; }
+    .control-status { padding: 0 16px 8px; color: #aab0b5; text-align: center; font-size: 11px; }
+    .cover { position: absolute; z-index: 50; inset: 0; background: #15191d54; }
+    .drawer { position: absolute; z-index: 51; top: 45px; bottom: 0; left: 0; width: 81%; display: flex; flex-direction: column; padding: 22px 16px 18px; background: #fff; box-shadow: 12px 0 40px #00000012; }
+    .drawer h2 { margin: 0 0 23px; font-size: 27px; }.drawer .drawer-label { margin: 0 8px 12px; color: #aaaeb0; font-size: 13px; font-weight: 700; }.drawer .drawer-hint { margin: 0 8px 17px; color: #777c80; font-size: 13px; }
+    .drawer-link { display: flex; align-items: center; gap: 14px; min-height: 46px; padding: 0 12px; border: 0; border-radius: 999px; background: transparent; text-align: left; font-size: 16px; font-weight: 700; }
+    .drawer-link.active { background: #f0f1f2; }.drawer-link svg { width: 23px; height: 23px; }
+    .side-chat { padding: 10px 9px; border: 0; background: transparent; text-align: left; font-size: 15px; }
+    .drawer-bottom { display: flex; gap: 8px; align-items: center; margin-top: auto; }
+    .drawer-bottom button { min-width: 44px; height: 44px; border: 1px solid var(--line); border-radius: 999px; background: #fff; }
+    .drawer-bottom .search { flex: 1; padding-left: 16px; color: #969a9d; text-align: left; }
+    .drawer-bottom input.search { min-width:0; height:44px; border:1px solid var(--line); border-radius:999px; background:#fff; }
+    .drawer-empty { margin:12px 9px; color:#868c91; font-size:13px; }
+    .sheet { position: absolute; z-index: 51; left: 0; right: 0; bottom: 0; max-height: calc(100% - 75px); overflow: auto; padding: 13px 18px 24px; border-radius: 32px 32px 0 0; background: #fff; box-shadow: 0 -8px 34px #00000012; }
+    .handle { width: 48px; height: 5px; margin: 0 auto 14px; border-radius: 10px; background: #c9cace; }
+    .sheet-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .sheet-top h2 { margin: 0; font-size: 20px; }.sheet-top .round { width: 41px; height: 41px; min-width: 41px; }
+    .progress-sheet .badge, .approval-sheet .badge, .artifact-sheet .badge { display: inline-block; margin: 9px 0 14px; padding: 7px 10px; border-radius: 9px; background: #17191b; color: #fff; font-size: 12px; font-weight: 750; }
+    .progress-sheet h3 { margin: 0 0 9px; font-size: 19px; }.sheet .summary { margin: 0; color: #5c6267; font-size: 14px; line-height: 1.5; }
+    .timeline { padding-top: 16px; border-top: 1px solid var(--line); }.timeline h4 { margin: 0 0 13px; font-size: 13px; letter-spacing: .08em; }
+    .step { display: flex; gap: 11px; position: relative; min-height: 63px; }
+    .step:not(:last-child):before { content: ""; position: absolute; top: 20px; left: 10px; bottom: 0; border-left: 1px dashed #d5d7d9; }
+    .step-icon { display: grid; place-items: center; flex: none; width: 21px; height: 21px; border: 2px solid #d2d5d7; border-radius: 50%; background: #fff; color: #fff; font-size: 13px; line-height: 1; }
+    .step.done .step-icon { border-color: var(--success); background: var(--success); }.step.running .step-icon { border-color: var(--working); }
+    .step strong { display: block; font-size: 14px; }.step p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .toast { position: absolute; z-index: 80; left: 20px; right: 20px; bottom: 98px; padding: 10px 14px; border-radius: 12px; background: #1f252adf; color: #fff; text-align: center; font-size: 12px; box-shadow: 0 8px 20px #0002; }
+    .display-caption { width: min(390px, 100%); margin: 0; color: #68757f; text-align: center; font-size: 12px; line-height: 1.5; }
+    @media (max-width: 800px) {
+      .review { display: block; }.review-rail { position: static; height: auto; padding: 18px 14px 12px; }.lead, .rail-note { display: none; }
+      .scene-list { display: flex; overflow: auto; gap: 5px; margin-top: 12px; scrollbar-width: none; }.scene-button { width: auto; min-width: max-content; min-height: 38px; padding: 7px 11px; font-size: 12px; }.scene-button svg { width: 17px; height: 17px; }
+      .display { justify-content: flex-start; gap: 9px; padding: 10px 0 0; }.display-head, .display-caption { display: none; }
+      .device { width: min(390px, 100%); height: calc(100dvh - 130px); min-height: 550px; border-width: 0; border-radius: 23px 23px 0 0; box-shadow: none; }
+    }
+    @media (max-width: 350px) { .message { font-size: 15px; }.chat-head { padding-left: 8px; padding-right: 8px; }.profile-body { padding-left: 12px; padding-right: 12px; } }
+    @media (prefers-reduced-motion: no-preference) { .scene-button, .bottom-nav button, .profile-tabs button { transition: background-color .16s ease; } }
+
+    .review-rail .phase { display:inline-block; margin: 0 0 12px; padding: 5px 9px; border-radius: 999px; background:#e7f3ff; color:#24688f; font-size:11px; font-weight:800; }
+    .review-rail .flow { margin-top: 19px; padding: 15px 17px; border-radius: 17px; background:#f5f7f8; color:#5f686f; font-size:12px; line-height:1.65; }
+    .review-rail .flow strong { display:block; color:#253441; margin-bottom:6px; }
+    .review-rail .flow ol { margin:7px 0 0; padding-left:18px; }
+    .review-rail .source-links { display:flex; gap:12px; margin-top:17px; flex-wrap:wrap; font-size:12px; }
+    .review-rail a { color:#176da9; }
+    .global-nav { position:absolute; z-index:20; left:11px; right:11px; bottom:16px; margin:0; }
+    .chat-footer { padding-bottom:86px; }
+    .chat-feed { padding-bottom:20px; }
+    .receipt-card { margin:0 0 18px; padding:14px 15px; border:1px solid #d9e8f2; border-radius:20px; background:#eef7ff; }
+    .receipt-card strong { display:block; margin-bottom:5px; font-size:15px; }
+    .receipt-card p { margin:0 0 10px; color:#4c6475; font-size:12px; line-height:1.5; }
+    .receipt-card .receipt-foot { display:flex; justify-content:space-between; align-items:center; gap:10px; font-size:11px; color:#678196; }
+    .receipt-card button { border:0; padding:7px 10px; border-radius:999px; background:#fff; color:#1874b8; font-size:12px; font-weight:750; white-space:nowrap; }
+    .receipt-card.done { border-color:#ccebd9; background:#eef9f2; }
+    .receipt-card.failed { border-color:#f1d8c5; background:#fff5ed; }
+    .receipt-card.failed p { color:#795943; }
+    .chat-result { display:flex; align-items:center; gap:12px; margin-bottom:18px; }
+    .chat-result svg { width:26px; height:26px; color:#2981bd; }
+    .chat-result span { flex:1; min-width:0; }
+    .chat-result small { display:block; margin-top:4px; color:#6f7c85; font-size:12px; }
+    .room-screen { background:var(--canvas); }
+    .room-head { flex:none; display:flex; align-items:center; gap:12px; padding:10px 15px 16px; }
+    .room-head h2 { flex:1; margin:0; font-size:24px; }
+    .room-body { flex:1; min-height:0; overflow:auto; padding:0 15px 108px; }
+    .room-kicker { margin:8px 2px 12px; color:#8b9299; font-size:12px; }
+    .feature-card { width:100%; margin-bottom:12px; padding:16px; border:1px solid #e6e9eb; border-radius:22px; background:#fff; color:var(--ink); text-align:left; }
+    .feature-card strong { display:block; font-size:16px; line-height:1.35; }
+    .feature-card p { margin:7px 0 0; color:#67727a; font-size:13px; line-height:1.5; }
+    .feature-card .meta { display:block; margin-top:12px; color:#85939c; font-size:11px; }
+    .feature-card .topline { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .mini-status { padding:5px 8px; border-radius:999px; background:#e5f6ec; color:#268353; font-size:11px; white-space:nowrap; }
+    .mini-status.working { background:#fff1dc; color:#996115; }
+    .mini-status.gray { background:#f0f1f2; color:#6a7379; }
+    .section-title { margin:20px 2px 11px; font-size:19px; }
+    .info-grid { display:grid; grid-template-columns:1fr 1fr; gap:9px; margin:12px 0; }
+    .info-grid > div { padding:12px; border-radius:15px; background:#f5f6f7; }
+    .info-grid small { display:block; color:#7d878d; font-size:11px; }
+    .info-grid strong { display:block; margin-top:5px; font-size:13px; line-height:1.4; }
+    .soft-link { min-height:44px; padding:0 15px; border:0; border-radius:999px; background:#e7f3ff; color:#1975b6; font-weight:750; }
+    .plain-link { min-height:44px; padding:0 15px; border:1px solid var(--line); border-radius:999px; background:#fff; color:#2a3d4a; font-weight:700; }
+    .button-row { display:flex; gap:8px; margin:13px 0; }
+    .button-row > button { flex:1; }
+    .sheet-field { display:block; margin:14px 0; }
+    .sheet-field span { display:block; margin-bottom:6px; font-size:12px; font-weight:750; color:#6a7379; }
+    .sheet-field select, .sheet-field input { width:100%; min-height:44px; padding:0 12px; border:1px solid var(--line); border-radius:12px; background:#f7f8f9; color:#1b242b; font-size:14px; }
+    .sheet-note { margin:10px 0 0; color:#6f7c85; font-size:12px; line-height:1.55; }
+    .attachment-sheet h3, .approval-sheet h3, .artifact-sheet h3 { margin:4px 0 11px; font-size:21px; }
+    .approval-sheet .submit-action { width:100%; min-height:47px; margin-top:15px; border:0; border-radius:999px; background:#a9d9fb; color:#142e42; font-weight:800; }
+    .approval-sheet .reject { background:#f2f3f4; color:#323c42; }
+    .progress-status-grid { display:grid; gap:8px; margin:15px 0; }
+    .progress-status-grid div { padding:11px 13px; border-radius:13px; background:#f3f5f6; }
+    .progress-status-grid small { display:block; margin-bottom:3px; color:#7d878d; font-size:11px; }
+    .progress-status-grid strong { font-size:13px; }
+    .progress-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:9px; }
+    .progress-actions button { min-height:42px; border:1px solid var(--line); border-radius:999px; background:#fff; font-size:12px; font-weight:700; }
+    .progress-actions button.primary { background:#e6f4ff; color:#1778b8; border-color:#e6f4ff; }
+    .profile-tabs button { display:flex; flex-direction:column; gap:2px; }
+    .profile-tabs button small { color:#67727a; font-size:10px; }
+    .profile-tabs svg { width:19px; height:19px; }
+    .profile-body .list-row { width:100%; }
+    .profile-body .memory-card { min-height:125px; }
+    .browser-screen .control-status { min-height:27px; }
+    .browser-actions-row { display:flex; gap:7px; padding:10px 13px 18px; }
+    .browser-actions-row button { min-height:44px; border:0; border-radius:999px; background:#303235; color:#fff; font-size:12px; font-weight:750; }
+    .browser-actions-row button:first-child { flex:1; }
+    .browser-actions-row button:last-child { padding:0 16px; }
+    .browser-screen[data-control="user"] .browser-heading strong { color:#fff; }
+    .browser-screen[data-control="user"] .control-status { color:#bde4ff; }
+    .settings-save { width:100%; min-height:46px; border:0; border-radius:999px; background:#b9deff; color:#123e5e; font-weight:800; }
+    .resource-warning { margin:10px 0 0; padding:10px 12px; border-radius:12px; background:#fff4e8; color:#82521b; font-size:12px; line-height:1.5; }
+    .library-item { display:flex; align-items:center; gap:12px; width:100%; min-height:68px; margin-bottom:9px; padding:12px; border:1px solid var(--line); border-radius:19px; background:#fff; color:var(--ink); text-align:left; }
+    .library-item > svg:first-child { width:38px; height:38px; padding:9px; border-radius:12px; background:#eaf5fd; color:#2587c7; }
+    .library-item > svg:last-child { width:18px; height:18px; margin-left:auto; color:#9aa4ab; }
+    .library-item span { min-width:0; }.library-item strong { display:block; font-size:15px; }.library-item small { display:block; margin-top:4px; color:#78858d; font-size:12px; }
+    .library-section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .library-edit { min-width:60px; min-height:44px; padding:0 12px; border:0; border-radius:999px; background:#e7f3ff; color:#1975b6; font-weight:750; }
+    .resource-edit-form { margin:12px 0; }
+    .browser-unavailable { flex:1; display:grid; place-content:center; padding:30px; border-radius:19px; background:#fff; color:#1b242b; text-align:center; }
+    .browser-unavailable strong { font-size:19px; }.browser-unavailable p { color:#67727a; font-size:13px; line-height:1.55; }
+    .preview-page { margin:16px 0; padding:20px 17px; min-height:190px; border:1px solid var(--line); border-radius:14px; background:#fafafa; }
+    .preview-page h4 { margin:0 0 13px; font-size:18px; }
+    .preview-page p { margin:0 0 10px; color:#58636a; font-size:13px; line-height:1.6; }
+    .progress-track { height:7px; margin:14px 0 4px; overflow:hidden; border-radius:99px; background:#ecedef; }
+    .progress-track span { display:block; width:67%; height:100%; border-radius:inherit; background:#77bdf1; }
+    @media(max-width:800px){ .review-rail .flow,.review-rail .source-links { display:none; } }
+  </style>
+</head>
+<body>
+  <svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 8h16M4 16h16"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M5 5l14 14M19 5L5 19"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5 8 8 0 0 1-3.4-.75L4 20l1.5-4.2A7.5 7.5 0 1 1 20 11.5Z"/></symbol>
+    <symbol id="i-news" viewBox="0 0 24 24"><rect x="6" y="4" width="14" height="16" rx="2"/><path d="M6 8H4v10a2 2 0 0 0 2 2M10 9h6M10 13h4"/></symbol>
+    <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M8 16c-1.6-1.2-2.5-2.8-2.5-5a6.5 6.5 0 1 1 13 0c0 2.2-.9 3.8-2.5 5l-.5 2H8.5L8 16Z"/><path d="M9 20h6"/></symbol>
+    <symbol id="i-checkbox" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><path d="m17 3 4 7h-8l4-7Z"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 4v16M4 12h16"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="m4 12 16-8-4 16-4-6-8-2Z"/><path d="m12 14 8-10"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 4 6 4 9s-1 6-4 9c-3-3-4-6-4-9s1-6 4-9Z"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 20 5v6c0 5-3.1 8.5-8 11-4.9-2.5-8-6-8-11V5l8-3Z"/><path d="m8.5 12 2.4 2.4 4.7-5"/></symbol>
+    <symbol id="i-desktop" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M9 21h6M12 18v3"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9M12 3v3M12 8v5l3 2M18 4l3 3"/></symbol>
+    <symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 16 0M7 13a5 5 0 0 1 10 0M10 14a2 2 0 0 1 4 0c0 3-.3 5.3-1.2 8M7 16c0 2-.3 3.6-1 5M17 16c0 1.7.4 3.4 1 5M10 18c-.1 1.1-.3 2.1-.6 3"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 16V3m0 0L8 7m4-4 4 4"/><path d="M7 10H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2h-2"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="m4 17 11-11 3 3L7 20l-4 1 1-4ZM15 6l2-2a2 2 0 0 1 3 3l-2 2"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M10 13h.01M14 13h.01M18 13h.01M7 16h10"/></symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M7 12V7a1.5 1.5 0 0 1 3 0v4-7a1.5 1.5 0 0 1 3 0v7-5a1.5 1.5 0 0 1 3 0v6-3a1.5 1.5 0 0 1 3 0v7c0 3-2 5-5 5h-3c-2 0-3-.8-4-2l-3-4a1.7 1.7 0 0 1 2.6-2Z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="7" width="12" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-note" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M6.5 17.5 5 19"/></symbol>
+  </svg>
+  <div class="review">
+    <aside class="review-rail" aria-label="融合后场景">
+      <span class="phase">目标态 · 尚未完成融合</span>
+      <p class="eyebrow">Morde · integrated iOS</p>
+      <p class="lead">底部保留聊天、动态、点子与资源库；长期目标从点子进入。常用电脑和工作区在资源库中指定。所有内容均为本地演示。</p>
+      <nav class="scene-list" aria-label="切换目标场景">
+        <button class="scene-button active" type="button" data-scene="chat-working"><svg><use href="#i-chat"/></svg>融合后主聊天</button>
+        <button class="scene-button" type="button" data-scene="chat-done"><svg><use href="#i-checkbox"/></svg>完成并保存结果</button>
+        <button class="scene-button" type="button" data-scene="chat-failed"><svg><use href="#i-shield"/></svg>保存未确认</button>
+        <button class="scene-button" type="button" data-scene="attach"><svg><use href="#i-plus"/></svg>添加附件</button>
+        <button class="scene-button" type="button" data-scene="progress"><svg><use href="#i-list"/></svg>会话进度</button>
+        <button class="scene-button" type="button" data-scene="approval"><svg><use href="#i-shield"/></svg>等待用户审批</button>
+        <button class="scene-button" type="button" data-scene="host"><svg><use href="#i-desktop"/></svg>云端电脑详情</button>
+        <button class="scene-button" type="button" data-scene="browser-ai"><svg><use href="#i-globe"/></svg>浏览器查看</button>
+        <button class="scene-button" type="button" data-scene="browser-user"><svg><use href="#i-desktop"/></svg>接管已确认</button>
+        <button class="scene-button" type="button" data-scene="profile"><svg><use href="#i-fingerprint"/></svg>助手与个人数据</button>
+        <button class="scene-button" type="button" data-scene="feed"><svg><use href="#i-news"/></svg>动态</button>
+        <button class="scene-button" type="button" data-scene="ideas"><svg><use href="#i-bulb"/></svg>点子</button>
+        <button class="scene-button" type="button" data-scene="goals"><svg><use href="#i-checkbox"/></svg>长期目标（二级页）</button>
+        <button class="scene-button" type="button" data-scene="library"><svg><use href="#i-grid"/></svg>资源库</button>
+        <button class="scene-button" type="button" data-scene="files"><svg><use href="#i-note"/></svg>工作区文件</button>
+        <button class="scene-button" type="button" data-scene="artifact"><svg><use href="#i-note"/></svg>文稿预览</button>
+        <button class="scene-button" type="button" data-scene="settings"><svg><use href="#i-settings"/></svg>账号与设置</button>
+        <button class="scene-button" type="button" data-scene="drawer"><svg><use href="#i-menu"/></svg>侧边会话</button>
+      </nav>
+      <div class="flow"><strong>用户看到会话，服务端记录每轮执行</strong><ol><li>用户在资源库中选择常用电脑与工作区，直接在会话里发消息。</li><li>服务端持久保存消息及执行记录，手机离线后继续处理。</li><li>账号专属云端 dsh 执行；获准时才操作所选 Host。</li><li>文件提交到 Workspace 后，在同一会话回报结果；PC 可接着聊。</li></ol></div>
+      <div class="source-links"><a href="../nanoMuse客户端与Morde服务端融合技术架构设计方案.md">融合技术架构</a><a href="./Morde-Meta-Muse手机端参考设计稿.html">Meta Muse 参考稿</a><a href="./Morde-当前iOS手机端源码还原预览.html">当前独立 iOS 预览</a></div>
+    </aside>
+    <main class="display">
+      <div class="display-head"><strong>Morde iOS · 融合后目标预览</strong><span>390 × 844 参考画布</span></div>
+      <div class="device" id="device" data-scene="chat" aria-label="融合后目标界面">
+        <div class="statusbar" aria-hidden="true"><span>9:41</span><span class="status-icons"><span class="signal"><i></i><i></i><i></i><i></i></span><span class="wifi"></span><span class="battery">86</span></span></div>
+        <section class="screen screen-chat" id="screen-chat" aria-label="主聊天">
+          <header class="chat-head">
+            <button class="round" type="button" data-scene="drawer" aria-label="打开侧边会话"><svg><use href="#i-menu"/></svg></button>
+            <button class="avatar-trigger" type="button" data-scene="profile" aria-label="打开助手详情"><span class="mascot" aria-hidden="true"></span><span class="avatar-name">Morde</span></button>
+          </header>
+          <div class="chat-feed" id="chat-feed">
+            <p class="dayline">今天 · 主会话 · 本地示例</p>
+            <div class="message user"><p>整理这周的 AI 资料，生成一份报告并保存好。</p></div>
+            <div class="receipt-card" data-chat-case="working"><strong>Muse 正在处理，可暂时离开</strong><p>这轮请求已在云端保存；手机离线后按现有授权继续。需要你决定时会暂停并通知。</p><div class="receipt-foot"><span>正在核对资料</span><button type="button" data-scene="progress">查看进度 →</button></div></div>
+            <div class="tool-card" data-chat-case="working">
+              <div class="tool-title"><span class="tool-icon"><svg><use href="#i-globe"/></svg></span><span>浏览器<small>正在核对公开网页</small></span></div>
+              <div class="tool-thumb" aria-hidden="true"><div class="mock-top"><b></b><b></b><b></b><span class="mock-search"></span></div><div class="mock-layout"><div class="mock-side"><i></i><i></i><i></i><i></i></div><div class="mock-main"><strong>Research sources</strong><div class="mock-lines"><i></i><i></i></div><div class="mock-lines"><i></i><i></i></div></div></div></div>
+              <button class="card-action" type="button" data-scene="browser">查看浏览过程</button>
+            </div>
+            <div class="message agent" data-chat-case="working"><p>我正在核对来源。报告保存并校验完成后，会在这里告诉你结果。</p></div>
+            <div class="receipt-card done" data-chat-case="done" hidden><strong>报告已保存并校验</strong><p>文件已提交到工作区并读回核对，完成状态以服务端保存结果为准。</p><div class="receipt-foot"><span>已完成 · 今天 09:46</span><span>可在资源库找到</span></div></div>
+            <div class="message agent" data-chat-case="done" hidden><p>这周的 AI 资料已整理成报告。我保留了来源链接和待核实的问题，后续可以在这段会话继续修改。</p></div>
+            <button class="feature-card chat-result" type="button" data-chat-case="done" data-artifact="本周 AI 资料报告" data-origin="主要聊天 · 产品研究工作区 · 已保存" data-preview="已整理本周 AI 资料，按来源列出摘要、发布日期与待核实的问题。" hidden><svg><use href="#i-note"/></svg><span><strong>本周 AI 资料报告</strong><small>工作区已保存 · 点击预览</small></span><svg><use href="#i-chevron"/></svg></button>
+            <div class="receipt-card failed" data-chat-case="failed" hidden><strong>报告保存未确认</strong><p>写入时连接中断，Muse 已暂停。核对工作区中的文件状态前，不会自动重做可能产生重复结果的操作。</p><div class="receipt-foot"><span>需要你处理</span><button type="button" data-scene="library">检查资源 →</button></div></div>
+            <div class="message agent" data-chat-case="failed" hidden><p>已核对的资料还在这段会话里。请先检查资源状态，再告诉我是否继续。</p></div>
+          </div>
+          <footer class="chat-footer">
+            <form class="composer" id="demo-form"><button type="button" data-scene="attach" aria-label="添加会话附件"><svg><use href="#i-plus"/></svg></button><label class="sr-only" for="message-input">发送消息</label><input id="message-input" autocomplete="off" placeholder="继续这段会话"><button class="mic" type="button" data-demo="语音入口仅演示，未调用设备麦克风。" aria-label="语音输入"><svg><use href="#i-mic"/></svg></button><button class="send" type="submit" aria-label="发送到当前会话"><svg><use href="#i-send"/></svg></button></form>
+          </footer>
+        </section>
+        <section class="screen profile-screen" id="screen-profile" aria-label="助手与个人数据" hidden>
+          <header class="profile-header">
+            <div class="profile-top"><button class="round" type="button" data-scene="chat" aria-label="返回聊天"><svg><use href="#i-close"/></svg></button><button class="round" type="button" data-demo="分享入口为界面示意。" aria-label="分享助手"><svg><use href="#i-share"/></svg></button></div>
+            <div class="profile-avatar"><span class="mascot large" aria-hidden="true"></span><button class="edit-badge" type="button" data-demo="头像编辑为界面示意。" aria-label="编辑头像"><svg><use href="#i-edit"/></svg></button></div>
+            <h2>Morde</h2><p class="connection"><b>●</b> 云端 Agent 在线</p>
+          </header>
+          <div class="profile-tabs" role="tablist" aria-label="助手分栏">
+            <button class="active" type="button" role="tab" aria-selected="true" data-profile-tab="activity" aria-label="活动"><svg><use href="#i-clock"/></svg><small>活动</small></button>
+            <button type="button" role="tab" aria-selected="false" data-profile-tab="approvals" aria-label="审批"><svg><use href="#i-shield"/></svg><small>审批</small></button>
+            <button type="button" role="tab" aria-selected="false" data-profile-tab="memory" aria-label="记忆"><svg><use href="#i-fingerprint"/></svg><small>记忆</small></button>
+          </div>
+          <div class="profile-body">
+            <section class="profile-panel" data-profile-panel="activity"><h3>最近活动</h3><button class="list-row" type="button" data-demo="历史活动详情由真实会话提供。"><span class="row-icon purple"><svg><use href="#i-globe"/></svg></span><span class="row-copy"><strong>已核对公开网页</strong><small>来自研究资料旁聊</small><em>昨天</em></span></button></section>
+            <section class="profile-panel" data-profile-panel="approvals" hidden><h3>审批历史</h3><button class="list-row" type="button" data-demo="审批历史详情由真实会话提供。"><span class="row-icon"><svg><use href="#i-shield"/></svg></span><span class="row-copy"><strong>读取公开网页</strong><small>已批准一次 · 关联原会话</small><em>昨天</em></span></button><p class="sheet-note">待处理的审批在动态中提醒，决定后在这里留痕。</p></section>
+            <section class="profile-panel" data-profile-panel="memory" hidden><h3>个人数据</h3><button class="soft-action" type="button" data-demo="记忆编辑仅为界面示意。">✎　管理记忆</button><div class="memory-grid"><button class="memory-card" type="button" data-demo="SOUL 内容为示意，不读取本机文件。"><span><strong>SOUL</strong><small>账号同步 · 需授权</small></span><span>PERSONA　♡</span></button><button class="memory-card blue" type="button" data-demo="记忆内容为示意，不读取本机文件。"><span><strong>记忆</strong><small>账号同步 · 有来源</small></span><span>MEMORY　□</span></button></div><p class="sheet-note">尚未选择迁入的本机历史继续留在设备，不会因登录自动上传。</p></section>
+          </div>
+        </section>
+        <section class="screen room-screen" id="screen-feed" aria-label="动态" hidden>
+          <header class="room-head"><button class="round" type="button" data-scene="drawer" aria-label="打开侧边栏"><svg><use href="#i-menu"/></svg></button><h2>动态</h2><span class="mascot small" aria-hidden="true"></span></header>
+          <div class="room-body">
+            <p class="room-kicker">Muse 写给你的短内容 · 本地示例</p>
+            <h3 class="section-title">今天的动态</h3>
+            <button class="feature-card" type="button" data-prompt="请和我一起核对这份 AI 资料的原文链接与发布日期，再决定是否保存进报告。"><strong>先核对来源，再保存报告</strong><p>整理 AI 资料时，记下原文链接和发布日期，以后回看更容易核实。</p><span class="meta">Muse 写给你 · 带入会话讨论 →</span></button>
+            <h3 class="section-title">需要你处理</h3>
+            <button class="feature-card" type="button" data-scene="approval"><span class="topline"><strong>有一项操作等待审批</strong><span class="mini-status working">待处理</span></span><p>查看操作目标与影响，再决定是否批准这一次。</p><span class="meta">研究资料旁聊 · 今天 →</span></button>
+          </div>
+        </section>
+        <section class="screen room-screen" id="screen-ideas" aria-label="点子" hidden>
+          <header class="room-head"><button class="round" type="button" data-scene="drawer" aria-label="打开侧边栏"><svg><use href="#i-menu"/></svg></button><h2>点子</h2><span class="mascot small" aria-hidden="true"></span></header>
+          <div class="room-body">
+            <p class="room-kicker">从现成灵感开始，可以带入会话或长期跟进 · 本地示例</p>
+            <h3 class="section-title">试试这些</h3>
+            <button class="feature-card" type="button" data-prompt="请帮我把这周的 AI 资料整理成报告，先和我确认范围，再核对来源并整理要点。"><strong>把资料整理成报告</strong><p>请 Muse 一起确定范围、核对来源并整理要点。</p><span class="meta">带入会话 →</span></button>
+            <h3 class="section-title">正在跟进</h3>
+            <button class="feature-card" type="button" data-scene="goals"><strong>持续学习 AI</strong><p>每周跟进资料与进展。</p><span class="meta">查看目标与定期回顾 →</span></button>
+          </div>
+        </section>
+        <section class="screen room-screen" id="screen-goals" aria-label="目标与例程" hidden>
+          <header class="room-head"><button class="round" type="button" data-scene="ideas" aria-label="返回点子"><svg><use href="#i-chevron" style="transform:rotate(180deg)"/></svg></button><h2>长期目标</h2><span class="mascot small" aria-hidden="true"></span></header>
+          <div class="room-body">
+            <p class="room-kicker">长期方向与日常会话分开记录 · 本地示例</p>
+            <h3 class="section-title">进行中</h3>
+            <button class="feature-card" type="button" data-demo="目标详情仅为界面示意。"><span class="topline"><strong>持续学习 AI</strong><span class="mini-status">进行中</span></span><p>每周看一份可信资料，写下要点并跟踪问题。</p><div class="progress-track" role="progressbar" aria-label="本周目标进度" aria-valuenow="2" aria-valuemin="0" aria-valuemax="3"><span></span></div><span class="meta">本周已完成 2 / 3 项</span></button>
+            <h3 class="section-title">接下来</h3>
+            <button class="feature-card" type="button" data-demo="例程编辑仅为界面示意。"><span class="topline"><strong>每周研究回顾</strong><span class="mini-status">已启用</span></span><p>周一 09:00 由服务端在关联会话中继续；手机关闭后仍按授权执行。</p><span class="meta">关联上方目标 · 时区 Asia/Shanghai</span></button>
+            <p class="sheet-note">已有本机目标和例程需由你选择后迁入；尚未迁入的内容仍留在设备。</p>
+          </div>
+        </section>
+        <section class="screen room-screen" id="screen-library" aria-label="资源库" hidden>
+          <header class="room-head"><button class="round" type="button" data-scene="drawer" aria-label="打开侧边栏"><svg><use href="#i-menu"/></svg></button><h2>资源库</h2><span class="mascot small" aria-hidden="true"></span></header>
+          <div class="room-body">
+            <div class="library-section-head"><h3 class="section-title">当前工作环境</h3><button class="library-edit" id="edit-resources" type="button" aria-controls="default-resources" aria-expanded="false">修改</button></div>
+            <button class="library-item" type="button" data-scene="library-browser"><svg><use href="#i-desktop"/></svg><span><strong id="current-host" aria-live="polite">云端电脑 A</strong><small id="current-host-hint">打开浏览器</small></span><svg><use href="#i-chevron"/></svg></button>
+            <button class="library-item" type="button" data-scene="files"><svg><use href="#i-grid"/></svg><span><strong id="current-workspace" aria-live="polite">产品研究</strong><small id="current-workspace-hint">打开工作区文件</small></span><svg><use href="#i-chevron"/></svg></button>
+            <form class="feature-card resource-edit-form" id="default-resources" hidden>
+              <label class="sheet-field"><span>常用云端电脑</span><select id="default-host" aria-label="常用云端电脑"><option value="a">云端电脑 A</option><option value="b">云端电脑 B（离线）</option><option value="none">不使用云端电脑</option></select></label>
+              <label class="sheet-field"><span>常用工作区</span><select id="default-workspace" aria-label="常用工作区"><option value="research">产品研究</option><option value="personal">个人资料</option><option value="none">不使用工作区</option></select></label>
+              <button class="settings-save" type="submit">保存选择</button>
+            </form>
+            <p class="resource-warning" id="resource-warning" role="status" hidden></p>
+            <p class="sheet-note">修改只影响之后发出的消息，正在处理的内容不变。本地示例刷新后重置。</p>
+            <h3 class="section-title">最近内容</h3>
+            <button class="library-item" type="button" data-chat-case="done" data-artifact="本周 AI 资料报告" data-origin="主要聊天 · 产品研究工作区 · 已保存" data-preview="已整理本周 AI 资料，按来源列出摘要、发布日期与待核实的问题。" hidden><svg><use href="#i-note"/></svg><span><strong>本周 AI 资料报告</strong><small>文稿 · 来自主要聊天 · 已校验</small></span><svg><use href="#i-chevron"/></svg></button>
+            <button class="library-item" type="button" data-artifact="产品调研摘要" data-origin="研究资料旁聊 · 已保存" data-preview="提炼了研究资料中的产品背景、主要发现和后续问题。"><svg><use href="#i-note"/></svg><span><strong>产品调研摘要</strong><small>文稿 · 来自研究资料旁聊</small></span><svg><use href="#i-chevron"/></svg></button>
+            <p class="resource-warning" data-chat-case="failed" hidden>本周 AI 资料报告保存未确认。请核对工作区文件状态，再回会话决定是否继续。</p>
+          </div>
+        </section>
+        <section class="screen room-screen" id="screen-files" aria-label="工作区文件管理" hidden>
+          <header class="room-head"><button class="round" type="button" data-scene="library" aria-label="返回资源库"><svg><use href="#i-chevron" style="transform:rotate(180deg)"/></svg></button><h2>工作区文件</h2></header>
+          <div class="room-body">
+            <p class="room-kicker" id="files-location">产品研究 · 根目录</p>
+            <div id="files-research"><h3 class="section-title">文件</h3>
+              <button class="library-item" type="button" data-artifact="资料来源清单" data-origin="产品研究工作区 · 云端文件" data-preview="列出资料的原始链接、发布时间与核对状态。"><svg><use href="#i-note"/></svg><span><strong>资料来源清单</strong><small>文稿 · 已保存</small></span><svg><use href="#i-chevron"/></svg></button>
+              <button class="library-item" type="button" data-chat-case="done" data-artifact="本周 AI 资料报告" data-origin="产品研究工作区 · 已校验" data-preview="已整理本周 AI 资料，按来源列出摘要、发布日期与待核实的问题。" hidden><svg><use href="#i-note"/></svg><span><strong>本周 AI 资料报告</strong><small>文稿 · 已校验</small></span><svg><use href="#i-chevron"/></svg></button>
+            </div>
+            <div class="feature-card" id="files-empty" hidden><strong id="files-empty-title">暂无文件</strong><p id="files-empty-note">这个工作区暂时没有云端文件。</p></div>
+            <p class="sheet-note">文件列表与预览均为本地示例，不读取或修改真实工作区。</p>
+          </div>
+        </section>
+        <section class="screen room-screen" id="screen-host" aria-label="云端电脑详情" hidden><header class="room-head"><button class="round" type="button" data-scene="library" aria-label="返回资源库"><svg><use href="#i-chevron" style="transform:rotate(180deg)"/></svg></button><h2>云端电脑 A</h2></header><div class="room-body"><p class="room-kicker">当前会话使用的电脑 · 后续默认选择不会改变这一轮</p><div class="feature-card"><span class="topline"><strong>电脑已连接</strong><span class="mini-status working" id="host-state">AI 使用中</span></span><div class="info-grid"><div><small>当前控制者</small><strong id="host-controller">AI · 正在浏览</strong></div><div><small>关联会话</small><strong>主要聊天</strong></div><div><small>工作区</small><strong>产品研究 · r12</strong></div><div><small>你的权限</small><strong id="host-action">可申请接管</strong></div></div><p id="host-handoff-note">接管前先等待这台电脑上的 AI 操作停止并确认；交还后重新核对页面和工作区版本。</p></div><div class="button-row"><button class="soft-link" type="button" data-scene="browser">查看远程画面</button><button class="plain-link" type="button" data-scene="chat">回到会话</button></div><p class="sheet-note">桌面、终端、文件和 VS Code 等能力以当前电脑授权及状态为准。</p></div></section>
+        <section class="screen room-screen" id="screen-settings" aria-label="账号与设置" hidden>
+          <header class="room-head"><button class="round" type="button" data-scene="settings-back" aria-label="返回上一页"><svg><use href="#i-close"/></svg></button><h2>设置</h2></header>
+          <div class="room-body">
+            <p class="room-kicker">Morde 账号 · 本地界面示意</p>
+            <div class="feature-card"><strong>已登录 Morde</strong><p>PC 和 iOS 使用同一账号、会话与资源权限。</p></div>
+            <h3 class="section-title">数据与隐私</h3>
+            <div class="feature-card"><strong>同步与记录</strong><p>账号数据通过 Morde 同步；本机历史由你选择后迁入。完整执行记录默认关闭，开启需单独同意。</p></div>
+            <h3 class="section-title">能力与连接</h3>
+            <button class="feature-card" type="button" data-demo="模型、连接器、技能和自有设备管理仅为入口示意。"><strong>模型、连接器与自有设备</strong><p>按会话选平台模型；管理已授权服务、技能和自己的设备。</p></button>
+            <button class="feature-card" type="button" data-demo="退出仅作界面示意，不会撤销授权或删除数据。"><strong>退出账号</strong><p>退出撤销本机安装授权，保留隔离的本机数据；删除另行确认。</p></button>
+          </div>
+        </section>
+        <section class="screen browser-screen" id="screen-browser" aria-label="浏览器远程查看与接管" data-control="ai" hidden><header class="browser-heading"><span class="spacer"></span><span><strong id="browser-title">AI 正在操作</strong><small id="browser-context">云端电脑 A · 主要聊天</small></span><button class="round" id="browser-back" type="button" data-scene="host" aria-label="返回电脑详情"><svg><use href="#i-close"/></svg></button></header><div class="remote" id="browser-remote" aria-label="模拟远程画面"><div class="remote-tab"><span>Morde Browser　×</span> ＋</div><div class="remote-bar"><svg><use href="#i-chevron"/></svg><svg><use href="#i-globe"/></svg><div class="url">example.org / research</div><svg><use href="#i-menu"/></svg></div><div class="remote-page"><div class="mark">Research</div><div class="searchbar"></div><div class="result"><strong>公开资料检索示意</strong><small>云端电脑画面 · 本地模拟</small><i></i><i></i></div></div></div><div class="browser-unavailable" id="browser-unavailable" hidden><strong id="browser-unavailable-title">电脑不可用</strong><p id="browser-unavailable-note">返回资源库选择可用的云端电脑。</p></div><p class="control-status" id="control-status">AI 控制 · 当前仅可观看</p><div class="browser-actions-row" id="browser-actions-row"><button type="button" id="control-button" data-demo="接管申请需等待服务端确认 AI 操作已停止；本地预览不会直接切换控制权。">申请接管电脑</button><button type="button" id="browser-stop" data-demo="停止当前处理需要服务端确认两侧执行均已停止。">停止当前处理</button></div></section>
+        <nav class="bottom-nav global-nav" id="global-nav" aria-label="手机端四栏导航">
+          <button class="active" type="button" data-scene="chat" aria-label="聊天"><svg><use href="#i-chat"/></svg></button>
+          <button type="button" data-scene="feed" aria-label="动态"><svg><use href="#i-news"/></svg></button>
+          <button type="button" data-scene="ideas" aria-label="点子"><svg><use href="#i-bulb"/></svg></button>
+          <button type="button" data-scene="library" aria-label="资源库"><svg><use href="#i-grid"/></svg></button>
+        </nav>
+        <div class="cover" id="drawer-cover" data-scene="close" hidden></div>
+        <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="侧边会话" hidden><h2>Morde</h2><p class="drawer-label">会话</p><button class="drawer-link active" type="button" data-scene="chat"><svg><use href="#i-chat"/></svg>主要聊天</button><button class="side-chat" type="button" data-demo="侧边会话切换仅作界面示意。">研究资料 · 旁聊</button><p class="drawer-empty" id="drawer-empty" hidden>没有找到会话</p><div class="drawer-bottom"><button type="button" data-scene="settings" aria-label="账号与设置"><svg><use href="#i-settings"/></svg></button><label class="sr-only" for="chat-search">搜索会话</label><input class="search" id="chat-search" type="search" placeholder="搜索会话" autocomplete="off"><button type="button" data-demo="新建旁聊仅作界面示意。" aria-label="新建旁聊"><svg><use href="#i-edit"/></svg></button></div></aside>
+        <div class="cover" id="sheet-cover" data-scene="close" hidden></div>
+        <section class="sheet attachment-sheet" id="attachment-sheet" role="dialog" aria-modal="true" aria-labelledby="attachment-title" hidden>
+          <div class="handle"></div><div class="sheet-top"><span class="status-chip">会话附件</span><button class="round" type="button" data-scene="close" aria-label="关闭附件选择"><svg><use href="#i-close"/></svg></button></div>
+          <h3 id="attachment-title">添加到这段会话</h3>
+          <p class="summary">选择本机文件后，它会附在输入框旁；你发送消息时才会上传选中的内容。</p>
+          <div class="feature-card"><strong>尚未选择文件</strong><p>只会使用你主动选择的文件，原有本机资料不会自动上传。</p><button class="soft-link" type="button" data-demo="文件选择仅演示；本稿不会读取或上传本机文件。">选择本机文件</button></div>
+          <p class="sheet-note">本地预览不会访问文件或发送消息。正式客户端会在当前会话中显示上传进度和失败原因。</p>
+        </section>
+        <section class="sheet progress-sheet" id="progress-sheet" role="dialog" aria-modal="true" aria-labelledby="progress-title" hidden>
+          <div class="handle"></div><div class="sheet-top"><span class="badge">处理中</span><button class="round" type="button" data-scene="close" aria-label="关闭会话进度"><svg><use href="#i-close"/></svg></button></div>
+          <h3 id="progress-title">这轮对话的进度</h3>
+          <p class="summary">Muse 已在云端保存你的请求。离开手机后会继续；更改资源选择不会移动正在进行的操作。</p>
+          <div class="progress-status-grid"><div><small>云端 Agent</small><strong>正在核对资料</strong></div><div><small>保存结果</small><strong>报告尚未提交；完成校验后会回到会话</strong></div></div>
+          <div class="timeline"><h4>处理过程</h4><div class="step done"><span class="step-icon">✓</span><div><strong>已收到你的消息</strong><p>请求与授权已在云端保存</p></div></div><div class="step done"><span class="step-icon">✓</span><div><strong>准备好可用的电脑</strong><p>目标与权限已核对</p></div></div><div class="step running"><span class="step-icon"></span><div><strong>核对网页来源</strong><p>Muse 正在继续处理</p></div></div><div class="step"><span class="step-icon"></span><div><strong>保存报告</strong><p>等待写入与读回校验</p></div></div></div>
+          <div class="progress-actions"><button class="primary" type="button" data-scene="host">查看电脑</button><button type="button" data-demo="停止当前处理需等待服务端确认 Agent 与电脑操作均已停止。">停止本轮处理</button></div>
+        </section>
+        <section class="sheet approval-sheet" id="approval-sheet" role="dialog" aria-modal="true" aria-labelledby="approval-title" hidden>
+          <div class="handle"></div><div class="sheet-top"><span class="badge">等待你处理</span><button class="round" type="button" data-scene="close" aria-label="关闭审批"><svg><use href="#i-close"/></svg></button></div>
+          <h3 id="approval-title">允许这次浏览器操作？</h3>
+          <p class="summary">相关会话的处理已暂停。你可以在 iOS 或已授权的 PC 上决定；同一请求只接受一次决定。</p>
+          <div class="progress-status-grid"><div><small>动作</small><strong>打开指定网页并读取公开资料</strong></div><div><small>目标</small><strong>云端电脑 A · 研究资料旁聊</strong></div><div><small>影响</small><strong>仅读取；不会代替你输入密码或提交表单</strong></div></div>
+          <button class="submit-action" type="button" data-demo="本地预览不会提交批准。真实操作需要审批版本条件提交。">批准一次</button><button class="submit-action reject" type="button" data-demo="本地预览不会提交拒绝。">拒绝</button>
+          <p class="sheet-note">关闭本页只收起审批，不会自动批准、拒绝或停止当前处理。</p>
+        </section>
+        <section class="sheet artifact-sheet" id="artifact-sheet" role="dialog" aria-modal="true" aria-labelledby="artifact-title" hidden>
+          <div class="handle"></div><div class="sheet-top"><span class="badge">已保存的文稿</span><button class="round" type="button" data-scene="close" aria-label="关闭文稿预览"><svg><use href="#i-close"/></svg></button></div>
+          <h3 id="artifact-title">产品调研摘要</h3>
+          <p class="summary" id="artifact-origin">研究资料旁聊 · 已保存</p>
+          <div class="preview-page"><h4 id="artifact-preview-title">产品调研摘要</h4><p id="artifact-preview-text">提炼了研究资料中的产品背景、主要发现和后续问题。</p><p>正式客户端在这里预览已保存的文件，并可返回来源会话继续修改。</p></div>
+          <button class="soft-link" type="button" data-demo="分享仅为界面示意，本地预览不会发送文件。">分享文稿</button>
+          <p class="sheet-note">本地示例内容；不会读取或分享真实文件。</p>
+        </section>
+        <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+      </div>
+      <p class="display-caption">本地目标态演示 · 无真实账号、API、文件访问与远程控制 · 不代表功能已实现</p>
+    </main>
+  </div>
+  <script>
+    // shortcut: 本地消息仅在预览页显示；实际发送须以服务端执行快照、授权和文件提交结果驱动。
+    const device = document.getElementById('device');
+    const screenIds = ['chat','profile','feed','ideas','goals','library','files','host','settings','browser'];
+    const overlayIds = ['drawer','attachment-sheet','progress-sheet','approval-sheet','artifact-sheet'];
+    const toast = document.getElementById('toast');
+    let toastTimer;
+    let activeScreen = 'chat';
+    let currentChatCase = 'working';
+    let hostControl = 'ai';
+    let settingsReturnScreen = 'chat';
+    let savedHost = 'a';
+    let savedWorkspace = 'research';
+    let browserSource = 'session';
+    function setChatCase(value) {
+      currentChatCase = value;
+      document.querySelectorAll('#device [data-chat-case]').forEach(item => { item.hidden = item.dataset.chatCase !== value; });
+    }
+    function showProfileTab(name) {
+      document.querySelectorAll('[data-profile-tab]').forEach(button => {
+        const active = button.dataset.profileTab === name;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+      });
+      document.querySelectorAll('[data-profile-panel]').forEach(panel => { panel.hidden = panel.dataset.profilePanel !== name; });
+    }
+    function showScene(scene) {
+      const overlay = {drawer:'drawer',attach:'attachment-sheet',progress:'progress-sheet',approval:'approval-sheet',artifact:'artifact-sheet'}[scene];
+      const chatCase = {'chat-working':'working','chat-done':'done','chat-failed':'failed'}[scene];
+      if (scene === 'settings' && activeScreen !== 'settings') settingsReturnScreen = activeScreen;
+      const base = (overlay || scene === 'close') ? activeScreen : chatCase ? 'chat' : ['browser-user','browser-ai','library-browser'].includes(scene) ? 'browser' : scene === 'settings-back' ? settingsReturnScreen : scene;
+      if (!screenIds.includes(base)) return;
+      if (chatCase) { setChatCase(chatCase); hostControl = 'ai'; }
+      if (scene === 'browser-user') hostControl = 'user';
+      if (scene === 'browser-ai') hostControl = 'ai';
+      if (scene === 'library-browser') browserSource = 'library';
+      if (['browser','browser-user','browser-ai'].includes(scene)) browserSource = 'session';
+      if (!overlay) activeScreen = base;
+      screenIds.forEach(id => { document.getElementById('screen-' + id).hidden = id !== base; });
+      overlayIds.forEach(id => { document.getElementById(id).hidden = id !== overlay; });
+      document.getElementById('drawer-cover').hidden = scene !== 'drawer';
+      document.getElementById('sheet-cover').hidden = !overlay || scene === 'drawer';
+      const navScene = base === 'host' || base === 'files' ? 'library' : base === 'goals' ? 'ideas' : base;
+      const nav = document.getElementById('global-nav');
+      nav.hidden = !['chat','feed','ideas','goals','library'].includes(base) || !!overlay;
+      nav.querySelectorAll('button').forEach(button => button.classList.toggle('active', button.dataset.scene === navScene));
+      document.querySelectorAll('.drawer-link').forEach(button => button.classList.toggle('active', button.dataset.scene === base));
+      let reviewScene = scene === 'close' || scene === 'settings-back' ? base : scene;
+      if (base === 'chat' && (scene === 'chat' || scene === 'close' || scene === 'settings-back')) reviewScene = `chat-${currentChatCase}`;
+      if (base === 'browser' && (scene === 'browser' || scene === 'close')) reviewScene = `browser-${hostControl}`;
+      document.querySelectorAll('.scene-button').forEach(button => button.classList.toggle('active', button.dataset.scene === reviewScene));
+      device.dataset.scene = base === 'browser' ? 'browser' : 'chat';
+      const browser = document.getElementById('screen-browser');
+      const userControls = hostControl === 'user';
+      const idle = currentChatCase !== 'working';
+      const hostState = document.getElementById('host-state');
+      hostState.textContent = userControls ? '你正在控制' : idle ? '空闲' : 'AI 使用中';
+      hostState.className = userControls ? 'mini-status' : idle ? 'mini-status gray' : 'mini-status working';
+      document.getElementById('host-controller').textContent = userControls ? '你 · 人工接管' : idle ? '无当前操作' : 'AI · 正在浏览';
+      document.getElementById('host-action').textContent = userControls ? '可交还控制' : '可申请接管';
+      document.getElementById('host-handoff-note').textContent = userControls ? '交还后会重新核对页面和工作区版本，确认后 AI 才能继续操作。' : '接管前先等待电脑上的 AI 操作停止并确认；交还后会重新核对页面和工作区版本。';
+      browser.dataset.control = userControls ? 'user' : 'ai';
+      document.getElementById('control-status').textContent = userControls ? '人工控制 · AI 已暂停这台电脑的输入（场景示意）' : idle ? '电脑空闲 · 当前可观看' : 'AI 控制 · 当前仅可观看';
+      const controlButton = document.getElementById('control-button');
+      controlButton.textContent = userControls ? '交还 AI' : '申请接管电脑';
+      controlButton.dataset.demo = userControls ? '交还控制需由服务端重新核对状态；本地预览不会直接切换。' : '接管申请需等待服务端核对电脑控制状态；本地预览不会直接切换控制权。';
+      const fromLibrary = browserSource === 'library';
+      const browserBack = document.getElementById('browser-back');
+      browserBack.dataset.scene = fromLibrary ? 'library' : 'host';
+      browserBack.setAttribute('aria-label', fromLibrary ? '返回资源库' : '返回电脑详情');
+      document.getElementById('browser-actions-row').hidden = fromLibrary;
+      document.getElementById('browser-context').textContent = fromLibrary ? (savedHost === 'a' ? '云端电脑 A · 常用电脑' : savedHost === 'b' ? '云端电脑 B · 常用电脑' : '未选择云端电脑') : '云端电脑 A · 主要聊天';
+      document.getElementById('browser-title').textContent = fromLibrary ? '浏览器' : userControls ? '由你掌控' : idle ? '电脑已空闲' : 'AI 正在操作';
+      const unavailable = fromLibrary && savedHost !== 'a';
+      document.getElementById('browser-remote').hidden = unavailable;
+      document.getElementById('browser-unavailable').hidden = !unavailable;
+      if (fromLibrary) {
+        document.getElementById('control-status').textContent = unavailable ? '返回资源库修改常用云端电脑' : '常用云端电脑 · 浏览器画面为本地示例';
+        document.getElementById('browser-unavailable-title').textContent = savedHost === 'b' ? '云端电脑 B 当前离线' : '尚未选择云端电脑';
+        document.getElementById('browser-unavailable-note').textContent = savedHost === 'b' ? '电脑恢复在线后可查看浏览器。' : '在资源库点击“修改”选择云端电脑。';
+      }
+      document.getElementById('files-location').textContent = savedWorkspace === 'research' ? '产品研究 · 根目录' : savedWorkspace === 'personal' ? '个人资料 · 根目录' : '未选择工作区';
+      document.getElementById('files-research').hidden = savedWorkspace !== 'research';
+      document.getElementById('files-empty').hidden = savedWorkspace === 'research';
+      document.getElementById('files-empty-title').textContent = savedWorkspace === 'none' ? '尚未选择工作区' : '暂无文件';
+      document.getElementById('files-empty-note').textContent = savedWorkspace === 'none' ? '返回资源库点击“修改”选择工作区。' : '个人资料工作区暂时没有文件。';
+      if (base === 'profile' && !overlay && scene !== 'close') showProfileTab('activity');
+    }
+    function showToast(message) {
+      toast.textContent = message;
+      toast.hidden = false;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { toast.hidden = true; }, 2800);
+    }
+    document.addEventListener('click', event => {
+      const tab = event.target.closest('[data-profile-tab]');
+      if (tab) { showProfileTab(tab.dataset.profileTab); return; }
+      const artifact = event.target.closest('[data-artifact]');
+      if (artifact) {
+        document.getElementById('artifact-title').textContent = artifact.dataset.artifact;
+        document.getElementById('artifact-preview-title').textContent = artifact.dataset.artifact;
+        document.getElementById('artifact-preview-text').textContent = artifact.dataset.preview;
+        document.getElementById('artifact-origin').textContent = artifact.dataset.origin;
+        showScene('artifact');
+        return;
+      }
+      const prompt = event.target.closest('[data-prompt]');
+      if (prompt) {
+        showScene('chat');
+        const input = document.getElementById('message-input');
+        if (input.value.trim()) { showToast('已保留未发送的草稿；请先处理后再带入新内容。'); return; }
+        input.value = prompt.dataset.prompt;
+        input.focus();
+        return;
+      }
+      const scene = event.target.closest('[data-scene]');
+      if (scene) { showScene(scene.dataset.scene); return; }
+      const demo = event.target.closest('[data-demo]');
+      if (demo) showToast(demo.dataset.demo);
+    });
+    document.getElementById('demo-form').addEventListener('submit', event => {
+      event.preventDefault();
+      const input = document.getElementById('message-input');
+      const message = input.value.trim();
+      if (!message) return;
+      const bubble = document.createElement('div');
+      bubble.className = 'message user';
+      const line = document.createElement('p');
+      line.textContent = message;
+      bubble.append(line);
+      const local = document.createElement('small');
+      local.textContent = '本地预览 · 未发送';
+      bubble.append(local);
+      const feed = document.getElementById('chat-feed');
+      feed.append(bubble);
+      feed.scrollTop = feed.scrollHeight;
+      input.value = '';
+      showToast('本地预览：消息只显示在当前会话，未发送到服务端。');
+    });
+    const resourceForm = document.getElementById('default-resources');
+    const resourceEdit = document.getElementById('edit-resources');
+    resourceEdit.addEventListener('click', () => {
+      resourceForm.hidden = !resourceForm.hidden;
+      resourceEdit.textContent = resourceForm.hidden ? '修改' : '取消';
+      resourceEdit.setAttribute('aria-expanded', String(!resourceForm.hidden));
+      document.getElementById('default-host').value = savedHost;
+      document.getElementById('default-workspace').value = savedWorkspace;
+    });
+    resourceForm.addEventListener('submit', event => {
+      event.preventDefault();
+      const hostSelect = document.getElementById('default-host');
+      const workspaceSelect = document.getElementById('default-workspace');
+      savedHost = hostSelect.value;
+      savedWorkspace = workspaceSelect.value;
+      document.getElementById('current-host').textContent = hostSelect.selectedOptions[0].textContent;
+      document.getElementById('current-workspace').textContent = workspaceSelect.selectedOptions[0].textContent;
+      document.getElementById('current-host-hint').textContent = savedHost === 'a' ? '打开浏览器' : savedHost === 'b' ? '离线 · 查看状态' : '未选择 · 查看说明';
+      document.getElementById('current-workspace-hint').textContent = savedWorkspace === 'none' ? '未选择 · 查看说明' : '打开工作区文件';
+      const warnings = [];
+      if (savedHost === 'b') warnings.push('云端电脑 B 当前离线；需要电脑操作时会等待，不会自动改用 A。');
+      if (savedHost === 'none') warnings.push('未选云端电脑；需要电脑操作时会请你选择。');
+      if (savedWorkspace === 'none') warnings.push('未选工作区；需要保存文件时会请你选择。');
+      const warning = document.getElementById('resource-warning');
+      warning.textContent = warnings.join(' ');
+      warning.hidden = warnings.length === 0;
+      resourceForm.hidden = true;
+      resourceEdit.textContent = '修改';
+      resourceEdit.setAttribute('aria-expanded', 'false');
+      showToast('资源选择已更新，仅影响之后发出的消息。');
+    });
+    // shortcut: 搜索只筛选本页的两条示例会话；接入真实会话列表时改用服务端索引。
+    document.getElementById('chat-search').addEventListener('input', event => {
+      const term = event.target.value.trim().toLocaleLowerCase();
+      const rows = [...document.querySelectorAll('#drawer .drawer-link, #drawer .side-chat')];
+      rows.forEach(row => { row.hidden = !row.textContent.toLocaleLowerCase().includes(term); });
+      document.getElementById('drawer-empty').hidden = rows.some(row => !row.hidden);
+    });
+    console.assert(screenIds.every(id => document.getElementById('screen-' + id)) && document.querySelectorAll('#global-nav button').length === 4, '目标态场景不完整');
+    console.assert(document.querySelectorAll('#screen-library select').length === 2 && !document.querySelector('#screen-settings select'), '资源选择应只在资源库');
+    console.assert(document.querySelectorAll('#screen-chat [data-chat-case="done"]').length === 3 && document.getElementById('artifact-sheet'), '结果场景不完整');
+    console.assert(document.querySelector('[data-prompt]'), '点子入口不完整');
+    showScene('chat-done'); showScene('library'); showScene('chat');
+    console.assert(currentChatCase === 'done' && !document.querySelector('#screen-chat [data-chat-case="done"]').hidden, '返回会话应保留结果');
+    showScene('library'); showScene('settings'); showScene('settings-back');
+    console.assert(activeScreen === 'library', '设置关闭应返回来源页面');
+    showScene('chat-done'); showScene('host');
+    console.assert(document.getElementById('host-state').textContent === '空闲', '会话完成后电脑不应显示 AI 使用中');
+    showScene('browser-user'); showScene('host'); showScene('browser');
+    console.assert(document.getElementById('browser-title').textContent === '由你掌控' && !document.getElementById('control-button').hasAttribute('data-scene'), '接管预览不应立即执行控制切换');
+    showScene('library'); showScene('library-browser');
+    console.assert(activeScreen === 'browser' && document.getElementById('browser-back').dataset.scene === 'library' && document.getElementById('browser-actions-row').hidden, '资源库电脑应直达浏览器并返回资源库');
+    showScene('files');
+    console.assert(activeScreen === 'files' && !document.getElementById('files-research').hidden, '工作区应直达文件管理页');
+    showScene('library');
+    console.assert(resourceForm.hidden, '未点击修改时应隐藏资源选择');
+    resourceEdit.click();
+    console.assert(!resourceForm.hidden && resourceEdit.getAttribute('aria-expanded') === 'true', '点击修改后应显示资源选择');
+    document.getElementById('default-host').value = 'b';
+    document.getElementById('default-workspace').value = 'personal';
+    resourceForm.dispatchEvent(new Event('submit', {cancelable:true}));
+    showScene('library-browser');
+    console.assert(document.getElementById('browser-remote').hidden && !document.getElementById('browser-unavailable').hidden, '离线电脑不应显示电脑 A 画面');
+    showScene('files');
+    console.assert(document.getElementById('files-research').hidden && !document.getElementById('files-empty').hidden, '个人工作区不应显示产品研究文件');
+    showScene('library');
+    resourceEdit.click();
+    document.getElementById('default-host').value = 'a';
+    document.getElementById('default-workspace').value = 'research';
+    resourceForm.dispatchEvent(new Event('submit', {cancelable:true}));
+    toast.hidden = true;
+    const searchCheck = document.getElementById('chat-search');
+    searchCheck.value = '研究'; searchCheck.dispatchEvent(new Event('input'));
+    console.assert(document.querySelector('#drawer .drawer-link').hidden && !document.querySelector('#drawer .side-chat').hidden, '侧栏搜索应筛选会话');
+    searchCheck.value = ''; searchCheck.dispatchEvent(new Event('input'));
+    showScene('ideas'); showScene('drawer');
+    console.assert(!document.getElementById('screen-ideas').hidden && !document.getElementById('drawer').hidden, '侧栏应保留原页面');
+    showScene('close'); showScene('chat-working');
+  </script>
+</body>
+</html>

@@ -402,7 +402,20 @@ function UserProjects() {
 
   const stopProjectTask = (task: ProjectTask) => {
     if (!project || task.initiator_id !== user?.id || task.conversation_id !== selectedProjectConversation?.id) return;
-    const body: components['schemas']['TaskActionRequest'] = { action: 'cancel', expected_status: task.status };
+    const hasCurrentRevision = task.current_revision !== undefined;
+    const hasDesiredRevision = task.desired_revision !== undefined;
+    if (hasCurrentRevision !== hasDesiredRevision ||
+      (hasCurrentRevision && (!Number.isSafeInteger(task.current_revision) || task.current_revision! < 0 ||
+        !Number.isSafeInteger(task.desired_revision) || task.desired_revision! < 0))) {
+      setNotice({ kind: 'error', message: '任务修订信息不完整或无效，请刷新状态后重试。' });
+      return;
+    }
+    const body: components['schemas']['TaskActionRequest'] = {
+      action: 'cancel', expected_status: task.status,
+      ...(hasCurrentRevision && hasDesiredRevision ? {
+        expected_current_revision: task.current_revision!, expected_desired_revision: task.desired_revision!,
+      } : {}),
+    };
     const scope = `stop-project-task:${project.id}:${task.id}`;
     const key = requestKeyFor(scope, body);
     void runAction({

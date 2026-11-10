@@ -4,6 +4,8 @@ import { Link, useLocation, useNavigate } from 'react-router';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { ConversationDeliveryStatus } from '../app/api';
+import { readK2TaskProjection } from '../app/k2-task-projection';
+import type { K2ResultReview, K2TaskDependency } from '../app/k2-task-projection';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import { useMessageOutbox } from '../app/use-message-outbox';
 import { deliveryStatusText, routingFailureText, routingStatusText } from '../app/message-status';
@@ -147,6 +149,14 @@ export function mergeTaskAssistantMessage(items: AssistantDisplayMessage[], task
   const messages: AssistantDisplayMessage[] = items.map((message) => message.output_status
     ? { ...message, snapshotStatus: message.output_status } : message);
   const snapshot = task?.assistant_message;
+  const k2Read = readK2TaskProjection(task);
+  const currentK2Snapshot = k2Read.kind !== 'available' || (task?.current_revision !== undefined &&
+    snapshot?.task_revision === task.current_revision);
+  // K2 publication is represented by its durable conversation message; a Task snapshot is never a fallback final reply.
+  if (k2Read.kind === 'invalid' || (k2Read.kind === 'available' && (snapshot?.status !== 'streaming'
+    || !task || terminalTaskStatuses.has(task.status) || !currentK2Snapshot))) {
+    return sortAssistantMessages(messages);
+  }
   if ((task?.result_message_pending || task?.result_message_published) &&
     snapshot?.status !== 'streaming' && snapshot?.status !== 'interrupted') {
     return sortAssistantMessages(messages);
@@ -323,6 +333,26 @@ function stepTitle(step: Task['steps'][number]): string {
 const stepStatus: Record<Task['steps'][number]['status'], string> = {
   queued: '等待中', running: '进行中', waiting_user: '等待确认', succeeded: '已完成', failed: '失败', unknown: '结果待确认',
 };
+
+const taskStatusLabel: Record<Task['status'], string> = {
+  queued: '排队中', running: '运行中', waiting_user: '等待用户', pausing: '正在暂停', paused: '已暂停',
+  cancelling: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止',
+};
+
+function dependencyStatusText(dependency: K2TaskDependency): string {
+  return dependency.satisfied
+    ? `已满足：任务 ${dependency.task_id} 修订 ${dependency.required_revision}（${taskStatusLabel[dependency.task_status]}）`
+    : `等待任务 ${dependency.task_id} 修订 ${dependency.required_revision}（当前状态：${taskStatusLabel[dependency.task_status]}）`;
+}
+
+function resultReviewStatusText(review: K2ResultReview, replyVisible: boolean): string {
+  switch (review.state) {
+    case 'pending': return '原始结果已保存，等待主助手整理。';
+    case 'processing': return '主助手正在整理原始结果。';
+    case 'published': return replyVisible ? '最终回复已同步到会话。' : '最终回复已发布，正在从会话历史补取。';
+    case 'failed': return '结果整理失败；原始任务结果仍保留，尚未发布最终回复。';
+  }
+}
 
 type TaskFeedState = 'connected' | 'disconnected' | 'resyncing';
 
@@ -770,8 +800,29 @@ export function Assistant() {
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
   const taskControl = useMutation({
-    mutationFn: (request: { taskID: string; action: 'pause' | 'resume' | 'cancel'; expectedStatus: Task['status']; actionScope: string; key: string }) =>
-      portalApi.taskAction(request.taskID, { action: request.action, expected_status: request.expectedStatus }, request.key),
+    mutationFn: async (request: { taskID: string; action: 'pause' | 'resume' | 'cancel'; expectedStatus: Task['status'];
+      expectedCurrentRevision: number | null; expectedDesiredRevision: number | null; actionScope: string; key: string }) => {
+      const hasCurrentRevision = request.expectedCurrentRevision !== null;
+      const hasDesiredRevision = request.expectedDesiredRevision !== null;
+      if (hasCurrentRevision !== hasDesiredRevision ||
+        (hasCurrentRevision && (!Number.isSafeInteger(request.expectedCurrentRevision) || request.expectedCurrentRevision! < 0 ||
+          !Number.isSafeInteger(request.expectedDesiredRevision) || request.expectedDesiredRevision! < 0))) {
+        throw new Error('任务修订信息不完整或无效，请刷新状态后重试。');
+      }
+      const latest = await portalApi.task(request.taskID);
+      if (latest.status !== request.expectedStatus || (latest.current_revision ?? null) !== request.expectedCurrentRevision
+        || (latest.desired_revision ?? null) !== request.expectedDesiredRevision) {
+        throw new ApiError({ message: '任务状态或修订已变化', code: 'conflict', status: 409 });
+      }
+      return portalApi.taskAction(request.taskID, {
+        action: request.action,
+        expected_status: request.expectedStatus,
+        ...(hasCurrentRevision && hasDesiredRevision ? {
+          expected_current_revision: request.expectedCurrentRevision!,
+          expected_desired_revision: request.expectedDesiredRevision!,
+        } : {}),
+      }, request.key);
+    },
     onSuccess: async (response, request) => {
       clearTaskActionKey(request.actionScope, request.key);
       await client.invalidateQueries({ queryKey: ['task', request.taskID] });
@@ -924,8 +975,12 @@ export function Assistant() {
   const submitTaskControl = (action: 'pause' | 'resume' | 'cancel') => {
     if (!activeTask) return;
     const actionScope = `${action}:${activeTask.id}`;
-    const fingerprint = JSON.stringify({ action, expected_status: activeTask.status });
-    taskControl.mutate({ taskID: activeTask.id, action, expectedStatus: activeTask.status, actionScope,
+    const expectedCurrentRevision = activeTask.current_revision ?? null;
+    const expectedDesiredRevision = activeTask.desired_revision ?? null;
+    const fingerprint = JSON.stringify({ action, expected_status: activeTask.status,
+      current_revision: expectedCurrentRevision, desired_revision: expectedDesiredRevision });
+    taskControl.mutate({ taskID: activeTask.id, action, expectedStatus: activeTask.status,
+      expectedCurrentRevision, expectedDesiredRevision, actionScope,
       key: taskActionKey(actionScope, fingerprint) });
   };
 
@@ -1007,6 +1062,9 @@ export function Assistant() {
     </article>;
   };
   const renderTaskActivity = (task: Task) => {
+    const k2Read = readK2TaskProjection(task);
+    const k2 = k2Read.kind === 'available' ? k2Read.projection : null;
+    const review = k2?.result_review ?? null;
     const busy = !terminalTaskStatuses.has(task.status);
     const currentStep = task.steps.find((step) => step.id === task.current_step);
     const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
@@ -1015,6 +1073,12 @@ export function Assistant() {
     const hasReply = displayMessages.some((message) => message.role === 'assistant' && (message.task_id === task.id ||
       message.sources?.some((source) => source.task_id === task.id && source.task_revision === task.assistant_message?.task_revision &&
         source.event_sequence === task.assistant_message?.result_event_sequence)));
+    const publishedReplyVisible = Boolean(review?.state === 'published' && review.source_task_id === task.id && review.reply_message_id &&
+      displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
+        message.sources?.some((source) => source.task_id === review.source_task_id &&
+          source.task_revision === review.source_task_revision && source.event_sequence === review.source_event_sequence)));
+    const canUseLegacyResultAsReply = k2Read.kind === 'legacy';
+    const hasK2Activity = k2Read.kind === 'invalid' || Boolean(k2 && (k2.dependencies.length || k2.child_jobs.length || review || task.result));
     const taskHost = task.host_id ? hostItems.find((host) => host.id === task.host_id) : undefined;
     const browserHandoffRequested = task.waiting_reason === 'clarification' && Boolean(task.clarification_request) && task.steps.some((step) =>
       step.kind === 'tool' && (step.title === 'Run cloud dsh tool: browser_prepare_user_handoff' ||
@@ -1022,13 +1086,18 @@ export function Assistant() {
     const answer = clarificationAnswers[task.id] ?? '';
     const hasPanel = busy || task.status === 'failed' || task.status === 'cancelled' || visibleSteps.length > 0 ||
       task.artifacts.length > 0 || task.result_message_pending || (task.result_message_published && !hasReply) ||
-      Boolean(task.host_id || task.pending_request || task.clarification_request);
+      Boolean(task.host_id || task.pending_request || task.clarification_request || hasK2Activity);
     return <Fragment key={`activity:${task.id}`}>
-      {task.status === 'completed' && task.result && !hasReply && !task.result_message_pending && !task.result_message_published && <article className="chat-message chat-message-assistant">
+      {task.status === 'completed' && task.result && canUseLegacyResultAsReply && !hasReply && !task.result_message_pending && !task.result_message_published && <article className="chat-message chat-message-assistant">
         <strong className="chat-message-author">AI 助手</strong><p>{task.result}</p>
         <AssistantReplySpeech text={task.result} sessionKey={`${conversationID}:${task.id}`} />
       </article>}
       {hasPanel && <section className="task-activity" aria-label={`任务 ${task.id} 的工作过程`}>
+        <header className="task-activity-heading">
+          <strong>任务 {task.id}</strong>
+          <span>服务端状态：{taskStatusLabel[task.status]}{task.current_revision !== undefined || task.desired_revision !== undefined
+            ? ` · 修订 ${task.current_revision ?? '—'} / ${task.desired_revision ?? '—'}` : ''}</span>
+        </header>
         {(busy || task.status === 'failed' || task.status === 'cancelled' || task.result_message_pending ||
           (task.result_message_published && !hasReply) || (!hasReply && !task.result)) && <div className="assistant-progress" role={task.status === 'failed' ? 'alert' : 'status'}>
           <span>{taskStatusText(task, cloudTasksAvailable)}</span>
@@ -1053,6 +1122,33 @@ export function Assistant() {
             {step.summary.trim() && <small className="task-activity-summary">{step.summary}</small>}
           </span></li>)}
         </ol></details>}
+        {k2Read.kind === 'invalid' && <div className="notice notice-warning" role="alert">
+          并发任务投影格式无效；当前只显示服务端 Task 状态，不会把未核验的结果当作最终回复。
+          {task.result && <details><summary>查看未核验的 Task 原始结果</summary><ChatMarkdown content={task.result} /></details>}
+        </div>}
+        {k2 && k2.dependencies.length > 0 && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的依赖`}>
+          <h4>依赖任务</h4>
+          <ul>{k2.dependencies.map((dependency) => <li key={`${dependency.task_id}:${dependency.required_revision}`}>
+            <span>{dependencyStatusText(dependency)}</span>
+          </li>)}</ul>
+        </section>}
+        {k2 && k2.child_jobs.length > 0 && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的子任务`}>
+          <h4>子任务进度</h4>
+          <ul>{k2.child_jobs.map((job) => <li key={job.job_id}>
+            <span><strong>{job.title || job.job_id}</strong><small>{stepStatus[job.status]}</small></span>
+            <small>子会话 {job.job_id} · 步骤 {job.task_step_id} · 修订 {job.task_revision}</small>
+          </li>)}</ul>
+        </section>}
+        {review && <section className="task-activity-k2 task-activity-review" aria-label={`任务 ${task.id} 的结果整理`}>
+          <h4>主助手结果整理</h4>
+          <p role={review.state === 'failed' ? 'alert' : 'status'}>{resultReviewStatusText(review, publishedReplyVisible)}</p>
+          <small>来源任务 {review.source_task_id} · 修订 {review.source_task_revision} · 结果事件 {review.source_event_sequence}</small>
+          {review.reply_message_id && <small>最终回复消息 {review.reply_message_id}</small>}
+        </section>}
+        {k2 && task.result && <section className="task-activity-k2" aria-label={`任务 ${task.id} 的原始结果`}>
+          <h4>Task 原始结果</h4>
+          <details><summary>查看 Task 原始结果（不是最终回复）</summary><ChatMarkdown content={task.result} /></details>
+        </section>}
         {task.artifacts.map((artifact) => <p className="task-activity-artifact" key={artifact.id}>成果：{artifact.label}</p>)}
         {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
           {taskHost?.state === 'running'

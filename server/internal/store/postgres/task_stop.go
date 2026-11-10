@@ -24,9 +24,12 @@ const (
 // RequestTaskAction atomically fences the current task worker and persists the
 // user's pause, resume, or cancel request. Pause and cancel remain transitional
 // until a stop worker has settled every runtime operation and safe_after passes.
-func (s *Store) RequestTaskAction(ctx context.Context, record app.IdempotencyRecord, taskID string, action task.Action, expectedStatus task.Status, requestID string) (app.TaskActionResult, error) {
+func (s *Store) RequestTaskAction(ctx context.Context, record app.IdempotencyRecord, taskID string, action task.Action, expectedStatus task.Status, revisionFence *app.TaskActionRevisionFence, requestID string) (app.TaskActionResult, error) {
 	if !domain.ValidTaskID(taskID) || !domain.ValidTaskActionID(requestID) || !validRequestedAction(action, expectedStatus) {
 		return app.TaskActionResult{}, domain.InvalidArgument("action", "task action fields are invalid")
+	}
+	if revisionFence != nil && (revisionFence.CurrentRevision < 0 || revisionFence.DesiredRevision < 0) {
+		return app.TaskActionResult{}, domain.InvalidArgument("revision", "expected task revisions must be non-negative")
 	}
 	if err := validateIdempotency(record); err != nil {
 		return app.TaskActionResult{}, err
@@ -106,6 +109,13 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
 			}
 			requestIDToUse = stored.ResourceID
 		} else {
+			// The task row is locked by taskOwnerIDForActor above. Compare both
+			// observed revisions before reserving idempotency or writing any action
+			// state so stale clients receive a side-effect-free conflict.
+			if revisionFence != nil &&
+				(currentRevision != revisionFence.CurrentRevision || desiredRevision != revisionFence.DesiredRevision) {
+				return domain.NewError(domain.CodeConflict, "task revision does not match expected revisions")
+			}
 			if action == task.ActionResume && currentRevision != desiredRevision {
 				return domain.NewError(domain.CodeConflict, "task has an unapplied revision")
 			}

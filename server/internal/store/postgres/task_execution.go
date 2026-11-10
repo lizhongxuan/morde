@@ -1368,6 +1368,31 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	var authorizationDenied bool
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		projectWorkspaceFence, err := lockProjectTaskWorkspaceFence(ctx, tx, progress.TaskID, false)
+		if err != nil && projectWorkspaceFence.projectID != "" &&
+			(domain.CodeOf(err) == domain.CodeNotFound || domain.CodeOf(err) == domain.CodeForbidden) {
+			// Serialize against a concurrent re-invite before deciding that the
+			// project Task has permanently lost its execution authorization.
+			var projectID string
+			lockErr := tx.QueryRow(ctx, `SELECT id FROM projects WHERE id=$1 FOR SHARE`, projectWorkspaceFence.projectID).Scan(&projectID)
+			if lockErr != nil && !errors.Is(lockErr, pgx.ErrNoRows) {
+				return fmt.Errorf("lock project before cancelling unauthorized task: %w", lockErr)
+			}
+			if lockErr == nil {
+				projectWorkspaceFence, err = lockProjectTaskWorkspaceFence(ctx, tx, progress.TaskID, false)
+			}
+			if errors.Is(lockErr, pgx.ErrNoRows) || err != nil &&
+				(domain.CodeOf(err) == domain.CodeNotFound || domain.CodeOf(err) == domain.CodeForbidden) {
+				var ownerID string
+				if err := tx.QueryRow(ctx, `SELECT owner_id FROM tasks WHERE id=$1`, progress.TaskID).Scan(&ownerID); err != nil {
+					return fmt.Errorf("read owner for unauthorized project Task: %w", err)
+				}
+				if err := requestTaskCancellationForAuthorization(ctx, tx, progress.TaskID, ownerID); err != nil {
+					return err
+				}
+				authorizationDenied = true
+				return nil
+			}
+		}
 		if err != nil {
 			return err
 		}

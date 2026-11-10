@@ -282,6 +282,52 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 	}
 }
 
+func TestPostgresAccountRuntimeExplicitStopAcceptsProofBeforeLeaseExpiry(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	conversationID := runtimeTestConversation(t, store, owner.ID)
+	runtimeService, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, 32)
+	nonce[0] = 62
+	runtime, replayed, err := runtimeService.Start(ctx, app.AccountAgentRuntimeStart{OwnerID: owner.ID, ConversationID: conversationID,
+		RuntimeID: "runtime-explicit-stop", LeaseOwner: "portal-explicit-stop", SupervisorNonce: nonce,
+		MaxConcurrentTasks: 2, LeaseDuration: 30 * time.Second})
+	if err != nil || replayed {
+		t.Fatalf("start account Runtime: runtime=%+v replayed=%t err=%v", runtime, replayed, err)
+	}
+	if _, err := runtimeService.Ready(ctx, runtime.Fence); err != nil {
+		t.Fatalf("ready account Runtime: %v", err)
+	}
+	identity, err := runtimeService.StopIdentity(ctx, conversationID)
+	if err != nil {
+		t.Fatalf("read Runtime stop identity: %v", err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := signedAccountRuntimeStopProof(t, identity, privateKey)
+	authenticator, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := runtimeService.RequestStop(ctx, runtime.Fence)
+	if err != nil || stopping.State != app.AccountAgentRuntimeStopping || !stopping.LeaseExpiresAt.After(time.Now()) {
+		t.Fatalf("request explicit Runtime stop: runtime=%+v err=%v", stopping, err)
+	}
+	if replayed, err := runtimeService.ConfirmGuardianStopped(ctx, proof, authenticator); err != nil || replayed {
+		t.Fatalf("confirm explicit Runtime stop while its lease is active: replayed=%t err=%v", replayed, err)
+	}
+	loaded, found, err := runtimeService.Get(ctx, conversationID)
+	if err != nil || !found || loaded.State != app.AccountAgentRuntimeStopped {
+		t.Fatalf("explicitly stopped Runtime was not persisted: runtime=%+v found=%t err=%v", loaded, found, err)
+	}
+}
+
 func TestPostgresAbortedAccountRuntimeStartRequiresExpiredLeaseAndNoWork(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()

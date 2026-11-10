@@ -9,15 +9,29 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-// RequestAction applies a versioned, idempotent pause, resume, or cancel
-// request. The store compares the task's current status atomically so a stale
-// client cannot undo a newer transition.
+// RequestAction applies a legacy status-fenced, idempotent pause, resume, or
+// cancel request.
 func (s *TaskService) RequestAction(
 	ctx context.Context,
 	principal identity.Principal,
 	taskID string,
 	action task.Action,
 	expectedStatus task.Status,
+	idempotencyKey string,
+) (TaskActionResult, error) {
+	return s.RequestActionWithRevisionFence(ctx, principal, taskID, action, expectedStatus, nil, idempotencyKey)
+}
+
+// RequestActionWithRevisionFence applies an idempotent task action optionally
+// fenced to the exact task revision pair observed by the caller. The store
+// compares the status and supplied revisions atomically before mutation.
+func (s *TaskService) RequestActionWithRevisionFence(
+	ctx context.Context,
+	principal identity.Principal,
+	taskID string,
+	action task.Action,
+	expectedStatus task.Status,
+	revisionFence *TaskActionRevisionFence,
 	idempotencyKey string,
 ) (TaskActionResult, error) {
 	if err := validateTaskPrincipal(principal); err != nil {
@@ -28,6 +42,9 @@ func (s *TaskService) RequestAction(
 	}
 	if !validTaskActionExpectedStatus(action, expectedStatus) {
 		return TaskActionResult{}, domain.InvalidArgument("action", "action or expected_status is invalid")
+	}
+	if revisionFence != nil && (revisionFence.CurrentRevision < 0 || revisionFence.DesiredRevision < 0) {
+		return TaskActionResult{}, domain.InvalidArgument("revision", "expected task revisions must be non-negative")
 	}
 	if err := validateIdempotencyKey(idempotencyKey); err != nil {
 		return TaskActionResult{}, err
@@ -47,14 +64,15 @@ func (s *TaskService) RequestAction(
 		return TaskActionResult{}, fmt.Errorf("generate task action id: %w", err)
 	}
 	request, err := idempotencyRecord(principal.UserID, "task.action."+string(action), idempotencyKey, struct {
-		Action         task.Action `json:"action"`
-		TaskID         string      `json:"task_id"`
-		ExpectedStatus task.Status `json:"expected_status"`
-	}{action, taskID, expectedStatus}, requestID, taskID)
+		Action         task.Action              `json:"action"`
+		TaskID         string                   `json:"task_id"`
+		ExpectedStatus task.Status              `json:"expected_status"`
+		RevisionFence  *TaskActionRevisionFence `json:"revision_fence,omitempty"`
+	}{action, taskID, expectedStatus, revisionFence}, requestID, taskID)
 	if err != nil {
 		return TaskActionResult{}, err
 	}
-	result, err := s.actions.RequestTaskAction(ctx, request, taskID, action, expectedStatus, requestID)
+	result, err := s.actions.RequestTaskAction(ctx, request, taskID, action, expectedStatus, revisionFence, requestID)
 	if err != nil {
 		return TaskActionResult{}, err
 	}

@@ -2,5 +2,5 @@
 web/portal/public/downloads/
 .idea
 /runtime/morde-runtime/.tmp-t21-shell/
-/docs/
 node_modules
+docs/实施/.local-baseline

@@ -23,7 +23,7 @@ func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 
 	pauseID := mustID(t, domain.NewTaskActionID)
 	pauseRecord := taskActionIdempotency(owner.ID, task.ActionPause, "pause-action-key", submitted.Task.ID, task.StatusQueued, pauseID)
-	pausedRequest, err := store.RequestTaskAction(ctx, pauseRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, pauseID)
+	pausedRequest, err := store.RequestTaskAction(ctx, pauseRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, nil, pauseID)
 	if err != nil || pausedRequest.Task.Status != task.StatusPausing || pausedRequest.Action != task.ActionPause || len(pausedRequest.UnsettledOperationIDs) != 0 {
 		t.Fatalf("pause request = %#v, err=%v", pausedRequest, err)
 	}
@@ -45,13 +45,13 @@ func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 	}
 	stalePauseID := mustID(t, domain.NewTaskActionID)
 	stalePauseRecord := taskActionIdempotency(owner.ID, task.ActionPause, "stale-pause-key", submitted.Task.ID, task.StatusQueued, stalePauseID)
-	if _, err := store.RequestTaskAction(ctx, stalePauseRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, stalePauseID); domain.CodeOf(err) != domain.CodeConflict {
+	if _, err := store.RequestTaskAction(ctx, stalePauseRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, nil, stalePauseID); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("stale expected task status error = %v", err)
 	}
 
 	resumeID := mustID(t, domain.NewTaskActionID)
 	resumeRecord := taskActionIdempotency(owner.ID, task.ActionResume, "resume-action-key", submitted.Task.ID, task.StatusPaused, resumeID)
-	resumed, err := store.RequestTaskAction(ctx, resumeRecord, submitted.Task.ID, task.ActionResume, task.StatusPaused, resumeID)
+	resumed, err := store.RequestTaskAction(ctx, resumeRecord, submitted.Task.ID, task.ActionResume, task.StatusPaused, nil, resumeID)
 	if err != nil || resumed.Task.Status != task.StatusQueued || resumed.Action != task.ActionResume {
 		t.Fatalf("resume request = %#v, err=%v", resumed, err)
 	}
@@ -61,13 +61,94 @@ func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 	retryID := mustID(t, domain.NewTaskActionID)
 	retryRecord := pauseRecord
 	retryRecord.ResourceID = retryID
-	replayed, err := store.RequestTaskAction(ctx, retryRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, retryID)
+	replayed, err := store.RequestTaskAction(ctx, retryRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, nil, retryID)
 	if err != nil || replayed.Action != task.ActionPause || replayed.Task.Status != task.StatusQueued {
 		t.Fatalf("pause idempotent replay after resume = %#v, err=%v", replayed, err)
 	}
 	var stopRows int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests WHERE task_id=$1`, submitted.Task.ID).Scan(&stopRows); err != nil || stopRows != 1 {
 		t.Fatalf("stop request rows after replay = %d, err=%v", stopRows, err)
+	}
+}
+
+func TestPostgresTaskActionRevisionFenceIsAtomicAndLegacyRequestWorks(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, "ai", 0)
+	submitted, err := store.SubmitTask(ctx, newTestTaskSubmission(t, owner.ID, hostValue.ID, "revision-fence-task", "pause with a revision fence"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeStatus string
+	var beforeSequence, currentRevision, desiredRevision int64
+	if err := store.pool.QueryRow(ctx, `SELECT status,event_seq,current_revision,desired_revision FROM tasks WHERE id=$1`, submitted.Task.ID).
+		Scan(&beforeStatus, &beforeSequence, &currentRevision, &desiredRevision); err != nil {
+		t.Fatal(err)
+	}
+	fence := app.TaskActionRevisionFence{CurrentRevision: currentRevision, DesiredRevision: desiredRevision}
+	staleCurrent := currentRevision
+	if staleCurrent == 0 {
+		staleCurrent = 1
+	} else {
+		staleCurrent = 0
+	}
+	staleDesired := desiredRevision
+	if staleDesired == 0 {
+		staleDesired = 1
+	} else {
+		staleDesired = 0
+	}
+	staleRequests := []struct {
+		name  string
+		fence app.TaskActionRevisionFence
+	}{
+		{name: "stale-current", fence: app.TaskActionRevisionFence{CurrentRevision: staleCurrent, DesiredRevision: desiredRevision}},
+		{name: "stale-desired", fence: app.TaskActionRevisionFence{CurrentRevision: currentRevision, DesiredRevision: staleDesired}},
+	}
+	for _, stale := range staleRequests {
+		t.Run(stale.name, func(t *testing.T) {
+			actionID := mustID(t, domain.NewTaskActionID)
+			key := "revision-fence-" + stale.name
+			record := taskActionIdempotency(owner.ID, task.ActionPause, key, submitted.Task.ID, task.StatusQueued, actionID)
+			if _, err := store.RequestTaskAction(ctx, record, submitted.Task.ID, task.ActionPause, task.StatusQueued, &stale.fence, actionID); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("stale revision pair error = %v, want conflict", err)
+			}
+			var status string
+			var sequence, stopRows, idempotencyRows int64
+			if err := store.pool.QueryRow(ctx, `SELECT status,event_seq FROM tasks WHERE id=$1`, submitted.Task.ID).Scan(&status, &sequence); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests WHERE task_id=$1`, submitted.Task.ID).Scan(&stopRows); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM idempotency_keys WHERE owner_id=$1 AND operation=$2 AND key=$3`,
+				owner.ID, record.Operation, record.Key).Scan(&idempotencyRows); err != nil {
+				t.Fatal(err)
+			}
+			if status != beforeStatus || sequence != beforeSequence || stopRows != 0 || idempotencyRows != 0 {
+				t.Fatalf("stale revision had side effects: status=%q sequence=%d stop_rows=%d idempotency_rows=%d", status, sequence, stopRows, idempotencyRows)
+			}
+		})
+	}
+	matchedID := mustID(t, domain.NewTaskActionID)
+	matchedRecord := taskActionIdempotency(owner.ID, task.ActionPause, "revision-fence-matched", submitted.Task.ID, task.StatusQueued, matchedID)
+	matched, err := store.RequestTaskAction(ctx, matchedRecord, submitted.Task.ID, task.ActionPause, task.StatusQueued, &fence, matchedID)
+	if err != nil || matched.Task.Status != task.StatusPausing {
+		t.Fatalf("matching revision pair action = %#v err=%v", matched, err)
+	}
+	claim, found, err := store.ClaimNextTaskStop(ctx, "revision-fence-stop-worker", time.Minute)
+	if err != nil || !found || claim.Request.ID != matchedID {
+		t.Fatalf("claim matched revision stop = %#v found=%t err=%v", claim, found, err)
+	}
+	if _, err := store.CompleteTaskStop(ctx, submitted.Task.ID, matchedID, "revision-fence-stop-worker", claim.Request.LeaseVersion); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := mustID(t, domain.NewTaskActionID)
+	legacyRecord := taskActionIdempotency(owner.ID, task.ActionResume, "revision-fence-legacy", submitted.Task.ID, task.StatusPaused, legacyID)
+	legacy, err := store.RequestTaskAction(ctx, legacyRecord, submitted.Task.ID, task.ActionResume, task.StatusPaused, nil, legacyID)
+	if err != nil || legacy.Task.Status != task.StatusQueued {
+		t.Fatalf("legacy request without revision pair = %#v err=%v", legacy, err)
 	}
 }
 
@@ -87,7 +168,7 @@ func TestPostgresTaskStopRecoversDispatchedMCPConnectorOperation(t *testing.T) {
 
 	stopID := mustID(t, domain.NewTaskActionID)
 	stopRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "stop-recover-mcp-action", fixture.running.ID, task.StatusRunning, stopID)
-	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionCancel, task.StatusRunning, stopID)
+	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionCancel, task.StatusRunning, nil, stopID)
 	if err != nil || requested.Task.Status != task.StatusCancelling || len(requested.UnsettledOperationIDs) != 1 {
 		t.Fatalf("stop request = %#v err=%v", requested, err)
 	}
@@ -146,7 +227,7 @@ func TestPostgresTaskStopRecoversRevokedDispatchedMCPConnectorOperation(t *testi
 
 	stopID := mustID(t, domain.NewTaskActionID)
 	stopRecord := taskActionIdempotency(owner.ID, task.ActionPause, "stop-recover-revoked-action", fixture.running.ID, task.StatusRunning, stopID)
-	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionPause, task.StatusRunning, stopID)
+	requested, err := store.RequestTaskAction(ctx, stopRecord, fixture.running.ID, task.ActionPause, task.StatusRunning, nil, stopID)
 	if err != nil || requested.Task.Status != task.StatusPausing || len(requested.UnsettledOperationIDs) != 1 {
 		t.Fatalf("pause request = %#v err=%v", requested, err)
 	}
@@ -183,7 +264,7 @@ func TestPostgresTaskStopWaitsForAgentStopReceipt(t *testing.T) {
 	}
 	cancelID := mustID(t, domain.NewTaskActionID)
 	stopRecord := taskActionIdempotency(f.request.Fence.OwnerID, task.ActionCancel, "cancel-agent-key", f.request.Fence.TaskID, task.StatusRunning, cancelID)
-	if _, err := f.store.RequestTaskAction(ctx, stopRecord, f.request.Fence.TaskID, task.ActionCancel, task.StatusRunning, cancelID); err != nil {
+	if _, err := f.store.RequestTaskAction(ctx, stopRecord, f.request.Fence.TaskID, task.ActionCancel, task.StatusRunning, nil, cancelID); err != nil {
 		t.Fatalf("request task cancellation: %v", err)
 	}
 	claim, found, err := f.store.ClaimNextTaskStop(ctx, "stop-worker", time.Minute)
@@ -292,7 +373,7 @@ func TestPostgresTaskCancelSettlesOperationsAndPendingApproval(t *testing.T) {
 
 	cancelID := mustID(t, domain.NewTaskActionID)
 	cancelRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "cancel-action-key", running.ID, task.StatusWaitingUser, cancelID)
-	cancelling, err := store.RequestTaskAction(ctx, cancelRecord, running.ID, task.ActionCancel, task.StatusWaitingUser, cancelID)
+	cancelling, err := store.RequestTaskAction(ctx, cancelRecord, running.ID, task.ActionCancel, task.StatusWaitingUser, nil, cancelID)
 	if err != nil || cancelling.Task.Status != task.StatusCancelling || cancelling.Task.Lease.Owner != "" || len(cancelling.UnsettledOperationIDs) != 3 {
 		t.Fatalf("cancel request = %#v, err=%v", cancelling, err)
 	}
@@ -431,7 +512,7 @@ func TestPostgresCancelSettlesPendingClarification(t *testing.T) {
 	}
 	cancelID := mustID(t, domain.NewTaskActionID)
 	record := taskActionIdempotency(owner.ID, task.ActionCancel, "cancel-clarification-key", claimed.ID, task.StatusWaitingUser, cancelID)
-	if _, err := store.RequestTaskAction(ctx, record, claimed.ID, task.ActionCancel, task.StatusWaitingUser, cancelID); err != nil {
+	if _, err := store.RequestTaskAction(ctx, record, claimed.ID, task.ActionCancel, task.StatusWaitingUser, nil, cancelID); err != nil {
 		t.Fatal(err)
 	}
 	var status string

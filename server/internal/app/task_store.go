@@ -39,8 +39,34 @@ type TaskListRequest struct {
 	Page    PageRequest
 }
 
+type Dependency struct {
+	TaskID           string
+	RequiredRevision int64
+	TaskStatus       task.Status
+	Satisfied        bool
+}
+
+type ChildJob struct {
+	JobID        string
+	TaskStepID   string
+	Title        string
+	TaskRevision int64
+	Status       task.StepStatus
+}
+
+type ResultReview struct {
+	State               string
+	SourceTaskID        string
+	SourceTaskRevision  int64
+	SourceEventSequence int64
+	ReplyMessageID      *string
+}
+
 type TaskDetails struct {
 	Task                   task.Task
+	Dependencies           []Dependency
+	ChildJobs              []ChildJob
+	ResultReview           *ResultReview
 	AssistantMessage       *AssistantMessageSnapshot
 	CurrentRevisionStarted *bool
 	ResultMessagePending   bool
@@ -77,6 +103,14 @@ type TaskActionResult struct {
 	Task                  task.Task
 	Action                task.Action
 	UnsettledOperationIDs []string
+}
+
+// TaskActionRevisionFence binds a user action to the exact revision pair the
+// caller observed. The store compares both values while holding the task row
+// lock and in the same transaction as the resulting state transition.
+type TaskActionRevisionFence struct {
+	CurrentRevision int64 `json:"expected_current_revision"`
+	DesiredRevision int64 `json:"expected_desired_revision"`
 }
 
 type TaskStopClaim struct {
@@ -252,7 +286,7 @@ type TaskStore interface {
 
 // TaskActionRequester owns the atomic, idempotent user-facing state transition.
 type TaskActionRequester interface {
-	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, string) (TaskActionResult, error)
+	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, *TaskActionRevisionFence, string) (TaskActionResult, error)
 }
 
 // TaskActionStore also owns recovery leases while confirming runtime operation

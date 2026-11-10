@@ -438,9 +438,10 @@ WHERE service_instance_id=$1::uuid AND runtime_id=$2`, attestation.Fence.Service
 			replayed = true
 			return nil
 		}
-		requiresExpiredLease := current.State != app.AccountAgentRuntimeFailed || attestation.StartAborted
+		requiresExpiredLease := current.State == app.AccountAgentRuntimeStarting ||
+			current.State == app.AccountAgentRuntimeRunning || attestation.StartAborted
 		if gate.state == execution.StateEnabled && requiresExpiredLease {
-			// Crash recovery and aborted-start recovery must wait out the exact Runtime lease.
+			// Unrequested crash recovery and aborted-start recovery must wait out the exact Runtime lease.
 			var leaseExpired bool
 			err := tx.QueryRow(ctx, `SELECT COALESCE(lease_expires_at<=clock_timestamp(),false) FROM account_agent_runtimes
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime_generation=$4

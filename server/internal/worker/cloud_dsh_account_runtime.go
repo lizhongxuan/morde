@@ -213,6 +213,7 @@ func (m *CloudDSHAccountRuntimeManager) Acquire(ctx context.Context, ownerID, co
 	}
 	session := &cloudDSHAccountRuntimeSession{manager: m, runtime: ready, process: process, frames: frames,
 		leaseExpiresAt: ready.LeaseExpiresAt, tasks: make(map[app.AgentInstanceFence]*cloudDSHAccountTask),
+		coordinators: make(map[string]*cloudDSHAccountCoordinator), coordinatorSlots: make(chan struct{}, max(1, ready.MaxConcurrentTasks)),
 		stopped: make(map[cloudDSHIdentity]struct{}),
 		input:   &cloudDSHRuntimeInput{target: process.Input}}
 	go session.route()
@@ -277,7 +278,7 @@ func (m *CloudDSHAccountRuntimeManager) stopUnattachedRuntime(ctx context.Contex
 		return errors.New("stale account Agent Runtime destruction is unconfirmed")
 	}
 	if _, err := m.options.Control.ConfirmGuardianStopped(ctx, attestation, m.options.StopVerifier); err != nil {
-		return errors.New("stale account Agent Runtime stop proof was not persisted")
+		return fmt.Errorf("persist Guardian stop proof for account Agent Runtime: %w", err)
 	}
 	if err := m.acknowledgeAccountRuntimeStopProof(ctx, attestation); err != nil {
 		return err
@@ -443,19 +444,23 @@ func (m *CloudDSHAccountRuntimeManager) renewAccountRuntime(ctx context.Context,
 }
 
 type cloudDSHAccountRuntimeSession struct {
-	manager        *CloudDSHAccountRuntimeManager
-	runtime        app.AccountAgentRuntime
-	leaseExpiresAt time.Time
-	process        CloudDSHAccountRuntimeProcess
-	frames         <-chan cloudDSHRead
-	input          *cloudDSHRuntimeInput
-	mu             sync.Mutex
-	startMu        sync.Mutex
-	renewMu        sync.Mutex
-	tasks          map[app.AgentInstanceFence]*cloudDSHAccountTask
-	stopped        map[cloudDSHIdentity]struct{}
-	failed         error
-	stopping       bool
+	manager             *CloudDSHAccountRuntimeManager
+	runtime             app.AccountAgentRuntime
+	leaseExpiresAt      time.Time
+	process             CloudDSHAccountRuntimeProcess
+	frames              <-chan cloudDSHRead
+	input               *cloudDSHRuntimeInput
+	mu                  sync.Mutex
+	startMu             sync.Mutex
+	coordinatorStartMu  sync.Mutex
+	renewMu             sync.Mutex
+	tasks               map[app.AgentInstanceFence]*cloudDSHAccountTask
+	coordinators        map[string]*cloudDSHAccountCoordinator
+	coordinatorSlots    chan struct{}
+	coordinatorSequence int64
+	stopped             map[cloudDSHIdentity]struct{}
+	failed              error
+	stopping            bool
 }
 
 func (s *cloudDSHAccountRuntimeSession) closed() bool {
@@ -478,9 +483,16 @@ func (s *cloudDSHAccountRuntimeSession) fail(err error) {
 	for _, task := range s.tasks {
 		tasks = append(tasks, task)
 	}
+	coordinators := make([]*cloudDSHAccountCoordinator, 0, len(s.coordinators))
+	for _, coordinator := range s.coordinators {
+		coordinators = append(coordinators, coordinator)
+	}
 	s.mu.Unlock()
 	for _, task := range tasks {
 		task.fail(err)
+	}
+	for _, coordinator := range coordinators {
+		coordinator.fail(err)
 	}
 	if markFailed {
 		_ = s.manager.markRuntimeFailed(context.Background(), s.runtime.Fence, execution.RuntimeFailureRuntime)
@@ -522,6 +534,12 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 	}
 	if err := s.validateRuntimeIdentity(frame); err != nil {
 		return err
+	}
+	var role string
+	_ = json.Unmarshal(frame["context_role"], &role)
+	if role == "coordinator" || kind == "coordinator_process_ready" || kind == "coordinator_started" ||
+		kind == "coordinator_settled" || kind == "coordinator_failed" || kind == "coordinator_terminated" {
+		return s.routeCoordinatorFrame(kind, frame)
 	}
 	var identity cloudDSHIdentity
 	if json.Unmarshal(raw, &identity) != nil || !cloudDSHIdentityValid(identity) {
@@ -614,6 +632,79 @@ func (s *cloudDSHAccountRuntimeSession) validateRuntimeIdentity(frame map[string
 	return nil
 }
 
+func (s *cloudDSHAccountRuntimeSession) routeCoordinatorFrame(kind string, frame map[string]json.RawMessage) error {
+	if !validCloudDSHCoordinatorRuntimeFrame(kind, frame) {
+		return errors.New("account Agent Runtime coordinator frame fields are invalid")
+	}
+	identity, err := decodeCloudDSHCoordinatorIdentity(frame)
+	if err != nil {
+		return err
+	}
+	identity.ServiceInstanceID = s.runtime.Fence.ServiceInstanceID
+	s.mu.Lock()
+	coordinator := s.coordinators[identity.SessionID]
+	if coordinator == nil || coordinator.identity != identity {
+		s.mu.Unlock()
+		return errors.New("account Agent Runtime frame names an unknown coordinator")
+	}
+	if coordinator.terminal {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	switch kind {
+	case "coordinator_process_ready":
+		var sequence int64
+		var pid int
+		if json.Unmarshal(frame["runtime_sequence"], &sequence) != nil || sequence != coordinator.sequence ||
+			json.Unmarshal(frame["container_pid"], &pid) != nil || pid < 1 {
+			return errors.New("account Agent Runtime coordinator process identity is invalid")
+		}
+		coordinator.mu.Lock()
+		if coordinator.admitted || coordinator.started {
+			coordinator.mu.Unlock()
+			return errors.New("account Agent Runtime coordinator process was admitted twice")
+		}
+		coordinator.admitted = true
+		coordinator.mu.Unlock()
+		return s.input.WriteFrame(coordinator.ctx, map[string]any{"type": "coordinator_process_admit",
+			"server_instance_id": s.runtime.Fence.ServiceInstanceID, "owner_id": s.runtime.Fence.OwnerID,
+			"runtime_id": s.runtime.Fence.RuntimeID, "runtime_generation": s.runtime.Fence.RuntimeGeneration,
+			"runtime_sequence": coordinator.sequence, "context_role": "coordinator",
+			"conversation_id": identity.ConversationID, "message_id": identity.MessageID, "actor_id": identity.ActorID, "agent_id": identity.AgentID,
+			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID})
+	case "coordinator_started":
+		coordinator.mu.Lock()
+		if !coordinator.admitted || coordinator.started {
+			coordinator.mu.Unlock()
+			return errors.New("account Agent Runtime coordinator start response is invalid")
+		}
+		coordinator.started = true
+		coordinator.mu.Unlock()
+		coordinator.startOnce.Do(func() { coordinator.startedResult <- nil })
+		return nil
+	case "coordinator_settled", "coordinator_failed", "coordinator_terminated":
+		coordinator.markTerminal()
+	}
+	for _, key := range []string{"server_instance_id", "runtime_id", "runtime_generation", "runtime_sequence", "container_pid"} {
+		delete(frame, key)
+	}
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		return errors.New("account Agent Runtime coordinator frame could not be decoded")
+	}
+	select {
+	case coordinator.events <- cloudDSHRead{frame: encoded}:
+		return nil
+	case <-coordinator.ctx.Done():
+		return nil
+	default:
+		coordinator.fail(errors.New("account Agent Runtime coordinator event queue is full"))
+		return nil
+	}
+}
+
 func cloudDSHIdentityValid(identity cloudDSHIdentity) bool {
 	return cloudDSHID.MatchString(identity.TaskID) && cloudDSHID.MatchString(identity.OwnerID) &&
 		cloudDSHID.MatchString(identity.AgentID) && cloudDSHID.MatchString(identity.SessionID) &&
@@ -681,6 +772,108 @@ func (s *cloudDSHAccountRuntimeSession) StartTask(ctx context.Context, fence app
 	task.events <- cloudDSHRead{frame: ready}
 	pipes := &cloudDSHAccountTaskPipes{session: s, task: task, ctx: ctx}
 	return pipes, pipes, nil
+}
+
+func (s *cloudDSHAccountRuntimeSession) StartCoordinator(ctx context.Context, claim app.ConversationRouteClaim,
+	identity app.ConversationCoordinatorIdentity, start map[string]any) (*cloudDSHAccountCoordinator, error) {
+	runtimeFence := s.runtime.Fence
+	if ctx == nil || app.ValidateConversationCoordinatorIdentity(claim, identity) != nil || start == nil ||
+		identity.ServiceInstanceID != runtimeFence.ServiceInstanceID || identity.OwnerID != runtimeFence.OwnerID ||
+		identity.ConversationID != runtimeFence.ConversationID || s.closed() {
+		return nil, errors.New("account Agent Runtime coordinator identity is invalid")
+	}
+	s.mu.Lock()
+	if s.coordinatorSlots == nil {
+		s.coordinatorSlots = make(chan struct{}, max(1, s.runtime.MaxConcurrentTasks))
+	}
+	slots := s.coordinatorSlots
+	s.mu.Unlock()
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	s.coordinatorStartMu.Lock()
+	sequenceLocked := true
+	defer func() {
+		if sequenceLocked {
+			s.coordinatorStartMu.Unlock()
+		}
+	}()
+	coordinator := &cloudDSHAccountCoordinator{ctx: ctx, session: s, identity: identity, events: make(chan cloudDSHRead, 32),
+		startedResult: make(chan error, 1), finished: make(chan struct{}), checkpointIDs: make(map[string]struct{}),
+		pageReadIDs: make(map[string]struct{}), through: -1, readThrough: -1, slots: slots}
+	s.mu.Lock()
+	if s.failed != nil || s.stopping || s.coordinators[identity.SessionID] != nil {
+		s.mu.Unlock()
+		coordinator.releaseSlot()
+		return nil, errors.New("account Agent Runtime coordinator is already active")
+	}
+	if s.coordinatorSequence == 1<<53-1 {
+		s.mu.Unlock()
+		coordinator.releaseSlot()
+		return nil, errors.New("account Agent Runtime coordinator sequence is exhausted")
+	}
+	s.coordinatorSequence++
+	coordinator.sequence = s.coordinatorSequence
+	s.coordinators[identity.SessionID] = coordinator
+	s.mu.Unlock()
+
+	for key, value := range map[string]any{"server_instance_id": s.runtime.Fence.ServiceInstanceID,
+		"owner_id": s.runtime.Fence.OwnerID, "runtime_id": s.runtime.Fence.RuntimeID,
+		"runtime_generation": s.runtime.Fence.RuntimeGeneration, "runtime_sequence": coordinator.sequence} {
+		start[key] = value
+	}
+	if err := s.input.WriteFrame(ctx, start); err != nil {
+		coordinator.fail(err)
+		_ = s.removeCoordinator(identity, coordinator)
+		return nil, errors.New("account Agent Runtime could not start the coordinator")
+	}
+	s.coordinatorStartMu.Unlock()
+	sequenceLocked = false
+	select {
+	case err := <-coordinator.startedResult:
+		if err != nil {
+			_ = s.removeCoordinator(identity, coordinator)
+			return nil, err
+		}
+		return coordinator, nil
+	case <-coordinator.finished:
+		_ = s.removeCoordinator(identity, coordinator)
+		return nil, errors.New("account Agent Runtime coordinator ended before readiness")
+	case <-ctx.Done():
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		_ = s.writeCoordinatorFrame(cancelCtx, identity, map[string]any{"type": "coordinator_cancel",
+			"context_role": "coordinator", "conversation_id": identity.ConversationID, "message_id": identity.MessageID,
+			"owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID,
+			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID})
+		cancel()
+		_ = s.removeCoordinator(identity, coordinator)
+		return nil, ctx.Err()
+	}
+}
+
+func (s *cloudDSHAccountRuntimeSession) writeCoordinatorFrame(ctx context.Context,
+	identity app.ConversationCoordinatorIdentity, frame map[string]any) error {
+	if ctx == nil {
+		return errors.New("coordinator runtime frame identity is invalid")
+	}
+	s.mu.Lock()
+	coordinator := s.coordinators[identity.SessionID]
+	valid := coordinator != nil && coordinator.identity == identity
+	s.mu.Unlock()
+	if !valid || frame["context_role"] != "coordinator" || frame["conversation_id"] != identity.ConversationID ||
+		frame["message_id"] != identity.MessageID || frame["owner_id"] != identity.OwnerID || frame["actor_id"] != identity.ActorID ||
+		frame["agent_id"] != identity.AgentID || frame["generation"] != identity.Generation || frame["authorization_version"] != identity.AuthorizationVersion ||
+		frame["session_id"] != identity.SessionID {
+		return errors.New("coordinator runtime frame identity is invalid")
+	}
+	for key, value := range map[string]any{"server_instance_id": s.runtime.Fence.ServiceInstanceID,
+		"owner_id": s.runtime.Fence.OwnerID, "runtime_id": s.runtime.Fence.RuntimeID,
+		"runtime_generation": s.runtime.Fence.RuntimeGeneration} {
+		frame[key] = value
+	}
+	return s.input.WriteFrame(ctx, frame)
 }
 
 func (s *cloudDSHAccountRuntimeSession) renewTask(ctx context.Context, task *cloudDSHAccountTask, expires time.Time) error {

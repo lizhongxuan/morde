@@ -7731,6 +7731,8 @@ export interface components {
         };
         /** @enum {string} */
         TaskStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "cancelling" | "completed" | "failed" | "cancelled";
+        /** @enum {string} */
+        TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
         TaskBudgetRequest: {
             active_seconds: number;
             tool_calls: number;
@@ -7745,6 +7747,32 @@ export interface components {
             active_seconds: number;
             tool_calls: number;
             model_tokens: number | null;
+        };
+        TaskDependency: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            required_revision: number;
+            task_status: components["schemas"]["TaskStatus"];
+            satisfied: boolean;
+        };
+        TaskChildJob: {
+            /** @description Opaque DSH child session identifier; it is not an independently authorized Task. */
+            job_id: string;
+            task_step_id: components["schemas"]["StepId"];
+            title: string;
+            /** Format: int64 */
+            task_revision: number;
+            status: components["schemas"]["TaskStepStatus"];
+        };
+        TaskResultReview: {
+            /** @enum {string} */
+            state: "pending" | "processing" | "published" | "failed";
+            source_task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            source_task_revision: number;
+            /** Format: int64 */
+            source_event_sequence: number;
+            reply_message_id: components["schemas"]["MessageId"] | null;
         };
         TaskSummary: {
             id: components["schemas"]["TaskId"];
@@ -7788,6 +7816,9 @@ export interface components {
             completed_step_count: number;
             budget: components["schemas"]["TaskBudget"];
             usage: components["schemas"]["TaskUsage"];
+            dependencies: components["schemas"]["TaskDependency"][];
+            child_jobs: components["schemas"]["TaskChildJob"][];
+            result_review: components["schemas"]["TaskResultReview"] | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -7798,8 +7829,7 @@ export interface components {
             sequence: number;
             /** @enum {string} */
             kind: "plan" | "model" | "tool" | "wait" | "clarification" | "budget" | "verification" | "verify" | "batch_item" | "batch_result" | "subagent" | "progress" | "result";
-            /** @enum {string} */
-            status: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
+            status: components["schemas"]["TaskStepStatus"];
             title: string;
             summary: string;
             /** Format: date-time */
@@ -7980,11 +8010,15 @@ export interface components {
             key: string;
             input: string;
         };
-        /** @description retry_batch_item requires batch_item_id only; pause, resume and cancel require expected_status only. */
+        /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. */
         TaskActionRequest: {
             /** @enum {string} */
             action: "retry_batch_item" | "pause" | "resume" | "cancel";
             expected_status?: components["schemas"]["TaskStatus"];
+            /** Format: int64 */
+            expected_current_revision?: number;
+            /** Format: int64 */
+            expected_desired_revision?: number;
             batch_item_id?: components["schemas"]["BatchItemId"];
         };
         TaskWorkspaceViewDeletionRequest: {
@@ -14768,6 +14802,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

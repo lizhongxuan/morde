@@ -299,12 +299,15 @@ describe('typed Portal API client', () => {
       return Response.json({ task_id: 'q1234567', action: 'cancel', status: 'cancelling', unsettled_operation_ids: ['op1234567'] }, { status: 202 });
     }));
 
-    const response = await portalApi.taskAction('q1234567', { action: 'cancel', expected_status: 'running' }, 'task-stop-retry-key');
+    const response = await portalApi.taskAction('q1234567', {
+      action: 'cancel', expected_status: 'running', expected_current_revision: 3, expected_desired_revision: 4,
+    }, 'task-stop-retry-key');
 
     expect(response.status).toBe('cancelling');
     expect(new URL(request!.url).pathname).toBe('/api/tasks/q1234567/actions');
     expect(request!.headers.get('Idempotency-Key')).toBe('task-stop-retry-key');
-    expect(await request!.json()).toEqual({ action: 'cancel', expected_status: 'running' });
+    expect(await request!.json()).toEqual({ action: 'cancel', expected_status: 'running',
+      expected_current_revision: 3, expected_desired_revision: 4 });
   });
 
   it('reads Host control status and sends version-scoped handoff actions', async () => {

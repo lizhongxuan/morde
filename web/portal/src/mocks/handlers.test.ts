@@ -1361,6 +1361,69 @@ describe("portal mock durable tasks", () => {
     expect(stale.status).toBe(409);
     expect((await stale.json()).error).toMatchObject({ code: "conflict" });
   });
+
+  it("atomically compares task revision fences and replays the exact fenced action", async () => {
+    await api("/api/auth/login", json("POST", { name: "demo", password: "demo" }));
+    const createTask = async (objective: string, key: string) => {
+      const response = await api("/api/tasks", {
+        ...json("POST", { model_id: "pmodel01", objective }),
+        headers: { "content-type": "application/json", "Idempotency-Key": key },
+      });
+      expect(response.status).toBe(202);
+      return await response.json() as { id: string };
+    };
+
+    for (const staleField of ["expected_current_revision", "expected_desired_revision"] as const) {
+      const task = await createTask(`修订条件测试 ${staleField}`, `task-stop-${staleField}-submit`);
+      const initialResponse = await api(`/api/tasks/${task.id}`);
+      const initial = await initialResponse.json() as {
+        status: string; event_sequence: number; current_revision?: number; desired_revision?: number;
+      };
+      const currentRevision = initial.current_revision ?? 0;
+      const desiredRevision = initial.desired_revision ?? 0;
+      const expected = { expected_current_revision: currentRevision, expected_desired_revision: desiredRevision };
+      const key = `task-stop-${staleField}-fence`;
+
+      const invalidPair = await api(`/api/tasks/${task.id}/actions`, {
+        ...json("POST", { action: "cancel", expected_status: "queued", expected_current_revision: currentRevision }),
+        headers: { "content-type": "application/json", "Idempotency-Key": key },
+      });
+      expect(invalidPair.status).toBe(400);
+      const stalePair = {
+        ...expected,
+        [staleField]: expected[staleField] + 1,
+      };
+      const stale = await api(`/api/tasks/${task.id}/actions`, {
+        ...json("POST", { action: "cancel", expected_status: "queued", ...stalePair }),
+        headers: { "content-type": "application/json", "Idempotency-Key": key },
+      });
+      expect(stale.status).toBe(409);
+      expect((await stale.json()).error).toMatchObject({ code: "conflict" });
+
+      const unchangedResponse = await api(`/api/tasks/${task.id}`);
+      const unchanged = await unchangedResponse.json();
+      expect(unchanged).toMatchObject({
+        status: "queued", event_sequence: initial.event_sequence,
+        current_revision: currentRevision, desired_revision: desiredRevision,
+      });
+
+      const matchingBody = { action: "cancel", expected_status: "queued", ...expected };
+      const accepted = await api(`/api/tasks/${task.id}/actions`, {
+        ...json("POST", matchingBody), headers: { "content-type": "application/json", "Idempotency-Key": key },
+      });
+      expect(accepted.status).toBe(202);
+      const acceptedBody = await accepted.json();
+      expect(acceptedBody).toMatchObject({ task_id: task.id, action: "cancel", status: "cancelling" });
+      const replay = await api(`/api/tasks/${task.id}/actions`, {
+        ...json("POST", matchingBody), headers: { "content-type": "application/json", "Idempotency-Key": key },
+      });
+      expect(replay.status).toBe(202);
+      expect(await replay.json()).toEqual(acceptedBody);
+      expect(await (await api(`/api/tasks/${task.id}`)).json()).toMatchObject({
+        status: "cancelling", event_sequence: initial.event_sequence + 1,
+      });
+    }
+  });
 });
 
 describe("portal mock quota and capacity", () => {

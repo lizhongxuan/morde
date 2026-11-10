@@ -1154,7 +1154,7 @@ func TestPostgresWorkspaceSyncCommitSerializesWithTaskOperationAdmission(t *test
 	}
 	resumeID := mustID(t, domain.NewTaskActionID)
 	resumeRecord := taskActionIdempotency(owner.ID, task.ActionResume, "stale-workspace-resume", claimed.ID, task.StatusPaused, resumeID)
-	if _, err := store.RequestTaskAction(ctx, resumeRecord, claimed.ID, task.ActionResume, task.StatusPaused, resumeID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
+	if _, err := store.RequestTaskAction(ctx, resumeRecord, claimed.ID, task.ActionResume, task.StatusPaused, nil, resumeID); domain.CodeOf(err) != domain.CodeWorkspaceConflict {
 		t.Fatalf("resume against a stale Workspace input error = %v, want workspace conflict", err)
 	}
 	notifications, err := store.ListUnprocessedNotificationEvents(ctx, 10)
@@ -1787,7 +1787,7 @@ func TestPostgresAssistantMessageSnapshotsInterruptIncompleteTurns(t *testing.T)
 		claimed, messageID, _ := stream("snapshot-worker-recovery")
 		cancelID := mustID(t, domain.NewTaskActionID)
 		cancelRecord := taskActionIdempotency(owner.ID, task.ActionCancel, "snapshot-cancel", claimed.ID, task.StatusRunning, cancelID)
-		requested, err := store.RequestTaskAction(ctx, cancelRecord, claimed.ID, task.ActionCancel, task.StatusRunning, cancelID)
+		requested, err := store.RequestTaskAction(ctx, cancelRecord, claimed.ID, task.ActionCancel, task.StatusRunning, nil, cancelID)
 		if err != nil || requested.Task.Status != task.StatusCancelling {
 			t.Fatalf("request cancellation = %#v, err=%v", requested, err)
 		}

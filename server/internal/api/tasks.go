@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,6 +37,10 @@ type TaskService interface {
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
+type TaskRevisionFencedActionService interface {
+	RequestActionWithRevisionFence(context.Context, identity.Principal, string, task.Action, task.Status, *app.TaskActionRevisionFence, string) (app.TaskActionResult, error)
+}
+
 type TaskWorkbenchObservationTicketService interface {
 	IssueWorkbenchObservationTicket(context.Context, identity.Principal, string) (app.TaskWorkbenchObservationTicket, error)
 }
@@ -55,28 +60,54 @@ type taskPageResponse struct {
 }
 
 type taskSummaryResponse struct {
-	ID                          string             `json:"id"`
-	OwnerID                     string             `json:"owner_id"`
-	InitiatorID                 string             `json:"initiator_id"`
-	HostID                      string             `json:"host_id,omitempty"`
-	ExecutionLocation           string             `json:"execution_location"`
-	WorkspaceID                 string             `json:"workspace_id,omitempty"`
-	InputRevision               *int64             `json:"input_revision,omitempty"`
-	CurrentRevision             *int64             `json:"current_revision,omitempty"`
-	DesiredRevision             *int64             `json:"desired_revision,omitempty"`
-	WorkspaceCheckpointRevision *int64             `json:"workspace_checkpoint_revision,omitempty"`
-	ApplicationID               string             `json:"application_id,omitempty"`
-	ConversationID              string             `json:"conversation_id"`
-	ModelID                     string             `json:"model_id"`
-	Objective                   string             `json:"objective"`
-	Status                      task.Status        `json:"status"`
-	CurrentStep                 *string            `json:"current_step"`
-	StepCount                   int64              `json:"step_count"`
-	CompletedStepCount          int64              `json:"completed_step_count"`
-	Budget                      taskBudgetResponse `json:"budget"`
-	Usage                       taskUsageResponse  `json:"usage"`
-	CreatedAt                   time.Time          `json:"created_at"`
-	UpdatedAt                   time.Time          `json:"updated_at"`
+	ID                          string                    `json:"id"`
+	OwnerID                     string                    `json:"owner_id"`
+	InitiatorID                 string                    `json:"initiator_id"`
+	HostID                      string                    `json:"host_id,omitempty"`
+	ExecutionLocation           string                    `json:"execution_location"`
+	WorkspaceID                 string                    `json:"workspace_id,omitempty"`
+	InputRevision               *int64                    `json:"input_revision,omitempty"`
+	CurrentRevision             *int64                    `json:"current_revision,omitempty"`
+	DesiredRevision             *int64                    `json:"desired_revision,omitempty"`
+	WorkspaceCheckpointRevision *int64                    `json:"workspace_checkpoint_revision,omitempty"`
+	ApplicationID               string                    `json:"application_id,omitempty"`
+	ConversationID              string                    `json:"conversation_id"`
+	ModelID                     string                    `json:"model_id"`
+	Objective                   string                    `json:"objective"`
+	Status                      task.Status               `json:"status"`
+	CurrentStep                 *string                   `json:"current_step"`
+	StepCount                   int64                     `json:"step_count"`
+	CompletedStepCount          int64                     `json:"completed_step_count"`
+	Budget                      taskBudgetResponse        `json:"budget"`
+	Usage                       taskUsageResponse         `json:"usage"`
+	Dependencies                []taskDependencyResponse  `json:"dependencies"`
+	ChildJobs                   []taskChildJobResponse    `json:"child_jobs"`
+	ResultReview                *taskResultReviewResponse `json:"result_review"`
+	CreatedAt                   time.Time                 `json:"created_at"`
+	UpdatedAt                   time.Time                 `json:"updated_at"`
+}
+
+type taskDependencyResponse struct {
+	TaskID           string      `json:"task_id"`
+	RequiredRevision int64       `json:"required_revision"`
+	TaskStatus       task.Status `json:"task_status"`
+	Satisfied        bool        `json:"satisfied"`
+}
+
+type taskChildJobResponse struct {
+	JobID        string          `json:"job_id"`
+	TaskStepID   string          `json:"task_step_id"`
+	Title        string          `json:"title"`
+	TaskRevision int64           `json:"task_revision"`
+	Status       task.StepStatus `json:"status"`
+}
+
+type taskResultReviewResponse struct {
+	State               string  `json:"state"`
+	SourceTaskID        string  `json:"source_task_id"`
+	SourceTaskRevision  int64   `json:"source_task_revision"`
+	SourceEventSequence int64   `json:"source_event_sequence"`
+	ReplyMessageID      *string `json:"reply_message_id"`
 }
 
 type taskResponse struct {
@@ -240,9 +271,22 @@ type batchItemRequest struct {
 }
 
 type taskActionRequest struct {
-	Action         string      `json:"action"`
-	ExpectedStatus task.Status `json:"expected_status"`
-	BatchItemID    string      `json:"batch_item_id"`
+	Action                  string          `json:"action"`
+	ExpectedStatus          task.Status     `json:"expected_status"`
+	ExpectedCurrentRevision json.RawMessage `json:"expected_current_revision"`
+	ExpectedDesiredRevision json.RawMessage `json:"expected_desired_revision"`
+	BatchItemID             string          `json:"batch_item_id"`
+}
+
+func parseOptionalTaskActionRevision(raw json.RawMessage) (*int64, bool) {
+	if raw == nil {
+		return nil, true
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || value < 0 {
+		return nil, false
+	}
+	return &value, true
 }
 
 type taskInputRequest struct {
@@ -421,9 +465,16 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
+		currentRevision, validCurrentRevision := parseOptionalTaskActionRevision(request.ExpectedCurrentRevision)
+		desiredRevision, validDesiredRevision := parseOptionalTaskActionRevision(request.ExpectedDesiredRevision)
+		if !validCurrentRevision || !validDesiredRevision {
+			writeError(c, domain.InvalidArgument("revision", "expected task revisions must be non-negative integers"))
+			return
+		}
 		switch request.Action {
 		case "retry_batch_item":
-			if !domain.ValidBatchItemID(request.BatchItemID) || request.ExpectedStatus != "" {
+			if !domain.ValidBatchItemID(request.BatchItemID) || request.ExpectedStatus != "" ||
+				request.ExpectedCurrentRevision != nil || request.ExpectedDesiredRevision != nil {
 				writeError(c, domain.InvalidArgument("action", "retry_batch_item requires only a valid batch_item_id"))
 				return
 			}
@@ -435,11 +486,30 @@ func (h *api) taskAction(service TaskService) gin.HandlerFunc {
 			return
 		case "pause", "resume", "cancel":
 			action := task.Action(request.Action)
-			if request.BatchItemID != "" || !validTaskActionExpectedStatus(action, request.ExpectedStatus) {
+			if request.BatchItemID != "" || !validTaskActionExpectedStatus(action, request.ExpectedStatus) ||
+				(request.ExpectedCurrentRevision == nil) != (request.ExpectedDesiredRevision == nil) {
 				writeError(c, domain.InvalidArgument("action", "pause, resume, or cancel requires a valid expected_status and no batch_item_id"))
 				return
 			}
-			result, err := service.RequestAction(c.Request.Context(), principal, taskID, action, request.ExpectedStatus, c.GetHeader("Idempotency-Key"))
+			var revisionFence *app.TaskActionRevisionFence
+			if currentRevision != nil {
+				revisionFence = &app.TaskActionRevisionFence{
+					CurrentRevision: *currentRevision,
+					DesiredRevision: *desiredRevision,
+				}
+			}
+			var result app.TaskActionResult
+			var err error
+			if revisionFence == nil {
+				result, err = service.RequestAction(c.Request.Context(), principal, taskID, action, request.ExpectedStatus, c.GetHeader("Idempotency-Key"))
+			} else {
+				fencedService, ok := service.(TaskRevisionFencedActionService)
+				if !ok {
+					writeError(c, domain.NewError(domain.CodeUnsupported, "revision-fenced task actions are unavailable"))
+					return
+				}
+				result, err = fencedService.RequestActionWithRevisionFence(c.Request.Context(), principal, taskID, action, request.ExpectedStatus, revisionFence, c.GetHeader("Idempotency-Key"))
+			}
 			if err != nil {
 				writeError(c, err)
 				return
@@ -646,7 +716,8 @@ func toTaskSummaryResponse(value task.Task) (taskSummaryResponse, error) {
 		StepCount: value.StepCount, CompletedStepCount: value.CompletedStepCount,
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,
-		}, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+		}, Dependencies: make([]taskDependencyResponse, 0), ChildJobs: make([]taskChildJobResponse, 0),
+		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}, nil
 }
 
@@ -666,6 +737,36 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
 		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt,
+	}
+	response.Dependencies = make([]taskDependencyResponse, 0, len(value.Dependencies))
+	for _, dependency := range value.Dependencies {
+		if !domain.ValidTaskID(dependency.TaskID) || dependency.RequiredRevision < 0 || !validTaskStatusResponse(dependency.TaskStatus) {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.Dependencies = append(response.Dependencies, taskDependencyResponse{
+			TaskID: dependency.TaskID, RequiredRevision: dependency.RequiredRevision,
+			TaskStatus: dependency.TaskStatus, Satisfied: dependency.Satisfied,
+		})
+	}
+	response.ChildJobs = make([]taskChildJobResponse, 0, len(value.ChildJobs))
+	for _, job := range value.ChildJobs {
+		if !utf8.ValidString(job.JobID) || utf8.RuneCountInString(job.JobID) < 1 || utf8.RuneCountInString(job.JobID) > 128 ||
+			!domain.ValidStepID(job.TaskStepID) || !utf8.ValidString(job.Title) || job.TaskRevision < 0 || !validStepStatus(job.Status) {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.ChildJobs = append(response.ChildJobs, taskChildJobResponse{
+			JobID: job.JobID, TaskStepID: job.TaskStepID, Title: job.Title, TaskRevision: job.TaskRevision, Status: job.Status,
+		})
+	}
+	if review := value.ResultReview; review != nil {
+		if !validTaskResultReviewState(review.State) || !domain.ValidTaskID(review.SourceTaskID) || review.SourceTaskRevision < 0 ||
+			review.SourceEventSequence < 1 || (review.ReplyMessageID != nil && !domain.ValidMessageID(*review.ReplyMessageID)) {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.ResultReview = &taskResultReviewResponse{
+			State: review.State, SourceTaskID: review.SourceTaskID, SourceTaskRevision: review.SourceTaskRevision,
+			SourceEventSequence: review.SourceEventSequence, ReplyMessageID: review.ReplyMessageID,
+		}
 	}
 	if assistant := value.AssistantMessage; assistant != nil {
 		message := assistant.Message
@@ -819,6 +920,15 @@ func validTaskStatusResponse(value task.Status) bool {
 	switch value {
 	case task.StatusQueued, task.StatusRunning, task.StatusWaitingUser, task.StatusPausing, task.StatusPaused,
 		task.StatusCancelling, task.StatusCompleted, task.StatusFailed, task.StatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func validTaskResultReviewState(value string) bool {
+	switch value {
+	case "pending", "processing", "published", "failed":
 		return true
 	default:
 		return false

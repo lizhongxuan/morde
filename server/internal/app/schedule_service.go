@@ -427,7 +427,7 @@ func (s *ScheduleService) cancelCurrentRun(ctx context.Context, principal identi
 	if err != nil {
 		return err
 	}
-	_, err = s.store.RequestTaskAction(ctx, request, *run.TaskID, task.ActionCancel, task.Status(run.Status), requestID)
+	_, err = s.store.RequestTaskAction(ctx, request, *run.TaskID, task.ActionCancel, task.Status(run.Status), nil, requestID)
 	return err
 }
 
